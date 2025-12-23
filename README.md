@@ -23,6 +23,20 @@ Base URL in local development:
 
 - `http://127.0.0.1:21080`
 
+---
+
+## Recent changes (Dec 2025)
+
+- **Catalog services API**
+  - New `Service` resource exposed under `/v1/services/`.
+  - Backed by the `catalog_services` table.
+  - Supports standard CRUD operations (see endpoints list below).
+- **Global folder items listing**
+  - New read-only endpoint `GET /v1/folder_items/` to list `FolderItem` objects across all folders.
+  - The response is still user-scoped (uses Zulip user context).
+- **Validation: only one `system_type=all` folder per user**
+  - Creating or updating a folder with `system_type="all"` now fails if the same user already has another `all` folder.
+
 Authentication and user scoping are delegated to Zulip via the
 `/json/users/me` endpoint. The backend never stores credentials; it uses
 incoming `Authorization` and/or `Cookie` headers to determine `user_id`
@@ -127,11 +141,17 @@ Main resources:
 - `GET /v1/folders/{FolderUuid}` — get folder by UUID.
 - `PUT /v1/folders/{FolderUuid}` — update folder.
 - `DELETE /v1/folders/{FolderUuid}` — delete folder.
+- `GET /v1/services/` — list catalog services.
+- `POST /v1/services/` — create catalog service.
+- `GET /v1/services/{ServiceUuid}` — get catalog service by UUID.
+- `PUT /v1/services/{ServiceUuid}` — update catalog service.
+- `DELETE /v1/services/{ServiceUuid}` — delete catalog service.
 - `GET /v1/folders/{FolderUuid}/items/` — list items in a folder.
 - `POST /v1/folders/{FolderUuid}/items/` — create folder item.
 - `GET /v1/folders/{FolderUuid}/items/{FolderItemUuid}` — get item.
 - `PUT /v1/folders/{FolderUuid}/items/{FolderItemUuid}` — update item.
 - `DELETE /v1/folders/{FolderUuid}/items/{FolderItemUuid}` — delete item.
+- `GET /v1/folder_items/` — list folder items across all folders (read-only).
 - `POST /v1/folders/{FolderUuid}/items/{FolderItemUuid}/actions/pin/invoke`
   — pin item.
 - `POST /v1/folders/{FolderUuid}/items/{FolderItemUuid}/actions/unpin/invoke`
@@ -356,6 +376,67 @@ curl -X POST \
 ```bash
 curl -X POST \
   "http://127.0.0.1:21080/v1/folders/${FOLDER_UUID}/items/${FOLDER_ITEM_UUID}/actions/unpin/invoke" \
+  -H "Cookie: ${WORKSPACE_COOKIE}"
+```
+
+### 13. List catalog services
+
+```bash
+curl -X GET \
+  "http://127.0.0.1:21080/v1/services/" \
+  -H "Cookie: ${WORKSPACE_COOKIE}"
+```
+
+### 14. Create catalog service
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:21080/v1/services/" \
+  -H "Cookie: ${WORKSPACE_COOKIE}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Zulip",
+    "description": "Corporate messenger",
+    "service_url": "https://zulip.example.com/",
+    "icon": "https://zulip.example.com/static/images/logo/zulip-icon-128x128.png"
+  }'
+```
+
+### 15. Get catalog service by UUID
+
+```bash
+SERVICE_UUID="50ecadd0-9823-4d97-b54c-806cc672c210"
+
+curl -X GET \
+  "http://127.0.0.1:21080/v1/services/${SERVICE_UUID}" \
+  -H "Cookie: ${WORKSPACE_COOKIE}"
+```
+
+### 16. Update catalog service
+
+```bash
+curl -X PUT \
+  "http://127.0.0.1:21080/v1/services/${SERVICE_UUID}" \
+  -H "Cookie: ${WORKSPACE_COOKIE}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Corporate messenger (updated)"
+  }'
+```
+
+### 17. Delete catalog service
+
+```bash
+curl -X DELETE \
+  "http://127.0.0.1:21080/v1/services/${SERVICE_UUID}" \
+  -H "Cookie: ${WORKSPACE_COOKIE}"
+```
+
+### 18. List folder items across all folders
+
+```bash
+curl -X GET \
+  "http://127.0.0.1:21080/v1/folder_items/" \
   -H "Cookie: ${WORKSPACE_COOKIE}"
 ```
 
