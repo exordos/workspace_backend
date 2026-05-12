@@ -34,7 +34,8 @@ class UserContextMiddleware(ra_middlewares.Middleware):
             return None
 
         # Build Zulip endpoint on the same domain as the incoming request
-        base_url = f"{req.headers['X-Forwarded-Proto']}://{req.headers['Host']}"
+        proto = req.headers.get("X-Forwarded-Proto", req.scheme)
+        base_url = f"{proto}://{req.headers['Host']}"
         client = zulip_client.ZulipClient(endpoint=base_url, timeout=3)
 
         headers = {}

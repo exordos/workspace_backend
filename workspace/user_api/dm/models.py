@@ -30,6 +30,7 @@ class SystemFolderType(str, enum.Enum):
 
 
 class Folder(
+    models.DumpToSimpleViewMixin,
     models.ModelWithUUID,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -56,11 +57,12 @@ class Folder(
         types.AllowNone(
             types.Enum([folder_type.value for folder_type in SystemFolderType])
         ),
-        default=SystemFolderType.CREATED,
+        default=SystemFolderType.CREATED.value,
     )
 
 
 class FolderItem(
+    models.DumpToSimpleViewMixin,
     models.CustomPropertiesMixin,
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -71,7 +73,11 @@ class FolderItem(
         "folder_uuid": types.UUID(),
     }
 
-    folder = relationships.relationship(Folder, required=True)
+    folder = relationships.relationship(
+        Folder,
+        prefetch=True,
+        required=True,
+    )
     user_id = properties.property(
         types.Integer(min_value=0, max_value=2**31 - 1),
         required=True,

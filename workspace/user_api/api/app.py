@@ -48,7 +48,7 @@ def get_openapi_engine():
     openapi_engine = openapi_engines.OpenApiEngine(
         info=openapi_structures.OpenApiInfo(
             title=f"Workspace {versions.API_VERSION_1_0} User API",
-            version=app_version.version_info.release_string(),
+            version=app_version.version_info,
             description=(f"OpenAPI - Workspace {versions.API_VERSION_1_0}"),
         ),
         paths=openapi_structures.OpenApiPaths(),

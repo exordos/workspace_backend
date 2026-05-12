@@ -37,6 +37,24 @@ Base URL in local development:
 - **Validation: only one `system_type=all` folder per user**
   - Creating or updating a folder with `system_type="all"` now fails if the same user already has another `all` folder.
 
+## Recent changes (May 2026)
+
+- **Nested folder view**
+  - `GET /v1/folders/` supports a `full_view` query parameter.
+  - Pass `?full_view=true` (accepted values: `true`, `1`, `yes`) to get folders with nested `items` array.
+  - By default (no parameter or `full_view=false`) the response is a flat paginated folder list.
+  - `DumpToSimpleViewMixin` added to `Folder` and `FolderItem` models for JSON serialization.
+- **OpenAPI schema for folder filter**
+  - The `GET /v1/folders/` endpoint now has a custom OpenAPI schema
+    describing the nested response structure and the `full_view` query parameter.
+  - Schema definitions extracted to `workspace/user_api/api/schemas.py`.
+- **Protocol header fallback**
+  - `UserContextMiddleware` no longer crashes when `X-Forwarded-Proto`
+    header is absent (falls back to `req.scheme`).
+- **OpenAPI engine fix**
+  - Fixed `AttributeError` on startup caused by calling `.release_string()`
+    on the version string.
+
 Authentication and user scoping are delegated to Zulip via the
 `/json/users/me` endpoint. The backend never stores credentials; it uses
 incoming `Authorization` and/or `Cookie` headers to determine `user_id`
@@ -136,7 +154,7 @@ The OpenAPI 3.0.3 specification is exposed at:
 
 Main resources:
 
-- `GET /v1/folders/` — list folders.
+- `GET /v1/folders/` — list folders; pass `?full_view=true` to include nested items.
 - `POST /v1/folders/` — create folder.
 - `GET /v1/folders/{FolderUuid}` — get folder by UUID.
 - `PUT /v1/folders/{FolderUuid}` — update folder.
@@ -214,8 +232,12 @@ constraints on top of the models:
 - `FolderController`:
   - On create, automatically sets `user_id` from the request context.
   - On get/filter/delete/update, always filters by both `uuid` and
-    `user_id`, so one user cannot see or modify another user’s folders.
+    `user_id`, so one user cannot see or modify another user's folders.
   - Hides `user_id` in API responses.
+  - `filter` returns a flat paginated list by default. Pass
+    `?full_view=true` to get a nested view where each folder dict
+    contains an `items` list with its `FolderItem` objects (serialized
+    via `dump_to_simple_view()`).
 - `FolderItemController`:
   - Nested under a parent folder; on create, sets `user_id` from the
     request context.
@@ -251,7 +273,7 @@ __Host-sessionid=<SESSION_ID>"
 curl -X GET "http://127.0.0.1:21080/specifications/3.0.3"
 ```
 
-### 2. List folders
+### 2. List folders (flat, default)
 
 ```bash
 curl -X GET \
@@ -271,6 +293,45 @@ curl -X GET \
     "system_type": "created",
     "created_at": "2025-10-16T10:20:30Z",
     "updated_at": "2025-10-16T10:20:30Z"
+  }
+]
+```
+
+### 2a. List folders with nested items
+
+Pass `?full_view=true` (also accepts `1`, `yes`) to include folder items
+in the response:
+
+```bash
+curl -X GET \
+  "http://127.0.0.1:21080/v1/folders/?full_view=true" \
+  -H "Cookie: ${WORKSPACE_COOKIE}"
+```
+
+**Sample response**
+
+```json
+[
+  {
+    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+    "title": "team",
+    "background_color_value": 4280391411,
+    "unread_messages": [7, 8, 9],
+    "system_type": "created",
+    "created_at": "2025-10-16T10:20:30Z",
+    "updated_at": "2025-10-16T10:20:30Z",
+    "items": [
+      {
+        "uuid": "426bab13-5702-493b-9780-430475700e4b",
+        "user_id": 42,
+        "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+        "chat_id": 100,
+        "order_index": null,
+        "pinned_at": null,
+        "created_at": "2025-10-16T10:20:30Z",
+        "updated_at": "2025-10-16T10:20:30Z"
+      }
+    ]
   }
 ]
 ```

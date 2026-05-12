@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import datetime
 import uuid as sys_uuid
 
@@ -22,8 +23,10 @@ from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
+from restalchemy.openapi import utils as oa_utils
 
 from workspace.user_api import exceptions as user_api_exceptions
+from workspace.user_api.api import schemas
 from workspace.user_api.api import versions
 from workspace.user_api.dm import models
 
@@ -32,6 +35,21 @@ class ApiEndpointController(ra_controllers.RoutesListController):
     """Controller for /v1/ endpoint"""
 
     __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/"
+
+
+_TRUE_VALUES = frozenset({"1", "true", "yes"})
+_FALSE_VALUES = frozenset({"0", "false", "no"})
+
+
+def _parse_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.lower() in _TRUE_VALUES:
+            return True
+        if value.lower() in _FALSE_VALUES:
+            return False
+    return default
 
 
 class UserScopedMixin:
@@ -77,11 +95,29 @@ class FolderController(UserScopedMixin, ra_controllers.BaseResourceControllerPag
             },
         )
 
+    @oa_utils.extend_schema(
+        summary="List folders with nested items",
+        parameters=schemas.FOLDER_FILTER_PARAMETERS,
+        responses=schemas.FOLDER_FILTER_RESPONSES,
+    )
     def filter(self, filters, **kwargs):
         user_id = self._get_user_id()
         filters = (filters or {}).copy()
         filters["user_id"] = dm_filters.EQ(user_id)
-        return super().filter(filters=filters, **kwargs)
+
+        folders = models.Folder.objects.get_all(filters=filters)
+        items = models.FolderItem.objects.get_all(
+            filters={"user_id": dm_filters.EQ(user_id)},
+        )
+        items_by_folder = collections.defaultdict(list)
+        for item in items:
+            items_by_folder[item.folder.uuid].append(item.dump_to_simple_view())
+        result = []
+        for folder in folders:
+            folder_view = folder.dump_to_simple_view()
+            folder_view["items"] = items_by_folder.get(folder.uuid, [])
+            result.append(folder_view)
+        return result
 
     def delete(self, uuid):
         dm = self.get(uuid=uuid)
