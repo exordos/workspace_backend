@@ -91,19 +91,7 @@ FOLDER_WITH_ITEMS_SCHEMA = {
     },
 }
 
-FOLDER_FILTER_PARAMETERS = [
-    oa_c.build_openapi_parameter(
-        "full_view",
-        description=(
-            "If true, return folders with nested items. "
-            "Accepted values: true, 1, yes / false, 0, no"
-        ),
-        required=False,
-        openapi_type="string",
-        param_type="query",
-        schema={"type": "string", "enum": ["true", "false", "1", "0", "yes", "no"]},
-    ),
-]
+FOLDER_FILTER_PARAMETERS = []
 
 FOLDER_FILTER_RESPONSES = {
     ra_status.HTTP_200_OK: {

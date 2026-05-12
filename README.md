@@ -39,14 +39,12 @@ Base URL in local development:
 
 ## Recent changes (May 2026)
 
-- **Nested folder view**
-  - `GET /v1/folders/` supports a `full_view` query parameter.
-  - Pass `?full_view=true` (accepted values: `true`, `1`, `yes`) to get folders with nested `items` array.
-  - By default (no parameter or `full_view=false`) the response is a flat paginated folder list.
+- **Nested folder view by default**
+  - `GET /v1/folders/` now always returns folders with nested `items` array.
   - `DumpToSimpleViewMixin` added to `Folder` and `FolderItem` models for JSON serialization.
 - **OpenAPI schema for folder filter**
   - The `GET /v1/folders/` endpoint now has a custom OpenAPI schema
-    describing the nested response structure and the `full_view` query parameter.
+    describing the nested response structure.
   - Schema definitions extracted to `workspace/user_api/api/schemas.py`.
 - **Protocol header fallback**
   - `UserContextMiddleware` no longer crashes when `X-Forwarded-Proto`
@@ -154,7 +152,7 @@ The OpenAPI 3.0.3 specification is exposed at:
 
 Main resources:
 
-- `GET /v1/folders/` — list folders; pass `?full_view=true` to include nested items.
+- `GET /v1/folders/` — list folders with nested items.
 - `POST /v1/folders/` — create folder.
 - `GET /v1/folders/{FolderUuid}` — get folder by UUID.
 - `PUT /v1/folders/{FolderUuid}` — update folder.
@@ -234,8 +232,7 @@ constraints on top of the models:
   - On get/filter/delete/update, always filters by both `uuid` and
     `user_id`, so one user cannot see or modify another user's folders.
   - Hides `user_id` in API responses.
-  - `filter` returns a flat paginated list by default. Pass
-    `?full_view=true` to get a nested view where each folder dict
+  - `filter` returns a nested view where each folder dict
     contains an `items` list with its `FolderItem` objects (serialized
     via `dump_to_simple_view()`).
 - `FolderItemController`:
@@ -273,38 +270,11 @@ __Host-sessionid=<SESSION_ID>"
 curl -X GET "http://127.0.0.1:21080/specifications/3.0.3"
 ```
 
-### 2. List folders (flat, default)
+### 2. List folders with nested items
 
 ```bash
 curl -X GET \
   "http://127.0.0.1:21080/v1/folders/" \
-  -H "Cookie: ${WORKSPACE_COOKIE}"
-```
-
-**Sample response**
-
-```json
-[
-  {
-    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
-    "title": "team",
-    "background_color_value": 4280391411,
-    "unread_messages": [7, 8, 9],
-    "system_type": "created",
-    "created_at": "2025-10-16T10:20:30Z",
-    "updated_at": "2025-10-16T10:20:30Z"
-  }
-]
-```
-
-### 2a. List folders with nested items
-
-Pass `?full_view=true` (also accepts `1`, `yes`) to include folder items
-in the response:
-
-```bash
-curl -X GET \
-  "http://127.0.0.1:21080/v1/folders/?full_view=true" \
   -H "Cookie: ${WORKSPACE_COOKIE}"
 ```
 
@@ -335,6 +305,7 @@ curl -X GET \
   }
 ]
 ```
+
 
 ### 3. Create folder
 

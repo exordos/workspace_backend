@@ -61,8 +61,6 @@ class TestFolderControllerFilter(unittest.TestCase):
             return_value=self.user_id,
         )
 
-    def _set_full_view(self, value):
-        self.controller._full_view = value
 
     @mock.patch(f"{MODELS_PATH}.FolderItem.objects")
     @mock.patch(f"{MODELS_PATH}.Folder.objects")
@@ -74,7 +72,6 @@ class TestFolderControllerFilter(unittest.TestCase):
         mock_folder_objects.get_all.return_value = [folder]
         mock_item_objects.get_all.return_value = [item1, item2]
 
-        self._set_full_view('yes')
         result = self.controller.filter(filters={})
 
         self.assertEqual(len(result), 1)
@@ -92,7 +89,6 @@ class TestFolderControllerFilter(unittest.TestCase):
         mock_folder_objects.get_all.return_value = [folder]
         mock_item_objects.get_all.return_value = []
 
-        self._set_full_view('yes')
         result = self.controller.filter(filters={})
 
         self.assertEqual(len(result), 1)
@@ -111,7 +107,6 @@ class TestFolderControllerFilter(unittest.TestCase):
         mock_folder_objects.get_all.return_value = [folder_a, folder_b]
         mock_item_objects.get_all.return_value = [item_a, item_b]
 
-        self._set_full_view('yes')
         result = self.controller.filter(filters={})
 
         self.assertEqual(len(result), 2)
@@ -127,7 +122,6 @@ class TestFolderControllerFilter(unittest.TestCase):
         mock_folder_objects.get_all.return_value = []
         mock_item_objects.get_all.return_value = []
 
-        self._set_full_view('yes')
         result = self.controller.filter(filters={})
 
         self.assertEqual(result, [])
@@ -144,47 +138,11 @@ class TestFolderControllerFilter(unittest.TestCase):
         mock_folder_objects.get_all.return_value = [folder]
         mock_item_objects.get_all.return_value = [orphan_item]
 
-        self._set_full_view('yes')
         result = self.controller.filter(filters={})
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["items"], [])
 
-    def test_default_delegates_to_super(self):
-        with mock.patch.object(
-            controllers.ra_controllers.BaseResourceControllerPaginated,
-            "filter",
-            return_value=["super_result"],
-        ) as mock_super_filter:
-            result = self.controller.filter(filters={})
-
-        self.assertEqual(result, ["super_result"])
-        mock_super_filter.assert_called_once()
-
-    def test_false_strings_delegate_to_super(self):
-        for value in (False, "0", "false", "False", "no"):
-            with mock.patch.object(
-                controllers.ra_controllers.BaseResourceControllerPaginated,
-                "filter",
-                return_value=["super_result"],
-            ) as mock_super_filter:
-                self._set_full_view(value)
-                result = self.controller.filter(filters={})
-
-            self.assertEqual(result, ["super_result"], msg=value)
-            mock_super_filter.assert_called_once()
-
-    @mock.patch(f"{MODELS_PATH}.FolderItem.objects")
-    @mock.patch(f"{MODELS_PATH}.Folder.objects")
-    def test_true_strings_return_nested(
-        self, mock_folder_objects, mock_item_objects
-    ):
-        mock_folder_objects.get_all.return_value = []
-        mock_item_objects.get_all.return_value = []
-        for value in (True, "1", "true", "True", "yes"):
-            self._set_full_view(value)
-            result = self.controller.filter(filters={})
-            self.assertEqual(result, [], msg=value)
 
     @mock.patch(f"{MODELS_PATH}.FolderItem.objects")
     @mock.patch(f"{MODELS_PATH}.Folder.objects")
@@ -192,7 +150,6 @@ class TestFolderControllerFilter(unittest.TestCase):
         mock_folder_objects.get_all.return_value = []
         mock_item_objects.get_all.return_value = []
 
-        self._set_full_view('yes')
         self.controller.filter(filters={"title": "x"})
 
         call_filters = mock_folder_objects.get_all.call_args[1]["filters"]
