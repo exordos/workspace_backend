@@ -28,6 +28,10 @@ FOLDER_ITEM_SCHEMA = {
         "chat_id": {
             "type": "integer",
         },
+        "chat_type": {
+            "type": "string",
+            "enum": ["stream", "group", "private"],
+        },
         "order_index": {
             "type": "integer",
             "nullable": True,

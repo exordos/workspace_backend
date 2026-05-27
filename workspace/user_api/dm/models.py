@@ -24,6 +24,12 @@ from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
 
+class ChatType(str, enum.Enum):
+    STREAM = "stream"
+    GROUP = "group"
+    PRIVATE = "private"
+
+
 class SystemFolderType(str, enum.Enum):
     ALL = "all"
     CREATED = "created"
@@ -93,6 +99,10 @@ class FolderItem(
     pinned_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()),
         default=None,
+    )
+    chat_type = properties.property(
+        types.Enum([t.value for t in ChatType]),
+        required=True,
     )
 
     @property

@@ -52,6 +52,9 @@ Base URL in local development:
 - **OpenAPI engine fix**
   - Fixed `AttributeError` on startup caused by calling `.release_string()`
     on the version string.
+- **`chat_type` field on `FolderItem`**
+  - New required field `chat_type` (`enum`: `stream`, `group`, `private`).
+  - Existing rows backfilled with `private` via migration `0003`.
 
 Authentication and user scoping are delegated to Zulip via the
 `/json/users/me` endpoint. The backend never stores credentials; it uses
@@ -123,6 +126,12 @@ Represents membership of a chat in a folder (many-to-many mapping
   Not exposed via the public API and always taken from Zulip
   (`/json/users/me`).
 - **chat_id**: `int`, required — chat/recipient identifier.
+- **chat_type**: `enum`, required — type of the chat. Possible values:
+
+  - `stream`
+  - `group`
+  - `private`
+
 - **order_index**: `int | null` — manual ordering (lower means higher).
 - **pinned_at**: `datetime | null (UTC)` — when the item was pinned.
 - **created_at**: `datetime (UTC)`, read-only, default now.
@@ -135,6 +144,7 @@ Represents membership of a chat in a folder (many-to-many mapping
   "uuid": "a9b28a50-c26e-11f0-a095-047c160cda6f",
   "folder_uuid": "a9b28a50-c26e-11f0-a095-047c160cda6f",
   "chat_id": 14,
+  "chat_type": "private",
   "order_index": 1,
   "pinned_at": "2025-10-16T10:20:30Z",
   "created_at": "2025-10-16T10:20:30Z",
@@ -296,6 +306,7 @@ curl -X GET \
         "user_id": 42,
         "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
         "chat_id": 100,
+        "chat_type": "stream",
         "order_index": null,
         "pinned_at": null,
         "created_at": "2025-10-16T10:20:30Z",
@@ -368,7 +379,8 @@ curl -X POST \
   -H "Cookie: ${WORKSPACE_COOKIE}" \
   -H "Content-Type: application/json" \
   -d '{
-    "chat_id": 100
+    "chat_id": 100,
+    "chat_type": "private"
   }'
 ```
 
