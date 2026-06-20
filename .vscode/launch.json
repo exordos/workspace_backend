@@ -1,0 +1,77 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: User API",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/workspace-user-api",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
+            "name": "Python Debugger: Messanger API",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/workspace-messanger-api",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
+            "name": "Python Debugger: Messanger Worker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/workspace-messanger-worker",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
+            "name": "Python Debugger: Apply Migrations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/ra-apply-migration",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf",
+                "-p",
+                "migrations"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "Python Debugger: Rollback Migrations",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/ra-rollback-migration",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf",
+                "-p",
+                "migrations",
+                "-m",
+                "root"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
