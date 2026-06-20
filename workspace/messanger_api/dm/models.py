@@ -140,6 +140,15 @@ class ZulipSource(types_dynamic.AbstractKindModel):
     )
 
 
+class NativeSource(types_dynamic.AbstractKindModel):
+    KIND = "native"
+
+
+class SourceName(str, enum.Enum):
+    ZULIP = ZulipSource.KIND
+    NATIVE = NativeSource.KIND
+
+
 class WorkspaceStream(
     models.ModelWithUUID,
     models.ModelWithRequiredNameDesc,
@@ -149,12 +158,13 @@ class WorkspaceStream(
     __tablename__ = "m_workspace_streams"
 
     source_name = properties.property(
-        types.String(min_length=1, max_length=64),
+        types.Enum([source.value for source in SourceName]),
         required=True,
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
         ),
         required=True,
     )
@@ -163,6 +173,10 @@ class WorkspaceStream(
         default=False,
     )
     announce = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    private = properties.property(
         types.Boolean(),
         default=False,
     )

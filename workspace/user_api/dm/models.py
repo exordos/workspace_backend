@@ -155,6 +155,10 @@ class ZulipSource(types_dynamic.AbstractKindModel):
     )
 
 
+class NativeSource(types_dynamic.AbstractKindModel):
+    KIND = "native"
+
+
 class WorkspaceStream(
     models.ModelWithUUID,
     models.ModelWithRequiredNameDesc,
@@ -170,6 +174,7 @@ class WorkspaceStream(
     source = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
         ),
         required=True,
     )
