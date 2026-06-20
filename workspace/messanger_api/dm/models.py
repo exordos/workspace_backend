@@ -149,8 +149,23 @@ class SourceName(str, enum.Enum):
     NATIVE = NativeSource.KIND
 
 
+class WorkspaceStreamRole(str, enum.Enum):
+    GUEST = "guest"
+    MEMBER = "member"
+    MODERATOR = "moderator"
+    ADMINISTRATOR = "administrator"
+    OWNER = "owner"
+
+
+class WorkspaceStreamBindingStatus(str, enum.Enum):
+    NEW = "new"
+    IN_PROGRESS = "in_progress"
+    ACTIVE = "active"
+
+
 class WorkspaceStream(
     models.ModelWithUUID,
+    models.ModelWithProject,
     models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -179,4 +194,34 @@ class WorkspaceStream(
     private = properties.property(
         types.Boolean(),
         default=False,
+    )
+
+
+class WorkspaceStreamBinding(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_stream_bindings"
+
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    who_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    role = properties.property(
+        types.Enum([role.value for role in WorkspaceStreamRole]),
+        default=WorkspaceStreamRole.MEMBER.value,
+    )
+    status = properties.property(
+        types.Enum([status.value for status in WorkspaceStreamBindingStatus]),
+        default=WorkspaceStreamBindingStatus.NEW.value,
     )

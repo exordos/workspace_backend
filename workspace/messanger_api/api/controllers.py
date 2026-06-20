@@ -18,6 +18,7 @@ import collections
 import datetime
 import uuid as sys_uuid
 
+from gcl_iam.api import controllers as iam_controllers
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
@@ -221,3 +222,43 @@ class FolderItemsController(
         filters["project_id"] = dm_filters.EQ(project_id)
         filters["user_uuid"] = dm_filters.EQ(user_uuid)
         return super().filter(filters=filters, **kwargs)
+
+
+class WorkspaceStreamController(
+    iam_controllers.PolicyBasedController,
+    IamScopedMixin,
+    ra_controllers.BaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceStream,
+        hidden_fields=[],
+        convert_underscore=False,
+    )
+
+    def create(self, **kwargs):
+        stream = super().create(**kwargs)
+        user_uuid = self._get_user_uuid()
+        binding = models.WorkspaceStreamBinding(
+            project_id=self._ctx_project_id,
+            stream_uuid=stream.uuid,
+            user_uuid=user_uuid,
+            who_uuid=user_uuid,
+            role=models.WorkspaceStreamRole.OWNER.value,
+        )
+        binding.insert()
+        return stream
+
+
+class WorkspaceStreamBindingController(
+    iam_controllers.PolicyBasedController,
+    IamScopedMixin,
+    ra_controllers.BaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceStreamBinding,
+        convert_underscore=False,
+    )
+
+    def create(self, **kwargs):
+        kwargs["who_uuid"] = self._get_user_uuid()
+        return super().create(**kwargs)
