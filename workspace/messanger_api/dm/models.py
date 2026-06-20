@@ -1,4 +1,4 @@
-#    Copyright 2025 Genesis Corporation.
+#    Copyright 2026 Genesis Corporation.
 #
 #    All Rights Reserved.
 #
@@ -39,17 +39,18 @@ class SystemFolderType(str, enum.Enum):
 class Folder(
     models.DumpToSimpleViewMixin,
     models.ModelWithUUID,
+    models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "folders"
+    __tablename__ = "m_folders"
 
     title = properties.property(
         types.String(min_length=1, max_length=64),
         required=True,
     )
-    user_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
+    user_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
     background_color_value = properties.property(
@@ -72,10 +73,11 @@ class FolderItem(
     models.DumpToSimpleViewMixin,
     models.CustomPropertiesMixin,
     models.ModelWithUUID,
+    models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "folder_items"
+    __tablename__ = "m_folder_items"
     __custom_properties__ = {
         "folder_uuid": types.UUID(),
     }
@@ -85,12 +87,12 @@ class FolderItem(
         prefetch=True,
         required=True,
     )
-    user_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
+    user_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
-    chat_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
+    stream_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
     order_index = properties.property(
@@ -119,31 +121,14 @@ class FolderItem(
         self.folder = Folder.objects.get_one(
             filters={
                 "uuid": dm_filters.EQ(folder_id),
-                "user_id": dm_filters.EQ(self.user_id),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
             },
         )
 
 
 class FolderItemRAFix(FolderItem):
     pass
-
-
-class Service(
-    models.ModelWithUUID,
-    models.ModelWithRequiredNameDesc,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "catalog_services"
-
-    service_url = properties.property(
-        types.Url(),
-        required=True,
-    )
-    icon = properties.property(
-        types.AllowNone(types.Url()),
-        default=None,
-    )
 
 
 class ZulipSource(types_dynamic.AbstractKindModel):
@@ -161,7 +146,7 @@ class WorkspaceStream(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "workspace_streams"
+    __tablename__ = "m_workspace_streams"
 
     source_name = properties.property(
         types.String(min_length=1, max_length=64),

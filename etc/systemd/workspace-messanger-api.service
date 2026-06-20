@@ -1,0 +1,14 @@
+[Unit]
+Description=Workspace Messanger API
+After=network-online.target
+
+[Service]
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+ExecStartPre=/bin/sleep 2
+ExecStart=workspace-messanger-api --config-file /etc/workspace/workspace.conf
+
+[Install]
+WantedBy=multi-user.target
