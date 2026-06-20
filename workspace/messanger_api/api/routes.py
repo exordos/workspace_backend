@@ -83,6 +83,23 @@ class WorkspaceStreamBindingRoute(routes.Route):
     ]
 
 
+class MeWorkspaceStreamRoute(routes.Route):
+    __controller__ = controllers.MeWorkspaceStreamController
+    __allow_methods__ = [
+        routes.FILTER,
+        routes.GET,
+    ]
+
+
+class MeRoute(routes.Route):
+    """Handler for /v1/me/ endpoint."""
+
+    __controller__ = controllers.MeController
+    __allow_methods__ = [routes.FILTER]
+
+    streams = routes.route(MeWorkspaceStreamRoute)
+
+
 class ApiEndpointRoute(routes.Route):
     """Handler for /v1/ endpoint."""
 
@@ -93,3 +110,4 @@ class ApiEndpointRoute(routes.Route):
     folder_items = routes.route(FolderItemsRoute)
     streams = routes.route(WorkspaceStreamRoute)
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
+    me = routes.route(MeRoute)

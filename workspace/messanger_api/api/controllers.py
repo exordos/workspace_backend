@@ -262,3 +262,37 @@ class WorkspaceStreamBindingController(
     def create(self, **kwargs):
         kwargs["who_uuid"] = self._get_user_uuid()
         return super().create(**kwargs)
+
+
+class MeController(ra_controllers.RoutesListController):
+    __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/me/"
+
+
+class MeWorkspaceStreamController(
+    IamScopedMixin,
+    ra_controllers.BaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceUserStream,
+        hidden_fields=[],
+        convert_underscore=False,
+    )
+
+    def get(self, uuid):
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+        return self.model.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+        )
+
+    def filter(self, filters, order_by=None):
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+        filters = (filters or {}).copy()
+        filters["project_id"] = dm_filters.EQ(project_id)
+        filters["user_uuid"] = dm_filters.EQ(user_uuid)
+        return super().filter(filters=filters, order_by=order_by)
