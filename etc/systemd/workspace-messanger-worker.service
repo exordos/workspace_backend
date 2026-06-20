@@ -1,5 +1,5 @@
 [Unit]
-Description=Workspace Builder Agent
+Description=Workspace Messanger Worker
 After=network-online.target
 
 [Service]
@@ -8,7 +8,7 @@ Restart=on-failure
 RestartSec=5s
 KillSignal=SIGINT
 ExecStartPre=/bin/sleep 2
-ExecStart=workspace-builder-agent --config-file /etc/workspace/workspace.conf
+ExecStart=workspace-messanger-worker --config-file /etc/workspace/workspace.conf
 
 [Install]
 WantedBy=multi-user.target

@@ -24,14 +24,11 @@ from gcl_looper.services import basic
 LOG = logging.getLogger(__name__)
 
 
-class BuilderAgent(basic.BasicService):
+class MessangerWorkerAgent(basic.BasicService):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
-    def _setup(self):
-        pass
 
     def _iteration(self):
         ctx = contexts.Context()
         with ctx.session_manager():
-            LOG.info("Hello from builder agent")
+            LOG.info("Hello from messanger worker agent")

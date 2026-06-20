@@ -17,16 +17,15 @@
 import logging
 import sys
 
-from gcl_looper.services import hub
 from oslo_config import cfg
 from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
 from workspace.common import log as infra_log
-from workspace.services.builders import agents
+from workspace.services.messanger_workers import agents
 
-DOMAIN = "builder_agent"
+DOMAIN = "messanger_worker_agent"
 
 
 CONF = cfg.CONF
@@ -39,9 +38,7 @@ def main():
     infra_log.configure()
     log = logging.getLogger(__name__)
 
-    service_hub = hub.ProcessHubService()
-
-    service = agents.BuilderAgent(
+    service = agents.MessangerWorkerAgent(
         iter_min_period=3,
     )
 
@@ -49,8 +46,7 @@ def main():
         lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
     )
 
-    service_hub.add_service(service)
-    service_hub.start()
+    service.start()
 
     log.info("Bye!!!")
 
