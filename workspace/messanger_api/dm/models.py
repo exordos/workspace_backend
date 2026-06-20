@@ -225,3 +225,87 @@ class WorkspaceStreamBinding(
         types.Enum([status.value for status in WorkspaceStreamBindingStatus]),
         default=WorkspaceStreamBindingStatus.NEW.value,
     )
+
+    def get_stream(self):
+        return WorkspaceStream.objects.get_one(
+            filters={"uuid": ra_filters.EQ(self.stream_uuid)}
+        )
+
+
+class WorkspaceUserStream(
+    models.ModelWithUUID,
+    models.ModelWithRequiredNameDesc,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_user_streams"
+
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    last_synced_at = properties.property(
+        types.UTCDateTimeZ(),
+        required=True,
+    )
+    source_name = properties.property(
+        types.Enum([source.value for source in SourceName]),
+        required=True,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
+        ),
+        required=True,
+    )
+    invite_only = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    announce = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    private = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+    def get_stream(self):
+        return WorkspaceStream.objects.get_one(
+            filters={"uuid": ra_filters.EQ(self.stream_uuid)}
+        )
+
+    def sync(self):
+        self.last_synced_at = self.get_stream().updated_at
+        self.update()
+
+
+class StreamBindingToSync(
+    models.ModelWithUUID,
+    orm.SQLStorableMixin,
+    
+):
+    __tablename__ = "m_stream_binding_to_sync"
+    
+    stream = relationships.relationship(
+        WorkspaceStream,
+        prefetch=True,
+        required=True,
+    )
+    user_stream = relationships.relationship(
+        WorkspaceUserStream,
+        prefetch=True,
+        required=False,
+    )
+    binding = relationships.relationship(
+        WorkspaceStreamBinding,
+        prefetch=True,
+        required=True,
+    )
