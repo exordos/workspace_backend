@@ -121,8 +121,8 @@ where = ["."]
 
 [project.scripts]
 workspace-user-api = "workspace.cmd.user_api:main"
-workspace-messanger-api = "workspace.cmd.messanger_api:main"
-workspace-messanger-worker = "workspace.cmd.messanger_worker:main"
+workspace-messenger-api = "workspace.cmd.messenger_api:main"
+workspace-messenger-worker = "workspace.cmd.messenger_worker:main"
 
 [tool.uv]
 package = true

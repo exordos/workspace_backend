@@ -19,7 +19,7 @@ import uuid as sys_uuid
 from gcl_iam import contexts as iam_contexts
 
 
-class WorkspaceMessangerAuthContext(iam_contexts.GenesisCoreAuthContext):
+class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
     """IAM-only context for workspace messenger models."""
 
     @property

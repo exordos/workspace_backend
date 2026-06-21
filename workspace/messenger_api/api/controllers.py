@@ -27,10 +27,10 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.openapi import utils as oa_utils
 
 from workspace.common.api import controllers as common_controllers
-from workspace.messanger_api import exceptions as messanger_exceptions
-from workspace.messanger_api.api import schemas
-from workspace.messanger_api.api import versions
-from workspace.messanger_api.dm import models
+from workspace.messenger_api import exceptions as messenger_exceptions
+from workspace.messenger_api.api import schemas
+from workspace.messenger_api.api import versions
+from workspace.messenger_api.dm import models
 
 
 class ApiEndpointController(ra_controllers.RoutesListController):
@@ -75,7 +75,7 @@ class FolderController(IamScopedMixin, ra_controllers.BaseResourceControllerPagi
                 "uuid": dm_filters.NE(change_uuid),
             }
         ):
-            raise messanger_exceptions.OnlyOneAllFolderPerUserError()
+            raise messenger_exceptions.OnlyOneAllFolderPerUserError()
 
     def create(self, uuid=None, system_type=None, **kwargs):
         project_id = self._get_project_id()

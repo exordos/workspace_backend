@@ -14,7 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""End-to-end messanger API tests against a real server + test database."""
+"""End-to-end messenger API tests against a real server + test database."""
 
 import uuid as sys_uuid
 

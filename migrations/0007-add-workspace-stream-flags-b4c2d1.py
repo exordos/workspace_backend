@@ -19,7 +19,7 @@ from restalchemy.storage.sql import migrations
 
 class MigrationStep(migrations.AbstractMigrationStep):
     def __init__(self):
-        self._depends = ["0006-init-messanger-api-models-a2f110.py"]
+        self._depends = ["0006-init-messenger-api-models-a2f110.py"]
 
     @property
     def migration_id(self):

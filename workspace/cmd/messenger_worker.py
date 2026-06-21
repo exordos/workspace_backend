@@ -23,9 +23,9 @@ from restalchemy.storage.sql import engines
 
 from workspace.common import config
 from workspace.common import log as infra_log
-from workspace.services.messanger_workers import agents
+from workspace.services.messenger_workers import agents
 
-DOMAIN = "messanger_worker_agent"
+DOMAIN = "messenger_worker_agent"
 
 
 CONF = cfg.CONF
@@ -38,7 +38,7 @@ def main():
     infra_log.configure()
     log = logging.getLogger(__name__)
 
-    service = agents.MessangerWorkerAgent(
+    service = agents.MessengerWorkerAgent(
         iter_min_period=3,
     )
 

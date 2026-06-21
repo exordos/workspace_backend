@@ -20,7 +20,7 @@ from unittest import mock
 
 import webob
 
-from workspace.messanger_api.api import middlewares
+from workspace.messenger_api.api import middlewares
 
 
 class ServerSettingsMiddlewareTest(unittest.TestCase):

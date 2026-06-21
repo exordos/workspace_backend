@@ -21,13 +21,13 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as ra_filters
 from gcl_looper.services import basic
 
-from workspace.messanger_api.dm import models
+from workspace.messenger_api.dm import models
 
 
 LOG = logging.getLogger(__name__)
 
 
-class MessangerWorkerAgent(basic.BasicService):
+class MessengerWorkerAgent(basic.BasicService):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 

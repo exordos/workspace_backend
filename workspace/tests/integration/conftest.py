@@ -14,7 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Integration test harness for the messanger API.
+"""Integration test harness for the messenger API.
 
 The suite spins up the *real* WSGI application (real routes, controllers, ORM)
 on a real HTTP server backed by a dedicated test PostgreSQL database, and runs
@@ -46,9 +46,9 @@ from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 
-from workspace.messanger_api.api import app as messanger_app
-from workspace.messanger_api.api import context as auth_context
-from workspace.messanger_api.api import middlewares as app_middlewares
+from workspace.messenger_api.api import app as messenger_app
+from workspace.messenger_api.api import context as auth_context
+from workspace.messenger_api.api import middlewares as app_middlewares
 
 
 # --------------------------------------------------------------------------- #
@@ -91,7 +91,7 @@ class _FakeToken:
 class FakeIamEngine:
     """Drop-in replacement for ``gcl_iam.engines.IamEngine``.
 
-    Exposes exactly the surface used by ``WorkspaceMessangerAuthContext`` and
+    Exposes exactly the surface used by ``WorkspaceMessengerAuthContext`` and
     ``PolicyBasedControllerMixin``: ``token_info``, ``introspection_info()``,
     ``get_introspection_info()`` and ``enforcer``.
     """
@@ -135,7 +135,7 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
         super().__init__(
             application=application,
             iam_engine_driver=None,
-            context_class=auth_context.WorkspaceMessangerAuthContext,
+            context_class=auth_context.WorkspaceMessengerAuthContext,
         )
 
     def _get_response(self, ctx, req):
@@ -152,8 +152,8 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
 def build_test_wsgi_application():
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     application = applications.OpenApiApplication(
-        route_class=messanger_app.get_api_application(),
-        openapi_engine=messanger_app.get_openapi_engine(),
+        route_class=messenger_app.get_api_application(),
+        openapi_engine=messenger_app.get_openapi_engine(),
     )
     return middlewares.attach_middlewares(
         application,

@@ -27,7 +27,7 @@ from restalchemy.storage.sql import engines
 
 from workspace.common import config
 from workspace.common import log as infra_log
-from workspace.messanger_api.api import app
+from workspace.messenger_api.api import app
 
 
 api_cli_opts = [
@@ -49,7 +49,7 @@ api_cli_opts = [
 ]
 
 
-DOMAIN = "messanger_api"
+DOMAIN = "messenger_api"
 
 CONF = cfg.CONF
 CONF.register_cli_opts(api_cli_opts, DOMAIN)

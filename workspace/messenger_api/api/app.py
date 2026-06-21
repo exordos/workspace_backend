@@ -22,32 +22,32 @@ from restalchemy.api import routes
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
 
-from workspace.messanger_api.api import context as auth_context
-from workspace.messanger_api.api import middlewares as app_middlewares
-from workspace.messanger_api.api import routes as app_routes
-from workspace.messanger_api.api import versions
+from workspace.messenger_api.api import context as auth_context
+from workspace.messenger_api.api import middlewares as app_middlewares
+from workspace.messenger_api.api import routes as app_routes
+from workspace.messenger_api.api import versions
 from workspace import version as app_version
 
 
-class MessangerApiApp(routes.RootRoute):
+class MessengerApiApp(routes.RootRoute):
     pass
 
 
 setattr(
-    MessangerApiApp,
+    MessengerApiApp,
     versions.API_VERSION_1_0,
     routes.route(app_routes.ApiEndpointRoute),
 )
 
 
 def get_api_application():
-    return MessangerApiApp
+    return MessengerApiApp
 
 
 def get_openapi_engine():
     openapi_engine = openapi_engines.OpenApiEngine(
         info=openapi_structures.OpenApiInfo(
-            title=f"Workspace {versions.API_VERSION_1_0} Messanger API",
+            title=f"Workspace {versions.API_VERSION_1_0} Messenger API",
             version=app_version.version_info,
             description=f"OpenAPI - Workspace {versions.API_VERSION_1_0}",
         ),
@@ -67,7 +67,7 @@ def build_wsgi_application(iam_engine_driver):
             middlewares.configure_middleware(
                 iam_mw.GenesisCoreAuthMiddleware,
                 iam_engine_driver=iam_engine_driver,
-                context_class=auth_context.WorkspaceMessangerAuthContext,
+                context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
             iam_mw.ErrorsHandlerMiddleware,

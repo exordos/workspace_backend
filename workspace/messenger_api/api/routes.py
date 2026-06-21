@@ -16,7 +16,7 @@
 
 from restalchemy.api import routes
 
-from workspace.messanger_api.api import controllers
+from workspace.messenger_api.api import controllers
 
 
 class FolderItemPinAction(routes.Action):

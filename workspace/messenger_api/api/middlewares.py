@@ -20,7 +20,7 @@ import webob
 
 from restalchemy.api import middlewares
 
-from workspace.messanger_api.api import versions
+from workspace.messenger_api.api import versions
 from workspace import version as app_version
 
 

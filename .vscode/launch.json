@@ -18,10 +18,10 @@
             "subProcess": true
         },
         {
-            "name": "Python Debugger: Messanger API",
+            "name": "Python Debugger: Messenger API",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/workspace-messanger-api",
+            "program": ".tox/develop/bin/workspace-messenger-api",
             "args": [
                 "--config-file",
                 "etc/workspace/workspace.conf"
@@ -31,10 +31,10 @@
             "subProcess": true
         },
         {
-            "name": "Python Debugger: Messanger Worker",
+            "name": "Python Debugger: Messenger Worker",
             "type": "debugpy",
             "request": "launch",
-            "program": ".tox/develop/bin/workspace-messanger-worker",
+            "program": ".tox/develop/bin/workspace-messenger-worker",
             "args": [
                 "--config-file",
                 "etc/workspace/workspace.conf"
@@ -74,7 +74,7 @@
             "justMyCode": false
         },
         {
-            "name": "Python: Integration tests (messanger_api)",
+            "name": "Python: Integration tests (messenger_api)",
             "type": "debugpy",
             "request": "launch",
             "module": "pytest",
