@@ -33,12 +33,11 @@ class MigrationStep(migrations.AbstractMigrationStep):
         expressions = [
             """
             CREATE TABLE IF NOT EXISTS "m_workspace_user_streams" (
-                "uuid" UUID PRIMARY KEY,
+                "uuid" UUID NOT NULL,
                 "name" VARCHAR(255) NOT NULL,
                 "description" VARCHAR(255) NULL,
                 "project_id" UUID NOT NULL,
                 "user_uuid" UUID NOT NULL,
-                "stream_uuid" UUID NOT NULL,
                 "last_synced_at" TIMESTAMP(6) NOT NULL,
                 "source_name" VARCHAR(64) NOT NULL,
                 "source" JSONB NOT NULL,
@@ -47,8 +46,9 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "private" BOOLEAN NOT NULL DEFAULT FALSE,
                 "created_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
                 "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
-                CONSTRAINT "m_workspace_user_streams_stream_uuid_fkey"
-                    FOREIGN KEY ("stream_uuid") REFERENCES "m_workspace_streams" ("uuid")
+                PRIMARY KEY ("uuid", "user_uuid"),
+                CONSTRAINT "m_workspace_user_streams_uuid_fkey"
+                    FOREIGN KEY ("uuid") REFERENCES "m_workspace_streams" ("uuid")
                     ON DELETE CASCADE
             );
             """,
@@ -61,15 +61,6 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 ON "m_workspace_user_streams" ("user_uuid");
             """,
             """
-            CREATE INDEX IF NOT EXISTS "m_workspace_user_streams_stream_uuid_idx"
-                ON "m_workspace_user_streams" ("stream_uuid");
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-                "m_workspace_user_streams_user_stream_idx"
-                ON "m_workspace_user_streams" ("user_uuid", "stream_uuid");
-            """,
-            """
             CREATE OR REPLACE VIEW "m_stream_binding_to_sync" AS
             SELECT
                 b.uuid AS uuid,
@@ -80,7 +71,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
             LEFT JOIN "m_workspace_streams" AS s
                 ON s.uuid = b.stream_uuid
             LEFT JOIN "m_workspace_user_streams" AS us
-                ON us.stream_uuid = b.stream_uuid
+                ON us.uuid = b.stream_uuid
                 AND us.user_uuid = b.user_uuid
             WHERE us.last_synced_at IS NULL OR us.last_synced_at <> s.updated_at;
             """,

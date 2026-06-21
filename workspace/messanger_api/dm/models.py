@@ -245,10 +245,6 @@ class WorkspaceUserStream(
         types.UUID(),
         required=True,
     )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
     last_synced_at = properties.property(
         types.UTCDateTimeZ(),
         required=True,
@@ -279,7 +275,7 @@ class WorkspaceUserStream(
 
     def get_stream(self):
         return WorkspaceStream.objects.get_one(
-            filters={"uuid": ra_filters.EQ(self.stream_uuid)}
+            filters={"uuid": ra_filters.EQ(self.uuid)}
         )
 
     def sync(self):
@@ -308,4 +304,100 @@ class StreamBindingToSync(
         WorkspaceStreamBinding,
         prefetch=True,
         required=True,
+    )
+
+
+class MarkdownPayload(types_dynamic.AbstractKindModel):
+    KIND = "markdown"
+
+    content = properties.property(
+        types.String(max_length=10000),
+        required=True,
+    )
+
+
+class WorkspaceMessage(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_messages"
+
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    payload = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(MarkdownPayload),
+        ),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+
+
+class WorkspaceUserMessage(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_user_messages"
+
+    payload = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(MarkdownPayload),
+        ),
+        required=True,
+    )
+    user_stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    last_synced_at = properties.property(
+        types.UTCDateTimeZ(),
+        required=True,
+    )
+    read = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    pinned = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    starred = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+
+class MessageToSync(
+    models.ModelWithUUID,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_message_to_sync"
+
+    message = relationships.relationship(
+        WorkspaceMessage,
+        prefetch=True,
+        required=True,
+    )
+    user_stream = relationships.relationship(
+        WorkspaceUserStream,
+        prefetch=True,
+        required=True,
+    )
+    user_message = relationships.relationship(
+        WorkspaceUserMessage,
+        prefetch=True,
+        required=False,
     )
