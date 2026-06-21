@@ -279,5 +279,16 @@ class WorkspaceMessageController(
         return super().create(init_message=True, **kwargs)
 
 
+class WorkspaceStreamTopicController(
+    iam_controllers.PolicyBasedController,
+    IamScopedMixin,
+    ra_controllers.BaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceStreamTopic,
+        convert_underscore=False,
+    )
+
+
 class MeController(ra_controllers.RoutesListController):
     __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/me/"

@@ -306,12 +306,28 @@ class WorkspaceUserStream(
         )
         binding.insert()
 
+        # create default topic
+        default_topic = WorkspaceStreamTopic(
+            project_id=stream.project_id,
+            stream_uuid=stream.uuid,
+            name="General Chat",
+            default_for_stream_uuid=stream.uuid,
+        )
+        default_topic.insert()
+
         return stream
 
     def get_stream(self, uuid):
         uuid = uuid or self.uuid
         return WorkspaceStream.objects.get_one(
             filters={"uuid": dm_filters.EQ(uuid)}
+        )
+    
+    def get_default_topic(self):
+        return WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "default_for_stream_uuid": dm_filters.EQ(self.uuid),
+            }
         )
 
     def sync(self):
@@ -352,6 +368,28 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
     )
 
 
+class WorkspaceStreamTopic(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_stream_topics"
+
+    name = properties.property(
+        types.String(max_length=128),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    default_for_stream_uuid = properties.property(
+        types.UUID(),
+        required=False,
+    )
+
+
 class WorkspaceMessage(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -373,6 +411,10 @@ class WorkspaceMessage(
     user_uuid = properties.property(
         types.UUID(),
         required=True,
+    )
+    topic_uuid = properties.property(
+        types.UUID(),
+        required=False,
     )
 
 
@@ -414,9 +456,15 @@ class WorkspaceUserMessage(
         types.Boolean(),
         default=False,
     )
+    topic_uuid = properties.property(
+        types.UUID(),
+        required=False,
+    )
 
     def __init__(self, init_message=False, **kwargs):
         kwargs["uuid"] = kwargs.get("uuid") or sys_uuid.uuid4()
+        stream = self.get_stream(kwargs.get("stream_uuid"))
+        kwargs["topic_uuid"] = kwargs.get("topic_uuid") or stream.topic_uuid
         if init_message:
             message = self._create_message(kwargs=kwargs)
         else:
@@ -436,6 +484,12 @@ class WorkspaceUserMessage(
         uuid = uuid or self.uuid
         return WorkspaceMessage.objects.get_one(
             filters={"uuid": dm_filters.EQ(uuid)}
+        )
+    
+    def get_stream(self, stream_uuid=None):
+        stream_uuid = stream_uuid or self.stream_uuid
+        return WorkspaceStream.objects.get_one(
+            filters={"uuid": dm_filters.EQ(stream_uuid)}
         )
 
 

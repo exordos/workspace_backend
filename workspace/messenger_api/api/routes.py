@@ -92,6 +92,17 @@ class WorkspaceMessageRoute(routes.Route):
     ]
 
 
+class WorkspaceStreamTopicRoute(routes.Route):
+    __controller__ = controllers.WorkspaceStreamTopicController
+    __allow_methods__ = [
+        routes.CREATE,
+        routes.FILTER,
+        routes.GET,
+        routes.UPDATE,
+        routes.DELETE,
+    ]
+
+
 class MeRoute(routes.Route):
     """Handler for /v1/me/ endpoint."""
 
@@ -109,5 +120,6 @@ class ApiEndpointRoute(routes.Route):
     folder_items = routes.route(FolderItemsRoute)
     streams = routes.route(WorkspaceStreamRoute)
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
+    stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
     me = routes.route(MeRoute)

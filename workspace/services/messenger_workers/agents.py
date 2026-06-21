@@ -68,6 +68,7 @@ class MessengerWorkerAgent(basic.BasicService):
             user_uuid=user_stream.user_uuid,
             stream_uuid=message.stream_uuid,
             payload=message.payload,
+            topic_uuid=message.topic_uuid,
             last_synced_at=message.updated_at,
             created_at=message.created_at,
             updated_at=message.updated_at,
@@ -78,6 +79,7 @@ class MessengerWorkerAgent(basic.BasicService):
         message = message_to_sync.message
         user_message = message_to_sync.user_message
         user_message.payload = message.payload
+        user_message.topic_uuid = message.topic_uuid
         user_message.last_synced_at = message.updated_at
         user_message.update()
 
