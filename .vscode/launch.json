@@ -72,6 +72,18 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": false
+        },
+        {
+            "name": "Python: Integration tests (messanger_api)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "workspace/tests/integration",
+                "-v"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
         }
     ]
 }

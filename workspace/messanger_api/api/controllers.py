@@ -26,6 +26,7 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.openapi import utils as oa_utils
 
+from workspace.common.api import controllers as common_controllers
 from workspace.messanger_api import exceptions as messanger_exceptions
 from workspace.messanger_api.api import schemas
 from workspace.messanger_api.api import versions
@@ -52,6 +53,10 @@ class IamScopedMixin:
         if project_id is None:
             raise ra_exc.ValidationErrorException()
         return project_id
+
+    def _get_complex_pk_scope(self):
+        """Auto-mixed scoped part of a composite primary key (user_uuid)."""
+        return {"user_uuid": self._get_user_uuid()}
 
 
 class FolderController(IamScopedMixin, ra_controllers.BaseResourceControllerPaginated):
@@ -227,8 +232,10 @@ class FolderItemsController(
 class WorkspaceStreamController(
     iam_controllers.PolicyBasedController,
     IamScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    common_controllers.BaseResourceControllerComplexPaginated,
 ):
+    __complex_primary_key__ = ["uuid", "user_uuid"]
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=[],
@@ -236,30 +243,8 @@ class WorkspaceStreamController(
     )
 
     def create(self, **kwargs):
-        user_stream = super().create(
-            init_stream=True,
-            user_uuid=self._get_user_uuid(),
-            **kwargs
-        )
-        return user_stream
-
-    def get(self, uuid, **kwargs):
-        kwargs["user_uuid"] = self._get_user_uuid()
-        return super().get(uuid, **kwargs)
-
-    def filter(self, filters, **kwargs):
-        kwargs["user_uuid"] = self._get_user_uuid()
-        return super().filter(filters=filters, **kwargs)
-
-    def delete(self, uuid):
-        dm = self.get(uuid=uuid)
-        dm.delete()
-
-    def update(self, uuid, **kwargs):
-        dm = self.get(uuid=uuid)
-        dm.update_dm(values=kwargs)
-        dm.update()
-        return dm
+        # user_uuid is mixed in automatically by the complex-PK base.
+        return super().create(init_stream=True, **kwargs)
 
 
 class WorkspaceStreamBindingController(
@@ -280,38 +265,18 @@ class WorkspaceStreamBindingController(
 class WorkspaceMessageController(
     iam_controllers.PolicyBasedController,
     IamScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    common_controllers.BaseResourceControllerComplexPaginated,
 ):
+    __complex_primary_key__ = ["uuid", "user_uuid"]
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserMessage,
         convert_underscore=False,
     )
 
     def create(self, **kwargs):
-        user_message = super().create(
-            init_message=True,
-            user_uuid=self._get_user_uuid(),
-            **kwargs
-        )
-        return user_message
-
-    def get(self, uuid, **kwargs):
-        kwargs["user_uuid"] = self._get_user_uuid()
-        return super().get(uuid, **kwargs)
-
-    def filter(self, filters, **kwargs):
-        kwargs["user_uuid"] = self._get_user_uuid()
-        return super().filter(filters=filters, **kwargs)
-
-    def delete(self, uuid):
-        dm = self.get(uuid=uuid)
-        dm.delete()
-
-    def update(self, uuid, **kwargs):
-        dm = self.get(uuid=uuid)
-        dm.update_dm(values=kwargs)
-        dm.update()
-        return dm
+        # user_uuid is mixed in automatically by the complex-PK base.
+        return super().create(init_message=True, **kwargs)
 
 
 class MeController(ra_controllers.RoutesListController):

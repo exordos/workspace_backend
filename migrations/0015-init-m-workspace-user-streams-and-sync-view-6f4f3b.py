@@ -33,7 +33,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
         expressions = [
             """
             CREATE TABLE IF NOT EXISTS "m_workspace_user_streams" (
-                "uuid" UUID PRIMARY KEY,
+                "uuid" UUID NOT NULL,
                 "source_stream_uuid" UUID NOT NULL,
                 "name" VARCHAR(255) NOT NULL,
                 "description" VARCHAR(255) NULL,
@@ -47,6 +47,8 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "private" BOOLEAN NOT NULL DEFAULT FALSE,
                 "created_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
                 "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
+                CONSTRAINT "m_workspace_user_streams_pkey"
+                    PRIMARY KEY ("uuid", "user_uuid"),
                 CONSTRAINT "m_workspace_user_streams_source_stream_uuid_fkey"
                     FOREIGN KEY ("source_stream_uuid") REFERENCES "m_workspace_streams" ("uuid")
                     ON DELETE CASCADE,
