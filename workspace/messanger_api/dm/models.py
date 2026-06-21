@@ -245,10 +245,6 @@ class WorkspaceUserStream(
 ):
     __tablename__ = "m_workspace_user_streams"
 
-    source_stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
     user_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -281,9 +277,31 @@ class WorkspaceUserStream(
         default=False,
     )
 
+    def __init__(self, init_stream=False, **kwargs):
+        if init_stream:
+            self._create_stream_and_bindings(kwargs=kwargs)
+        super().__init__(**kwargs)
+    
+    def _create_stream_and_bindings(self, kwargs):
+        # create stream
+        stream = models.WorkspaceStream(
+            **kwargs
+        )
+        stream.insert()
+
+        # create binding
+        binding = models.WorkspaceStreamBinding(
+            project_id=stream.project_id,
+            stream_uuid=stream.uuid,
+            user_uuid=stream.user_uuid,
+            who_uuid=stream.user_uuid,
+            role=models.WorkspaceStreamRole.OWNER.value,
+        )
+        binding.insert()
+
     def get_stream(self):
         return WorkspaceStream.objects.get_one(
-            filters={"uuid": ra_filters.EQ(self.source_stream_uuid)}
+            filters={"uuid": dm_filters.EQ(self.uuid)}
         )
 
     def sync(self):
@@ -356,18 +374,10 @@ class WorkspaceUserMessage(
 ):
     __tablename__ = "m_workspace_user_messages"
 
-    source_message_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
     payload = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(MarkdownPayload),
         ),
-        required=True,
-    )
-    user_stream_uuid = properties.property(
-        types.UUID(),
         required=True,
     )
     user_uuid = properties.property(
@@ -390,6 +400,18 @@ class WorkspaceUserMessage(
         types.Boolean(),
         default=False,
     )
+
+    def __init__(self, init_message=False, **kwargs):
+        if init_message:
+            self._create_message(kwargs=kwargs)
+        super().__init__(**kwargs)
+    
+    def _create_message(self, kwargs):
+        # create message
+        message = WorkspaceMessage(
+            **kwargs
+        )
+        message.insert()
 
 
 class MessageToSync(

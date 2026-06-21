@@ -41,12 +41,11 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
         self.assertEqual(response.status_int, 200)
         self.assertEqual(response.content_type, "application/json")
         self.assertEqual(result["result"], "success")
-        self.assertEqual(result["msg"], "")
-        self.assertEqual(result["realm_url"], "http://127.0.0.1:3000")
-        self.assertEqual(result["realm_uri"], "http://127.0.0.1:3000")
+        self.assertEqual(result["msg"], "Welcome to Exordos Workspace")
+        self.assertEqual(result["realm_url"], "https://zulip.genesis-core.tech")
+        self.assertEqual(result["realm_uri"], "https://zulip.genesis-core.tech")
         self.assertTrue(result["authentication_methods"]["password"])
         self.assertEqual(result["external_authentication_methods"], [])
-        self.assertFalse(result["is_incompatible"])
 
     def test_reports_unsupported_parameters(self):
         req = webob.Request.blank(

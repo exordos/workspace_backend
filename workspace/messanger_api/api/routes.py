@@ -83,26 +83,10 @@ class WorkspaceStreamBindingRoute(routes.Route):
     ]
 
 
-class MeWorkspaceStreamRoute(routes.Route):
-    __controller__ = controllers.MeWorkspaceStreamController
-    __allow_methods__ = [
-        routes.FILTER,
-        routes.GET,
-    ]
-
-
 class WorkspaceMessageRoute(routes.Route):
     __controller__ = controllers.WorkspaceMessageController
     __allow_methods__ = [
         routes.CREATE,
-        routes.FILTER,
-        routes.GET,
-    ]
-
-
-class MeWorkspaceUserMessageRoute(routes.Route):
-    __controller__ = controllers.MeWorkspaceUserMessageController
-    __allow_methods__ = [
         routes.FILTER,
         routes.GET,
     ]
@@ -113,9 +97,6 @@ class MeRoute(routes.Route):
 
     __controller__ = controllers.MeController
     __allow_methods__ = [routes.FILTER]
-
-    streams = routes.route(MeWorkspaceStreamRoute)
-    messages = routes.route(MeWorkspaceUserMessageRoute)
 
 
 class ApiEndpointRoute(routes.Route):

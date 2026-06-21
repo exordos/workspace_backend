@@ -230,23 +230,36 @@ class WorkspaceStreamController(
     ra_controllers.BaseResourceControllerPaginated,
 ):
     __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceStream,
+        model_class=models.WorkspaceUserStream,
         hidden_fields=[],
         convert_underscore=False,
     )
 
     def create(self, **kwargs):
-        stream = super().create(**kwargs)
-        user_uuid = self._get_user_uuid()
-        binding = models.WorkspaceStreamBinding(
-            project_id=self._ctx_project_id,
-            stream_uuid=stream.uuid,
-            user_uuid=user_uuid,
-            who_uuid=user_uuid,
-            role=models.WorkspaceStreamRole.OWNER.value,
+        user_stream = super().create(
+            init_stream=True,
+            user_uuid=self._get_user_uuid(),
+            **kwargs
         )
-        binding.insert()
-        return stream
+        return user_stream
+
+    def get(self, uuid, **kwargs):
+        kwargs["user_uuid"] = self._get_user_uuid()
+        return super().get(uuid, **kwargs)
+
+    def filter(self, filters, **kwargs):
+        kwargs["user_uuid"] = self._get_user_uuid()
+        return super().filter(filters=filters, **kwargs)
+
+    def delete(self, uuid):
+        dm = self.get(uuid=uuid)
+        dm.delete()
+
+    def update(self, uuid, **kwargs):
+        dm = self.get(uuid=uuid)
+        dm.update_dm(values=kwargs)
+        dm.update()
+        return dm
 
 
 class WorkspaceStreamBindingController(
@@ -265,40 +278,7 @@ class WorkspaceStreamBindingController(
 
 
 class WorkspaceMessageController(
-    IamScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
-):
-    __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceMessage,
-        convert_underscore=False,
-    )
-
-    def create(self, **kwargs):
-        kwargs["project_id"] = self._get_project_id()
-        kwargs["user_uuid"] = self._get_user_uuid()
-        return super().create(**kwargs)
-
-    def get(self, uuid):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        return self.model.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-        )
-
-    def filter(self, filters, **kwargs):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        filters = (filters or {}).copy()
-        filters["project_id"] = dm_filters.EQ(project_id)
-        filters["user_uuid"] = dm_filters.EQ(user_uuid)
-        return super().filter(filters=filters, **kwargs)
-
-
-class MeWorkspaceUserMessageController(
+    iam_controllers.PolicyBasedController,
     IamScopedMixin,
     ra_controllers.BaseResourceControllerPaginated,
 ):
@@ -307,33 +287,32 @@ class MeWorkspaceUserMessageController(
         convert_underscore=False,
     )
 
+    def create(self, **kwargs):
+        user_message = super().create(
+            init_message=True,
+            user_uuid=self._get_user_uuid(),
+            **kwargs
+        )
+        return user_message
+
+    def get(self, uuid, **kwargs):
+        kwargs["user_uuid"] = self._get_user_uuid()
+        return super().get(uuid, **kwargs)
+
     def filter(self, filters, **kwargs):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        filters = (filters or {}).copy()
-        filters["project_id"] = dm_filters.EQ(project_id)
-        filters["user_uuid"] = dm_filters.EQ(user_uuid)
+        kwargs["user_uuid"] = self._get_user_uuid()
         return super().filter(filters=filters, **kwargs)
+
+    def delete(self, uuid):
+        dm = self.get(uuid=uuid)
+        dm.delete()
+
+    def update(self, uuid, **kwargs):
+        dm = self.get(uuid=uuid)
+        dm.update_dm(values=kwargs)
+        dm.update()
+        return dm
 
 
 class MeController(ra_controllers.RoutesListController):
     __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/me/"
-
-
-class MeWorkspaceStreamController(
-    IamScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
-):
-    __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceUserStream,
-        hidden_fields=[],
-        convert_underscore=False,
-    )
-
-    def filter(self, filters, order_by=None):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        filters = (filters or {}).copy()
-        filters["project_id"] = dm_filters.EQ(project_id)
-        filters["user_uuid"] = dm_filters.EQ(user_uuid)
-        return super().filter(filters=filters, order_by=order_by)
