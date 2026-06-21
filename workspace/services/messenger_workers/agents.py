@@ -66,6 +66,7 @@ class MessengerWorkerAgent(basic.BasicService):
             uuid=message.uuid,
             project_id=message.project_id,
             user_uuid=user_stream.user_uuid,
+            stream_uuid=message.stream_uuid,
             payload=message.payload,
             last_synced_at=message.updated_at,
             created_at=message.created_at,

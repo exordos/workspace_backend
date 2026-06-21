@@ -291,14 +291,12 @@ def db():
 def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
     """Insert a source stream and the matching per-user stream row.
 
-    The ``WorkspaceUserStream`` write path is not exercised through the ORM here
-    (it requires source-reference columns the model does not yet expose), so the
-    row is created directly.  Reads still flow through the real API/ORM.
+    The per-user stream shares its uuid with the source stream.
+    The row is created directly; reads still flow through the real API/ORM.
 
     Returns the ``uuid`` of the created ``m_workspace_user_streams`` row.
     """
     stream_uuid = sys_uuid.uuid4()
-    user_stream_uuid = sys_uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -313,14 +311,14 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
         cur.execute(
             """
             INSERT INTO m_workspace_user_streams
-                (uuid, source_stream_uuid, name, description, project_id,
+                (uuid, name, description, project_id,
                  user_uuid, last_synced_at, source_name, source,
                  invite_only, announce, private)
-            SELECT %s, uuid, name, description, project_id, user_uuid,
+            SELECT uuid, name, description, project_id, user_uuid,
                    NOW(), source_name, source, invite_only, announce, private
             FROM m_workspace_streams
             WHERE uuid = %s
             """,
-            (str(user_stream_uuid), str(stream_uuid)),
+            (str(stream_uuid),),
         )
-    return str(user_stream_uuid)
+    return str(stream_uuid)

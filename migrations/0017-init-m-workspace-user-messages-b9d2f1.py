@@ -34,10 +34,10 @@ class MigrationStep(migrations.AbstractMigrationStep):
             """
             CREATE TABLE IF NOT EXISTS "m_workspace_user_messages" (
                 "uuid" UUID NOT NULL,
-                "source_message_uuid" UUID NOT NULL,
                 "project_id" UUID NOT NULL,
                 "user_stream_uuid" UUID NOT NULL,
                 "user_uuid" UUID NOT NULL,
+                "stream_uuid" UUID NOT NULL,
                 "payload" JSONB NOT NULL,
                 "last_synced_at" TIMESTAMP(6) NOT NULL,
                 "read" BOOLEAN NOT NULL DEFAULT FALSE,
@@ -51,11 +51,9 @@ class MigrationStep(migrations.AbstractMigrationStep):
                     FOREIGN KEY ("user_stream_uuid", "user_uuid")
                     REFERENCES "m_workspace_user_streams" ("uuid", "user_uuid")
                     ON DELETE CASCADE,
-                CONSTRAINT "m_workspace_user_messages_source_message_uuid_fkey"
-                    FOREIGN KEY ("source_message_uuid")
-                    REFERENCES "m_workspace_messages" ("uuid")
-                    ON DELETE CASCADE,
-                CONSTRAINT "m_workspace_user_messages_message_user_unique" UNIQUE ("source_message_uuid", "user_uuid")
+                CONSTRAINT "m_workspace_user_messages_stream_uuid_fkey"
+                    FOREIGN KEY ("stream_uuid") REFERENCES "m_workspace_streams" ("uuid")
+                    ON DELETE CASCADE
             );
             """,
             """
@@ -65,6 +63,10 @@ class MigrationStep(migrations.AbstractMigrationStep):
             """
             CREATE INDEX IF NOT EXISTS "m_workspace_user_messages_user_uuid_idx"
                 ON "m_workspace_user_messages" ("user_uuid");
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS "m_workspace_user_messages_stream_uuid_idx"
+                ON "m_workspace_user_messages" ("stream_uuid");
             """,
             """
             CREATE INDEX IF NOT EXISTS "m_workspace_user_messages_user_stream_uuid_idx"

@@ -15,6 +15,7 @@
 #    under the License.
 
 import enum
+import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
@@ -278,30 +279,39 @@ class WorkspaceUserStream(
     )
 
     def __init__(self, init_stream=False, **kwargs):
+        kwargs["uuid"] = kwargs.get("uuid") or sys_uuid.uuid4()
         if init_stream:
-            self._create_stream_and_bindings(kwargs=kwargs)
+            stream = self._create_stream_and_bindings(kwargs=kwargs)
+        else:
+            stream = self.get_stream(kwargs['uuid'])
+        kwargs['last_synced_at'] = stream.updated_at
         super().__init__(**kwargs)
     
     def _create_stream_and_bindings(self, kwargs):
-        # create stream
-        stream = models.WorkspaceStream(
+        # create the shared source stream from the incoming payload (the
+        # source-reference fields below are user-stream only and must not be
+        # passed to WorkspaceStream).
+        stream = WorkspaceStream(
             **kwargs
         )
         stream.insert()
 
         # create binding
-        binding = models.WorkspaceStreamBinding(
+        binding = WorkspaceStreamBinding(
             project_id=stream.project_id,
             stream_uuid=stream.uuid,
             user_uuid=stream.user_uuid,
             who_uuid=stream.user_uuid,
-            role=models.WorkspaceStreamRole.OWNER.value,
+            role=WorkspaceStreamRole.OWNER.value,
         )
         binding.insert()
 
-    def get_stream(self):
+        return stream
+
+    def get_stream(self, uuid):
+        uuid = uuid or self.uuid
         return WorkspaceStream.objects.get_one(
-            filters={"uuid": dm_filters.EQ(self.uuid)}
+            filters={"uuid": dm_filters.EQ(uuid)}
         )
 
     def sync(self):
@@ -384,6 +394,10 @@ class WorkspaceUserMessage(
         types.UUID(),
         required=True,
     )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
     last_synced_at = properties.property(
         types.UTCDateTimeZ(),
         required=True,
@@ -402,8 +416,12 @@ class WorkspaceUserMessage(
     )
 
     def __init__(self, init_message=False, **kwargs):
+        kwargs["uuid"] = kwargs.get("uuid") or sys_uuid.uuid4()
         if init_message:
-            self._create_message(kwargs=kwargs)
+            message = self._create_message(kwargs=kwargs)
+        else:
+            message = self.get_message(kwargs['uuid'])
+        kwargs['last_synced_at'] = message.updated_at
         super().__init__(**kwargs)
     
     def _create_message(self, kwargs):
@@ -412,6 +430,13 @@ class WorkspaceUserMessage(
             **kwargs
         )
         message.insert()
+        return message
+
+    def get_message(self, uuid):
+        uuid = uuid or self.uuid
+        return WorkspaceMessage.objects.get_one(
+            filters={"uuid": dm_filters.EQ(uuid)}
+        )
 
 
 class MessageToSync(
