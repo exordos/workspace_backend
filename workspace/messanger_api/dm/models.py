@@ -172,6 +172,10 @@ class WorkspaceStream(
 ):
     __tablename__ = "m_workspace_streams"
 
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
     source_name = properties.property(
         types.Enum([source.value for source in SourceName]),
         required=True,
@@ -241,6 +245,10 @@ class WorkspaceUserStream(
 ):
     __tablename__ = "m_workspace_user_streams"
 
+    source_stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
     user_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -275,7 +283,7 @@ class WorkspaceUserStream(
 
     def get_stream(self):
         return WorkspaceStream.objects.get_one(
-            filters={"uuid": ra_filters.EQ(self.uuid)}
+            filters={"uuid": ra_filters.EQ(self.source_stream_uuid)}
         )
 
     def sync(self):
@@ -348,6 +356,10 @@ class WorkspaceUserMessage(
 ):
     __tablename__ = "m_workspace_user_messages"
 
+    source_message_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
     payload = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(MarkdownPayload),

@@ -21,7 +21,6 @@ import uuid as sys_uuid
 from gcl_iam.api import controllers as iam_controllers
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import controllers as ra_controllers
-from restalchemy.api.controllers import PaginationFilterBuilder
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
@@ -299,23 +298,6 @@ class WorkspaceMessageController(
         return super().filter(filters=filters, **kwargs)
 
 
-class _UserScopedPaginationFilterBuilder(PaginationFilterBuilder):
-    def __init__(self, model, marker_id, sort_column, sort_direction, user_uuid):
-        self._extra_filters = {"user_uuid": dm_filters.EQ(user_uuid)}
-        super().__init__(model, marker_id, sort_column, sort_direction)
-
-    def _fetch_sort_val(self, model):
-        if self.sort_col in (None, self.id_name):
-            return self.marker_id
-        marker_row = model.objects.get_one(
-            filters={
-                self.id_name: dm_filters.EQ(self.marker_id),
-                **self._extra_filters,
-            }
-        )
-        return getattr(marker_row, self.sort_col)
-
-
 class MeWorkspaceUserMessageController(
     IamScopedMixin,
     ra_controllers.BaseResourceControllerPaginated,
@@ -325,17 +307,6 @@ class MeWorkspaceUserMessageController(
         convert_underscore=False,
     )
 
-    def get(self, uuid):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        return self.model.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-        )
-
     def filter(self, filters, **kwargs):
         project_id = self._get_project_id()
         user_uuid = self._get_user_uuid()
@@ -343,31 +314,6 @@ class MeWorkspaceUserMessageController(
         filters["project_id"] = dm_filters.EQ(project_id)
         filters["user_uuid"] = dm_filters.EQ(user_uuid)
         return super().filter(filters=filters, **kwargs)
-
-    def _build_pagination_with_cursor(self, filters, order_by):
-        if self._pagination_marker:
-            sort_col, sort_dir = (
-                next(iter(order_by.items())) if order_by else (None, "asc")
-            )
-            cursor = _UserScopedPaginationFilterBuilder(
-                self.model,
-                self._pagination_marker,
-                sort_col,
-                sort_dir,
-                user_uuid=self._get_user_uuid(),
-            )
-            pagination_filters = cursor.build_filter()
-            filters = dm_filters.AND(pagination_filters, filters)
-
-        id_name = self.model.get_id_property_name()
-        if order_by:
-            order_by = order_by.copy()
-            if id_name not in order_by:
-                order_by[id_name] = "asc"
-        else:
-            order_by = {id_name: "asc"}
-
-        return filters, order_by
 
 
 class MeController(ra_controllers.RoutesListController):
@@ -383,17 +329,6 @@ class MeWorkspaceStreamController(
         hidden_fields=[],
         convert_underscore=False,
     )
-
-    def get(self, uuid):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        return self.model.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-        )
 
     def filter(self, filters, order_by=None):
         project_id = self._get_project_id()

@@ -35,10 +35,10 @@ class MessangerWorkerAgent(basic.BasicService):
         stream = binding_to_sync.stream
         binding = binding_to_sync.binding
         user_stream = models.WorkspaceUserStream(
-            uuid=stream.uuid,
             name=stream.name,
             description=stream.description,
             project_id=stream.project_id,
+            source_stream_uuid=stream.uuid,
             user_uuid=binding.user_uuid,
             last_synced_at=stream.updated_at,
             source_name=stream.source_name,
@@ -61,8 +61,8 @@ class MessangerWorkerAgent(basic.BasicService):
         message = message_to_sync.message
         user_stream = message_to_sync.user_stream
         user_message = models.WorkspaceUserMessage(
-            uuid=message.uuid,
             project_id=message.project_id,
+            source_message_uuid=message.uuid,
             user_stream_uuid=user_stream.uuid,
             user_uuid=user_stream.user_uuid,
             payload=message.payload,

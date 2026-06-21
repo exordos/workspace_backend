@@ -42,7 +42,8 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
                 CONSTRAINT "m_workspace_messages_stream_uuid_fkey"
                     FOREIGN KEY ("stream_uuid") REFERENCES "m_workspace_streams" ("uuid")
-                    ON DELETE CASCADE
+                    ON DELETE CASCADE,
+                CONSTRAINT "m_workspace_messages_uuid_user_uuid_unique" UNIQUE ("uuid", "user_uuid")
             );
             """,
             """

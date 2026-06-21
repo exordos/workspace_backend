@@ -68,7 +68,7 @@
                 "-p",
                 "migrations",
                 "-m",
-                "root"
+                "0000"
             ],
             "console": "integratedTerminal",
             "justMyCode": false

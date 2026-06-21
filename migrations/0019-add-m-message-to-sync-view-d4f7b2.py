@@ -34,15 +34,15 @@ class MigrationStep(migrations.AbstractMigrationStep):
             """
             CREATE OR REPLACE VIEW "m_message_to_sync" AS
             SELECT
-                msg.uuid        AS uuid,
-                msg.uuid        AS message,
-                us.uuid         AS user_stream,
-                um.uuid         AS user_message
+                gen_random_uuid()   AS uuid,
+                msg.uuid            AS message,
+                us.uuid             AS user_stream,
+                um.uuid             AS user_message
             FROM "m_workspace_messages" AS msg
             JOIN "m_workspace_user_streams" AS us
-                ON us.uuid = msg.stream_uuid
+                ON us.source_stream_uuid = msg.stream_uuid
             LEFT JOIN "m_workspace_user_messages" AS um
-                ON um.user_stream_uuid = us.uuid
+                ON um.source_message_uuid = msg.uuid
                 AND um.user_uuid = us.user_uuid
             WHERE um.last_synced_at IS NULL
                OR um.last_synced_at <> msg.updated_at;

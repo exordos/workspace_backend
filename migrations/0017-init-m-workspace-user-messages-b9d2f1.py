@@ -33,7 +33,8 @@ class MigrationStep(migrations.AbstractMigrationStep):
         expressions = [
             """
             CREATE TABLE IF NOT EXISTS "m_workspace_user_messages" (
-                "uuid" UUID NOT NULL,
+                "uuid" UUID PRIMARY KEY,
+                "source_message_uuid" UUID NOT NULL,
                 "project_id" UUID NOT NULL,
                 "user_stream_uuid" UUID NOT NULL,
                 "user_uuid" UUID NOT NULL,
@@ -44,11 +45,15 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "starred" BOOLEAN NOT NULL DEFAULT FALSE,
                 "created_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
                 "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
-                PRIMARY KEY ("uuid", "user_uuid"),
                 CONSTRAINT "m_workspace_user_messages_user_stream_uuid_fkey"
                     FOREIGN KEY ("user_stream_uuid")
                     REFERENCES "m_workspace_user_streams" ("uuid")
-                    ON DELETE CASCADE
+                    ON DELETE CASCADE,
+                CONSTRAINT "m_workspace_user_messages_source_message_uuid_fkey"
+                    FOREIGN KEY ("source_message_uuid")
+                    REFERENCES "m_workspace_messages" ("uuid")
+                    ON DELETE CASCADE,
+                CONSTRAINT "m_workspace_user_messages_message_user_unique" UNIQUE ("source_message_uuid", "user_uuid")
             );
             """,
             """

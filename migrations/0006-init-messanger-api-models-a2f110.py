@@ -96,8 +96,10 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "description" VARCHAR(255) NULL,
                 "source_name" VARCHAR(64) NOT NULL,
                 "source" JSONB NOT NULL,
+                "user_uuid" UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
                 "created_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
-                "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW()
+                "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
+                CONSTRAINT "m_workspace_streams_uuid_user_uuid_unique" UNIQUE ("uuid", "user_uuid")
             );
             """,
             """

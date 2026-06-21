@@ -33,7 +33,8 @@ class MigrationStep(migrations.AbstractMigrationStep):
         expressions = [
             """
             CREATE TABLE IF NOT EXISTS "m_workspace_user_streams" (
-                "uuid" UUID NOT NULL,
+                "uuid" UUID PRIMARY KEY,
+                "source_stream_uuid" UUID NOT NULL,
                 "name" VARCHAR(255) NOT NULL,
                 "description" VARCHAR(255) NULL,
                 "project_id" UUID NOT NULL,
@@ -46,10 +47,10 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "private" BOOLEAN NOT NULL DEFAULT FALSE,
                 "created_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
                 "updated_at" TIMESTAMP(6) NOT NULL DEFAULT NOW(),
-                PRIMARY KEY ("uuid", "user_uuid"),
-                CONSTRAINT "m_workspace_user_streams_uuid_fkey"
-                    FOREIGN KEY ("uuid") REFERENCES "m_workspace_streams" ("uuid")
-                    ON DELETE CASCADE
+                CONSTRAINT "m_workspace_user_streams_source_stream_uuid_fkey"
+                    FOREIGN KEY ("source_stream_uuid") REFERENCES "m_workspace_streams" ("uuid")
+                    ON DELETE CASCADE,
+                CONSTRAINT "m_workspace_user_streams_stream_user_unique" UNIQUE ("source_stream_uuid", "user_uuid")
             );
             """,
             """
@@ -59,6 +60,10 @@ class MigrationStep(migrations.AbstractMigrationStep):
             """
             CREATE INDEX IF NOT EXISTS "m_workspace_user_streams_user_uuid_idx"
                 ON "m_workspace_user_streams" ("user_uuid");
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS "m_workspace_user_streams_source_stream_uuid_idx"
+                ON "m_workspace_user_streams" ("source_stream_uuid");
             """,
             """
             CREATE OR REPLACE VIEW "m_stream_binding_to_sync" AS
@@ -71,7 +76,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
             LEFT JOIN "m_workspace_streams" AS s
                 ON s.uuid = b.stream_uuid
             LEFT JOIN "m_workspace_user_streams" AS us
-                ON us.uuid = b.stream_uuid
+                ON us.source_stream_uuid = b.stream_uuid
                 AND us.user_uuid = b.user_uuid
             WHERE us.last_synced_at IS NULL OR us.last_synced_at <> s.updated_at;
             """,
