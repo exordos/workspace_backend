@@ -14,7 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
 import datetime
 import uuid as sys_uuid
 
@@ -24,11 +23,8 @@ from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
-from restalchemy.openapi import utils as oa_utils
 
 from workspace.common.api import controllers as common_controllers
-from workspace.messenger_api import exceptions as messenger_exceptions
-from workspace.messenger_api.api import schemas
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
 
@@ -59,174 +55,70 @@ class IamScopedMixin:
         return {"user_uuid": self._get_user_uuid()}
 
 
-class FolderController(IamScopedMixin, ra_controllers.BaseResourceControllerPaginated):
+class FolderController(
+    iam_controllers.PolicyBasedController,
+    IamScopedMixin,
+    common_controllers.BaseResourceControllerComplexPaginated,
+):
+    __complex_primary_key__ = ["uuid", "user_uuid"]
+
     __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.Folder,
+        model_class=models.UserFolder,
         hidden_fields=["project_id", "user_uuid"],
         convert_underscore=False,
     )
 
-    def _check_system_type(self, change_uuid, project_id, user_uuid):
-        for folder in self.model.objects.get_all(
-            filters={
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-                "system_type": dm_filters.EQ(models.SystemFolderType.ALL),
-                "uuid": dm_filters.NE(change_uuid),
-            }
-        ):
-            raise messenger_exceptions.OnlyOneAllFolderPerUserError()
-
-    def create(self, uuid=None, system_type=None, **kwargs):
-        project_id = self._get_project_id()
+    def create(self, **kwargs):
         user_uuid = self._get_user_uuid()
-        kwargs["project_id"] = project_id
-        kwargs["user_uuid"] = user_uuid
-        if system_type == models.SystemFolderType.ALL:
-            uuid = uuid or sys_uuid.uuid4()
-            self._check_system_type(uuid, project_id, user_uuid)
-        return super().create(uuid=uuid, system_type=system_type, **kwargs)
-
-    def get(self, uuid):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        return self.model.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
+        folder = models.Folder(
+            user_uuid=user_uuid,
+            project_id=self._get_project_id(),
+            **kwargs,
         )
-
-    @oa_utils.extend_schema(
-        summary="List folders with nested items",
-        parameters=schemas.FOLDER_FILTER_PARAMETERS,
-        responses=schemas.FOLDER_FILTER_RESPONSES,
-    )
-    def filter(self, filters, **kwargs):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        filters = (filters or {}).copy()
-        filters["project_id"] = dm_filters.EQ(project_id)
-        filters["user_uuid"] = dm_filters.EQ(user_uuid)
-
-        folders = models.Folder.objects.get_all(filters=filters)
-        items = models.FolderItem.objects.get_all(
-            filters={
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-        )
-        items_by_folder = collections.defaultdict(list)
-        for item in items:
-            items_by_folder[item.folder.uuid].append(item.dump_to_simple_view())
-        result = []
-        for folder in folders:
-            folder_view = folder.dump_to_simple_view()
-            folder_view["items"] = items_by_folder.get(folder.uuid, [])
-            result.append(folder_view)
-        return result
-
-    def delete(self, uuid):
-        dm = self.get(uuid=uuid)
-        dm.delete()
-
-    def update(self, uuid, **kwargs):
-        dm = self.get(uuid=uuid)
-        system_type = kwargs.get("system_type", dm.system_type)
-        if system_type == models.SystemFolderType.ALL:
-            self._check_system_type(
-                uuid,
-                self._get_project_id(),
-                self._get_user_uuid(),
-            )
-        dm.update_dm(values=kwargs)
-        dm.update()
-        return dm
+        folder.insert()
+        return self.get(uuid=folder.uuid)
 
 
 class FolderItemController(
+    iam_controllers.PolicyBasedController,
     IamScopedMixin,
-    ra_controllers.BaseNestedResourceControllerPaginated,
+    common_controllers.BaseResourceControllerComplexPaginated,
 ):
-    __resource__ = ra_resources.ResourceByModelWithCustomProps(
-        model_class=models.FolderItem,
-        hidden_fields=["folder", "project_id", "user_uuid"],
+    __complex_primary_key__ = ["uuid", "user_uuid"]
+
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.UserFolderItem,
         convert_underscore=False,
     )
-    __pr_name__ = "folder"
 
-    def create(self, parent_resource, **kwargs):
-        project_id = self._get_project_id()
+    def create(self, **kwargs):
         user_uuid = self._get_user_uuid()
-        kwargs["project_id"] = project_id
-        kwargs["user_uuid"] = user_uuid
-        return super().create(parent_resource=parent_resource, **kwargs)
-
-    def get(self, parent_resource, uuid):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        return self.model.objects.get_one(
-            filters={
-                self.__pr_name__: dm_filters.EQ(parent_resource),
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-        )
-
-    def filter(self, parent_resource, filters, **kwargs):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        filters = (filters or {}).copy()
-        filters["project_id"] = dm_filters.EQ(project_id)
-        filters["user_uuid"] = dm_filters.EQ(user_uuid)
-        return super().filter(
-            parent_resource=parent_resource,
-            filters=filters,
+        item = models.FolderItem(
+            user_uuid=user_uuid,
+            project_id=self._get_project_id(),
             **kwargs,
         )
-
-    def delete(self, parent_resource, uuid):
-        dm = self.get(parent_resource=parent_resource, uuid=uuid)
-        dm.delete()
-
-    def update(self, parent_resource, uuid, **kwargs):
-        dm = self.get(parent_resource=parent_resource, uuid=uuid)
-        dm.update_dm(values=kwargs)
-        dm.update()
-        return dm
+        item.insert()
+        return self.get(uuid=item.uuid, user_uuid=user_uuid)
 
     @ra_actions.post
     def pin(self, resource, *args, **kwargs):
-        resource.pinned_at = datetime.datetime.now(datetime.timezone.utc)
-        resource.save()
-        return resource
+        dm = models.FolderItem.objects.get_one(
+            filters={"uuid": dm_filters.EQ(resource.uuid), **self._scoped_pk_filters()},
+        )
+        dm.pinned_at = datetime.datetime.now(datetime.timezone.utc)
+        dm.save()
+        return self.get(uuid=resource.uuid, user_uuid=self._get_user_uuid())
 
     @ra_actions.post
     def unpin(self, resource, *args, **kwargs):
-        resource.pinned_at = None
-        resource.save()
-        return resource
+        dm = models.FolderItem.objects.get_one(
+            filters={"uuid": dm_filters.EQ(resource.uuid), **self._scoped_pk_filters()},
+        )
+        dm.pinned_at = None
+        dm.save()
+        return self.get(uuid=resource.uuid, user_uuid=self._get_user_uuid())
 
-
-class FolderItemsController(
-    IamScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
-):
-    __resource__ = ra_resources.ResourceByModelWithCustomProps(
-        model_class=models.FolderItemRAFix,
-        hidden_fields=["folder", "project_id", "user_uuid"],
-        convert_underscore=False,
-    )
-
-    def filter(self, filters, **kwargs):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        filters = (filters or {}).copy()
-        filters["project_id"] = dm_filters.EQ(project_id)
-        filters["user_uuid"] = dm_filters.EQ(user_uuid)
-        return super().filter(filters=filters, **kwargs)
 
 
 class WorkspaceStreamController(

@@ -33,8 +33,6 @@ class FolderItemRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
-        routes.UPDATE,
-        routes.DELETE,
     ]
 
     pin = routes.action(FolderItemPinAction, invoke=True)
@@ -47,17 +45,6 @@ class FolderRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
-        routes.UPDATE,
-        routes.DELETE,
-    ]
-
-    items = routes.route(FolderItemRoute, resource_route=True)
-
-
-class FolderItemsRoute(routes.Route):
-    __controller__ = controllers.FolderItemsController
-    __allow_methods__ = [
-        routes.FILTER,
     ]
 
 
@@ -115,7 +102,7 @@ class ApiEndpointRoute(routes.Route):
     __allow_methods__ = [routes.FILTER]
 
     folders = routes.route(FolderRoute)
-    folder_items = routes.route(FolderItemsRoute)
+    folder_items = routes.route(FolderItemRoute)
     streams = routes.route(WorkspaceStreamRoute)
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
     stream_topics = routes.route(WorkspaceStreamTopicRoute)

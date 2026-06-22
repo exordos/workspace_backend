@@ -64,6 +64,35 @@ class Folder(
         types.AllowNone(types.Integer(min_value=0, max_value=2**32 - 1)),
         default=None,
     )
+    system_type = properties.property(
+        types.AllowNone(
+            types.Enum([folder_type.value for folder_type in SystemFolderType])
+        ),
+        default=SystemFolderType.CREATED.value,
+    )
+
+
+class UserFolder(
+    models.DumpToSimpleViewMixin,
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_folders_view"
+
+    title = properties.property(
+        types.String(min_length=1, max_length=64),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    background_color_value = properties.property(
+        types.AllowNone(types.Integer(min_value=0, max_value=2**32 - 1)),
+        default=None,
+    )
     unread_count = properties.property(
         types.Integer(min_value=0),
         default=0,
@@ -74,24 +103,58 @@ class Folder(
         ),
         default=SystemFolderType.CREATED.value,
     )
+    folder_items = properties.property(
+        types.List(),
+        default=list,
+    )
 
 
 class FolderItem(
     models.DumpToSimpleViewMixin,
-    models.CustomPropertiesMixin,
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_folder_items"
-    __custom_properties__ = {
-        "folder_uuid": types.UUID(),
-    }
 
-    folder = relationships.relationship(
-        Folder,
-        prefetch=True,
+    folder_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    order_index = properties.property(
+        types.AllowNone(types.Integer(max_value=2**31 - 1)),
+        default=None,
+    )
+    pinned_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
+    chat_type = properties.property(
+        types.Enum([t.value for t in ChatType]),
+        required=True,
+    )
+
+
+class UserFolderItem(
+    models.DumpToSimpleViewMixin,
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_folder_items_created_view"
+
+    folder_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
     user_uuid = properties.property(
@@ -118,28 +181,6 @@ class FolderItem(
         types.Integer(min_value=0),
         default=0,
     )
-
-    @property
-    def folder_uuid(self):
-        return self.folder.uuid
-
-    @folder_uuid.setter
-    def folder_uuid(self, value):
-        if value is None:
-            raise ValueError("folder_uuid must not be None")
-
-        folder_id = types.UUID().from_simple_type(value)
-        self.folder = Folder.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(folder_id),
-                "user_uuid": dm_filters.EQ(self.user_uuid),
-                "project_id": dm_filters.EQ(self.project_id),
-            },
-        )
-
-
-class FolderItemRAFix(FolderItem):
-    pass
 
 
 class ZulipSource(types_dynamic.AbstractKindModel):

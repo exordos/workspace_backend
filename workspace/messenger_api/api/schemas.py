@@ -42,6 +42,9 @@ FOLDER_ITEM_SCHEMA = {
             "format": "date-time",
             "nullable": True,
         },
+        "unread_count": {
+            "type": "integer",
+        },
         "created_at": {
             "type": "string",
             "format": "date-time",

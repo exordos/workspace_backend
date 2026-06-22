@@ -35,31 +35,31 @@ class MigrationStep(migrations.AbstractMigrationStep):
             CREATE OR REPLACE VIEW "m_folder_all_view" AS
             SELECT
                 '00000000-0000-0000-0000-000000000000'::uuid AS uuid,
-                'All chats'::varchar                         AS title,
                 i.project_id,
                 i.user_uuid,
+                'All chats'::varchar                         AS title,
                 11184810::bigint                             AS background_color_value,
-                COALESCE(SUM(i.unread_count), 0)::integer    AS unread_count,
                 'all'::varchar                               AS system_type,
+                COALESCE(SUM(i.unread_count), 0)::integer    AS unread_count,
                 json_agg(
                     json_build_object(
-                        'uuid',        i.uuid,
-                        'folder',      i.folder,
-                        'project_id',  i.project_id,
-                        'user_uuid',   i.user_uuid,
-                        'stream_uuid', i.stream_uuid,
-                        'order_index', i.order_index,
-                        'pinned_at',   i.pinned_at,
-                        'chat_type',   i.chat_type,
-                        'unread_count',i.unread_count,
-                        'created_at',  i.created_at,
-                        'updated_at',  i.updated_at
+                        'uuid',         i.uuid,
+                        'folder',       i.folder,
+                        'project_id',   i.project_id,
+                        'user_uuid',    i.user_uuid,
+                        'stream_uuid',  i.stream_uuid,
+                        'order_index',  i.order_index,
+                        'pinned_at',    i.pinned_at,
+                        'chat_type',    i.chat_type,
+                        'unread_count', i.unread_count,
+                        'created_at',   i.created_at,
+                        'updated_at',   i.updated_at
                     )
-                )                                            AS items,
+                )                                            AS folder_items,
                 '2000-01-01 00:00:00'::timestamp             AS created_at,
                 '2000-01-01 00:00:00'::timestamp             AS updated_at
             FROM "m_folder_all_items_view" AS i
-            GROUP BY i.user_uuid, i.project_id;
+            GROUP BY i.project_id, i.user_uuid;
             """
         )
 
