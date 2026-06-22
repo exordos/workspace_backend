@@ -67,8 +67,6 @@ class WorkspaceStreamRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
-        routes.UPDATE,
-        routes.DELETE,
     ]
 
 

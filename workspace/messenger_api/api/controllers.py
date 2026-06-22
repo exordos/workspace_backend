@@ -243,8 +243,36 @@ class WorkspaceStreamController(
     )
 
     def create(self, **kwargs):
-        # user_uuid is mixed in automatically by the complex-PK base.
-        return super().create(init_stream=True, **kwargs)
+        stream_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+
+        stream = models.WorkspaceStream(
+            uuid=stream_uuid,
+            project_id=project_id,
+            user_uuid=user_uuid,
+            **kwargs,
+        )
+        stream.insert()
+
+        binding = models.WorkspaceStreamBinding(
+            project_id=project_id,
+            stream_uuid=stream.uuid,
+            user_uuid=user_uuid,
+            who_uuid=user_uuid,
+            role=models.WorkspaceStreamRole.OWNER.value,
+        )
+        binding.insert()
+
+        default_topic = models.WorkspaceStreamTopic(
+            project_id=project_id,
+            stream_uuid=stream.uuid,
+            name="General Topic",
+            default_for_stream_uuid=stream.uuid,
+        )
+        default_topic.insert()
+
+        return self.get(uuid=stream.uuid, user_uuid=user_uuid)
 
 
 class WorkspaceStreamBindingController(
@@ -275,19 +303,46 @@ class WorkspaceMessageController(
     )
 
     def create(self, **kwargs):
-        # user_uuid is mixed in automatically by the complex-PK base.
-        return super().create(init_message=True, **kwargs)
+        message_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+
+        message = models.WorkspaceMessage(
+            uuid=message_uuid,
+            project_id=project_id,
+            user_uuid=user_uuid,
+            **kwargs,
+        )
+        message.insert()
+
+        return self.get(uuid=message.uuid, user_uuid=user_uuid)
 
 
 class WorkspaceStreamTopicController(
     iam_controllers.PolicyBasedController,
     IamScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    common_controllers.BaseResourceControllerComplexPaginated,
 ):
+    __complex_primary_key__ = ["uuid", "user_uuid"]
+
     __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceStreamTopic,
+        model_class=models.WorkspaceUserTopic,
         convert_underscore=False,
     )
+
+    def create(self, **kwargs):
+        topic_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+
+        topic = models.WorkspaceStreamTopic(
+            uuid=topic_uuid,
+            project_id=project_id,
+            **kwargs,
+        )
+        topic.insert()
+
+        return self.get(uuid=topic.uuid, user_uuid=user_uuid)
 
 
 class MeController(ra_controllers.RoutesListController):

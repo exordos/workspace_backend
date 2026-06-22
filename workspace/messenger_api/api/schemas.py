@@ -75,11 +75,8 @@ FOLDER_WITH_ITEMS_SCHEMA = {
             "type": "integer",
             "nullable": True,
         },
-        "unread_messages": {
-            "type": "array",
-            "items": {
-                "type": "integer",
-            },
+        "unread_count": {
+            "type": "integer",
         },
         "system_type": {
             "type": "string",

@@ -53,11 +53,13 @@ class ComplexPaginationFilterBuilder:
         id_name,
         sort_column=None,
         sort_direction="asc",
+        scope_filters=None,
     ):
         self.marker_id = marker_id
         self.sort_col = sort_column
         self.sort_dir = sort_direction
         self.id_name = id_name
+        self.scope_filters = scope_filters or {}
         self.sort_value = self._fetch_sort_val(model)
 
     def _fetch_sort_val(self, model):
@@ -66,9 +68,9 @@ class ComplexPaginationFilterBuilder:
         if self.sort_col in (None, self.id_name):
             return self.marker_id
 
-        marker_row = model.objects.get_one(
-            filters={self.id_name: dm_filters.EQ(self.marker_id)}
-        )
+        filters = {self.id_name: dm_filters.EQ(self.marker_id)}
+        filters.update(self.scope_filters)
+        marker_row = model.objects.get_one(filters=filters)
         return getattr(marker_row, self.sort_col)
 
     def build_filter(self):
@@ -209,6 +211,7 @@ class ComplexPrimaryKeyPaginationMixin(object):
                 id_name,
                 sort_col,
                 sort_dir,
+                scope_filters=self._scoped_pk_filters(),
             )
             pagination_filters = cursor.build_filter()
             filters = dm_filters.AND(pagination_filters, filters)

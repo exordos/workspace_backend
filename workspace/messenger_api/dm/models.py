@@ -37,6 +37,12 @@ class SystemFolderType(str, enum.Enum):
     CREATED = "created"
 
 
+class ReactionStatus(str, enum.Enum):
+    NEW = "new"
+    ACTIVE = "active"
+    DELETED = "deleted"
+
+
 class Folder(
     models.DumpToSimpleViewMixin,
     models.ModelWithUUID,
@@ -58,9 +64,9 @@ class Folder(
         types.AllowNone(types.Integer(min_value=0, max_value=2**32 - 1)),
         default=None,
     )
-    unread_messages = properties.property(
-        types.TypedList(types.Integer(min_value=0, max_value=2**31 - 1)),
-        default=list,
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
     )
     system_type = properties.property(
         types.AllowNone(
@@ -107,6 +113,10 @@ class FolderItem(
     chat_type = properties.property(
         types.Enum([t.value for t in ChatType]),
         required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
     )
 
     @property
@@ -158,10 +168,52 @@ class WorkspaceStreamRole(str, enum.Enum):
     OWNER = "owner"
 
 
-class WorkspaceStreamBindingStatus(str, enum.Enum):
-    NEW = "new"
-    IN_PROGRESS = "in_progress"
+class WorkspaceUserStatus(str, enum.Enum):
     ACTIVE = "active"
+    IDLE = "idle"
+    OFFLINE = "offline"
+    DO_NOT_DISTURB = "do_not_disturb"
+
+
+class WorkspaceUserSource(str, enum.Enum):
+    IAM = "iam"
+
+
+class WorkspaceUser(
+    models.ModelWithUUID,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_users"
+
+    username = properties.property(
+        types.String(min_length=1, max_length=128),
+        required=True,
+    )
+    source = properties.property(
+        types.Enum([source.value for source in WorkspaceUserSource]),
+        default=WorkspaceUserSource.IAM.value,
+    )
+    status = properties.property(
+        types.Enum([status.value for status in WorkspaceUserStatus]),
+        default=WorkspaceUserStatus.ACTIVE.value,
+    )
+    first_name = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+    )
+    last_name = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+    )
+    email = properties.property(
+        types.AllowNone(types.String(max_length=256)),
+        default=None,
+    )
+    last_ping_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
 
 
 class WorkspaceStream(
@@ -226,10 +278,6 @@ class WorkspaceStreamBinding(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         default=WorkspaceStreamRole.MEMBER.value,
     )
-    status = properties.property(
-        types.Enum([status.value for status in WorkspaceStreamBindingStatus]),
-        default=WorkspaceStreamBindingStatus.NEW.value,
-    )
 
     def get_stream(self):
         return WorkspaceStream.objects.get_one(
@@ -246,13 +294,21 @@ class WorkspaceUserStream(
 ):
     __tablename__ = "m_workspace_user_streams"
 
+    owner = properties.property(
+        types.UUID(),
+        required=True,
+    )
     user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
-    last_synced_at = properties.property(
-        types.UTCDateTimeZ(),
+    role = properties.property(
+        types.Enum([role.value for role in WorkspaceStreamRole]),
         required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
     )
     source_name = properties.property(
         types.Enum([source.value for source in SourceName]),
@@ -278,51 +334,6 @@ class WorkspaceUserStream(
         default=False,
     )
 
-    def __init__(self, init_stream=False, **kwargs):
-        kwargs["uuid"] = kwargs.get("uuid") or sys_uuid.uuid4()
-        if init_stream:
-            stream = self._create_stream_and_bindings(kwargs=kwargs)
-        else:
-            stream = self.get_stream(kwargs['uuid'])
-        kwargs['last_synced_at'] = stream.updated_at
-        super().__init__(**kwargs)
-    
-    def _create_stream_and_bindings(self, kwargs):
-        # create the shared source stream from the incoming payload (the
-        # source-reference fields below are user-stream only and must not be
-        # passed to WorkspaceStream).
-        stream = WorkspaceStream(
-            **kwargs
-        )
-        stream.insert()
-
-        # create binding
-        binding = WorkspaceStreamBinding(
-            project_id=stream.project_id,
-            stream_uuid=stream.uuid,
-            user_uuid=stream.user_uuid,
-            who_uuid=stream.user_uuid,
-            role=WorkspaceStreamRole.OWNER.value,
-        )
-        binding.insert()
-
-        # create default topic
-        default_topic = WorkspaceStreamTopic(
-            project_id=stream.project_id,
-            stream_uuid=stream.uuid,
-            name="General Chat",
-            default_for_stream_uuid=stream.uuid,
-        )
-        default_topic.insert()
-
-        return stream
-
-    def get_stream(self, uuid):
-        uuid = uuid or self.uuid
-        return WorkspaceStream.objects.get_one(
-            filters={"uuid": dm_filters.EQ(uuid)}
-        )
-    
     def get_default_topic(self):
         return WorkspaceStreamTopic.objects.get_one(
             filters={
@@ -330,31 +341,29 @@ class WorkspaceUserStream(
             }
         )
 
-    def sync(self):
-        self.last_synced_at = self.get_stream().updated_at
-        self.update()
 
-
-class StreamBindingToSync(
+class WorkspaceMessageReactions(
     models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
     orm.SQLStorableMixin,
-    
 ):
-    __tablename__ = "m_stream_binding_to_sync"
-    
-    stream = relationships.relationship(
-        WorkspaceStream,
-        prefetch=True,
+    __tablename__ = "m_workspace_message_reactions"
+
+    message_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
-    user_stream = relationships.relationship(
-        WorkspaceUserStream,
-        prefetch=True,
-        required=False,
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
     )
-    binding = relationships.relationship(
-        WorkspaceStreamBinding,
-        prefetch=True,
+    emoji_name = properties.property(
+        types.String(max_length=128),
+        required=True,
+    )
+    status = properties.property(
+        types.Enum([s.value for s in ReactionStatus]),
         required=True,
     )
 
@@ -363,18 +372,29 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
     KIND = "markdown"
 
     content = properties.property(
-        types.String(max_length=10000),
+        types.String(min_length=1, max_length=10000),
         required=True,
     )
+
+    def is_user_mentioned(self, user_uuid):
+        needle = str(user_uuid)
+        return (
+            ("@" + needle) in self.content
+            or ("<@" + needle + ">") in self.content
+        )
 
 
 class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
+    models.CustomPropertiesMixin,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_stream_topics"
+    __custom_properties__ = {
+        "is_default": types.Boolean(),
+    }
 
     name = properties.property(
         types.String(max_length=128),
@@ -385,8 +405,42 @@ class WorkspaceStreamTopic(
         required=True,
     )
     default_for_stream_uuid = properties.property(
-        types.UUID(),
+        types.AllowNone(types.UUID()),
         required=False,
+    )
+
+    @property
+    def is_default(self):
+        return self.default_for_stream_uuid is not None
+
+
+class WorkspaceUserTopic(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_user_topics_view"
+
+    name = properties.property(
+        types.String(max_length=128),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    is_default = properties.property(
+        types.Boolean(),
+        default=False,
     )
 
 
@@ -416,6 +470,10 @@ class WorkspaceMessage(
         types.UUID(),
         required=False,
     )
+    reactions = properties.property(
+        types.TypedDict(types.Integer()),
+        default=dict,
+    )
 
 
 class WorkspaceUserMessage(
@@ -424,8 +482,20 @@ class WorkspaceUserMessage(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_workspace_user_messages"
+    __tablename__ = "m_workspace_user_messages_view"
 
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    author_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    topic_uuid = properties.property(
+        types.UUID(),
+        required=False,
+    )
     payload = properties.property(
         types_dynamic.KindModelSelectorType(
             types_dynamic.KindModelType(MarkdownPayload),
@@ -434,14 +504,6 @@ class WorkspaceUserMessage(
     )
     user_uuid = properties.property(
         types.UUID(),
-        required=True,
-    )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    last_synced_at = properties.property(
-        types.UTCDateTimeZ(),
         required=True,
     )
     read = properties.property(
@@ -456,61 +518,54 @@ class WorkspaceUserMessage(
         types.Boolean(),
         default=False,
     )
-    topic_uuid = properties.property(
-        types.UUID(),
-        required=False,
+    is_own = properties.property(
+        types.Boolean(),
+        default=False,
     )
 
-    def __init__(self, init_message=False, **kwargs):
-        kwargs["uuid"] = kwargs.get("uuid") or sys_uuid.uuid4()
-        stream = self.get_stream(kwargs.get("stream_uuid"))
-        kwargs["topic_uuid"] = kwargs.get("topic_uuid") or stream.topic_uuid
-        if init_message:
-            message = self._create_message(kwargs=kwargs)
-        else:
-            message = self.get_message(kwargs['uuid'])
-        kwargs['last_synced_at'] = message.updated_at
-        super().__init__(**kwargs)
-    
-    def _create_message(self, kwargs):
-        # create message
-        message = WorkspaceMessage(
-            **kwargs
-        )
-        message.insert()
-        return message
 
-    def get_message(self, uuid):
-        uuid = uuid or self.uuid
-        return WorkspaceMessage.objects.get_one(
-            filters={"uuid": dm_filters.EQ(uuid)}
-        )
-    
-    def get_stream(self, stream_uuid=None):
-        stream_uuid = stream_uuid or self.stream_uuid
-        return WorkspaceStream.objects.get_one(
-            filters={"uuid": dm_filters.EQ(stream_uuid)}
-        )
-
-
-class MessageToSync(
+class WorkspaceUserMessageFlags(
     models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "m_message_to_sync"
+    __tablename__ = "m_workspace_user_message_flags"
 
-    message = relationships.relationship(
-        WorkspaceMessage,
-        prefetch=True,
+    user_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
-    user_stream = relationships.relationship(
-        WorkspaceUserStream,
-        prefetch=True,
+    read = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    pinned = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    starred = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+
+class UnreadUserMessages(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_unread_user_messages"
+
+    user_uuid = properties.property(
+        types.UUID(),
         required=True,
     )
-    user_message = relationships.relationship(
-        WorkspaceUserMessage,
-        prefetch=True,
-        required=False,
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        required=True,
     )
