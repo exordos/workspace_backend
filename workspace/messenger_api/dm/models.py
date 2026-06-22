@@ -511,10 +511,6 @@ class WorkspaceMessage(
         types.UUID(),
         required=False,
     )
-    reactions = properties.property(
-        types.TypedDict(types.Integer()),
-        default=dict,
-    )
 
 
 class WorkspaceUserMessage(

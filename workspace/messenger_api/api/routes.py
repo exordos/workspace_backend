@@ -88,6 +88,14 @@ class WorkspaceStreamTopicRoute(routes.Route):
     ]
 
 
+class WorkspaceUserRoute(routes.Route):
+    __controller__ = controllers.WorkspaceUserController
+    __allow_methods__ = [
+        routes.FILTER,
+        routes.GET,
+    ]
+
+
 class MeRoute(routes.Route):
     """Handler for /v1/me/ endpoint."""
 
@@ -107,4 +115,5 @@ class ApiEndpointRoute(routes.Route):
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
     stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
+    users = routes.route(WorkspaceUserRoute)
     me = routes.route(MeRoute)

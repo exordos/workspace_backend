@@ -135,7 +135,7 @@ class WorkspaceStreamController(
     )
 
     def create(self, **kwargs):
-        stream_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
         project_id = self._get_project_id()
         user_uuid = self._get_user_uuid()
 
@@ -195,7 +195,7 @@ class WorkspaceMessageController(
     )
 
     def create(self, **kwargs):
-        message_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        message_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
         project_id = self._get_project_id()
         user_uuid = self._get_user_uuid()
 
@@ -223,7 +223,7 @@ class WorkspaceStreamTopicController(
     )
 
     def create(self, **kwargs):
-        topic_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
         project_id = self._get_project_id()
         user_uuid = self._get_user_uuid()
 
@@ -235,6 +235,15 @@ class WorkspaceStreamTopicController(
         topic.insert()
 
         return self.get(uuid=topic.uuid, user_uuid=user_uuid)
+
+
+class WorkspaceUserController(
+    ra_controllers.BaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceUser,
+        convert_underscore=False,
+    )
 
 
 class MeController(ra_controllers.RoutesListController):
