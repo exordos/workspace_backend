@@ -483,6 +483,19 @@ class WorkspaceUserTopic(
         types.Boolean(),
         default=False,
     )
+    is_done = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+    def get_flags(self):
+        return WorkspaceUserTopicFlags.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(self.uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
+            }
+        )
 
 
 class WorkspaceMessage(
@@ -582,6 +595,25 @@ class WorkspaceUserMessageFlags(
         default=False,
     )
     starred = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+
+class WorkspaceUserTopicFlags(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_user_topic_flags"
+
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+        id_property=True,
+    )
+    is_done = properties.property(
         types.Boolean(),
         default=False,
     )

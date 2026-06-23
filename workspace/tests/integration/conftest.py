@@ -322,3 +322,55 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
             (str(stream_uuid),),
         )
     return str(stream_uuid)
+
+
+def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid,
+                             role="member"):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings
+                (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (project_id, stream_uuid, user_uuid, who_uuid) DO NOTHING
+            """,
+            (str(sys_uuid.uuid4()), str(project_id), str(stream_uuid),
+             str(user_uuid), str(user_uuid), role),
+        )
+
+
+def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name,
+                      is_default=False):
+    """Insert a topic and the binding needed for the user topics view."""
+    topic_uuid = sys_uuid.uuid4()
+    default_for = str(stream_uuid) if is_default else None
+    seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_stream_topics
+                (uuid, project_id, name, stream_uuid, default_for_stream_uuid,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            """,
+            (str(topic_uuid), str(project_id), name, str(stream_uuid),
+             default_for),
+        )
+    return str(topic_uuid)
+
+
+def seed_stream_topic_flags(conn, topic_uuid, user_uuid, project_id,
+                            is_done=False):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_topic_flags
+                (uuid, user_uuid, project_id, is_done, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (uuid, user_uuid) DO UPDATE SET
+                is_done = EXCLUDED.is_done,
+                updated_at = NOW()
+            """,
+            (str(topic_uuid), str(user_uuid), str(project_id), is_done),
+        )

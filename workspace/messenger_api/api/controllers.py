@@ -29,6 +29,33 @@ from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
 
 
+def _create_topic_with_flags(project_id, **kwargs):
+    topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
+    topic = models.WorkspaceStreamTopic(
+        uuid=topic_uuid,
+        project_id=project_id,
+        **kwargs,
+    )
+    topic.insert()
+
+    bindings = models.WorkspaceStreamBinding.objects.get_all(
+        filters={
+            "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        }
+    )
+    for binding in bindings:
+        flags = models.WorkspaceUserTopicFlags(
+            uuid=topic.uuid,
+            user_uuid=binding.user_uuid,
+            project_id=project_id,
+            is_done=False,
+        )
+        flags.insert()
+
+    return topic
+
+
 class ApiEndpointController(ra_controllers.RoutesListController):
     """Controller for /v1/ endpoint."""
 
@@ -156,13 +183,12 @@ class WorkspaceStreamController(
         )
         binding.insert()
 
-        default_topic = models.WorkspaceStreamTopic(
+        default_topic = _create_topic_with_flags(
             project_id=project_id,
             stream_uuid=stream.uuid,
             name="General Topic",
             default_for_stream_uuid=stream.uuid,
         )
-        default_topic.insert()
 
         return self.get(uuid=stream.uuid, user_uuid=user_uuid)
 
@@ -223,18 +249,46 @@ class WorkspaceStreamTopicController(
     )
 
     def create(self, **kwargs):
-        topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
         project_id = self._get_project_id()
         user_uuid = self._get_user_uuid()
 
-        topic = models.WorkspaceStreamTopic(
-            uuid=topic_uuid,
-            project_id=project_id,
-            **kwargs,
-        )
-        topic.insert()
+        topic = _create_topic_with_flags(project_id=project_id, **kwargs)
 
         return self.get(uuid=topic.uuid, user_uuid=user_uuid)
+
+    def update(self, uuid, **kwargs):
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+
+        topic = models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            }
+        )
+
+        models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+                "user_uuid": dm_filters.EQ(user_uuid),
+                "project_id": dm_filters.EQ(project_id),
+            }
+        )
+
+        if "name" not in kwargs:
+            raise ra_exc.ValidationErrorException()
+
+        topic.update_dm(values={"name": kwargs["name"]})
+        topic.update()
+
+        return self.get(uuid=uuid, user_uuid=user_uuid)
+
+    @ra_actions.post
+    def toggle_done(self, resource, *args, **kwargs):
+        flags = resource.get_flags()
+        flags.is_done = not flags.is_done
+        flags.update()
+        return self.get(uuid=resource.uuid, user_uuid=self._get_user_uuid())
 
 
 class WorkspaceUserController(

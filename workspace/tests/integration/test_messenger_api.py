@@ -24,6 +24,7 @@ from workspace.tests.integration import conftest
 V1 = "/v1"
 STREAMS = f"{V1}/streams/"
 FOLDERS = f"{V1}/folders/"
+STREAM_TOPICS = f"{V1}/stream_topics/"
 
 
 # --------------------------------------------------------------------------- #
@@ -154,3 +155,46 @@ def test_streams_cursor_pagination_with_composite_pk(api, db):
     assert sorted(collected) == sorted(seeded)
     assert len(collected) == len(set(collected)) == 5
     assert pages == 3  # 2 + 2 + 1
+
+
+# --------------------------------------------------------------------------- #
+# Stream topics: rename
+# --------------------------------------------------------------------------- #
+
+
+def test_stream_topic_rename(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "team-chat"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "standups"
+    )
+
+    resp = api.put(f"{STREAM_TOPICS}{topic_uuid}", json={"name": "retros"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "retros"
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "retros"
+
+
+def test_stream_topic_is_done_flag(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "team-chat"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "standups"
+    )
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_done"] is False
+
+    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/toggle_done/")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_done"] is True
+
+    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/toggle_done/")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_done"] is False

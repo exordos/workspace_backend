@@ -77,6 +77,10 @@ class WorkspaceMessageRoute(routes.Route):
     ]
 
 
+class WorkspaceStreamTopicToggleDoneAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamTopicController
+
+
 class WorkspaceStreamTopicRoute(routes.Route):
     __controller__ = controllers.WorkspaceStreamTopicController
     __allow_methods__ = [
@@ -86,6 +90,8 @@ class WorkspaceStreamTopicRoute(routes.Route):
         routes.UPDATE,
         routes.DELETE,
     ]
+
+    toggle_done = routes.action(WorkspaceStreamTopicToggleDoneAction, invoke=True)
 
 
 class WorkspaceUserRoute(routes.Route):
