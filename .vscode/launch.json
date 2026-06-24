@@ -31,6 +31,19 @@
             "subProcess": true
         },
         {
+            "name": "Python Debugger: Messenger Events",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/workspace-messenger-events",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
             "name": "Python Debugger: Messenger Worker",
             "type": "debugpy",
             "request": "launch",

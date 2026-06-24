@@ -23,9 +23,11 @@ from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
+from webob import multidict
 
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
+from workspace.messenger_api import events as messenger_events
 
 
 def _create_topic_with_flags(project_id, **kwargs):
@@ -61,7 +63,19 @@ class ApiEndpointController(ra_controllers.RoutesListController):
     __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/"
 
 
-class IamContextMixin:
+class WorkspaceBaseResourceControllerPaginated(
+    iam_controllers.PolicyBasedController,
+    ra_controllers.BaseResourceControllerPaginated,
+):
+    __user_scoped__ = False
+
+    _filter_operator_suffixes = (
+        ("=>", dm_filters.GE),
+        ("=<", dm_filters.LE),
+        (">", dm_filters.GT),
+        ("<", dm_filters.LT),
+    )
+
     def _get_user_uuid(self):
         ctx = self.get_context()
         user_uuid = getattr(ctx, "user_uuid", None) if ctx is not None else None
@@ -76,24 +90,54 @@ class IamContextMixin:
             raise ra_exc.ValidationErrorException()
         return project_id
 
+    @classmethod
+    def _split_filter_operator(cls, name):
+        for suffix, operator in cls._filter_operator_suffixes:
+            if name.endswith(suffix):
+                return name[: -len(suffix)], operator
+        return name, None
 
-class IamUserScopedMixin(IamContextMixin):
+    def _prepare_filters(self, params):
+        self._conditional_filters = []
+        cleaned_params = []
+        for name, value in params.items():
+            field_name, operator = self._split_filter_operator(name)
+            if operator is None:
+                cleaned_params.append((name, value))
+                continue
+            field_name, field_value = self._prepare_filter(field_name, value)
+            self._conditional_filters.append(
+                {field_name: operator(field_value)}
+            )
+        return super()._prepare_filters(multidict.MultiDict(cleaned_params))
+
+    def _apply_autofilters(self, filters):
+        filters = super()._apply_autofilters(filters)
+        conditional_filters = getattr(self, "_conditional_filters", [])
+        if conditional_filters:
+            return dm_filters.AND(filters, *conditional_filters)
+        return filters
+
     def get_autofilters(self):
         filters = super().get_autofilters().copy()
+        if not self.__user_scoped__:
+            return filters
         filters["user_uuid"] = dm_filters.EQ(self._get_user_uuid())
         return filters
 
     def get_autovalues(self):
         values = super().get_autovalues().copy()
+        if not self.__user_scoped__:
+            return values
         values["user_uuid"] = self._get_user_uuid()
         return values
 
 
 class FolderController(
-    iam_controllers.PolicyBasedController,
-    IamUserScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    WorkspaceBaseResourceControllerPaginated,
 ):
+    __user_scoped__ = True
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.UserFolder,
         hidden_fields=["project_id", "user_uuid"],
@@ -113,10 +157,10 @@ class FolderController(
 
 
 class FolderItemController(
-    iam_controllers.PolicyBasedController,
-    IamUserScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    WorkspaceBaseResourceControllerPaginated,
 ):
+    __user_scoped__ = True
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.UserFolderItem,
         convert_underscore=False,
@@ -162,10 +206,10 @@ class FolderItemController(
 
 
 class WorkspaceStreamController(
-    iam_controllers.PolicyBasedController,
-    IamUserScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    WorkspaceBaseResourceControllerPaginated,
 ):
+    __user_scoped__ = True
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=[],
@@ -206,9 +250,7 @@ class WorkspaceStreamController(
 
 
 class WorkspaceStreamBindingController(
-    iam_controllers.PolicyBasedController,
-    IamContextMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    WorkspaceBaseResourceControllerPaginated,
 ):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceStreamBinding,
@@ -222,10 +264,10 @@ class WorkspaceStreamBindingController(
 
 
 class WorkspaceMessageController(
-    iam_controllers.PolicyBasedController,
-    IamUserScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+    WorkspaceBaseResourceControllerPaginated,
 ):
+    __user_scoped__ = True
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserMessage,
         convert_underscore=False,
@@ -234,13 +276,10 @@ class WorkspaceMessageController(
 
     def create(self, **kwargs):
         message_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-
         message = models.WorkspaceMessage(
             uuid=message_uuid,
-            project_id=project_id,
-            user_uuid=user_uuid,
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
             **kwargs,
         )
         message.insert()
@@ -248,11 +287,36 @@ class WorkspaceMessageController(
         return self.get(uuid=message.uuid)
 
 
-class WorkspaceStreamTopicController(
-    iam_controllers.PolicyBasedController,
-    IamUserScopedMixin,
-    ra_controllers.BaseResourceControllerPaginated,
+class WorkspaceEventController(
+    WorkspaceBaseResourceControllerPaginated,
 ):
+    __user_scoped__ = True
+
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceEvent,
+        convert_underscore=False,
+        process_filters=True,
+    )
+    __default_sort__ = {"epoch_version": "asc"}
+
+
+class WorkspaceEpochController(
+    WorkspaceBaseResourceControllerPaginated,
+):
+    def filter(self, filters, order_by=None):
+        return {
+            "epoch_version": messenger_events.get_current_epoch_version(
+                project_id=self._get_project_id(),
+                user_uuid=self._get_user_uuid(),
+            )
+        }
+
+
+class WorkspaceStreamTopicController(
+    WorkspaceBaseResourceControllerPaginated,
+):
+    __user_scoped__ = True
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserTopic,
         convert_underscore=False,
@@ -302,7 +366,7 @@ class WorkspaceStreamTopicController(
 
 
 class WorkspaceUserController(
-    ra_controllers.BaseResourceControllerPaginated,
+    WorkspaceBaseResourceControllerPaginated,
 ):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUser,

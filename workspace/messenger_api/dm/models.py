@@ -23,6 +23,10 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
+from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import event_payloads
+from workspace.messenger_api.dm import message_payloads
+
 
 class ChatType(str, enum.Enum):
     STREAM = "stream"
@@ -403,20 +407,26 @@ class WorkspaceMessageReactions(
     )
 
 
-class MarkdownPayload(types_dynamic.AbstractKindModel):
-    KIND = "markdown"
+class WorkspaceEvent(
+    UserScopedModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_events"
 
-    content = properties.property(
-        types.String(min_length=1, max_length=10000),
+    epoch_version = properties.property(
+        types.Integer(min_value=0),
+        required=False,
+    )
+    payload = properties.property(
+        event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE,
         required=True,
     )
 
-    def is_user_mentioned(self, user_uuid):
-        needle = str(user_uuid)
-        return (
-            ("@" + needle) in self.content
-            or ("<@" + needle + ">") in self.content
-        )
+    @classmethod
+    def get_id_property(cls):
+        return {"epoch_version": cls.properties.properties["epoch_version"]}
 
 
 class WorkspaceStreamTopic(
@@ -501,9 +511,7 @@ class WorkspaceMessage(
         required=True,
     )
     payload = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(MarkdownPayload),
-        ),
+        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
         required=True,
     )
     user_uuid = properties.property(
@@ -512,8 +520,16 @@ class WorkspaceMessage(
     )
     topic_uuid = properties.property(
         types.UUID(),
-        required=False,
+        required=True,
     )
+
+    def insert(self, session=None):
+        super().insert(session=session)
+        messenger_events.create_outbox_for_message(
+            project_id=self.project_id,
+            message=self,
+            session=session,
+        )
 
 
 class WorkspaceUserMessage(
@@ -534,12 +550,10 @@ class WorkspaceUserMessage(
     )
     topic_uuid = properties.property(
         types.UUID(),
-        required=False,
+        required=True,
     )
     payload = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(MarkdownPayload),
-        ),
+        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
         required=True,
     )
     read = properties.property(

@@ -77,6 +77,20 @@ class WorkspaceMessageRoute(routes.Route):
     ]
 
 
+class WorkspaceEventRoute(routes.Route):
+    __controller__ = controllers.WorkspaceEventController
+    __allow_methods__ = [
+        routes.FILTER,
+    ]
+
+
+class WorkspaceEpochRoute(routes.Route):
+    __controller__ = controllers.WorkspaceEpochController
+    __allow_methods__ = [
+        routes.FILTER,
+    ]
+
+
 class WorkspaceStreamTopicToggleDoneAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
@@ -121,5 +135,7 @@ class ApiEndpointRoute(routes.Route):
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
     stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
+    events = routes.route(WorkspaceEventRoute)
+    epoch = routes.route(WorkspaceEpochRoute)
     users = routes.route(WorkspaceUserRoute)
     me = routes.route(MeRoute)

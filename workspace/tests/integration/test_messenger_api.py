@@ -18,6 +18,8 @@
 
 import uuid as sys_uuid
 
+from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import models
 from workspace.tests.integration import conftest
 
 
@@ -25,6 +27,9 @@ V1 = "/v1"
 STREAMS = f"{V1}/streams/"
 FOLDERS = f"{V1}/folders/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
+MESSAGES = f"{V1}/messages/"
+EVENTS = f"{V1}/events/"
+EPOCH = f"{V1}/epoch/"
 
 
 # --------------------------------------------------------------------------- #
@@ -198,3 +203,307 @@ def test_stream_topic_is_done_flag(api, db):
     resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/toggle_done/")
     assert resp.status_code == 200, resp.text
     assert resp.json()["is_done"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Message events: durable epoch/outbox delivery
+# --------------------------------------------------------------------------- #
+
+
+def test_epoch_is_zero_without_visible_events(api):
+    resp = api.get(EPOCH)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"epoch_version": 0}
+
+
+def test_message_create_writes_flags_and_visible_events(api, db):
+    other_user = sys_uuid.uuid4()
+    outsider = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "events-team"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+
+    resp = api.post(
+        MESSAGES,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "hello over epochs",
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    message = resp.json()
+    message_uuid = message["uuid"]
+    assert message["read"] is True
+    assert message["is_own"] is True
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, read
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s
+            ORDER BY user_uuid
+            """,
+            (message_uuid,),
+        )
+        flags = {str(row[0]): row[1] for row in cur.fetchall()}
+    assert flags == {
+        str(api.user_uuid): True,
+        str(other_user): False,
+    }
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        event_rows = {str(row[0]): row[1] for row in cur.fetchall()}
+    assert set(event_rows) == {str(api.user_uuid), str(other_user)}
+    author_payload = event_rows[str(api.user_uuid)]
+    other_payload = event_rows[str(other_user)]
+    assert author_payload["kind"] == "message.created"
+    assert author_payload["uuid"] == message_uuid
+    assert author_payload["stream_uuid"] == stream_uuid
+    assert author_payload["topic_uuid"] == topic_uuid
+    assert author_payload["author_uuid"] == str(api.user_uuid)
+    assert author_payload["payload"] == {
+        "kind": "markdown",
+        "content": "hello over epochs",
+    }
+    assert "read" not in author_payload
+    assert "is_own" not in author_payload
+    assert "read" not in other_payload
+    assert "is_own" not in other_payload
+
+    author_resp = api.get(EVENTS, params={"page_limit": 100})
+    assert author_resp.status_code == 200, author_resp.text
+    author_events = author_resp.json()
+    assert len(author_events) == 1
+    event = author_events[0]
+    assert event["project_id"] == str(api.project_id)
+    assert event["user_uuid"] == str(api.user_uuid)
+    assert event["payload"]["kind"] == "message.created"
+    assert event["payload"]["uuid"] == message_uuid
+    assert event["payload"]["stream_uuid"] == stream_uuid
+    assert event["payload"]["topic_uuid"] == topic_uuid
+    assert event["payload"]["author_uuid"] == str(api.user_uuid)
+    assert event["payload"]["payload"]["content"] == "hello over epochs"
+    assert "read" not in event["payload"]
+    assert "is_own" not in event["payload"]
+
+    other_events = api.get(
+        EVENTS,
+        user=other_user,
+        params={"page_limit": 100},
+    ).json()
+    assert len(other_events) == 1
+    other_event = other_events[0]
+    assert other_event["payload"]["uuid"] == message_uuid
+    assert other_event["payload"]["kind"] == "message.created"
+    assert "read" not in other_event["payload"]
+    assert "is_own" not in other_event["payload"]
+
+    outsider_events = api.get(
+        EVENTS,
+        user=outsider,
+        params={"page_limit": 100},
+    ).json()
+    assert outsider_events == []
+
+    next_page = api.get(
+        EVENTS,
+        params={
+            "page_limit": 100,
+            "page_marker": event["epoch_version"],
+        },
+    ).json()
+    assert next_page == []
+
+
+def test_unbound_user_cannot_send_message(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, other_user, "private-team"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, other_user, "general", is_default=True
+    )
+
+    resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "nope",
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_messages
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND stream_uuid = %s
+            """,
+            (api.project_id, api.user_uuid, stream_uuid),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_message_create_requires_topic(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-required-team"
+    )
+
+    resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "missing topic",
+            },
+        },
+    )
+    assert resp.status_code == 400, resp.text
+
+
+def test_message_model_insert_writes_visible_event(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "model-events-team"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
+    )
+    message_uuid = sys_uuid.uuid4()
+    message = models.WorkspaceMessage(
+        uuid=message_uuid,
+        project_id=sys_uuid.UUID(api.project_id),
+        user_uuid=sys_uuid.UUID(api.user_uuid),
+        stream_uuid=sys_uuid.UUID(stream_uuid),
+        topic_uuid=sys_uuid.UUID(topic_uuid),
+        payload=message_payloads.MarkdownPayload(content="created through model"),
+    )
+
+    message.insert()
+
+    resp = api.get(EVENTS, params={"page_limit": 100})
+    assert resp.status_code == 200, resp.text
+    events = resp.json()
+    assert len(events) == 1
+    assert events[0]["payload"]["uuid"] == str(message_uuid)
+    assert events[0]["payload"]["kind"] == "message.created"
+
+
+def test_events_filter_by_epoch_range(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "range-events-team"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
+    )
+    message_uuids = []
+    for content in ("first through model", "second through model"):
+        message_uuid = sys_uuid.uuid4()
+        message_uuids.append(str(message_uuid))
+        message = models.WorkspaceMessage(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content=content),
+        )
+        message.insert()
+
+    resp = api.get(EVENTS, params={"page_limit": 100})
+    assert resp.status_code == 200, resp.text
+    events = resp.json()
+    assert [
+        event["payload"]["uuid"]
+        for event in events
+    ] == message_uuids
+    first_epoch = events[0]["epoch_version"]
+    second_epoch = events[1]["epoch_version"]
+
+    after_resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version=>", first_epoch),
+        ],
+    )
+    assert after_resp.status_code == 200, after_resp.text
+    assert [
+        event["epoch_version"]
+        for event in after_resp.json()
+    ] == [first_epoch, second_epoch]
+
+    strict_after_resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version>", first_epoch),
+        ],
+    )
+    assert strict_after_resp.status_code == 200, strict_after_resp.text
+    assert [
+        event["epoch_version"]
+        for event in strict_after_resp.json()
+    ] == [second_epoch]
+
+    before_resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version=<", first_epoch),
+        ],
+    )
+    assert before_resp.status_code == 200, before_resp.text
+    assert [event["epoch_version"] for event in before_resp.json()] == [first_epoch]
+
+    strict_before_resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version<", second_epoch),
+        ],
+    )
+    assert strict_before_resp.status_code == 200, strict_before_resp.text
+    assert [
+        event["epoch_version"]
+        for event in strict_before_resp.json()
+    ] == [first_epoch]
+
+    exact_resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version=>", second_epoch),
+            ("epoch_version=<", second_epoch),
+        ],
+    )
+    assert exact_resp.status_code == 200, exact_resp.text
+    assert [event["epoch_version"] for event in exact_resp.json()] == [second_epoch]

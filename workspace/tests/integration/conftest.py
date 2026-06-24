@@ -37,8 +37,8 @@ import psycopg
 import pytest
 import requests
 
+from gcl_iam import engines as iam_engines
 from gcl_iam import middlewares as iam_mw
-from gcl_iam.engines import IntrospectionInfo
 from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api.middlewares import contexts as contexts_mw
@@ -114,7 +114,7 @@ class FakeIamEngine:
         return self._info
 
     def get_introspection_info(self):
-        return IntrospectionInfo(info=self._info)
+        return iam_engines.IntrospectionInfo(info=self._info)
 
     @property
     def enforcer(self):
@@ -289,10 +289,7 @@ def db():
 
 
 def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
-    """Insert a source stream and the matching per-user stream row.
-
-    The per-user stream shares its uuid with the source stream.
-    The row is created directly; reads still flow through the real API/ORM.
+    """Insert a source stream and the matching stream binding.
 
     Returns the ``uuid`` of the created ``m_workspace_user_streams`` row.
     """
@@ -310,16 +307,14 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
         )
         cur.execute(
             """
-            INSERT INTO m_workspace_user_streams
-                (uuid, name, description, project_id,
-                 user_uuid, last_synced_at, source_name, source,
-                 invite_only, announce, private)
-            SELECT uuid, name, description, project_id, user_uuid,
-                   NOW(), source_name, source, invite_only, announce, private
-            FROM m_workspace_streams
-            WHERE uuid = %s
+            INSERT INTO m_workspace_stream_bindings
+                (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, 'owner', NOW(), NOW())
+            ON CONFLICT (project_id, stream_uuid, user_uuid, who_uuid) DO NOTHING
             """,
-            (str(stream_uuid),),
+            (str(sys_uuid.uuid4()), str(project_id), str(stream_uuid),
+             str(user_uuid), str(user_uuid)),
         )
     return str(stream_uuid)
 
