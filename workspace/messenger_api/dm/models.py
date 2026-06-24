@@ -15,12 +15,10 @@
 #    under the License.
 
 import enum
-import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
-from restalchemy.dm import relationships
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
@@ -41,6 +39,18 @@ class ReactionStatus(str, enum.Enum):
     NEW = "new"
     ACTIVE = "active"
     DELETED = "deleted"
+
+
+class UserScopedModelWithUUID(models.ModelWithUUID):
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+        id_property=True,
+    )
+
+    @classmethod
+    def get_id_property(cls):
+        return {"uuid": cls.properties.properties["uuid"]}
 
 
 class Folder(
@@ -74,7 +84,7 @@ class Folder(
 
 class UserFolder(
     models.DumpToSimpleViewMixin,
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -83,10 +93,6 @@ class UserFolder(
 
     title = properties.property(
         types.String(min_length=1, max_length=64),
-        required=True,
-    )
-    user_uuid = properties.property(
-        types.UUID(),
         required=True,
     )
     background_color_value = properties.property(
@@ -111,7 +117,7 @@ class UserFolder(
 
 class FolderItem(
     models.DumpToSimpleViewMixin,
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -119,10 +125,6 @@ class FolderItem(
     __tablename__ = "m_folder_items"
 
     folder_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
@@ -146,7 +148,7 @@ class FolderItem(
 
 class UserFolderItem(
     models.DumpToSimpleViewMixin,
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -154,10 +156,6 @@ class UserFolderItem(
     __tablename__ = "m_folder_items_created_view"
 
     folder_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
@@ -322,12 +320,12 @@ class WorkspaceStreamBinding(
 
     def get_stream(self):
         return WorkspaceStream.objects.get_one(
-            filters={"uuid": ra_filters.EQ(self.stream_uuid)}
+            filters={"uuid": dm_filters.EQ(self.stream_uuid)}
         )
 
 
 class WorkspaceUserStream(
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithRequiredNameDesc,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -336,10 +334,6 @@ class WorkspaceUserStream(
     __tablename__ = "m_workspace_user_streams"
 
     owner = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
@@ -456,7 +450,7 @@ class WorkspaceStreamTopic(
 
 
 class WorkspaceUserTopic(
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -468,10 +462,6 @@ class WorkspaceUserTopic(
         required=True,
     )
     stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
@@ -527,7 +517,7 @@ class WorkspaceMessage(
 
 
 class WorkspaceUserMessage(
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -552,10 +542,6 @@ class WorkspaceUserMessage(
         ),
         required=True,
     )
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
     read = properties.property(
         types.Boolean(),
         default=False,
@@ -575,17 +561,13 @@ class WorkspaceUserMessage(
 
 
 class WorkspaceUserMessageFlags(
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_user_message_flags"
 
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
     read = properties.property(
         types.Boolean(),
         default=False,
@@ -601,18 +583,13 @@ class WorkspaceUserMessageFlags(
 
 
 class WorkspaceUserTopicFlags(
-    models.ModelWithUUID,
+    UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_user_topic_flags"
 
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-        id_property=True,
-    )
     is_done = properties.property(
         types.Boolean(),
         default=False,

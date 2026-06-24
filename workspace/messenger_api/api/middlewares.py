@@ -21,7 +21,6 @@ import webob
 from restalchemy.api import middlewares
 
 from workspace.messenger_api.api import versions
-from workspace import version as app_version
 
 
 SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/server_settings"
@@ -32,7 +31,6 @@ def _normalize_path(path):
 
 
 def build_server_settings(req):
-    realm_url = req.host_url.rstrip("/")
     result = {
         "result": "success",
         "msg": "Welcome to Exordos Workspace",
