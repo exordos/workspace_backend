@@ -25,7 +25,8 @@ loggers:
   workspace: {}
   bjoern: {}
   gcl_looper: {}
-  restalchemy: {}
+  restalchemy:
+    level: INFO
   sentry_sdk: {}
 
 root:
