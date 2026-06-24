@@ -257,7 +257,8 @@ class MessengerEventsWebsocketServer:
                 continue
             if not isinstance(frame, dict):
                 continue
-            if frame.get("type") == "ack":
+            frame_type = frame.get("type")
+            if frame_type == "ack":
                 epoch_version = messenger_events.normalize_epoch_version(
                     frame.get("epoch_version"),
                     default=connection.last_epoch_version,
@@ -266,6 +267,8 @@ class MessengerEventsWebsocketServer:
                     connection.last_epoch_version,
                     epoch_version,
                 )
+            elif frame_type == "pong":
+                continue
 
     async def _heartbeat(self, connection):
         while True:

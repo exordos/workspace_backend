@@ -14,6 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import asyncio
+import importlib
+import json
+import sys
+import types
 import unittest
 import uuid as sys_uuid
 
@@ -23,6 +28,20 @@ from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api import events
 from workspace.messenger_api import websocket_protocol
+
+
+class FakeWebsocket:
+    def __init__(self, frames):
+        self._frames = iter(frames)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._frames)
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 class MessengerEventsTestCase(unittest.TestCase):
@@ -110,6 +129,38 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertFalse(event["message"]["is_own"])
         self.assertFalse(event["message"]["read"])
         self.assertEqual([], event["message"]["flags"])
+
+    def test_websocket_consumer_accepts_pong_frames(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket(
+                [
+                    json.dumps({"type": "pong", "ts": "2026-06-24T00:00:00+00:00"}),
+                    json.dumps({"type": "ack", "epoch_version": 9}),
+                ]
+            ),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+        )
+
+        asyncio.run(server._consume_client_frames(connection))
+
+        self.assertEqual(9, connection.last_epoch_version)
 
 
 if __name__ == "__main__":
