@@ -319,6 +319,21 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
     return str(stream_uuid)
 
 
+def seed_workspace_user(conn, user_uuid, username):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_users
+                (uuid, username, source, status, created_at, updated_at)
+            VALUES (%s, %s, 'iam', 'active', NOW(), NOW())
+            ON CONFLICT (uuid) DO UPDATE
+                SET username = EXCLUDED.username,
+                    updated_at = NOW()
+            """,
+            (str(user_uuid), username),
+        )
+
+
 def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid,
                              role="member"):
     with conn.cursor() as cur:

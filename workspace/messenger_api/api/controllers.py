@@ -366,7 +366,7 @@ class WorkspaceStreamTopicController(
 
 
 class WorkspaceUserController(
-    WorkspaceBaseResourceControllerPaginated,
+    ra_controllers.BaseResourceControllerPaginated,
 ):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUser,

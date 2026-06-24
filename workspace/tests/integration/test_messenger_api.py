@@ -30,6 +30,7 @@ STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
 EVENTS = f"{V1}/events/"
 EPOCH = f"{V1}/epoch/"
+USERS = f"{V1}/users/"
 
 
 # --------------------------------------------------------------------------- #
@@ -40,6 +41,22 @@ EPOCH = f"{V1}/epoch/"
 def test_root_endpoint_is_served(api):
     resp = api.get(f"{V1}/")
     assert resp.status_code == 200, resp.text
+
+
+def test_user_get_by_uuid_uses_global_user_table(api, db):
+    user_uuid = sys_uuid.uuid4()
+    username = f"user-{user_uuid}"
+    conftest.seed_workspace_user(db, user_uuid, username)
+
+    resp = api.get(f"{USERS}{user_uuid}")
+    assert resp.status_code == 200, resp.text
+    user = resp.json()
+    assert user["uuid"] == str(user_uuid)
+    assert user["username"] == username
+
+    resp = api.get(USERS, params={"username": username})
+    assert resp.status_code == 200, resp.text
+    assert [user["uuid"] for user in resp.json()] == [str(user_uuid)]
 
 
 # --------------------------------------------------------------------------- #
