@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
-#    Copyright 2025 Genesis Corporation.
+# Copyright 2026 Genesis Corporation.
 #
-#    All Rights Reserved.
+# All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -17,5 +17,15 @@
 #    under the License.
 
 set -eu
-set -x
 set -o pipefail
+
+WORKSPACE_CONFIG="/etc/workspace/workspace.conf"
+READY_FILE="/run/workspace/bootstrap.ready"
+
+if [ ! -s "$WORKSPACE_CONFIG" ]; then
+    exit 0
+fi
+
+rm -f "$READY_FILE"
+/usr/local/bin/workspace-bootstrap
+/usr/local/bin/workspace-restart-services

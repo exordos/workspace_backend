@@ -1,4 +1,6 @@
-#    Copyright 2025 Genesis Corporation.
+#!/usr/bin/env bash
+
+# Copyright 2026 Genesis Corporation.
 #
 # All Rights Reserved.
 #
@@ -14,15 +16,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-build:
-  deps:
-    - dst: /opt/workspace
-      path:
-        src: ../../workspace
+set -eu
+set -o pipefail
 
-  elements:
-    - images:
-      - name: workspace
-        format: raw
-        profile: genesis_base
-        script: images/install.sh
+READY_FILE="/run/workspace/bootstrap.ready"
+TIMEOUT="${WORKSPACE_BOOTSTRAP_WAIT_TIMEOUT:-900}"
+
+if [ ! -f "$READY_FILE" ]; then
+    /usr/local/bin/workspace-bootstrap
+fi
+
+deadline=$((SECONDS + TIMEOUT))
+while [ ! -f "$READY_FILE" ]; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "Workspace bootstrap did not become ready within ${TIMEOUT}s" >&2
+        exit 1
+    fi
+    sleep 1
+done

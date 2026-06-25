@@ -1,0 +1,307 @@
+name: "workspace"
+description: "Workspace backend element"
+schema_version: 1
+version: "{{ version }}"
+api_version: "v1"
+
+requirements:
+  core:
+    from_version: "0.0.0"
+  dbaas:
+    from_version: "0.0.0"
+
+imports:
+  pg18:
+    element: "$dbaas"
+    kind: "resource"
+    link: "$dbaas.types.postgres.versions.$pg18"
+  var_default_cores:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$default_cores"
+  var_default_ram:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$default_ram"
+  var_core_ip_address:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$core_ip_address"
+  var_hs256_jwks_encryption_key:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$hs256_jwks_encryption_key"
+
+resources:
+
+  $core.compute.nodes:
+    workspace_backend:
+      name: workspace-backend
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cores: $workspace.imports.$var_default_cores:value
+      ram: $workspace.imports.$var_default_ram:value
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 8
+            image: "{{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace/{{ version }}/images/workspace-backend.raw.zst"
+            label: root
+
+  $core.secret.passwords:
+    workspace_db_password:
+      name: workspace_db_password
+      description: "Workspace PostgreSQL password"
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+
+  $dbaas.types.postgres.instances:
+    workspace_cluster_pg:
+      name: "workspace-pg-cluster"
+      nodes_number: 1
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cpu: 1
+      ram: 1024
+      disk_size: 15
+      version: $workspace.imports.$pg18:uuid
+
+  $dbaas.types.postgres.instances.$workspace_cluster_pg.users:
+    workspace_db_user:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace
+      password: $core.secret.passwords.$workspace_db_password:value
+      instance: $dbaas.types.postgres.instances.$workspace_cluster_pg:uuid
+
+  $dbaas.types.postgres.instances.$workspace_cluster_pg.databases:
+    workspace_db:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace
+      owner: $dbaas.types.postgres.instances.$workspace_cluster_pg.users.$workspace_db_user:uuid
+      instance: $dbaas.types.postgres.instances.$workspace_cluster_pg:uuid
+
+  $core.config.configs:
+    workspace_backend_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/workspace.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-reload-config
+      body:
+        kind: text
+        content: |
+          f"
+          [db]
+          connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_cluster_pg.users.$workspace_db_user:name}:{$core.secret.passwords.$workspace_db_password:value}@{$dbaas.types.postgres.instances.$workspace_cluster_pg:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_cluster_pg.databases.$workspace_db:name}
+
+
+          [logging]
+          config = logging.yaml
+
+
+          [iam]
+          iam_endpoint = http://{$workspace.imports.$var_core_ip_address:value}/api/core/iam/clients/default
+          audience = Exordos
+          hs256_jwks_decryption_key = {$workspace.imports.$var_hs256_jwks_encryption_key:value}
+
+
+          [HS256]
+
+
+          [user_api]
+          bind_host = 127.0.0.1
+          bind_port = 21080
+          workers = 1
+
+
+          [messenger_api]
+          bind_host = 127.0.0.1
+          bind_port = 21081
+          workers = 1
+
+
+          [messenger_events]
+          bind_host = 127.0.0.1
+          bind_port = 21082
+          workers = 1
+          heartbeat_interval = 25
+          client_timeout = 60
+          catchup_limit = 500
+          send_queue_limit = 32
+          poll_interval = 3
+          "
+    workspace_backend_nginx:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/nginx/conf.d/workspace.conf
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-nginx-reload
+      body:
+        kind: text
+        content: |
+          upstream workspace_core_api {
+              include /etc/nginx/workspace.d/core-upstream.conf;
+          }
+
+          server {
+              listen 80;
+              server_name workspace.exordos.local;
+
+              location /api/core/ {
+                  proxy_pass http://workspace_core_api/api/core/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location = /api/messenger/ws {
+                  proxy_pass http://127.0.0.1:21082/v1/events/ws;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+              }
+
+              location /api/messenger/ {
+                  proxy_pass http://127.0.0.1:21081/;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:5173;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  # Vite HMR / WebSocket
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+              }
+          }
+    workspace_backend_nginx_core_upstream:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/nginx/workspace.d/core-upstream.conf
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-nginx-reload
+      body:
+        kind: text
+        content: |
+          f"server {$workspace.imports.$var_core_ip_address:value}:80;"
+
+  $core.em.services:
+    workspace_bootstrap:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-bootstrap
+      path: /usr/local/bin/workspace-bootstrap
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: oneshot
+      target_status: enabled
+    workspace_nginx:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-nginx
+      path: '/usr/sbin/nginx -g "daemon off;"'
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-nginx-reload --check-only
+    workspace_user_api:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-user-api
+      path: /usr/bin/workspace-user-api --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+    workspace_messenger_api:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-messenger-api
+      path: /usr/bin/workspace-messenger-api --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+    workspace_messenger_worker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-messenger-worker
+      path: /usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+    workspace_messenger_events:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-messenger-events
+      path: /usr/bin/workspace-messenger-events --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+
+exports:
+  backend_node:
+    link: "$core.compute.nodes.$workspace_backend"
+    kind: "resource"
+  db_instance:
+    link: "$dbaas.types.postgres.instances.$workspace_cluster_pg"
+    kind: "resource"

@@ -1,0 +1,79 @@
+name: Exordos element
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the built element to the configured Exordos repository"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  ARTIFACTS_PATH: output
+  EXORDOS_CFG: exordos/exordos.yaml
+
+jobs:
+  build:
+    runs-on: [self-hosted, vm]
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Exordos build prerequisites
+        run: |
+          set -euo pipefail
+
+          exordos version
+          command -v packer
+          command -v qemu-img
+          command -v qemu-system-x86_64
+          command -v mkisofs
+
+      - name: Build element
+        run: |
+          set -euo pipefail
+
+          rm -rf "${ARTIFACTS_PATH}"
+          exordos build . \
+            --exordos-cfg-file "${EXORDOS_CFG}" \
+            --output-dir "${ARTIFACTS_PATH}" \
+            --force
+
+      - name: Show build output
+        run: |
+          set -euo pipefail
+          find "${ARTIFACTS_PATH}" -maxdepth 4 -type f -printf "%p %s bytes\n"
+
+      - name: Publish element
+        env:
+          PUSH_CFG: ${{ secrets.PUSH_CFG }}
+        run: |
+          set -euo pipefail
+
+          : "${PUSH_CFG:?Set secret PUSH_CFG to base64-encoded exordos.push.yaml content}"
+
+          push_cfg_path="${RUNNER_TEMP}/exordos.push.yaml"
+          printf "%s" "${PUSH_CFG}" | base64 -d > "${push_cfg_path}"
+
+          latest_arg=()
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            latest_arg=(--latest)
+          fi
+
+          exordos push . \
+            --exordos-cfg-file "${push_cfg_path}" \
+            --element-dir "${ARTIFACTS_PATH}" \
+            --force \
+            "${latest_arg[@]}"
