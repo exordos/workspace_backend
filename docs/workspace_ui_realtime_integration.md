@@ -87,6 +87,82 @@ handshake is closed with code `4400`.
 ]
 ```
 
+Folder mutations use the same raw REST event envelope. Folder create/update
+payloads contain a full folder snapshot; folder and folder item deletes contain
+only the deleted entity id.
+
+Folder update raw REST event:
+
+```json
+{
+  "epoch_version": 125,
+  "uuid": "dbf5f7ad-4fe5-4fe7-8fa7-cd5cf65ad573",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "folder.updated",
+    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+    "project_id": "22222222-2222-2222-2222-222222222222",
+    "user_uuid": "11111111-1111-1111-1111-111111111111",
+    "title": "Inbox",
+    "background_color_value": 4280391411,
+    "system_type": "created",
+    "unread_count": 0,
+    "folder_items": [
+      {
+        "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+        "project_id": "22222222-2222-2222-2222-222222222222",
+        "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+        "user_uuid": "11111111-1111-1111-1111-111111111111",
+        "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+        "chat_type": "stream",
+        "order_index": 10,
+        "pinned_at": "2026-06-22T09:31:00Z",
+        "unread_count": 0,
+        "created_at": "2026-06-22T09:30:00Z",
+        "updated_at": "2026-06-22T09:31:00Z"
+      }
+    ],
+    "created_at": "2026-06-22T09:30:00Z",
+    "updated_at": "2026-06-22T09:31:00Z"
+  },
+  "created_at": "2026-06-22T09:31:00Z",
+  "updated_at": "2026-06-22T09:31:00Z"
+}
+```
+
+Delete raw REST events:
+
+```json
+{
+  "epoch_version": 126,
+  "uuid": "a1f9ddf2-b28c-4df0-89af-cab996ba43e1",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "folder.deleted",
+    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210"
+  },
+  "created_at": "2026-06-22T09:32:00Z",
+  "updated_at": "2026-06-22T09:32:00Z"
+}
+```
+
+```json
+{
+  "epoch_version": 127,
+  "uuid": "7ae06725-4d74-4704-97bb-ed8eceaef60e",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "folder_item.deleted",
+    "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50"
+  },
+  "created_at": "2026-06-22T09:33:00Z",
+  "updated_at": "2026-06-22T09:33:00Z"
+}
+```
+
 For catch-up, request events strictly newer than the last successfully handled
 epoch:
 
@@ -155,6 +231,75 @@ Event frame:
 }
 ```
 
+Folder update event frame:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 126,
+    "type": "folder",
+    "kind": "folder.updated",
+    "folder": {
+      "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+      "project_id": "22222222-2222-2222-2222-222222222222",
+      "user_uuid": "11111111-1111-1111-1111-111111111111",
+      "title": "Inbox",
+      "background_color_value": 4280391411,
+      "system_type": "created",
+      "unread_count": 0,
+      "folder_items": [
+        {
+          "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+          "project_id": "22222222-2222-2222-2222-222222222222",
+          "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+          "user_uuid": "11111111-1111-1111-1111-111111111111",
+          "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+          "chat_type": "stream",
+          "order_index": 10,
+          "pinned_at": "2026-06-22T09:31:00Z",
+          "unread_count": 0,
+          "created_at": "2026-06-22T09:30:00Z",
+          "updated_at": "2026-06-22T09:31:00Z"
+        }
+      ],
+      "created_at": "2026-06-22T09:30:00Z",
+      "updated_at": "2026-06-22T09:31:00Z"
+    }
+  }
+}
+```
+
+Delete event frames:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 127,
+    "type": "folder",
+    "kind": "folder.deleted",
+    "folder": {
+      "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210"
+    }
+  }
+}
+```
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 128,
+    "type": "folder_item",
+    "kind": "folder_item.deleted",
+    "folder_item": {
+      "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50"
+    }
+  }
+}
+```
+
 Ping frame:
 
 ```json
@@ -201,7 +346,18 @@ type WorkspaceRealtimeEvent = {
     }
   | {
       type: "folder";
+      kind: "folder.created" | "folder.updated";
       folder: WorkspaceFolder;
+    }
+  | {
+      type: "folder";
+      kind: "folder.deleted";
+      folder: { uuid: string };
+    }
+  | {
+      type: "folder_item";
+      kind: "folder_item.deleted";
+      folder_item: { uuid: string };
     }
 );
 ```
@@ -209,18 +365,40 @@ type WorkspaceRealtimeEvent = {
 REST `/events/` returns the raw outbox model, so the UI catch-up path must
 normalize `WorkspaceEventModel` to the same shape as websocket event frames.
 
-Current mapping for `payload.kind === "message.created"` and
-`payload.kind === "folder.created"`:
+Current mapping:
 
 ```ts
 function normalizeWorkspaceEvent(
   model: WorkspaceEventModel,
 ): WorkspaceRealtimeEvent | null {
-  if (model.payload.kind !== "message.created") {
-    if (model.payload.kind === "folder.created") {
+  switch (model.payload.kind) {
+    case "message.created":
+      return {
+        epoch_version: model.epoch_version,
+        type: "message",
+        message: {
+          uuid: model.payload.uuid,
+          project_id: model.payload.project_id,
+          user_uuid: model.payload.user_uuid,
+          stream_uuid: model.payload.stream_uuid,
+          topic_uuid: model.payload.topic_uuid,
+          author_uuid: model.payload.author_uuid,
+          payload: model.payload.payload,
+          read: model.payload.read,
+          pinned: model.payload.pinned,
+          starred: model.payload.starred,
+          is_own: model.payload.is_own,
+          created_at: model.payload.created_at,
+          updated_at: model.payload.updated_at,
+        },
+      };
+
+    case "folder.created":
+    case "folder.updated":
       return {
         epoch_version: model.epoch_version,
         type: "folder",
+        kind: model.payload.kind,
         folder: {
           uuid: model.payload.uuid,
           project_id: model.payload.project_id,
@@ -234,31 +412,31 @@ function normalizeWorkspaceEvent(
           updated_at: model.payload.updated_at,
         },
       };
-    }
 
-    console.warn("Unsupported workspace event kind", model.payload.kind);
-    return null;
+    case "folder.deleted":
+      return {
+        epoch_version: model.epoch_version,
+        type: "folder",
+        kind: "folder.deleted",
+        folder: {
+          uuid: model.payload.uuid,
+        },
+      };
+
+    case "folder_item.deleted":
+      return {
+        epoch_version: model.epoch_version,
+        type: "folder_item",
+        kind: "folder_item.deleted",
+        folder_item: {
+          uuid: model.payload.uuid,
+        },
+      };
+
+    default:
+      console.warn("Unsupported workspace event kind", model.payload.kind);
+      return null;
   }
-
-  return {
-    epoch_version: model.epoch_version,
-    type: "message",
-    message: {
-      uuid: model.payload.uuid,
-      project_id: model.payload.project_id,
-      user_uuid: model.payload.user_uuid,
-      stream_uuid: model.payload.stream_uuid,
-      topic_uuid: model.payload.topic_uuid,
-      author_uuid: model.payload.author_uuid,
-      payload: model.payload.payload,
-      read: model.payload.read,
-      pinned: model.payload.pinned,
-      starred: model.payload.starred,
-      is_own: model.payload.is_own,
-      created_at: model.payload.created_at,
-      updated_at: model.payload.updated_at,
-    },
-  };
 }
 ```
 
@@ -308,9 +486,9 @@ UUID.
   auth/session layer refreshes the token.
 - If the websocket closes with `4401`, treat it as an auth failure and wait for
   auth/session refresh.
-- If an unknown REST `payload.kind` or websocket `event.type` arrives, log it,
-  skip it, and advance the cursor after the skip decision so the UI does not
-  fetch the same unsupported event forever.
+- If an unknown REST `payload.kind`, websocket `event.type`, or websocket
+  `event.kind` arrives, log it, skip it, and advance the cursor after the skip
+  decision so the UI does not fetch the same unsupported event forever.
 - If a message payload kind is unknown, keep the event idempotent and avoid
   crashing the realtime loop. v1 only supports `payload.kind === "markdown"`.
 
@@ -319,9 +497,11 @@ UUID.
 - Delivery is at-least-once.
 - Ordering is by `epoch_version`.
 - The UI dispatch pipeline must be idempotent.
-- v1 supports `payload.kind === "message.created"` and
-  `payload.kind === "folder.created"` on REST, plus `event.type === "message"`
-  and `event.type === "folder"` on websocket.
+- REST v1 supports `message.created`, `folder.created`, `folder.updated`,
+  `folder.deleted`, and `folder_item.deleted`.
+- Websocket v1 emits `event.type === "message"`, `event.type === "folder"`,
+  and `event.type === "folder_item"`. Folder and folder item events include
+  `event.kind`.
 
 ## Manual Verification Checklist
 
@@ -334,4 +514,9 @@ test account.
 3. Reconnect does not duplicate already rendered messages.
 4. Own messages are displayed as own/read.
 5. Messages from another user in the same stream arrive through websocket.
-6. Unknown events are logged and skipped without breaking the realtime loop.
+6. Creating or renaming a folder updates folder state through websocket.
+7. Adding, pinning, and unpinning a stream in a folder updates the parent
+   folder snapshot through `folder.updated`.
+8. Deleting a folder removes it by `folder.uuid`; deleting a folder item removes
+   it by `folder_item.uuid`.
+9. Unknown events are logged and skipped without breaking the realtime loop.

@@ -165,9 +165,12 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `GET` | `/v1/folders/` | List folders for the current IAM user. |
 | `POST` | `/v1/folders/` | Create a folder. |
 | `GET` | `/v1/folders/{folder_uuid}` | Get a folder. |
+| `PUT` | `/v1/folders/{folder_uuid}` | Update a folder. |
+| `DELETE` | `/v1/folders/{folder_uuid}` | Delete a folder. |
 | `GET` | `/v1/folder_items/` | List folder items for the current IAM user. |
 | `POST` | `/v1/folder_items/` | Create a folder item. |
 | `GET` | `/v1/folder_items/{folder_item_uuid}` | Get a folder item. |
+| `DELETE` | `/v1/folder_items/{folder_item_uuid}` | Delete a folder item. |
 | `POST` | `/v1/folder_items/{folder_item_uuid}/actions/pin/invoke` | Pin a folder item. |
 | `POST` | `/v1/folder_items/{folder_item_uuid}/actions/unpin/invoke` | Unpin a folder item. |
 | `GET` | `/v1/streams/` | List streams visible to the current IAM user. |
@@ -244,7 +247,7 @@ Responses hide `project_id` and `user_uuid`.
 | `title` | string, 1..64 | yes | no | Folder title. |
 | `background_color_value` | integer `0..2^32-1` or `null` | no | no | ARGB color value. |
 | `unread_count` | integer | no | yes | Aggregated unread count. |
-| `system_type` | `all`, `created`, or `null` | no | no | System folder type; defaults to `created`. |
+| `system_type` | `all`, `created`, or `null` | no | yes | System folder type; defaults to `created`. |
 | `folder_items` | array | no | yes | Nested folder items from the view. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
@@ -254,8 +257,20 @@ Create request:
 ```json
 {
   "title": "Inbox",
-  "background_color_value": 4280391411,
-  "system_type": "created"
+  "background_color_value": 4280391411
+}
+```
+
+Example:
+
+```http
+POST /api/messenger/v1/folders/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "title": "Inbox",
+  "background_color_value": 4280391411
 }
 ```
 
@@ -288,6 +303,34 @@ Response example:
 }
 ```
 
+Update example:
+
+```http
+PUT /api/messenger/v1/folders/50ecadd0-9823-4d97-b54c-806cc672c210
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "title": "Archive",
+  "background_color_value": 4289352960
+}
+```
+
+Delete example:
+
+```http
+DELETE /api/messenger/v1/folders/50ecadd0-9823-4d97-b54c-806cc672c210
+Authorization: Bearer <access_token>
+```
+
+Realtime side effects:
+
+| Operation | Durable payload kind | Websocket event type | Websocket body |
+| --- | --- | --- | --- |
+| create folder | `folder.created` | `folder` | Full folder snapshot. |
+| update folder | `folder.updated` | `folder` | Full folder snapshot. |
+| delete folder | `folder.deleted` | `folder` | Only `folder.uuid`. |
+
 ## Folder Items
 
 `POST /v1/folder_items/` writes to `m_folder_items`. Reads use
@@ -318,8 +361,89 @@ Create request:
 }
 ```
 
+Create example:
+
+```http
+POST /api/messenger/v1/folder_items/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10
+}
+```
+
+Response example:
+
+```json
+{
+  "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10,
+  "pinned_at": null,
+  "unread_count": 0,
+  "created_at": "2026-06-22T09:30:00Z",
+  "updated_at": "2026-06-22T09:30:00Z"
+}
+```
+
 Pin and unpin return the same folder item shape. `pin` sets `pinned_at` to the
 current UTC time; `unpin` sets it to `null`.
+
+Pin example:
+
+```http
+POST /api/messenger/v1/folder_items/9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50/actions/pin/invoke
+Authorization: Bearer <access_token>
+```
+
+Pin response example:
+
+```json
+{
+  "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10,
+  "pinned_at": "2026-06-22T09:31:00Z",
+  "unread_count": 0,
+  "created_at": "2026-06-22T09:30:00Z",
+  "updated_at": "2026-06-22T09:31:00Z"
+}
+```
+
+Unpin example:
+
+```http
+POST /api/messenger/v1/folder_items/9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50/actions/unpin/invoke
+Authorization: Bearer <access_token>
+```
+
+Delete example:
+
+```http
+DELETE /api/messenger/v1/folder_items/9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50
+Authorization: Bearer <access_token>
+```
+
+Realtime side effects:
+
+| Operation | Durable payload kind | Websocket event type | Websocket body |
+| --- | --- | --- | --- |
+| add stream to folder | `folder.updated` | `folder` | Full parent folder snapshot with `folder_items`. |
+| pin stream in folder | `folder.updated` | `folder` | Full parent folder snapshot with updated `pinned_at`. |
+| unpin stream in folder | `folder.updated` | `folder` | Full parent folder snapshot with `pinned_at: null`. |
+| remove stream from folder | `folder_item.deleted` | `folder_item` | Only `folder_item.uuid`. |
 
 ## Streams
 
@@ -515,14 +639,15 @@ Response example:
 ## Events And Epoch
 
 Events are durable outbox rows stored in `m_workspace_events`. They are
-generated when messages and folders are created. Message events are scoped per
-recipient; folder events are scoped to the folder owner. The event primary
-identifier is `epoch_version`, a monotonically increasing integer.
+generated when messages are created and when folders or folder items change.
+Message events are scoped per recipient; folder and folder item events are
+scoped to the folder owner. The event primary identifier is `epoch_version`, a
+monotonically increasing integer.
 
 `GET /v1/events/` returns a standard RESTAlchemy list with no envelope. Events
 are sorted by `epoch_version` ascending by default.
 
-Example:
+Message event example:
 
 ```json
 [
@@ -556,8 +681,91 @@ Example:
 ]
 ```
 
-Folder create event payloads use `kind: "folder.created"` and contain the
-created folder snapshot from `m_folders_view`.
+Folder create and update event payloads contain a full folder snapshot from
+`m_folders_view`. Adding a stream to a folder and pinning or unpinning a folder
+item also produce `folder.updated`, because the parent folder snapshot changed.
+
+Folder update event example:
+
+```json
+{
+  "epoch_version": 125,
+  "uuid": "dbf5f7ad-4fe5-4fe7-8fa7-cd5cf65ad573",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "folder.updated",
+    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+    "project_id": "22222222-2222-2222-2222-222222222222",
+    "user_uuid": "11111111-1111-1111-1111-111111111111",
+    "title": "Inbox",
+    "background_color_value": 4280391411,
+    "system_type": "created",
+    "unread_count": 0,
+    "folder_items": [
+      {
+        "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+        "project_id": "22222222-2222-2222-2222-222222222222",
+        "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+        "user_uuid": "11111111-1111-1111-1111-111111111111",
+        "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+        "chat_type": "stream",
+        "order_index": 10,
+        "pinned_at": "2026-06-22T09:31:00Z",
+        "unread_count": 0,
+        "created_at": "2026-06-22T09:30:00Z",
+        "updated_at": "2026-06-22T09:31:00Z"
+      }
+    ],
+    "created_at": "2026-06-22T09:30:00Z",
+    "updated_at": "2026-06-22T09:31:00Z"
+  },
+  "created_at": "2026-06-22T09:31:00Z",
+  "updated_at": "2026-06-22T09:31:00Z"
+}
+```
+
+Delete events intentionally contain only the deleted entity identifier:
+
+```json
+{
+  "epoch_version": 126,
+  "uuid": "a1f9ddf2-b28c-4df0-89af-cab996ba43e1",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "folder.deleted",
+    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210"
+  },
+  "created_at": "2026-06-22T09:32:00Z",
+  "updated_at": "2026-06-22T09:32:00Z"
+}
+```
+
+```json
+{
+  "epoch_version": 127,
+  "uuid": "7ae06725-4d74-4704-97bb-ed8eceaef60e",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "folder_item.deleted",
+    "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50"
+  },
+  "created_at": "2026-06-22T09:33:00Z",
+  "updated_at": "2026-06-22T09:33:00Z"
+}
+```
+
+Supported event payload kinds:
+
+| Payload kind | Produced by | REST payload |
+| --- | --- | --- |
+| `message.created` | `POST /v1/messages/` | Full user message snapshot. |
+| `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
+| `folder.updated` | `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
+| `folder.deleted` | `DELETE /v1/folders/{uuid}` | Only deleted folder `uuid`. |
+| `folder_item.deleted` | `DELETE /v1/folder_items/{uuid}` | Only deleted folder item `uuid`. |
 
 For strict catch-up after a processed cursor, use:
 
@@ -599,3 +807,83 @@ the bearer token from `Sec-WebSocket-Protocol`. The `last_epoch_version` query
 parameter is optional at protocol level and defaults to `0`, but UI clients
 should always pass their latest persisted cursor. Detailed UI integration rules
 are documented in `docs/workspace_ui_realtime_integration.md`.
+
+Connection example from browser code:
+
+```ts
+const ws = new WebSocket(
+  "/api/messenger/ws?last_epoch_version=124",
+  ["workspace.events.v1", `bearer.${accessToken}`],
+);
+```
+
+The server sends dispatch-ready event frames. Folder create, folder update, and
+folder item add/pin/unpin events have `event.type: "folder"` and include a full
+folder snapshot:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 125,
+    "type": "folder",
+    "kind": "folder.updated",
+    "folder": {
+      "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+      "project_id": "22222222-2222-2222-2222-222222222222",
+      "user_uuid": "11111111-1111-1111-1111-111111111111",
+      "title": "Inbox",
+      "background_color_value": 4280391411,
+      "system_type": "created",
+      "unread_count": 0,
+      "folder_items": [
+        {
+          "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+          "project_id": "22222222-2222-2222-2222-222222222222",
+          "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+          "user_uuid": "11111111-1111-1111-1111-111111111111",
+          "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+          "chat_type": "stream",
+          "order_index": 10,
+          "pinned_at": "2026-06-22T09:31:00Z",
+          "unread_count": 0,
+          "created_at": "2026-06-22T09:30:00Z",
+          "updated_at": "2026-06-22T09:31:00Z"
+        }
+      ],
+      "created_at": "2026-06-22T09:30:00Z",
+      "updated_at": "2026-06-22T09:31:00Z"
+    }
+  }
+}
+```
+
+Delete events are minimal:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 126,
+    "type": "folder",
+    "kind": "folder.deleted",
+    "folder": {
+      "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210"
+    }
+  }
+}
+```
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 127,
+    "type": "folder_item",
+    "kind": "folder_item.deleted",
+    "folder_item": {
+      "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50"
+    }
+  }
+}
+```
