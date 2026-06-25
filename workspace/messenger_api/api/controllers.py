@@ -14,7 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
 import uuid as sys_uuid
 
 from restalchemy.api import actions as ra_actions
@@ -192,30 +191,19 @@ class FolderItemController(
 
     @ra_actions.post
     def pin(self, resource, *args, **kwargs):
-        dm = models.FolderItem.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(resource.uuid),
-                "project_id": dm_filters.EQ(self._get_project_id()),
-                "user_uuid": dm_filters.EQ(self._get_user_uuid()),
-            },
+        return messenger_dm_helpers.pin_workspace_user_folder_item(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            item_uuid=resource.uuid,
         )
-        dm.pinned_at = datetime.datetime.now(datetime.timezone.utc)
-        dm.save()
-        return self.get(uuid=resource.uuid)
 
     @ra_actions.post
     def unpin(self, resource, *args, **kwargs):
-        dm = models.FolderItem.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(resource.uuid),
-                "project_id": dm_filters.EQ(self._get_project_id()),
-                "user_uuid": dm_filters.EQ(self._get_user_uuid()),
-            },
+        return messenger_dm_helpers.unpin_workspace_user_folder_item(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            item_uuid=resource.uuid,
         )
-        dm.pinned_at = None
-        dm.save()
-        return self.get(uuid=resource.uuid)
-
 
 
 class WorkspaceStreamController(

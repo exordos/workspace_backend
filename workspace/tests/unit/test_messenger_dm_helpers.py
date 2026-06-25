@@ -180,6 +180,134 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_pin_workspace_user_folder_item_updates_folder_event(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        item_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_item = types.SimpleNamespace(uuid=item_uuid)
+        returned_folder = types.SimpleNamespace(uuid=folder_uuid)
+        saved_item = {}
+
+        class ExistingItem:
+            def __init__(self):
+                self.folder_uuid = folder_uuid
+                self.pinned_at = None
+
+            def save(self, session=None):
+                saved_item["save_session"] = session
+                saved_item["pinned_at"] = self.pinned_at
+
+        existing_item = ExistingItem()
+
+        class FakeFolderItem:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_item)
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "FolderItem", FakeFolderItem
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_folder_item",
+            return_value=returned_item,
+        ) as get_user_folder_item:
+            result = dm_helpers.pin_workspace_user_folder_item(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                item_uuid=item_uuid,
+                session=session,
+            )
+
+        self.assertIs(returned_item, result)
+        self.assertIs(session, saved_item["save_session"])
+        self.assertIsNotNone(saved_item["pinned_at"])
+        get_user_folder.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            folder=returned_folder,
+            session=session,
+        )
+        get_user_folder_item.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+
+    def test_unpin_workspace_user_folder_item_updates_folder_event(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        item_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_item = types.SimpleNamespace(uuid=item_uuid)
+        returned_folder = types.SimpleNamespace(uuid=folder_uuid)
+        saved_item = {}
+
+        class ExistingItem:
+            def __init__(self):
+                self.folder_uuid = folder_uuid
+                self.pinned_at = object()
+
+            def save(self, session=None):
+                saved_item["save_session"] = session
+                saved_item["pinned_at"] = self.pinned_at
+
+        existing_item = ExistingItem()
+
+        class FakeFolderItem:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_item)
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "FolderItem", FakeFolderItem
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_folder_item",
+            return_value=returned_item,
+        ) as get_user_folder_item:
+            result = dm_helpers.unpin_workspace_user_folder_item(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                item_uuid=item_uuid,
+                session=session,
+            )
+
+        self.assertIs(returned_item, result)
+        self.assertIs(session, saved_item["save_session"])
+        self.assertIsNone(saved_item["pinned_at"])
+        get_user_folder.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            folder=returned_folder,
+            session=session,
+        )
+        get_user_folder_item.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+
     def test_update_workspace_user_folder_updates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
@@ -107,6 +108,66 @@ def delete_workspace_user_folder_item(project_id, user_uuid, item_uuid,
     )
     item.delete(session=session)
     messenger_events.create_folder_item_deleted_event(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        item_uuid=item_uuid,
+        session=session,
+    )
+
+
+def pin_workspace_user_folder_item(project_id, user_uuid, item_uuid,
+                                   session=None):
+    item = models.FolderItem.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(item_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    item.pinned_at = datetime.datetime.now(datetime.timezone.utc)
+    item.save(session=session)
+    user_folder = get_workspace_user_folder(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        folder_uuid=item.folder_uuid,
+        session=session,
+    )
+    messenger_events.create_folder_updated_event(
+        folder=user_folder,
+        session=session,
+    )
+    return get_workspace_user_folder_item(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        item_uuid=item_uuid,
+        session=session,
+    )
+
+
+def unpin_workspace_user_folder_item(project_id, user_uuid, item_uuid,
+                                     session=None):
+    item = models.FolderItem.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(item_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    item.pinned_at = None
+    item.save(session=session)
+    user_folder = get_workspace_user_folder(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        folder_uuid=item.folder_uuid,
+        session=session,
+    )
+    messenger_events.create_folder_updated_event(
+        folder=user_folder,
+        session=session,
+    )
+    return get_workspace_user_folder_item(
         project_id=project_id,
         user_uuid=user_uuid,
         item_uuid=item_uuid,

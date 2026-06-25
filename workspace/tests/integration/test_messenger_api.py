@@ -341,6 +341,76 @@ def test_folder_item_delete_writes_deleted_event(api, db):
     assert event["folder_item"] == {"uuid": item["uuid"]}
 
 
+def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
+    resp = api.post(FOLDERS, json={"title": "Inbox"})
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "standups"
+    )
+    resp = api.post(
+        FOLDER_ITEMS,
+        json={
+            "folder_uuid": folder["uuid"],
+            "stream_uuid": stream_uuid,
+            "chat_type": "stream",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    item = resp.json()
+    assert item["pinned_at"] is None
+
+    resp = api.post(f"{FOLDER_ITEMS}{item['uuid']}/actions/pin/invoke")
+    assert resp.status_code == 200, resp.text
+    pinned_item = resp.json()
+    assert pinned_item["uuid"] == item["uuid"]
+    assert pinned_item["pinned_at"] is not None
+
+    resp = api.post(f"{FOLDER_ITEMS}{item['uuid']}/actions/unpin/invoke")
+    assert resp.status_code == 200, resp.text
+    unpinned_item = resp.json()
+    assert unpinned_item["uuid"] == item["uuid"]
+    assert unpinned_item["pinned_at"] is None
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 4
+    _, user_uuid, pin_payload = rows[2]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert pin_payload["kind"] == "folder.updated"
+    assert pin_payload["uuid"] == folder["uuid"]
+    assert pin_payload["folder_items"][0]["uuid"] == item["uuid"]
+    assert pin_payload["folder_items"][0]["pinned_at"] is not None
+
+    epoch_version, user_uuid, unpin_payload = rows[3]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert unpin_payload["kind"] == "folder.updated"
+    assert unpin_payload["uuid"] == folder["uuid"]
+    assert unpin_payload["folder_items"][0]["uuid"] == item["uuid"]
+    assert unpin_payload["folder_items"][0]["pinned_at"] is None
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": unpin_payload,
+        }
+    )
+    assert event["type"] == "folder"
+    assert event["kind"] == "folder.updated"
+    assert event["folder"]["folder_items"][0]["pinned_at"] is None
+
+
 def test_folders_are_scoped_to_the_authenticated_user(api):
     other_user = sys_uuid.uuid4()
 
