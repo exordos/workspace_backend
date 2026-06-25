@@ -71,14 +71,14 @@ HEADER_PROJECT = "X-Test-Project-Id"
 # --------------------------------------------------------------------------- #
 
 
-class _AllowAllEnforcer:
-    """Enforcer stub that authorizes every policy rule."""
+class _PolicyShouldNotBeCalledEnforcer:
+    """Enforcer stub that fails if workspace controllers ask for policy."""
 
     def enforce(self, rule, do_raise=False, exc=None):
-        return True
+        raise AssertionError(f"Policy enforcement is disabled, got {rule!r}")
 
     def enforce_raw(self, rule, do_raise=False, exc=None):
-        return True
+        raise AssertionError(f"Policy enforcement is disabled, got {rule!r}")
 
 
 class _FakeToken:
@@ -91,9 +91,8 @@ class _FakeToken:
 class FakeIamEngine:
     """Drop-in replacement for ``gcl_iam.engines.IamEngine``.
 
-    Exposes exactly the surface used by ``WorkspaceMessengerAuthContext`` and
-    ``PolicyBasedControllerMixin``: ``token_info``, ``introspection_info()``,
-    ``get_introspection_info()`` and ``enforcer``.
+    Exposes exactly the surface used by ``WorkspaceMessengerAuthContext``.
+    The enforcer is intentionally hostile: workspace must not call policies.
     """
 
     def __init__(self, user_uuid, project_id):
@@ -118,7 +117,7 @@ class FakeIamEngine:
 
     @property
     def enforcer(self):
-        return _AllowAllEnforcer()
+        return _PolicyShouldNotBeCalledEnforcer()
 
 
 class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):

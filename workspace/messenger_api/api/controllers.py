@@ -17,7 +17,6 @@
 import datetime
 import uuid as sys_uuid
 
-from gcl_iam.api import controllers as iam_controllers
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
@@ -65,11 +64,8 @@ class ApiEndpointController(ra_controllers.RoutesListController):
 
 
 class WorkspaceBaseResourceControllerPaginated(
-    iam_controllers.PolicyBasedController,
     ra_controllers.BaseResourceControllerPaginated,
 ):
-    __user_scoped__ = False
-
     _filter_operator_suffixes = (
         ("=>", dm_filters.GE),
         ("=<", dm_filters.LE),
@@ -120,25 +116,21 @@ class WorkspaceBaseResourceControllerPaginated(
         return filters
 
     def get_autofilters(self):
-        filters = super().get_autofilters().copy()
-        if not self.__user_scoped__:
-            return filters
-        filters["user_uuid"] = dm_filters.EQ(self._get_user_uuid())
-        return filters
+        return {
+            "project_id": dm_filters.EQ(self._get_project_id()),
+            "user_uuid": dm_filters.EQ(self._get_user_uuid()),
+        }
 
     def get_autovalues(self):
-        values = super().get_autovalues().copy()
-        if not self.__user_scoped__:
-            return values
-        values["user_uuid"] = self._get_user_uuid()
-        return values
+        return {
+            "project_id": self._get_project_id(),
+            "user_uuid": self._get_user_uuid(),
+        }
 
 
 class FolderController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __user_scoped__ = True
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.UserFolder,
         hidden_fields=["project_id", "user_uuid"],
@@ -147,11 +139,8 @@ class FolderController(
     )
 
     def create(self, **kwargs):
-        user_uuid = self._get_user_uuid()
         folder = models.Folder(
-            user_uuid=user_uuid,
-            project_id=self._get_project_id(),
-            **kwargs,
+            **self._apply_autovalues(kwargs),
         )
         folder.insert()
         return self.get(uuid=folder.uuid)
@@ -160,8 +149,6 @@ class FolderController(
 class FolderItemController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __user_scoped__ = True
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.UserFolderItem,
         convert_underscore=False,
@@ -169,11 +156,8 @@ class FolderItemController(
     )
 
     def create(self, **kwargs):
-        user_uuid = self._get_user_uuid()
         item = models.FolderItem(
-            user_uuid=user_uuid,
-            project_id=self._get_project_id(),
-            **kwargs,
+            **self._apply_autovalues(kwargs),
         )
         item.insert()
         return self.get(uuid=item.uuid)
@@ -209,8 +193,6 @@ class FolderItemController(
 class WorkspaceStreamController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __user_scoped__ = True
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=[],
@@ -219,15 +201,16 @@ class WorkspaceStreamController(
     )
 
     def create(self, **kwargs):
-        stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
+        values = self._apply_autovalues(kwargs)
+        stream_uuid = values.pop("uuid", None) or sys_uuid.uuid4()
+        project_id = values.pop("project_id")
+        user_uuid = values.pop("user_uuid")
 
         stream = models.WorkspaceStream(
             uuid=stream_uuid,
             project_id=project_id,
             user_uuid=user_uuid,
-            **kwargs,
+            **values,
         )
         stream.insert()
 
@@ -267,8 +250,6 @@ class WorkspaceStreamBindingController(
 class WorkspaceMessageController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __user_scoped__ = True
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserMessage,
         convert_underscore=False,
@@ -288,8 +269,6 @@ class WorkspaceMessageController(
 class WorkspaceEventController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __user_scoped__ = True
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceEvent,
         convert_underscore=False,
@@ -313,18 +292,19 @@ class WorkspaceEpochController(
 class WorkspaceStreamTopicController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __user_scoped__ = True
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserTopic,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def create(self, **kwargs):
-        project_id = self._get_project_id()
+    def get_autovalues(self):
+        return {
+            "project_id": self._get_project_id(),
+        }
 
-        topic = _create_topic_with_flags(project_id=project_id, **kwargs)
+    def create(self, **kwargs):
+        topic = _create_topic_with_flags(**self._apply_autovalues(kwargs))
 
         return self.get(uuid=topic.uuid)
 

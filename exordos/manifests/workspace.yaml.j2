@@ -15,6 +15,10 @@ imports:
     element: "$dbaas"
     kind: "resource"
     link: "$dbaas.types.postgres.versions.$pg18"
+  core_local_domain:
+    element: "$core"
+    kind: "resource"
+    link: "$core.dns.domains.$local_domain"
   var_default_cores:
     element: "$core"
     kind: "resource"
@@ -31,6 +35,10 @@ imports:
     element: "$core"
     kind: "resource"
     link: "$core.vs.variables.$hs256_jwks_encryption_key"
+  var_iam_default_client_id:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$iam_default_client_id"
 
 resources:
 
@@ -103,8 +111,8 @@ resources:
 
 
           [iam]
-          iam_endpoint = https://exordos.com/api/core/v1/iam/clients/default
-          audience = exordos
+          iam_endpoint = http://core.{$workspace.imports.$core_local_domain:name}/api/core/v1/iam/clients/default
+          audience = {$workspace.imports.$var_iam_default_client_id:value}
           hs256_jwks_decryption_key = {$workspace.imports.$var_hs256_jwks_encryption_key:value}
 
 
