@@ -31,6 +31,18 @@ GC_PG_PASS="pass"
 GC_PG_DB="workspace"
 
 SYSTEMD_SERVICE_DIR=/etc/systemd/system/
+WORKSPACE_BINARIES=(
+    workspace-user-api
+    workspace-messenger-api
+    workspace-messenger-worker
+    workspace-messenger-events
+)
+WORKSPACE_SERVICES=(
+    workspace-user-api.service
+    workspace-messenger-api.service
+    workspace-messenger-worker.service
+    workspace-messenger-events.service
+)
 
 # Install packages
 sudo apt update
@@ -42,14 +54,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 source "$HOME"/.local/bin/env
 
 # Default creds for workspace services
-sudo -u postgres psql -c "CREATE ROLE $GC_PG_USER WITH LOGIN PASSWORD '$GC_PG_PASS';"
-sudo -u postgres psql -c "CREATE DATABASE $GC_PG_USER OWNER $GC_PG_DB;"
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$GC_PG_USER'" | grep -q 1; then
+    sudo -u postgres psql -c "CREATE ROLE $GC_PG_USER WITH LOGIN PASSWORD '$GC_PG_PASS';"
+fi
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$GC_PG_DB'" | grep -q 1; then
+    sudo -u postgres createdb -O "$GC_PG_USER" "$GC_PG_DB"
+fi
 
 # Install genesis core
-sudo mkdir -p $GC_CFG_DIR
-sudo cp "$GC_PATH/etc/workspace/workspace.conf" $GC_CFG_DIR/
-sudo cp "$GC_PATH/etc/workspace/logging.yaml" $GC_CFG_DIR/
-sudo cp "$GC_PATH/genesis/images/bootstrap.sh" $BOOTSTRAP_PATH/0100-gc-bootstrap.sh
+sudo mkdir -p "$GC_CFG_DIR" "$BOOTSTRAP_PATH" "$SYSTEMD_SERVICE_DIR"
+sudo cp "$GC_PATH/etc/workspace/workspace.conf" "$GC_CFG_DIR/"
+sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
+sudo cp "$GC_PATH/genesis/images/bootstrap.sh" "$BOOTSTRAP_PATH/0100-gc-bootstrap.sh"
 
 cd "$GC_PATH"
 uv sync
@@ -60,10 +76,17 @@ ra-apply-migration --config-dir "$GC_PATH/etc/workspace/" --path "$GC_PATH/migra
 deactivate
 
 # Create links to venv
-sudo ln -sf "$VENV_PATH/bin/workspace-user-api" "/usr/bin/workspace-user-api"
+for binary in "${WORKSPACE_BINARIES[@]}"; do
+    sudo ln -sf "$VENV_PATH/bin/$binary" "/usr/bin/$binary"
+done
 
 # Install Systemd service files
-sudo cp "$GC_PATH/etc/systemd/workspace-user-api.service" $SYSTEMD_SERVICE_DIR
+for service in "${WORKSPACE_SERVICES[@]}"; do
+    sudo cp "$GC_PATH/etc/systemd/$service" "$SYSTEMD_SERVICE_DIR"
+done
+sudo systemctl daemon-reload
 
 # Enable workspace services
-sudo systemctl enable workspace-user-api
+for service in "${WORKSPACE_SERVICES[@]}"; do
+    sudo systemctl enable "$service"
+done
