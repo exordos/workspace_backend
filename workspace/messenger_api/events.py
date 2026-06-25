@@ -14,91 +14,43 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.storage.sql import engines
 
 from workspace.messenger_api.dm import event_payloads
+from workspace.messenger_api.dm import models
 
 
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 DEFAULT_EVENTS_LIMIT = 100
 MAX_EVENTS_LIMIT = 500
+WORKSPACE_USER_MESSAGE_FIELDS = tuple(
+    models.WorkspaceUserMessage.properties.properties
+)
 
 
 def _to_uuid_string(value):
     return str(value).lower()
 
 
-def _to_epoch_seconds(value):
-    if value is None:
-        return 0
-    if isinstance(value, str):
-        value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(value)
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=datetime.timezone.utc)
-    return int(value.timestamp())
-
-
-def _build_message_snapshot(message):
-    return event_payloads.MessageCreatedEventPayload(
-        uuid=message.uuid,
-        stream_uuid=message.stream_uuid,
-        topic_uuid=message.topic_uuid,
-        author_uuid=message.user_uuid,
-        payload=message.payload,
-        created_at=message.created_at,
-        updated_at=message.updated_at,
-    )
-
-
-def _message_from_event_payload(event_payload, recipient_uuid):
-    payload = event_payload.get("payload") or {}
-    content = payload.get("content") or ""
-    is_own = _to_uuid_string(recipient_uuid) == _to_uuid_string(
-        event_payload["author_uuid"]
-    )
-    read = is_own
-    pinned = False
-    starred = False
-    message = {
-        "id": _to_uuid_string(event_payload["uuid"]),
-        "source_message_uuid": _to_uuid_string(event_payload["uuid"]),
-        "sender_id": 0,
-        "author_uuid": _to_uuid_string(event_payload["author_uuid"]),
-        "sender_uuid": _to_uuid_string(event_payload["author_uuid"]),
-        "is_own": is_own,
-        "read": read,
-        "pinned": pinned,
-        "starred": starred,
-        "sender_full_name": "",
-        "stream_uuid": _to_uuid_string(event_payload["stream_uuid"]),
-        "display_recipient": "",
-        "channel": "",
-        "subject": "",
-        "content": content,
-        "markdown_source": content,
-        "timestamp": _to_epoch_seconds(event_payload.get("created_at")),
-        "type": "stream",
-        "flags": [
-            flag
-            for flag, enabled in (
-                ("read", read),
-                ("pinned", pinned),
-                ("starred", starred),
+def _message_from_event_payload(event_payload):
+    result = {}
+    for name in WORKSPACE_USER_MESSAGE_FIELDS:
+        value = event_payload[name]
+        if value is None:
+            continue
+        if name in ("created_at", "updated_at"):
+            value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(
+                value
             )
-            if enabled
-        ],
-        "reactions": [],
-        "payload": payload,
-        "uuid": _to_uuid_string(event_payload["uuid"]),
-    }
-    if event_payload.get("topic_uuid") is not None:
-        message["topic_uuid"] = _to_uuid_string(event_payload["topic_uuid"])
-    return message
+            value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
+        elif name.endswith("uuid") or name == "project_id":
+            value = _to_uuid_string(value)
+        result[name] = value
+    return result
 
 
 def event_row_to_messenger_event(row):
@@ -108,12 +60,8 @@ def event_row_to_messenger_event(row):
     return {
         "epoch_version": row["epoch_version"],
         "type": "message",
-        "message": _message_from_event_payload(payload, row["user_uuid"]),
+        "message": _message_from_event_payload(payload),
     }
-
-
-def _event_payload_to_simple_type(payload):
-    return event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.to_simple_type(payload)
 
 
 def _fetch_one(session, statement, values):
@@ -126,130 +74,69 @@ def _fetch_all(session, statement, values):
     return list(result.fetchall())
 
 
-def get_stream_recipients(project_id, stream_uuid, session=None):
+def create_message_event(project_id, message, recipients, session=None):
+    if not recipients:
+        return []
+
+    event_uuids = [str(sys_uuid.uuid4()) for _ in recipients]
+    recipient_uuids = [str(recipient_uuid) for recipient_uuid in recipients]
     engine = engines.engine_factory.get_engine()
     with engine.session_manager(session=session) as s:
         rows = _fetch_all(
             s,
             """
-            SELECT DISTINCT user_uuid
-            FROM m_workspace_stream_bindings
-            WHERE project_id = %s
-              AND stream_uuid = %s
-            ORDER BY user_uuid
-            """,
-            (str(project_id), str(stream_uuid)),
-        )
-    return [row["user_uuid"] for row in rows]
-
-
-def ensure_stream_member(project_id, stream_uuid, user_uuid, session=None):
-    recipients = get_stream_recipients(project_id, stream_uuid, session=session)
-    if user_uuid not in recipients:
-        raise ra_exc.ValidationErrorException()
-    return recipients
-
-
-def ensure_topic_belongs_to_stream(project_id, stream_uuid, topic_uuid, session=None):
-    if topic_uuid is None:
-        raise ra_exc.ValidationErrorException()
-    engine = engines.engine_factory.get_engine()
-    with engine.session_manager(session=session) as s:
-        row = _fetch_one(
-            s,
-            """
-            SELECT uuid
-            FROM m_workspace_stream_topics
-            WHERE uuid = %s
-              AND stream_uuid = %s
-              AND project_id = %s
-            """,
-            (str(topic_uuid), str(stream_uuid), str(project_id)),
-        )
-    if row is None:
-        raise ra_exc.ValidationErrorException()
-
-
-def create_message_flags(project_id, message_uuid, author_uuid, recipients,
-                         session=None):
-    engine = engines.engine_factory.get_engine()
-    with engine.session_manager(session=session) as s:
-        for recipient_uuid in recipients:
-            s.execute(
-                """
-                INSERT INTO m_workspace_user_message_flags
-                    (uuid, user_uuid, project_id, read, pinned, starred,
-                     created_at, updated_at)
-                VALUES (%s, %s, %s, %s, FALSE, FALSE, NOW(), NOW())
-                ON CONFLICT (uuid, user_uuid) DO NOTHING
-                """,
-                (
-                    str(message_uuid),
-                    str(recipient_uuid),
-                    str(project_id),
-                    recipient_uuid == author_uuid,
-                ),
-            )
-
-
-def create_message_event(project_id, message, recipients, session=None):
-    engine = engines.engine_factory.get_engine()
-    with engine.session_manager(session=session) as s:
-        epoch_versions = []
-        payload = _build_message_snapshot(message)
-        for recipient_uuid in recipients:
-            row = _fetch_one(
-                s,
-                """
+            WITH recipients AS (
+                SELECT *
+                FROM unnest(%s::uuid[], %s::uuid[]) AS r(
+                    event_uuid,
+                    user_uuid
+                )
+            ),
+            inserted AS (
                 INSERT INTO m_workspace_events
                     (uuid, project_id, user_uuid, payload, created_at,
                      updated_at)
-                VALUES (%s, %s, %s, %s::jsonb, NOW(), NOW())
+                SELECT
+                    r.event_uuid,
+                    um.project_id,
+                    um.user_uuid,
+                    to_jsonb(um) || jsonb_build_object(
+                        'kind', %s::text,
+                        'created_at', to_char(
+                            um.created_at,
+                            'YYYY-MM-DD HH24:MI:SS.US'
+                        ),
+                        'updated_at', to_char(
+                            um.updated_at,
+                            'YYYY-MM-DD HH24:MI:SS.US'
+                        )
+                    ),
+                    NOW(),
+                    NOW()
+                FROM recipients AS r
+                JOIN m_workspace_user_messages_view AS um
+                    ON  um.uuid = %s
+                    AND um.project_id = %s
+                    AND um.user_uuid = r.user_uuid
+                ORDER BY um.user_uuid
                 RETURNING epoch_version
-                """,
-                (
-                    str(sys_uuid.uuid4()),
-                    str(project_id),
-                    str(recipient_uuid),
-                    _event_payload_to_simple_type(payload),
-                ),
             )
-            epoch_version = row["epoch_version"]
-            epoch_versions.append(epoch_version)
-            s.execute(
-                "SELECT pg_notify(%s, %s)",
-                (EVENTS_CHANNEL, str(epoch_version)),
-            )
+            SELECT epoch_version
+            FROM inserted
+            ORDER BY epoch_version
+            """,
+            (
+                event_uuids,
+                recipient_uuids,
+                MESSAGE_CREATED_EVENT,
+                str(message.uuid),
+                str(project_id),
+            ),
+        )
 
-        return epoch_versions
-
-
-def create_outbox_for_message(project_id, message, session=None):
-    recipients = ensure_stream_member(
-        project_id=project_id,
-        stream_uuid=message.stream_uuid,
-        user_uuid=message.user_uuid,
-        session=session,
-    )
-    ensure_topic_belongs_to_stream(
-        project_id=project_id,
-        stream_uuid=message.stream_uuid,
-        topic_uuid=message.topic_uuid,
-        session=session,
-    )
-    create_message_flags(
-        project_id=project_id,
-        message_uuid=message.uuid,
-        author_uuid=message.user_uuid,
-        recipients=recipients,
-        session=session,
-    )
-    return create_message_event(
-        project_id=project_id,
-        message=message,
-        recipients=recipients,
-        session=session,
-    )
+    if len(rows) != len(recipients):
+        raise ra_exc.ValidationErrorException()
+    return [row["epoch_version"] for row in rows]
 
 
 def _event_rows_statement(where_clause):

@@ -18,8 +18,9 @@
 
 import uuid as sys_uuid
 
+from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import messages as messenger_messages
 from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import models
 from workspace.tests.integration import conftest
 
 
@@ -264,6 +265,12 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert message["read"] is True
     assert message["is_own"] is True
 
+    other_message_resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
+    assert other_message_resp.status_code == 200, other_message_resp.text
+    other_message = other_message_resp.json()
+    assert other_message["read"] is False
+    assert other_message["is_own"] is False
+
     with db.cursor() as cur:
         cur.execute(
             """
@@ -303,10 +310,32 @@ def test_message_create_writes_flags_and_visible_events(api, db):
         "kind": "markdown",
         "content": "hello over epochs",
     }
-    assert "read" not in author_payload
-    assert "is_own" not in author_payload
-    assert "read" not in other_payload
-    assert "is_own" not in other_payload
+    assert author_payload["user_uuid"] == str(api.user_uuid)
+    assert author_payload["project_id"] == str(api.project_id)
+    assert author_payload["read"] is True
+    assert author_payload["pinned"] is False
+    assert author_payload["starred"] is False
+    assert author_payload["is_own"] is True
+    assert other_payload["user_uuid"] == str(other_user)
+    assert other_payload["project_id"] == str(api.project_id)
+    assert other_payload["read"] is False
+    assert other_payload["pinned"] is False
+    assert other_payload["starred"] is False
+    assert other_payload["is_own"] is False
+    assert messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": 1,
+            "user_uuid": api.user_uuid,
+            "payload": author_payload,
+        }
+    )["message"] == message
+    assert messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": 2,
+            "user_uuid": other_user,
+            "payload": other_payload,
+        }
+    )["message"] == other_message
 
     author_resp = api.get(EVENTS, params={"page_limit": 100})
     assert author_resp.status_code == 200, author_resp.text
@@ -321,8 +350,10 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert event["payload"]["topic_uuid"] == topic_uuid
     assert event["payload"]["author_uuid"] == str(api.user_uuid)
     assert event["payload"]["payload"]["content"] == "hello over epochs"
-    assert "read" not in event["payload"]
-    assert "is_own" not in event["payload"]
+    assert event["payload"]["user_uuid"] == str(api.user_uuid)
+    assert event["payload"]["project_id"] == str(api.project_id)
+    assert event["payload"]["read"] is True
+    assert event["payload"]["is_own"] is True
 
     other_events = api.get(
         EVENTS,
@@ -333,8 +364,10 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     other_event = other_events[0]
     assert other_event["payload"]["uuid"] == message_uuid
     assert other_event["payload"]["kind"] == "message.created"
-    assert "read" not in other_event["payload"]
-    assert "is_own" not in other_event["payload"]
+    assert other_event["payload"]["user_uuid"] == str(other_user)
+    assert other_event["payload"]["project_id"] == str(api.project_id)
+    assert other_event["payload"]["read"] is False
+    assert other_event["payload"]["is_own"] is False
 
     outsider_events = api.get(
         EVENTS,
@@ -407,15 +440,15 @@ def test_message_create_requires_topic(api, db):
     assert resp.status_code == 400, resp.text
 
 
-def test_message_model_insert_writes_visible_event(api, db):
+def test_message_helper_writes_visible_event(api, db):
     stream_uuid = conftest.seed_user_stream(
-        db, api.project_id, api.user_uuid, "model-events-team"
+        db, api.project_id, api.user_uuid, "helper-events-team"
     )
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
     message_uuid = sys_uuid.uuid4()
-    message = models.WorkspaceMessage(
+    message = messenger_messages.create_workspace_user_message(
         uuid=message_uuid,
         project_id=sys_uuid.UUID(api.project_id),
         user_uuid=sys_uuid.UUID(api.user_uuid),
@@ -424,14 +457,14 @@ def test_message_model_insert_writes_visible_event(api, db):
         payload=message_payloads.MarkdownPayload(content="created through model"),
     )
 
-    message.insert()
-
     resp = api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text
     events = resp.json()
     assert len(events) == 1
     assert events[0]["payload"]["uuid"] == str(message_uuid)
     assert events[0]["payload"]["kind"] == "message.created"
+    assert events[0]["payload"]["user_uuid"] == str(message.user_uuid)
+    assert events[0]["payload"]["read"] is True
 
 
 def test_events_filter_by_epoch_range(api, db):
@@ -445,7 +478,7 @@ def test_events_filter_by_epoch_range(api, db):
     for content in ("first through model", "second through model"):
         message_uuid = sys_uuid.uuid4()
         message_uuids.append(str(message_uuid))
-        message = models.WorkspaceMessage(
+        messenger_messages.create_workspace_user_message(
             uuid=message_uuid,
             project_id=sys_uuid.UUID(api.project_id),
             user_uuid=sys_uuid.UUID(api.user_uuid),
@@ -453,7 +486,6 @@ def test_events_filter_by_epoch_range(api, db):
             topic_uuid=sys_uuid.UUID(topic_uuid),
             payload=message_payloads.MarkdownPayload(content=content),
         )
-        message.insert()
 
     resp = api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text

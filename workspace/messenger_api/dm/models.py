@@ -16,6 +16,7 @@
 
 import enum
 
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -23,9 +24,8 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
-from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import event_payloads
-from workspace.messenger_api.dm import message_payloads
 
 
 class ChatType(str, enum.Enum):
@@ -43,18 +43,6 @@ class ReactionStatus(str, enum.Enum):
     NEW = "new"
     ACTIVE = "active"
     DELETED = "deleted"
-
-
-class UserScopedModelWithUUID(models.ModelWithUUID):
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-        id_property=True,
-    )
-
-    @classmethod
-    def get_id_property(cls):
-        return {"uuid": cls.properties.properties["uuid"]}
 
 
 class Folder(
@@ -88,7 +76,7 @@ class Folder(
 
 class UserFolder(
     models.DumpToSimpleViewMixin,
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -121,7 +109,7 @@ class UserFolder(
 
 class FolderItem(
     models.DumpToSimpleViewMixin,
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -152,7 +140,7 @@ class FolderItem(
 
 class UserFolderItem(
     models.DumpToSimpleViewMixin,
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -296,6 +284,13 @@ class WorkspaceStream(
         default=False,
     )
 
+    def get_recipients(self, session=None):
+        return get_stream_recipients(
+            project_id=self.project_id,
+            stream_uuid=self.uuid,
+            session=session,
+        )
+
 
 class WorkspaceStreamBinding(
     models.ModelWithUUID,
@@ -328,8 +323,20 @@ class WorkspaceStreamBinding(
         )
 
 
+def get_stream_recipients(project_id, stream_uuid, session=None):
+    bindings = WorkspaceStreamBinding.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        order_by={"user_uuid": "asc"},
+        session=session,
+    )
+    return [binding.user_uuid for binding in bindings]
+
+
 class WorkspaceUserStream(
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithRequiredNameDesc,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -380,6 +387,13 @@ class WorkspaceUserStream(
             }
         )
 
+    def get_recipients(self, session=None):
+        return get_stream_recipients(
+            project_id=self.project_id,
+            stream_uuid=self.uuid,
+            session=session,
+        )
+
 
 class WorkspaceMessageReactions(
     models.ModelWithUUID,
@@ -408,7 +422,7 @@ class WorkspaceMessageReactions(
 
 
 class WorkspaceEvent(
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -427,6 +441,12 @@ class WorkspaceEvent(
     @classmethod
     def get_id_property(cls):
         return {"epoch_version": cls.properties.properties["epoch_version"]}
+
+    def _get_prepared_data(self, properties=None):
+        data = super()._get_prepared_data(properties=properties)
+        if "epoch_version" in data and data["epoch_version"] is None:
+            data.pop("epoch_version")
+        return data
 
 
 class WorkspaceStreamTopic(
@@ -458,9 +478,16 @@ class WorkspaceStreamTopic(
     def is_default(self):
         return self.default_for_stream_uuid is not None
 
+    def get_recipients(self, session=None):
+        return get_stream_recipients(
+            project_id=self.project_id,
+            stream_uuid=self.stream_uuid,
+            session=session,
+        )
+
 
 class WorkspaceUserTopic(
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -497,85 +524,71 @@ class WorkspaceUserTopic(
             }
         )
 
+    def get_recipients(self, session=None):
+        return get_stream_recipients(
+            project_id=self.project_id,
+            stream_uuid=self.stream_uuid,
+            session=session,
+        )
+
 
 class WorkspaceMessage(
     models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
+    base.WorkspaceMessageBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_messages"
 
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    payload = properties.property(
-        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
-        required=True,
-    )
     user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
-    topic_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
 
-    def insert(self, session=None):
-        super().insert(session=session)
-        messenger_events.create_outbox_for_message(
+    def validate(self):
+        super().validate()
+        binding = WorkspaceStreamBinding.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+            },
+        )
+        if binding is None:
+            raise ra_exc.ValidationErrorException()
+        topic = WorkspaceStreamTopic.objects.get_one_or_none(
+            filters={
+                "uuid": dm_filters.EQ(self.topic_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.stream_uuid),
+            },
+        )
+        if topic is None:
+            raise ra_exc.ValidationErrorException()
+
+    def get_recipients(self, session=None):
+        return get_stream_recipients(
             project_id=self.project_id,
-            message=self,
+            stream_uuid=self.stream_uuid,
             session=session,
         )
 
 
 class WorkspaceUserMessage(
-    UserScopedModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
+    base.WorkspaceUserMessageBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_user_messages_view"
 
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    author_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    topic_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    payload = properties.property(
-        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
-        required=True,
-    )
-    read = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    pinned = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    starred = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    is_own = properties.property(
-        types.Boolean(),
-        default=False,
-    )
+    def get_recipients(self, session=None):
+        return get_stream_recipients(
+            project_id=self.project_id,
+            stream_uuid=self.stream_uuid,
+            session=session,
+        )
 
 
 class WorkspaceUserMessageFlags(
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
@@ -597,7 +610,7 @@ class WorkspaceUserMessageFlags(
 
 
 class WorkspaceUserTopicFlags(
-    UserScopedModelWithUUID,
+    base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,

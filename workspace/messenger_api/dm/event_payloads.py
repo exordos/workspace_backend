@@ -14,46 +14,46 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
+
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
-from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import base
 
 
-MESSAGE_EVENT_TIMESTAMP_TYPE = types.UTCDateTimeZ()
+class MessageEventTimestampType(types.UTCDateTimeZ):
+    def from_simple_type(self, value):
+        try:
+            return super().from_simple_type(value)
+        except ValueError:
+            if not isinstance(value, str):
+                raise
+            parsed = datetime.datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
 
 
-class MessageCreatedEventPayload(types_dynamic.AbstractKindModel):
+MESSAGE_EVENT_TIMESTAMP_TYPE = MessageEventTimestampType()
+
+
+class MessageCreatedEventPayload(
+    types_dynamic.AbstractKindModel,
+    base.WorkspaceUserMessageBase,
+):
     KIND = "message.created"
 
-    uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    topic_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    author_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    payload = properties.property(
-        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
-        required=True,
-    )
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
-        required=True,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
     updated_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
-        required=True,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
 
 

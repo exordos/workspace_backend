@@ -311,7 +311,7 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
                 (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
                  created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, 'owner', NOW(), NOW())
-            ON CONFLICT (project_id, stream_uuid, user_uuid, who_uuid) DO NOTHING
+            ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
             """,
             (str(sys_uuid.uuid4()), str(project_id), str(stream_uuid),
              str(user_uuid), str(user_uuid)),
@@ -343,7 +343,7 @@ def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid,
                 (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
                  created_at, updated_at)
             VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
-            ON CONFLICT (project_id, stream_uuid, user_uuid, who_uuid) DO NOTHING
+            ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
             """,
             (str(sys_uuid.uuid4()), str(project_id), str(stream_uuid),
              str(user_uuid), str(user_uuid), role),

@@ -27,6 +27,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api import events
+from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api import websocket_protocol
 
 
@@ -99,10 +100,31 @@ class MessengerEventsTestCase(unittest.TestCase):
             split("epoch_version"),
         )
 
-    def test_event_row_to_messenger_event_derives_message_flags(self):
+    def test_event_row_to_messenger_event_uses_rest_message_snapshot(self):
         author_uuid = sys_uuid.uuid4()
         recipient_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        message = {
+            "uuid": str(message_uuid),
+            "user_uuid": str(recipient_uuid),
+            "project_id": str(project_id),
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:00:00.000000Z",
+            "stream_uuid": str(stream_uuid),
+            "author_uuid": str(author_uuid),
+            "topic_uuid": str(topic_uuid),
+            "payload": {
+                "kind": "markdown",
+                "content": "hello",
+            },
+            "read": False,
+            "pinned": False,
+            "starred": False,
+            "is_own": False,
+        }
         event = events.event_row_to_messenger_event(
             {
                 "epoch_version": 7,
@@ -110,13 +132,19 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "payload": {
                     "kind": "message.created",
                     "uuid": str(message_uuid),
-                    "stream_uuid": str(sys_uuid.uuid4()),
-                    "topic_uuid": str(sys_uuid.uuid4()),
+                    "user_uuid": str(recipient_uuid),
+                    "project_id": str(project_id),
+                    "stream_uuid": str(stream_uuid),
+                    "topic_uuid": str(topic_uuid),
                     "author_uuid": str(author_uuid),
                     "payload": {
                         "kind": "markdown",
                         "content": "hello",
                     },
+                    "read": False,
+                    "pinned": False,
+                    "starred": False,
+                    "is_own": False,
                     "created_at": "2026-06-24 10:00:00.000000",
                     "updated_at": "2026-06-24 10:00:00.000000",
                 },
@@ -125,10 +153,44 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(7, event["epoch_version"])
         self.assertEqual("message", event["type"])
-        self.assertEqual(str(message_uuid), event["message"]["id"])
-        self.assertFalse(event["message"]["is_own"])
-        self.assertFalse(event["message"]["read"])
-        self.assertEqual([], event["message"]["flags"])
+        self.assertEqual(message, event["message"])
+
+    def test_message_event_payload_accepts_postgres_json_timestamp(self):
+        author_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "message.created",
+                "uuid": str(message_uuid),
+                "user_uuid": str(recipient_uuid),
+                "project_id": str(project_id),
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "author_uuid": str(author_uuid),
+                "payload": {
+                    "kind": "markdown",
+                    "content": "hello",
+                },
+                "read": False,
+                "pinned": False,
+                "starred": False,
+                "is_own": False,
+                "created_at": "2026-06-24T22:28:34.166369",
+                "updated_at": "2026-06-24T22:28:34.166369",
+            }
+        )
+
+        self.assertEqual(
+            "2026-06-24T22:28:34.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.created_at
+            ),
+        )
 
     def test_websocket_consumer_accepts_pong_frames(self):
         websockets_stub = types.ModuleType("websockets")

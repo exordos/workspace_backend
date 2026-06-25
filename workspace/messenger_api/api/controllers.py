@@ -25,9 +25,10 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from webob import multidict
 
+from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import messages as messenger_messages
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
-from workspace.messenger_api import events as messenger_events
 
 
 def _create_topic_with_flags(project_id, **kwargs):
@@ -275,16 +276,13 @@ class WorkspaceMessageController(
     )
 
     def create(self, **kwargs):
-        message_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
-        message = models.WorkspaceMessage(
-            uuid=message_uuid,
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            **kwargs,
+        values = self._apply_autovalues(kwargs)
+        return messenger_messages.create_workspace_user_message(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=values.pop("user_uuid"),
+            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            **values,
         )
-        message.insert()
-
-        return self.get(uuid=message.uuid)
 
 
 class WorkspaceEventController(
