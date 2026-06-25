@@ -37,6 +37,79 @@ service endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 Authorization: Bearer <token>
 ```
 
+To get a token in the local test environment, request it from Exordos Core IAM
+through the gateway and use the `access_token` field from the response:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+
+grant_type=login%2Bpassword&
+login=admin&
+password=admin&
+scope=openid+email+profile+project%3Af04648e8-2bdf-4e93-b7bb-aac9850133fe&
+ttl=3600&
+refresh_ttl=172800
+```
+
+The same token request can also be sent as JSON:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/json
+Accept: application/json
+
+{
+  "grant_type": "login+password",
+  "login": "admin",
+  "password": "admin",
+  "scope": "openid email profile project:f04648e8-2bdf-4e93-b7bb-aac9850133fe",
+  "ttl": 3600,
+  "refresh_ttl": 172800
+}
+```
+
+The UI client uses the IAM default client. No client credentials are required or
+sent from browser-side code. `ttl=3600` means the access token is issued for 1
+hour. `refresh_ttl=172800` means the refresh token is issued for 2 days.
+
+Example authenticated request:
+
+```http
+GET /api/messenger/v1/folders/
+Authorization: Bearer <access_token from IAM response>
+```
+
+To refresh an expired access token, send the refresh token to the same default
+client endpoint:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+
+grant_type=refresh_token&
+refresh_token=<refresh_token from IAM response>
+```
+
+JSON refresh body is also accepted:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/json
+Accept: application/json
+
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "<refresh_token from IAM response>"
+}
+```
+
+Use the new `access_token` from the response for subsequent messenger API
+requests. If the refresh response includes a new `refresh_token`, replace the
+stored refresh token with it.
+
 `user_uuid` is taken from IAM token information. `project_id` is taken from IAM
 introspection information. User-scoped resources automatically filter and/or
 write the current `user_uuid`.
@@ -122,8 +195,9 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 
 ## Server Settings
 
-`GET /v1/server_settings` is implemented by middleware and does not use the
-resource router. Unsupported query parameters are reported in
+`GET /v1/server_settings` is public and does not require `Authorization`. It is
+implemented by middleware and does not use the resource router. Unsupported
+query parameters are reported in
 `ignored_parameters_unsupported`.
 
 Example response:
