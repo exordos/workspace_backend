@@ -44,7 +44,13 @@ sudo apt install -y \
     nginx \
     postgresql-client
 
-sudo mkdir -p "$GC_CFG_DIR" /etc/nginx/conf.d /etc/nginx/workspace.d /usr/local/bin
+sudo mkdir -p \
+    "$GC_CFG_DIR" \
+    /etc/nginx/conf.d \
+    /etc/nginx/sites-available \
+    /etc/nginx/sites-enabled \
+    /etc/nginx/workspace.d \
+    /usr/local/bin
 sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 
 cd "$GC_PATH"

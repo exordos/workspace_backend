@@ -135,7 +135,7 @@ resources:
           "
     workspace_backend_nginx:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/nginx/conf.d/workspace.conf
+      path: /etc/nginx/sites-available/workspace.conf
       target:
         kind: node
         node: $core.compute.nodes.$workspace_backend:uuid
@@ -151,7 +151,7 @@ resources:
 
           server {
               listen 80;
-              server_name workspace.exordos.local;
+              server_name _;
 
               location /api/core/ {
                   proxy_pass http://workspace_core_api/api/core/;

@@ -24,7 +24,9 @@ if [ "${1:-}" = "--check-only" ]; then
     CHECK_ONLY=1
 fi
 
-NGINX_CONFIG="/etc/nginx/conf.d/workspace.conf"
+NGINX_CONFIG="/etc/nginx/sites-available/workspace.conf"
+NGINX_ENABLED="/etc/nginx/sites-enabled/workspace.conf"
+OLD_NGINX_CONFIG="/etc/nginx/conf.d/workspace.conf"
 CORE_UPSTREAM="/etc/nginx/workspace.d/core-upstream.conf"
 
 wait_for_nginx_configs() {
@@ -43,6 +45,9 @@ else
 fi
 
 rm -f /etc/nginx/sites-enabled/default
+rm -f "$OLD_NGINX_CONFIG"
+mkdir -p "$(dirname "$NGINX_CONFIG")" "$(dirname "$NGINX_ENABLED")"
+ln -sfn "$NGINX_CONFIG" "$NGINX_ENABLED"
 nginx -t
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
