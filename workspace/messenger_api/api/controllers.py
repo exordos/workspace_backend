@@ -22,6 +22,7 @@ from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage import exceptions as storage_exc
 from webob import multidict
 
 from workspace.messenger_api import events as messenger_events
@@ -242,9 +243,37 @@ class WorkspaceStreamBindingController(
         process_filters=True,
     )
 
+    def get_autofilters(self):
+        return {
+            "project_id": dm_filters.EQ(self._get_project_id()),
+        }
+
+    def get_autovalues(self):
+        return {
+            "project_id": self._get_project_id(),
+        }
+
+    def _get_existing_binding(self, values):
+        return models.WorkspaceStreamBinding.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(values["project_id"]),
+                "stream_uuid": dm_filters.EQ(values["stream_uuid"]),
+                "user_uuid": dm_filters.EQ(values["user_uuid"]),
+            },
+        )
+
     def create(self, **kwargs):
         kwargs["who_uuid"] = self._get_user_uuid()
-        return super().create(**kwargs)
+        values = self._apply_autovalues(kwargs)
+        binding = self.model(**values)
+        try:
+            binding.insert()
+        except storage_exc.ConflictRecords:
+            existing = self._get_existing_binding(values)
+            if existing is None:
+                raise
+            return existing
+        return binding
 
 
 class WorkspaceMessageController(

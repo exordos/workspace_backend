@@ -16,10 +16,14 @@
 
 import types
 import uuid as sys_uuid
+from unittest import mock
 
 from gcl_iam.api import controllers as iam_controllers
+from restalchemy.storage import exceptions as storage_exc
+from restalchemy.storage.sql import orm
 
 from workspace.messenger_api.api import controllers
+from workspace.messenger_api.dm import models
 
 
 def test_workspace_controller_does_not_use_policy_based_controller():
@@ -67,3 +71,80 @@ def test_topic_controller_autovalues_match_topic_table_shape():
     assert filters["project_id"].value == project_id
     assert filters["user_uuid"].value == user_uuid
     assert values == {"project_id": project_id}
+
+
+def test_stream_binding_controller_preserves_target_user_uuid():
+    project_id = sys_uuid.uuid4()
+    actor_uuid = sys_uuid.uuid4()
+    target_user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=actor_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamBindingController(request)
+
+    with mock.patch.object(models.WorkspaceStreamBinding, "insert") as insert:
+        binding = controller.create(
+            project_id=sys_uuid.uuid4(),
+            stream_uuid=stream_uuid,
+            user_uuid=target_user_uuid,
+            who_uuid=sys_uuid.uuid4(),
+            role=models.WorkspaceStreamRole.MEMBER.value,
+        )
+
+    insert.assert_called_once_with()
+    assert binding.project_id == project_id
+    assert binding.stream_uuid == stream_uuid
+    assert binding.user_uuid == target_user_uuid
+    assert binding.who_uuid == actor_uuid
+
+
+def test_stream_binding_controller_returns_existing_binding_on_duplicate():
+    project_id = sys_uuid.uuid4()
+    actor_uuid = sys_uuid.uuid4()
+    target_user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=actor_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamBindingController(request)
+    existing = models.WorkspaceStreamBinding(
+        uuid=sys_uuid.uuid4(),
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_uuid=target_user_uuid,
+        who_uuid=actor_uuid,
+        role=models.WorkspaceStreamRole.MEMBER.value,
+    )
+    conflict = storage_exc.ConflictRecords(
+        model="binding",
+        msg="duplicate key value violates unique constraint",
+    )
+
+    with mock.patch.object(
+        models.WorkspaceStreamBinding,
+        "insert",
+        side_effect=conflict,
+    ):
+        with mock.patch.object(
+            orm.ObjectCollection,
+            "get_one_or_none",
+            return_value=existing,
+        ) as get_one_or_none:
+            binding = controller.create(
+                stream_uuid=stream_uuid,
+                user_uuid=target_user_uuid,
+                role=models.WorkspaceStreamRole.MEMBER.value,
+            )
+
+    assert binding is existing
+    filters = get_one_or_none.call_args.kwargs["filters"]
+    assert filters["project_id"].value == project_id
+    assert filters["stream_uuid"].value == stream_uuid
+    assert filters["user_uuid"].value == target_user_uuid
