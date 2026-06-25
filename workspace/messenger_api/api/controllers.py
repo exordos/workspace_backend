@@ -157,6 +157,13 @@ class FolderController(
             **values,
         )
 
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_user_folder(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            folder_uuid=uuid,
+        )
+
 
 class FolderItemController(
     WorkspaceBaseResourceControllerPaginated,

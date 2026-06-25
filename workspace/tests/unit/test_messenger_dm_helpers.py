@@ -172,6 +172,46 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_delete_workspace_user_folder_deletes_event_with_folder_id(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        session = object()
+        deleted_folder = {}
+
+        class ExistingFolder:
+            def delete(self, session=None):
+                deleted_folder["delete_session"] = session
+
+        existing_folder = ExistingFolder()
+
+        class FakeFolder:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_folder)
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "Folder", FakeFolder
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_deleted_event"
+        ) as create_event:
+            result = dm_helpers.delete_workspace_user_folder(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                folder_uuid=folder_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(session, deleted_folder["delete_session"])
+        FakeFolder.objects.get_one.assert_called_once()
+        create_event.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

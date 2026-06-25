@@ -82,6 +82,25 @@ def update_workspace_user_folder(project_id, user_uuid, folder_uuid,
     return user_folder
 
 
+def delete_workspace_user_folder(project_id, user_uuid, folder_uuid,
+                                 session=None):
+    folder = models.Folder.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(folder_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    folder.delete(session=session)
+    messenger_events.create_folder_deleted_event(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        folder_uuid=folder_uuid,
+        session=session,
+    )
+
+
 def get_workspace_user_message(project_id, user_uuid, message_uuid,
                                session=None):
     return models.WorkspaceUserMessage.objects.get_one(

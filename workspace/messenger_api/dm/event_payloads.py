@@ -17,6 +17,7 @@
 import datetime
 
 from restalchemy.dm import properties
+from restalchemy.dm import models
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
@@ -81,8 +82,16 @@ class FolderUpdatedEventPayload(FolderEventPayloadBase):
     KIND = "folder.updated"
 
 
+class FolderDeletedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    KIND = "folder.deleted"
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
+    types_dynamic.KindModelType(FolderDeletedEventPayload),
 )

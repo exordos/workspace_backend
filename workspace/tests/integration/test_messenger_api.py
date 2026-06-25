@@ -131,6 +131,7 @@ def test_folder_create_writes_realtime_event(api, db):
         }
     )
     assert event["type"] == "folder"
+    assert event["kind"] == "folder.created"
     assert event["folder"]["uuid"] == folder["uuid"]
     assert event["folder"]["title"] == "Inbox"
 
@@ -175,8 +176,52 @@ def test_folder_update_writes_realtime_event(api, db):
         }
     )
     assert event["type"] == "folder"
+    assert event["kind"] == "folder.updated"
     assert event["folder"]["uuid"] == folder["uuid"]
     assert event["folder"]["title"] == "Archive"
+
+
+def test_folder_delete_writes_realtime_event(api, db):
+    resp = api.post(FOLDERS, json={"title": "Inbox"})
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+
+    resp = api.delete(f"{FOLDERS}{folder['uuid']}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{FOLDERS}{folder['uuid']}")
+    assert resp.status_code == 404, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 2
+    epoch_version, user_uuid, payload = rows[1]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload == {
+        "kind": "folder.deleted",
+        "uuid": folder["uuid"],
+    }
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "folder"
+    assert event["kind"] == "folder.deleted"
+    assert event["folder"] == {"uuid": folder["uuid"]}
 
 
 def test_folders_are_scoped_to_the_authenticated_user(api):

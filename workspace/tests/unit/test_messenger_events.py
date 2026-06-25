@@ -197,6 +197,7 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(8, event["epoch_version"])
         self.assertEqual("folder", event["type"])
+        self.assertEqual("folder.created", event["kind"])
         self.assertEqual(folder, event["folder"])
 
     def test_event_row_to_messenger_event_uses_updated_folder_snapshot(self):
@@ -226,8 +227,29 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(9, event["epoch_version"])
         self.assertEqual("folder", event["type"])
+        self.assertEqual("folder.updated", event["kind"])
         self.assertEqual("Archive", event["folder"]["title"])
         self.assertEqual(str(folder_uuid), event["folder"]["uuid"])
+
+    def test_event_row_to_messenger_event_uses_deleted_folder_id(self):
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 10,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "folder.deleted",
+                    "uuid": str(folder_uuid),
+                },
+            }
+        )
+
+        self.assertEqual(10, event["epoch_version"])
+        self.assertEqual("folder", event["type"])
+        self.assertEqual("folder.deleted", event["kind"])
+        self.assertEqual({"uuid": str(folder_uuid)}, event["folder"])
 
     def test_message_event_payload_accepts_postgres_json_timestamp(self):
         author_uuid = sys_uuid.uuid4()
@@ -323,6 +345,18 @@ class MessengerEventsTestCase(unittest.TestCase):
                 payload.updated_at
             ),
         )
+
+    def test_folder_deleted_event_payload_accepts_folder_id(self):
+        folder_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "folder.deleted",
+                "uuid": str(folder_uuid),
+            }
+        )
+
+        self.assertEqual(folder_uuid, payload.uuid)
 
     def test_workspace_event_insert_omits_generated_epoch_version(self):
         user_uuid = sys_uuid.uuid4()
@@ -464,6 +498,41 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Archive", created_event["payload"].title)
         self.assertEqual(updated_at, created_event["payload"].updated_at)
+
+    def test_create_folder_deleted_event_uses_folder_id(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 44
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_folder_deleted_event(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                folder_uuid=folder_uuid,
+                session=session,
+            )
+
+        self.assertEqual(44, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.FolderDeletedEventPayload,
+        )
+        self.assertEqual(folder_uuid, created_event["payload"].uuid)
 
     def test_websocket_consumer_accepts_pong_frames(self):
         websockets_stub = types.ModuleType("websockets")

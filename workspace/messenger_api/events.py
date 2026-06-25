@@ -27,7 +27,11 @@ EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 FOLDER_UPDATED_EVENT = event_payloads.FolderUpdatedEventPayload.KIND
-FOLDER_EVENTS = (FOLDER_CREATED_EVENT, FOLDER_UPDATED_EVENT)
+FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
+FOLDER_EVENTS = (
+    FOLDER_CREATED_EVENT,
+    FOLDER_UPDATED_EVENT,
+)
 DEFAULT_EVENTS_LIMIT = 100
 MAX_EVENTS_LIMIT = 500
 WORKSPACE_USER_MESSAGE_FIELDS = tuple(
@@ -72,6 +76,12 @@ def _folder_from_event_payload(event_payload):
     }
 
 
+def _deleted_folder_from_event_payload(event_payload):
+    return {
+        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
+    }
+
+
 def event_row_to_messenger_event(row):
     payload = row["payload"]
     if payload["kind"] == MESSAGE_CREATED_EVENT:
@@ -80,10 +90,18 @@ def event_row_to_messenger_event(row):
             "type": "message",
             "message": _message_from_event_payload(payload),
         }
+    if payload["kind"] == FOLDER_DELETED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "folder",
+            "kind": payload["kind"],
+            "folder": _deleted_folder_from_event_payload(payload),
+        }
     if payload["kind"] in FOLDER_EVENTS:
         return {
             "epoch_version": row["epoch_version"],
             "type": "folder",
+            "kind": payload["kind"],
             "folder": _folder_from_event_payload(payload),
         }
     raise ra_exc.ValidationErrorException()
@@ -185,6 +203,20 @@ def create_folder_updated_event(folder, session=None):
         user_uuid=folder.user_uuid,
         payload=event_payloads.FolderUpdatedEventPayload(
             **dict(folder)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_folder_deleted_event(project_id, user_uuid, folder_uuid,
+                                session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.FolderDeletedEventPayload(
+            uuid=folder_uuid,
         ),
     )
     return event.insert(session=session)
