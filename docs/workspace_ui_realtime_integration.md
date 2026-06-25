@@ -194,21 +194,48 @@ shape:
 ```ts
 type WorkspaceRealtimeEvent = {
   epoch_version: number;
-  type: "message";
-  message: WorkspaceUserMessage;
-};
+} & (
+  | {
+      type: "message";
+      message: WorkspaceUserMessage;
+    }
+  | {
+      type: "folder";
+      folder: WorkspaceFolder;
+    }
+);
 ```
 
 REST `/events/` returns the raw outbox model, so the UI catch-up path must
 normalize `WorkspaceEventModel` to the same shape as websocket event frames.
 
-Current mapping for `payload.kind === "message.created"`:
+Current mapping for `payload.kind === "message.created"` and
+`payload.kind === "folder.created"`:
 
 ```ts
 function normalizeWorkspaceEvent(
   model: WorkspaceEventModel,
 ): WorkspaceRealtimeEvent | null {
   if (model.payload.kind !== "message.created") {
+    if (model.payload.kind === "folder.created") {
+      return {
+        epoch_version: model.epoch_version,
+        type: "folder",
+        folder: {
+          uuid: model.payload.uuid,
+          project_id: model.payload.project_id,
+          user_uuid: model.payload.user_uuid,
+          title: model.payload.title,
+          background_color_value: model.payload.background_color_value,
+          unread_count: model.payload.unread_count,
+          system_type: model.payload.system_type,
+          folder_items: model.payload.folder_items,
+          created_at: model.payload.created_at,
+          updated_at: model.payload.updated_at,
+        },
+      };
+    }
+
     console.warn("Unsupported workspace event kind", model.payload.kind);
     return null;
   }
@@ -292,8 +319,9 @@ UUID.
 - Delivery is at-least-once.
 - Ordering is by `epoch_version`.
 - The UI dispatch pipeline must be idempotent.
-- v1 supports only `payload.kind === "message.created"` on REST and
-  `event.type === "message"` on websocket.
+- v1 supports `payload.kind === "message.created"` and
+  `payload.kind === "folder.created"` on REST, plus `event.type === "message"`
+  and `event.type === "folder"` on websocket.
 
 ## Manual Verification Checklist
 

@@ -515,8 +515,9 @@ Response example:
 ## Events And Epoch
 
 Events are durable outbox rows stored in `m_workspace_events`. They are
-generated when messages are created and are scoped per recipient. The event
-primary identifier is `epoch_version`, a monotonically increasing integer.
+generated when messages and folders are created. Message events are scoped per
+recipient; folder events are scoped to the folder owner. The event primary
+identifier is `epoch_version`, a monotonically increasing integer.
 
 `GET /v1/events/` returns a standard RESTAlchemy list with no envelope. Events
 are sorted by `epoch_version` ascending by default.
@@ -554,6 +555,9 @@ Example:
   }
 ]
 ```
+
+Folder create event payloads use `kind: "folder.created"` and contain the
+created folder snapshot from `m_folders_view`.
 
 For strict catch-up after a processed cursor, use:
 

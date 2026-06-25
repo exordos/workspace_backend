@@ -22,6 +22,40 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import models
 
 
+def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
+                              session=None):
+    return models.UserFolder.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(folder_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+
+
+def create_workspace_user_folder(project_id, user_uuid, session=None,
+                                 **kwargs):
+    folder = models.Folder(
+        uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
+        project_id=project_id,
+        user_uuid=user_uuid,
+        **kwargs,
+    )
+    folder.insert(session=session)
+    user_folder = get_workspace_user_folder(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        folder_uuid=folder.uuid,
+        session=session,
+    )
+    messenger_events.create_folder_event(
+        folder=user_folder,
+        session=session,
+    )
+    return user_folder
+
+
 def get_workspace_user_message(project_id, user_uuid, message_uuid,
                                session=None):
     return models.WorkspaceUserMessage.objects.get_one(
@@ -63,7 +97,7 @@ def create_workspace_user_message(project_id, user_uuid, session=None,
         recipients=recipients,
         session=session,
     )
-    messenger_events.create_message_event(
+    messenger_events.create_message_events(
         project_id=project_id,
         message=message,
         recipients=recipients,

@@ -19,7 +19,7 @@
 import uuid as sys_uuid
 
 from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api import messages as messenger_messages
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.tests.integration import conftest
 
@@ -93,6 +93,46 @@ def test_folder_crud_roundtrip(api):
     # gone
     resp = api.get(f"{FOLDERS}{folder_uuid}")
     assert resp.status_code == 404, resp.text
+
+
+def test_folder_create_writes_realtime_event(api, db):
+    resp = api.post(FOLDERS, json={"title": "Inbox"})
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 1
+    epoch_version, user_uuid, payload = rows[0]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload["kind"] == "folder.created"
+    assert payload["uuid"] == folder["uuid"]
+    assert payload["title"] == "Inbox"
+    assert payload["user_uuid"] == str(api.user_uuid)
+    assert payload["project_id"] == str(api.project_id)
+    assert payload["unread_count"] == 0
+    assert payload["folder_items"] == []
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "folder"
+    assert event["folder"]["uuid"] == folder["uuid"]
+    assert event["folder"]["title"] == "Inbox"
 
 
 def test_folders_are_scoped_to_the_authenticated_user(api):
@@ -448,7 +488,7 @@ def test_message_helper_writes_visible_event(api, db):
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
     message_uuid = sys_uuid.uuid4()
-    message = messenger_messages.create_workspace_user_message(
+    message = messenger_dm_helpers.create_workspace_user_message(
         uuid=message_uuid,
         project_id=sys_uuid.UUID(api.project_id),
         user_uuid=sys_uuid.UUID(api.user_uuid),
@@ -478,7 +518,7 @@ def test_events_filter_by_epoch_range(api, db):
     for content in ("first through model", "second through model"):
         message_uuid = sys_uuid.uuid4()
         message_uuids.append(str(message_uuid))
-        messenger_messages.create_workspace_user_message(
+        messenger_dm_helpers.create_workspace_user_message(
             uuid=message_uuid,
             project_id=sys_uuid.UUID(api.project_id),
             user_uuid=sys_uuid.UUID(api.user_uuid),

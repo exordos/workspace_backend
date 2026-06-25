@@ -26,8 +26,8 @@ from restalchemy.storage import exceptions as storage_exc
 from webob import multidict
 
 from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api import messages as messenger_messages
 from workspace.messenger_api.api import versions
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import models
 
 
@@ -140,11 +140,13 @@ class FolderController(
     )
 
     def create(self, **kwargs):
-        folder = models.Folder(
-            **self._apply_autovalues(kwargs),
+        values = self._apply_autovalues(kwargs)
+        return messenger_dm_helpers.create_workspace_user_folder(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
+            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            **values,
         )
-        folder.insert()
-        return self.get(uuid=folder.uuid)
 
 
 class FolderItemController(
@@ -287,7 +289,7 @@ class WorkspaceMessageController(
 
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
-        return messenger_messages.create_workspace_user_message(
+        return messenger_dm_helpers.create_workspace_user_message(
             project_id=values.pop("project_id", self._get_project_id()),
             user_uuid=values.pop("user_uuid"),
             uuid=values.pop("uuid", None) or sys_uuid.uuid4(),

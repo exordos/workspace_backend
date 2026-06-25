@@ -15,12 +15,14 @@
 #    under the License.
 
 import asyncio
+import datetime
 import importlib
 import json
 import sys
 import types
 import unittest
 import uuid as sys_uuid
+from unittest import mock
 
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
@@ -28,6 +30,7 @@ from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api import events
 from workspace.messenger_api.dm import event_payloads
+from workspace.messenger_api.dm import models
 from workspace.messenger_api import websocket_protocol
 
 
@@ -155,6 +158,47 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("message", event["type"])
         self.assertEqual(message, event["message"])
 
+    def test_event_row_to_messenger_event_uses_rest_folder_snapshot(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        folder = {
+            "uuid": str(folder_uuid),
+            "user_uuid": str(user_uuid),
+            "project_id": str(project_id),
+            "title": "Inbox",
+            "background_color_value": None,
+            "unread_count": 0,
+            "system_type": "created",
+            "folder_items": [],
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:00:00.000000Z",
+        }
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 8,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "folder.created",
+                    "uuid": str(folder_uuid),
+                    "user_uuid": str(user_uuid),
+                    "project_id": str(project_id),
+                    "title": "Inbox",
+                    "background_color_value": None,
+                    "unread_count": 0,
+                    "system_type": "created",
+                    "folder_items": [],
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:00:00.000000",
+                },
+            }
+        )
+
+        self.assertEqual(8, event["epoch_version"])
+        self.assertEqual("folder", event["type"])
+        self.assertEqual(folder, event["folder"])
+
     def test_message_event_payload_accepts_postgres_json_timestamp(self):
         author_uuid = sys_uuid.uuid4()
         recipient_uuid = sys_uuid.uuid4()
@@ -191,6 +235,124 @@ class MessengerEventsTestCase(unittest.TestCase):
                 payload.created_at
             ),
         )
+
+    def test_folder_event_payload_accepts_postgres_json_timestamp(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "folder.created",
+                "uuid": str(folder_uuid),
+                "user_uuid": str(user_uuid),
+                "project_id": str(project_id),
+                "title": "Inbox",
+                "background_color_value": None,
+                "unread_count": 0,
+                "system_type": "created",
+                "folder_items": [],
+                "created_at": "2026-06-24T22:28:34.166369",
+                "updated_at": "2026-06-24T22:28:34.166369",
+            }
+        )
+
+        self.assertEqual("Inbox", payload.title)
+        self.assertEqual(
+            "2026-06-24T22:28:34.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.created_at
+            ),
+        )
+
+    def test_workspace_event_insert_omits_generated_epoch_version(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        payload = event_payloads.FolderCreatedEventPayload(
+            uuid=folder_uuid,
+            user_uuid=user_uuid,
+            project_id=project_id,
+            title="Inbox",
+            background_color_value=None,
+            unread_count=0,
+            system_type="created",
+            folder_items=[],
+        )
+        event = models.WorkspaceEvent(
+            uuid=sys_uuid.uuid4(),
+            user_uuid=user_uuid,
+            project_id=project_id,
+            payload=payload,
+        )
+        session = mock.MagicMock()
+        session.execute.return_value.fetchone.return_value = {
+            "epoch_version": 42
+        }
+        engine = mock.MagicMock()
+        engine.escape.side_effect = lambda value: f'"{value}"'
+        engine.session_manager.return_value.__enter__.return_value = session
+
+        with mock.patch.object(
+            models.WorkspaceEvent, "_get_engine", return_value=engine
+        ):
+            result = event.insert()
+
+        statement = session.execute.call_args.args[0]
+        inserted_columns = statement.split("VALUES", 1)[0]
+        self.assertNotIn("epoch_version", inserted_columns)
+        self.assertIn('RETURNING "epoch_version"', statement)
+        self.assertEqual(42, result)
+        self.assertEqual(42, event.epoch_version)
+
+    def test_create_folder_event_uses_user_folder_snapshot(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        user_folder = models.UserFolder(
+            uuid=folder_uuid,
+            user_uuid=user_uuid,
+            project_id=project_id,
+            title="Inbox",
+            background_color_value=None,
+            unread_count=0,
+            system_type="created",
+            folder_items=[],
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 42
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_folder_event(
+                folder=user_folder,
+                session=session,
+            )
+
+        self.assertEqual(42, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.FolderCreatedEventPayload,
+        )
+        self.assertEqual("Inbox", created_event["payload"].title)
+        self.assertEqual(created_at, created_event["payload"].created_at)
 
     def test_websocket_consumer_accepts_pong_frames(self):
         websockets_stub = types.ModuleType("websockets")

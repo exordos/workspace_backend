@@ -1,0 +1,43 @@
+# New users added to exordos
+# Password: Test12345!
+# Role: newcomer (726f6c65-0000-0000-0000-000000000001)
+
+# Projects:
+# - f04648e8-2bdf-4e93-b7bb-aac9850133fe (Workspace)
+# - fe02e55d-4548-4b3e-a175-fcae928f41b2 (New Project)
+
+charlie:
+  uuid: 05c53ea8-4c94-4ec0-8b85-aa16717feaa2
+  email: charlie@example.com
+  first_name: Charlie
+  last_name: Brown
+
+eugene:
+  uuid: 1a6911d7-a9ac-4c9f-b957-1062cb91ff66
+  email: eugene@frolov.net.ru
+  first_name: Eugene
+  last_name: Frolov
+
+eve:
+  uuid: 568189a7-a7d0-497f-94e9-80ef259a409b
+  email: eve@example.com
+  first_name: Eve
+  last_name: Wilson
+
+bob:
+  uuid: 5bedf04d-e7e1-463d-9a7a-15ac5a7fa41e
+  email: bob@example.com
+  first_name: Bob
+  last_name: Jones
+
+diana:
+  uuid: 94db454f-1d92-423f-a41d-cb4658d3722a
+  email: diana@example.com
+  first_name: Diana
+  last_name: Prince
+
+alice:
+  uuid: cc0d427f-bd17-437b-9e42-c20a5c26b42d
+  email: alice@example.com
+  first_name: Alice
+  last_name: Smith

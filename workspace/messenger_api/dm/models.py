@@ -35,8 +35,8 @@ class ChatType(str, enum.Enum):
 
 
 class SystemFolderType(str, enum.Enum):
-    ALL = "all"
-    CREATED = "created"
+    ALL = base.FOLDER_SYSTEM_TYPE_ALL
+    CREATED = base.FOLDER_SYSTEM_TYPE_CREATED
 
 
 class ReactionStatus(str, enum.Enum):
@@ -46,69 +46,20 @@ class ReactionStatus(str, enum.Enum):
 
 
 class Folder(
-    models.DumpToSimpleViewMixin,
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
+    base.WorkspaceFolderBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_folders"
 
-    title = properties.property(
-        types.String(min_length=1, max_length=64),
-        required=True,
-    )
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    background_color_value = properties.property(
-        types.AllowNone(types.Integer(min_value=0, max_value=2**32 - 1)),
-        default=None,
-    )
-    system_type = properties.property(
-        types.AllowNone(
-            types.Enum([folder_type.value for folder_type in SystemFolderType])
-        ),
-        default=SystemFolderType.CREATED.value,
-    )
-
 
 class UserFolder(
-    models.DumpToSimpleViewMixin,
-    base.UserScopedModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
+    base.WorkspaceUserFolderBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_folders_view"
 
-    title = properties.property(
-        types.String(min_length=1, max_length=64),
-        required=True,
-    )
-    background_color_value = properties.property(
-        types.AllowNone(types.Integer(min_value=0, max_value=2**32 - 1)),
-        default=None,
-    )
-    unread_count = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-    system_type = properties.property(
-        types.AllowNone(
-            types.Enum([folder_type.value for folder_type in SystemFolderType])
-        ),
-        default=SystemFolderType.CREATED.value,
-    )
-    folder_items = properties.property(
-        types.List(),
-        default=list,
-    )
-
 
 class FolderItem(
-    models.DumpToSimpleViewMixin,
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -139,7 +90,6 @@ class FolderItem(
 
 
 class UserFolderItem(
-    models.DumpToSimpleViewMixin,
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
@@ -319,7 +269,10 @@ class WorkspaceStreamBinding(
 
     def get_stream(self):
         return WorkspaceStream.objects.get_one(
-            filters={"uuid": dm_filters.EQ(self.stream_uuid)}
+            filters={
+                "uuid": dm_filters.EQ(self.stream_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
+            },
         )
 
 
@@ -447,6 +400,23 @@ class WorkspaceEvent(
         if "epoch_version" in data and data["epoch_version"] is None:
             data.pop("epoch_version")
         return data
+
+    def insert(self, session=None):
+        engine = self._get_engine()
+        data = self._get_prepared_data()
+        data.pop("epoch_version", None)
+        columns = tuple(data)
+        statement = (
+            f"INSERT INTO {engine.escape(self.get_table().name)} "
+            f"({', '.join(engine.escape(column) for column in columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(columns))}) "
+            f"RETURNING {engine.escape('epoch_version')}"
+        )
+        with engine.session_manager(session=session) as s:
+            row = s.execute(statement, tuple(data[column] for column in columns))
+            self.epoch_version = row.fetchone()["epoch_version"]
+            self._saved = True
+        return self.epoch_version
 
 
 class WorkspaceStreamTopic(

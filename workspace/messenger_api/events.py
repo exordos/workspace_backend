@@ -25,15 +25,32 @@ from workspace.messenger_api.dm import models
 
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
+FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 DEFAULT_EVENTS_LIMIT = 100
 MAX_EVENTS_LIMIT = 500
 WORKSPACE_USER_MESSAGE_FIELDS = tuple(
     models.WorkspaceUserMessage.properties.properties
 )
+WORKSPACE_USER_FOLDER_FIELDS = tuple(
+    models.UserFolder.properties.properties
+)
 
 
 def _to_uuid_string(value):
     return str(value).lower()
+
+
+def _event_payload_value(name, value):
+    if value is None:
+        return None
+    if name in ("created_at", "updated_at"):
+        value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(
+            value
+        )
+        return event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
+    if name == "uuid" or name.endswith("uuid") or name == "project_id":
+        return _to_uuid_string(value)
+    return value
 
 
 def _message_from_event_payload(event_payload):
@@ -42,26 +59,32 @@ def _message_from_event_payload(event_payload):
         value = event_payload[name]
         if value is None:
             continue
-        if name in ("created_at", "updated_at"):
-            value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(
-                value
-            )
-            value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
-        elif name.endswith("uuid") or name == "project_id":
-            value = _to_uuid_string(value)
-        result[name] = value
+        result[name] = _event_payload_value(name, value)
     return result
+
+
+def _folder_from_event_payload(event_payload):
+    return {
+        name: _event_payload_value(name, event_payload[name])
+        for name in WORKSPACE_USER_FOLDER_FIELDS
+    }
 
 
 def event_row_to_messenger_event(row):
     payload = row["payload"]
-    if payload["kind"] != MESSAGE_CREATED_EVENT:
-        raise ra_exc.ValidationErrorException()
-    return {
-        "epoch_version": row["epoch_version"],
-        "type": "message",
-        "message": _message_from_event_payload(payload),
-    }
+    if payload["kind"] == MESSAGE_CREATED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "message",
+            "message": _message_from_event_payload(payload),
+        }
+    if payload["kind"] == FOLDER_CREATED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "folder",
+            "folder": _folder_from_event_payload(payload),
+        }
+    raise ra_exc.ValidationErrorException()
 
 
 def _fetch_one(session, statement, values):
@@ -74,7 +97,7 @@ def _fetch_all(session, statement, values):
     return list(result.fetchall())
 
 
-def create_message_event(project_id, message, recipients, session=None):
+def create_message_events(project_id, message, recipients, session=None):
     if not recipients:
         return []
 
@@ -137,6 +160,19 @@ def create_message_event(project_id, message, recipients, session=None):
     if len(rows) != len(recipients):
         raise ra_exc.ValidationErrorException()
     return [row["epoch_version"] for row in rows]
+
+
+def create_folder_event(folder, session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=folder.project_id,
+        user_uuid=folder.user_uuid,
+        payload=event_payloads.FolderCreatedEventPayload(
+            **dict(folder)
+        ),
+    )
+    return event.insert(session=session)
 
 
 def _event_rows_statement(where_clause):

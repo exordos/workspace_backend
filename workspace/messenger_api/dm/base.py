@@ -21,6 +21,11 @@ from restalchemy.dm import types
 from workspace.messenger_api.dm import message_payloads
 
 
+FOLDER_SYSTEM_TYPE_ALL = "all"
+FOLDER_SYSTEM_TYPE_CREATED = "created"
+FOLDER_SYSTEM_TYPES = (FOLDER_SYSTEM_TYPE_ALL, FOLDER_SYSTEM_TYPE_CREATED)
+
+
 class UserScopedModelWithUUID(models.ModelWithUUID):
     user_uuid = properties.property(
         types.UUID(),
@@ -79,4 +84,36 @@ class WorkspaceUserMessageBase(
     is_own = properties.property(
         types.Boolean(),
         default=False,
+    )
+
+
+class WorkspaceFolderBase(
+    UserScopedModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+):
+    title = properties.property(
+        types.String(min_length=1, max_length=64),
+        required=True,
+    )
+    background_color_value = properties.property(
+        types.AllowNone(types.Integer(min_value=0, max_value=2**32 - 1)),
+        default=None,
+    )
+    system_type = properties.property(
+        types.AllowNone(types.Enum(FOLDER_SYSTEM_TYPES)),
+        default=FOLDER_SYSTEM_TYPE_CREATED,
+    )
+
+
+class WorkspaceUserFolderBase(
+    WorkspaceFolderBase,
+):
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    folder_items = properties.property(
+        types.List(),
+        default=list,
     )
