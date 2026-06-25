@@ -72,6 +72,74 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_create_workspace_user_folder_item_updates_folder_event(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        item_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_item = types.SimpleNamespace(uuid=item_uuid)
+        returned_folder = types.SimpleNamespace(uuid=folder_uuid)
+        created_item = {}
+
+        class FakeFolderItem:
+            def __init__(self, **kwargs):
+                created_item.update(kwargs)
+                self.uuid = kwargs["uuid"]
+                self.project_id = kwargs["project_id"]
+                self.user_uuid = kwargs["user_uuid"]
+                self.folder_uuid = kwargs["folder_uuid"]
+
+            def insert(self, session=None):
+                created_item["insert_session"] = session
+
+        with mock.patch.object(
+            dm_helpers.models, "FolderItem", FakeFolderItem
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_folder_item",
+            return_value=returned_item,
+        ) as get_user_folder_item:
+            result = dm_helpers.create_workspace_user_folder_item(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=item_uuid,
+                folder_uuid=folder_uuid,
+                stream_uuid=stream_uuid,
+                chat_type="stream",
+                session=session,
+            )
+
+        self.assertIs(returned_item, result)
+        self.assertEqual(item_uuid, created_item["uuid"])
+        self.assertEqual(project_id, created_item["project_id"])
+        self.assertEqual(user_uuid, created_item["user_uuid"])
+        self.assertEqual(folder_uuid, created_item["folder_uuid"])
+        self.assertEqual(stream_uuid, created_item["stream_uuid"])
+        self.assertEqual("stream", created_item["chat_type"])
+        self.assertIs(session, created_item["insert_session"])
+        get_user_folder.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            folder=returned_folder,
+            session=session,
+        )
+        get_user_folder_item.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+
     def test_update_workspace_user_folder_updates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

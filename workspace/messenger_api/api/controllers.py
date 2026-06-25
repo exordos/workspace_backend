@@ -175,11 +175,13 @@ class FolderItemController(
     )
 
     def create(self, **kwargs):
-        item = models.FolderItem(
-            **self._apply_autovalues(kwargs),
+        values = self._apply_autovalues(kwargs)
+        return messenger_dm_helpers.create_workspace_user_folder_item(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
+            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            **values,
         )
-        item.insert()
-        return self.get(uuid=item.uuid)
 
     @ra_actions.post
     def pin(self, resource, *args, **kwargs):

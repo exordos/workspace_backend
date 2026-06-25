@@ -27,6 +27,7 @@ from workspace.tests.integration import conftest
 V1 = "/v1"
 STREAMS = f"{V1}/streams/"
 FOLDERS = f"{V1}/folders/"
+FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
 EVENTS = f"{V1}/events/"
@@ -222,6 +223,66 @@ def test_folder_delete_writes_realtime_event(api, db):
     assert event["type"] == "folder"
     assert event["kind"] == "folder.deleted"
     assert event["folder"] == {"uuid": folder["uuid"]}
+
+
+def test_folder_item_create_writes_folder_updated_event(api, db):
+    resp = api.post(FOLDERS, json={"title": "Inbox"})
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "standups"
+    )
+
+    resp = api.post(
+        FOLDER_ITEMS,
+        json={
+            "folder_uuid": folder["uuid"],
+            "stream_uuid": stream_uuid,
+            "chat_type": "stream",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    item = resp.json()
+    assert item["folder_uuid"] == folder["uuid"]
+    assert item["stream_uuid"] == stream_uuid
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 2
+    epoch_version, user_uuid, payload = rows[1]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload["kind"] == "folder.updated"
+    assert payload["uuid"] == folder["uuid"]
+    assert payload["title"] == "Inbox"
+    assert payload["user_uuid"] == str(api.user_uuid)
+    assert payload["project_id"] == str(api.project_id)
+    assert payload["unread_count"] == 0
+    assert len(payload["folder_items"]) == 1
+    assert payload["folder_items"][0]["uuid"] == item["uuid"]
+    assert payload["folder_items"][0]["folder_uuid"] == folder["uuid"]
+    assert payload["folder_items"][0]["stream_uuid"] == stream_uuid
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "folder"
+    assert event["kind"] == "folder.updated"
+    assert event["folder"]["uuid"] == folder["uuid"]
+    assert event["folder"]["folder_items"][0]["stream_uuid"] == stream_uuid
 
 
 def test_folders_are_scoped_to_the_authenticated_user(api):

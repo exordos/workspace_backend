@@ -81,6 +81,41 @@ class MessengerFolderControllerTestCase(unittest.TestCase):
             folder_uuid=folder_uuid,
         )
 
+    def test_create_folder_item_uses_dm_helper(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        item_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        returned_item = object()
+        controller = controllers.FolderItemController.__new__(
+            controllers.FolderItemController,
+        )
+        controller._get_project_id = mock.MagicMock(return_value=project_id)
+        controller._get_user_uuid = mock.MagicMock(return_value=user_uuid)
+
+        with mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "create_workspace_user_folder_item",
+            return_value=returned_item,
+        ) as create_item:
+            result = controller.create(
+                uuid=item_uuid,
+                folder_uuid=folder_uuid,
+                stream_uuid=stream_uuid,
+                chat_type="stream",
+            )
+
+        self.assertIs(returned_item, result)
+        create_item.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            uuid=item_uuid,
+            folder_uuid=folder_uuid,
+            stream_uuid=stream_uuid,
+            chat_type="stream",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
