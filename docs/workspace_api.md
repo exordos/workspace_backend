@@ -499,7 +499,9 @@ user, or `0` when there are no visible events:
 ## Workspace Users
 
 Workspace users are stored in `m_workspace_users`. The route is global rather
-than project-scoped.
+than project-scoped. A successful messenger websocket connection creates the
+current IAM user row if it is absent, using a single `INSERT ... ON CONFLICT
+(uuid) DO NOTHING` statement.
 
 | Field | Type | Description |
 | --- | --- | --- |
