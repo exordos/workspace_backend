@@ -103,8 +103,8 @@ resources:
 
 
           [iam]
-          iam_endpoint = http://{$workspace.imports.$var_core_ip_address:value}/api/core/iam/clients/default
-          audience = Exordos
+          iam_endpoint = https://exordos.com/api/core/v1/iam/clients/default
+          audience = exordos
           hs256_jwks_decryption_key = {$workspace.imports.$var_hs256_jwks_encryption_key:value}
 
 

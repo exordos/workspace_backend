@@ -48,12 +48,7 @@ Do not put the token in the websocket query string. `last_epoch_version` is the
 only websocket query parameter the backend reads; if it is omitted, the backend
 uses `0`. UI clients should still send the latest persisted cursor explicitly.
 An unauthorized websocket handshake is closed with code `4401`; an invalid
-handshake is closed with code `4400`. If IAM authentication succeeds but
-workspace user provisioning fails, the server closes with code `1011`.
-
-After successful IAM authentication, the websocket service ensures that the
-current user exists in `m_workspace_users`. Missing users are inserted
-idempotently; existing rows are left untouched.
+handshake is closed with code `4400`.
 
 ## REST Event Format
 
