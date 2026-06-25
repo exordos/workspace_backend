@@ -140,6 +140,46 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_delete_workspace_user_folder_item_deletes_event_with_item_id(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        item_uuid = sys_uuid.uuid4()
+        session = object()
+        deleted_item = {}
+
+        class ExistingItem:
+            def delete(self, session=None):
+                deleted_item["delete_session"] = session
+
+        existing_item = ExistingItem()
+
+        class FakeFolderItem:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_item)
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "FolderItem", FakeFolderItem
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_item_deleted_event"
+        ) as create_event:
+            result = dm_helpers.delete_workspace_user_folder_item(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                item_uuid=item_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(session, deleted_item["delete_session"])
+        FakeFolderItem.objects.get_one.assert_called_once()
+        create_event.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+
     def test_update_workspace_user_folder_updates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

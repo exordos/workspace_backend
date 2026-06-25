@@ -116,6 +116,33 @@ class MessengerFolderControllerTestCase(unittest.TestCase):
             chat_type="stream",
         )
 
+    def test_folder_item_route_allows_delete(self):
+        self.assertIn(ra_routes.DELETE, routes.FolderItemRoute.__allow_methods__)
+
+    def test_delete_folder_item_uses_dm_helper(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        item_uuid = sys_uuid.uuid4()
+        controller = controllers.FolderItemController.__new__(
+            controllers.FolderItemController,
+        )
+        controller._get_project_id = mock.MagicMock(return_value=project_id)
+        controller._get_user_uuid = mock.MagicMock(return_value=user_uuid)
+
+        with mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "delete_workspace_user_folder_item",
+            return_value=None,
+        ) as delete_item:
+            result = controller.delete(item_uuid)
+
+        self.assertIsNone(result)
+        delete_item.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

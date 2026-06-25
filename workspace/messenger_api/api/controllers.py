@@ -183,6 +183,13 @@ class FolderItemController(
             **values,
         )
 
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_user_folder_item(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            item_uuid=uuid,
+        )
+
     @ra_actions.post
     def pin(self, resource, *args, **kwargs):
         dm = models.FolderItem.objects.get_one(

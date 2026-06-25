@@ -89,9 +89,17 @@ class FolderDeletedEventPayload(
     KIND = "folder.deleted"
 
 
+class FolderItemDeletedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    KIND = "folder_item.deleted"
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
     types_dynamic.KindModelType(FolderDeletedEventPayload),
+    types_dynamic.KindModelType(FolderItemDeletedEventPayload),
 )

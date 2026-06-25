@@ -33,6 +33,7 @@ class FolderItemRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
+        routes.DELETE,
     ]
 
     pin = routes.action(FolderItemPinAction, invoke=True)

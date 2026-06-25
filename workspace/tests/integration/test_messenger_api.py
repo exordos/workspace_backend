@@ -285,6 +285,62 @@ def test_folder_item_create_writes_folder_updated_event(api, db):
     assert event["folder"]["folder_items"][0]["stream_uuid"] == stream_uuid
 
 
+def test_folder_item_delete_writes_deleted_event(api, db):
+    resp = api.post(FOLDERS, json={"title": "Inbox"})
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "standups"
+    )
+    resp = api.post(
+        FOLDER_ITEMS,
+        json={
+            "folder_uuid": folder["uuid"],
+            "stream_uuid": stream_uuid,
+            "chat_type": "stream",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    item = resp.json()
+
+    resp = api.delete(f"{FOLDER_ITEMS}{item['uuid']}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{FOLDER_ITEMS}{item['uuid']}")
+    assert resp.status_code == 404, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 3
+    epoch_version, user_uuid, payload = rows[2]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload == {
+        "kind": "folder_item.deleted",
+        "uuid": item["uuid"],
+    }
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "folder_item"
+    assert event["kind"] == "folder_item.deleted"
+    assert event["folder_item"] == {"uuid": item["uuid"]}
+
+
 def test_folders_are_scoped_to_the_authenticated_user(api):
     other_user = sys_uuid.uuid4()
 

@@ -28,6 +28,9 @@ MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 FOLDER_UPDATED_EVENT = event_payloads.FolderUpdatedEventPayload.KIND
 FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
+FOLDER_ITEM_DELETED_EVENT = (
+    event_payloads.FolderItemDeletedEventPayload.KIND
+)
 FOLDER_EVENTS = (
     FOLDER_CREATED_EVENT,
     FOLDER_UPDATED_EVENT,
@@ -82,6 +85,12 @@ def _deleted_folder_from_event_payload(event_payload):
     }
 
 
+def _deleted_folder_item_from_event_payload(event_payload):
+    return {
+        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
+    }
+
+
 def event_row_to_messenger_event(row):
     payload = row["payload"]
     if payload["kind"] == MESSAGE_CREATED_EVENT:
@@ -96,6 +105,13 @@ def event_row_to_messenger_event(row):
             "type": "folder",
             "kind": payload["kind"],
             "folder": _deleted_folder_from_event_payload(payload),
+        }
+    if payload["kind"] == FOLDER_ITEM_DELETED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "folder_item",
+            "kind": payload["kind"],
+            "folder_item": _deleted_folder_item_from_event_payload(payload),
         }
     if payload["kind"] in FOLDER_EVENTS:
         return {
@@ -217,6 +233,20 @@ def create_folder_deleted_event(project_id, user_uuid, folder_uuid,
         user_uuid=user_uuid,
         payload=event_payloads.FolderDeletedEventPayload(
             uuid=folder_uuid,
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_folder_item_deleted_event(project_id, user_uuid, item_uuid,
+                                     session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.FolderItemDeletedEventPayload(
+            uuid=item_uuid,
         ),
     )
     return event.insert(session=session)
