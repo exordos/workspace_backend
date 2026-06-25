@@ -72,6 +72,106 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_update_workspace_user_folder_updates_event_and_returns_view(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_folder = types.SimpleNamespace(uuid=folder_uuid)
+        updated_folder = {}
+
+        class ExistingFolder:
+            title = "Inbox"
+
+            def update_dm(self, values):
+                updated_folder["values"] = values
+                self.title = values["title"]
+
+            def update(self, session=None):
+                updated_folder["update_session"] = session
+
+        existing_folder = ExistingFolder()
+
+        class FakeFolder:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_folder)
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "Folder", FakeFolder
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        ) as get_user_folder:
+            result = dm_helpers.update_workspace_user_folder(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                folder_uuid=folder_uuid,
+                title="Archive",
+                session=session,
+            )
+
+        self.assertIs(returned_folder, result)
+        self.assertEqual({"title": "Archive"}, updated_folder["values"])
+        self.assertIs(session, updated_folder["update_session"])
+        get_user_folder.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            folder=returned_folder,
+            session=session,
+        )
+
+    def test_update_workspace_user_folder_creates_event_for_same_title(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_folder = types.SimpleNamespace(uuid=folder_uuid)
+        updated_folder = {}
+
+        class ExistingFolder:
+            title = "Inbox"
+
+            def update_dm(self, values):
+                updated_folder["values"] = values
+                self.title = values["title"]
+
+            def update(self, session=None):
+                updated_folder["update_session"] = session
+
+        class FakeFolder:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingFolder())
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "Folder", FakeFolder
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        ):
+            result = dm_helpers.update_workspace_user_folder(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                folder_uuid=folder_uuid,
+                title="Inbox",
+                session=session,
+            )
+
+        self.assertIs(returned_folder, result)
+        self.assertEqual({"title": "Inbox"}, updated_folder["values"])
+        self.assertIs(session, updated_folder["update_session"])
+        create_event.assert_called_once_with(
+            folder=returned_folder,
+            session=session,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

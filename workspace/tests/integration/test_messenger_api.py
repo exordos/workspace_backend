@@ -135,6 +135,50 @@ def test_folder_create_writes_realtime_event(api, db):
     assert event["folder"]["title"] == "Inbox"
 
 
+def test_folder_update_writes_realtime_event(api, db):
+    resp = api.post(FOLDERS, json={"title": "Inbox"})
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+
+    resp = api.put(f"{FOLDERS}{folder['uuid']}", json={"title": "Archive"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == "Archive"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 2
+    epoch_version, user_uuid, payload = rows[1]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload["kind"] == "folder.updated"
+    assert payload["uuid"] == folder["uuid"]
+    assert payload["title"] == "Archive"
+    assert payload["user_uuid"] == str(api.user_uuid)
+    assert payload["project_id"] == str(api.project_id)
+    assert payload["unread_count"] == 0
+    assert payload["folder_items"] == []
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "folder"
+    assert event["folder"]["uuid"] == folder["uuid"]
+    assert event["folder"]["title"] == "Archive"
+
+
 def test_folders_are_scoped_to_the_authenticated_user(api):
     other_user = sys_uuid.uuid4()
 

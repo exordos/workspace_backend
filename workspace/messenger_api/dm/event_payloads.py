@@ -57,12 +57,10 @@ class MessageCreatedEventPayload(
     )
 
 
-class FolderCreatedEventPayload(
+class FolderEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserFolderBase,
 ):
-    KIND = "folder.created"
-
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
         read_only=True,
@@ -75,7 +73,16 @@ class FolderCreatedEventPayload(
     )
 
 
+class FolderCreatedEventPayload(FolderEventPayloadBase):
+    KIND = "folder.created"
+
+
+class FolderUpdatedEventPayload(FolderEventPayloadBase):
+    KIND = "folder.updated"
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
+    types_dynamic.KindModelType(FolderUpdatedEventPayload),
 )

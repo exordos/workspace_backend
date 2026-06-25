@@ -45,6 +45,7 @@ class FolderRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
+        routes.UPDATE,
     ]
 
 

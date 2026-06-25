@@ -103,6 +103,7 @@ class WorkspaceFolderBase(
     system_type = properties.property(
         types.AllowNone(types.Enum(FOLDER_SYSTEM_TYPES)),
         default=FOLDER_SYSTEM_TYPE_CREATED,
+        read_only=True,
     )
 
 

@@ -148,6 +148,15 @@ class FolderController(
             **values,
         )
 
+    def update(self, uuid, **kwargs):
+        values = self._apply_autovalues(kwargs)
+        return messenger_dm_helpers.update_workspace_user_folder(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
+            folder_uuid=uuid,
+            **values,
+        )
+
 
 class FolderItemController(
     WorkspaceBaseResourceControllerPaginated,

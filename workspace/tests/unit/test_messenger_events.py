@@ -199,6 +199,36 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("folder", event["type"])
         self.assertEqual(folder, event["folder"])
 
+    def test_event_row_to_messenger_event_uses_updated_folder_snapshot(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 9,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "folder.updated",
+                    "uuid": str(folder_uuid),
+                    "user_uuid": str(user_uuid),
+                    "project_id": str(project_id),
+                    "title": "Archive",
+                    "background_color_value": None,
+                    "unread_count": 0,
+                    "system_type": "created",
+                    "folder_items": [],
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:05:00.000000",
+                },
+            }
+        )
+
+        self.assertEqual(9, event["epoch_version"])
+        self.assertEqual("folder", event["type"])
+        self.assertEqual("Archive", event["folder"]["title"])
+        self.assertEqual(str(folder_uuid), event["folder"]["uuid"])
+
     def test_message_event_payload_accepts_postgres_json_timestamp(self):
         author_uuid = sys_uuid.uuid4()
         recipient_uuid = sys_uuid.uuid4()
@@ -262,6 +292,35 @@ class MessengerEventsTestCase(unittest.TestCase):
             "2026-06-24T22:28:34.166369Z",
             event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
                 payload.created_at
+            ),
+        )
+
+    def test_folder_updated_event_payload_accepts_postgres_json_timestamp(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "folder.updated",
+                "uuid": str(folder_uuid),
+                "user_uuid": str(user_uuid),
+                "project_id": str(project_id),
+                "title": "Archive",
+                "background_color_value": None,
+                "unread_count": 0,
+                "system_type": "created",
+                "folder_items": [],
+                "created_at": "2026-06-24T22:28:34.166369",
+                "updated_at": "2026-06-24T22:28:34.166369",
+            }
+        )
+
+        self.assertEqual("Archive", payload.title)
+        self.assertEqual(
+            "2026-06-24T22:28:34.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.updated_at
             ),
         )
 
@@ -353,6 +412,58 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Inbox", created_event["payload"].title)
         self.assertEqual(created_at, created_event["payload"].created_at)
+
+    def test_create_folder_updated_event_uses_user_folder_snapshot(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        updated_at = datetime.datetime(
+            2026, 6, 24, 10, 5, 0, tzinfo=datetime.timezone.utc
+        )
+        user_folder = models.UserFolder(
+            uuid=folder_uuid,
+            user_uuid=user_uuid,
+            project_id=project_id,
+            title="Archive",
+            background_color_value=None,
+            unread_count=0,
+            system_type="created",
+            folder_items=[],
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 43
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_folder_updated_event(
+                folder=user_folder,
+                session=session,
+            )
+
+        self.assertEqual(43, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.FolderUpdatedEventPayload,
+        )
+        self.assertEqual("Archive", created_event["payload"].title)
+        self.assertEqual(updated_at, created_event["payload"].updated_at)
 
     def test_websocket_consumer_accepts_pong_frames(self):
         websockets_stub = types.ModuleType("websockets")
