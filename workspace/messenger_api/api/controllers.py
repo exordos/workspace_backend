@@ -191,16 +191,20 @@ class WorkspaceStreamController(
 ):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
-        hidden_fields=[],
+        hidden_fields=["private_index"],
         convert_underscore=False,
         process_filters=True,
     )
 
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.create_workspace_user_stream(
-            project_id=values.pop("project_id"),
-            user_uuid=values.pop("user_uuid"),
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+        values.pop("project_id", None)
+        values.pop("user_uuid", None)
+        return messenger_dm_helpers.get_or_create_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=user_uuid,
             uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
             **values,
         )

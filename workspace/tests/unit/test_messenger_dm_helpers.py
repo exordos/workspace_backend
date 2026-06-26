@@ -19,16 +19,67 @@ import unittest
 import uuid as sys_uuid
 from unittest import mock
 
+from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.dm import helpers as dm_helpers
 
 
 class MessengerDMHelpersTestCase(unittest.TestCase):
-    def test_create_workspace_user_stream_creates_topic_event_and_returns_view(self):
+    def _existing_stream(self, **kwargs):
+        class ExistingStream:
+            def __init__(self, **values):
+                object.__setattr__(self, "_dirty", False)
+                object.__setattr__(self, "update_session", None)
+                for field_name, value in values.items():
+                    object.__setattr__(self, field_name, value)
+
+            def __setattr__(self, name, value):
+                if getattr(self, name, None) != value:
+                    object.__setattr__(self, "_dirty", True)
+                object.__setattr__(self, name, value)
+
+            def is_dirty(self):
+                return self._dirty
+
+            def update_dm(self, values):
+                for field_name, value in values.items():
+                    setattr(self, field_name, value)
+
+            def update(self, session=None):
+                self.update_session = session
+                self._dirty = False
+
+        return ExistingStream(**kwargs)
+
+    def test_get_or_create_workspace_user_stream_creates_topic_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         session = object()
-        returned_stream = types.SimpleNamespace(uuid=stream_uuid)
+        returned_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+        )
+        other_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=other_user_uuid,
+        )
+        other_all_folder = types.SimpleNamespace(
+            uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+            user_uuid=other_user_uuid,
+        )
+        other_channels_folder = types.SimpleNamespace(
+            uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+            user_uuid=other_user_uuid,
+        )
+        returned_all_folder = types.SimpleNamespace(
+            uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+        returned_channels_folder = types.SimpleNamespace(
+            uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
         created_stream = {}
         created_binding = {}
 
@@ -49,6 +100,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 created_binding["insert_session"] = session
 
+        get_user_streams = mock.Mock(return_value=[other_stream, returned_stream])
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(get_all=get_user_streams)
+
+        get_user_folder = mock.Mock(
+            side_effect=[
+                other_all_folder,
+                other_channels_folder,
+                returned_all_folder,
+                returned_channels_folder,
+            ]
+        )
+
         with mock.patch.object(
             dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
         ), mock.patch.object(
@@ -56,15 +121,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             "WorkspaceStreamBinding",
             FakeWorkspaceStreamBinding,
         ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
             dm_helpers, "create_workspace_stream_topic_with_flags"
         ) as create_topic, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=returned_stream,
-        ) as get_user_stream, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", get_user_folder
+        ), mock.patch.object(
             dm_helpers.messenger_events, "create_stream_event"
-        ) as create_event:
-            result = dm_helpers.create_workspace_user_stream(
+        ) as create_event, mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_folder_event:
+            result = dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
                 uuid=stream_uuid,
@@ -95,16 +162,425 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             default_for_stream_uuid=stream_uuid,
             session=session,
         )
-        get_user_stream.assert_called_once_with(
-            project_id=project_id,
+        get_user_streams.assert_called_once_with(
+            filters={
+                "uuid": mock.ANY,
+                "project_id": mock.ANY,
+            },
+            session=session,
+        )
+        filters = get_user_streams.call_args.kwargs["filters"]
+        self.assertEqual(stream_uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertNotIn("user_uuid", filters)
+        create_event.assert_has_calls(
+            [
+                mock.call(stream=other_stream, session=session),
+                mock.call(stream=returned_stream, session=session),
+            ]
+        )
+        self.assertEqual(2, create_event.call_count)
+        get_user_folder.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=other_user_uuid,
+                    folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=other_user_uuid,
+                    folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
+                ),
+            ]
+        )
+        create_folder_event.assert_has_calls(
+            [
+                mock.call(folder=other_all_folder, session=session),
+                mock.call(folder=other_channels_folder, session=session),
+                mock.call(folder=returned_all_folder, session=session),
+                mock.call(folder=returned_channels_folder, session=session),
+            ]
+        )
+        self.assertEqual(4, create_folder_event.call_count)
+
+    def test_get_or_create_workspace_user_stream_with_direct_user_creates_private_pair(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        direct_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        owner_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
             user_uuid=user_uuid,
+        )
+        direct_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=direct_user_uuid,
+        )
+        direct_all_folder = types.SimpleNamespace(
+            uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+            user_uuid=direct_user_uuid,
+        )
+        direct_personal_folder = types.SimpleNamespace(
+            uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+            user_uuid=direct_user_uuid,
+        )
+        owner_all_folder = types.SimpleNamespace(
+            uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+        owner_personal_folder = types.SimpleNamespace(
+            uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+        created_stream = {}
+        created_bindings = []
+
+        class FakeWorkspaceStream:
+            def __init__(self, **kwargs):
+                created_stream.update(kwargs)
+                self.uuid = kwargs["uuid"]
+                self.project_id = kwargs["project_id"]
+                self.user_uuid = kwargs["user_uuid"]
+
+            def insert(self, session=None):
+                created_stream["insert_session"] = session
+
+        class FakeWorkspaceStreamBinding:
+            def __init__(self, **kwargs):
+                self._values = kwargs
+                created_bindings.append(self._values)
+
+            def insert(self, session=None):
+                self._values["insert_session"] = session
+
+        expected_index = ":".join(
+            sorted([str(user_uuid), str(direct_user_uuid)])
+        )
+        get_all_streams = mock.Mock(return_value=[])
+
+        FakeWorkspaceStream.objects = types.SimpleNamespace(
+            get_all=get_all_streams,
+        )
+        get_user_streams = mock.Mock(return_value=[direct_stream, owner_stream])
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(get_all=get_user_streams)
+
+        get_user_folder = mock.Mock(
+            side_effect=[
+                direct_all_folder,
+                direct_personal_folder,
+                owner_all_folder,
+                owner_personal_folder,
+            ]
+        )
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
+            dm_helpers, "create_workspace_stream_topic_with_flags"
+        ) as create_topic, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", get_user_folder
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_folder_event:
+            result = dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=stream_uuid,
+                name="Direct",
+                description="Private chat",
+                source_name="native",
+                source={"kind": "native"},
+                direct_user_uuid=direct_user_uuid,
+                session=session,
+            )
+
+        self.assertIs(owner_stream, result)
+        self.assertEqual(True, created_stream["private"])
+        self.assertEqual(direct_user_uuid, created_stream["direct_user_uuid"])
+        self.assertEqual(expected_index, created_stream["private_index"])
+        self.assertIs(session, created_stream["insert_session"])
+        get_all_streams.assert_called_once_with(
+            filters={
+                "project_id": mock.ANY,
+                "private_index": mock.ANY,
+            },
+            limit=1,
+            session=session,
+        )
+        filters = get_all_streams.call_args.kwargs["filters"]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(expected_index, filters["private_index"].value)
+        get_user_streams.assert_called_once_with(
+            filters={
+                "project_id": mock.ANY,
+                "private_index": mock.ANY,
+            },
+            session=session,
+        )
+        filters = get_user_streams.call_args.kwargs["filters"]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(expected_index, filters["private_index"].value)
+        self.assertNotIn("user_uuid", filters)
+        self.assertEqual(2, len(created_bindings))
+        self.assertEqual(
+            [user_uuid, direct_user_uuid],
+            [binding["user_uuid"] for binding in created_bindings],
+        )
+        self.assertEqual(
+            ["owner", "owner"],
+            [binding["role"] for binding in created_bindings],
+        )
+        self.assertEqual(
+            [user_uuid, user_uuid],
+            [binding["who_uuid"] for binding in created_bindings],
+        )
+        create_topic.assert_called_once_with(
+            project_id=project_id,
             stream_uuid=stream_uuid,
+            name="General Topic",
+            default_for_stream_uuid=stream_uuid,
             session=session,
         )
-        create_event.assert_called_once_with(
-            stream=returned_stream,
+        create_event.assert_has_calls(
+            [
+                mock.call(stream=direct_stream, session=session),
+                mock.call(stream=owner_stream, session=session),
+            ]
+        )
+        self.assertEqual(2, create_event.call_count)
+        get_user_folder.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=direct_user_uuid,
+                    folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=direct_user_uuid,
+                    folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
+                ),
+            ]
+        )
+        create_folder_event.assert_has_calls(
+            [
+                mock.call(folder=direct_all_folder, session=session),
+                mock.call(folder=direct_personal_folder, session=session),
+                mock.call(folder=owner_all_folder, session=session),
+                mock.call(folder=owner_personal_folder, session=session),
+            ]
+        )
+        self.assertEqual(4, create_folder_event.call_count)
+
+    def test_get_or_create_workspace_user_stream_with_direct_user_returns_existing(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        direct_user_uuid = sys_uuid.uuid4()
+        existing_stream = self._existing_stream(
+            uuid=sys_uuid.uuid4(),
+            name="Old direct",
+            description="Old private chat",
+            source_name="native",
+            source={"kind": "native"},
+        )
+        owner_stream = types.SimpleNamespace(
+            uuid=existing_stream.uuid,
+            user_uuid=user_uuid,
+        )
+        direct_stream = types.SimpleNamespace(
+            uuid=existing_stream.uuid,
+            user_uuid=direct_user_uuid,
+        )
+        session = object()
+        get_all_streams = mock.Mock(return_value=[existing_stream])
+
+        class FakeWorkspaceStream:
+            objects = types.SimpleNamespace(get_all=get_all_streams)
+
+            def __init__(self, **kwargs):
+                raise AssertionError("existing stream should be returned")
+
+        get_user_streams = mock.Mock(return_value=[direct_stream, owner_stream])
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(get_all=get_user_streams)
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_event"
+        ) as create_event:
+            result = dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                name="Direct",
+                description="Private chat",
+                source_name="native",
+                source={"kind": "native"},
+                direct_user_uuid=direct_user_uuid,
+                session=session,
+            )
+
+        self.assertIs(owner_stream, result)
+        self.assertEqual("Direct", existing_stream.name)
+        self.assertEqual("Private chat", existing_stream.description)
+        self.assertIs(session, existing_stream.update_session)
+        get_user_streams.assert_called_once_with(
+            filters={
+                "uuid": mock.ANY,
+                "project_id": mock.ANY,
+            },
             session=session,
         )
+        filters = get_user_streams.call_args.kwargs["filters"]
+        self.assertEqual(existing_stream.uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertNotIn("user_uuid", filters)
+        create_event.assert_has_calls(
+            [
+                mock.call(stream=direct_stream, session=session),
+                mock.call(stream=owner_stream, session=session),
+            ]
+        )
+        self.assertEqual(2, create_event.call_count)
+
+    def test_get_or_create_workspace_user_stream_skips_existing_update_when_clean(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        direct_user_uuid = sys_uuid.uuid4()
+        source = {"kind": "native"}
+        existing_stream = self._existing_stream(
+            uuid=sys_uuid.uuid4(),
+            name="Direct",
+            description="Private chat",
+            source_name="native",
+            source=source,
+        )
+        owner_stream = types.SimpleNamespace(
+            uuid=existing_stream.uuid,
+            user_uuid=user_uuid,
+        )
+        direct_stream = types.SimpleNamespace(
+            uuid=existing_stream.uuid,
+            user_uuid=direct_user_uuid,
+        )
+        session = object()
+        get_all_streams = mock.Mock(return_value=[existing_stream])
+
+        class FakeWorkspaceStream:
+            objects = types.SimpleNamespace(get_all=get_all_streams)
+
+            def __init__(self, **kwargs):
+                raise AssertionError("existing stream should be returned")
+
+        get_user_streams = mock.Mock(return_value=[direct_stream, owner_stream])
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(get_all=get_user_streams)
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_event"
+        ) as create_event:
+            result = dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                name="Direct",
+                description="Private chat",
+                source_name="native",
+                source=source,
+                direct_user_uuid=direct_user_uuid,
+                session=session,
+            )
+
+        self.assertIs(owner_stream, result)
+        self.assertIs(session, existing_stream.update_session)
+        get_user_streams.assert_called_once()
+        create_event.assert_not_called()
+
+    def test_get_or_create_workspace_user_stream_rejects_client_private_index(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        direct_user_uuid = sys_uuid.uuid4()
+        private_index = ":".join(sorted([str(user_uuid), str(direct_user_uuid)]))
+
+        with self.assertRaises(
+            messenger_exc.PrivateIndexIsTechnicalFieldError
+        ) as error_context:
+            dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                name="Direct",
+                description="Private chat",
+                source_name="native",
+                source={"kind": "native"},
+                direct_user_uuid=direct_user_uuid,
+                private_index=private_index,
+            )
+        self.assertIn("private_index", error_context.exception.msg)
+
+    def test_get_or_create_workspace_user_stream_rejects_self_direct_user(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+
+        with self.assertRaises(
+            messenger_exc.DirectStreamSelfChatError
+        ) as error_context:
+            dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                name="Direct",
+                description="Private chat",
+                source_name="native",
+                source={"kind": "native"},
+                direct_user_uuid=user_uuid,
+            )
+        self.assertIn("direct_user_uuid", error_context.exception.msg)
 
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()

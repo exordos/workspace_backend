@@ -73,6 +73,45 @@ def test_topic_controller_autovalues_match_topic_table_shape():
     assert values == {"project_id": project_id}
 
 
+def test_stream_controller_hides_private_index():
+    resource = controllers.WorkspaceStreamController.__resource__
+
+    assert resource.is_public_field("private_index") is False
+    assert resource.is_public_field("name") is True
+
+
+def test_stream_controller_create_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamController(request)
+    returned_stream = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "get_or_create_workspace_user_stream",
+        return_value=returned_stream,
+    ) as get_or_create:
+        result = controller.create(
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            name="Direct",
+            description="Private chat",
+            source_name="native",
+            source={"kind": "native"},
+        )
+
+    assert result is returned_stream
+    create_kwargs = get_or_create.call_args.kwargs
+    assert create_kwargs["project_id"] == project_id
+    assert create_kwargs["user_uuid"] == user_uuid
+
+
 def test_stream_binding_controller_preserves_target_user_uuid():
     project_id = sys_uuid.uuid4()
     actor_uuid = sys_uuid.uuid4()

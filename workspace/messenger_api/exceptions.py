@@ -20,3 +20,13 @@ from restalchemy.common import exceptions as ra_exc
 class OnlyOneAllFolderPerUserError(ra_exc.ValidationErrorException):
     message = "Only one 'all' folder is allowed per user"
     code = 400001001
+
+
+class PrivateIndexIsTechnicalFieldError(ra_exc.ValidationErrorException):
+    message = "'private_index' is a technical field and cannot be provided"
+    code = 400001002
+
+
+class DirectStreamSelfChatError(ra_exc.ValidationErrorException):
+    message = "'direct_user_uuid' must point to another user"
+    code = 400001003

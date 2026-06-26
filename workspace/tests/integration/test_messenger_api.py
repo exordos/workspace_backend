@@ -468,7 +468,6 @@ def test_stream_create_writes_realtime_event(api, db):
             "source": {"kind": "native"},
             "invite_only": False,
             "announce": False,
-            "private": False,
         },
     )
     assert resp.status_code in (200, 201), resp.text
@@ -486,7 +485,7 @@ def test_stream_create_writes_realtime_event(api, db):
         )
         rows = cur.fetchall()
 
-    assert len(rows) == 1
+    assert len(rows) == 3
     epoch_version, user_uuid, payload = rows[0]
     assert str(user_uuid) == str(api.user_uuid)
     assert payload["kind"] == "stream.created"
@@ -513,6 +512,117 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["stream"]["uuid"] == stream["uuid"]
     assert event["stream"]["name"] == "Engineering"
     assert event["stream"]["role"] == "owner"
+
+    folder_events = [row[2] for row in rows[1:]]
+    assert [payload["kind"] for payload in folder_events] == [
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert [payload["uuid"] for payload in folder_events] == [
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000002",
+    ]
+    assert [payload["title"] for payload in folder_events] == [
+        "All chats",
+        "Channels",
+    ]
+    assert all(
+        payload["user_uuid"] == str(api.user_uuid)
+        for payload in folder_events
+    )
+
+
+def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
+    direct_user_uuid = sys_uuid.uuid4()
+    expected_index = ":".join(
+        sorted([str(api.user_uuid), str(direct_user_uuid)])
+    )
+    payload = {
+        "name": "Direct",
+        "description": "Private workspace",
+        "source_name": "native",
+        "source": {"kind": "native"},
+        "direct_user_uuid": str(direct_user_uuid),
+    }
+
+    first_resp = api.post(STREAMS, json=payload)
+    assert first_resp.status_code in (200, 201), first_resp.text
+    first_stream = first_resp.json()
+
+    second_resp = api.post(STREAMS, json=payload)
+    assert second_resp.status_code in (200, 201), second_resp.text
+    second_stream = second_resp.json()
+
+    assert second_stream["uuid"] == first_stream["uuid"]
+    assert first_stream["private"] is True
+    assert first_stream["direct_user_uuid"] == str(direct_user_uuid)
+    assert "private_index" not in first_stream
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT private_index
+            FROM m_workspace_streams
+            WHERE project_id = %s
+                AND uuid = %s
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        stored_private_index = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT user_uuid, role
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+                AND stream_uuid = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        bindings = cur.fetchall()
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'stream.created'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        events = cur.fetchall()
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'folder.updated'
+            ORDER BY user_uuid, payload->>'uuid'
+            """,
+            (api.project_id,),
+        )
+        folder_events = cur.fetchall()
+
+    assert stored_private_index == expected_index
+    assert [(str(user_uuid), role) for user_uuid, role in bindings] == [
+        (user_uuid, "owner")
+        for user_uuid in sorted([str(api.user_uuid), str(direct_user_uuid)])
+    ]
+    assert [str(user_uuid) for user_uuid, _payload in events] == sorted(
+        [str(api.user_uuid), str(direct_user_uuid)]
+    )
+    assert [
+        (str(user_uuid), payload["uuid"], payload["title"])
+        for user_uuid, payload in folder_events
+    ] == [
+        (user_uuid, folder_uuid, title)
+        for user_uuid in sorted([str(api.user_uuid), str(direct_user_uuid)])
+        for folder_uuid, title in (
+            ("00000000-0000-0000-0000-000000000000", "All chats"),
+            ("00000000-0000-0000-0000-000000000001", "Personal"),
+        )
+    ]
 
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):

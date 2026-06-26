@@ -447,9 +447,17 @@ Realtime side effects:
 
 ## Streams
 
-`POST /v1/streams/` writes to `m_workspace_streams`, creates an owner binding
-for the current IAM user, and creates a default topic named `General Topic`.
-Reads use `m_workspace_user_streams`.
+`POST /v1/streams/` writes to `m_workspace_streams`, creates owner bindings,
+and creates a default topic named `General Topic`. Reads use
+`m_workspace_user_streams`.
+
+If `direct_user_uuid` is provided, the backend creates a two-user private
+stream, sets `private: true`, stores `private_index` as
+`":".join(sorted([current_user_uuid, direct_user_uuid]))`, and creates owner
+bindings for both users. `private_index` is a technical read-only field for
+database deduplication, is hidden from the public API, and must not be sent by
+the client. Repeating the same request for the same user pair returns the
+existing stream.
 
 Supported source payloads:
 
@@ -486,7 +494,8 @@ Supported source payloads:
 | `source` | object | yes | no | Source payload. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
 | `announce` | boolean | no | no | Announcement stream flag. |
-| `private` | boolean | no | no | Private stream flag. |
+| `direct_user_uuid` | UUID | no | no | Other direct-chat participant. |
+| `private` | boolean | no | yes | Private stream flag. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -501,8 +510,21 @@ Create request:
     "kind": "native"
   },
   "invite_only": false,
-  "announce": false,
-  "private": false
+  "announce": false
+}
+```
+
+Direct chat create request:
+
+```json
+{
+  "name": "Direct",
+  "description": "Private workspace",
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  },
+  "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
 
@@ -511,6 +533,12 @@ Realtime side effects:
 | Operation | Durable payload kind | Websocket event type | Websocket body |
 | --- | --- | --- | --- |
 | create stream | `stream.created` | `stream` | Full user stream snapshot. |
+| create stream | `folder.updated` | `folder` | Updated `All chats` and `Channels`/`Personal` system folder snapshots. |
+
+For direct private streams, one `stream.created` event is written for each
+participant. Stream creation also writes `folder.updated` events for each
+participant's `All chats` folder and for `Personal` when the stream is private,
+or `Channels` when it is not private.
 
 ## Stream Bindings
 
@@ -771,7 +799,7 @@ Supported event payload kinds:
 | `stream.created` | `POST /v1/streams/` | Full user stream snapshot. |
 | `message.created` | `POST /v1/messages/` | Full user message snapshot. |
 | `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
-| `folder.updated` | `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
+| `folder.updated` | `POST /v1/streams/`, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
 | `folder.deleted` | `DELETE /v1/folders/{uuid}` | Only deleted folder `uuid`. |
 | `folder_item.deleted` | `DELETE /v1/folder_items/{uuid}` | Only deleted folder item `uuid`. |
 

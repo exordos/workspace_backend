@@ -250,6 +250,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "invite_only": False,
             "announce": False,
             "private": False,
+            "direct_user_uuid": None,
             "created_at": "2026-06-24T10:00:00.000000Z",
             "updated_at": "2026-06-24T10:00:00.000000Z",
         }
@@ -273,6 +274,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "invite_only": False,
                     "announce": False,
                     "private": False,
+                    "private_index": "internal-value",
                     "created_at": "2026-06-24 10:00:00.000000",
                     "updated_at": "2026-06-24 10:00:00.000000",
                 },

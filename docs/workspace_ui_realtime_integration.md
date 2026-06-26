@@ -256,12 +256,17 @@ Stream create event frame:
       "invite_only": false,
       "announce": false,
       "private": false,
+      "direct_user_uuid": null,
       "created_at": "2026-06-22T09:30:00Z",
       "updated_at": "2026-06-22T09:30:00Z"
     }
   }
 }
 ```
+
+After a stream is created, clients should also expect `folder.updated` events
+for the affected system folders. Every new stream updates `All chats`; private
+streams also update `Personal`, and non-private streams update `Channels`.
 
 Folder update event frame:
 
@@ -449,6 +454,7 @@ function normalizeWorkspaceEvent(
           invite_only: model.payload.invite_only,
           announce: model.payload.announce,
           private: model.payload.private,
+          direct_user_uuid: model.payload.direct_user_uuid,
           created_at: model.payload.created_at,
           updated_at: model.payload.updated_at,
         },

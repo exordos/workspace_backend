@@ -42,7 +42,8 @@ WORKSPACE_USER_MESSAGE_FIELDS = tuple(
     models.WorkspaceUserMessage.properties.properties
 )
 WORKSPACE_USER_STREAM_FIELDS = tuple(
-    models.WorkspaceUserStream.properties.properties
+    name for name in models.WorkspaceUserStream.properties.properties
+    if name != "private_index"
 )
 WORKSPACE_USER_FOLDER_FIELDS = tuple(
     models.UserFolder.properties.properties
@@ -66,6 +67,15 @@ def _event_payload_value(name, value):
     return value
 
 
+def _event_payload_get(event_payload, name):
+    if hasattr(event_payload, "get"):
+        return event_payload.get(name)
+    try:
+        return event_payload[name]
+    except KeyError:
+        return None
+
+
 def _message_from_event_payload(event_payload):
     result = {}
     for name in WORKSPACE_USER_MESSAGE_FIELDS:
@@ -85,7 +95,7 @@ def _folder_from_event_payload(event_payload):
 
 def _stream_from_event_payload(event_payload):
     return {
-        name: _event_payload_value(name, event_payload[name])
+        name: _event_payload_value(name, _event_payload_get(event_payload, name))
         for name in WORKSPACE_USER_STREAM_FIELDS
     }
 

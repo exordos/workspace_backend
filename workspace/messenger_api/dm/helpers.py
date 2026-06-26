@@ -19,8 +19,14 @@ import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import models
+
+
+ALL_CHATS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000000")
+PERSONAL_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000001")
+CHANNELS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000002")
 
 
 def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
@@ -59,6 +65,67 @@ def get_workspace_user_stream(project_id, user_uuid, stream_uuid,
     )
 
 
+def build_private_stream_index(user_uuid, direct_user_uuid):
+    if user_uuid == direct_user_uuid:
+        raise messenger_exc.DirectStreamSelfChatError()
+    return ":".join(sorted([str(user_uuid), str(direct_user_uuid)]))
+
+
+def _create_owner_binding(project_id, stream_uuid, user_uuid, who_uuid,
+                          session=None):
+    binding = models.WorkspaceStreamBinding(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_uuid=user_uuid,
+        who_uuid=who_uuid,
+        role=models.WorkspaceStreamRole.OWNER.value,
+    )
+    binding.insert(session=session)
+    return binding
+
+
+def _create_stream_folder_updated_events(project_id, user_uuid, private,
+                                         session=None):
+    folder_uuids = (
+        ALL_CHATS_FOLDER_UUID,
+        PERSONAL_FOLDER_UUID if private else CHANNELS_FOLDER_UUID,
+    )
+    for folder_uuid in folder_uuids:
+        user_folder = get_workspace_user_folder(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        messenger_events.create_folder_updated_event(
+            folder=user_folder,
+            session=session,
+        )
+
+
+def fetch_existing_private_workspace_user_stream(project_id, user_uuid, stream,
+                                                 fields, session=None):
+    stream.update_dm(values=fields)
+    should_send_event = stream.is_dirty()
+    stream.update(session=session)
+    result = None
+    for user_stream in models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(stream.uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    ):
+        if user_stream.user_uuid == user_uuid:
+            result = user_stream
+        if should_send_event:
+            messenger_events.create_stream_event(
+                stream=user_stream,
+                session=session,
+            )
+    return result
+
+
 def create_workspace_stream_topic_with_flags(project_id, session=None,
                                              **kwargs):
     topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
@@ -88,25 +155,46 @@ def create_workspace_stream_topic_with_flags(project_id, session=None,
     return topic
 
 
-def create_workspace_user_stream(project_id, user_uuid, session=None,
-                                 **kwargs):
-    stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
+def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
+                                                 direct_user_uuid, stream_uuid,
+                                                 session=None, **kwargs):
+    private_index = build_private_stream_index(user_uuid, direct_user_uuid)
+    for existing in models.WorkspaceStream.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "private_index": dm_filters.EQ(private_index),
+        },
+        limit=1,
+        session=session,
+    ):
+        return fetch_existing_private_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream=existing,
+            fields=kwargs,
+            session=session,
+        )
+
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
         user_uuid=user_uuid,
+        private=True,
+        direct_user_uuid=direct_user_uuid,
+        private_index=private_index,
         **kwargs,
     )
     stream.insert(session=session)
 
-    binding = models.WorkspaceStreamBinding(
-        project_id=project_id,
-        stream_uuid=stream.uuid,
-        user_uuid=user_uuid,
-        who_uuid=user_uuid,
-        role=models.WorkspaceStreamRole.OWNER.value,
-    )
-    binding.insert(session=session)
+    participant_uuids = (user_uuid, direct_user_uuid)
+    for participant_uuid in participant_uuids:
+        _create_owner_binding(
+            project_id=project_id,
+            stream_uuid=stream.uuid,
+            user_uuid=participant_uuid,
+            who_uuid=user_uuid,
+            session=session,
+        )
 
     create_workspace_stream_topic_with_flags(
         project_id=project_id,
@@ -116,17 +204,91 @@ def create_workspace_user_stream(project_id, user_uuid, session=None,
         session=session,
     )
 
-    user_stream = get_workspace_user_stream(
+    result = None
+    for user_stream in models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "private_index": dm_filters.EQ(private_index),
+        },
+        session=session,
+    ):
+        if user_stream.user_uuid == user_uuid:
+            result = user_stream
+        messenger_events.create_stream_event(
+            stream=user_stream,
+            session=session,
+        )
+        _create_stream_folder_updated_events(
+            project_id=project_id,
+            user_uuid=user_stream.user_uuid,
+            private=True,
+            session=session,
+        )
+    return result
+
+
+def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
+                                        **kwargs):
+    stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
+    direct_user_uuid = kwargs.pop("direct_user_uuid", None)
+    kwargs.pop("private", None)
+    if kwargs.pop("private_index", None) is not None:
+        raise messenger_exc.PrivateIndexIsTechnicalFieldError()
+    if direct_user_uuid is not None:
+        return _get_or_create_private_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            direct_user_uuid=direct_user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+            **kwargs,
+        )
+
+    stream = models.WorkspaceStream(
+        uuid=stream_uuid,
         project_id=project_id,
         user_uuid=user_uuid,
+        **kwargs,
+    )
+    stream.insert(session=session)
+
+    _create_owner_binding(
+        project_id=project_id,
         stream_uuid=stream.uuid,
+        user_uuid=user_uuid,
+        who_uuid=user_uuid,
         session=session,
     )
-    messenger_events.create_stream_event(
-        stream=user_stream,
+
+    create_workspace_stream_topic_with_flags(
+        project_id=project_id,
+        stream_uuid=stream.uuid,
+        name="General Topic",
+        default_for_stream_uuid=stream.uuid,
         session=session,
     )
-    return user_stream
+
+    result = None
+    for user_stream in models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(stream.uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    ):
+        if user_stream.user_uuid == user_uuid:
+            result = user_stream
+        messenger_events.create_stream_event(
+            stream=user_stream,
+            session=session,
+        )
+        _create_stream_folder_updated_events(
+            project_id=project_id,
+            user_uuid=user_stream.user_uuid,
+            private=False,
+            session=session,
+        )
+    return result
 
 
 def create_workspace_user_folder(project_id, user_uuid, session=None,

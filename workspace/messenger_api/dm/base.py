@@ -182,6 +182,14 @@ class WorkspaceStreamBase(
         types.Boolean(),
         default=False,
     )
+    direct_user_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    private_index = properties.property(
+        types.AllowNone(types.String(max_length=73)),
+        default=None,
+    )
 
 
 class WorkspaceUserStreamBase(
@@ -224,4 +232,12 @@ class WorkspaceUserStreamBase(
     private = properties.property(
         types.Boolean(),
         default=False,
+    )
+    direct_user_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    private_index = properties.property(
+        types.AllowNone(types.String(max_length=73)),
+        default=None,
     )
