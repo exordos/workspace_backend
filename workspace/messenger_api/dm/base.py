@@ -14,9 +14,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import enum
+
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
+from restalchemy.dm import types_dynamic
 
 from workspace.messenger_api.dm import message_payloads
 
@@ -117,4 +120,108 @@ class WorkspaceUserFolderBase(
     folder_items = properties.property(
         types.List(),
         default=list,
+    )
+
+
+class ZulipSource(types_dynamic.AbstractKindModel):
+    KIND = "zulip"
+
+    stream_id = properties.property(
+        types.Integer(min_value=0, max_value=2**31 - 1),
+        required=True,
+    )
+
+
+class NativeSource(types_dynamic.AbstractKindModel):
+    KIND = "native"
+
+
+class SourceName(str, enum.Enum):
+    ZULIP = ZulipSource.KIND
+    NATIVE = NativeSource.KIND
+
+
+class WorkspaceStreamRole(str, enum.Enum):
+    GUEST = "guest"
+    MEMBER = "member"
+    MODERATOR = "moderator"
+    ADMINISTRATOR = "administrator"
+    OWNER = "owner"
+
+
+class WorkspaceStreamBase(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithRequiredNameDesc,
+    models.ModelWithTimestamp,
+):
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    source_name = properties.property(
+        types.Enum([source.value for source in SourceName]),
+        required=True,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
+        ),
+        required=True,
+    )
+    invite_only = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    announce = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    private = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+
+class WorkspaceUserStreamBase(
+    UserScopedModelWithUUID,
+    models.ModelWithRequiredNameDesc,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+):
+    owner = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    role = properties.property(
+        types.Enum([role.value for role in WorkspaceStreamRole]),
+        required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    source_name = properties.property(
+        types.Enum([source.value for source in SourceName]),
+        required=True,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
+        ),
+        required=True,
+    )
+    invite_only = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    announce = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    private = properties.property(
+        types.Boolean(),
+        default=False,
     )

@@ -23,6 +23,89 @@ from workspace.messenger_api.dm import helpers as dm_helpers
 
 
 class MessengerDMHelpersTestCase(unittest.TestCase):
+    def test_create_workspace_user_stream_creates_topic_event_and_returns_view(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_stream = types.SimpleNamespace(uuid=stream_uuid)
+        created_stream = {}
+        created_binding = {}
+
+        class FakeWorkspaceStream:
+            def __init__(self, **kwargs):
+                created_stream.update(kwargs)
+                self.uuid = kwargs["uuid"]
+                self.project_id = kwargs["project_id"]
+                self.user_uuid = kwargs["user_uuid"]
+
+            def insert(self, session=None):
+                created_stream["insert_session"] = session
+
+        class FakeWorkspaceStreamBinding:
+            def __init__(self, **kwargs):
+                created_binding.update(kwargs)
+
+            def insert(self, session=None):
+                created_binding["insert_session"] = session
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers, "create_workspace_stream_topic_with_flags"
+        ) as create_topic, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            return_value=returned_stream,
+        ) as get_user_stream, mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_event"
+        ) as create_event:
+            result = dm_helpers.create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=stream_uuid,
+                name="Engineering",
+                description="Engineering workspace",
+                source_name="native",
+                source={"kind": "native"},
+                session=session,
+            )
+
+        self.assertIs(returned_stream, result)
+        self.assertEqual(stream_uuid, created_stream["uuid"])
+        self.assertEqual(project_id, created_stream["project_id"])
+        self.assertEqual(user_uuid, created_stream["user_uuid"])
+        self.assertEqual("Engineering", created_stream["name"])
+        self.assertEqual("native", created_stream["source_name"])
+        self.assertIs(session, created_stream["insert_session"])
+        self.assertEqual(project_id, created_binding["project_id"])
+        self.assertEqual(stream_uuid, created_binding["stream_uuid"])
+        self.assertEqual(user_uuid, created_binding["user_uuid"])
+        self.assertEqual(user_uuid, created_binding["who_uuid"])
+        self.assertEqual("owner", created_binding["role"])
+        self.assertIs(session, created_binding["insert_session"])
+        create_topic.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            name="General Topic",
+            default_for_stream_uuid=stream_uuid,
+            session=session,
+        )
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            stream=returned_stream,
+            session=session,
+        )
+
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

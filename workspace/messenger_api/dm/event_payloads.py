@@ -82,6 +82,24 @@ class FolderUpdatedEventPayload(FolderEventPayloadBase):
     KIND = "folder.updated"
 
 
+class StreamCreatedEventPayload(
+    types_dynamic.AbstractKindModel,
+    base.WorkspaceUserStreamBase,
+):
+    KIND = "stream.created"
+
+    created_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+
+
 class FolderDeletedEventPayload(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
@@ -100,6 +118,7 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
+    types_dynamic.KindModelType(StreamCreatedEventPayload),
     types_dynamic.KindModelType(FolderDeletedEventPayload),
     types_dynamic.KindModelType(FolderItemDeletedEventPayload),
 )

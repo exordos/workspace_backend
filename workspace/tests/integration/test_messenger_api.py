@@ -458,6 +458,63 @@ def test_stream_get_by_uuid_is_scoped(api, db):
     assert resp.status_code == 404, resp.text
 
 
+def test_stream_create_writes_realtime_event(api, db):
+    resp = api.post(
+        STREAMS,
+        json={
+            "name": "Engineering",
+            "description": "Engineering workspace",
+            "source_name": "native",
+            "source": {"kind": "native"},
+            "invite_only": False,
+            "announce": False,
+            "private": False,
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    stream = resp.json()
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id,),
+        )
+        rows = cur.fetchall()
+
+    assert len(rows) == 1
+    epoch_version, user_uuid, payload = rows[0]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload["kind"] == "stream.created"
+    assert payload["uuid"] == stream["uuid"]
+    assert payload["name"] == "Engineering"
+    assert payload["description"] == "Engineering workspace"
+    assert payload["user_uuid"] == str(api.user_uuid)
+    assert payload["project_id"] == str(api.project_id)
+    assert payload["owner"] == str(api.user_uuid)
+    assert payload["role"] == "owner"
+    assert payload["unread_count"] == 0
+    assert payload["source_name"] == "native"
+    assert payload["source"] == {"kind": "native"}
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "stream"
+    assert event["kind"] == "stream.created"
+    assert event["stream"]["uuid"] == stream["uuid"]
+    assert event["stream"]["name"] == "Engineering"
+    assert event["stream"]["role"] == "owner"
+
+
 def test_streams_cursor_pagination_with_composite_pk(api, db):
     seeded = {
         conftest.seed_user_stream(db, api.project_id, api.user_uuid, f"s-{i}")

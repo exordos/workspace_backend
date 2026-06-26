@@ -506,6 +506,12 @@ Create request:
 }
 ```
 
+Realtime side effects:
+
+| Operation | Durable payload kind | Websocket event type | Websocket body |
+| --- | --- | --- | --- |
+| create stream | `stream.created` | `stream` | Full user stream snapshot. |
+
 ## Stream Bindings
 
 Stream bindings are stored in `m_workspace_stream_bindings`. On create,
@@ -639,10 +645,11 @@ Response example:
 ## Events And Epoch
 
 Events are durable outbox rows stored in `m_workspace_events`. They are
-generated when messages are created and when folders or folder items change.
-Message events are scoped per recipient; folder and folder item events are
-scoped to the folder owner. The event primary identifier is `epoch_version`, a
-monotonically increasing integer.
+generated when streams or messages are created and when folders or folder items
+change. Stream events are scoped to the created stream owner. Message events are
+scoped per recipient; folder and folder item events are scoped to the folder
+owner. The event primary identifier is `epoch_version`, a monotonically
+increasing integer.
 
 `GET /v1/events/` returns a standard RESTAlchemy list with no envelope. Events
 are sorted by `epoch_version` ascending by default.
@@ -761,6 +768,7 @@ Supported event payload kinds:
 
 | Payload kind | Produced by | REST payload |
 | --- | --- | --- |
+| `stream.created` | `POST /v1/streams/` | Full user stream snapshot. |
 | `message.created` | `POST /v1/messages/` | Full user message snapshot. |
 | `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
 | `folder.updated` | `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
@@ -817,9 +825,10 @@ const ws = new WebSocket(
 );
 ```
 
-The server sends dispatch-ready event frames. Folder create, folder update, and
-folder item add/pin/unpin events have `event.type: "folder"` and include a full
-folder snapshot:
+The server sends dispatch-ready event frames. Stream creation events have
+`event.type: "stream"` and include a full user stream snapshot. Folder create,
+folder update, and folder item add/pin/unpin events have `event.type: "folder"`
+and include a full folder snapshot:
 
 ```json
 {

@@ -31,30 +31,10 @@ from workspace.messenger_api.dm import models
 
 
 def _create_topic_with_flags(project_id, **kwargs):
-    topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
-    topic = models.WorkspaceStreamTopic(
-        uuid=topic_uuid,
+    return messenger_dm_helpers.create_workspace_stream_topic_with_flags(
         project_id=project_id,
         **kwargs,
     )
-    topic.insert()
-
-    bindings = models.WorkspaceStreamBinding.objects.get_all(
-        filters={
-            "stream_uuid": dm_filters.EQ(topic.stream_uuid),
-            "project_id": dm_filters.EQ(project_id),
-        }
-    )
-    for binding in bindings:
-        flags = models.WorkspaceUserTopicFlags(
-            uuid=topic.uuid,
-            user_uuid=binding.user_uuid,
-            project_id=project_id,
-            is_done=False,
-        )
-        flags.insert()
-
-    return topic
 
 
 class ApiEndpointController(ra_controllers.RoutesListController):
@@ -218,35 +198,12 @@ class WorkspaceStreamController(
 
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
-        stream_uuid = values.pop("uuid", None) or sys_uuid.uuid4()
-        project_id = values.pop("project_id")
-        user_uuid = values.pop("user_uuid")
-
-        stream = models.WorkspaceStream(
-            uuid=stream_uuid,
-            project_id=project_id,
-            user_uuid=user_uuid,
+        return messenger_dm_helpers.create_workspace_user_stream(
+            project_id=values.pop("project_id"),
+            user_uuid=values.pop("user_uuid"),
+            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
             **values,
         )
-        stream.insert()
-
-        binding = models.WorkspaceStreamBinding(
-            project_id=project_id,
-            stream_uuid=stream.uuid,
-            user_uuid=user_uuid,
-            who_uuid=user_uuid,
-            role=models.WorkspaceStreamRole.OWNER.value,
-        )
-        binding.insert()
-
-        _create_topic_with_flags(
-            project_id=project_id,
-            stream_uuid=stream.uuid,
-            name="General Topic",
-            default_for_stream_uuid=stream.uuid,
-        )
-
-        return self.get(uuid=stream.uuid)
 
 
 class WorkspaceStreamBindingController(

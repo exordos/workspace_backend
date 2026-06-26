@@ -231,6 +231,59 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("Archive", event["folder"]["title"])
         self.assertEqual(str(folder_uuid), event["folder"]["uuid"])
 
+    def test_event_row_to_messenger_event_uses_rest_stream_snapshot(self):
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        stream = {
+            "uuid": str(stream_uuid),
+            "user_uuid": str(user_uuid),
+            "name": "Engineering",
+            "description": "Engineering workspace",
+            "project_id": str(project_id),
+            "owner": str(owner_uuid),
+            "role": "member",
+            "unread_count": 0,
+            "source_name": "native",
+            "source": {"kind": "native"},
+            "invite_only": False,
+            "announce": False,
+            "private": False,
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:00:00.000000Z",
+        }
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 10,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "stream.created",
+                    "uuid": str(stream_uuid),
+                    "user_uuid": str(user_uuid),
+                    "name": "Engineering",
+                    "description": "Engineering workspace",
+                    "project_id": str(project_id),
+                    "owner": str(owner_uuid),
+                    "role": "member",
+                    "unread_count": 0,
+                    "source_name": "native",
+                    "source": {"kind": "native"},
+                    "invite_only": False,
+                    "announce": False,
+                    "private": False,
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:00:00.000000",
+                },
+            }
+        )
+
+        self.assertEqual(10, event["epoch_version"])
+        self.assertEqual("stream", event["type"])
+        self.assertEqual("stream.created", event["kind"])
+        self.assertEqual(stream, event["stream"])
+
     def test_event_row_to_messenger_event_uses_deleted_folder_id(self):
         user_uuid = sys_uuid.uuid4()
         folder_uuid = sys_uuid.uuid4()
@@ -363,6 +416,41 @@ class MessengerEventsTestCase(unittest.TestCase):
             "2026-06-24T22:28:34.166369Z",
             event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
                 payload.updated_at
+            ),
+        )
+
+    def test_stream_created_event_payload_accepts_postgres_json_timestamp(self):
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "stream.created",
+                "uuid": str(stream_uuid),
+                "user_uuid": str(user_uuid),
+                "name": "Engineering",
+                "description": "Engineering workspace",
+                "project_id": str(project_id),
+                "owner": str(owner_uuid),
+                "role": "owner",
+                "unread_count": 0,
+                "source_name": "native",
+                "source": {"kind": "native"},
+                "invite_only": False,
+                "announce": False,
+                "private": False,
+                "created_at": "2026-06-24T22:28:34.166369",
+                "updated_at": "2026-06-24T22:28:34.166369",
+            }
+        )
+
+        self.assertEqual("Engineering", payload.name)
+        self.assertEqual(
+            "2026-06-24T22:28:34.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.created_at
             ),
         )
 
@@ -530,6 +618,61 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Archive", created_event["payload"].title)
         self.assertEqual(updated_at, created_event["payload"].updated_at)
+
+    def test_create_stream_event_uses_user_stream_snapshot(self):
+        project_id = sys_uuid.uuid4()
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        user_stream = models.WorkspaceUserStream(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            name="Engineering",
+            description="Engineering workspace",
+            project_id=project_id,
+            owner=owner_uuid,
+            role="member",
+            unread_count=0,
+            source_name="native",
+            source=models.NativeSource(),
+            invite_only=False,
+            announce=False,
+            private=False,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 44
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_stream_event(
+                stream=user_stream,
+                session=session,
+            )
+
+        self.assertEqual(44, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.StreamCreatedEventPayload,
+        )
+        self.assertEqual("Engineering", created_event["payload"].name)
+        self.assertEqual(created_at, created_event["payload"].created_at)
 
     def test_create_folder_deleted_event_uses_folder_id(self):
         project_id = sys_uuid.uuid4()

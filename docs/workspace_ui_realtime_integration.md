@@ -231,6 +231,38 @@ Event frame:
 }
 ```
 
+Stream create event frame:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 126,
+    "type": "stream",
+    "kind": "stream.created",
+    "stream": {
+      "uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+      "project_id": "22222222-2222-2222-2222-222222222222",
+      "user_uuid": "11111111-1111-1111-1111-111111111111",
+      "owner": "11111111-1111-1111-1111-111111111111",
+      "role": "owner",
+      "name": "Engineering",
+      "description": "Engineering workspace",
+      "unread_count": 0,
+      "source_name": "native",
+      "source": {
+        "kind": "native"
+      },
+      "invite_only": false,
+      "announce": false,
+      "private": false,
+      "created_at": "2026-06-22T09:30:00Z",
+      "updated_at": "2026-06-22T09:30:00Z"
+    }
+  }
+}
+```
+
 Folder update event frame:
 
 ```json
@@ -345,6 +377,11 @@ type WorkspaceRealtimeEvent = {
       message: WorkspaceUserMessage;
     }
   | {
+      type: "stream";
+      kind: "stream.created";
+      stream: WorkspaceUserStream;
+    }
+  | {
       type: "folder";
       kind: "folder.created" | "folder.updated";
       folder: WorkspaceFolder;
@@ -388,6 +425,30 @@ function normalizeWorkspaceEvent(
           pinned: model.payload.pinned,
           starred: model.payload.starred,
           is_own: model.payload.is_own,
+          created_at: model.payload.created_at,
+          updated_at: model.payload.updated_at,
+        },
+      };
+
+    case "stream.created":
+      return {
+        epoch_version: model.epoch_version,
+        type: "stream",
+        kind: "stream.created",
+        stream: {
+          uuid: model.payload.uuid,
+          project_id: model.payload.project_id,
+          user_uuid: model.payload.user_uuid,
+          owner: model.payload.owner,
+          role: model.payload.role,
+          name: model.payload.name,
+          description: model.payload.description,
+          unread_count: model.payload.unread_count,
+          source_name: model.payload.source_name,
+          source: model.payload.source,
+          invite_only: model.payload.invite_only,
+          announce: model.payload.announce,
+          private: model.payload.private,
           created_at: model.payload.created_at,
           updated_at: model.payload.updated_at,
         },
@@ -497,11 +558,11 @@ UUID.
 - Delivery is at-least-once.
 - Ordering is by `epoch_version`.
 - The UI dispatch pipeline must be idempotent.
-- REST v1 supports `message.created`, `folder.created`, `folder.updated`,
-  `folder.deleted`, and `folder_item.deleted`.
-- Websocket v1 emits `event.type === "message"`, `event.type === "folder"`,
-  and `event.type === "folder_item"`. Folder and folder item events include
-  `event.kind`.
+- REST v1 supports `stream.created`, `message.created`, `folder.created`,
+  `folder.updated`, `folder.deleted`, and `folder_item.deleted`.
+- Websocket v1 emits `event.type === "stream"`, `event.type === "message"`,
+  `event.type === "folder"`, and `event.type === "folder_item"`. Stream,
+  folder, and folder item events include `event.kind`.
 
 ## Manual Verification Checklist
 
@@ -514,9 +575,10 @@ test account.
 3. Reconnect does not duplicate already rendered messages.
 4. Own messages are displayed as own/read.
 5. Messages from another user in the same stream arrive through websocket.
-6. Creating or renaming a folder updates folder state through websocket.
-7. Adding, pinning, and unpinning a stream in a folder updates the parent
+6. Creating a stream adds it through websocket.
+7. Creating or renaming a folder updates folder state through websocket.
+8. Adding, pinning, and unpinning a stream in a folder updates the parent
    folder snapshot through `folder.updated`.
-8. Deleting a folder removes it by `folder.uuid`; deleting a folder item removes
+9. Deleting a folder removes it by `folder.uuid`; deleting a folder item removes
    it by `folder_item.uuid`.
-9. Unknown events are logged and skipped without breaking the realtime loop.
+10. Unknown events are logged and skipped without breaking the realtime loop.

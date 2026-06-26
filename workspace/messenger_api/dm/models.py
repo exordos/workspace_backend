@@ -21,7 +21,6 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
-from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 from workspace.messenger_api.dm import base
@@ -43,6 +42,12 @@ class ReactionStatus(str, enum.Enum):
     NEW = "new"
     ACTIVE = "active"
     DELETED = "deleted"
+
+
+ZulipSource = base.ZulipSource
+NativeSource = base.NativeSource
+SourceName = base.SourceName
+WorkspaceStreamRole = base.WorkspaceStreamRole
 
 
 class Folder(
@@ -123,32 +128,6 @@ class UserFolderItem(
     )
 
 
-class ZulipSource(types_dynamic.AbstractKindModel):
-    KIND = "zulip"
-
-    stream_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
-        required=True,
-    )
-
-
-class NativeSource(types_dynamic.AbstractKindModel):
-    KIND = "native"
-
-
-class SourceName(str, enum.Enum):
-    ZULIP = ZulipSource.KIND
-    NATIVE = NativeSource.KIND
-
-
-class WorkspaceStreamRole(str, enum.Enum):
-    GUEST = "guest"
-    MEMBER = "member"
-    MODERATOR = "moderator"
-    ADMINISTRATOR = "administrator"
-    OWNER = "owner"
-
-
 class WorkspaceUserStatus(str, enum.Enum):
     ACTIVE = "active"
     IDLE = "idle"
@@ -197,42 +176,8 @@ class WorkspaceUser(
     )
 
 
-class WorkspaceStream(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithRequiredNameDesc,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
+class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_streams"
-
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
-        required=True,
-    )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
-            types_dynamic.KindModelType(NativeSource),
-        ),
-        required=True,
-    )
-    invite_only = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    announce = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    private = properties.property(
-        types.Boolean(),
-        default=False,
-    )
 
     def get_recipients(self, session=None):
         return get_stream_recipients(
@@ -288,50 +233,8 @@ def get_stream_recipients(project_id, stream_uuid, session=None):
     return [binding.user_uuid for binding in bindings]
 
 
-class WorkspaceUserStream(
-    base.UserScopedModelWithUUID,
-    models.ModelWithRequiredNameDesc,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
+class WorkspaceUserStream(base.WorkspaceUserStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_user_streams"
-
-    owner = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    role = properties.property(
-        types.Enum([role.value for role in WorkspaceStreamRole]),
-        required=True,
-    )
-    unread_count = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-    source_name = properties.property(
-        types.Enum([source.value for source in SourceName]),
-        required=True,
-    )
-    source = properties.property(
-        types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
-            types_dynamic.KindModelType(NativeSource),
-        ),
-        required=True,
-    )
-    invite_only = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    announce = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    private = properties.property(
-        types.Boolean(),
-        default=False,
-    )
 
     def get_default_topic(self):
         return WorkspaceStreamTopic.objects.get_one(
