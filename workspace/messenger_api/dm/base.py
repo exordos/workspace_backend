@@ -182,6 +182,10 @@ class WorkspaceStreamBase(
         types.Boolean(),
         default=False,
     )
+    is_archived = properties.property(
+        types.Boolean(),
+        default=False,
+    )
     direct_user_uuid = properties.property(
         types.AllowNone(types.UUID()),
         default=None,
@@ -230,6 +234,10 @@ class WorkspaceUserStreamBase(
         default=False,
     )
     private = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    is_archived = properties.property(
         types.Boolean(),
         default=False,
     )

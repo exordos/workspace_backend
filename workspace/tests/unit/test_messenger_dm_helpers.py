@@ -450,7 +450,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
         ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_event"
+            dm_helpers.messenger_events, "create_stream_updated_event"
         ) as create_event:
             result = dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
@@ -977,7 +977,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers, "get_workspace_user_stream", return_value=returned_stream
         ) as get_user_stream, mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_event"
+            dm_helpers.messenger_events, "create_stream_updated_event"
         ) as create_event:
             result = dm_helpers.update_workspace_user_stream(
                 project_id=project_id,

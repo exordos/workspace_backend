@@ -31,6 +31,14 @@ class WorkspaceStreamBindingsAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamBindingController
 
 
+class WorkspaceStreamArchiveAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamController
+
+
+class WorkspaceStreamUnarchiveAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamController
+
+
 class FolderItemRoute(routes.Route):
     __controller__ = controllers.FolderItemController
     __allow_methods__ = [
@@ -65,6 +73,8 @@ class WorkspaceStreamRoute(routes.Route):
     ]
 
     add_users = routes.action(WorkspaceStreamBindingsAction, invoke=True)
+    archive = routes.action(WorkspaceStreamArchiveAction, invoke=True)
+    unarchive = routes.action(WorkspaceStreamUnarchiveAction, invoke=True)
 
 
 class WorkspaceStreamBindingRoute(routes.Route):

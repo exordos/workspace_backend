@@ -154,6 +154,72 @@ def test_stream_route_allows_update():
     assert ra_routes.UPDATE in routes.WorkspaceStreamRoute.__allow_methods__
 
 
+def test_stream_controller_archive_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamController(request)
+    resource = types.SimpleNamespace(uuid=stream_uuid)
+    returned_stream = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "update_workspace_user_stream",
+        return_value=returned_stream,
+    ) as update_stream:
+        result = controllers.WorkspaceStreamController.archive._post(
+            self=controller,
+            resource=resource,
+        )
+
+    assert result is returned_stream
+    update_stream.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        values={"is_archived": True},
+    )
+
+
+def test_stream_controller_unarchive_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamController(request)
+    resource = types.SimpleNamespace(uuid=stream_uuid)
+    returned_stream = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "update_workspace_user_stream",
+        return_value=returned_stream,
+    ) as update_stream:
+        result = controllers.WorkspaceStreamController.unarchive._post(
+            self=controller,
+            resource=resource,
+        )
+
+    assert result is returned_stream
+    update_stream.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        values={"is_archived": False},
+    )
+
+
 def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
     project_id = sys_uuid.uuid4()
     actor_uuid = sys_uuid.uuid4()
@@ -199,6 +265,17 @@ def test_stream_bindings_action_uses_binding_controller_resource():
     assert (
         routes.WorkspaceStreamBindingsAction.__controller__
         is controllers.WorkspaceStreamBindingController
+    )
+
+
+def test_stream_archive_actions_use_stream_controller_resource():
+    assert (
+        routes.WorkspaceStreamArchiveAction.__controller__
+        is controllers.WorkspaceStreamController
+    )
+    assert (
+        routes.WorkspaceStreamUnarchiveAction.__controller__
+        is controllers.WorkspaceStreamController
     )
 
 

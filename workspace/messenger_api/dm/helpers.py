@@ -119,7 +119,7 @@ def fetch_existing_private_workspace_user_stream(project_id, user_uuid, stream,
         if user_stream.user_uuid == user_uuid:
             result = user_stream
         if should_send_event:
-            messenger_events.create_stream_event(
+            messenger_events.create_stream_updated_event(
                 stream=user_stream,
                 session=session,
             )
@@ -432,7 +432,7 @@ def update_workspace_user_stream(project_id, user_uuid, stream_uuid, values,
     ):
         if user_stream.user_uuid == user_uuid:
             result = user_stream
-        messenger_events.create_stream_event(
+        messenger_events.create_stream_updated_event(
             stream=user_stream,
             session=session,
         )

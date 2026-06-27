@@ -250,6 +250,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "invite_only": False,
             "announce": False,
             "private": False,
+            "is_archived": False,
             "direct_user_uuid": None,
             "created_at": "2026-06-24T10:00:00.000000Z",
             "updated_at": "2026-06-24T10:00:00.000000Z",
@@ -274,6 +275,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "invite_only": False,
                     "announce": False,
                     "private": False,
+                    "is_archived": False,
                     "private_index": "internal-value",
                     "created_at": "2026-06-24 10:00:00.000000",
                     "updated_at": "2026-06-24 10:00:00.000000",
@@ -285,6 +287,45 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("stream", event["type"])
         self.assertEqual("stream.created", event["kind"])
         self.assertEqual(stream, event["stream"])
+
+    def test_event_row_to_messenger_event_uses_updated_stream_snapshot(self):
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 11,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "stream.updated",
+                    "uuid": str(stream_uuid),
+                    "user_uuid": str(user_uuid),
+                    "name": "Core Team",
+                    "description": "Core workspace",
+                    "project_id": str(project_id),
+                    "owner": str(owner_uuid),
+                    "role": "member",
+                    "unread_count": 0,
+                    "source_name": "native",
+                    "source": {"kind": "native"},
+                    "invite_only": True,
+                    "announce": False,
+                    "private": False,
+                    "is_archived": True,
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:05:00.000000",
+                },
+            }
+        )
+
+        self.assertEqual(11, event["epoch_version"])
+        self.assertEqual("stream", event["type"])
+        self.assertEqual("stream.updated", event["kind"])
+        self.assertEqual("Core Team", event["stream"]["name"])
+        self.assertEqual(True, event["stream"]["invite_only"])
+        self.assertEqual(True, event["stream"]["is_archived"])
 
     def test_event_row_to_messenger_event_uses_stream_bindings_snapshot(self):
         owner_uuid = sys_uuid.uuid4()
@@ -746,6 +787,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             invite_only=False,
             announce=False,
             private=False,
+            is_archived=False,
             created_at=created_at,
             updated_at=created_at,
         )
@@ -777,7 +819,64 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.StreamCreatedEventPayload,
         )
         self.assertEqual("Engineering", created_event["payload"].name)
+        self.assertEqual(False, created_event["payload"].is_archived)
         self.assertEqual(created_at, created_event["payload"].created_at)
+
+    def test_create_stream_updated_event_uses_user_stream_snapshot(self):
+        project_id = sys_uuid.uuid4()
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        user_stream = models.WorkspaceUserStream(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            name="Engineering",
+            description="Engineering workspace",
+            project_id=project_id,
+            owner=owner_uuid,
+            role="member",
+            unread_count=0,
+            source_name="native",
+            source=models.NativeSource(),
+            invite_only=False,
+            announce=False,
+            private=False,
+            is_archived=True,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 46
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_stream_updated_event(
+                stream=user_stream,
+                session=session,
+            )
+
+        self.assertEqual(46, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.StreamUpdatedEventPayload,
+        )
+        self.assertEqual("Engineering", created_event["payload"].name)
+        self.assertEqual(True, created_event["payload"].is_archived)
 
     def test_create_stream_bindings_created_event_uses_binding_snapshots(self):
         project_id = sys_uuid.uuid4()

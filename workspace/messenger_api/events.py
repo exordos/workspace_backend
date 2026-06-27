@@ -26,6 +26,7 @@ from workspace.messenger_api.dm import models
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
+STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
 STREAM_BINDINGS_CREATED_EVENT = (
     event_payloads.StreamBindingsCreatedEventPayload.KIND
 )
@@ -140,7 +141,7 @@ def event_row_to_messenger_event(row):
             "type": "message",
             "message": _message_from_event_payload(payload),
         }
-    if payload["kind"] == STREAM_CREATED_EVENT:
+    if payload["kind"] in (STREAM_CREATED_EVENT, STREAM_UPDATED_EVENT):
         return {
             "epoch_version": row["epoch_version"],
             "type": "stream",
@@ -277,6 +278,19 @@ def create_stream_event(stream, session=None):
         project_id=stream.project_id,
         user_uuid=stream.user_uuid,
         payload=event_payloads.StreamCreatedEventPayload(
+            **dict(stream)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_stream_updated_event(stream, session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=stream.project_id,
+        user_uuid=stream.user_uuid,
+        payload=event_payloads.StreamUpdatedEventPayload(
             **dict(stream)
         ),
     )

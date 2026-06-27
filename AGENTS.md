@@ -8,3 +8,8 @@
 - For required dict values, use `value = data[key]`, not `data.get(key)`.
 - Write minimal code without extra defensive checks for every possible case.
 - Let domain models perform data validation; do not duplicate model validation in controllers or helpers.
+- Restalchemy provides project CLI utilities in `.tox/develop/bin` such as `ra-new-migration`, `ra-apply-migration`, `ra-rollback-migration`, and `ra-rename-migrations`; check and use them before hand-writing equivalent restalchemy workflow code.
+- Create new migrations with `.tox/develop/bin/ra-new-migration`, not by hand.
+- When creating migrations, pass the migrations directory with `--path migrations` and set the dependency to the latest migration, preferably with `--depend HEAD` unless an explicit latest filename is required.
+- Apply migrations with `.tox/develop/bin/ra-apply-migration --config-file etc/workspace/workspace.conf --path migrations`; pass `--migration <name>` for a specific target, otherwise let the utility apply the latest HEAD migration.
+- If a migration appears applied but schema changes are missing, check the `ra_migrations` table by `migration_id`; restalchemy tracks applied migrations by UUID, so duplicated or previously applied UUIDs can hide an unapplied file.

@@ -216,6 +216,24 @@ class WorkspaceStreamController(
             values=kwargs,
         )
 
+    @ra_actions.post
+    def archive(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.update_workspace_user_stream(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            stream_uuid=resource.uuid,
+            values={"is_archived": True},
+        )
+
+    @ra_actions.post
+    def unarchive(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.update_workspace_user_stream(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            stream_uuid=resource.uuid,
+            values={"is_archived": False},
+        )
+
 
 class WorkspaceStreamBindingController(
     WorkspaceBaseResourceControllerPaginated,
