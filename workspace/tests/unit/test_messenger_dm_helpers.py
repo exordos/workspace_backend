@@ -582,6 +582,354 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
         self.assertIn("direct_user_uuid", error_context.exception.msg)
 
+    def test_create_workspace_stream_binding_events_for_public_stream(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        binding = types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+        )
+        user_stream = types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            uuid=stream_uuid,
+            private=False,
+        )
+        all_folder = types.SimpleNamespace(
+            uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+        channels_folder = types.SimpleNamespace(
+            uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            return_value=user_stream,
+        ) as get_user_stream, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_folder",
+            side_effect=[all_folder, channels_folder],
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_stream_event",
+        ) as create_stream_event, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_folder_updated_event",
+        ) as create_folder_event:
+            dm_helpers.create_workspace_stream_binding_events(
+                binding=binding,
+                session=session,
+            )
+
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        create_stream_event.assert_called_once_with(
+            stream=user_stream,
+            session=session,
+        )
+        get_user_folder.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
+                ),
+            ]
+        )
+        create_folder_event.assert_has_calls(
+            [
+                mock.call(folder=all_folder, session=session),
+                mock.call(folder=channels_folder, session=session),
+            ]
+        )
+
+    def test_create_workspace_stream_binding_events_for_private_stream(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        binding = types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+        )
+        user_stream = types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            uuid=stream_uuid,
+            private=True,
+        )
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            return_value=user_stream,
+        ), mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_folder",
+            side_effect=[
+                types.SimpleNamespace(uuid=dm_helpers.ALL_CHATS_FOLDER_UUID),
+                types.SimpleNamespace(uuid=dm_helpers.PERSONAL_FOLDER_UUID),
+            ],
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_stream_event",
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_folder_updated_event",
+        ):
+            dm_helpers.create_workspace_stream_binding_events(binding=binding)
+
+        folder_uuids = [
+            call.kwargs["folder_uuid"]
+            for call in get_user_folder.call_args_list
+        ]
+        self.assertEqual(
+            [
+                dm_helpers.ALL_CHATS_FOLDER_UUID,
+                dm_helpers.PERSONAL_FOLDER_UUID,
+            ],
+            folder_uuids,
+        )
+
+    def test_create_workspace_stream_bindings_created_events_batches_bindings(self):
+        project_id = sys_uuid.uuid4()
+        owner_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        added_user_uuid = sys_uuid.uuid4()
+        second_added_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        added_binding = types.SimpleNamespace(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=added_user_uuid,
+        )
+        second_added_binding = types.SimpleNamespace(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=second_added_user_uuid,
+        )
+        owner_binding = types.SimpleNamespace(user_uuid=owner_uuid)
+        other_binding = types.SimpleNamespace(user_uuid=other_user_uuid)
+        get_bindings = mock.Mock(
+            return_value=[
+                owner_binding,
+                added_binding,
+                other_binding,
+                second_added_binding,
+            ]
+        )
+
+        class FakeWorkspaceStreamBinding:
+            objects = types.SimpleNamespace(get_all=get_bindings)
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_stream_bindings_created_event",
+        ) as create_binding_event:
+            dm_helpers.create_workspace_stream_bindings_created_events(
+                bindings=[added_binding, second_added_binding],
+                session=session,
+            )
+
+        get_bindings.assert_called_once_with(
+            filters={
+                "project_id": mock.ANY,
+                "stream_uuid": mock.ANY,
+            },
+            session=session,
+        )
+        filters = get_bindings.call_args.kwargs["filters"]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(stream_uuid, filters["stream_uuid"].value)
+        create_binding_event.assert_has_calls(
+            [
+                mock.call(
+                    bindings=[added_binding, second_added_binding],
+                    user_uuid=owner_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    bindings=[added_binding, second_added_binding],
+                    user_uuid=other_user_uuid,
+                    session=session,
+                ),
+            ],
+            any_order=True,
+        )
+        self.assertEqual(2, create_binding_event.call_count)
+
+    def test_get_or_create_workspace_stream_binding_returns_existing(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        who_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        existing = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+        get_all = mock.Mock(return_value=[existing])
+
+        class FakeWorkspaceStreamBinding:
+            objects = types.SimpleNamespace(get_all=get_all)
+
+            def __init__(self, **kwargs):
+                raise AssertionError("existing binding should be returned")
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers,
+            "create_workspace_stream_binding_events",
+        ) as create_events:
+            result = dm_helpers.get_or_create_workspace_stream_binding(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+                who_uuid=who_uuid,
+                role=dm_helpers.models.WorkspaceStreamRole.MEMBER.value,
+            )
+
+        self.assertIs(existing, result)
+        create_events.assert_not_called()
+        get_all.assert_called_once_with(
+            filters={
+                "project_id": mock.ANY,
+                "stream_uuid": mock.ANY,
+                "user_uuid": mock.ANY,
+            },
+            limit=1,
+            session=None,
+        )
+
+    def test_get_or_create_workspace_stream_bindings_creates_grouped_roles(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        who_uuid = sys_uuid.uuid4()
+        member_uuid = sys_uuid.uuid4()
+        owner_uuid = sys_uuid.uuid4()
+        created_bindings = []
+        get_all = mock.Mock(return_value=[])
+
+        class FakeWorkspaceStreamBinding:
+            objects = types.SimpleNamespace(get_all=get_all)
+
+            def __init__(self, **kwargs):
+                self._values = kwargs
+                self.project_id = kwargs["project_id"]
+                self.stream_uuid = kwargs["stream_uuid"]
+                self.user_uuid = kwargs["user_uuid"]
+                self.who_uuid = kwargs["who_uuid"]
+                self.role = kwargs["role"]
+                created_bindings.append(self)
+
+            def insert(self, session=None):
+                self.insert_session = session
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers,
+            "create_workspace_stream_binding_events",
+        ) as create_user_events, mock.patch.object(
+            dm_helpers,
+            "create_workspace_stream_bindings_created_events",
+        ) as create_batch_events:
+            result = dm_helpers.get_or_create_workspace_stream_bindings(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                who_uuid=who_uuid,
+                role_user_uuids={
+                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value: [
+                        member_uuid
+                    ],
+                    dm_helpers.models.WorkspaceStreamRole.OWNER.value: [
+                        owner_uuid
+                    ],
+                },
+            )
+
+        self.assertEqual(created_bindings, result)
+        self.assertEqual(
+            [
+                (member_uuid, "member"),
+                (owner_uuid, "owner"),
+            ],
+            [
+                (binding.user_uuid, binding.role)
+                for binding in created_bindings
+            ],
+        )
+        self.assertEqual(2, create_user_events.call_count)
+        create_batch_events.assert_called_once_with(
+            bindings=created_bindings,
+            session=None,
+        )
+
+    def test_get_or_create_workspace_stream_bindings_rejects_invalid_role(self):
+        with self.assertRaises(
+            messenger_exc.InvalidStreamBindingRoleError
+        ) as error_context:
+            dm_helpers.get_or_create_workspace_stream_bindings(
+                project_id=sys_uuid.uuid4(),
+                stream_uuid=sys_uuid.uuid4(),
+                who_uuid=sys_uuid.uuid4(),
+                role_user_uuids={"not-a-role": [sys_uuid.uuid4()]},
+            )
+
+        self.assertIn("not-a-role", error_context.exception.msg)
+
+    def test_get_or_create_workspace_stream_bindings_rejects_non_list_users(self):
+        with self.assertRaises(
+            messenger_exc.StreamBindingUsersPayloadError
+        ) as error_context:
+            dm_helpers.get_or_create_workspace_stream_bindings(
+                project_id=sys_uuid.uuid4(),
+                stream_uuid=sys_uuid.uuid4(),
+                who_uuid=sys_uuid.uuid4(),
+                role_user_uuids={
+                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value:
+                        str(sys_uuid.uuid4()),
+                },
+            )
+
+        self.assertIn("user UUID lists", error_context.exception.msg)
+
+    def test_get_or_create_workspace_stream_bindings_rejects_tuple_users(self):
+        with self.assertRaises(messenger_exc.StreamBindingUsersPayloadError):
+            dm_helpers.get_or_create_workspace_stream_bindings(
+                project_id=sys_uuid.uuid4(),
+                stream_uuid=sys_uuid.uuid4(),
+                who_uuid=sys_uuid.uuid4(),
+                role_user_uuids={
+                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value: (
+                        sys_uuid.uuid4(),
+                    ),
+                },
+            )
+
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

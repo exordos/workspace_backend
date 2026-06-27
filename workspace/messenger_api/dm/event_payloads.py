@@ -100,6 +100,22 @@ class StreamCreatedEventPayload(
     )
 
 
+class StreamBindingsCreatedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithProject,
+):
+    KIND = "stream_bindings.created"
+
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    stream_bindings = properties.property(
+        types.List(),
+        required=True,
+    )
+
+
 class FolderDeletedEventPayload(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
@@ -119,6 +135,7 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
     types_dynamic.KindModelType(StreamCreatedEventPayload),
+    types_dynamic.KindModelType(StreamBindingsCreatedEventPayload),
     types_dynamic.KindModelType(FolderDeletedEventPayload),
     types_dynamic.KindModelType(FolderItemDeletedEventPayload),
 )

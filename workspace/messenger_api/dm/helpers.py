@@ -126,6 +126,118 @@ def fetch_existing_private_workspace_user_stream(project_id, user_uuid, stream,
     return result
 
 
+def create_workspace_stream_binding_events(binding, session=None):
+    user_stream = get_workspace_user_stream(
+        project_id=binding.project_id,
+        user_uuid=binding.user_uuid,
+        stream_uuid=binding.stream_uuid,
+        session=session,
+    )
+    messenger_events.create_stream_event(
+        stream=user_stream,
+        session=session,
+    )
+    _create_stream_folder_updated_events(
+        project_id=binding.project_id,
+        user_uuid=binding.user_uuid,
+        private=user_stream.private,
+        session=session,
+    )
+
+
+def create_workspace_stream_bindings_created_events(bindings, session=None):
+    if not bindings:
+        return
+    added_user_uuids = {binding.user_uuid for binding in bindings}
+    binding = bindings[0]
+    for stream_binding in models.WorkspaceStreamBinding.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(binding.project_id),
+            "stream_uuid": dm_filters.EQ(binding.stream_uuid),
+        },
+        session=session,
+    ):
+        if stream_binding.user_uuid in added_user_uuids:
+            continue
+        messenger_events.create_stream_bindings_created_event(
+            bindings=bindings,
+            user_uuid=stream_binding.user_uuid,
+            session=session,
+        )
+
+
+def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
+                                            who_uuid, role, session=None):
+    for existing in models.WorkspaceStreamBinding.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        limit=1,
+        session=session,
+    ):
+        return existing, False
+
+    binding = models.WorkspaceStreamBinding(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_uuid=user_uuid,
+        who_uuid=who_uuid,
+        role=role,
+    )
+    binding.insert(session=session)
+    create_workspace_stream_binding_events(binding, session=session)
+    return binding, True
+
+
+def get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
+                                           who_uuid, role, session=None):
+    binding, _created = _get_or_create_workspace_stream_binding(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_uuid=user_uuid,
+        who_uuid=who_uuid,
+        role=role,
+        session=session,
+    )
+    return binding
+
+
+def _validate_stream_binding_roles_payload(role_user_uuids):
+    allowed_roles = {role.value for role in models.WorkspaceStreamRole}
+    for role, user_uuids in role_user_uuids.items():
+        if role not in allowed_roles:
+            raise messenger_exc.InvalidStreamBindingRoleError(role=role)
+        if not isinstance(user_uuids, list):
+            raise messenger_exc.StreamBindingUsersPayloadError()
+
+
+def get_or_create_workspace_stream_bindings(project_id, stream_uuid, who_uuid,
+                                            role_user_uuids, session=None):
+    _validate_stream_binding_roles_payload(role_user_uuids)
+    result = []
+    created_bindings = []
+    for role, user_uuids in role_user_uuids.items():
+        for user_uuid in user_uuids:
+            binding, created = _get_or_create_workspace_stream_binding(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+                who_uuid=who_uuid,
+                role=role,
+                session=session,
+            )
+            result.append(binding)
+            if created:
+                created_bindings.append(binding)
+    create_workspace_stream_bindings_created_events(
+        bindings=created_bindings,
+        session=session,
+    )
+    return result
+
+
 def create_workspace_stream_topic_with_flags(project_id, session=None,
                                              **kwargs):
     topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()

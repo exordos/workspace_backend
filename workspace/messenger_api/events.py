@@ -26,6 +26,9 @@ from workspace.messenger_api.dm import models
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
+STREAM_BINDINGS_CREATED_EVENT = (
+    event_payloads.StreamBindingsCreatedEventPayload.KIND
+)
 FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 FOLDER_UPDATED_EVENT = event_payloads.FolderUpdatedEventPayload.KIND
 FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
@@ -44,6 +47,9 @@ WORKSPACE_USER_MESSAGE_FIELDS = tuple(
 WORKSPACE_USER_STREAM_FIELDS = tuple(
     name for name in models.WorkspaceUserStream.properties.properties
     if name != "private_index"
+)
+WORKSPACE_STREAM_BINDING_FIELDS = tuple(
+    models.WorkspaceStreamBinding.properties.properties
 )
 WORKSPACE_USER_FOLDER_FIELDS = tuple(
     models.UserFolder.properties.properties
@@ -100,6 +106,20 @@ def _stream_from_event_payload(event_payload):
     }
 
 
+def _stream_binding_snapshot_from_mapping(value):
+    return {
+        name: _event_payload_value(name, _event_payload_get(value, name))
+        for name in WORKSPACE_STREAM_BINDING_FIELDS
+    }
+
+
+def _stream_bindings_from_event_payload(event_payload):
+    return [
+        _stream_binding_snapshot_from_mapping(stream_binding)
+        for stream_binding in event_payload["stream_bindings"]
+    ]
+
+
 def _deleted_folder_from_event_payload(event_payload):
     return {
         "uuid": _event_payload_value("uuid", event_payload["uuid"]),
@@ -126,6 +146,17 @@ def event_row_to_messenger_event(row):
             "type": "stream",
             "kind": payload["kind"],
             "stream": _stream_from_event_payload(payload),
+        }
+    if payload["kind"] == STREAM_BINDINGS_CREATED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "stream_binding",
+            "kind": payload["kind"],
+            "stream_uuid": _event_payload_value(
+                "stream_uuid",
+                payload["stream_uuid"],
+            ),
+            "stream_bindings": _stream_bindings_from_event_payload(payload),
         }
     if payload["kind"] == FOLDER_DELETED_EVENT:
         return {
@@ -247,6 +278,25 @@ def create_stream_event(stream, session=None):
         user_uuid=stream.user_uuid,
         payload=event_payloads.StreamCreatedEventPayload(
             **dict(stream)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_stream_bindings_created_event(bindings, user_uuid, session=None):
+    binding = bindings[0]
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=binding.project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.StreamBindingsCreatedEventPayload(
+            project_id=binding.project_id,
+            stream_uuid=binding.stream_uuid,
+            stream_bindings=[
+                _stream_binding_snapshot_from_mapping(stream_binding)
+                for stream_binding in bindings
+            ],
         ),
     )
     return event.insert(session=session)

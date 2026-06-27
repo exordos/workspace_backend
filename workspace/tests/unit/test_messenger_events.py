@@ -286,6 +286,79 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("stream.created", event["kind"])
         self.assertEqual(stream, event["stream"])
 
+    def test_event_row_to_messenger_event_uses_stream_bindings_snapshot(self):
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        second_user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        binding_uuid = sys_uuid.uuid4()
+        second_binding_uuid = sys_uuid.uuid4()
+        stream_bindings = [
+            {
+                "uuid": str(binding_uuid),
+                "project_id": str(project_id),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(user_uuid),
+                "who_uuid": str(owner_uuid),
+                "role": "member",
+                "created_at": "2026-06-24T10:00:00.000000Z",
+                "updated_at": "2026-06-24T10:00:00.000000Z",
+            },
+            {
+                "uuid": str(second_binding_uuid),
+                "project_id": str(project_id),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(second_user_uuid),
+                "who_uuid": str(owner_uuid),
+                "role": "owner",
+                "created_at": "2026-06-24T10:00:00.000000Z",
+                "updated_at": "2026-06-24T10:00:00.000000Z",
+            },
+        ]
+        first_payload_binding = {
+            "uuid": str(binding_uuid),
+            "project_id": str(project_id),
+            "stream_uuid": str(stream_uuid),
+            "user_uuid": str(user_uuid),
+            "who_uuid": str(owner_uuid),
+            "role": "member",
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:00:00.000000Z",
+        }
+        second_payload_binding = {
+            "uuid": str(second_binding_uuid),
+            "project_id": str(project_id),
+            "stream_uuid": str(stream_uuid),
+            "user_uuid": str(second_user_uuid),
+            "who_uuid": str(owner_uuid),
+            "role": "owner",
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:00:00.000000Z",
+        }
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 11,
+                "user_uuid": owner_uuid,
+                "payload": {
+                    "kind": "stream_bindings.created",
+                    "project_id": str(project_id),
+                    "stream_uuid": str(stream_uuid),
+                    "stream_bindings": [
+                        first_payload_binding,
+                        second_payload_binding,
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(11, event["epoch_version"])
+        self.assertEqual("stream_binding", event["type"])
+        self.assertEqual("stream_bindings.created", event["kind"])
+        self.assertEqual(str(stream_uuid), event["stream_uuid"])
+        self.assertEqual(stream_bindings, event["stream_bindings"])
+
     def test_event_row_to_messenger_event_uses_deleted_folder_id(self):
         user_uuid = sys_uuid.uuid4()
         folder_uuid = sys_uuid.uuid4()
@@ -455,6 +528,36 @@ class MessengerEventsTestCase(unittest.TestCase):
                 payload.created_at
             ),
         )
+
+    def test_stream_bindings_created_event_payload_accepts_binding_list(self):
+        owner_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        binding_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "stream_bindings.created",
+                "project_id": str(project_id),
+                "stream_uuid": str(stream_uuid),
+                "stream_bindings": [
+                    {
+                        "uuid": str(binding_uuid),
+                        "project_id": str(project_id),
+                        "stream_uuid": str(stream_uuid),
+                        "user_uuid": str(user_uuid),
+                        "who_uuid": str(owner_uuid),
+                        "role": "member",
+                        "created_at": "2026-06-24T22:28:34.166369Z",
+                        "updated_at": "2026-06-24T22:28:34.166369Z",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(stream_uuid, payload.stream_uuid)
+        self.assertEqual(str(user_uuid), payload.stream_bindings[0]["user_uuid"])
 
     def test_folder_deleted_event_payload_accepts_folder_id(self):
         folder_uuid = sys_uuid.uuid4()
@@ -675,6 +778,79 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Engineering", created_event["payload"].name)
         self.assertEqual(created_at, created_event["payload"].created_at)
+
+    def test_create_stream_bindings_created_event_uses_binding_snapshots(self):
+        project_id = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        second_user_uuid = sys_uuid.uuid4()
+        owner_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        binding_uuid = sys_uuid.uuid4()
+        second_binding_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        binding = models.WorkspaceStreamBinding(
+            uuid=binding_uuid,
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=user_uuid,
+            who_uuid=owner_uuid,
+            role="member",
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        second_binding = models.WorkspaceStreamBinding(
+            uuid=second_binding_uuid,
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=second_user_uuid,
+            who_uuid=owner_uuid,
+            role="owner",
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 45
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_stream_bindings_created_event(
+                bindings=[binding, second_binding],
+                user_uuid=recipient_uuid,
+                session=session,
+            )
+
+        self.assertEqual(45, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(recipient_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.StreamBindingsCreatedEventPayload,
+        )
+        self.assertEqual(stream_uuid, created_event["payload"].stream_uuid)
+        self.assertEqual(
+            [str(user_uuid), str(second_user_uuid)],
+            [
+                binding["user_uuid"]
+                for binding in created_event["payload"].stream_bindings
+            ],
+        )
+        self.assertEqual(
+            "2026-06-24T10:00:00.000000Z",
+            created_event["payload"].stream_bindings[0]["created_at"],
+        )
 
     def test_create_folder_deleted_event_uses_folder_id(self):
         project_id = sys_uuid.uuid4()

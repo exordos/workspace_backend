@@ -27,6 +27,10 @@ class FolderItemUnpinAction(routes.Action):
     __controller__ = controllers.FolderItemController
 
 
+class WorkspaceStreamBindingsAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamController
+
+
 class FolderItemRoute(routes.Route):
     __controller__ = controllers.FolderItemController
     __allow_methods__ = [
@@ -59,11 +63,12 @@ class WorkspaceStreamRoute(routes.Route):
         routes.GET,
     ]
 
+    add_users = routes.action(WorkspaceStreamBindingsAction, invoke=True)
+
 
 class WorkspaceStreamBindingRoute(routes.Route):
     __controller__ = controllers.WorkspaceStreamBindingController
     __allow_methods__ = [
-        routes.CREATE,
         routes.FILTER,
         routes.GET,
         routes.UPDATE,

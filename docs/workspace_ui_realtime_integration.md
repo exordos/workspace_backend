@@ -267,6 +267,11 @@ Stream create event frame:
 After a stream is created, clients should also expect `folder.updated` events
 for the affected system folders. Every new stream updates `All chats`; private
 streams also update `Personal`, and non-private streams update `Channels`.
+When a user is added to an existing stream, that user receives the same
+`stream.created` and system-folder `folder.updated` events for the stream that
+just became visible. Existing stream participants receive
+`stream_bindings.created` with the new binding snapshots for the whole added
+batch instead of another `stream.created` event.
 
 Folder update event frame:
 
@@ -387,6 +392,12 @@ type WorkspaceRealtimeEvent = {
       stream: WorkspaceUserStream;
     }
   | {
+      type: "stream_binding";
+      kind: "stream_bindings.created";
+      stream_uuid: string;
+      stream_bindings: WorkspaceStreamBinding[];
+    }
+  | {
       type: "folder";
       kind: "folder.created" | "folder.updated";
       folder: WorkspaceFolder;
@@ -458,6 +469,24 @@ function normalizeWorkspaceEvent(
           created_at: model.payload.created_at,
           updated_at: model.payload.updated_at,
         },
+      };
+
+    case "stream_bindings.created":
+      return {
+        epoch_version: model.epoch_version,
+        type: "stream_binding",
+        kind: "stream_bindings.created",
+        stream_uuid: model.payload.stream_uuid,
+        stream_bindings: model.payload.stream_bindings.map((binding) => ({
+          uuid: binding.uuid,
+          project_id: binding.project_id,
+          stream_uuid: binding.stream_uuid,
+          user_uuid: binding.user_uuid,
+          who_uuid: binding.who_uuid,
+          role: binding.role,
+          created_at: binding.created_at,
+          updated_at: binding.updated_at,
+        })),
       };
 
     case "folder.created":
@@ -564,11 +593,13 @@ UUID.
 - Delivery is at-least-once.
 - Ordering is by `epoch_version`.
 - The UI dispatch pipeline must be idempotent.
-- REST v1 supports `stream.created`, `message.created`, `folder.created`,
-  `folder.updated`, `folder.deleted`, and `folder_item.deleted`.
+- REST v1 supports `stream.created`, `stream_bindings.created`,
+  `message.created`, `folder.created`, `folder.updated`, `folder.deleted`, and
+  `folder_item.deleted`.
 - Websocket v1 emits `event.type === "stream"`, `event.type === "message"`,
-  `event.type === "folder"`, and `event.type === "folder_item"`. Stream,
-  folder, and folder item events include `event.kind`.
+  `event.type === "stream_binding"`, `event.type === "folder"`, and
+  `event.type === "folder_item"`. Stream, stream binding, folder, and folder
+  item events include `event.kind`.
 
 ## Manual Verification Checklist
 

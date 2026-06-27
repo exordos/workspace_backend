@@ -625,6 +625,88 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     ]
 
 
+def test_stream_binding_create_notifies_added_user(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Engineering",
+    )
+    target_user_uuid = sys_uuid.uuid4()
+    second_target_user_uuid = sys_uuid.uuid4()
+
+    resp = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={
+            "member": [
+                str(target_user_uuid),
+                str(second_target_user_uuid),
+            ],
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+
+    for target_uuid in (target_user_uuid, second_target_user_uuid):
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload
+                FROM m_workspace_events
+                WHERE project_id = %s
+                    AND user_uuid = %s
+                ORDER BY epoch_version
+                """,
+                (api.project_id, target_uuid),
+            )
+            events = [row[0] for row in cur.fetchall()]
+
+        assert [event["kind"] for event in events] == [
+            "stream.created",
+            "folder.updated",
+            "folder.updated",
+        ]
+        assert events[0]["uuid"] == stream_uuid
+        assert events[0]["user_uuid"] == str(target_uuid)
+        assert events[0]["role"] == "member"
+        assert [(event["uuid"], event["title"]) for event in events[1:]] == [
+            ("00000000-0000-0000-0000-000000000000", "All chats"),
+            ("00000000-0000-0000-0000-000000000002", "Channels"),
+        ]
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND user_uuid = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, api.user_uuid),
+        )
+        owner_events = [row[0] for row in cur.fetchall()]
+
+    assert [event["kind"] for event in owner_events] == [
+        "stream_bindings.created",
+    ]
+    assert owner_events[0]["stream_uuid"] == stream_uuid
+    assert [
+        binding["user_uuid"]
+        for binding in owner_events[0]["stream_bindings"]
+    ] == [
+        str(target_user_uuid),
+        str(second_target_user_uuid),
+    ]
+    assert {
+        binding["who_uuid"]
+        for binding in owner_events[0]["stream_bindings"]
+    } == {str(api.user_uuid)}
+    assert {
+        binding["role"]
+        for binding in owner_events[0]["stream_bindings"]
+    } == {"member"}
+
+
 def test_streams_cursor_pagination_with_composite_pk(api, db):
     seeded = {
         conftest.seed_user_stream(db, api.project_id, api.user_uuid, f"s-{i}")

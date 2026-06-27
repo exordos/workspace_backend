@@ -176,8 +176,8 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `GET` | `/v1/streams/` | List streams visible to the current IAM user. |
 | `POST` | `/v1/streams/` | Create a stream. |
 | `GET` | `/v1/streams/{stream_uuid}` | Get a stream. |
+| `POST` | `/v1/streams/{stream_uuid}/actions/add_users/invoke` | Add users to a stream by role. |
 | `GET` | `/v1/stream_bindings/` | List stream bindings. |
-| `POST` | `/v1/stream_bindings/` | Create a stream binding. |
 | `GET` | `/v1/stream_bindings/{binding_uuid}` | Get a stream binding. |
 | `PUT` | `/v1/stream_bindings/{binding_uuid}` | Update a stream binding. |
 | `DELETE` | `/v1/stream_bindings/{binding_uuid}` | Delete a stream binding. |
@@ -534,6 +534,9 @@ Realtime side effects:
 | --- | --- | --- | --- |
 | create stream | `stream.created` | `stream` | Full user stream snapshot. |
 | create stream | `folder.updated` | `folder` | Updated `All chats` and `Channels`/`Personal` system folder snapshots. |
+| add stream binding | `stream.created` | `stream` | Added user's full user stream snapshot. |
+| add stream bindings | `stream_bindings.created` | `stream_binding` | New stream binding snapshots for existing stream participants. |
+| add stream binding | `folder.updated` | `folder` | Updated added user's `All chats` and `Channels`/`Personal` system folder snapshots. |
 
 For direct private streams, one `stream.created` event is written for each
 participant. Stream creation also writes `folder.updated` events for each
@@ -542,8 +545,15 @@ or `Channels` when it is not private.
 
 ## Stream Bindings
 
-Stream bindings are stored in `m_workspace_stream_bindings`. On create,
-`who_uuid` is always overwritten with the current IAM user's UUID.
+Stream bindings are stored in `m_workspace_stream_bindings`. New bindings are
+created through `POST /v1/streams/{stream_uuid}/actions/add_users/invoke`, where
+the request body groups added users by role. `who_uuid` is always overwritten
+with the current IAM user's UUID.
+When a new binding is created, the added user receives a `stream.created`
+event for the newly visible stream and `folder.updated` events for `All chats`
+and either `Personal` or `Channels`, depending on the stream privacy. Existing
+stream participants receive one `stream_bindings.created` event containing the
+new binding snapshots for the whole added batch.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -556,14 +566,17 @@ Stream bindings are stored in `m_workspace_stream_bindings`. On create,
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
-Create request:
+Add users request:
 
 ```json
 {
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
-  "user_uuid": "33333333-3333-3333-3333-333333333333",
-  "role": "member"
+  "member": [
+    "33333333-3333-3333-3333-333333333333",
+    "44444444-4444-4444-4444-444444444444"
+  ],
+  "owner": [
+    "55555555-5555-5555-5555-555555555555"
+  ]
 }
 ```
 
@@ -796,10 +809,11 @@ Supported event payload kinds:
 
 | Payload kind | Produced by | REST payload |
 | --- | --- | --- |
-| `stream.created` | `POST /v1/streams/` | Full user stream snapshot. |
+| `stream.created` | `POST /v1/streams/`, `POST /v1/streams/{uuid}/actions/add_users/invoke` | Full user stream snapshot. |
+| `stream_bindings.created` | `POST /v1/streams/{uuid}/actions/add_users/invoke` | Stream UUID and full stream binding snapshots for the added batch. |
 | `message.created` | `POST /v1/messages/` | Full user message snapshot. |
 | `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
-| `folder.updated` | `POST /v1/streams/`, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
+| `folder.updated` | `POST /v1/streams/`, `POST /v1/streams/{uuid}/actions/add_users/invoke`, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
 | `folder.deleted` | `DELETE /v1/folders/{uuid}` | Only deleted folder `uuid`. |
 | `folder_item.deleted` | `DELETE /v1/folder_items/{uuid}` | Only deleted folder item `uuid`. |
 
