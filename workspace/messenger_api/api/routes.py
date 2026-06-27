@@ -28,7 +28,7 @@ class FolderItemUnpinAction(routes.Action):
 
 
 class WorkspaceStreamBindingsAction(routes.Action):
-    __controller__ = controllers.WorkspaceStreamController
+    __controller__ = controllers.WorkspaceStreamBindingController
 
 
 class FolderItemRoute(routes.Route):

@@ -208,15 +208,6 @@ class WorkspaceStreamController(
             **values,
         )
 
-    @ra_actions.post
-    def add_users(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
-            project_id=resource.project_id,
-            stream_uuid=resource.uuid,
-            who_uuid=self._get_user_uuid(),
-            role_user_uuids=kwargs,
-        )
-
 
 class WorkspaceStreamBindingController(
     WorkspaceBaseResourceControllerPaginated,
@@ -236,6 +227,15 @@ class WorkspaceStreamBindingController(
         return {
             "project_id": self._get_project_id(),
         }
+
+    @ra_actions.post
+    def add_users(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
+            project_id=resource.project_id,
+            stream_uuid=resource.uuid,
+            who_uuid=self._get_user_uuid(),
+            role_user_uuids=kwargs,
+        )
 
 
 class WorkspaceMessageController(

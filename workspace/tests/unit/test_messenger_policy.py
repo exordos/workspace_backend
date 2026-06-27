@@ -112,7 +112,7 @@ def test_stream_controller_create_uses_context_scope():
     assert create_kwargs["user_uuid"] == user_uuid
 
 
-def test_stream_controller_bindings_action_uses_context_and_stream_resource():
+def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
     project_id = sys_uuid.uuid4()
     actor_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -122,7 +122,7 @@ def test_stream_controller_bindings_action_uses_context_and_stream_resource():
             user_uuid=actor_uuid,
         )
     )
-    controller = controllers.WorkspaceStreamController(request)
+    controller = controllers.WorkspaceStreamBindingController(request)
     resource = types.SimpleNamespace(
         project_id=project_id,
         uuid=stream_uuid,
@@ -138,7 +138,7 @@ def test_stream_controller_bindings_action_uses_context_and_stream_resource():
         "get_or_create_workspace_stream_bindings",
         return_value=returned_bindings,
     ) as get_or_create:
-        result = controllers.WorkspaceStreamController.add_users._post(
+        result = controllers.WorkspaceStreamBindingController.add_users._post(
             self=controller,
             resource=resource,
             **payload,
@@ -150,6 +150,13 @@ def test_stream_controller_bindings_action_uses_context_and_stream_resource():
         stream_uuid=stream_uuid,
         who_uuid=actor_uuid,
         role_user_uuids=payload,
+    )
+
+
+def test_stream_bindings_action_uses_binding_controller_resource():
+    assert (
+        routes.WorkspaceStreamBindingsAction.__controller__
+        is controllers.WorkspaceStreamBindingController
     )
 
 

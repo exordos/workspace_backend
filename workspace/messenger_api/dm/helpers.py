@@ -220,6 +220,7 @@ def get_or_create_workspace_stream_bindings(project_id, stream_uuid, who_uuid,
     created_bindings = []
     for role, user_uuids in role_user_uuids.items():
         for user_uuid in user_uuids:
+            user_uuid = sys_uuid.UUID(str(user_uuid))
             binding, created = _get_or_create_workspace_stream_binding(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
