@@ -106,6 +106,63 @@ class StreamUpdatedEventPayload(StreamEventPayloadBase):
     KIND = "stream.updated"
 
 
+class TopicEventPayloadBase(
+    types_dynamic.AbstractKindModel,
+    base.UserScopedModelWithUUID,
+    models.ModelWithProject,
+):
+    name = properties.property(
+        types.String(max_length=128),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    is_default = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    is_done = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    created_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+
+
+class TopicCreatedEventPayload(TopicEventPayloadBase):
+    KIND = "topic.created"
+
+
+class TopicUpdatedEventPayload(TopicEventPayloadBase):
+    KIND = "topic.updated"
+
+
+class TopicDeletedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    KIND = "topic.deleted"
+
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+
+
 class StreamDeletedEventPayload(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
@@ -149,6 +206,9 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
     types_dynamic.KindModelType(StreamCreatedEventPayload),
     types_dynamic.KindModelType(StreamUpdatedEventPayload),
+    types_dynamic.KindModelType(TopicCreatedEventPayload),
+    types_dynamic.KindModelType(TopicUpdatedEventPayload),
+    types_dynamic.KindModelType(TopicDeletedEventPayload),
     types_dynamic.KindModelType(StreamDeletedEventPayload),
     types_dynamic.KindModelType(StreamBindingsCreatedEventPayload),
     types_dynamic.KindModelType(FolderDeletedEventPayload),

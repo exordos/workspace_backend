@@ -1111,6 +1111,279 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(5, get_user_folder.call_count)
         self.assertEqual(5, create_folder_updated.call_count)
 
+    def test_create_workspace_user_stream_topic_creates_events_for_users(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        created_topic = types.SimpleNamespace(uuid=topic_uuid)
+        returned_topic = types.SimpleNamespace(user_uuid=user_uuid)
+        other_topic = types.SimpleNamespace(user_uuid=other_user_uuid)
+
+        class FakeStreamBinding:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=object())
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStreamBinding", FakeStreamBinding
+        ), mock.patch.object(
+            dm_helpers,
+            "create_workspace_stream_topic_with_flags",
+            return_value=created_topic,
+        ) as create_topic, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_stream_topics",
+            return_value=[other_topic, returned_topic],
+        ) as get_topics, mock.patch.object(
+            dm_helpers.messenger_events, "create_topic_event"
+        ) as create_event:
+            result = dm_helpers.create_workspace_user_stream_topic(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                values={
+                    "name": "Planning",
+                    "stream_uuid": stream_uuid,
+                },
+                session=session,
+            )
+
+        self.assertIs(returned_topic, result)
+        FakeStreamBinding.objects.get_one.assert_called_once()
+        create_topic.assert_called_once_with(
+            project_id=project_id,
+            session=session,
+            name="Planning",
+            stream_uuid=stream_uuid,
+        )
+        get_topics.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        create_event.assert_has_calls(
+            [
+                mock.call(topic=other_topic, session=session),
+                mock.call(topic=returned_topic, session=session),
+            ]
+        )
+
+    def test_update_workspace_user_stream_topic_creates_events_for_users(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        updated_topic = {}
+        returned_topic = types.SimpleNamespace(user_uuid=user_uuid)
+        other_topic = types.SimpleNamespace(user_uuid=other_user_uuid)
+
+        class ExistingTopic:
+            def update_dm(self, values):
+                updated_topic["values"] = values
+
+            def update(self, session=None):
+                updated_topic["update_session"] = session
+
+        with mock.patch.object(
+            dm_helpers,
+            "_get_workspace_stream_topic_for_user",
+            return_value=ExistingTopic(),
+        ) as get_topic, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_stream_topics",
+            return_value=[returned_topic, other_topic],
+        ) as get_topics, mock.patch.object(
+            dm_helpers.messenger_events, "create_topic_updated_event"
+        ) as create_event:
+            result = dm_helpers.update_workspace_user_stream_topic(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                topic_uuid=topic_uuid,
+                values={"name": "Retros"},
+                session=session,
+            )
+
+        self.assertIs(returned_topic, result)
+        self.assertEqual({"name": "Retros"}, updated_topic["values"])
+        self.assertIs(session, updated_topic["update_session"])
+        get_topic.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        get_topics.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        create_event.assert_has_calls(
+            [
+                mock.call(topic=returned_topic, session=session),
+                mock.call(topic=other_topic, session=session),
+            ]
+        )
+
+    def test_delete_workspace_user_stream_topic_creates_events_for_users(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        deleted_topic = {}
+        returned_topic = types.SimpleNamespace(user_uuid=user_uuid)
+        other_topic = types.SimpleNamespace(user_uuid=other_user_uuid)
+
+        class ExistingTopic:
+            def __init__(self):
+                self.stream_uuid = stream_uuid
+
+            def delete(self, session=None):
+                deleted_topic["delete_session"] = session
+
+        with mock.patch.object(
+            dm_helpers,
+            "_get_workspace_stream_topic_for_user",
+            return_value=ExistingTopic(),
+        ) as get_topic, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_stream_topics",
+            return_value=[returned_topic, other_topic],
+        ) as get_topics, mock.patch.object(
+            dm_helpers.messenger_events, "create_topic_deleted_event"
+        ) as create_event:
+            result = dm_helpers.delete_workspace_user_stream_topic(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                topic_uuid=topic_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(session, deleted_topic["delete_session"])
+        get_topic.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        get_topics.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        create_event.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    topic_uuid=topic_uuid,
+                    stream_uuid=stream_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=other_user_uuid,
+                    topic_uuid=topic_uuid,
+                    stream_uuid=stream_uuid,
+                    session=session,
+                ),
+            ]
+        )
+
+    def test_toggle_workspace_user_stream_topic_done_creates_event(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        current_topic = types.SimpleNamespace(is_done=False)
+        user_topic = types.SimpleNamespace(user_uuid=user_uuid)
+        other_topic = types.SimpleNamespace(user_uuid=other_user_uuid)
+        returned_topic = types.SimpleNamespace(
+            uuid=topic_uuid,
+            user_uuid=user_uuid,
+            is_done=True,
+        )
+        returned_other_topic = types.SimpleNamespace(
+            uuid=topic_uuid,
+            user_uuid=other_user_uuid,
+            is_done=True,
+        )
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream_topic",
+            return_value=current_topic,
+        ) as get_topic, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_stream_topics",
+            side_effect=[
+                [user_topic, other_topic],
+                [returned_topic, returned_other_topic],
+            ],
+        ) as get_topics, mock.patch.object(
+            dm_helpers, "_set_workspace_user_topic_done"
+        ) as set_done, mock.patch.object(
+            dm_helpers.messenger_events, "create_topic_updated_event"
+        ) as create_event:
+            result = dm_helpers.toggle_workspace_user_stream_topic_done(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                topic_uuid=topic_uuid,
+                session=session,
+            )
+
+        self.assertIs(returned_topic, result)
+        get_topic.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        get_topics.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    topic_uuid=topic_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    topic_uuid=topic_uuid,
+                    session=session,
+                ),
+            ]
+        )
+        set_done.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    topic_uuid=topic_uuid,
+                    is_done=True,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=other_user_uuid,
+                    topic_uuid=topic_uuid,
+                    is_done=True,
+                    session=session,
+                ),
+            ]
+        )
+        create_event.assert_has_calls(
+            [
+                mock.call(topic=returned_topic, session=session),
+                mock.call(topic=returned_other_topic, session=session),
+            ]
+        )
+
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

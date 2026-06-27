@@ -955,13 +955,96 @@ def test_streams_cursor_pagination_with_composite_pk(api, db):
 
 
 # --------------------------------------------------------------------------- #
-# Stream topics: rename
+# Stream topics: CRUD
 # --------------------------------------------------------------------------- #
 
 
+def test_stream_topic_create_is_visible_to_stream_users(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-create-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+
+    resp = api.post(
+        STREAM_TOPICS,
+        json={
+            "name": "planning",
+            "stream_uuid": stream_uuid,
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    topic = resp.json()
+    assert topic["name"] == "planning"
+    assert topic["stream_uuid"] == stream_uuid
+    assert topic["is_default"] is False
+    assert topic["is_done"] is False
+
+    resp = api.get(f"{STREAM_TOPICS}{topic['uuid']}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "planning"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_topic_flags
+            WHERE uuid = %s
+                AND project_id = %s
+                AND user_uuid IN (%s, %s)
+            """,
+            (topic["uuid"], api.project_id, api.user_uuid, other_user),
+        )
+        flags_count = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'topic.created'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, topic["uuid"]),
+        )
+        event_rows = cur.fetchall()
+
+    assert flags_count == 2
+    assert {str(row[1]) for row in event_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    for _, _, payload in event_rows:
+        assert payload["kind"] == "topic.created"
+        assert payload["uuid"] == topic["uuid"]
+        assert payload["name"] == "planning"
+        assert payload["stream_uuid"] == stream_uuid
+        assert payload["unread_count"] == 0
+        assert payload["is_default"] is False
+        assert payload["is_done"] is False
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": event_rows[0][0],
+            "user_uuid": event_rows[0][1],
+            "payload": event_rows[0][2],
+        }
+    )
+    assert event["type"] == "topic"
+    assert event["kind"] == "topic.created"
+    assert event["topic"]["uuid"] == topic["uuid"]
+    assert event["topic"]["name"] == "planning"
+
+
 def test_stream_topic_rename(api, db):
+    other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "team-chat"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
     )
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
@@ -975,13 +1058,110 @@ def test_stream_topic_rename(api, db):
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "retros"
 
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'topic.updated'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, topic_uuid),
+        )
+        event_rows = cur.fetchall()
+
+    assert {str(row[0]) for row in event_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    for _, payload in event_rows:
+        assert payload["name"] == "retros"
+        assert payload["stream_uuid"] == stream_uuid
+
+
+def test_stream_topic_delete_cascades_topic_messages(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-delete-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "standups"
+    )
+    message_uuid = str(sys_uuid.uuid4())
+
+    resp = api.post(
+        MESSAGES,
+        json={
+            "uuid": message_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "delete with topic",
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    resp = api.delete(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code == 404, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM m_workspace_stream_topics
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_user_topic_flags
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_messages
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_user_message_flags
+                 WHERE uuid = %s)
+            """,
+            (topic_uuid, topic_uuid, message_uuid, message_uuid),
+        )
+        counts = cur.fetchone()
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'topic.deleted'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, topic_uuid),
+        )
+        event_rows = cur.fetchall()
+
+    assert counts == (0, 0, 0, 0)
+    assert {str(row[0]) for row in event_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    for _, payload in event_rows:
+        assert payload["stream_uuid"] == stream_uuid
+
 
 def test_stream_topic_is_done_flag(api, db):
+    other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "team-chat"
     )
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
     )
 
     resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
@@ -992,7 +1172,38 @@ def test_stream_topic_is_done_flag(api, db):
     assert resp.status_code == 200, resp.text
     assert resp.json()["is_done"] is True
 
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_done"] is True
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'topic.updated'
+                AND payload->>'uuid' = %s
+                AND payload->>'is_done' = 'true'
+            ORDER BY user_uuid
+            """,
+            (api.project_id, topic_uuid),
+        )
+        event_rows = cur.fetchall()
+
+    assert {str(row[0]) for row in event_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    for _, payload in event_rows:
+        assert payload["stream_uuid"] == stream_uuid
+        assert payload["is_done"] is True
+
     resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/toggle_done/")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_done"] is False
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=other_user)
     assert resp.status_code == 200, resp.text
     assert resp.json()["is_done"] is False
 

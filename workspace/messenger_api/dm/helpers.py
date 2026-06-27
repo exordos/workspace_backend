@@ -356,6 +356,188 @@ def create_workspace_stream_topic_with_flags(project_id, session=None,
     return topic
 
 
+def get_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
+                                    session=None):
+    return models.WorkspaceUserTopic.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+
+
+def _get_workspace_user_stream_topics(project_id, topic_uuid, session=None):
+    return models.WorkspaceUserTopic.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+
+
+def _get_workspace_stream_topic_for_user(project_id, user_uuid, topic_uuid,
+                                         session=None):
+    topic = models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+    models.WorkspaceStreamBinding.objects.get_one(
+        filters={
+            "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    return topic
+
+
+def create_workspace_user_stream_topic(project_id, user_uuid, values,
+                                       session=None):
+    stream_uuid = values["stream_uuid"]
+    models.WorkspaceStreamBinding.objects.get_one(
+        filters={
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    topic = create_workspace_stream_topic_with_flags(
+        project_id=project_id,
+        session=session,
+        **values,
+    )
+    result = None
+    for user_topic in _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic.uuid,
+        session=session,
+    ):
+        if user_topic.user_uuid == user_uuid:
+            result = user_topic
+        messenger_events.create_topic_event(
+            topic=user_topic,
+            session=session,
+        )
+    return result
+
+
+def update_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
+                                       values, session=None):
+    topic = _get_workspace_stream_topic_for_user(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    topic.update_dm(values={"name": values["name"]})
+    topic.update(session=session)
+    result = None
+    for user_topic in _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+        session=session,
+    ):
+        if user_topic.user_uuid == user_uuid:
+            result = user_topic
+        messenger_events.create_topic_updated_event(
+            topic=user_topic,
+            session=session,
+        )
+    return result
+
+
+def delete_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
+                                       session=None):
+    topic = _get_workspace_stream_topic_for_user(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    for user_topic in _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+        session=session,
+    ):
+        messenger_events.create_topic_deleted_event(
+            project_id=project_id,
+            user_uuid=user_topic.user_uuid,
+            topic_uuid=topic_uuid,
+            stream_uuid=topic.stream_uuid,
+            session=session,
+        )
+    topic.delete(session=session)
+
+
+def _set_workspace_user_topic_done(project_id, user_uuid, topic_uuid,
+                                   is_done, session=None):
+    for flags in models.WorkspaceUserTopicFlags.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        limit=1,
+        session=session,
+    ):
+        flags.is_done = is_done
+        flags.update(session=session)
+        return
+
+    flags = models.WorkspaceUserTopicFlags(
+        uuid=topic_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        is_done=is_done,
+    )
+    flags.insert(session=session)
+
+
+def toggle_workspace_user_stream_topic_done(project_id, user_uuid, topic_uuid,
+                                            session=None):
+    topic = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    is_done = not topic.is_done
+    for user_topic in _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+        session=session,
+    ):
+        _set_workspace_user_topic_done(
+            project_id=project_id,
+            user_uuid=user_topic.user_uuid,
+            topic_uuid=topic_uuid,
+            is_done=is_done,
+            session=session,
+        )
+
+    result = None
+    for user_topic in _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+        session=session,
+    ):
+        if user_topic.user_uuid == user_uuid:
+            result = user_topic
+        messenger_events.create_topic_updated_event(
+            topic=user_topic,
+            session=session,
+        )
+    return result
+
+
 def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
                                                  direct_user_uuid, stream_uuid,
                                                  session=None, **kwargs):

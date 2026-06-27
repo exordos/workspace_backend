@@ -348,6 +348,108 @@ class MessengerEventsTestCase(unittest.TestCase):
             event["stream"],
         )
 
+    def test_event_row_to_messenger_event_uses_rest_topic_snapshot(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic = {
+            "uuid": str(topic_uuid),
+            "user_uuid": str(user_uuid),
+            "project_id": str(project_id),
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:00:00.000000Z",
+            "name": "Planning",
+            "stream_uuid": str(stream_uuid),
+            "unread_count": 2,
+            "is_default": False,
+            "is_done": True,
+        }
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 13,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "topic.created",
+                    "uuid": str(topic_uuid),
+                    "user_uuid": str(user_uuid),
+                    "project_id": str(project_id),
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:00:00.000000",
+                    "name": "Planning",
+                    "stream_uuid": str(stream_uuid),
+                    "unread_count": 2,
+                    "is_default": False,
+                    "is_done": True,
+                },
+            }
+        )
+
+        self.assertEqual(13, event["epoch_version"])
+        self.assertEqual("topic", event["type"])
+        self.assertEqual("topic.created", event["kind"])
+        self.assertEqual(topic, event["topic"])
+
+    def test_event_row_to_messenger_event_uses_updated_topic_snapshot(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 14,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "topic.updated",
+                    "uuid": str(topic_uuid),
+                    "user_uuid": str(user_uuid),
+                    "project_id": str(project_id),
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:05:00.000000",
+                    "name": "Retros",
+                    "stream_uuid": str(stream_uuid),
+                    "unread_count": 0,
+                    "is_default": False,
+                    "is_done": False,
+                },
+            }
+        )
+
+        self.assertEqual(14, event["epoch_version"])
+        self.assertEqual("topic", event["type"])
+        self.assertEqual("topic.updated", event["kind"])
+        self.assertEqual("Retros", event["topic"]["name"])
+        self.assertEqual(str(topic_uuid), event["topic"]["uuid"])
+        self.assertEqual(str(stream_uuid), event["topic"]["stream_uuid"])
+
+    def test_event_row_to_messenger_event_uses_deleted_topic_id(self):
+        topic_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 15,
+                "payload": {
+                    "kind": "topic.deleted",
+                    "uuid": str(topic_uuid),
+                    "stream_uuid": str(stream_uuid),
+                },
+            }
+        )
+
+        self.assertEqual(15, event["epoch_version"])
+        self.assertEqual("topic", event["type"])
+        self.assertEqual("topic.deleted", event["kind"])
+        self.assertEqual(
+            {
+                "uuid": str(topic_uuid),
+                "stream_uuid": str(stream_uuid),
+            },
+            event["topic"],
+        )
+
     def test_event_row_to_messenger_event_uses_stream_bindings_snapshot(self):
         owner_uuid = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -620,6 +722,51 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(stream_uuid, payload.stream_uuid)
         self.assertEqual(str(user_uuid), payload.stream_bindings[0]["user_uuid"])
+
+    def test_topic_created_event_payload_accepts_postgres_json_timestamp(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "topic.created",
+                "uuid": str(topic_uuid),
+                "user_uuid": str(user_uuid),
+                "project_id": str(project_id),
+                "created_at": "2026-06-24T22:28:34.166369",
+                "updated_at": "2026-06-24T22:28:34.166369",
+                "name": "Planning",
+                "stream_uuid": str(stream_uuid),
+                "unread_count": 0,
+                "is_default": False,
+                "is_done": False,
+            }
+        )
+
+        self.assertEqual("Planning", payload.name)
+        self.assertEqual(
+            "2026-06-24T22:28:34.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.created_at
+            ),
+        )
+
+    def test_topic_deleted_event_payload_accepts_topic_id(self):
+        topic_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "topic.deleted",
+                "uuid": str(topic_uuid),
+                "stream_uuid": str(stream_uuid),
+            }
+        )
+
+        self.assertEqual(topic_uuid, payload.uuid)
+        self.assertEqual(stream_uuid, payload.stream_uuid)
 
     def test_folder_deleted_event_payload_accepts_folder_id(self):
         folder_uuid = sys_uuid.uuid4()
@@ -899,6 +1046,109 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("Engineering", created_event["payload"].name)
         self.assertEqual(True, created_event["payload"].is_archived)
 
+    def test_create_topic_event_uses_user_topic_snapshot(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        user_topic = models.WorkspaceUserTopic(
+            uuid=topic_uuid,
+            user_uuid=user_uuid,
+            project_id=project_id,
+            created_at=created_at,
+            updated_at=created_at,
+            name="Planning",
+            stream_uuid=stream_uuid,
+            unread_count=0,
+            is_default=False,
+            is_done=False,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 48
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_topic_event(
+                topic=user_topic,
+                session=session,
+            )
+
+        self.assertEqual(48, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.TopicCreatedEventPayload,
+        )
+        self.assertEqual("Planning", created_event["payload"].name)
+        self.assertEqual(False, created_event["payload"].is_done)
+
+    def test_create_topic_updated_event_uses_user_topic_snapshot(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 6, 24, 10, 0, 0, tzinfo=datetime.timezone.utc
+        )
+        updated_at = datetime.datetime(
+            2026, 6, 24, 10, 5, 0, tzinfo=datetime.timezone.utc
+        )
+        user_topic = models.WorkspaceUserTopic(
+            uuid=topic_uuid,
+            user_uuid=user_uuid,
+            project_id=project_id,
+            created_at=created_at,
+            updated_at=updated_at,
+            name="Retros",
+            stream_uuid=stream_uuid,
+            unread_count=1,
+            is_default=False,
+            is_done=True,
+        )
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 49
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_topic_updated_event(
+                topic=user_topic,
+                session=session,
+            )
+
+        self.assertEqual(49, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.TopicUpdatedEventPayload,
+        )
+        self.assertEqual("Retros", created_event["payload"].name)
+        self.assertEqual(True, created_event["payload"].is_done)
+
     def test_create_stream_bindings_created_event_uses_binding_snapshots(self):
         project_id = sys_uuid.uuid4()
         recipient_uuid = sys_uuid.uuid4()
@@ -1041,6 +1291,44 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.StreamDeletedEventPayload,
         )
         self.assertEqual(stream_uuid, created_event["payload"].uuid)
+
+    def test_create_topic_deleted_event_uses_topic_id(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 50
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_topic_deleted_event(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                topic_uuid=topic_uuid,
+                stream_uuid=stream_uuid,
+                session=session,
+            )
+
+        self.assertEqual(50, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.TopicDeletedEventPayload,
+        )
+        self.assertEqual(topic_uuid, created_event["payload"].uuid)
+        self.assertEqual(stream_uuid, created_event["payload"].stream_uuid)
 
     def test_create_folder_item_deleted_event_uses_item_id(self):
         project_id = sys_uuid.uuid4()

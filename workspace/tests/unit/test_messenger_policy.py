@@ -73,6 +73,129 @@ def test_topic_controller_autovalues_match_topic_table_shape():
     assert values == {"project_id": project_id}
 
 
+def test_topic_controller_create_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamTopicController(request)
+    returned_topic = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "create_workspace_user_stream_topic",
+        return_value=returned_topic,
+    ) as create_topic:
+        result = controller.create(
+            project_id=sys_uuid.uuid4(),
+            name="planning",
+            stream_uuid=stream_uuid,
+        )
+
+    assert result is returned_topic
+    create_topic.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        values={
+            "name": "planning",
+            "stream_uuid": stream_uuid,
+        },
+    )
+
+
+def test_topic_controller_update_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamTopicController(request)
+    returned_topic = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "update_workspace_user_stream_topic",
+        return_value=returned_topic,
+    ) as update_topic:
+        result = controller.update(topic_uuid, name="retros")
+
+    assert result is returned_topic
+    update_topic.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        values={"name": "retros"},
+    )
+
+
+def test_topic_controller_delete_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamTopicController(request)
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "delete_workspace_user_stream_topic",
+        return_value=None,
+    ) as delete_topic:
+        result = controller.delete(topic_uuid)
+
+    assert result is None
+    delete_topic.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+    )
+
+
+def test_topic_controller_toggle_done_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamTopicController(request)
+    resource = types.SimpleNamespace(uuid=topic_uuid)
+    returned_topic = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "toggle_workspace_user_stream_topic_done",
+        return_value=returned_topic,
+    ) as toggle_topic:
+        result = controllers.WorkspaceStreamTopicController.toggle_done._post(
+            self=controller,
+            resource=resource,
+        )
+
+    assert result is returned_topic
+    toggle_topic.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+    )
+
+
 def test_stream_controller_hides_private_index():
     resource = controllers.WorkspaceStreamController.__resource__
 

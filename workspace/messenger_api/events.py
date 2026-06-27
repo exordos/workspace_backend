@@ -31,6 +31,9 @@ STREAM_DELETED_EVENT = event_payloads.StreamDeletedEventPayload.KIND
 STREAM_BINDINGS_CREATED_EVENT = (
     event_payloads.StreamBindingsCreatedEventPayload.KIND
 )
+TOPIC_CREATED_EVENT = event_payloads.TopicCreatedEventPayload.KIND
+TOPIC_UPDATED_EVENT = event_payloads.TopicUpdatedEventPayload.KIND
+TOPIC_DELETED_EVENT = event_payloads.TopicDeletedEventPayload.KIND
 FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 FOLDER_UPDATED_EVENT = event_payloads.FolderUpdatedEventPayload.KIND
 FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
@@ -40,6 +43,10 @@ FOLDER_ITEM_DELETED_EVENT = (
 FOLDER_EVENTS = (
     FOLDER_CREATED_EVENT,
     FOLDER_UPDATED_EVENT,
+)
+TOPIC_EVENTS = (
+    TOPIC_CREATED_EVENT,
+    TOPIC_UPDATED_EVENT,
 )
 DEFAULT_EVENTS_LIMIT = 100
 MAX_EVENTS_LIMIT = 500
@@ -52,6 +59,9 @@ WORKSPACE_USER_STREAM_FIELDS = tuple(
 )
 WORKSPACE_STREAM_BINDING_FIELDS = tuple(
     models.WorkspaceStreamBinding.properties.properties
+)
+WORKSPACE_USER_TOPIC_FIELDS = tuple(
+    models.WorkspaceUserTopic.properties.properties
 )
 WORKSPACE_USER_FOLDER_FIELDS = tuple(
     models.UserFolder.properties.properties
@@ -108,6 +118,13 @@ def _stream_from_event_payload(event_payload):
     }
 
 
+def _topic_from_event_payload(event_payload):
+    return {
+        name: _event_payload_value(name, event_payload[name])
+        for name in WORKSPACE_USER_TOPIC_FIELDS
+    }
+
+
 def _stream_binding_snapshot_from_mapping(value):
     return {
         name: _event_payload_value(name, _event_payload_get(value, name))
@@ -125,6 +142,16 @@ def _stream_bindings_from_event_payload(event_payload):
 def _deleted_stream_from_event_payload(event_payload):
     return {
         "uuid": _event_payload_value("uuid", event_payload["uuid"]),
+    }
+
+
+def _deleted_topic_from_event_payload(event_payload):
+    return {
+        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
+        "stream_uuid": _event_payload_value(
+            "stream_uuid",
+            event_payload["stream_uuid"],
+        ),
     }
 
 
@@ -161,6 +188,20 @@ def event_row_to_messenger_event(row):
             "type": "stream",
             "kind": payload["kind"],
             "stream": _deleted_stream_from_event_payload(payload),
+        }
+    if payload["kind"] in TOPIC_EVENTS:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "topic",
+            "kind": payload["kind"],
+            "topic": _topic_from_event_payload(payload),
+        }
+    if payload["kind"] == TOPIC_DELETED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "topic",
+            "kind": payload["kind"],
+            "topic": _deleted_topic_from_event_payload(payload),
         }
     if payload["kind"] == STREAM_BINDINGS_CREATED_EVENT:
         return {
@@ -306,6 +347,47 @@ def create_stream_updated_event(stream, session=None):
         user_uuid=stream.user_uuid,
         payload=event_payloads.StreamUpdatedEventPayload(
             **dict(stream)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_topic_event(topic, session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=topic.project_id,
+        user_uuid=topic.user_uuid,
+        payload=event_payloads.TopicCreatedEventPayload(
+            **dict(topic)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_topic_updated_event(topic, session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=topic.project_id,
+        user_uuid=topic.user_uuid,
+        payload=event_payloads.TopicUpdatedEventPayload(
+            **dict(topic)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_topic_deleted_event(project_id, user_uuid, topic_uuid, stream_uuid,
+                               session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.TopicDeletedEventPayload(
+            uuid=topic_uuid,
+            stream_uuid=stream_uuid,
         ),
     )
     return event.insert(session=session)

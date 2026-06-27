@@ -29,13 +29,6 @@ from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import models
 
 
-def _create_topic_with_flags(project_id, **kwargs):
-    return messenger_dm_helpers.create_workspace_stream_topic_with_flags(
-        project_id=project_id,
-        **kwargs,
-    )
-
-
 class ApiEndpointController(ra_controllers.RoutesListController):
     """Controller for /v1/ endpoint."""
 
@@ -335,43 +328,35 @@ class WorkspaceStreamTopicController(
         }
 
     def create(self, **kwargs):
-        topic = _create_topic_with_flags(**self._apply_autovalues(kwargs))
-
-        return self.get(uuid=topic.uuid)
+        values = self._apply_autovalues(kwargs)
+        return messenger_dm_helpers.create_workspace_user_stream_topic(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=self._get_user_uuid(),
+            values=values,
+        )
 
     def update(self, uuid, **kwargs):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-
-        topic = models.WorkspaceStreamTopic.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            }
+        return messenger_dm_helpers.update_workspace_user_stream_topic(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            topic_uuid=uuid,
+            values=kwargs,
         )
 
-        models.WorkspaceStreamBinding.objects.get_one(
-            filters={
-                "stream_uuid": dm_filters.EQ(topic.stream_uuid),
-                "user_uuid": dm_filters.EQ(user_uuid),
-                "project_id": dm_filters.EQ(project_id),
-            }
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_user_stream_topic(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            topic_uuid=uuid,
         )
-
-        if "name" not in kwargs:
-            raise ra_exc.ValidationErrorException()
-
-        topic.update_dm(values={"name": kwargs["name"]})
-        topic.update()
-
-        return self.get(uuid=uuid)
 
     @ra_actions.post
     def toggle_done(self, resource, *args, **kwargs):
-        flags = resource.get_flags()
-        flags.is_done = not flags.is_done
-        flags.update()
-        return self.get(uuid=resource.uuid)
+        return messenger_dm_helpers.toggle_workspace_user_stream_topic_done(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            topic_uuid=resource.uuid,
+        )
 
 
 class WorkspaceUserController(
