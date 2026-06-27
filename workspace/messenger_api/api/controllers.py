@@ -161,6 +161,13 @@ class FolderItemController(
             **values,
         )
 
+    def get(self, uuid):
+        return messenger_dm_helpers.get_workspace_user_folder_item(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            item_uuid=uuid,
+        )
+
     def delete(self, uuid):
         return messenger_dm_helpers.delete_workspace_user_folder_item(
             project_id=self._get_project_id(),

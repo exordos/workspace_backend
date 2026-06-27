@@ -411,6 +411,68 @@ def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
     assert event["folder"]["folder_items"][0]["pinned_at"] is None
 
 
+def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "system-pins"
+    )
+    item_uuid = f"00{stream_uuid[2:]}"
+
+    resp = api.post(f"{FOLDER_ITEMS}{item_uuid}/actions/pin/invoke")
+    assert resp.status_code == 200, resp.text
+    pinned_item = resp.json()
+    assert pinned_item["uuid"] == item_uuid
+    assert pinned_item["stream_uuid"] == stream_uuid
+    assert pinned_item["folder_uuid"] == str(
+        messenger_dm_helpers.ALL_CHATS_FOLDER_UUID
+    )
+    assert pinned_item["pinned_at"] is not None
+
+    resp = api.get(f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}")
+    assert resp.status_code == 200, resp.text
+    folder_item = [
+        item for item in resp.json()["folder_items"]
+        if item["uuid"] == item_uuid
+    ][0]
+    assert folder_item["pinned_at"] is not None
+
+    resp = api.post(f"{FOLDER_ITEMS}{item_uuid}/actions/unpin/invoke")
+    assert resp.status_code == 200, resp.text
+    unpinned_item = resp.json()
+    assert unpinned_item["uuid"] == item_uuid
+    assert unpinned_item["pinned_at"] is None
+
+    resp = api.get(f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}")
+    assert resp.status_code == 200, resp.text
+    folder_item = [
+        item for item in resp.json()["folder_items"]
+        if item["uuid"] == item_uuid
+    ][0]
+    assert folder_item["pinned_at"] is None
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_folder_items
+            WHERE uuid = %s
+                AND project_id = %s
+                AND user_uuid = %s
+                AND folder_uuid = %s
+                AND stream_uuid = %s
+            """,
+            (
+                item_uuid,
+                api.project_id,
+                api.user_uuid,
+                str(messenger_dm_helpers.ALL_CHATS_FOLDER_UUID),
+                stream_uuid,
+            ),
+        )
+        item_count = cur.fetchone()[0]
+
+    assert item_count == 1
+
+
 def test_folders_are_scoped_to_the_authenticated_user(api):
     other_user = sys_uuid.uuid4()
 

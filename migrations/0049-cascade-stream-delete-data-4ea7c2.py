@@ -33,6 +33,24 @@ class MigrationStep(migrations.AbstractMigrationStep):
     def upgrade(self, session):
         expressions = [
             """
+            CREATE TABLE IF NOT EXISTS "m_workspace_message_reactions" (
+                "uuid" UUID NOT NULL,
+                "project_id" UUID NOT NULL,
+                "created_at" TIMESTAMP WITH TIME ZONE NOT NULL,
+                "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL,
+                "message_uuid" UUID NOT NULL,
+                "user_uuid" UUID NOT NULL,
+                "emoji_name" VARCHAR(128) NOT NULL,
+                "status" VARCHAR(16) NOT NULL,
+                PRIMARY KEY ("uuid"),
+                UNIQUE ("message_uuid", "user_uuid", "emoji_name")
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS "m_workspace_message_reactions_message_uuid_idx"
+                ON "m_workspace_message_reactions" ("message_uuid");
+            """,
+            """
             DELETE FROM "m_workspace_message_reactions" AS r
             WHERE NOT EXISTS (
                 SELECT 1

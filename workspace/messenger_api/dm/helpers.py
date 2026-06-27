@@ -18,6 +18,7 @@ import datetime
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage import exceptions as storage_exc
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import models
@@ -26,6 +27,11 @@ from workspace.messenger_api.dm import models
 ALL_CHATS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000000")
 PERSONAL_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000001")
 CHANNELS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000002")
+SYSTEM_FOLDER_ITEM_MODELS = {
+    "00": models.AllFolderItem,
+    "11": models.PersonalFolderItem,
+    "22": models.ChannelFolderItem,
+}
 
 
 def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
@@ -42,7 +48,29 @@ def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
 
 def get_workspace_user_folder_item(project_id, user_uuid, item_uuid,
                                    session=None):
-    return models.UserFolderItem.objects.get_one(
+    filters = {
+        "uuid": dm_filters.EQ(item_uuid),
+        "project_id": dm_filters.EQ(project_id),
+        "user_uuid": dm_filters.EQ(user_uuid),
+    }
+    try:
+        return models.UserFolderItem.objects.get_one(
+            filters=filters,
+            session=session,
+        )
+    except storage_exc.RecordNotFound:
+        system_item_model = SYSTEM_FOLDER_ITEM_MODELS.get(str(item_uuid)[:2])
+        if system_item_model is None:
+            raise
+        return system_item_model.objects.get_one(
+            filters=filters,
+            session=session,
+        )
+
+
+def _get_workspace_user_folder_item_for_update(project_id, user_uuid,
+                                               item_uuid, session=None):
+    return models.FolderItem.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(item_uuid),
             "project_id": dm_filters.EQ(project_id),
@@ -50,6 +78,35 @@ def get_workspace_user_folder_item(project_id, user_uuid, item_uuid,
         },
         session=session,
     )
+
+
+def _get_workspace_user_folder_item_for_stream_folder(project_id, user_uuid,
+                                                      item, session=None):
+    return models.FolderItem.objects.get_one_or_none(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+            "folder_uuid": dm_filters.EQ(item.folder_uuid),
+            "stream_uuid": dm_filters.EQ(item.stream_uuid),
+        },
+        session=session,
+    )
+
+
+def _create_workspace_user_folder_item_from_view(project_id, user_uuid, item,
+                                                 pinned_at, session=None):
+    folder_item = models.FolderItem(
+        uuid=item.uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        folder_uuid=item.folder_uuid,
+        stream_uuid=item.stream_uuid,
+        order_index=item.order_index,
+        pinned_at=pinned_at,
+        chat_type=item.chat_type,
+    )
+    folder_item.insert(session=session)
+    return folder_item
 
 
 def get_workspace_user_stream(project_id, user_uuid, stream_uuid,
@@ -592,20 +649,46 @@ def delete_workspace_user_folder_item(project_id, user_uuid, item_uuid,
 
 def pin_workspace_user_folder_item(project_id, user_uuid, item_uuid,
                                    session=None):
-    item = models.FolderItem.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(item_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-        },
-        session=session,
-    )
-    item.pinned_at = datetime.datetime.now(datetime.timezone.utc)
-    item.save(session=session)
+    pinned_at = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        item = _get_workspace_user_folder_item_for_update(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+        item.pinned_at = pinned_at
+        item.save(session=session)
+        folder_uuid = item.folder_uuid
+    except storage_exc.RecordNotFound:
+        view_item = get_workspace_user_folder_item(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+        item = _get_workspace_user_folder_item_for_stream_folder(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item=view_item,
+            session=session,
+        )
+        if item is None:
+            item = _create_workspace_user_folder_item_from_view(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                item=view_item,
+                pinned_at=pinned_at,
+                session=session,
+            )
+        else:
+            item.pinned_at = pinned_at
+            item.save(session=session)
+        folder_uuid = item.folder_uuid
     user_folder = get_workspace_user_folder(
         project_id=project_id,
         user_uuid=user_uuid,
-        folder_uuid=item.folder_uuid,
+        folder_uuid=folder_uuid,
         session=session,
     )
     messenger_events.create_folder_updated_event(
@@ -622,20 +705,39 @@ def pin_workspace_user_folder_item(project_id, user_uuid, item_uuid,
 
 def unpin_workspace_user_folder_item(project_id, user_uuid, item_uuid,
                                      session=None):
-    item = models.FolderItem.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(item_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-        },
-        session=session,
-    )
-    item.pinned_at = None
-    item.save(session=session)
+    try:
+        item = _get_workspace_user_folder_item_for_update(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+        item.pinned_at = None
+        item.save(session=session)
+        folder_uuid = item.folder_uuid
+    except storage_exc.RecordNotFound:
+        view_item = get_workspace_user_folder_item(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item_uuid=item_uuid,
+            session=session,
+        )
+        item = _get_workspace_user_folder_item_for_stream_folder(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            item=view_item,
+            session=session,
+        )
+        if item is not None:
+            item.pinned_at = None
+            item.save(session=session)
+            folder_uuid = item.folder_uuid
+        else:
+            folder_uuid = view_item.folder_uuid
     user_folder = get_workspace_user_folder(
         project_id=project_id,
         user_uuid=user_uuid,
-        folder_uuid=item.folder_uuid,
+        folder_uuid=folder_uuid,
         session=session,
     )
     messenger_events.create_folder_updated_event(

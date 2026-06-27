@@ -128,6 +128,54 @@ class UserFolderItem(
     )
 
 
+class SystemFolderItemBase(
+    base.UserScopedModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    folder = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    order_index = properties.property(
+        types.AllowNone(types.Integer(max_value=2**31 - 1)),
+        default=None,
+    )
+    pinned_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
+    chat_type = properties.property(
+        types.Enum([t.value for t in ChatType]),
+        required=True,
+    )
+    unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+
+    @property
+    def folder_uuid(self):
+        return self.folder
+
+
+class AllFolderItem(SystemFolderItemBase):
+    __tablename__ = "m_folder_all_items_view"
+
+
+class PersonalFolderItem(SystemFolderItemBase):
+    __tablename__ = "m_folder_private_items_view"
+
+
+class ChannelFolderItem(SystemFolderItemBase):
+    __tablename__ = "m_folder_channel_items_view"
+
+
 class WorkspaceUserStatus(str, enum.Enum):
     ACTIVE = "active"
     IDLE = "idle"
