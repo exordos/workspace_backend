@@ -709,6 +709,33 @@ def update_workspace_user_stream(project_id, user_uuid, stream_uuid, values,
     return result
 
 
+def update_workspace_user_stream_notifications(project_id, user_uuid,
+                                               stream_uuid,
+                                               notification_mode,
+                                               session=None):
+    binding = models.WorkspaceStreamBinding.objects.get_one(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    binding.update_dm(values={"notification_mode": notification_mode})
+    binding.update(session=session)
+    stream = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    messenger_events.create_stream_updated_event(
+        stream=stream,
+        session=session,
+    )
+    return stream
+
+
 def delete_workspace_user_stream(project_id, user_uuid, stream_uuid,
                                  session=None):
     get_workspace_user_stream(

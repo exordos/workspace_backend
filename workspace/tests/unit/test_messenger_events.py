@@ -244,6 +244,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "project_id": str(project_id),
             "owner": str(owner_uuid),
             "role": "member",
+            "notification_mode": "all_messages",
             "unread_count": 0,
             "source_name": "native",
             "source": {"kind": "native"},
@@ -269,6 +270,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "project_id": str(project_id),
                     "owner": str(owner_uuid),
                     "role": "member",
+                    "notification_mode": "all_messages",
                     "unread_count": 0,
                     "source_name": "native",
                     "source": {"kind": "native"},
@@ -307,6 +309,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "project_id": str(project_id),
                     "owner": str(owner_uuid),
                     "role": "member",
+                    "notification_mode": "muted",
                     "unread_count": 0,
                     "source_name": "native",
                     "source": {"kind": "native"},
@@ -326,6 +329,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("Core Team", event["stream"]["name"])
         self.assertEqual(True, event["stream"]["invite_only"])
         self.assertEqual(True, event["stream"]["is_archived"])
+        self.assertEqual("muted", event["stream"]["notification_mode"])
 
     def test_event_row_to_messenger_event_uses_deleted_stream_id(self):
         stream_uuid = sys_uuid.uuid4()
@@ -466,6 +470,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "user_uuid": str(user_uuid),
                 "who_uuid": str(owner_uuid),
                 "role": "member",
+                "notification_mode": "mentions_only",
                 "created_at": "2026-06-24T10:00:00.000000Z",
                 "updated_at": "2026-06-24T10:00:00.000000Z",
             },
@@ -476,6 +481,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "user_uuid": str(second_user_uuid),
                 "who_uuid": str(owner_uuid),
                 "role": "owner",
+                "notification_mode": "all_messages",
                 "created_at": "2026-06-24T10:00:00.000000Z",
                 "updated_at": "2026-06-24T10:00:00.000000Z",
             },
@@ -487,6 +493,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "user_uuid": str(user_uuid),
             "who_uuid": str(owner_uuid),
             "role": "member",
+            "notification_mode": "mentions_only",
             "created_at": "2026-06-24T10:00:00.000000Z",
             "updated_at": "2026-06-24T10:00:00.000000Z",
         }
@@ -497,6 +504,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "user_uuid": str(second_user_uuid),
             "who_uuid": str(owner_uuid),
             "role": "owner",
+            "notification_mode": "all_messages",
             "created_at": "2026-06-24T10:00:00.000000Z",
             "updated_at": "2026-06-24T10:00:00.000000Z",
         }
@@ -674,6 +682,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "project_id": str(project_id),
                 "owner": str(owner_uuid),
                 "role": "owner",
+                "notification_mode": "all_messages",
                 "unread_count": 0,
                 "source_name": "native",
                 "source": {"kind": "native"},
@@ -713,6 +722,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                         "user_uuid": str(user_uuid),
                         "who_uuid": str(owner_uuid),
                         "role": "member",
+                        "notification_mode": "mentions_only",
                         "created_at": "2026-06-24T22:28:34.166369Z",
                         "updated_at": "2026-06-24T22:28:34.166369Z",
                     }
@@ -949,6 +959,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             project_id=project_id,
             owner=owner_uuid,
             role="member",
+            notification_mode="all_messages",
             unread_count=0,
             source_name="native",
             source=models.NativeSource(),
@@ -988,6 +999,10 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Engineering", created_event["payload"].name)
         self.assertEqual(False, created_event["payload"].is_archived)
+        self.assertEqual(
+            "all_messages",
+            created_event["payload"].notification_mode,
+        )
         self.assertEqual(created_at, created_event["payload"].created_at)
 
     def test_create_stream_updated_event_uses_user_stream_snapshot(self):
@@ -1006,6 +1021,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             project_id=project_id,
             owner=owner_uuid,
             role="member",
+            notification_mode="muted",
             unread_count=0,
             source_name="native",
             source=models.NativeSource(),
@@ -1045,6 +1061,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Engineering", created_event["payload"].name)
         self.assertEqual(True, created_event["payload"].is_archived)
+        self.assertEqual("muted", created_event["payload"].notification_mode)
 
     def test_create_topic_event_uses_user_topic_snapshot(self):
         project_id = sys_uuid.uuid4()
@@ -1168,6 +1185,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             who_uuid=owner_uuid,
             role="member",
+            notification_mode="mentions_only",
             created_at=created_at,
             updated_at=created_at,
         )
@@ -1178,6 +1196,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             user_uuid=second_user_uuid,
             who_uuid=owner_uuid,
             role="owner",
+            notification_mode="all_messages",
             created_at=created_at,
             updated_at=created_at,
         )
@@ -1220,6 +1239,10 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(
             "2026-06-24T10:00:00.000000Z",
             created_event["payload"].stream_bindings[0]["created_at"],
+        )
+        self.assertEqual(
+            "mentions_only",
+            created_event["payload"].stream_bindings[0]["notification_mode"],
         )
 
     def test_create_folder_deleted_event_uses_folder_id(self):

@@ -558,6 +558,7 @@ def test_stream_create_writes_realtime_event(api, db):
     assert payload["project_id"] == str(api.project_id)
     assert payload["owner"] == str(api.user_uuid)
     assert payload["role"] == "owner"
+    assert payload["notification_mode"] == "all_messages"
     assert payload["unread_count"] == 0
     assert payload["source_name"] == "native"
     assert payload["source"] == {"kind": "native"}
@@ -574,6 +575,7 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["stream"]["uuid"] == stream["uuid"]
     assert event["stream"]["name"] == "Engineering"
     assert event["stream"]["role"] == "owner"
+    assert event["stream"]["notification_mode"] == "all_messages"
 
     folder_events = [row[2] for row in rows[1:]]
     assert [payload["kind"] for payload in folder_events] == [
@@ -592,6 +594,93 @@ def test_stream_create_writes_realtime_event(api, db):
         payload["user_uuid"] == str(api.user_uuid)
         for payload in folder_events
     )
+
+
+def test_stream_notifications_are_user_scoped_and_write_event(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "notifications-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+
+    resp = api.get(f"{STREAMS}{stream_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "all_messages"
+
+    resp = api.get(f"{STREAMS}{stream_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "all_messages"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_epoch = cur.fetchone()[0]
+
+    resp = api.post(
+        f"{STREAMS}{stream_uuid}/actions/notifications/invoke",
+        json={"notification_mode": "mentions_only"},
+    )
+    assert resp.status_code == 200, resp.text
+    stream = resp.json()
+    assert stream["notification_mode"] == "mentions_only"
+
+    resp = api.get(f"{STREAMS}{stream_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "all_messages"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, notification_mode
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+                AND stream_uuid = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, stream_uuid),
+        )
+        bindings = cur.fetchall()
+        cur.execute(
+            """
+            SELECT epoch_version, user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+                AND payload->>'kind' = 'stream.updated'
+                AND payload->>'uuid' = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_epoch, stream_uuid),
+        )
+        event_rows = cur.fetchall()
+
+    assert dict((str(user_uuid), mode) for user_uuid, mode in bindings) == {
+        str(api.user_uuid): "mentions_only",
+        str(other_user): "all_messages",
+    }
+    assert len(event_rows) == 1
+    epoch_version, user_uuid, payload = event_rows[0]
+    assert str(user_uuid) == str(api.user_uuid)
+    assert payload["notification_mode"] == "mentions_only"
+
+    event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": epoch_version,
+            "user_uuid": user_uuid,
+            "payload": payload,
+        }
+    )
+    assert event["type"] == "stream"
+    assert event["kind"] == "stream.updated"
+    assert event["stream"]["notification_mode"] == "mentions_only"
 
 
 def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
@@ -877,6 +966,7 @@ def test_stream_binding_create_notifies_added_user(api, db):
         assert events[0]["uuid"] == stream_uuid
         assert events[0]["user_uuid"] == str(target_uuid)
         assert events[0]["role"] == "member"
+        assert events[0]["notification_mode"] == "all_messages"
         assert [(event["uuid"], event["title"]) for event in events[1:]] == [
             ("00000000-0000-0000-0000-000000000000", "All chats"),
             ("00000000-0000-0000-0000-000000000002", "Channels"),
@@ -914,6 +1004,10 @@ def test_stream_binding_create_notifies_added_user(api, db):
         binding["role"]
         for binding in owner_events[0]["stream_bindings"]
     } == {"member"}
+    assert {
+        binding["notification_mode"]
+        for binding in owner_events[0]["stream_bindings"]
+    } == {"all_messages"}
 
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):

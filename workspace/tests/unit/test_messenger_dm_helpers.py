@@ -1018,6 +1018,74 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
+    def test_update_workspace_user_stream_notifications_updates_binding(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            notification_mode="mentions_only",
+        )
+        updated_binding = {}
+
+        class ExistingBinding:
+            notification_mode = "all_messages"
+
+            def update_dm(self, values):
+                updated_binding["values"] = values
+                self.notification_mode = values["notification_mode"]
+
+            def update(self, session=None):
+                updated_binding["update_session"] = session
+
+        class FakeWorkspaceStreamBinding:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingBinding())
+            )
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers, "get_workspace_user_stream", return_value=returned_stream
+        ) as get_user_stream, mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_updated_event"
+        ) as create_event:
+            result = dm_helpers.update_workspace_user_stream_notifications(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                stream_uuid=stream_uuid,
+                notification_mode="mentions_only",
+                session=session,
+            )
+
+        self.assertIs(returned_stream, result)
+        self.assertEqual(
+            {"notification_mode": "mentions_only"},
+            updated_binding["values"],
+        )
+        self.assertIs(session, updated_binding["update_session"])
+        FakeWorkspaceStreamBinding.objects.get_one.assert_called_once()
+        filters = FakeWorkspaceStreamBinding.objects.get_one.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(stream_uuid, filters["stream_uuid"].value)
+        self.assertEqual(user_uuid, filters["user_uuid"].value)
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            stream=returned_stream,
+            session=session,
+        )
+
     def test_delete_workspace_user_stream_deletes_stream_and_sends_events(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

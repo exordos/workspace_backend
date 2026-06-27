@@ -149,6 +149,12 @@ class WorkspaceStreamRole(str, enum.Enum):
     OWNER = "owner"
 
 
+class WorkspaceStreamNotificationMode(str, enum.Enum):
+    MENTIONS_ONLY = "mentions_only"
+    MUTED = "muted"
+    ALL_MESSAGES = "all_messages"
+
+
 class WorkspaceStreamBase(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -209,6 +215,10 @@ class WorkspaceUserStreamBase(
     role = properties.property(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         required=True,
+    )
+    notification_mode = properties.property(
+        types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
+        default=WorkspaceStreamNotificationMode.ALL_MESSAGES.value,
     )
     unread_count = properties.property(
         types.Integer(min_value=0),

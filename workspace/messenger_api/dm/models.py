@@ -48,6 +48,7 @@ ZulipSource = base.ZulipSource
 NativeSource = base.NativeSource
 SourceName = base.SourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
+WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 
 
 class Folder(
@@ -258,6 +259,10 @@ class WorkspaceStreamBinding(
     role = properties.property(
         types.Enum([role.value for role in WorkspaceStreamRole]),
         default=WorkspaceStreamRole.MEMBER.value,
+    )
+    notification_mode = properties.property(
+        types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
+        default=WorkspaceStreamNotificationMode.ALL_MESSAGES.value,
     )
 
     def get_stream(self):

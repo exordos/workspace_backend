@@ -241,6 +241,15 @@ class WorkspaceStreamController(
             values={"is_archived": False},
         )
 
+    @ra_actions.post
+    def notifications(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.update_workspace_user_stream_notifications(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            stream_uuid=resource.uuid,
+            notification_mode=kwargs["notification_mode"],
+        )
+
 
 class WorkspaceStreamBindingController(
     WorkspaceBaseResourceControllerPaginated,
