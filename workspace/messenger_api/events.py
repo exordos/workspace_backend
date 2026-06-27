@@ -119,10 +119,13 @@ def _stream_from_event_payload(event_payload):
 
 
 def _topic_from_event_payload(event_payload):
-    return {
-        name: _event_payload_value(name, event_payload[name])
-        for name in WORKSPACE_USER_TOPIC_FIELDS
-    }
+    result = {}
+    for name in WORKSPACE_USER_TOPIC_FIELDS:
+        value = _event_payload_get(event_payload, name)
+        if name == "notification_mode" and value is None:
+            value = models.WorkspaceTopicNotificationMode.DEFAULT.value
+        result[name] = _event_payload_value(name, value)
+    return result
 
 
 def _stream_binding_snapshot_from_mapping(value):

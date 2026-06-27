@@ -1452,6 +1452,132 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
+    def test_update_workspace_user_stream_topic_notifications_allows_unmute_on_muted_stream(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        current_topic = types.SimpleNamespace(stream_uuid=stream_uuid)
+        current_stream = types.SimpleNamespace(notification_mode="muted")
+        returned_topic = types.SimpleNamespace(
+            uuid=topic_uuid,
+            user_uuid=user_uuid,
+            notification_mode="unmute",
+        )
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream_topic",
+            side_effect=[current_topic, returned_topic],
+        ) as get_topic, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            return_value=current_stream,
+        ) as get_stream, mock.patch.object(
+            dm_helpers, "_set_workspace_user_topic_notification_mode"
+        ) as set_notification, mock.patch.object(
+            dm_helpers.messenger_events, "create_topic_updated_event"
+        ) as create_event:
+            result = dm_helpers.update_workspace_user_stream_topic_notifications(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                topic_uuid=topic_uuid,
+                notification_mode="unmute",
+                session=session,
+            )
+
+        self.assertIs(returned_topic, result)
+        get_topic.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    topic_uuid=topic_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    topic_uuid=topic_uuid,
+                    session=session,
+                ),
+            ]
+        )
+        get_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        set_notification.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            notification_mode="unmute",
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            topic=returned_topic,
+            session=session,
+        )
+
+    def test_update_workspace_user_stream_topic_notifications_rejects_unmute_on_default_stream(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        current_topic = types.SimpleNamespace(stream_uuid=stream_uuid)
+        current_stream = types.SimpleNamespace(notification_mode="all_messages")
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream_topic",
+            return_value=current_topic,
+        ), mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            return_value=current_stream,
+        ), mock.patch.object(
+            dm_helpers, "_set_workspace_user_topic_notification_mode"
+        ) as set_notification:
+            with self.assertRaises(
+                messenger_exc.InvalidTopicNotificationModeError
+            ):
+                dm_helpers.update_workspace_user_stream_topic_notifications(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    topic_uuid=topic_uuid,
+                    notification_mode="unmute",
+                    session=session,
+                )
+
+        set_notification.assert_not_called()
+
+    def test_topic_notification_mode_matrix_matches_stream_mode(self):
+        shared_modes = ("mute", "default", "follow")
+        for stream_mode in ("all_messages", "mentions_only", "muted"):
+            stream = types.SimpleNamespace(notification_mode=stream_mode)
+            for topic_mode in shared_modes:
+                dm_helpers._validate_topic_notification_mode(
+                    stream=stream,
+                    notification_mode=topic_mode,
+                )
+
+        muted_stream = types.SimpleNamespace(notification_mode="muted")
+        dm_helpers._validate_topic_notification_mode(
+            stream=muted_stream,
+            notification_mode="unmute",
+        )
+
+        default_stream = types.SimpleNamespace(notification_mode="all_messages")
+        with self.assertRaises(messenger_exc.InvalidTopicNotificationModeError):
+            dm_helpers._validate_topic_notification_mode(
+                stream=default_stream,
+                notification_mode="unmute",
+            )
+
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

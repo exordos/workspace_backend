@@ -49,6 +49,7 @@ NativeSource = base.NativeSource
 SourceName = base.SourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
+WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
 
 
 class Folder(
@@ -440,6 +441,10 @@ class WorkspaceUserTopic(
         types.Boolean(),
         default=False,
     )
+    notification_mode = properties.property(
+        types.Enum([mode.value for mode in WorkspaceTopicNotificationMode]),
+        default=WorkspaceTopicNotificationMode.DEFAULT.value,
+    )
 
     def get_flags(self):
         return WorkspaceUserTopicFlags.objects.get_one(
@@ -546,6 +551,10 @@ class WorkspaceUserTopicFlags(
     is_done = properties.property(
         types.Boolean(),
         default=False,
+    )
+    notification_mode = properties.property(
+        types.Enum([mode.value for mode in WorkspaceTopicNotificationMode]),
+        default=WorkspaceTopicNotificationMode.DEFAULT.value,
     )
 
 

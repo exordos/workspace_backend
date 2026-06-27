@@ -1075,6 +1075,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert topic["stream_uuid"] == stream_uuid
     assert topic["is_default"] is False
     assert topic["is_done"] is False
+    assert topic["notification_mode"] == "default"
 
     resp = api.get(f"{STREAM_TOPICS}{topic['uuid']}", user=other_user)
     assert resp.status_code == 200, resp.text
@@ -1118,6 +1119,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
         assert payload["unread_count"] == 0
         assert payload["is_default"] is False
         assert payload["is_done"] is False
+        assert payload["notification_mode"] == "default"
 
     event = messenger_events.event_row_to_messenger_event(
         {
@@ -1130,6 +1132,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert event["kind"] == "topic.created"
     assert event["topic"]["uuid"] == topic["uuid"]
     assert event["topic"]["name"] == "planning"
+    assert event["topic"]["notification_mode"] == "default"
 
 
 def test_stream_topic_rename(api, db):
@@ -1173,6 +1176,92 @@ def test_stream_topic_rename(api, db):
     for _, payload in event_rows:
         assert payload["name"] == "retros"
         assert payload["stream_uuid"] == stream_uuid
+
+
+def test_stream_topic_notifications_follow_stream_mute_rules(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-notifications-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "standups"
+    )
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "default"
+
+    resp = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/notifications/invoke",
+        json={"notification_mode": "follow"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "follow"
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "default"
+
+    resp = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/notifications/invoke",
+        json={"notification_mode": "unmute"},
+    )
+    assert resp.status_code == 400, resp.text
+
+    resp = api.post(
+        f"{STREAMS}{stream_uuid}/actions/notifications/invoke",
+        json={"notification_mode": "muted"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    resp = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/notifications/invoke",
+        json={"notification_mode": "unmute"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "unmute"
+
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "default"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, notification_mode
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s
+                AND uuid = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, topic_uuid),
+        )
+        topic_rows = cur.fetchall()
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND user_uuid = %s
+                AND payload->>'kind' = 'topic.updated'
+                AND payload->>'uuid' = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, api.user_uuid, topic_uuid),
+        )
+        event_rows = cur.fetchall()
+
+    assert dict((str(user_uuid), mode) for user_uuid, mode in topic_rows) == {
+        str(api.user_uuid): "unmute",
+        str(other_user): "default",
+    }
+    assert [payload["notification_mode"] for _, payload in event_rows] == [
+        "follow",
+        "unmute",
+    ]
 
 
 def test_stream_topic_delete_cascades_topic_messages(api, db):

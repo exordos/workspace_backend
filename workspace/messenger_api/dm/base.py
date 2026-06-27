@@ -155,6 +155,13 @@ class WorkspaceStreamNotificationMode(str, enum.Enum):
     ALL_MESSAGES = "all_messages"
 
 
+class WorkspaceTopicNotificationMode(str, enum.Enum):
+    MUTE = "mute"
+    DEFAULT = "default"
+    UNMUTE = "unmute"
+    FOLLOW = "follow"
+
+
 class WorkspaceStreamBase(
     models.ModelWithUUID,
     models.ModelWithProject,

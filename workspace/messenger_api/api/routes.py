@@ -123,6 +123,10 @@ class WorkspaceStreamTopicToggleDoneAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
 
+class WorkspaceStreamTopicNotificationsAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamTopicController
+
+
 class WorkspaceStreamTopicRoute(routes.Route):
     __controller__ = controllers.WorkspaceStreamTopicController
     __allow_methods__ = [
@@ -134,6 +138,10 @@ class WorkspaceStreamTopicRoute(routes.Route):
     ]
 
     toggle_done = routes.action(WorkspaceStreamTopicToggleDoneAction, invoke=True)
+    notifications = routes.action(
+        WorkspaceStreamTopicNotificationsAction,
+        invoke=True,
+    )
 
 
 class WorkspaceUserRoute(routes.Route):

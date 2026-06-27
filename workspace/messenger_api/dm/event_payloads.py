@@ -131,6 +131,12 @@ class TopicEventPayloadBase(
         types.Boolean(),
         default=False,
     )
+    notification_mode = properties.property(
+        types.Enum([
+            mode.value for mode in base.WorkspaceTopicNotificationMode
+        ]),
+        default=base.WorkspaceTopicNotificationMode.DEFAULT.value,
+    )
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
         read_only=True,

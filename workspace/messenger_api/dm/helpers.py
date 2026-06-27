@@ -32,6 +32,14 @@ SYSTEM_FOLDER_ITEM_MODELS = {
     "11": models.PersonalFolderItem,
     "22": models.ChannelFolderItem,
 }
+TOPIC_NOTIFICATION_MODES = {
+    models.WorkspaceTopicNotificationMode.MUTE.value,
+    models.WorkspaceTopicNotificationMode.DEFAULT.value,
+    models.WorkspaceTopicNotificationMode.FOLLOW.value,
+}
+MUTED_STREAM_TOPIC_NOTIFICATION_MODES = TOPIC_NOTIFICATION_MODES | {
+    models.WorkspaceTopicNotificationMode.UNMUTE.value,
+}
 
 
 def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
@@ -501,6 +509,49 @@ def _set_workspace_user_topic_done(project_id, user_uuid, topic_uuid,
     flags.insert(session=session)
 
 
+def _set_workspace_user_topic_notification_mode(
+    project_id,
+    user_uuid,
+    topic_uuid,
+    notification_mode,
+    session=None,
+):
+    for flags in models.WorkspaceUserTopicFlags.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        limit=1,
+        session=session,
+    ):
+        flags.notification_mode = notification_mode
+        flags.update(session=session)
+        return
+
+    flags = models.WorkspaceUserTopicFlags(
+        uuid=topic_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        notification_mode=notification_mode,
+    )
+    flags.insert(session=session)
+
+
+def _validate_topic_notification_mode(stream, notification_mode):
+    if (
+        stream.notification_mode ==
+        models.WorkspaceStreamNotificationMode.MUTED.value
+    ):
+        allowed_modes = MUTED_STREAM_TOPIC_NOTIFICATION_MODES
+    else:
+        allowed_modes = TOPIC_NOTIFICATION_MODES
+    if notification_mode not in allowed_modes:
+        raise messenger_exc.InvalidTopicNotificationModeError(
+            mode=notification_mode
+        )
+
+
 def toggle_workspace_user_stream_topic_done(project_id, user_uuid, topic_uuid,
                                             session=None):
     topic = get_workspace_user_stream_topic(
@@ -535,6 +586,49 @@ def toggle_workspace_user_stream_topic_done(project_id, user_uuid, topic_uuid,
             topic=user_topic,
             session=session,
         )
+    return result
+
+
+def update_workspace_user_stream_topic_notifications(
+    project_id,
+    user_uuid,
+    topic_uuid,
+    notification_mode,
+    session=None,
+):
+    topic = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    stream = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=topic.stream_uuid,
+        session=session,
+    )
+    _validate_topic_notification_mode(
+        stream=stream,
+        notification_mode=notification_mode,
+    )
+    _set_workspace_user_topic_notification_mode(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        notification_mode=notification_mode,
+        session=session,
+    )
+    result = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    messenger_events.create_topic_updated_event(
+        topic=result,
+        session=session,
+    )
     return result
 
 

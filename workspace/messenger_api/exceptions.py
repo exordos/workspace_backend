@@ -40,3 +40,11 @@ class InvalidStreamBindingRoleError(ra_exc.ValidationErrorException):
 class StreamBindingUsersPayloadError(ra_exc.ValidationErrorException):
     message = "Stream binding action expects role values to be user UUID lists"
     code = 400001005
+
+
+class InvalidTopicNotificationModeError(ra_exc.ValidationErrorException):
+    message = (
+        "Topic notification mode '%(mode)s' is not allowed for current stream "
+        "notification mode"
+    )
+    code = 400001006

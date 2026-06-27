@@ -367,6 +367,18 @@ class WorkspaceStreamTopicController(
             topic_uuid=resource.uuid,
         )
 
+    @ra_actions.post
+    def notifications(self, resource, *args, **kwargs):
+        update_notifications = (
+            messenger_dm_helpers.update_workspace_user_stream_topic_notifications
+        )
+        return update_notifications(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            topic_uuid=resource.uuid,
+            notification_mode=kwargs["notification_mode"],
+        )
+
 
 class WorkspaceUserController(
     ra_controllers.BaseResourceControllerPaginated,

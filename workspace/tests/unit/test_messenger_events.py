@@ -368,6 +368,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "unread_count": 2,
             "is_default": False,
             "is_done": True,
+            "notification_mode": "follow",
         }
 
         event = events.event_row_to_messenger_event(
@@ -386,6 +387,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "unread_count": 2,
                     "is_default": False,
                     "is_done": True,
+                    "notification_mode": "follow",
                 },
             }
         )
@@ -417,6 +419,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "unread_count": 0,
                     "is_default": False,
                     "is_done": False,
+                    "notification_mode": "mute",
                 },
             }
         )
@@ -427,6 +430,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("Retros", event["topic"]["name"])
         self.assertEqual(str(topic_uuid), event["topic"]["uuid"])
         self.assertEqual(str(stream_uuid), event["topic"]["stream_uuid"])
+        self.assertEqual("mute", event["topic"]["notification_mode"])
 
     def test_event_row_to_messenger_event_uses_deleted_topic_id(self):
         topic_uuid = sys_uuid.uuid4()
@@ -752,10 +756,12 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "unread_count": 0,
                 "is_default": False,
                 "is_done": False,
+                "notification_mode": "default",
             }
         )
 
         self.assertEqual("Planning", payload.name)
+        self.assertEqual("default", payload.notification_mode)
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
             event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
@@ -1082,6 +1088,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             unread_count=0,
             is_default=False,
             is_done=False,
+            notification_mode="default",
         )
         session = object()
         created_event = {}
@@ -1112,6 +1119,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Planning", created_event["payload"].name)
         self.assertEqual(False, created_event["payload"].is_done)
+        self.assertEqual("default", created_event["payload"].notification_mode)
 
     def test_create_topic_updated_event_uses_user_topic_snapshot(self):
         project_id = sys_uuid.uuid4()
@@ -1135,6 +1143,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             unread_count=1,
             is_default=False,
             is_done=True,
+            notification_mode="unmute",
         )
         session = object()
         created_event = {}
@@ -1165,6 +1174,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Retros", created_event["payload"].name)
         self.assertEqual(True, created_event["payload"].is_done)
+        self.assertEqual("unmute", created_event["payload"].notification_mode)
 
     def test_create_stream_bindings_created_event_uses_binding_snapshots(self):
         project_id = sys_uuid.uuid4()
