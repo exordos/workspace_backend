@@ -1018,6 +1018,99 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
+    def test_delete_workspace_user_stream_deletes_stream_and_sends_events(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        custom_folder_uuid = sys_uuid.uuid4()
+        session = mock.Mock()
+        actor_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            private=False,
+        )
+        other_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=other_user_uuid,
+            private=True,
+        )
+        custom_item = types.SimpleNamespace(
+            user_uuid=user_uuid,
+            folder_uuid=custom_folder_uuid,
+        )
+
+        class ExistingStream:
+            def delete(self, session=None):
+                self.delete_session = session
+
+        existing_stream = ExistingStream()
+
+        class FakeWorkspaceStream:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_stream)
+            )
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(return_value=[actor_stream, other_stream])
+            )
+
+        class FakeFolderItem:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(return_value=[custom_item])
+            )
+
+        with mock.patch.object(
+            dm_helpers, "get_workspace_user_stream", return_value=actor_stream
+        ) as get_user_stream, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=object()
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
+            dm_helpers.models, "FolderItem", FakeFolderItem
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_deleted_event"
+        ) as create_stream_deleted, mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_folder_updated:
+            result = dm_helpers.delete_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                stream_uuid=stream_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        self.assertIs(session, existing_stream.delete_session)
+        self.assertFalse(session.execute.called)
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        create_stream_deleted.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    stream_uuid=stream_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=other_user_uuid,
+                    stream_uuid=stream_uuid,
+                    session=session,
+                ),
+            ]
+        )
+        self.assertEqual(5, get_user_folder.call_count)
+        self.assertEqual(5, create_folder_updated.call_count)
+
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

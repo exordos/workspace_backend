@@ -216,6 +216,13 @@ class WorkspaceStreamController(
             values=kwargs,
         )
 
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_user_stream(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            stream_uuid=uuid,
+        )
+
     @ra_actions.post
     def archive(self, resource, *args, **kwargs):
         return messenger_dm_helpers.update_workspace_user_stream(

@@ -532,6 +532,153 @@ def test_stream_create_writes_realtime_event(api, db):
     )
 
 
+def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "delete-me"
+    )
+    conftest.seed_user_stream(db, api.project_id, api.user_uuid, "keep-owner")
+    conftest.seed_user_stream(db, api.project_id, other_user, "keep-other")
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
+    )
+    conftest.seed_stream_topic_flags(
+        db, topic_uuid, api.user_uuid, api.project_id
+    )
+
+    folder_resp = api.post(FOLDERS, json={"title": "Pinned"})
+    assert folder_resp.status_code in (200, 201), folder_resp.text
+    folder_uuid = folder_resp.json()["uuid"]
+    item_resp = api.post(
+        FOLDER_ITEMS,
+        json={
+            "folder_uuid": folder_uuid,
+            "stream_uuid": stream_uuid,
+            "chat_type": "stream",
+        },
+    )
+    assert item_resp.status_code in (200, 201), item_resp.text
+
+    message_resp = api.post(
+        MESSAGES,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "delete cascade check",
+            },
+        },
+    )
+    assert message_resp.status_code == 201, message_resp.text
+    message_uuid = message_resp.json()["uuid"]
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_message_reactions
+                (uuid, project_id, created_at, updated_at, message_uuid,
+                 user_uuid, emoji_name, status)
+            VALUES (%s, %s, NOW(), NOW(), %s, %s, 'thumbs_up', 'active')
+            """,
+            (str(sys_uuid.uuid4()), api.project_id, message_uuid, api.user_uuid),
+        )
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_delete_epoch = cur.fetchone()[0]
+
+    resp = api.delete(f"{STREAMS}{stream_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM m_workspace_streams
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_stream_topics
+                 WHERE stream_uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_user_topic_flags
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_messages
+                 WHERE stream_uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_user_message_flags
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_message_reactions
+                 WHERE message_uuid = %s),
+                (SELECT COUNT(*) FROM m_folder_items
+                 WHERE stream_uuid = %s)
+            """,
+            (
+                stream_uuid,
+                stream_uuid,
+                topic_uuid,
+                stream_uuid,
+                message_uuid,
+                message_uuid,
+                stream_uuid,
+            ),
+        )
+        counts = cur.fetchone()
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_delete_epoch),
+        )
+        event_rows = cur.fetchall()
+
+    assert counts == (0, 0, 0, 0, 0, 0, 0)
+    events_by_user = {}
+    for user_uuid, payload in event_rows:
+        events_by_user.setdefault(str(user_uuid), []).append(payload)
+
+    assert set(events_by_user) == {str(api.user_uuid), str(other_user)}
+    assert [event["kind"] for event in events_by_user[str(api.user_uuid)]] == [
+        "stream.deleted",
+        "folder.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert [event["kind"] for event in events_by_user[str(other_user)]] == [
+        "stream.deleted",
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert events_by_user[str(api.user_uuid)][0]["uuid"] == stream_uuid
+    assert events_by_user[str(other_user)][0]["uuid"] == stream_uuid
+
+    owner_folder_events = events_by_user[str(api.user_uuid)][1:]
+    other_folder_events = events_by_user[str(other_user)][1:]
+    assert [event["uuid"] for event in owner_folder_events] == [
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000002",
+        folder_uuid,
+    ]
+    assert [event["uuid"] for event in other_folder_events] == [
+        "00000000-0000-0000-0000-000000000000",
+        "00000000-0000-0000-0000-000000000002",
+    ]
+    for event in owner_folder_events + other_folder_events:
+        assert all(
+            item["stream_uuid"] != stream_uuid
+            for item in event["folder_items"]
+        )
+
+
 def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     direct_user_uuid = sys_uuid.uuid4()
     expected_index = ":".join(

@@ -8,6 +8,9 @@
 - For required dict values, use `value = data[key]`, not `data.get(key)`.
 - Write minimal code without extra defensive checks for every possible case.
 - Let domain models perform data validation; do not duplicate model validation in controllers or helpers.
+- Do not instantiate synthetic domain models as fallbacks for event payloads; use persisted/view models and let missing required data surface naturally.
+- Do not write helper/controller raw SQL delete chains for dependent rows; delete the root model and make the database own cleanup through `ON DELETE CASCADE` foreign keys added by migrations.
+- Do not open `engines.engine_factory.get_engine().session_manager()` inside API helpers/controllers for request work; restalchemy already runs request operations in one transaction, so pass the current `session` argument through.
 - Restalchemy provides project CLI utilities in `.tox/develop/bin` such as `ra-new-migration`, `ra-apply-migration`, `ra-rollback-migration`, and `ra-rename-migrations`; check and use them before hand-writing equivalent restalchemy workflow code.
 - Create new migrations with `.tox/develop/bin/ra-new-migration`, not by hand.
 - When creating migrations, pass the migrations directory with `--path migrations` and set the dependency to the latest migration, preferably with `--depend HEAD` unless an explicit latest filename is required.

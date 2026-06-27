@@ -18,7 +18,6 @@ import datetime
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
-
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import models
@@ -82,6 +81,38 @@ def _create_owner_binding(project_id, stream_uuid, user_uuid, who_uuid,
     )
     binding.insert(session=session)
     return binding
+
+
+def _add_folder_event_target(targets, user_uuid, folder_uuid):
+    target = (user_uuid, folder_uuid)
+    if target not in targets:
+        targets.append(target)
+
+
+def _get_stream_folder_event_targets(project_id, stream_uuid, user_streams,
+                                     session=None):
+    targets = []
+    for user_stream in user_streams:
+        _add_folder_event_target(
+            targets,
+            user_stream.user_uuid,
+            ALL_CHATS_FOLDER_UUID,
+        )
+        _add_folder_event_target(
+            targets,
+            user_stream.user_uuid,
+            PERSONAL_FOLDER_UUID if user_stream.private else CHANNELS_FOLDER_UUID,
+        )
+
+    for item in models.FolderItem.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        session=session,
+    ):
+        _add_folder_event_target(targets, item.user_uuid, item.folder_uuid)
+    return targets
 
 
 def _create_stream_folder_updated_events(project_id, user_uuid, private,
@@ -437,6 +468,58 @@ def update_workspace_user_stream(project_id, user_uuid, stream_uuid, values,
             session=session,
         )
     return result
+
+
+def delete_workspace_user_stream(project_id, user_uuid, stream_uuid,
+                                 session=None):
+    get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    stream = models.WorkspaceStream.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+    user_streams = models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+    folder_targets = _get_stream_folder_event_targets(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_streams=user_streams,
+        session=session,
+    )
+
+    for user_stream in user_streams:
+        messenger_events.create_stream_deleted_event(
+            project_id=project_id,
+            user_uuid=user_stream.user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+
+    stream.delete(session=session)
+
+    for target_user_uuid, folder_uuid in folder_targets:
+        folder = get_workspace_user_folder(
+            project_id=project_id,
+            user_uuid=target_user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        messenger_events.create_folder_updated_event(
+            folder=folder,
+            session=session,
+        )
 
 
 def create_workspace_user_folder(project_id, user_uuid, session=None,

@@ -27,6 +27,7 @@ EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
 STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
+STREAM_DELETED_EVENT = event_payloads.StreamDeletedEventPayload.KIND
 STREAM_BINDINGS_CREATED_EVENT = (
     event_payloads.StreamBindingsCreatedEventPayload.KIND
 )
@@ -121,6 +122,12 @@ def _stream_bindings_from_event_payload(event_payload):
     ]
 
 
+def _deleted_stream_from_event_payload(event_payload):
+    return {
+        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
+    }
+
+
 def _deleted_folder_from_event_payload(event_payload):
     return {
         "uuid": _event_payload_value("uuid", event_payload["uuid"]),
@@ -147,6 +154,13 @@ def event_row_to_messenger_event(row):
             "type": "stream",
             "kind": payload["kind"],
             "stream": _stream_from_event_payload(payload),
+        }
+    if payload["kind"] == STREAM_DELETED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "stream",
+            "kind": payload["kind"],
+            "stream": _deleted_stream_from_event_payload(payload),
         }
     if payload["kind"] == STREAM_BINDINGS_CREATED_EVENT:
         return {
@@ -292,6 +306,20 @@ def create_stream_updated_event(stream, session=None):
         user_uuid=stream.user_uuid,
         payload=event_payloads.StreamUpdatedEventPayload(
             **dict(stream)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_stream_deleted_event(project_id, user_uuid, stream_uuid,
+                                session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.StreamDeletedEventPayload(
+            uuid=stream_uuid,
         ),
     )
     return event.insert(session=session)

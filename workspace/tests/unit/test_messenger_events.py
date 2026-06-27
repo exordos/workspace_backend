@@ -327,6 +327,27 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(True, event["stream"]["invite_only"])
         self.assertEqual(True, event["stream"]["is_archived"])
 
+    def test_event_row_to_messenger_event_uses_deleted_stream_id(self):
+        stream_uuid = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 12,
+                "payload": {
+                    "kind": "stream.deleted",
+                    "uuid": str(stream_uuid),
+                },
+            }
+        )
+
+        self.assertEqual(12, event["epoch_version"])
+        self.assertEqual("stream", event["type"])
+        self.assertEqual("stream.deleted", event["kind"])
+        self.assertEqual(
+            {"uuid": str(stream_uuid)},
+            event["stream"],
+        )
+
     def test_event_row_to_messenger_event_uses_stream_bindings_snapshot(self):
         owner_uuid = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -985,6 +1006,41 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.FolderDeletedEventPayload,
         )
         self.assertEqual(folder_uuid, created_event["payload"].uuid)
+
+    def test_create_stream_deleted_event_uses_stream_id(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 47
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_stream_deleted_event(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                stream_uuid=stream_uuid,
+                session=session,
+            )
+
+        self.assertEqual(47, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.StreamDeletedEventPayload,
+        )
+        self.assertEqual(stream_uuid, created_event["payload"].uuid)
 
     def test_create_folder_item_deleted_event_uses_item_id(self):
         project_id = sys_uuid.uuid4()

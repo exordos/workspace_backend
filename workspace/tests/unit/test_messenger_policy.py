@@ -150,6 +150,38 @@ def test_stream_controller_update_uses_context_scope():
     )
 
 
+def test_stream_controller_delete_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamController(request)
+    returned_stream = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "delete_workspace_user_stream",
+        return_value=returned_stream,
+    ) as delete_stream:
+        result = controller.delete(uuid=stream_uuid)
+
+    assert result is returned_stream
+    delete_stream.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+    )
+
+
+def test_stream_route_allows_delete():
+    assert ra_routes.DELETE in routes.WorkspaceStreamRoute.__allow_methods__
+
+
 def test_stream_route_allows_update():
     assert ra_routes.UPDATE in routes.WorkspaceStreamRoute.__allow_methods__
 
