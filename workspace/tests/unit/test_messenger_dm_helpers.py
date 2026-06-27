@@ -930,6 +930,94 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 },
             )
 
+    def test_update_workspace_user_stream_updates_event_and_returns_view(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        updated_stream = {}
+        returned_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+        )
+        other_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=other_user_uuid,
+        )
+
+        class ExistingStream:
+            name = "Engineering"
+            description = "Engineering chat"
+            invite_only = False
+
+            def update_dm(self, values):
+                updated_stream["values"] = values
+                self.name = values["name"]
+                self.description = values["description"]
+                self.invite_only = values["invite_only"]
+
+            def update(self, session=None):
+                updated_stream["update_session"] = session
+
+        class FakeWorkspaceStream:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingStream())
+            )
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(return_value=[returned_stream, other_stream])
+            )
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
+            dm_helpers, "get_workspace_user_stream", return_value=returned_stream
+        ) as get_user_stream, mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_event"
+        ) as create_event:
+            result = dm_helpers.update_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                stream_uuid=stream_uuid,
+                values={
+                    "name": "Core Team",
+                    "description": "Core team chat",
+                    "invite_only": True,
+                },
+                session=session,
+            )
+
+        self.assertIs(returned_stream, result)
+        self.assertEqual(
+            {
+                "name": "Core Team",
+                "description": "Core team chat",
+                "invite_only": True,
+            },
+            updated_stream["values"],
+        )
+        self.assertIs(session, updated_stream["update_session"])
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        FakeWorkspaceStream.objects.get_one.assert_called_once()
+        filters = FakeWorkspaceStream.objects.get_one.call_args.kwargs["filters"]
+        self.assertEqual(stream_uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        create_event.assert_has_calls(
+            [
+                mock.call(stream=returned_stream, session=session),
+                mock.call(stream=other_stream, session=session),
+            ]
+        )
+
     def test_create_workspace_user_folder_creates_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

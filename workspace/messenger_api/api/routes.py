@@ -61,6 +61,7 @@ class WorkspaceStreamRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
+        routes.UPDATE,
     ]
 
     add_users = routes.action(WorkspaceStreamBindingsAction, invoke=True)

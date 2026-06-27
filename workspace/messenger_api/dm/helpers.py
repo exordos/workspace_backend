@@ -404,6 +404,41 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
     return result
 
 
+def update_workspace_user_stream(project_id, user_uuid, stream_uuid, values,
+                                 session=None):
+    get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    stream = models.WorkspaceStream.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+    stream.update_dm(values=values)
+    stream.update(session=session)
+
+    result = None
+    for user_stream in models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    ):
+        if user_stream.user_uuid == user_uuid:
+            result = user_stream
+        messenger_events.create_stream_event(
+            stream=user_stream,
+            session=session,
+        )
+    return result
+
+
 def create_workspace_user_folder(project_id, user_uuid, session=None,
                                  **kwargs):
     folder = models.Folder(

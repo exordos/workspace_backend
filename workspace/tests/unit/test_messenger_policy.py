@@ -112,6 +112,48 @@ def test_stream_controller_create_uses_context_scope():
     assert create_kwargs["user_uuid"] == user_uuid
 
 
+def test_stream_controller_update_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamController(request)
+    returned_stream = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "update_workspace_user_stream",
+        return_value=returned_stream,
+    ) as update_stream:
+        result = controller.update(
+            uuid=stream_uuid,
+            name="Core Team",
+            description="Core team chat",
+            invite_only=True,
+        )
+
+    assert result is returned_stream
+    update_stream.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        values={
+            "name": "Core Team",
+            "description": "Core team chat",
+            "invite_only": True,
+        },
+    )
+
+
+def test_stream_route_allows_update():
+    assert ra_routes.UPDATE in routes.WorkspaceStreamRoute.__allow_methods__
+
+
 def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
     project_id = sys_uuid.uuid4()
     actor_uuid = sys_uuid.uuid4()

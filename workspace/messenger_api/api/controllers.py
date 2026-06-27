@@ -208,6 +208,14 @@ class WorkspaceStreamController(
             **values,
         )
 
+    def update(self, uuid, **kwargs):
+        return messenger_dm_helpers.update_workspace_user_stream(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            stream_uuid=uuid,
+            values=kwargs,
+        )
+
 
 class WorkspaceStreamBindingController(
     WorkspaceBaseResourceControllerPaginated,
