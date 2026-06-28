@@ -1645,14 +1645,13 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         read_events = [row[0] for row in cur.fetchall()]
 
     assert [event["kind"] for event in read_events] == [
-        "message.updated",
+        "messages.read",
         "topic.updated",
         "stream.updated",
         "folder.updated",
         "folder.updated",
     ]
-    assert read_events[0]["uuid"] == message_uuid
-    assert read_events[0]["read"] is True
+    assert read_events[0]["message_uuids"] == [message_uuid]
     assert read_events[1]["unread_count"] == 0
     assert read_events[2]["unread_count"] == 0
     assert [event["unread_count"] for event in read_events[3:]] == [0, 0]
@@ -1762,6 +1761,121 @@ def test_message_update_read_delete_write_realtime_events(api, db):
     assert all(row[1]["uuid"] == message_uuid for row in delete_rows)
     assert all(row[1]["stream_uuid"] == stream_uuid for row in delete_rows)
     assert all(row[1]["topic_uuid"] == topic_uuid for row in delete_rows)
+
+
+def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "read-actions-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+    other_topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "random"
+    )
+
+    message_uuids = []
+    for topic, content in (
+        (topic_uuid, "first"),
+        (topic_uuid, "second"),
+        (topic_uuid, "third"),
+        (other_topic_uuid, "other topic"),
+    ):
+        resp = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic,
+                "payload": {
+                    "kind": "markdown",
+                    "content": content,
+                },
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        message_uuids.append(resp.json()["uuid"])
+
+    def other_user_flags():
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT uuid, read
+                FROM m_workspace_user_message_flags
+                WHERE project_id = %s
+                    AND user_uuid = %s
+                    AND uuid IN (%s, %s, %s, %s)
+                """,
+                (api.project_id, str(other_user), *message_uuids),
+            )
+            return {str(uuid): read for uuid, read in cur.fetchall()}
+
+    assert other_user_flags() == {
+        message_uuids[0]: False,
+        message_uuids[1]: False,
+        message_uuids[2]: False,
+        message_uuids[3]: False,
+    }
+
+    resp = api.post(
+        f"{MESSAGES}{message_uuids[1]}/actions/read/invoke",
+        user=other_user,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == message_uuids[1]
+    assert resp.json()["read"] is True
+    assert other_user_flags() == {
+        message_uuids[0]: False,
+        message_uuids[1]: True,
+        message_uuids[2]: False,
+        message_uuids[3]: False,
+    }
+
+    resp = api.post(
+        f"{MESSAGES}{message_uuids[1]}/actions/read_up_to/invoke",
+        user=other_user,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == message_uuids[1]
+    assert resp.json()["read"] is True
+    assert other_user_flags() == {
+        message_uuids[0]: True,
+        message_uuids[1]: True,
+        message_uuids[2]: False,
+        message_uuids[3]: False,
+    }
+
+    resp = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/read/invoke",
+        user=other_user,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == topic_uuid
+    assert resp.json()["unread_count"] == 0
+    assert other_user_flags() == {
+        message_uuids[0]: True,
+        message_uuids[1]: True,
+        message_uuids[2]: True,
+        message_uuids[3]: False,
+    }
+
+    resp = api.post(
+        f"{STREAMS}{stream_uuid}/actions/read/invoke",
+        user=other_user,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == stream_uuid
+    assert resp.json()["unread_count"] == 0
+    assert other_user_flags() == {
+        message_uuids[0]: True,
+        message_uuids[1]: True,
+        message_uuids[2]: True,
+        message_uuids[3]: True,
+    }
 
 
 def test_unbound_user_cannot_send_message(api, db):

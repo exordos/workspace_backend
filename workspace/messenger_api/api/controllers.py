@@ -250,6 +250,14 @@ class WorkspaceStreamController(
             notification_mode=kwargs["notification_mode"],
         )
 
+    @ra_actions.post
+    def read(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.read_workspace_user_stream_messages(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            stream_uuid=resource.uuid,
+        )
+
 
 class WorkspaceStreamBindingController(
     WorkspaceBaseResourceControllerPaginated,
@@ -316,6 +324,14 @@ class WorkspaceMessageController(
     @ra_actions.post
     def read(self, resource, *args, **kwargs):
         return messenger_dm_helpers.read_workspace_user_message(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            message_uuid=resource.uuid,
+        )
+
+    @ra_actions.post
+    def read_up_to(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.read_workspace_user_topic_messages_to_message(
             project_id=self._get_project_id(),
             user_uuid=self._get_user_uuid(),
             message_uuid=resource.uuid,
@@ -400,6 +416,14 @@ class WorkspaceStreamTopicController(
             user_uuid=self._get_user_uuid(),
             topic_uuid=resource.uuid,
             notification_mode=kwargs["notification_mode"],
+        )
+
+    @ra_actions.post
+    def read(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.read_workspace_user_stream_topic_messages(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            topic_uuid=resource.uuid,
         )
 
 

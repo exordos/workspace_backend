@@ -35,6 +35,10 @@ class WorkspaceMessageReadAction(routes.Action):
     __controller__ = controllers.WorkspaceMessageController
 
 
+class WorkspaceMessageReadUpToAction(routes.Action):
+    __controller__ = controllers.WorkspaceMessageController
+
+
 class WorkspaceStreamArchiveAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamController
 
@@ -44,6 +48,10 @@ class WorkspaceStreamUnarchiveAction(routes.Action):
 
 
 class WorkspaceStreamNotificationsAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamController
+
+
+class WorkspaceStreamReadAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamController
 
 
@@ -88,6 +96,7 @@ class WorkspaceStreamRoute(routes.Route):
         WorkspaceStreamNotificationsAction,
         invoke=True,
     )
+    read = routes.action(WorkspaceStreamReadAction, invoke=True)
 
 
 class WorkspaceStreamBindingRoute(routes.Route):
@@ -111,6 +120,7 @@ class WorkspaceMessageRoute(routes.Route):
     ]
 
     read = routes.action(WorkspaceMessageReadAction, invoke=True)
+    read_up_to = routes.action(WorkspaceMessageReadUpToAction, invoke=True)
 
 
 class WorkspaceEventRoute(routes.Route):
@@ -135,6 +145,10 @@ class WorkspaceStreamTopicNotificationsAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
 
+class WorkspaceStreamTopicReadAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamTopicController
+
+
 class WorkspaceStreamTopicRoute(routes.Route):
     __controller__ = controllers.WorkspaceStreamTopicController
     __allow_methods__ = [
@@ -150,6 +164,7 @@ class WorkspaceStreamTopicRoute(routes.Route):
         WorkspaceStreamTopicNotificationsAction,
         invoke=True,
     )
+    read = routes.action(WorkspaceStreamTopicReadAction, invoke=True)
 
 
 class WorkspaceUserRoute(routes.Route):

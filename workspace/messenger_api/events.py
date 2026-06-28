@@ -26,6 +26,7 @@ from workspace.messenger_api.dm import models
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 MESSAGE_UPDATED_EVENT = event_payloads.MessageUpdatedEventPayload.KIND
+MESSAGES_READ_EVENT = event_payloads.MessagesReadEventPayload.KIND
 MESSAGE_DELETED_EVENT = event_payloads.MessageDeletedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
 STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
@@ -174,6 +175,13 @@ def _deleted_message_from_event_payload(event_payload):
     }
 
 
+def _read_message_uuids_from_event_payload(event_payload):
+    return [
+        _event_payload_value("uuid", message_uuid)
+        for message_uuid in event_payload["message_uuids"]
+    ]
+
+
 def _deleted_folder_from_event_payload(event_payload):
     return {
         "uuid": _event_payload_value("uuid", event_payload["uuid"]),
@@ -200,6 +208,13 @@ def event_row_to_messenger_event(row):
             "type": "message",
             "kind": payload["kind"],
             "message": _message_from_event_payload(payload),
+        }
+    if payload["kind"] == MESSAGES_READ_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "message",
+            "kind": payload["kind"],
+            "message_uuids": _read_message_uuids_from_event_payload(payload),
         }
     if payload["kind"] == MESSAGE_DELETED_EVENT:
         return {
@@ -354,6 +369,23 @@ def create_message_updated_event(message, session=None):
         user_uuid=message.user_uuid,
         payload=event_payloads.MessageUpdatedEventPayload(
             **dict(message)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_messages_read_event(project_id, user_uuid, message_uuids,
+                               session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.MessagesReadEventPayload(
+            project_id=project_id,
+            message_uuids=[
+                str(message_uuid) for message_uuid in message_uuids
+            ],
         ),
     )
     return event.insert(session=session)

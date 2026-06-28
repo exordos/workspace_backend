@@ -64,6 +64,18 @@ class MessageUpdatedEventPayload(MessageEventPayloadBase):
     KIND = "message.updated"
 
 
+class MessagesReadEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithProject,
+):
+    KIND = "messages.read"
+
+    message_uuids = properties.property(
+        types.List(),
+        required=True,
+    )
+
+
 class MessageDeletedEventPayload(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
@@ -231,6 +243,7 @@ class FolderItemDeletedEventPayload(
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(MessageUpdatedEventPayload),
+    types_dynamic.KindModelType(MessagesReadEventPayload),
     types_dynamic.KindModelType(MessageDeletedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),

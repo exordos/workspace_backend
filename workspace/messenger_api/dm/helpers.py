@@ -222,17 +222,28 @@ def _get_user_stream_folder_event_targets(project_id, user_uuid, stream_uuid,
 
 def _create_message_unread_updated_events(project_id, user_uuid, stream_uuid,
                                           topic_uuid, session=None):
-    user_topic = get_workspace_user_stream_topic(
+    _create_unread_updated_events(
         project_id=project_id,
         user_uuid=user_uuid,
-        topic_uuid=topic_uuid,
-        session=session,
-    )
-    messenger_events.create_topic_updated_event(
-        topic=user_topic,
+        stream_uuid=stream_uuid,
+        topic_uuids=[topic_uuid],
         session=session,
     )
 
+
+def _create_unread_updated_events(project_id, user_uuid, stream_uuid,
+                                  topic_uuids, session=None):
+    for topic_uuid in topic_uuids:
+        user_topic = get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        messenger_events.create_topic_updated_event(
+            topic=user_topic,
+            session=session,
+        )
     user_stream = get_workspace_user_stream(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -1190,6 +1201,27 @@ def get_workspace_user_message(project_id, user_uuid, message_uuid,
     )
 
 
+def _get_unread_workspace_user_messages(project_id, user_uuid,
+                                        stream_uuid=None, topic_uuid=None,
+                                        created_at=None, session=None):
+    filters = {
+        "project_id": dm_filters.EQ(project_id),
+        "user_uuid": dm_filters.EQ(user_uuid),
+        "read": dm_filters.EQ(False),
+    }
+    if stream_uuid is not None:
+        filters["stream_uuid"] = dm_filters.EQ(stream_uuid)
+    if topic_uuid is not None:
+        filters["topic_uuid"] = dm_filters.EQ(topic_uuid)
+    if created_at is not None:
+        filters["created_at"] = dm_filters.LE(created_at)
+    return models.WorkspaceUserMessage.objects.get_all(
+        filters=filters,
+        order_by={"created_at": "asc", "uuid": "asc"},
+        session=session,
+    )
+
+
 def _get_workspace_user_messages(project_id, message_uuid, session=None):
     return models.WorkspaceUserMessage.objects.get_all(
         filters={
@@ -1222,6 +1254,36 @@ def create_message_flags(project_id, message_uuid, author_uuid, recipients,
             read=recipient_uuid == author_uuid,
         )
         flags.insert(session=session)
+
+
+def _read_workspace_user_messages(project_id, user_uuid, messages,
+                                  session=None):
+    topic_uuids = []
+    message_uuids = []
+    stream_uuid = None
+    for message in messages:
+        flags = models.WorkspaceUserMessageFlags.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(message.uuid),
+                "project_id": dm_filters.EQ(project_id),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+            session=session,
+        )
+        flags.update_dm(values={"read": True})
+        flags.update(session=session)
+        message_uuids.append(message.uuid)
+        stream_uuid = message.stream_uuid
+        if message.topic_uuid not in topic_uuids:
+            topic_uuids.append(message.topic_uuid)
+    if message_uuids:
+        messenger_events.create_messages_read_event(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuids=message_uuids,
+            session=session,
+        )
+    return stream_uuid, topic_uuids, message_uuids
 
 
 def create_workspace_user_message(project_id, user_uuid, session=None,
@@ -1298,6 +1360,117 @@ def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
     return result
 
 
+def read_workspace_user_stream_messages(project_id, user_uuid, stream_uuid,
+                                        session=None):
+    get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    unread_messages = _get_unread_workspace_user_messages(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    _, topic_uuids, _ = _read_workspace_user_messages(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        messages=unread_messages,
+        session=session,
+    )
+    if topic_uuids:
+        _create_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=topic_uuids,
+            session=session,
+        )
+    return get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+
+
+def read_workspace_user_stream_topic_messages(project_id, user_uuid,
+                                              topic_uuid, session=None):
+    topic = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    unread_messages = _get_unread_workspace_user_messages(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=topic.stream_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    _, topic_uuids, _ = _read_workspace_user_messages(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        messages=unread_messages,
+        session=session,
+    )
+    if topic_uuids:
+        _create_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=topic.stream_uuid,
+            topic_uuids=topic_uuids,
+            session=session,
+        )
+    return get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+
+
+def read_workspace_user_topic_messages_to_message(project_id, user_uuid,
+                                                  message_uuid, session=None):
+    current_message = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    unread_messages = _get_unread_workspace_user_messages(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=current_message.stream_uuid,
+        topic_uuid=current_message.topic_uuid,
+        created_at=current_message.created_at,
+        session=session,
+    )
+    stream_uuid, topic_uuids, _ = _read_workspace_user_messages(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        messages=unread_messages,
+        session=session,
+    )
+    if topic_uuids:
+        _create_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=topic_uuids,
+            session=session,
+        )
+    return get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+
+
 def read_workspace_user_message(project_id, user_uuid, message_uuid,
                                 session=None):
     current_message = get_workspace_user_message(
@@ -1324,11 +1497,13 @@ def read_workspace_user_message(project_id, user_uuid, message_uuid,
         message_uuid=message_uuid,
         session=session,
     )
-    messenger_events.create_message_updated_event(
-        message=result,
-        session=session,
-    )
     if not was_read:
+        messenger_events.create_messages_read_event(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuids=[message_uuid],
+            session=session,
+        )
         _create_message_unread_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,

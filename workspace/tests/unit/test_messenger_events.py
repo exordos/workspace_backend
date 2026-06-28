@@ -200,6 +200,35 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(True, event["message"]["read"])
         self.assertEqual("edited", event["message"]["payload"]["content"])
 
+    def test_event_row_to_messenger_event_uses_read_message_ids(self):
+        user_uuid = sys_uuid.uuid4()
+        project_id = sys_uuid.uuid4()
+        message_uuid_1 = sys_uuid.uuid4()
+        message_uuid_2 = sys_uuid.uuid4()
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 19,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "messages.read",
+                    "project_id": str(project_id),
+                    "message_uuids": [
+                        str(message_uuid_1),
+                        str(message_uuid_2),
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(19, event["epoch_version"])
+        self.assertEqual("message", event["type"])
+        self.assertEqual("messages.read", event["kind"])
+        self.assertEqual(
+            [str(message_uuid_1), str(message_uuid_2)],
+            event["message_uuids"],
+        )
+
     def test_event_row_to_messenger_event_uses_deleted_message_id(self):
         user_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
@@ -685,6 +714,32 @@ class MessengerEventsTestCase(unittest.TestCase):
             ),
         )
 
+    def test_messages_read_event_payload_accepts_message_ids(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid_1 = sys_uuid.uuid4()
+        message_uuid_2 = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "messages.read",
+                "project_id": str(project_id),
+                "message_uuids": [
+                    str(message_uuid_1),
+                    str(message_uuid_2),
+                ],
+            }
+        )
+
+        self.assertIsInstance(
+            payload,
+            event_payloads.MessagesReadEventPayload,
+        )
+        self.assertEqual(project_id, payload.project_id)
+        self.assertEqual(
+            [str(message_uuid_1), str(message_uuid_2)],
+            payload.message_uuids,
+        )
+
     def test_folder_event_payload_accepts_postgres_json_timestamp(self):
         user_uuid = sys_uuid.uuid4()
         project_id = sys_uuid.uuid4()
@@ -979,6 +1034,46 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("edited", created_event["payload"].payload.content)
         self.assertEqual(True, created_event["payload"].read)
         self.assertEqual(updated_at, created_event["payload"].updated_at)
+
+    def test_create_messages_read_event_uses_message_ids(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid_1 = sys_uuid.uuid4()
+        message_uuid_2 = sys_uuid.uuid4()
+        session = object()
+        created_event = {}
+
+        class FakeWorkspaceEvent:
+            def __init__(self, **kwargs):
+                created_event.update(kwargs)
+
+            def insert(self, session=None):
+                created_event["insert_session"] = session
+                return 42
+
+        with mock.patch.object(
+            events.models, "WorkspaceEvent", FakeWorkspaceEvent
+        ):
+            result = events.create_messages_read_event(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuids=[message_uuid_1, message_uuid_2],
+                session=session,
+            )
+
+        self.assertEqual(42, result)
+        self.assertIs(session, created_event["insert_session"])
+        self.assertEqual(project_id, created_event["project_id"])
+        self.assertEqual(user_uuid, created_event["user_uuid"])
+        self.assertIsInstance(
+            created_event["payload"],
+            event_payloads.MessagesReadEventPayload,
+        )
+        self.assertEqual(project_id, created_event["payload"].project_id)
+        self.assertEqual(
+            [str(message_uuid_1), str(message_uuid_2)],
+            created_event["payload"].message_uuids,
+        )
 
     def test_create_folder_event_uses_user_folder_snapshot(self):
         project_id = sys_uuid.uuid4()
