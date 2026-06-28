@@ -176,20 +176,29 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `GET` | `/v1/streams/` | List streams visible to the current IAM user. |
 | `POST` | `/v1/streams/` | Create a stream. |
 | `GET` | `/v1/streams/{stream_uuid}` | Get a stream. |
+| `PUT` | `/v1/streams/{stream_uuid}` | Update a stream. |
+| `DELETE` | `/v1/streams/{stream_uuid}` | Delete a stream for all stream users. |
 | `POST` | `/v1/streams/{stream_uuid}/actions/add_users/invoke` | Add users to a stream by role. |
+| `POST` | `/v1/streams/{stream_uuid}/actions/archive/invoke` | Set `is_archived: true`. |
+| `POST` | `/v1/streams/{stream_uuid}/actions/unarchive/invoke` | Set `is_archived: false`. |
+| `POST` | `/v1/streams/{stream_uuid}/actions/notifications/invoke` | Set current user's stream notification mode. |
 | `GET` | `/v1/stream_bindings/` | List stream bindings. |
 | `GET` | `/v1/stream_bindings/{binding_uuid}` | Get a stream binding. |
 | `PUT` | `/v1/stream_bindings/{binding_uuid}` | Update a stream binding. |
-| `DELETE` | `/v1/stream_bindings/{binding_uuid}` | Delete a stream binding. |
+| `DELETE` | `/v1/stream_bindings/{binding_uuid}` | Remove a user from a stream. |
 | `GET` | `/v1/stream_topics/` | List topics visible to the current IAM user. |
 | `POST` | `/v1/stream_topics/` | Create a topic. |
 | `GET` | `/v1/stream_topics/{topic_uuid}` | Get a topic. |
 | `PUT` | `/v1/stream_topics/{topic_uuid}` | Rename a topic; body must contain `name`. |
 | `DELETE` | `/v1/stream_topics/{topic_uuid}` | Delete a topic. |
 | `POST` | `/v1/stream_topics/{topic_uuid}/actions/toggle_done/invoke` | Toggle the current user's `is_done` flag. |
+| `POST` | `/v1/stream_topics/{topic_uuid}/actions/notifications/invoke` | Set current user's topic notification mode. |
 | `GET` | `/v1/messages/` | List messages visible to the current IAM user. |
 | `POST` | `/v1/messages/` | Create a message. |
 | `GET` | `/v1/messages/{message_uuid}` | Get a message. |
+| `PUT` | `/v1/messages/{message_uuid}` | Update a message payload. |
+| `DELETE` | `/v1/messages/{message_uuid}` | Delete a message. |
+| `POST` | `/v1/messages/{message_uuid}/actions/read/invoke` | Mark message as read for the current user. |
 | `GET` | `/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/v1/users/` | List workspace users. |
@@ -489,6 +498,7 @@ Supported source payloads:
 | `owner` | UUID | no | yes | Owner from the user stream view. |
 | `user_uuid` | UUID | no | yes | Current user in the user stream view. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | yes | Current user's role. |
+| `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | user-scoped action-managed | Current user's stream notification mode; defaults to `all_messages`. |
 | `unread_count` | integer | no | yes | Current user's unread count. |
 | `source_name` | `native`, `zulip` | yes | no | Source name. |
 | `source` | object | yes | no | Source payload. |
@@ -496,6 +506,7 @@ Supported source payloads:
 | `announce` | boolean | no | no | Announcement stream flag. |
 | `direct_user_uuid` | UUID | no | no | Other direct-chat participant. |
 | `private` | boolean | no | yes | Private stream flag. |
+| `is_archived` | boolean | no | action-managed | Archived flag. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -528,15 +539,34 @@ Direct chat create request:
 }
 ```
 
+Stream notification mode request:
+
+```http
+POST /api/messenger/v1/streams/75309057-419c-4b12-a7c1-3932429ec4a6/actions/notifications/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "notification_mode": "mentions_only"
+}
+```
+
 Realtime side effects:
 
 | Operation | Durable payload kind | Websocket event type | Websocket body |
 | --- | --- | --- | --- |
 | create stream | `stream.created` | `stream` | Full user stream snapshot. |
 | create stream | `folder.updated` | `folder` | Updated `All chats` and `Channels`/`Personal` system folder snapshots. |
+| update stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
+| archive or unarchive stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
+| change stream notification mode | `stream.updated` | `stream` | Full user stream snapshot for the current user only. |
+| delete stream | `stream.deleted` | `stream` | Only deleted stream `uuid`, sent to every stream user. |
+| delete stream | `folder.updated` | `folder` | Updated affected users' system/custom folder snapshots after the stream is removed. |
 | add stream binding | `stream.created` | `stream` | Added user's full user stream snapshot. |
 | add stream bindings | `stream_bindings.created` | `stream_binding` | New stream binding snapshots for existing stream participants. |
 | add stream binding | `folder.updated` | `folder` | Updated added user's `All chats` and `Channels`/`Personal` system folder snapshots. |
+| delete stream binding | `stream.deleted` | `stream` | Only stream `uuid`, sent to the removed user. |
+| delete stream binding | `folder.updated` | `folder` | Updated removed user's system/custom folder snapshots after access is removed. |
 
 For direct private streams, one `stream.created` event is written for each
 participant. Stream creation also writes `folder.updated` events for each
@@ -563,6 +593,7 @@ new binding snapshots for the whole added batch.
 | `user_uuid` | UUID | yes | no | User receiving access. |
 | `who_uuid` | UUID | no | yes | User that performed the action. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | no | Role; defaults to `member`. |
+| `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | no | User's stream notification mode; defaults to `all_messages`. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -580,6 +611,10 @@ Add users request:
 }
 ```
 
+Deleting a binding removes that user's access to the stream. The removed user
+receives `stream.deleted` and then `folder.updated` for affected system and
+custom folders. Other stream users do not receive a binding-delete event.
+
 ## Stream Topics
 
 `POST /v1/stream_topics/` writes to `m_workspace_stream_topics` and creates
@@ -596,6 +631,7 @@ Add users request:
 | `unread_count` | integer | no | yes | Current user's unread count for the topic. |
 | `is_default` | boolean | no | yes | Whether this is the stream default topic. |
 | `is_done` | boolean | no | action-managed | Current user's done flag. |
+| `notification_mode` | `mute`, `default`, `unmute`, `follow` | no | user-scoped action-managed | Current user's topic notification mode; defaults to `default`. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -614,6 +650,28 @@ renaming the topic.
 
 `POST /v1/stream_topics/{topic_uuid}/actions/toggle_done/invoke` flips the
 current user's `is_done` flag and returns the updated topic view.
+
+`POST /v1/stream_topics/{topic_uuid}/actions/notifications/invoke` sets the
+current user's topic notification mode:
+
+```json
+{
+  "notification_mode": "follow"
+}
+```
+
+Allowed topic notification modes are `mute`, `default`, and `follow`. `unmute`
+is allowed only when the current user's stream notification mode is `muted`.
+
+Realtime side effects:
+
+| Operation | Durable payload kind | Websocket event type | Websocket body |
+| --- | --- | --- | --- |
+| create topic | `topic.created` | `topic` | Full user topic snapshot for every stream user. |
+| rename topic | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| toggle done | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| change topic notification mode | `topic.updated` | `topic` | Full user topic snapshot for the current user only. |
+| delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. |
 
 ## Messages
 
@@ -683,14 +741,52 @@ Response example:
 }
 ```
 
+Update request:
+
+```json
+{
+  "payload": {
+    "kind": "markdown",
+    "content": "Edited text"
+  }
+}
+```
+
+`PUT /v1/messages/{message_uuid}` updates the root message payload and returns
+the current user's message view. Only the message author can update the root
+message. `DELETE /v1/messages/{message_uuid}` deletes the root message and
+cascades per-user message flags through database foreign keys.
+
+Read action:
+
+```http
+POST /api/messenger/v1/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/read/invoke
+Authorization: Bearer <access_token>
+```
+
+`read` sets the current user's message flag to `true` and returns the updated
+message view.
+
+Realtime side effects:
+
+| Operation | Durable payload kind | Websocket event type | Websocket body |
+| --- | --- | --- | --- |
+| create message | `message.created` | `message` | Full user message snapshot for every stream user. |
+| create unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the new message is unread. |
+| update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
+| read message | `message.updated` | `message` | Full user message snapshot for the current user. |
+| read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
+| delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`, sent to every stream user. |
+| delete unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the deleted message was unread. |
+
 ## Events And Epoch
 
 Events are durable outbox rows stored in `m_workspace_events`. They are
-generated when streams or messages are created and when folders or folder items
-change. Stream events are scoped to the created stream owner. Message events are
-scoped per recipient; folder and folder item events are scoped to the folder
-owner. The event primary identifier is `epoch_version`, a monotonically
-increasing integer.
+generated by stream, binding, topic, message, folder, and folder item changes.
+Events are always scoped to the affected `user_uuid`: message snapshots are
+per recipient, stream/topic/folder snapshots are per visible user, and delete
+events are sent only to users that need to remove local state. The event primary
+identifier is `epoch_version`, a monotonically increasing integer.
 
 `GET /v1/events/` returns a standard RESTAlchemy list with no envelope. Events
 are sorted by `epoch_version` ascending by default.
@@ -773,7 +869,11 @@ Folder update event example:
 }
 ```
 
-Delete events intentionally contain only the deleted entity identifier:
+Delete events intentionally contain only the identifiers needed to remove or
+unlink local state. `stream.deleted`, `folder.deleted`, and
+`folder_item.deleted` contain only `uuid`; `topic.deleted` contains `uuid` and
+`stream_uuid`; `message.deleted` contains `uuid`, `stream_uuid`, and
+`topic_uuid`.
 
 ```json
 {
@@ -810,10 +910,17 @@ Supported event payload kinds:
 | Payload kind | Produced by | REST payload |
 | --- | --- | --- |
 | `stream.created` | `POST /v1/streams/`, `POST /v1/streams/{uuid}/actions/add_users/invoke` | Full user stream snapshot. |
+| `stream.updated` | `PUT /v1/streams/{uuid}`, archive/unarchive actions, stream notification action, message unread-count changes | Full user stream snapshot. |
+| `stream.deleted` | `DELETE /v1/streams/{uuid}`, `DELETE /v1/stream_bindings/{binding_uuid}` | Only stream `uuid`. |
 | `stream_bindings.created` | `POST /v1/streams/{uuid}/actions/add_users/invoke` | Stream UUID and full stream binding snapshots for the added batch. |
+| `topic.created` | `POST /v1/stream_topics/` | Full user topic snapshot. |
+| `topic.updated` | `PUT /v1/stream_topics/{uuid}`, toggle done action, topic notification action, message unread-count changes | Full user topic snapshot. |
+| `topic.deleted` | `DELETE /v1/stream_topics/{uuid}` | Deleted topic `uuid` and `stream_uuid`. |
 | `message.created` | `POST /v1/messages/` | Full user message snapshot. |
+| `message.updated` | `PUT /v1/messages/{uuid}`, message read action | Full user message snapshot. |
+| `message.deleted` | `DELETE /v1/messages/{uuid}` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`. |
 | `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
-| `folder.updated` | `POST /v1/streams/`, `POST /v1/streams/{uuid}/actions/add_users/invoke`, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
+| `folder.updated` | stream create/delete, stream binding add/delete, message unread-count changes, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
 | `folder.deleted` | `DELETE /v1/folders/{uuid}` | Only deleted folder `uuid`. |
 | `folder_item.deleted` | `DELETE /v1/folder_items/{uuid}` | Only deleted folder item `uuid`. |
 
@@ -867,10 +974,23 @@ const ws = new WebSocket(
 );
 ```
 
-The server sends dispatch-ready event frames. Stream creation events have
-`event.type: "stream"` and include a full user stream snapshot. Folder create,
-folder update, and folder item add/pin/unpin events have `event.type: "folder"`
-and include a full folder snapshot:
+The server sends dispatch-ready event frames. Raw REST events and websocket
+frames carry the same `epoch_version`, but websocket frames are already
+normalized for dispatch:
+
+| Websocket `event.type` | `event.kind` | Body field |
+| --- | --- | --- |
+| `message` | omitted for `message.created`; `message.updated` or `message.deleted` otherwise | `message` |
+| `stream` | `stream.created`, `stream.updated`, `stream.deleted` | `stream` |
+| `stream_binding` | `stream_bindings.created` | `stream_uuid`, `stream_bindings` |
+| `topic` | `topic.created`, `topic.updated`, `topic.deleted` | `topic` |
+| `folder` | `folder.created`, `folder.updated`, `folder.deleted` | `folder` |
+| `folder_item` | `folder_item.deleted` | `folder_item` |
+
+Create/update events include full snapshots. Delete events are minimal and
+include only the identifiers documented in the event payload table above.
+Folder create, folder update, and folder item add/pin/unpin events have
+`event.type: "folder"` and include a full folder snapshot:
 
 ```json
 {

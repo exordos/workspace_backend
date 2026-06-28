@@ -4,6 +4,11 @@ Backend service for **Genesis Workspace**. It exposes a REST API for
 managing user-specific folders and folder items (chat memberships) and
 serves an OpenAPI 3.0.3 specification for the API.
 
+Current messenger REST and realtime contracts are documented in:
+
+- [`docs/workspace_api.md`](docs/workspace_api.md)
+- [`docs/workspace_ui_realtime_integration.md`](docs/workspace_ui_realtime_integration.md)
+
 This service is planned to evolve into a **full replacement for Zulip**
 in the future. At the current stage, it is used to integrate features
 that are **not available in Zulip** yet, while still reusing Zulip as

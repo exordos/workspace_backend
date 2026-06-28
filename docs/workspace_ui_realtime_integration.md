@@ -87,9 +87,11 @@ handshake is closed with code `4400`.
 ]
 ```
 
-Folder mutations use the same raw REST event envelope. Folder create/update
-payloads contain a full folder snapshot; folder and folder item deletes contain
-only the deleted entity id.
+All raw REST events use the same outbox envelope. Create/update payloads carry
+the persisted/view snapshot for the affected user. Delete payloads are minimal:
+`stream.deleted`, `folder.deleted`, and `folder_item.deleted` contain only
+`uuid`; `topic.deleted` contains `uuid` and `stream_uuid`; `message.deleted`
+contains `uuid`, `stream_uuid`, and `topic_uuid`.
 
 Folder update raw REST event:
 
@@ -160,6 +162,23 @@ Delete raw REST events:
   },
   "created_at": "2026-06-22T09:33:00Z",
   "updated_at": "2026-06-22T09:33:00Z"
+}
+```
+
+```json
+{
+  "epoch_version": 128,
+  "uuid": "70678474-5c9f-4de3-9b41-020cd248eac4",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "message.deleted",
+    "uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+    "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+    "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047"
+  },
+  "created_at": "2026-06-22T09:34:00Z",
+  "updated_at": "2026-06-22T09:34:00Z"
 }
 ```
 
@@ -246,6 +265,7 @@ Stream create event frame:
       "user_uuid": "11111111-1111-1111-1111-111111111111",
       "owner": "11111111-1111-1111-1111-111111111111",
       "role": "owner",
+      "notification_mode": "all_messages",
       "name": "Engineering",
       "description": "Engineering workspace",
       "unread_count": 0,
@@ -256,6 +276,7 @@ Stream create event frame:
       "invite_only": false,
       "announce": false,
       "private": false,
+      "is_archived": false,
       "direct_user_uuid": null,
       "created_at": "2026-06-22T09:30:00Z",
       "updated_at": "2026-06-22T09:30:00Z"
@@ -272,6 +293,16 @@ When a user is added to an existing stream, that user receives the same
 just became visible. Existing stream participants receive
 `stream_bindings.created` with the new binding snapshots for the whole added
 batch instead of another `stream.created` event.
+
+When a user is removed from a stream through `DELETE /v1/stream_bindings/{uuid}`,
+only the removed user receives `stream.deleted` for that stream. The same user
+then receives `folder.updated` for affected system and custom folders after
+the binding has been removed.
+
+When a new message is unread for a user, that user receives the message event
+and aggregate `topic.updated`, `stream.updated`, and `folder.updated` events.
+The same aggregate updates are sent when unread counts decrease because the
+user marks a message as read or because an unread message is deleted.
 
 Folder update event frame:
 
@@ -384,18 +415,39 @@ type WorkspaceRealtimeEvent = {
 } & (
   | {
       type: "message";
+      kind?: "message.updated";
       message: WorkspaceUserMessage;
     }
   | {
+      type: "message";
+      kind: "message.deleted";
+      message: { uuid: string; stream_uuid: string; topic_uuid: string };
+    }
+  | {
       type: "stream";
-      kind: "stream.created";
+      kind: "stream.created" | "stream.updated";
       stream: WorkspaceUserStream;
+    }
+  | {
+      type: "stream";
+      kind: "stream.deleted";
+      stream: { uuid: string };
     }
   | {
       type: "stream_binding";
       kind: "stream_bindings.created";
       stream_uuid: string;
       stream_bindings: WorkspaceStreamBinding[];
+    }
+  | {
+      type: "topic";
+      kind: "topic.created" | "topic.updated";
+      topic: WorkspaceUserTopic;
+    }
+  | {
+      type: "topic";
+      kind: "topic.deleted";
+      topic: { uuid: string; stream_uuid: string };
     }
   | {
       type: "folder";
@@ -418,7 +470,12 @@ type WorkspaceRealtimeEvent = {
 REST `/events/` returns the raw outbox model, so the UI catch-up path must
 normalize `WorkspaceEventModel` to the same shape as websocket event frames.
 
-Current mapping:
+Current mapping. The `toWorkspaceUserMessage`, `toWorkspaceUserStream`,
+`toWorkspaceUserTopic`, and `toWorkspaceFolder` helpers should copy the same
+fields returned by the matching REST resource. In particular, keep
+`notification_mode` on streams, stream bindings, and topics, keep
+`is_archived` on streams, and keep `read`, `pinned`, `starred`, and `is_own`
+on messages.
 
 ```ts
 function normalizeWorkspaceEvent(
@@ -426,48 +483,44 @@ function normalizeWorkspaceEvent(
 ): WorkspaceRealtimeEvent | null {
   switch (model.payload.kind) {
     case "message.created":
+    case "message.updated":
       return {
         epoch_version: model.epoch_version,
         type: "message",
+        ...(model.payload.kind === "message.updated"
+          ? { kind: "message.updated" as const }
+          : {}),
+        message: toWorkspaceUserMessage(model.payload),
+      };
+
+    case "message.deleted":
+      return {
+        epoch_version: model.epoch_version,
+        type: "message",
+        kind: "message.deleted",
         message: {
           uuid: model.payload.uuid,
-          project_id: model.payload.project_id,
-          user_uuid: model.payload.user_uuid,
           stream_uuid: model.payload.stream_uuid,
           topic_uuid: model.payload.topic_uuid,
-          author_uuid: model.payload.author_uuid,
-          payload: model.payload.payload,
-          read: model.payload.read,
-          pinned: model.payload.pinned,
-          starred: model.payload.starred,
-          is_own: model.payload.is_own,
-          created_at: model.payload.created_at,
-          updated_at: model.payload.updated_at,
         },
       };
 
     case "stream.created":
+    case "stream.updated":
       return {
         epoch_version: model.epoch_version,
         type: "stream",
-        kind: "stream.created",
+        kind: model.payload.kind,
+        stream: toWorkspaceUserStream(model.payload),
+      };
+
+    case "stream.deleted":
+      return {
+        epoch_version: model.epoch_version,
+        type: "stream",
+        kind: "stream.deleted",
         stream: {
           uuid: model.payload.uuid,
-          project_id: model.payload.project_id,
-          user_uuid: model.payload.user_uuid,
-          owner: model.payload.owner,
-          role: model.payload.role,
-          name: model.payload.name,
-          description: model.payload.description,
-          unread_count: model.payload.unread_count,
-          source_name: model.payload.source_name,
-          source: model.payload.source,
-          invite_only: model.payload.invite_only,
-          announce: model.payload.announce,
-          private: model.payload.private,
-          direct_user_uuid: model.payload.direct_user_uuid,
-          created_at: model.payload.created_at,
-          updated_at: model.payload.updated_at,
         },
       };
 
@@ -484,9 +537,30 @@ function normalizeWorkspaceEvent(
           user_uuid: binding.user_uuid,
           who_uuid: binding.who_uuid,
           role: binding.role,
+          notification_mode: binding.notification_mode,
           created_at: binding.created_at,
           updated_at: binding.updated_at,
         })),
+      };
+
+    case "topic.created":
+    case "topic.updated":
+      return {
+        epoch_version: model.epoch_version,
+        type: "topic",
+        kind: model.payload.kind,
+        topic: toWorkspaceUserTopic(model.payload),
+      };
+
+    case "topic.deleted":
+      return {
+        epoch_version: model.epoch_version,
+        type: "topic",
+        kind: "topic.deleted",
+        topic: {
+          uuid: model.payload.uuid,
+          stream_uuid: model.payload.stream_uuid,
+        },
       };
 
     case "folder.created":
@@ -495,18 +569,7 @@ function normalizeWorkspaceEvent(
         epoch_version: model.epoch_version,
         type: "folder",
         kind: model.payload.kind,
-        folder: {
-          uuid: model.payload.uuid,
-          project_id: model.payload.project_id,
-          user_uuid: model.payload.user_uuid,
-          title: model.payload.title,
-          background_color_value: model.payload.background_color_value,
-          unread_count: model.payload.unread_count,
-          system_type: model.payload.system_type,
-          folder_items: model.payload.folder_items,
-          created_at: model.payload.created_at,
-          updated_at: model.payload.updated_at,
-        },
+        folder: toWorkspaceFolder(model.payload),
       };
 
     case "folder.deleted":
@@ -593,13 +656,15 @@ UUID.
 - Delivery is at-least-once.
 - Ordering is by `epoch_version`.
 - The UI dispatch pipeline must be idempotent.
-- REST v1 supports `stream.created`, `stream_bindings.created`,
-  `message.created`, `folder.created`, `folder.updated`, `folder.deleted`, and
+- REST v1 supports `stream.created`, `stream.updated`, `stream.deleted`,
+  `stream_bindings.created`, `topic.created`, `topic.updated`,
+  `topic.deleted`, `message.created`, `message.updated`, `message.deleted`,
+  `folder.created`, `folder.updated`, `folder.deleted`, and
   `folder_item.deleted`.
 - Websocket v1 emits `event.type === "stream"`, `event.type === "message"`,
-  `event.type === "stream_binding"`, `event.type === "folder"`, and
-  `event.type === "folder_item"`. Stream, stream binding, folder, and folder
-  item events include `event.kind`.
+  `event.type === "stream_binding"`, `event.type === "topic"`,
+  `event.type === "folder"`, and `event.type === "folder_item"`. All events
+  except `message.created` include `event.kind`.
 
 ## Manual Verification Checklist
 
@@ -612,10 +677,18 @@ test account.
 3. Reconnect does not duplicate already rendered messages.
 4. Own messages are displayed as own/read.
 5. Messages from another user in the same stream arrive through websocket.
-6. Creating a stream adds it through websocket.
-7. Creating or renaming a folder updates folder state through websocket.
-8. Adding, pinning, and unpinning a stream in a folder updates the parent
+6. Marking a message as read updates the message and decrements topic, stream,
+   and folder unread counts.
+7. Editing and deleting a message update or remove it without manual refresh.
+8. Creating, editing, archiving, unarchiving, and deleting a stream updates UI
+   state through websocket.
+9. Removing a user from a stream sends that removed user `stream.deleted` and
+   folder updates.
+10. Creating, renaming, marking done, muting/following, and deleting a topic
+   update UI state through websocket.
+11. Creating or renaming a folder updates folder state through websocket.
+12. Adding, pinning, and unpinning a stream in a folder updates the parent
    folder snapshot through `folder.updated`.
-9. Deleting a folder removes it by `folder.uuid`; deleting a folder item removes
+13. Deleting a folder removes it by `folder.uuid`; deleting a folder item removes
    it by `folder_item.uuid`.
-10. Unknown events are logged and skipped without breaking the realtime loop.
+14. Unknown events are logged and skipped without breaking the realtime loop.
