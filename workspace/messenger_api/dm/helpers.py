@@ -32,6 +32,11 @@ SYSTEM_FOLDER_ITEM_MODELS = {
     "11": models.PersonalFolderItem,
     "22": models.ChannelFolderItem,
 }
+SYSTEM_FOLDER_UUIDS = {
+    ALL_CHATS_FOLDER_UUID,
+    PERSONAL_FOLDER_UUID,
+    CHANNELS_FOLDER_UUID,
+}
 TOPIC_NOTIFICATION_MODES = {
     models.WorkspaceTopicNotificationMode.MUTE.value,
     models.WorkspaceTopicNotificationMode.DEFAULT.value,
@@ -152,6 +157,26 @@ def _add_folder_event_target(targets, user_uuid, folder_uuid):
     target = (user_uuid, folder_uuid)
     if target not in targets:
         targets.append(target)
+
+
+def _create_available_folder_updated_events(project_id, folder_targets,
+                                            session=None):
+    for target_user_uuid, folder_uuid in folder_targets:
+        try:
+            folder = get_workspace_user_folder(
+                project_id=project_id,
+                user_uuid=target_user_uuid,
+                folder_uuid=folder_uuid,
+                session=session,
+            )
+        except storage_exc.RecordNotFound:
+            if folder_uuid in SYSTEM_FOLDER_UUIDS:
+                continue
+            raise
+        messenger_events.create_folder_updated_event(
+            folder=folder,
+            session=session,
+        )
 
 
 def _get_stream_folder_event_targets(project_id, stream_uuid, user_streams,
@@ -381,17 +406,11 @@ def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
     )
     binding.delete(session=session)
 
-    for target_user_uuid, folder_uuid in folder_targets:
-        folder = get_workspace_user_folder(
-            project_id=project_id,
-            user_uuid=target_user_uuid,
-            folder_uuid=folder_uuid,
-            session=session,
-        )
-        messenger_events.create_folder_updated_event(
-            folder=folder,
-            session=session,
-        )
+    _create_available_folder_updated_events(
+        project_id=project_id,
+        folder_targets=folder_targets,
+        session=session,
+    )
 
 
 def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
@@ -1001,17 +1020,11 @@ def delete_workspace_user_stream(project_id, user_uuid, stream_uuid,
 
     stream.delete(session=session)
 
-    for target_user_uuid, folder_uuid in folder_targets:
-        folder = get_workspace_user_folder(
-            project_id=project_id,
-            user_uuid=target_user_uuid,
-            folder_uuid=folder_uuid,
-            session=session,
-        )
-        messenger_events.create_folder_updated_event(
-            folder=folder,
-            session=session,
-        )
+    _create_available_folder_updated_events(
+        project_id=project_id,
+        folder_targets=folder_targets,
+        session=session,
+    )
 
 
 def create_workspace_user_folder(project_id, user_uuid, session=None,
