@@ -674,6 +674,32 @@ def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
     )
 
 
+def test_stream_binding_controller_delete_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    actor_uuid = sys_uuid.uuid4()
+    binding_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=actor_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamBindingController(request)
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "delete_workspace_stream_binding",
+        return_value=None,
+    ) as delete_binding:
+        result = controller.delete(binding_uuid)
+
+    assert result is None
+    delete_binding.assert_called_once_with(
+        project_id=project_id,
+        binding_uuid=binding_uuid,
+    )
+
+
 def test_stream_bindings_action_uses_binding_controller_resource():
     assert (
         routes.WorkspaceStreamBindingsAction.__controller__

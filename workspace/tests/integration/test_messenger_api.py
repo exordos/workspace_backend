@@ -26,6 +26,7 @@ from workspace.tests.integration import conftest
 
 V1 = "/v1"
 STREAMS = f"{V1}/streams/"
+STREAM_BINDINGS = f"{V1}/stream_bindings/"
 FOLDERS = f"{V1}/folders/"
 FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
@@ -1008,6 +1009,113 @@ def test_stream_binding_create_notifies_added_user(api, db):
         binding["notification_mode"]
         for binding in owner_events[0]["stream_bindings"]
     } == {"all_messages"}
+
+
+def test_stream_binding_delete_notifies_removed_user(api, db):
+    target_user_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Remove user team",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        target_user_uuid,
+    )
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+                AND stream_uuid = %s
+                AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, str(target_user_uuid)),
+        )
+        binding_uuid = cur.fetchone()[0]
+
+    resp = api.post(
+        FOLDERS,
+        user=target_user_uuid,
+        json={"title": "Watched"},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    folder = resp.json()
+    resp = api.post(
+        FOLDER_ITEMS,
+        user=target_user_uuid,
+        json={
+            "folder_uuid": folder["uuid"],
+            "stream_uuid": stream_uuid,
+            "chat_type": "stream",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_delete_epoch = cur.fetchone()[0]
+
+    resp = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{STREAMS}{stream_uuid}", user=target_user_uuid)
+    assert resp.status_code == 404, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE uuid = %s
+            """,
+            (binding_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_delete_epoch),
+        )
+        event_rows = cur.fetchall()
+
+    assert [str(row[0]) for row in event_rows] == [
+        str(target_user_uuid),
+        str(target_user_uuid),
+        str(target_user_uuid),
+        str(target_user_uuid),
+    ]
+    events = [row[1] for row in event_rows]
+    assert [event["kind"] for event in events] == [
+        "stream.deleted",
+        "folder.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert events[0]["uuid"] == stream_uuid
+    assert [(event["uuid"], event["title"]) for event in events[1:]] == [
+        ("00000000-0000-0000-0000-000000000000", "All chats"),
+        ("00000000-0000-0000-0000-000000000002", "Channels"),
+        (folder["uuid"], "Watched"),
+    ]
+    assert events[3]["folder_items"] == []
 
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):

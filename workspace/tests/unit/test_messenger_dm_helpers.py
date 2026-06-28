@@ -780,6 +780,124 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(2, create_binding_event.call_count)
 
+    def test_delete_workspace_stream_binding_sends_removed_user_events(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        binding_uuid = sys_uuid.uuid4()
+        custom_folder_uuid = sys_uuid.uuid4()
+        session = object()
+        order = []
+        user_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            private=False,
+        )
+        all_folder = types.SimpleNamespace(uuid=dm_helpers.ALL_CHATS_FOLDER_UUID)
+        channels_folder = types.SimpleNamespace(uuid=dm_helpers.CHANNELS_FOLDER_UUID)
+        custom_folder = types.SimpleNamespace(uuid=custom_folder_uuid)
+
+        class ExistingBinding:
+            def __init__(self):
+                self.uuid = binding_uuid
+                self.project_id = project_id
+                self.user_uuid = user_uuid
+                self.stream_uuid = stream_uuid
+
+            def delete(self, session=None):
+                order.append(("delete", session))
+
+        class FakeWorkspaceStreamBinding:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingBinding())
+            )
+
+        def create_stream_deleted_event(**kwargs):
+            order.append(("stream.deleted", kwargs))
+
+        def create_folder_updated_event(**kwargs):
+            order.append(("folder.updated", kwargs))
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            return_value=user_stream,
+        ) as get_user_stream, mock.patch.object(
+            dm_helpers,
+            "_get_user_stream_folder_event_targets",
+            return_value=[
+                (user_uuid, dm_helpers.ALL_CHATS_FOLDER_UUID),
+                (user_uuid, dm_helpers.CHANNELS_FOLDER_UUID),
+                (user_uuid, custom_folder_uuid),
+            ],
+        ) as get_folder_targets, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_folder",
+            side_effect=[all_folder, channels_folder, custom_folder],
+        ) as get_user_folder, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_stream_deleted_event",
+            side_effect=create_stream_deleted_event,
+        ) as create_stream_deleted, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_folder_updated_event",
+            side_effect=create_folder_updated_event,
+        ) as create_folder_updated:
+            result = dm_helpers.delete_workspace_stream_binding(
+                project_id=project_id,
+                binding_uuid=binding_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        FakeWorkspaceStreamBinding.objects.get_one.assert_called_once()
+        filters = FakeWorkspaceStreamBinding.objects.get_one.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual(binding_uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        get_folder_targets.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            private=False,
+            session=session,
+        )
+        create_stream_deleted.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        self.assertEqual(3, get_user_folder.call_count)
+        create_folder_updated.assert_has_calls(
+            [
+                mock.call(folder=all_folder, session=session),
+                mock.call(folder=channels_folder, session=session),
+                mock.call(folder=custom_folder, session=session),
+            ]
+        )
+        self.assertEqual(
+            [
+                "stream.deleted",
+                "delete",
+                "folder.updated",
+                "folder.updated",
+                "folder.updated",
+            ],
+            [item[0] for item in order],
+        )
+
     def test_get_or_create_workspace_stream_binding_returns_existing(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

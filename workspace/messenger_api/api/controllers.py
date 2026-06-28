@@ -287,6 +287,12 @@ class WorkspaceStreamBindingController(
             role_user_uuids=kwargs,
         )
 
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_stream_binding(
+            project_id=self._get_project_id(),
+            binding_uuid=uuid,
+        )
+
 
 class WorkspaceMessageController(
     WorkspaceBaseResourceControllerPaginated,

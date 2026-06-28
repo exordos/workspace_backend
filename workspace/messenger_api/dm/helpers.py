@@ -351,6 +351,49 @@ def create_workspace_stream_bindings_created_events(bindings, session=None):
         )
 
 
+def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
+    binding = models.WorkspaceStreamBinding.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(binding_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+    user_stream = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=binding.user_uuid,
+        stream_uuid=binding.stream_uuid,
+        session=session,
+    )
+    folder_targets = _get_user_stream_folder_event_targets(
+        project_id=project_id,
+        user_uuid=binding.user_uuid,
+        stream_uuid=binding.stream_uuid,
+        private=user_stream.private,
+        session=session,
+    )
+
+    messenger_events.create_stream_deleted_event(
+        project_id=project_id,
+        user_uuid=binding.user_uuid,
+        stream_uuid=binding.stream_uuid,
+        session=session,
+    )
+    binding.delete(session=session)
+
+    for target_user_uuid, folder_uuid in folder_targets:
+        folder = get_workspace_user_folder(
+            project_id=project_id,
+            user_uuid=target_user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        messenger_events.create_folder_updated_event(
+            folder=folder,
+            session=session,
+        )
+
+
 def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
                                             who_uuid, role, session=None):
     for existing in models.WorkspaceStreamBinding.objects.get_all(
