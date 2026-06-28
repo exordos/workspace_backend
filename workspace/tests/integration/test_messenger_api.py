@@ -1465,10 +1465,24 @@ def test_message_create_writes_flags_and_visible_events(api, db):
             """,
             (api.project_id,),
         )
-        event_rows = {str(row[0]): row[1] for row in cur.fetchall()}
-    assert set(event_rows) == {str(api.user_uuid), str(other_user)}
-    author_payload = event_rows[str(api.user_uuid)]
-    other_payload = event_rows[str(other_user)]
+        event_rows = cur.fetchall()
+    events_by_user = {}
+    for user_uuid, payload in event_rows:
+        events_by_user.setdefault(str(user_uuid), []).append(payload)
+
+    assert set(events_by_user) == {str(api.user_uuid), str(other_user)}
+    assert [payload["kind"] for payload in events_by_user[str(api.user_uuid)]] == [
+        "message.created",
+    ]
+    assert [payload["kind"] for payload in events_by_user[str(other_user)]] == [
+        "message.created",
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    author_payload = events_by_user[str(api.user_uuid)][0]
+    other_payload = events_by_user[str(other_user)][0]
     assert author_payload["kind"] == "message.created"
     assert author_payload["uuid"] == message_uuid
     assert author_payload["stream_uuid"] == stream_uuid
@@ -1528,7 +1542,13 @@ def test_message_create_writes_flags_and_visible_events(api, db):
         user=other_user,
         params={"page_limit": 100},
     ).json()
-    assert len(other_events) == 1
+    assert [event["payload"]["kind"] for event in other_events] == [
+        "message.created",
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
     other_event = other_events[0]
     assert other_event["payload"]["uuid"] == message_uuid
     assert other_event["payload"]["kind"] == "message.created"
@@ -1552,6 +1572,196 @@ def test_message_create_writes_flags_and_visible_events(api, db):
         },
     ).json()
     assert next_page == []
+
+
+def test_message_update_read_delete_write_realtime_events(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "message-crud-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+
+    resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "first version",
+            },
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    message_uuid = resp.json()["uuid"]
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_read_epoch = cur.fetchone()[0]
+
+    resp = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=other_user,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["read"] is True
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s
+                AND project_id = %s
+                AND user_uuid = %s
+            """,
+            (message_uuid, api.project_id, str(other_user)),
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND user_uuid = %s
+                AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, str(other_user), before_read_epoch),
+        )
+        read_events = [row[0] for row in cur.fetchall()]
+
+    assert [event["kind"] for event in read_events] == [
+        "message.updated",
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert read_events[0]["uuid"] == message_uuid
+    assert read_events[0]["read"] is True
+    assert read_events[1]["unread_count"] == 0
+    assert read_events[2]["unread_count"] == 0
+    assert [event["unread_count"] for event in read_events[3:]] == [0, 0]
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_update_epoch = cur.fetchone()[0]
+
+    resp = api.put(
+        f"{MESSAGES}{message_uuid}",
+        json={
+            "payload": {
+                "kind": "markdown",
+                "content": "edited version",
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["payload"]["content"] == "edited version"
+
+    resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["payload"]["content"] == "edited version"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_update_epoch),
+        )
+        update_rows = cur.fetchall()
+
+    assert {str(row[0]) for row in update_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    assert [row[1]["kind"] for row in update_rows] == [
+        "message.updated",
+        "message.updated",
+    ]
+    assert all(
+        row[1]["payload"]["content"] == "edited version"
+        for row in update_rows
+    )
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_delete_epoch = cur.fetchone()[0]
+
+    resp = api.delete(f"{MESSAGES}{message_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
+    assert resp.status_code == 404, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM m_workspace_messages
+                 WHERE uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_user_message_flags
+                 WHERE uuid = %s)
+            """,
+            (message_uuid, message_uuid),
+        )
+        assert cur.fetchone() == (0, 0)
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_delete_epoch),
+        )
+        delete_rows = cur.fetchall()
+
+    assert {str(row[0]) for row in delete_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    assert [row[1]["kind"] for row in delete_rows] == [
+        "message.deleted",
+        "message.deleted",
+    ]
+    assert all(row[1]["uuid"] == message_uuid for row in delete_rows)
+    assert all(row[1]["stream_uuid"] == stream_uuid for row in delete_rows)
+    assert all(row[1]["topic_uuid"] == topic_uuid for row in delete_rows)
 
 
 def test_unbound_user_cannot_send_message(api, db):

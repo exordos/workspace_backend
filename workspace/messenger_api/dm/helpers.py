@@ -199,6 +199,84 @@ def _create_stream_folder_updated_events(project_id, user_uuid, private,
         )
 
 
+def _get_user_stream_folder_event_targets(project_id, user_uuid, stream_uuid,
+                                          private, session=None):
+    targets = []
+    _add_folder_event_target(targets, user_uuid, ALL_CHATS_FOLDER_UUID)
+    _add_folder_event_target(
+        targets,
+        user_uuid,
+        PERSONAL_FOLDER_UUID if private else CHANNELS_FOLDER_UUID,
+    )
+    for item in models.FolderItem.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        session=session,
+    ):
+        _add_folder_event_target(targets, item.user_uuid, item.folder_uuid)
+    return targets
+
+
+def _create_message_unread_updated_events(project_id, user_uuid, stream_uuid,
+                                          topic_uuid, session=None):
+    user_topic = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    messenger_events.create_topic_updated_event(
+        topic=user_topic,
+        session=session,
+    )
+
+    user_stream = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    messenger_events.create_stream_updated_event(
+        stream=user_stream,
+        session=session,
+    )
+
+    folder_targets = _get_user_stream_folder_event_targets(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        private=user_stream.private,
+        session=session,
+    )
+    for target_user_uuid, folder_uuid in folder_targets:
+        user_folder = get_workspace_user_folder(
+            project_id=project_id,
+            user_uuid=target_user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        messenger_events.create_folder_updated_event(
+            folder=user_folder,
+            session=session,
+        )
+
+
+def _create_messages_unread_updated_events(project_id, user_uuids,
+                                           stream_uuid, topic_uuid,
+                                           session=None):
+    for user_uuid in user_uuids:
+        _create_message_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+
+
 def fetch_existing_private_workspace_user_stream(project_id, user_uuid, stream,
                                                  fields, session=None):
     stream.update_dm(values=fields)
@@ -1112,6 +1190,28 @@ def get_workspace_user_message(project_id, user_uuid, message_uuid,
     )
 
 
+def _get_workspace_user_messages(project_id, message_uuid, session=None):
+    return models.WorkspaceUserMessage.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+
+
+def _get_workspace_message_for_author(project_id, user_uuid, message_uuid,
+                                      session=None):
+    return models.WorkspaceMessage.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+
+
 def create_message_flags(project_id, message_uuid, author_uuid, recipients,
                          session=None):
     for recipient_uuid in recipients:
@@ -1147,9 +1247,136 @@ def create_workspace_user_message(project_id, user_uuid, session=None,
         recipients=recipients,
         session=session,
     )
+    unread_user_uuids = [
+        recipient_uuid for recipient_uuid in recipients
+        if recipient_uuid != message.user_uuid
+    ]
+    _create_messages_unread_updated_events(
+        project_id=project_id,
+        user_uuids=unread_user_uuids,
+        stream_uuid=message.stream_uuid,
+        topic_uuid=message.topic_uuid,
+        session=session,
+    )
     return get_workspace_user_message(
         project_id=project_id,
         user_uuid=user_uuid,
         message_uuid=message.uuid,
+        session=session,
+    )
+
+
+def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
+                                  session=None):
+    get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    message = _get_workspace_message_for_author(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    message.update_dm(values={"payload": values["payload"]})
+    message.update(session=session)
+
+    result = None
+    for user_message in _get_workspace_user_messages(
+        project_id=project_id,
+        message_uuid=message_uuid,
+        session=session,
+    ):
+        if user_message.user_uuid == user_uuid:
+            result = user_message
+        messenger_events.create_message_updated_event(
+            message=user_message,
+            session=session,
+        )
+    return result
+
+
+def read_workspace_user_message(project_id, user_uuid, message_uuid,
+                                session=None):
+    current_message = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    flags = models.WorkspaceUserMessageFlags.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    was_read = flags.read
+    flags.update_dm(values={"read": True})
+    flags.update(session=session)
+
+    result = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    messenger_events.create_message_updated_event(
+        message=result,
+        session=session,
+    )
+    if not was_read:
+        _create_message_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=current_message.stream_uuid,
+            topic_uuid=current_message.topic_uuid,
+            session=session,
+        )
+    return result
+
+
+def delete_workspace_user_message(project_id, user_uuid, message_uuid,
+                                  session=None):
+    get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    message = _get_workspace_message_for_author(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    user_messages = _get_workspace_user_messages(
+        project_id=project_id,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    unread_user_uuids = [
+        user_message.user_uuid for user_message in user_messages
+        if not user_message.read
+    ]
+    for user_message in user_messages:
+        messenger_events.create_message_deleted_event(
+            project_id=project_id,
+            user_uuid=user_message.user_uuid,
+            message_uuid=message_uuid,
+            stream_uuid=message.stream_uuid,
+            topic_uuid=message.topic_uuid,
+            session=session,
+        )
+
+    message.delete(session=session)
+    _create_messages_unread_updated_events(
+        project_id=project_id,
+        user_uuids=unread_user_uuids,
+        stream_uuid=message.stream_uuid,
+        topic_uuid=message.topic_uuid,
         session=session,
     )

@@ -31,6 +31,10 @@ class WorkspaceStreamBindingsAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamBindingController
 
 
+class WorkspaceMessageReadAction(routes.Action):
+    __controller__ = controllers.WorkspaceMessageController
+
+
 class WorkspaceStreamArchiveAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamController
 
@@ -102,7 +106,11 @@ class WorkspaceMessageRoute(routes.Route):
         routes.CREATE,
         routes.FILTER,
         routes.GET,
+        routes.UPDATE,
+        routes.DELETE,
     ]
+
+    read = routes.action(WorkspaceMessageReadAction, invoke=True)
 
 
 class WorkspaceEventRoute(routes.Route):

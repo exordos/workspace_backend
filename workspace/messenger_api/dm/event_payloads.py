@@ -40,12 +40,10 @@ class MessageEventTimestampType(types.UTCDateTimeZ):
 MESSAGE_EVENT_TIMESTAMP_TYPE = MessageEventTimestampType()
 
 
-class MessageCreatedEventPayload(
+class MessageEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserMessageBase,
 ):
-    KIND = "message.created"
-
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
         read_only=True,
@@ -55,6 +53,30 @@ class MessageCreatedEventPayload(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
         read_only=True,
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+
+
+class MessageCreatedEventPayload(MessageEventPayloadBase):
+    KIND = "message.created"
+
+
+class MessageUpdatedEventPayload(MessageEventPayloadBase):
+    KIND = "message.updated"
+
+
+class MessageDeletedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    KIND = "message.deleted"
+
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    topic_uuid = properties.property(
+        types.UUID(),
+        required=True,
     )
 
 
@@ -208,6 +230,8 @@ class FolderItemDeletedEventPayload(
 
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
+    types_dynamic.KindModelType(MessageUpdatedEventPayload),
+    types_dynamic.KindModelType(MessageDeletedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
     types_dynamic.KindModelType(StreamCreatedEventPayload),

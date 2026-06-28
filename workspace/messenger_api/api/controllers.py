@@ -298,6 +298,29 @@ class WorkspaceMessageController(
             **values,
         )
 
+    def update(self, uuid, **kwargs):
+        return messenger_dm_helpers.update_workspace_user_message(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            message_uuid=uuid,
+            values=kwargs,
+        )
+
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_user_message(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            message_uuid=uuid,
+        )
+
+    @ra_actions.post
+    def read(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.read_workspace_user_message(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            message_uuid=resource.uuid,
+        )
+
 
 class WorkspaceEventController(
     WorkspaceBaseResourceControllerPaginated,

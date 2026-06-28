@@ -230,6 +230,95 @@ def test_topic_controller_notifications_uses_context_scope():
     )
 
 
+def test_message_controller_update_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageController(request)
+    returned_message = object()
+    payload = {"kind": "markdown", "content": "edited"}
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "update_workspace_user_message",
+        return_value=returned_message,
+    ) as update_message:
+        result = controller.update(message_uuid, payload=payload)
+
+    assert result is returned_message
+    update_message.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        values={"payload": payload},
+    )
+
+
+def test_message_controller_delete_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageController(request)
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "delete_workspace_user_message",
+        return_value=None,
+    ) as delete_message:
+        result = controller.delete(message_uuid)
+
+    assert result is None
+    delete_message.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+    )
+
+
+def test_message_controller_read_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageController(request)
+    resource = types.SimpleNamespace(uuid=message_uuid)
+    returned_message = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "read_workspace_user_message",
+        return_value=returned_message,
+    ) as read_message:
+        result = controllers.WorkspaceMessageController.read._post(
+            self=controller,
+            resource=resource,
+        )
+
+    assert result is returned_message
+    read_message.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+    )
+
+
 def test_stream_controller_hides_private_index():
     resource = controllers.WorkspaceStreamController.__resource__
 
@@ -341,6 +430,11 @@ def test_stream_route_allows_delete():
 
 def test_stream_route_allows_update():
     assert ra_routes.UPDATE in routes.WorkspaceStreamRoute.__allow_methods__
+
+
+def test_message_route_allows_update_and_delete():
+    assert ra_routes.UPDATE in routes.WorkspaceMessageRoute.__allow_methods__
+    assert ra_routes.DELETE in routes.WorkspaceMessageRoute.__allow_methods__
 
 
 def test_stream_controller_archive_uses_context_scope():
@@ -510,6 +604,13 @@ def test_topic_notifications_action_uses_topic_controller_resource():
     assert (
         routes.WorkspaceStreamTopicNotificationsAction.__controller__
         is controllers.WorkspaceStreamTopicController
+    )
+
+
+def test_message_read_action_uses_message_controller_resource():
+    assert (
+        routes.WorkspaceMessageReadAction.__controller__
+        is controllers.WorkspaceMessageController
     )
 
 

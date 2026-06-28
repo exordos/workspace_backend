@@ -25,6 +25,8 @@ from workspace.messenger_api.dm import models
 
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
+MESSAGE_UPDATED_EVENT = event_payloads.MessageUpdatedEventPayload.KIND
+MESSAGE_DELETED_EVENT = event_payloads.MessageDeletedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
 STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
 STREAM_DELETED_EVENT = event_payloads.StreamDeletedEventPayload.KIND
@@ -158,6 +160,20 @@ def _deleted_topic_from_event_payload(event_payload):
     }
 
 
+def _deleted_message_from_event_payload(event_payload):
+    return {
+        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
+        "stream_uuid": _event_payload_value(
+            "stream_uuid",
+            event_payload["stream_uuid"],
+        ),
+        "topic_uuid": _event_payload_value(
+            "topic_uuid",
+            event_payload["topic_uuid"],
+        ),
+    }
+
+
 def _deleted_folder_from_event_payload(event_payload):
     return {
         "uuid": _event_payload_value("uuid", event_payload["uuid"]),
@@ -177,6 +193,20 @@ def event_row_to_messenger_event(row):
             "epoch_version": row["epoch_version"],
             "type": "message",
             "message": _message_from_event_payload(payload),
+        }
+    if payload["kind"] == MESSAGE_UPDATED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "message",
+            "kind": payload["kind"],
+            "message": _message_from_event_payload(payload),
+        }
+    if payload["kind"] == MESSAGE_DELETED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "message",
+            "kind": payload["kind"],
+            "message": _deleted_message_from_event_payload(payload),
         }
     if payload["kind"] in (STREAM_CREATED_EVENT, STREAM_UPDATED_EVENT):
         return {
@@ -314,6 +344,35 @@ def create_message_events(project_id, message, recipients, session=None):
     if len(rows) != len(recipients):
         raise ra_exc.ValidationErrorException()
     return [row["epoch_version"] for row in rows]
+
+
+def create_message_updated_event(message, session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=message.project_id,
+        user_uuid=message.user_uuid,
+        payload=event_payloads.MessageUpdatedEventPayload(
+            **dict(message)
+        ),
+    )
+    return event.insert(session=session)
+
+
+def create_message_deleted_event(project_id, user_uuid, message_uuid,
+                                 stream_uuid, topic_uuid, session=None):
+    event_uuid = sys_uuid.uuid4()
+    event = models.WorkspaceEvent(
+        uuid=event_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        payload=event_payloads.MessageDeletedEventPayload(
+            uuid=message_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+        ),
+    )
+    return event.insert(session=session)
 
 
 def create_folder_event(folder, session=None):
