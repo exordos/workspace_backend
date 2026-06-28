@@ -919,7 +919,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers,
             "create_workspace_stream_binding_events",
-        ) as create_events:
+        ) as create_events, mock.patch.object(
+            dm_helpers,
+            "_create_workspace_stream_binding_message_flags",
+        ) as create_flags:
             result = dm_helpers.get_or_create_workspace_stream_binding(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
@@ -930,6 +933,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         self.assertIs(existing, result)
         create_events.assert_not_called()
+        create_flags.assert_not_called()
         get_all.assert_called_once_with(
             filters={
                 "project_id": mock.ANY,
@@ -973,6 +977,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             "create_workspace_stream_binding_events",
         ) as create_user_events, mock.patch.object(
             dm_helpers,
+            "_create_workspace_stream_binding_message_flags",
+        ) as create_flags, mock.patch.object(
+            dm_helpers,
             "create_workspace_stream_bindings_created_events",
         ) as create_batch_events:
             result = dm_helpers.get_or_create_workspace_stream_bindings(
@@ -1001,9 +1008,78 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ],
         )
         self.assertEqual(2, create_user_events.call_count)
+        create_flags.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    stream_uuid=stream_uuid,
+                    user_uuid=member_uuid,
+                    session=None,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    stream_uuid=stream_uuid,
+                    user_uuid=owner_uuid,
+                    session=None,
+                ),
+            ]
+        )
         create_batch_events.assert_called_once_with(
             bindings=created_bindings,
             session=None,
+        )
+
+    def test_create_workspace_stream_binding_message_flags_inserts_missing(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        session = object()
+        sql_session = types.SimpleNamespace(execute=mock.Mock())
+
+        class SessionContext:
+            def __enter__(self):
+                return sql_session
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        engine = types.SimpleNamespace(
+            session_manager=mock.Mock(return_value=SessionContext())
+        )
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceUserMessageFlags",
+        ) as flags_model:
+            flags_model._get_engine.return_value = engine
+            dm_helpers._create_workspace_stream_binding_message_flags(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        flags_model._get_engine.assert_called_once_with()
+        engine.session_manager.assert_called_once_with(session=session)
+        sql_session.execute.assert_called_once()
+        statement, values = sql_session.execute.call_args.args
+        self.assertIn(
+            'INSERT INTO "m_workspace_user_message_flags"',
+            statement,
+        )
+        self.assertIn('FROM "m_workspace_messages" AS m', statement)
+        self.assertIn(
+            'ON CONFLICT ("uuid", "user_uuid") DO NOTHING',
+            statement,
+        )
+        self.assertEqual(
+            [
+                str(user_uuid),
+                str(user_uuid),
+                str(project_id),
+                str(stream_uuid),
+            ],
+            list(values),
         )
 
     def test_get_or_create_workspace_stream_bindings_rejects_invalid_role(self):

@@ -413,6 +413,32 @@ def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
     )
 
 
+def _create_workspace_stream_binding_message_flags(project_id, stream_uuid,
+                                                   user_uuid, session=None):
+    statement = """
+        INSERT INTO "m_workspace_user_message_flags"
+            ("uuid", "user_uuid", "project_id", "read")
+        SELECT
+            m."uuid",
+            %s::uuid,
+            m."project_id",
+            m."user_uuid" = %s::uuid
+        FROM "m_workspace_messages" AS m
+        WHERE m."project_id" = %s::uuid
+            AND m."stream_uuid" = %s::uuid
+        ON CONFLICT ("uuid", "user_uuid") DO NOTHING;
+    """
+    values = (
+        str(user_uuid),
+        str(user_uuid),
+        str(project_id),
+        str(stream_uuid),
+    )
+    engine = models.WorkspaceUserMessageFlags._get_engine()
+    with engine.session_manager(session=session) as s:
+        s.execute(statement, values)
+
+
 def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
                                             who_uuid, role, session=None):
     for existing in models.WorkspaceStreamBinding.objects.get_all(
@@ -434,6 +460,12 @@ def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
         role=role,
     )
     binding.insert(session=session)
+    _create_workspace_stream_binding_message_flags(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_uuid=user_uuid,
+        session=session,
+    )
     create_workspace_stream_binding_events(binding, session=session)
     return binding, True
 
