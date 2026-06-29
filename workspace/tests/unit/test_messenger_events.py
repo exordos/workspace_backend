@@ -348,6 +348,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "role": "member",
             "notification_mode": "all_messages",
             "unread_count": 0,
+            "color": 1122867,
             "source_name": "native",
             "source": {"kind": "native"},
             "invite_only": False,
@@ -374,6 +375,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "role": "member",
                     "notification_mode": "all_messages",
                     "unread_count": 0,
+                    "color": 1122867,
                     "source_name": "native",
                     "source": {"kind": "native"},
                     "invite_only": False,
@@ -413,6 +415,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "role": "member",
                     "notification_mode": "muted",
                     "unread_count": 0,
+                    "color": 4478310,
                     "source_name": "native",
                     "source": {"kind": "native"},
                     "invite_only": True,
@@ -432,6 +435,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(True, event["stream"]["invite_only"])
         self.assertEqual(True, event["stream"]["is_archived"])
         self.assertEqual("muted", event["stream"]["notification_mode"])
+        self.assertEqual(4478310, event["stream"]["color"])
 
     def test_event_row_to_messenger_event_uses_deleted_stream_id(self):
         stream_uuid = sys_uuid.uuid4()
@@ -467,6 +471,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "updated_at": "2026-06-24T10:00:00.000000Z",
             "name": "Planning",
             "stream_uuid": str(stream_uuid),
+            "color": 1193046,
             "unread_count": 2,
             "is_default": False,
             "is_done": True,
@@ -486,6 +491,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "updated_at": "2026-06-24 10:00:00.000000",
                     "name": "Planning",
                     "stream_uuid": str(stream_uuid),
+                    "color": 1193046,
                     "unread_count": 2,
                     "is_default": False,
                     "is_done": True,
@@ -518,6 +524,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "updated_at": "2026-06-24 10:05:00.000000",
                     "name": "Retros",
                     "stream_uuid": str(stream_uuid),
+                    "color": 6636321,
                     "unread_count": 0,
                     "is_default": False,
                     "is_done": False,
@@ -533,6 +540,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(str(topic_uuid), event["topic"]["uuid"])
         self.assertEqual(str(stream_uuid), event["topic"]["stream_uuid"])
         self.assertEqual("mute", event["topic"]["notification_mode"])
+        self.assertEqual(6636321, event["topic"]["color"])
 
     def test_event_row_to_messenger_event_uses_deleted_topic_id(self):
         topic_uuid = sys_uuid.uuid4()
@@ -816,6 +824,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "role": "owner",
                 "notification_mode": "all_messages",
                 "unread_count": 0,
+                "color": 1122867,
                 "source_name": "native",
                 "source": {"kind": "native"},
                 "invite_only": False,
@@ -881,6 +890,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "updated_at": "2026-06-24T22:28:34.166369",
                 "name": "Planning",
                 "stream_uuid": str(stream_uuid),
+                "color": 1193046,
                 "unread_count": 0,
                 "is_default": False,
                 "is_done": False,
@@ -1194,6 +1204,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             role="member",
             notification_mode="all_messages",
             unread_count=0,
+            color=1122867,
             source_name="native",
             source=models.NativeSource(),
             invite_only=False,
@@ -1231,6 +1242,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.StreamCreatedEventPayload,
         )
         self.assertEqual("Engineering", created_event["payload"].name)
+        self.assertEqual(1122867, created_event["payload"].color)
         self.assertEqual(False, created_event["payload"].is_archived)
         self.assertEqual(
             "all_messages",
@@ -1256,6 +1268,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             role="member",
             notification_mode="muted",
             unread_count=0,
+            color=4478310,
             source_name="native",
             source=models.NativeSource(),
             invite_only=False,
@@ -1293,6 +1306,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.StreamUpdatedEventPayload,
         )
         self.assertEqual("Engineering", created_event["payload"].name)
+        self.assertEqual(4478310, created_event["payload"].color)
         self.assertEqual(True, created_event["payload"].is_archived)
         self.assertEqual("muted", created_event["payload"].notification_mode)
 
@@ -1312,6 +1326,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             updated_at=created_at,
             name="Planning",
             stream_uuid=stream_uuid,
+            color=1193046,
             unread_count=0,
             is_default=False,
             is_done=False,
@@ -1345,6 +1360,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.TopicCreatedEventPayload,
         )
         self.assertEqual("Planning", created_event["payload"].name)
+        self.assertEqual(1193046, created_event["payload"].color)
         self.assertEqual(False, created_event["payload"].is_done)
         self.assertEqual("default", created_event["payload"].notification_mode)
 
@@ -1367,6 +1383,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             updated_at=updated_at,
             name="Retros",
             stream_uuid=stream_uuid,
+            color=6636321,
             unread_count=1,
             is_default=False,
             is_done=True,
@@ -1400,6 +1417,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             event_payloads.TopicUpdatedEventPayload,
         )
         self.assertEqual("Retros", created_event["payload"].name)
+        self.assertEqual(6636321, created_event["payload"].color)
         self.assertEqual(True, created_event["payload"].is_done)
         self.assertEqual("unmute", created_event["payload"].notification_mode)
 

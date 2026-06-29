@@ -123,6 +123,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
         ), mock.patch.object(
+            dm_helpers, "_random_color", return_value=12345
+        ), mock.patch.object(
             dm_helpers, "create_workspace_stream_topic_with_flags"
         ) as create_topic, mock.patch.object(
             dm_helpers, "get_workspace_user_folder", get_user_folder
@@ -148,6 +150,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(user_uuid, created_stream["user_uuid"])
         self.assertEqual("Engineering", created_stream["name"])
         self.assertEqual("native", created_stream["source_name"])
+        self.assertEqual(12345, created_stream["color"])
         self.assertIs(session, created_stream["insert_session"])
         self.assertEqual(project_id, created_binding["project_id"])
         self.assertEqual(stream_uuid, created_binding["stream_uuid"])
@@ -300,6 +303,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
         ), mock.patch.object(
+            dm_helpers, "_random_color", return_value=23456
+        ), mock.patch.object(
             dm_helpers, "create_workspace_stream_topic_with_flags"
         ) as create_topic, mock.patch.object(
             dm_helpers, "get_workspace_user_folder", get_user_folder
@@ -324,6 +329,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(True, created_stream["private"])
         self.assertEqual(direct_user_uuid, created_stream["direct_user_uuid"])
         self.assertEqual(expected_index, created_stream["private_index"])
+        self.assertEqual(23456, created_stream["color"])
         self.assertIs(session, created_stream["insert_session"])
         get_all_streams.assert_called_once_with(
             filters={
@@ -1450,6 +1456,84 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_create_workspace_stream_topic_with_flags_defaults_color(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        session = object()
+        created_topic = {}
+        created_flags = []
+
+        class FakeWorkspaceStreamTopic:
+            def __init__(self, **kwargs):
+                created_topic.update(kwargs)
+                self.uuid = kwargs["uuid"]
+                self.stream_uuid = kwargs["stream_uuid"]
+
+            def insert(self, session=None):
+                created_topic["insert_session"] = session
+
+        class FakeWorkspaceStreamBinding:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(
+                    return_value=[types.SimpleNamespace(user_uuid=user_uuid)]
+                )
+            )
+
+        class FakeWorkspaceUserTopicFlags:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def insert(self, session=None):
+                self.kwargs["insert_session"] = session
+                created_flags.append(self.kwargs)
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamTopic",
+            FakeWorkspaceStreamTopic,
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceUserTopicFlags",
+            FakeWorkspaceUserTopicFlags,
+        ), mock.patch.object(
+            dm_helpers, "_random_color", return_value=445566
+        ):
+            topic = dm_helpers.create_workspace_stream_topic_with_flags(
+                project_id=project_id,
+                uuid=topic_uuid,
+                stream_uuid=stream_uuid,
+                name="Planning",
+                session=session,
+            )
+
+        self.assertEqual(topic_uuid, topic.uuid)
+        self.assertEqual(445566, created_topic["color"])
+        self.assertIs(session, created_topic["insert_session"])
+        FakeWorkspaceStreamBinding.objects.get_all.assert_called_once()
+        filters = FakeWorkspaceStreamBinding.objects.get_all.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual(stream_uuid, filters["stream_uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(
+            [
+                {
+                    "uuid": topic_uuid,
+                    "user_uuid": user_uuid,
+                    "project_id": project_id,
+                    "is_done": False,
+                    "insert_session": session,
+                }
+            ],
+            created_flags,
+        )
+
     def test_create_workspace_user_stream_topic_creates_events_for_users(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -1541,12 +1625,21 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 project_id=project_id,
                 user_uuid=user_uuid,
                 topic_uuid=topic_uuid,
-                values={"name": "Retros"},
+                values={
+                    "name": "Retros",
+                    "color": 11259375,
+                },
                 session=session,
             )
 
         self.assertIs(returned_topic, result)
-        self.assertEqual({"name": "Retros"}, updated_topic["values"])
+        self.assertEqual(
+            {
+                "name": "Retros",
+                "color": 11259375,
+            },
+            updated_topic["values"],
+        )
         self.assertIs(session, updated_topic["update_session"])
         get_topic.assert_called_once_with(
             project_id=project_id,

@@ -15,6 +15,7 @@
 #    under the License.
 
 import enum
+import random
 
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -27,6 +28,11 @@ from workspace.messenger_api.dm import message_payloads
 FOLDER_SYSTEM_TYPE_ALL = "all"
 FOLDER_SYSTEM_TYPE_CREATED = "created"
 FOLDER_SYSTEM_TYPES = (FOLDER_SYSTEM_TYPE_ALL, FOLDER_SYSTEM_TYPE_CREATED)
+COLOR_MAX_VALUE = 0xFFFFFF
+
+
+def random_color():
+    return random.randint(0, COLOR_MAX_VALUE)
 
 
 class UserScopedModelWithUUID(models.ModelWithUUID):
@@ -207,6 +213,10 @@ class WorkspaceStreamBase(
         types.AllowNone(types.String(max_length=73)),
         default=None,
     )
+    color = properties.property(
+        types.Integer(min_value=0, max_value=COLOR_MAX_VALUE),
+        default=random_color,
+    )
 
 
 class WorkspaceUserStreamBase(
@@ -265,4 +275,8 @@ class WorkspaceUserStreamBase(
     private_index = properties.property(
         types.AllowNone(types.String(max_length=73)),
         default=None,
+    )
+    color = properties.property(
+        types.Integer(min_value=0, max_value=COLOR_MAX_VALUE),
+        default=random_color,
     )

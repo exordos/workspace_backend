@@ -561,6 +561,8 @@ def test_stream_create_writes_realtime_event(api, db):
     assert payload["role"] == "owner"
     assert payload["notification_mode"] == "all_messages"
     assert payload["unread_count"] == 0
+    assert 0 <= stream["color"] <= 0xFFFFFF
+    assert payload["color"] == stream["color"]
     assert payload["source_name"] == "native"
     assert payload["source"] == {"kind": "native"}
 
@@ -577,6 +579,7 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["stream"]["name"] == "Engineering"
     assert event["stream"]["role"] == "owner"
     assert event["stream"]["notification_mode"] == "all_messages"
+    assert event["stream"]["color"] == stream["color"]
 
     folder_events = [row[2] for row in rows[1:]]
     assert [payload["kind"] for payload in folder_events] == [
@@ -1181,6 +1184,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     topic = resp.json()
     assert topic["name"] == "planning"
     assert topic["stream_uuid"] == stream_uuid
+    assert 0 <= topic["color"] <= 0xFFFFFF
     assert topic["is_default"] is False
     assert topic["is_done"] is False
     assert topic["notification_mode"] == "default"
@@ -1224,6 +1228,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
         assert payload["uuid"] == topic["uuid"]
         assert payload["name"] == "planning"
         assert payload["stream_uuid"] == stream_uuid
+        assert payload["color"] == topic["color"]
         assert payload["unread_count"] == 0
         assert payload["is_default"] is False
         assert payload["is_done"] is False
@@ -1240,6 +1245,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert event["kind"] == "topic.created"
     assert event["topic"]["uuid"] == topic["uuid"]
     assert event["topic"]["name"] == "planning"
+    assert event["topic"]["color"] == topic["color"]
     assert event["topic"]["notification_mode"] == "default"
 
 
@@ -1255,13 +1261,18 @@ def test_stream_topic_rename(api, db):
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
     )
 
-    resp = api.put(f"{STREAM_TOPICS}{topic_uuid}", json={"name": "retros"})
+    resp = api.put(
+        f"{STREAM_TOPICS}{topic_uuid}",
+        json={"name": "retros", "color": 0xABCDEF},
+    )
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "retros"
+    assert resp.json()["color"] == 0xABCDEF
 
     resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
     assert resp.status_code == 200, resp.text
     assert resp.json()["name"] == "retros"
+    assert resp.json()["color"] == 0xABCDEF
 
     with db.cursor() as cur:
         cur.execute(
@@ -1284,6 +1295,7 @@ def test_stream_topic_rename(api, db):
     for _, payload in event_rows:
         assert payload["name"] == "retros"
         assert payload["stream_uuid"] == stream_uuid
+        assert payload["color"] == 0xABCDEF
 
 
 def test_stream_topic_notifications_follow_stream_mute_rules(api, db):

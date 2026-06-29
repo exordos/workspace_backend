@@ -396,6 +396,10 @@ class WorkspaceStreamTopic(
         types.UUID(),
         required=True,
     )
+    color = properties.property(
+        types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
+        default=base.random_color,
+    )
     default_for_stream_uuid = properties.property(
         types.AllowNone(types.UUID()),
         required=False,
@@ -428,6 +432,10 @@ class WorkspaceUserTopic(
     stream_uuid = properties.property(
         types.UUID(),
         required=True,
+    )
+    color = properties.property(
+        types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
+        default=base.random_color,
     )
     unread_count = properties.property(
         types.Integer(min_value=0),

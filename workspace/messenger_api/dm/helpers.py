@@ -21,6 +21,7 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.messenger_api.dm import models
 
 
@@ -45,6 +46,18 @@ TOPIC_NOTIFICATION_MODES = {
 MUTED_STREAM_TOPIC_NOTIFICATION_MODES = TOPIC_NOTIFICATION_MODES | {
     models.WorkspaceTopicNotificationMode.UNMUTE.value,
 }
+
+
+def _random_color():
+    return messenger_dm_base.random_color()
+
+
+def _ensure_color(values):
+    if (
+        "color" not in values or
+        values["color"] is None
+    ):
+        values["color"] = _random_color()
 
 
 def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
@@ -521,6 +534,7 @@ def get_or_create_workspace_stream_bindings(project_id, stream_uuid, who_uuid,
 def create_workspace_stream_topic_with_flags(project_id, session=None,
                                              **kwargs):
     topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
+    _ensure_color(kwargs)
     topic = models.WorkspaceStreamTopic(
         uuid=topic_uuid,
         project_id=project_id,
@@ -628,7 +642,7 @@ def update_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
         topic_uuid=topic_uuid,
         session=session,
     )
-    topic.update_dm(values={"name": values["name"]})
+    topic.update_dm(values=values)
     topic.update(session=session)
     result = None
     for user_topic in _get_workspace_user_stream_topics(
@@ -835,6 +849,7 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
             session=session,
         )
 
+    _ensure_color(kwargs)
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
@@ -904,6 +919,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
             **kwargs,
         )
 
+    _ensure_color(kwargs)
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,

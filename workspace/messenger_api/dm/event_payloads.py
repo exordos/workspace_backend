@@ -153,6 +153,10 @@ class TopicEventPayloadBase(
         types.UUID(),
         required=True,
     )
+    color = properties.property(
+        types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
+        default=base.random_color,
+    )
     unread_count = properties.property(
         types.Integer(min_value=0),
         default=0,
