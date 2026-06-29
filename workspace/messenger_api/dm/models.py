@@ -437,6 +437,10 @@ class WorkspaceUserTopic(
         types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
         default=base.random_color,
     )
+    last_message_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
     unread_count = properties.property(
         types.Integer(min_value=0),
         default=0,

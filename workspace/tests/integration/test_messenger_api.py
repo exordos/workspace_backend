@@ -561,6 +561,8 @@ def test_stream_create_writes_realtime_event(api, db):
     assert payload["role"] == "owner"
     assert payload["notification_mode"] == "all_messages"
     assert payload["unread_count"] == 0
+    assert stream["last_message_uuid"] is None
+    assert payload["last_message_uuid"] is None
     assert 0 <= stream["color"] <= 0xFFFFFF
     assert payload["color"] == stream["color"]
     assert payload["source_name"] == "native"
@@ -580,6 +582,7 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["stream"]["role"] == "owner"
     assert event["stream"]["notification_mode"] == "all_messages"
     assert event["stream"]["color"] == stream["color"]
+    assert event["stream"]["last_message_uuid"] is None
 
     folder_events = [row[2] for row in rows[1:]]
     assert [payload["kind"] for payload in folder_events] == [
@@ -1185,6 +1188,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert topic["name"] == "planning"
     assert topic["stream_uuid"] == stream_uuid
     assert 0 <= topic["color"] <= 0xFFFFFF
+    assert topic["last_message_uuid"] is None
     assert topic["is_default"] is False
     assert topic["is_done"] is False
     assert topic["notification_mode"] == "default"
@@ -1229,6 +1233,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
         assert payload["name"] == "planning"
         assert payload["stream_uuid"] == stream_uuid
         assert payload["color"] == topic["color"]
+        assert payload["last_message_uuid"] is None
         assert payload["unread_count"] == 0
         assert payload["is_default"] is False
         assert payload["is_done"] is False
@@ -1246,6 +1251,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert event["topic"]["uuid"] == topic["uuid"]
     assert event["topic"]["name"] == "planning"
     assert event["topic"]["color"] == topic["color"]
+    assert event["topic"]["last_message_uuid"] is None
     assert event["topic"]["notification_mode"] == "default"
 
 
@@ -1578,6 +1584,30 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     with db.cursor() as cur:
         cur.execute(
             """
+            SELECT last_message_uuid
+            FROM m_workspace_user_streams
+            WHERE project_id = %s
+                AND uuid = %s
+                AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, api.user_uuid),
+        )
+        assert str(cur.fetchone()[0]) == message_uuid
+        cur.execute(
+            """
+            SELECT last_message_uuid
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s
+                AND uuid = %s
+                AND user_uuid = %s
+            """,
+            (api.project_id, topic_uuid, api.user_uuid),
+        )
+        assert str(cur.fetchone()[0]) == message_uuid
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
             SELECT user_uuid, payload
             FROM m_workspace_events
             WHERE project_id = %s
@@ -1676,6 +1706,8 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert other_event["payload"]["project_id"] == str(api.project_id)
     assert other_event["payload"]["read"] is False
     assert other_event["payload"]["is_own"] is False
+    assert other_events[1]["payload"]["last_message_uuid"] == message_uuid
+    assert other_events[2]["payload"]["last_message_uuid"] == message_uuid
 
     outsider_events = api.get(
         EVENTS,
@@ -1858,6 +1890,22 @@ def test_message_update_read_delete_write_realtime_events(api, db):
             (message_uuid, message_uuid),
         )
         assert cur.fetchone() == (0, 0)
+        cur.execute(
+            """
+            SELECT s.last_message_uuid, t.last_message_uuid
+            FROM m_workspace_user_streams AS s
+            JOIN m_workspace_user_topics_view AS t
+                ON t.stream_uuid = s.uuid
+                AND t.project_id = s.project_id
+                AND t.user_uuid = s.user_uuid
+            WHERE s.project_id = %s
+                AND s.uuid = %s
+                AND t.uuid = %s
+                AND s.user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, topic_uuid, api.user_uuid),
+        )
+        assert cur.fetchone() == (None, None)
         cur.execute(
             """
             SELECT user_uuid, payload
