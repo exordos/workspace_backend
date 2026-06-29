@@ -2022,14 +2022,20 @@ def test_unbound_user_cannot_send_message(api, db):
         assert cur.fetchone()[0] == 0
 
 
-def test_message_create_requires_topic(api, db):
+def test_message_create_uses_stream_default_topic(api, db):
     stream_uuid = conftest.seed_user_stream(
-        db, api.project_id, api.user_uuid, "topic-required-team"
+        db, api.project_id, api.user_uuid, "default-topic-team"
     )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+    message_uuid = str(sys_uuid.uuid4())
 
     resp = api.post(
         MESSAGES,
         json={
+            "uuid": message_uuid,
             "stream_uuid": stream_uuid,
             "payload": {
                 "kind": "markdown",
@@ -2037,7 +2043,33 @@ def test_message_create_requires_topic(api, db):
             },
         },
     )
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["topic_uuid"] == topic_uuid
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT topic_uuid
+            FROM m_workspace_messages
+            WHERE uuid = %s
+            """,
+            (message_uuid,),
+        )
+        stored_topic_uuid = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'message.created'
+                AND payload->>'uuid' = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        event_payload = cur.fetchone()[0]
+
+    assert str(stored_topic_uuid) == topic_uuid
+    assert event_payload["topic_uuid"] == topic_uuid
 
 
 def test_message_helper_writes_visible_event(api, db):

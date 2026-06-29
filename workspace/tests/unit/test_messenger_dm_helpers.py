@@ -1950,6 +1950,108 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_create_workspace_user_message_uses_stream_default_topic(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+        returned_message = object()
+        created_message = {}
+        created_flags = []
+        get_default_topic = mock.Mock(
+            return_value=types.SimpleNamespace(uuid=topic_uuid)
+        )
+
+        class FakeWorkspaceMessage:
+            def __init__(self, **kwargs):
+                created_message.update(kwargs)
+                self.uuid = kwargs["uuid"]
+                self.project_id = kwargs["project_id"]
+                self.user_uuid = kwargs["user_uuid"]
+                self.stream_uuid = kwargs["stream_uuid"]
+                self.topic_uuid = kwargs["topic_uuid"]
+
+            def insert(self, session=None):
+                created_message["insert_session"] = session
+
+            def get_recipients(self, session=None):
+                created_message["recipients_session"] = session
+                return [user_uuid]
+
+        class FakeWorkspaceStreamTopic:
+            objects = types.SimpleNamespace(get_one=get_default_topic)
+
+        class FakeWorkspaceUserMessageFlags:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def insert(self, session=None):
+                self.kwargs["insert_session"] = session
+                created_flags.append(self.kwargs)
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceMessage", FakeWorkspaceMessage
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceStreamTopic", FakeWorkspaceStreamTopic
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceUserMessageFlags",
+            FakeWorkspaceUserMessageFlags,
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_message_events"
+        ) as create_message_events, mock.patch.object(
+            dm_helpers, "_create_messages_unread_updated_events"
+        ) as create_unread_events, mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_message",
+            return_value=returned_message,
+        ) as get_user_message:
+            result = dm_helpers.create_workspace_user_message(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=message_uuid,
+                stream_uuid=stream_uuid,
+                topic_uuid=None,
+                payload={"kind": "markdown", "content": "hello"},
+                session=session,
+            )
+
+        self.assertIs(returned_message, result)
+        self.assertEqual(topic_uuid, created_message["topic_uuid"])
+        self.assertIs(session, created_message["insert_session"])
+        filters = get_default_topic.call_args.kwargs["filters"]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(stream_uuid, filters["stream_uuid"].value)
+        self.assertEqual(stream_uuid, filters["default_for_stream_uuid"].value)
+        self.assertEqual(
+            [
+                {
+                    "uuid": message_uuid,
+                    "user_uuid": user_uuid,
+                    "project_id": project_id,
+                    "read": True,
+                    "insert_session": session,
+                },
+            ],
+            created_flags,
+        )
+        create_message_events.assert_called_once()
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuids=[],
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        get_user_message.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=session,
+        )
+
     def test_update_workspace_user_message_updates_payload_and_sends_events(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

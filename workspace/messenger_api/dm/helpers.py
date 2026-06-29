@@ -1289,6 +1289,17 @@ def get_workspace_user_message(project_id, user_uuid, message_uuid,
     )
 
 
+def _get_workspace_stream_default_topic(project_id, stream_uuid, session=None):
+    return models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+            "default_for_stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        session=session,
+    )
+
+
 def _get_unread_workspace_user_messages(project_id, user_uuid,
                                         stream_uuid=None, topic_uuid=None,
                                         created_at=None, session=None):
@@ -1376,6 +1387,14 @@ def _read_workspace_user_messages(project_id, user_uuid, messages,
 
 def create_workspace_user_message(project_id, user_uuid, session=None,
                                   **kwargs):
+    if "topic_uuid" not in kwargs or kwargs["topic_uuid"] is None:
+        topic = _get_workspace_stream_default_topic(
+            project_id=project_id,
+            stream_uuid=kwargs["stream_uuid"],
+            session=session,
+        )
+        kwargs["topic_uuid"] = topic.uuid
+
     message = models.WorkspaceMessage(
         uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
         project_id=project_id,
