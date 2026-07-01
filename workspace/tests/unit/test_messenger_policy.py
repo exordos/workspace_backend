@@ -14,6 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import hashlib
+import io
 import types
 import uuid as sys_uuid
 from unittest import mock
@@ -750,3 +752,159 @@ def test_message_read_action_uses_message_controller_resource():
 
 def test_stream_binding_route_does_not_allow_create():
     assert ra_routes.CREATE not in routes.WorkspaceStreamBindingRoute.__allow_methods__
+
+
+def test_file_route_registered_and_allows_crud():
+    assert routes.ApiEndpointRoute.files is routes.WorkspaceFileRoute
+    assert ra_routes.CREATE in routes.WorkspaceFileRoute.__allow_methods__
+    assert ra_routes.FILTER in routes.WorkspaceFileRoute.__allow_methods__
+    assert ra_routes.GET in routes.WorkspaceFileRoute.__allow_methods__
+    assert ra_routes.UPDATE in routes.WorkspaceFileRoute.__allow_methods__
+    assert ra_routes.DELETE in routes.WorkspaceFileRoute.__allow_methods__
+    assert routes.WorkspaceFileDownloadAction.__controller__ is controllers.WorkspaceFileController
+    assert not routes.WorkspaceFileDownloadAction.is_invoke()
+
+
+def test_file_controller_create_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceFileController(request)
+    returned_file = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "create_workspace_file",
+        return_value=returned_file,
+    ) as create_file:
+        result = controller.create(
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            stream_uuid=stream_uuid,
+            name="example.txt",
+            description="Example",
+            content_type="text/plain",
+            size_bytes=12,
+            hash="abc",
+        )
+
+    assert result is returned_file
+    create_kwargs = create_file.call_args.kwargs
+    assert create_kwargs["project_id"] == project_id
+    assert create_kwargs["user_uuid"] == user_uuid
+    assert create_kwargs["stream_uuid"] == stream_uuid
+    assert create_kwargs["name"] == "example.txt"
+    assert create_kwargs["hash"] == "abc"
+
+
+def test_file_controller_autofilters_use_accesses():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    file_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceFileController(request)
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "get_workspace_user_file_uuids",
+        return_value=file_uuids,
+    ) as get_file_uuids:
+        filters = controller.get_autofilters()
+
+    get_file_uuids.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+    )
+    assert filters["project_id"].value == project_id
+    assert filters["uuid"].value == file_uuids
+
+
+def test_file_controller_create_from_multipart_builds_file_metadata():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceFileController(request)
+    data = b"example data"
+    file_part = types.SimpleNamespace(
+        file=io.BytesIO(data),
+        filename="example.txt",
+        type="text/plain",
+    )
+    parts = {
+        "file": file_part,
+        "stream_uuid": types.SimpleNamespace(value=str(stream_uuid)),
+    }
+    returned_file = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "create_workspace_file",
+        return_value=returned_file,
+    ) as create_file, mock.patch.object(
+        controllers.file_storage, "save_workspace_file"
+    ) as save_file:
+        result = controller.create(multipart=True, parts=parts)
+
+    assert result is returned_file
+    create_kwargs = create_file.call_args.kwargs
+    assert create_kwargs["project_id"] == project_id
+    assert create_kwargs["user_uuid"] == user_uuid
+    assert create_kwargs["stream_uuid"] == stream_uuid
+    assert create_kwargs["name"] == "example.txt"
+    save_file.assert_called_once_with(
+        file_uuid=create_kwargs["uuid"],
+        data=data,
+    )
+    assert create_kwargs["content_type"] == "text/plain"
+    assert create_kwargs["size_bytes"] == len(data)
+    assert create_kwargs["hash"] == hashlib.sha256(data).hexdigest()
+
+
+def test_file_controller_download_returns_file_response():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceFileController(request)
+    resource = types.SimpleNamespace(
+        uuid=file_uuid,
+        name='example "file".txt',
+        content_type="text/plain",
+    )
+    data = b"example data"
+
+    with mock.patch.object(
+        controllers.file_storage,
+        "read_workspace_file",
+        return_value=data,
+    ) as read_file:
+        response = controller._download_file_response(resource)
+
+    read_file.assert_called_once_with(file_uuid=file_uuid)
+    assert response.status_int == 200
+    assert response.body == data
+    assert response.content_type == "text/plain"
+    content_disposition = response.headers["Content-Disposition"]
+    assert 'filename="example \\"file\\".txt"' in content_disposition

@@ -14,16 +14,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import hashlib
+import urllib.parse
 import uuid as sys_uuid
 
+import webob
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
+from restalchemy.openapi import constants as oa_c
+from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import models
@@ -183,6 +189,166 @@ class FolderItemController(
             user_uuid=self._get_user_uuid(),
             item_uuid=resource.uuid,
         )
+
+
+class WorkspaceFileController(
+    WorkspaceBaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceFile,
+        hidden_fields=["project_id"],
+        convert_underscore=False,
+        process_filters=True,
+    )
+
+    @staticmethod
+    def _get_multipart_value(part):
+        return getattr(part, "value", part)
+
+    @classmethod
+    def _get_optional_multipart_value(cls, parts, name, default=None):
+        part = parts.get(name)
+        if part is None:
+            return default
+        return cls._get_multipart_value(part)
+
+    @staticmethod
+    def _get_content_disposition(file):
+        quoted_name = file.name.replace("\\", "\\\\").replace('"', '\\"')
+        encoded_name = urllib.parse.quote(file.name)
+        return (
+            f'attachment; filename="{quoted_name}"; '
+            f"filename*=UTF-8''{encoded_name}"
+        )
+
+    def process_result(self, result, *args, **kwargs):
+        if isinstance(result, webob.Response):
+            return result
+        return super().process_result(result, *args, **kwargs)
+
+    def get_autofilters(self):
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+        file_uuids = messenger_dm_helpers.get_workspace_user_file_uuids(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+        return {
+            "project_id": dm_filters.EQ(project_id),
+            "uuid": dm_filters.In(file_uuids),
+        }
+
+    def _apply_autofilters(self, filters):
+        filter_parts = [filters, self.get_autofilters()]
+        filter_parts.extend(getattr(self, "_conditional_filters", []))
+        return dm_filters.AND(*filter_parts)
+
+    def _create_from_multipart(self, parts):
+        file_part = parts["file"]
+        stream_uuid_part = parts["stream_uuid"]
+        stream_uuid = sys_uuid.UUID(
+            self._get_multipart_value(stream_uuid_part),
+        )
+
+        file_part.file.seek(0)
+        data = file_part.file.read()
+        file_part.file.seek(0)
+
+        file_uuid = sys_uuid.uuid4()
+        file_storage.save_workspace_file(file_uuid=file_uuid, data=data)
+        try:
+            return messenger_dm_helpers.create_workspace_file(
+                project_id=self._get_project_id(),
+                user_uuid=self._get_user_uuid(),
+                uuid=file_uuid,
+                stream_uuid=stream_uuid,
+                name=self._get_optional_multipart_value(
+                    parts,
+                    "name",
+                    file_part.filename,
+                ),
+                description=self._get_optional_multipart_value(
+                    parts,
+                    "description",
+                    "",
+                ),
+                content_type=file_part.type,
+                size_bytes=len(data),
+                hash=hashlib.sha256(data).hexdigest(),
+            )
+        except Exception:
+            file_storage.delete_workspace_file(file_uuid=file_uuid)
+            raise
+
+    def create(self, **kwargs):
+        if kwargs.pop("multipart", False):
+            parts = kwargs["parts"]
+            return self._create_from_multipart(parts)
+
+        values = self._apply_autovalues(kwargs)
+        return messenger_dm_helpers.create_workspace_file(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
+            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            **values,
+        )
+
+    def update(self, uuid, **kwargs):
+        values = kwargs.copy()
+        values.pop("project_id", None)
+        values.pop("user_uuid", None)
+        return messenger_dm_helpers.update_workspace_file(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            file_uuid=uuid,
+            values=values,
+        )
+
+    def delete(self, uuid):
+        result = messenger_dm_helpers.delete_workspace_file(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            file_uuid=uuid,
+        )
+        file_storage.delete_workspace_file(file_uuid=uuid)
+        return result
+
+    def _download_file_response(self, resource):
+        data = file_storage.read_workspace_file(file_uuid=resource.uuid)
+        return webob.Response(
+            body=data,
+            status=200,
+            headers={
+                "Content-Type": resource.content_type,
+                "Content-Disposition": self._get_content_disposition(resource),
+            },
+        )
+
+    @ra_actions.get
+    def download(self, resource, *args, **kwargs):
+        return self._download_file_response(resource)
+
+
+WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
+    summary="Upload file",
+    parameters=(),
+    responses=oa_c.build_openapi_create_response("WorkspaceFile_Create"),
+    request_body=oa_c.build_openapi_req_body_multipart(
+        description="Upload workspace file",
+        properties={
+            "file": {"format": "binary", "type": "string"},
+            "stream_uuid": {"format": "uuid", "type": "string"},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+        },
+    ),
+)
+
+WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
+    summary="Download file",
+    parameters=(),
+    responses=oa_c.build_openapi_response_octet_stream("Download file"),
+)
 
 
 class WorkspaceStreamController(

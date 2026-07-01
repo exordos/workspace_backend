@@ -226,6 +226,55 @@ class WorkspaceUser(
     )
 
 
+class WorkspaceFile(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithRequiredNameDesc,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_files"
+
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    content_type = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+    size_bytes = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    hash = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+
+
+class WorkspaceFileAccess(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_file_accesses"
+
+    file_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+
+
 class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_streams"
 

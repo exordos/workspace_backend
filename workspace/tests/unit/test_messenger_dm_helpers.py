@@ -849,6 +849,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             "create_stream_deleted_event",
             side_effect=create_stream_deleted_event,
         ) as create_stream_deleted, mock.patch.object(
+            dm_helpers,
+            "_delete_workspace_stream_binding_file_accesses",
+            side_effect=lambda **kwargs: order.append(
+                ("file_accesses.deleted", kwargs)
+            ),
+        ) as delete_file_accesses, mock.patch.object(
             dm_helpers.messenger_events,
             "create_folder_updated_event",
             side_effect=create_folder_updated_event,
@@ -879,6 +885,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             private=False,
             session=session,
         )
+        delete_file_accesses.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=user_uuid,
+            session=session,
+        )
         create_stream_deleted.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
@@ -896,6 +908,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(
             [
                 "stream.deleted",
+                "file_accesses.deleted",
                 "delete",
                 "folder.updated",
                 "folder.updated",
@@ -928,7 +941,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ) as create_events, mock.patch.object(
             dm_helpers,
             "_create_workspace_stream_binding_message_flags",
-        ) as create_flags:
+        ) as create_flags, mock.patch.object(
+            dm_helpers,
+            "_create_workspace_stream_binding_file_accesses",
+        ) as create_file_accesses:
             result = dm_helpers.get_or_create_workspace_stream_binding(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
@@ -940,6 +956,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertIs(existing, result)
         create_events.assert_not_called()
         create_flags.assert_not_called()
+        create_file_accesses.assert_not_called()
         get_all.assert_called_once_with(
             filters={
                 "project_id": mock.ANY,
@@ -986,6 +1003,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             "_create_workspace_stream_binding_message_flags",
         ) as create_flags, mock.patch.object(
             dm_helpers,
+            "_create_workspace_stream_binding_file_accesses",
+        ) as create_file_accesses, mock.patch.object(
+            dm_helpers,
             "create_workspace_stream_bindings_created_events",
         ) as create_batch_events:
             result = dm_helpers.get_or_create_workspace_stream_bindings(
@@ -1015,6 +1035,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(2, create_user_events.call_count)
         create_flags.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    stream_uuid=stream_uuid,
+                    user_uuid=member_uuid,
+                    session=None,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    stream_uuid=stream_uuid,
+                    user_uuid=owner_uuid,
+                    session=None,
+                ),
+            ]
+        )
+        create_file_accesses.assert_has_calls(
             [
                 mock.call(
                     project_id=project_id,
@@ -3232,6 +3268,311 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             folder_uuid=folder_uuid,
             session=session,
         )
+
+    def test_create_workspace_file_creates_stream_accesses(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        other_user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        file_uuid = sys_uuid.uuid4()
+        session = object()
+        created_file = {}
+
+        class FakeWorkspaceFile:
+            def __init__(self, **kwargs):
+                created_file.update(kwargs)
+                self.uuid = kwargs["uuid"]
+
+            def insert(self, session=None):
+                created_file["insert_session"] = session
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile
+        ), mock.patch.object(
+            dm_helpers.models,
+            "get_stream_recipients",
+            return_value=[user_uuid, other_user_uuid],
+        ) as get_recipients, mock.patch.object(
+            dm_helpers, "get_or_create_workspace_file_access"
+        ) as get_access:
+            result = dm_helpers.create_workspace_file(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=file_uuid,
+                stream_uuid=stream_uuid,
+                name="example.txt",
+                description="Example",
+                content_type="text/plain",
+                size_bytes=12,
+                hash="abc",
+                session=session,
+            )
+
+        self.assertEqual(file_uuid, result.uuid)
+        self.assertEqual(project_id, created_file["project_id"])
+        self.assertEqual(user_uuid, created_file["user_uuid"])
+        self.assertEqual(stream_uuid, created_file["stream_uuid"])
+        self.assertEqual("example.txt", created_file["name"])
+        self.assertEqual("abc", created_file["hash"])
+        self.assertIs(session, created_file["insert_session"])
+        get_recipients.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        get_access.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    file_uuid=file_uuid,
+                    user_uuid=user_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    file_uuid=file_uuid,
+                    user_uuid=other_user_uuid,
+                    session=session,
+                ),
+            ]
+        )
+        self.assertEqual(2, get_access.call_count)
+
+    def test_create_workspace_stream_binding_file_accesses_grants_stream_files(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        first_file_uuid = sys_uuid.uuid4()
+        second_file_uuid = sys_uuid.uuid4()
+        session = object()
+        files = [
+            types.SimpleNamespace(uuid=first_file_uuid),
+            types.SimpleNamespace(uuid=second_file_uuid),
+        ]
+
+        with mock.patch.object(
+            dm_helpers,
+            "_get_workspace_stream_files",
+            return_value=files,
+        ) as get_files, mock.patch.object(
+            dm_helpers, "get_or_create_workspace_file_access"
+        ) as get_access:
+            dm_helpers._create_workspace_stream_binding_file_accesses(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        get_files.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        get_access.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    file_uuid=first_file_uuid,
+                    user_uuid=user_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    file_uuid=second_file_uuid,
+                    user_uuid=user_uuid,
+                    session=session,
+                ),
+            ]
+        )
+        self.assertEqual(2, get_access.call_count)
+
+    def test_delete_workspace_stream_binding_file_accesses_removes_stream_files(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        first_file_uuid = sys_uuid.uuid4()
+        second_file_uuid = sys_uuid.uuid4()
+        session = object()
+        files = [
+            types.SimpleNamespace(uuid=first_file_uuid),
+            types.SimpleNamespace(uuid=second_file_uuid),
+        ]
+        existing_access = mock.Mock()
+        get_one_or_none = mock.Mock(side_effect=[existing_access, None])
+
+        class FakeWorkspaceFileAccess:
+            objects = types.SimpleNamespace(get_one_or_none=get_one_or_none)
+
+        with mock.patch.object(
+            dm_helpers,
+            "_get_workspace_stream_files",
+            return_value=files,
+        ) as get_files, mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceFileAccess",
+            FakeWorkspaceFileAccess,
+        ):
+            dm_helpers._delete_workspace_stream_binding_file_accesses(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        get_files.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        self.assertEqual(2, get_one_or_none.call_count)
+        first_filters = get_one_or_none.call_args_list[0].kwargs["filters"]
+        second_filters = get_one_or_none.call_args_list[1].kwargs["filters"]
+        self.assertEqual(project_id, first_filters["project_id"].value)
+        self.assertEqual(first_file_uuid, first_filters["file_uuid"].value)
+        self.assertEqual(user_uuid, first_filters["user_uuid"].value)
+        self.assertEqual(project_id, second_filters["project_id"].value)
+        self.assertEqual(second_file_uuid, second_filters["file_uuid"].value)
+        self.assertEqual(user_uuid, second_filters["user_uuid"].value)
+        existing_access.delete.assert_called_once_with(session=session)
+
+    def test_get_or_create_workspace_file_access_returns_existing(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        file_uuid = sys_uuid.uuid4()
+        session = object()
+        existing_access = object()
+        get_one_or_none = mock.Mock(return_value=existing_access)
+
+        class FakeWorkspaceFileAccess:
+            objects = types.SimpleNamespace(get_one_or_none=get_one_or_none)
+
+            def __init__(self, **kwargs):
+                raise AssertionError("access already exists")
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceFileAccess", FakeWorkspaceFileAccess
+        ):
+            result = dm_helpers.get_or_create_workspace_file_access(
+                project_id=project_id,
+                file_uuid=file_uuid,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        self.assertIs(existing_access, result)
+        get_one_or_none.assert_called_once()
+        filters = get_one_or_none.call_args.kwargs["filters"]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(file_uuid, filters["file_uuid"].value)
+        self.assertEqual(user_uuid, filters["user_uuid"].value)
+        self.assertIs(session, get_one_or_none.call_args.kwargs["session"])
+
+    def test_get_or_create_workspace_file_access_creates_missing(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        file_uuid = sys_uuid.uuid4()
+        session = object()
+        get_one_or_none = mock.Mock(return_value=None)
+        created_access = {}
+
+        class FakeWorkspaceFileAccess:
+            objects = types.SimpleNamespace(get_one_or_none=get_one_or_none)
+
+            def __init__(self, **kwargs):
+                created_access.update(kwargs)
+
+            def insert(self, session=None):
+                created_access["insert_session"] = session
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceFileAccess", FakeWorkspaceFileAccess
+        ):
+            result = dm_helpers.get_or_create_workspace_file_access(
+                project_id=project_id,
+                file_uuid=file_uuid,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        self.assertIsInstance(result, FakeWorkspaceFileAccess)
+        self.assertEqual(project_id, created_access["project_id"])
+        self.assertEqual(file_uuid, created_access["file_uuid"])
+        self.assertEqual(user_uuid, created_access["user_uuid"])
+        self.assertIs(session, created_access["insert_session"])
+
+    def test_update_workspace_file_updates_owned_file(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        file_uuid = sys_uuid.uuid4()
+        session = object()
+        updated_file = {}
+
+        class ExistingFile:
+            def update_dm(self, values):
+                updated_file["values"] = values
+
+            def update(self, session=None):
+                updated_file["update_session"] = session
+
+        existing_file = ExistingFile()
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_owned_file",
+            return_value=existing_file,
+        ) as get_file:
+            result = dm_helpers.update_workspace_file(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                file_uuid=file_uuid,
+                values={"name": "renamed.txt"},
+                session=session,
+            )
+
+        self.assertIs(existing_file, result)
+        get_file.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            file_uuid=file_uuid,
+            session=session,
+        )
+        self.assertEqual({"name": "renamed.txt"}, updated_file["values"])
+        self.assertIs(session, updated_file["update_session"])
+
+    def test_delete_workspace_file_deletes_owned_file(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        file_uuid = sys_uuid.uuid4()
+        session = object()
+        deleted_file = {}
+
+        class ExistingFile:
+            def delete(self, session=None):
+                deleted_file["delete_session"] = session
+
+        existing_file = ExistingFile()
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_owned_file",
+            return_value=existing_file,
+        ) as get_file:
+            result = dm_helpers.delete_workspace_file(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                file_uuid=file_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        get_file.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            file_uuid=file_uuid,
+            session=session,
+        )
+        self.assertIs(session, deleted_file["delete_session"])
 
 
 if __name__ == "__main__":

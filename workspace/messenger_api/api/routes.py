@@ -55,6 +55,10 @@ class WorkspaceStreamReadAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamController
 
 
+class WorkspaceFileDownloadAction(routes.Action):
+    __controller__ = controllers.WorkspaceFileController
+
+
 class FolderItemRoute(routes.Route):
     __controller__ = controllers.FolderItemController
     __allow_methods__ = [
@@ -66,6 +70,19 @@ class FolderItemRoute(routes.Route):
 
     pin = routes.action(FolderItemPinAction, invoke=True)
     unpin = routes.action(FolderItemUnpinAction, invoke=True)
+
+
+class WorkspaceFileRoute(routes.Route):
+    __controller__ = controllers.WorkspaceFileController
+    __allow_methods__ = [
+        routes.CREATE,
+        routes.FILTER,
+        routes.GET,
+        routes.UPDATE,
+        routes.DELETE,
+    ]
+
+    download = routes.action(WorkspaceFileDownloadAction)
 
 
 class FolderRoute(routes.Route):
@@ -194,6 +211,7 @@ class ApiEndpointRoute(routes.Route):
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
     stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
+    files = routes.route(WorkspaceFileRoute)
     events = routes.route(WorkspaceEventRoute)
     epoch = routes.route(WorkspaceEpochRoute)
     users = routes.route(WorkspaceUserRoute)

@@ -147,6 +147,166 @@ def get_workspace_user_stream(project_id, user_uuid, stream_uuid,
     )
 
 
+def get_workspace_file(project_id, file_uuid, session=None):
+    return models.WorkspaceFile.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(file_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+
+
+def get_workspace_user_file(project_id, user_uuid, file_uuid, session=None):
+    models.WorkspaceFileAccess.objects.get_one(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "file_uuid": dm_filters.EQ(file_uuid),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    return get_workspace_file(
+        project_id=project_id,
+        file_uuid=file_uuid,
+        session=session,
+    )
+
+
+def get_workspace_owned_file(project_id, user_uuid, file_uuid, session=None):
+    return models.WorkspaceFile.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(file_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+
+
+def get_workspace_user_file_uuids(project_id, user_uuid, session=None):
+    accesses = models.WorkspaceFileAccess.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    return [access.file_uuid for access in accesses]
+
+
+def get_or_create_workspace_file_access(project_id, file_uuid, user_uuid,
+                                        session=None):
+    access = models.WorkspaceFileAccess.objects.get_one_or_none(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "file_uuid": dm_filters.EQ(file_uuid),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    if access is not None:
+        return access
+
+    access = models.WorkspaceFileAccess(
+        project_id=project_id,
+        file_uuid=file_uuid,
+        user_uuid=user_uuid,
+    )
+    access.insert(session=session)
+    return access
+
+
+def _get_workspace_stream_files(project_id, stream_uuid, session=None):
+    return models.WorkspaceFile.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        session=session,
+    )
+
+
+def _create_workspace_stream_binding_file_accesses(project_id, stream_uuid,
+                                                    user_uuid, session=None):
+    for file in _get_workspace_stream_files(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        session=session,
+    ):
+        get_or_create_workspace_file_access(
+            project_id=project_id,
+            file_uuid=file.uuid,
+            user_uuid=user_uuid,
+            session=session,
+        )
+
+
+def _delete_workspace_stream_binding_file_accesses(project_id, stream_uuid,
+                                                    user_uuid, session=None):
+    for file in _get_workspace_stream_files(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        session=session,
+    ):
+        access = models.WorkspaceFileAccess.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "file_uuid": dm_filters.EQ(file.uuid),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+            session=session,
+        )
+        if access is not None:
+            access.delete(session=session)
+
+
+def create_workspace_file(project_id, user_uuid, uuid, session=None, **values):
+    file = models.WorkspaceFile(
+        uuid=uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        **values,
+    )
+    file.insert(session=session)
+    stream_user_uuids = models.get_stream_recipients(
+        project_id=project_id,
+        stream_uuid=values["stream_uuid"],
+        session=session,
+    )
+    for stream_user_uuid in stream_user_uuids:
+        get_or_create_workspace_file_access(
+            project_id=project_id,
+            file_uuid=file.uuid,
+            user_uuid=stream_user_uuid,
+            session=session,
+        )
+    return file
+
+
+def update_workspace_file(project_id, user_uuid, file_uuid, values,
+                          session=None):
+    file = get_workspace_owned_file(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        file_uuid=file_uuid,
+        session=session,
+    )
+    file.update_dm(values=values)
+    file.update(session=session)
+    return file
+
+
+def delete_workspace_file(project_id, user_uuid, file_uuid, session=None):
+    file = get_workspace_owned_file(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        file_uuid=file_uuid,
+        session=session,
+    )
+    file.delete(session=session)
+
+
 def build_private_stream_index(user_uuid, direct_user_uuid):
     if user_uuid == direct_user_uuid:
         raise messenger_exc.DirectStreamSelfChatError()
@@ -417,6 +577,12 @@ def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
         stream_uuid=binding.stream_uuid,
         session=session,
     )
+    _delete_workspace_stream_binding_file_accesses(
+        project_id=project_id,
+        stream_uuid=binding.stream_uuid,
+        user_uuid=binding.user_uuid,
+        session=session,
+    )
     binding.delete(session=session)
 
     _create_available_folder_updated_events(
@@ -474,6 +640,12 @@ def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
     )
     binding.insert(session=session)
     _create_workspace_stream_binding_message_flags(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        user_uuid=user_uuid,
+        session=session,
+    )
+    _create_workspace_stream_binding_file_accesses(
         project_id=project_id,
         stream_uuid=stream_uuid,
         user_uuid=user_uuid,

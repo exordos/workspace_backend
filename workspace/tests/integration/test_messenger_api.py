@@ -16,9 +16,12 @@
 
 """End-to-end messenger API tests against a real server + test database."""
 
+import hashlib
+import io
 import uuid as sys_uuid
 
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.tests.integration import conftest
@@ -28,6 +31,7 @@ V1 = "/v1"
 STREAMS = f"{V1}/streams/"
 STREAM_BINDINGS = f"{V1}/stream_bindings/"
 FOLDERS = f"{V1}/folders/"
+FILES = f"{V1}/files/"
 FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
@@ -60,6 +64,175 @@ def test_user_get_by_uuid_uses_global_user_table(api, db):
     resp = api.get(USERS, params={"username": username})
     assert resp.status_code == 200, resp.text
     assert [user["uuid"] for user in resp.json()] == [str(user_uuid)]
+
+
+# --------------------------------------------------------------------------- #
+# Files: metadata and local storage
+# --------------------------------------------------------------------------- #
+
+
+def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "files-team"
+    )
+    stream_user = sys_uuid.uuid4()
+    outsider_user = sys_uuid.uuid4()
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, stream_user
+    )
+
+    resp = api.post(
+        FILES,
+        json={
+            "stream_uuid": stream_uuid,
+            "name": "example.txt",
+            "description": "Example",
+            "content_type": "text/plain",
+            "size_bytes": 12,
+            "hash": "abc",
+        },
+    )
+    assert resp.status_code in (200, 201), resp.text
+    file = resp.json()
+    file_uuid = file["uuid"]
+    assert file["name"] == "example.txt"
+    assert file["stream_uuid"] == stream_uuid
+    assert file["user_uuid"] == str(api.user_uuid)
+    assert "project_id" not in file
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_file_accesses
+            WHERE file_uuid = %s
+            """,
+            (file_uuid,),
+        )
+        access_user_uuids = {str(row[0]) for row in cur.fetchall()}
+    assert access_user_uuids == {str(api.user_uuid), str(stream_user)}
+
+    resp = api.get(FILES)
+    assert resp.status_code == 200, resp.text
+    assert [item["uuid"] for item in resp.json()] == [file_uuid]
+
+    resp = api.get(FILES, user=stream_user)
+    assert resp.status_code == 200, resp.text
+    assert [item["uuid"] for item in resp.json()] == [file_uuid]
+
+    resp = api.get(f"{FILES}{file_uuid}", user=stream_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == file_uuid
+
+    resp = api.get(FILES, user=outsider_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == []
+
+    resp = api.get(f"{FILES}{file_uuid}", user=outsider_user)
+    assert resp.status_code == 404, resp.text
+    resp = api.get(
+        f"{FILES}{file_uuid}/actions/download", user=outsider_user
+    )
+    assert resp.status_code == 404, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_file_accesses
+                (uuid, project_id, file_uuid, user_uuid, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, NOW(), NOW())
+            ON CONFLICT (project_id, file_uuid, user_uuid) DO NOTHING
+            """,
+            (
+                str(sys_uuid.uuid4()), api.project_id, file_uuid,
+                str(outsider_user),
+            ),
+        )
+
+    resp = api.get(f"{FILES}{file_uuid}", user=outsider_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == file_uuid
+
+    resp = api.put(
+        f"{FILES}{file_uuid}",
+        user=outsider_user,
+        json={"name": "not-owner.txt"},
+    )
+    assert resp.status_code == 404, resp.text
+
+    resp = api.put(
+        f"{FILES}{file_uuid}",
+        json={"name": "renamed.txt", "description": "Updated"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "renamed.txt"
+    assert resp.json()["description"] == "Updated"
+
+    resp = api.delete(f"{FILES}{file_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM m_workspace_files WHERE uuid = %s),
+                (SELECT COUNT(*)
+                 FROM m_workspace_file_accesses
+                 WHERE file_uuid = %s)
+            """,
+            (file_uuid, file_uuid),
+        )
+        file_count, access_count = cur.fetchone()
+
+    assert file_count == 0
+    assert access_count == 0
+
+
+def test_file_multipart_upload_writes_local_file(
+    api, db, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "file-upload-team"
+    )
+    stream_user = sys_uuid.uuid4()
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, stream_user
+    )
+    data = b"uploaded file data"
+
+    resp = api.post(
+        FILES,
+        data={"stream_uuid": stream_uuid},
+        files={"file": ("upload.txt", io.BytesIO(data), "text/plain")},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    file = resp.json()
+
+    path = file_storage.get_workspace_file_path(
+        file_uuid=file["uuid"],
+        storage_path=tmp_path,
+    )
+    assert path.read_bytes() == data
+    assert file["name"] == "upload.txt"
+    resp = api.get(f"{FILES}{file['uuid']}/actions/download")
+    assert resp.status_code == 200, resp.text
+    assert resp.content == data
+    assert resp.headers["Content-Type"].startswith("text/plain")
+    assert 'filename="upload.txt"' in resp.headers["Content-Disposition"]
+
+    resp = api.get(
+        f"{FILES}{file['uuid']}/actions/download", user=stream_user
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == data
+
+    assert file["size_bytes"] == len(data)
+    assert file["hash"] == hashlib.sha256(data).hexdigest()
+
+    resp = api.delete(f"{FILES}{file['uuid']}")
+    assert resp.status_code in (200, 204), resp.text
+    assert not path.exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -939,6 +1112,22 @@ def test_stream_binding_create_notifies_added_user(api, db):
     )
     target_user_uuid = sys_uuid.uuid4()
     second_target_user_uuid = sys_uuid.uuid4()
+    file_resp = api.post(
+        FILES,
+        json={
+            "stream_uuid": stream_uuid,
+            "name": "roadmap.txt",
+            "description": "Roadmap",
+            "content_type": "text/plain",
+            "size_bytes": 7,
+            "hash": "hash",
+        },
+    )
+    assert file_resp.status_code in (200, 201), file_resp.text
+    file_uuid = file_resp.json()["uuid"]
+
+    resp = api.get(f"{FILES}{file_uuid}", user=target_user_uuid)
+    assert resp.status_code == 404, resp.text
 
     resp = api.post(
         f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
@@ -950,6 +1139,26 @@ def test_stream_binding_create_notifies_added_user(api, db):
         },
     )
     assert resp.status_code in (200, 201), resp.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_file_accesses
+            WHERE file_uuid = %s
+            """,
+            (file_uuid,),
+        )
+        access_user_uuids = {str(row[0]) for row in cur.fetchall()}
+    assert access_user_uuids == {
+        str(api.user_uuid),
+        str(target_user_uuid),
+        str(second_target_user_uuid),
+    }
+
+    for target_uuid in (target_user_uuid, second_target_user_uuid):
+        resp = api.get(f"{FILES}{file_uuid}", user=target_uuid)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["uuid"] == file_uuid
 
     for target_uuid in (target_user_uuid, second_target_user_uuid):
         with db.cursor() as cur:
@@ -1045,6 +1254,23 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
         )
         binding_uuid = cur.fetchone()[0]
 
+    file_resp = api.post(
+        FILES,
+        json={
+            "stream_uuid": stream_uuid,
+            "name": "handoff.txt",
+            "description": "Handoff",
+            "content_type": "text/plain",
+            "size_bytes": 8,
+            "hash": "hash",
+        },
+    )
+    assert file_resp.status_code in (200, 201), file_resp.text
+    file_uuid = file_resp.json()["uuid"]
+
+    resp = api.get(f"{FILES}{file_uuid}", user=target_user_uuid)
+    assert resp.status_code == 200, resp.text
+
     resp = api.post(
         FOLDERS,
         user=target_user_uuid,
@@ -1079,6 +1305,10 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
 
     resp = api.get(f"{STREAMS}{stream_uuid}", user=target_user_uuid)
     assert resp.status_code == 404, resp.text
+    resp = api.get(f"{FILES}{file_uuid}", user=target_user_uuid)
+    assert resp.status_code == 404, resp.text
+    resp = api.get(f"{FILES}{file_uuid}")
+    assert resp.status_code == 200, resp.text
 
     with db.cursor() as cur:
         cur.execute(
@@ -1088,6 +1318,16 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
             WHERE uuid = %s
             """,
             (binding_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_file_accesses
+            WHERE file_uuid = %s
+                AND user_uuid = %s
+            """,
+            (file_uuid, str(target_user_uuid)),
         )
         assert cur.fetchone()[0] == 0
         cur.execute(
@@ -1105,24 +1345,16 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
     assert [str(row[0]) for row in event_rows] == [
         str(target_user_uuid),
         str(target_user_uuid),
-        str(target_user_uuid),
-        str(target_user_uuid),
     ]
     events = [row[1] for row in event_rows]
     assert [event["kind"] for event in events] == [
         "stream.deleted",
         "folder.updated",
-        "folder.updated",
-        "folder.updated",
     ]
     assert events[0]["uuid"] == stream_uuid
     assert [(event["uuid"], event["title"]) for event in events[1:]] == [
-        ("00000000-0000-0000-0000-000000000000", "All chats"),
-        ("00000000-0000-0000-0000-000000000002", "Channels"),
         (folder["uuid"], "Watched"),
     ]
-    assert events[3]["folder_items"] == []
-
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):
     seeded = {

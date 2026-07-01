@@ -46,6 +46,7 @@ from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 
+from workspace.common import file_storage_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
@@ -150,6 +151,7 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
 
 def build_test_wsgi_application():
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
+    file_storage_opts.register_opts()
     application = applications.OpenApiApplication(
         route_class=messenger_app.get_api_application(),
         openapi_engine=messenger_app.get_openapi_engine(),
