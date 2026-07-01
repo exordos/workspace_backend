@@ -35,6 +35,7 @@ FILES = f"{V1}/files/"
 FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
+MESSAGE_REACTIONS = f"{V1}/message_reactions/"
 EVENTS = f"{V1}/events/"
 EPOCH = f"{V1}/epoch/"
 USERS = f"{V1}/users/"
@@ -906,14 +907,16 @@ def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
         },
     )
     assert message_resp.status_code == 201, message_resp.text
-    message_uuid = message_resp.json()["uuid"]
+    message = message_resp.json()
+    message_uuid = message["uuid"]
+    assert message["reactions"] == {}
     with db.cursor() as cur:
         cur.execute(
             """
             INSERT INTO m_workspace_message_reactions
                 (uuid, project_id, created_at, updated_at, message_uuid,
-                 user_uuid, emoji_name, status)
-            VALUES (%s, %s, NOW(), NOW(), %s, %s, 'thumbs_up', 'active')
+                 user_uuid, emoji_name)
+            VALUES (%s, %s, NOW(), NOW(), %s, %s, 'thumbs_up')
             """,
             (str(sys_uuid.uuid4()), api.project_id, message_uuid, api.user_uuid),
         )
@@ -1790,12 +1793,14 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     message_uuid = message["uuid"]
     assert message["read"] is True
     assert message["is_own"] is True
+    assert message["reactions"] == {}
 
     other_message_resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
     assert other_message_resp.status_code == 200, other_message_resp.text
     other_message = other_message_resp.json()
     assert other_message["read"] is False
     assert other_message["is_own"] is False
+    assert other_message["reactions"] == {}
 
     with db.cursor() as cur:
         cur.execute(
@@ -1880,12 +1885,14 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert author_payload["pinned"] is False
     assert author_payload["starred"] is False
     assert author_payload["is_own"] is True
+    assert author_payload["reactions"] == {}
     assert other_payload["user_uuid"] == str(other_user)
     assert other_payload["project_id"] == str(api.project_id)
     assert other_payload["read"] is False
     assert other_payload["pinned"] is False
     assert other_payload["starred"] is False
     assert other_payload["is_own"] is False
+    assert other_payload["reactions"] == {}
     assert messenger_events.event_row_to_messenger_event(
         {
             "epoch_version": 1,
@@ -1918,6 +1925,7 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert event["payload"]["project_id"] == str(api.project_id)
     assert event["payload"]["read"] is True
     assert event["payload"]["is_own"] is True
+    assert event["payload"]["reactions"] == {}
 
     other_events = api.get(
         EVENTS,
@@ -1938,6 +1946,7 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert other_event["payload"]["project_id"] == str(api.project_id)
     assert other_event["payload"]["read"] is False
     assert other_event["payload"]["is_own"] is False
+    assert other_event["payload"]["reactions"] == {}
     assert other_events[1]["payload"]["last_message_uuid"] == message_uuid
     assert other_events[2]["payload"]["last_message_uuid"] == message_uuid
 
@@ -2161,6 +2170,246 @@ def test_message_update_read_delete_write_realtime_events(api, db):
     assert all(row[1]["uuid"] == message_uuid for row in delete_rows)
     assert all(row[1]["stream_uuid"] == stream_uuid for row in delete_rows)
     assert all(row[1]["topic_uuid"] == topic_uuid for row in delete_rows)
+
+
+def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db):
+    other_user = sys_uuid.uuid4()
+    outsider_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "reaction-crud-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+
+    message_resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "react to this",
+            },
+        },
+    )
+    assert message_resp.status_code == 201, message_resp.text
+    message_uuid = message_resp.json()["uuid"]
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_reactions_epoch = cur.fetchone()[0]
+
+    reaction_uuid = str(sys_uuid.uuid4())
+    resp = api.post(
+        MESSAGE_REACTIONS,
+        json={
+            "uuid": reaction_uuid,
+            "message_uuid": message_uuid,
+            "emoji_name": "thumbs_up",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    reaction = resp.json()
+    assert reaction["uuid"] == reaction_uuid
+    assert reaction["project_id"] == str(api.project_id)
+    assert reaction["user_uuid"] == str(api.user_uuid)
+    assert reaction["message_uuid"] == message_uuid
+    assert reaction["emoji_name"] == "thumbs_up"
+    assert "status" not in reaction
+
+    resp = api.get(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["emoji_name"] == "thumbs_up"
+
+    resp = api.get(f"{MESSAGE_REACTIONS}{reaction_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user_uuid"] == str(api.user_uuid)
+
+    resp = api.get(f"{MESSAGE_REACTIONS}{reaction_uuid}", user=outsider_user)
+    assert resp.status_code == 404, resp.text
+
+    resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reactions"] == {"thumbs_up": 1}
+
+    duplicate_resp = api.post(
+        MESSAGE_REACTIONS,
+        json={
+            "message_uuid": message_uuid,
+            "emoji_name": "thumbs_up",
+        },
+    )
+    assert duplicate_resp.status_code == 409, duplicate_resp.text
+
+    second_resp = api.post(
+        MESSAGE_REACTIONS,
+        json={
+            "message_uuid": message_uuid,
+            "emoji_name": "eyes",
+        },
+    )
+    assert second_resp.status_code == 201, second_resp.text
+    second_reaction_uuid = second_resp.json()["uuid"]
+
+    other_resp = api.post(
+        MESSAGE_REACTIONS,
+        user=other_user,
+        json={
+            "message_uuid": message_uuid,
+            "emoji_name": "thumbs_up",
+        },
+    )
+    assert other_resp.status_code == 201, other_resp.text
+    other_reaction_uuid = other_resp.json()["uuid"]
+
+    resp = api.get(f"{MESSAGES}{message_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reactions"] == {
+        "eyes": 1,
+        "thumbs_up": 2,
+    }
+
+    resp = api.get(MESSAGE_REACTIONS, params={"message_uuid": message_uuid})
+    assert resp.status_code == 200, resp.text
+    expected_reactions = {
+        ("eyes", str(api.user_uuid)),
+        ("thumbs_up", str(api.user_uuid)),
+        ("thumbs_up", str(other_user)),
+    }
+    assert {
+        (item["emoji_name"], item["user_uuid"])
+        for item in resp.json()
+    } == expected_reactions
+
+    other_filter_resp = api.get(
+        MESSAGE_REACTIONS,
+        user=other_user,
+        params={"message_uuid": message_uuid},
+    )
+    assert other_filter_resp.status_code == 200, other_filter_resp.text
+    assert {
+        (item["emoji_name"], item["user_uuid"])
+        for item in other_filter_resp.json()
+    } == expected_reactions
+
+    user_filter_resp = api.get(
+        MESSAGE_REACTIONS,
+        params={"message_uuid": message_uuid, "user_uuid": str(other_user)},
+    )
+    assert user_filter_resp.status_code == 200, user_filter_resp.text
+    assert [item["emoji_name"] for item in user_filter_resp.json()] == [
+        "thumbs_up",
+    ]
+
+    outsider_filter_resp = api.get(
+        MESSAGE_REACTIONS,
+        user=outsider_user,
+        params={"message_uuid": message_uuid},
+    )
+    assert outsider_filter_resp.status_code == 200, outsider_filter_resp.text
+    assert outsider_filter_resp.json() == []
+
+    resp = api.put(
+        f"{MESSAGE_REACTIONS}{reaction_uuid}",
+        json={"emoji_name": "heart"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["emoji_name"] == "heart"
+
+    resp = api.get(f"{MESSAGES}{message_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reactions"] == {
+        "eyes": 1,
+        "heart": 1,
+        "thumbs_up": 1,
+    }
+
+    resp = api.delete(f"{MESSAGE_REACTIONS}{other_reaction_uuid}")
+    assert resp.status_code == 404, resp.text
+
+    resp = api.delete(f"{MESSAGE_REACTIONS}{second_reaction_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{MESSAGE_REACTIONS}{second_reaction_uuid}")
+    assert resp.status_code == 404, resp.text
+
+    resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["reactions"] == {
+        "heart": 1,
+        "thumbs_up": 1,
+    }
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT emoji_name, user_uuid
+            FROM m_workspace_message_reactions
+            WHERE project_id = %s
+                AND message_uuid = %s
+            ORDER BY emoji_name, user_uuid
+            """,
+            (api.project_id, message_uuid),
+        )
+        stored_reactions = [
+            (emoji_name, str(user_uuid))
+            for emoji_name, user_uuid in cur.fetchall()
+        ]
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_reactions_epoch),
+        )
+        reaction_event_rows = [
+            (str(user_uuid), payload)
+            for user_uuid, payload in cur.fetchall()
+        ]
+
+    assert stored_reactions == [
+        ("heart", str(api.user_uuid)),
+        ("thumbs_up", str(other_user)),
+    ]
+    expected_event_users = {str(api.user_uuid), str(other_user)}
+    expected_reaction_snapshots = [
+        {"thumbs_up": 1},
+        {"eyes": 1, "thumbs_up": 1},
+        {"eyes": 1, "thumbs_up": 2},
+        {"eyes": 1, "heart": 1, "thumbs_up": 1},
+        {"heart": 1, "thumbs_up": 1},
+    ]
+    assert len(reaction_event_rows) == len(expected_reaction_snapshots) * 2
+    assert all(
+        payload["kind"] == "message.updated"
+        for _, payload in reaction_event_rows
+    )
+    assert all(
+        payload["uuid"] == message_uuid
+        for _, payload in reaction_event_rows
+    )
+    for index, expected_reactions in enumerate(expected_reaction_snapshots):
+        group = reaction_event_rows[index * 2:index * 2 + 2]
+        assert {user_uuid for user_uuid, _ in group} == expected_event_users
+        assert all(
+            payload["reactions"] == expected_reactions
+            for _, payload in group
+        )
 
 
 def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):

@@ -1477,6 +1477,120 @@ def get_workspace_user_message(project_id, user_uuid, message_uuid,
     )
 
 
+def get_workspace_user_message_uuids(project_id, user_uuid, session=None):
+    messages = models.WorkspaceUserMessage.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    return [message.uuid for message in messages]
+
+
+def get_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
+                                   session=None):
+    return models.WorkspaceMessageReactions.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(reaction_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+
+
+def _create_workspace_message_reaction_updated_events(project_id,
+                                                      message_uuid,
+                                                      session=None):
+    for user_message in _get_workspace_user_messages(
+        project_id=project_id,
+        message_uuid=message_uuid,
+        session=session,
+    ):
+        messenger_events.create_message_updated_event(
+            message=user_message,
+            session=session,
+        )
+
+
+def create_workspace_message_reaction(project_id, user_uuid, session=None,
+                                      **kwargs):
+    message_uuid = kwargs["message_uuid"]
+    get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    reaction = models.WorkspaceMessageReactions(
+        uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
+        project_id=project_id,
+        user_uuid=user_uuid,
+        **kwargs,
+    )
+    reaction.insert(session=session)
+    _create_workspace_message_reaction_updated_events(
+        project_id=project_id,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    return reaction
+
+
+def update_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
+                                      values, session=None):
+    reaction = get_workspace_message_reaction(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        reaction_uuid=reaction_uuid,
+        session=session,
+    )
+    old_message_uuid = reaction.message_uuid
+    if "message_uuid" in values:
+        get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=values["message_uuid"],
+            session=session,
+        )
+    values.pop("project_id", None)
+    values.pop("user_uuid", None)
+    values.pop("uuid", None)
+    reaction.update_dm(values=values)
+    reaction.update(session=session)
+    new_message_uuid = values.get("message_uuid", old_message_uuid)
+    _create_workspace_message_reaction_updated_events(
+        project_id=project_id,
+        message_uuid=old_message_uuid,
+        session=session,
+    )
+    if new_message_uuid != old_message_uuid:
+        _create_workspace_message_reaction_updated_events(
+            project_id=project_id,
+            message_uuid=new_message_uuid,
+            session=session,
+        )
+    return reaction
+
+
+def delete_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
+                                      session=None):
+    reaction = get_workspace_message_reaction(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        reaction_uuid=reaction_uuid,
+        session=session,
+    )
+    message_uuid = reaction.message_uuid
+    reaction.delete(session=session)
+    _create_workspace_message_reaction_updated_events(
+        project_id=project_id,
+        message_uuid=message_uuid,
+        session=session,
+    )
+
+
 def _get_workspace_stream_default_topic(project_id, stream_uuid, session=None):
     return models.WorkspaceStreamTopic.objects.get_one(
         filters={

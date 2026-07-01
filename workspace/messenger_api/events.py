@@ -100,7 +100,9 @@ def _event_payload_get(event_payload, name):
 def _message_from_event_payload(event_payload):
     result = {}
     for name in WORKSPACE_USER_MESSAGE_FIELDS:
-        value = event_payload[name]
+        value = _event_payload_get(event_payload, name)
+        if name == "reactions" and value is None:
+            value = {}
         if value is None:
             continue
         result[name] = _event_payload_value(name, value)

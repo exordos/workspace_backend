@@ -385,6 +385,135 @@ def test_message_controller_read_up_to_uses_context_scope():
     )
 
 
+
+def test_message_reaction_controller_reads_all_visible_message_reactions():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    first_message_uuid = sys_uuid.uuid4()
+    second_message_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageReactionController(request)
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "get_workspace_user_message_uuids",
+        return_value=[first_message_uuid, second_message_uuid],
+    ) as get_message_uuids:
+        filters = controller.get_autofilters()
+
+    assert filters["project_id"].value == project_id
+    assert filters["message_uuid"].value == [
+        first_message_uuid,
+        second_message_uuid,
+    ]
+    assert "user_uuid" not in filters
+    get_message_uuids.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+    )
+
+
+def test_message_reaction_controller_create_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    reaction_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageReactionController(request)
+    returned_reaction = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "create_workspace_message_reaction",
+        return_value=returned_reaction,
+    ) as create_reaction:
+        result = controller.create(
+            uuid=reaction_uuid,
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            message_uuid=message_uuid,
+            emoji_name="thumbs_up",
+        )
+
+    assert result is returned_reaction
+    create_reaction.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        uuid=reaction_uuid,
+        message_uuid=message_uuid,
+        emoji_name="thumbs_up",
+    )
+
+
+def test_message_reaction_controller_update_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    reaction_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageReactionController(request)
+    returned_reaction = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "update_workspace_message_reaction",
+        return_value=returned_reaction,
+    ) as update_reaction:
+        result = controller.update(
+            reaction_uuid,
+            emoji_name="heart",
+        )
+
+    assert result is returned_reaction
+    update_reaction.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        reaction_uuid=reaction_uuid,
+        values={"emoji_name": "heart"},
+    )
+
+
+def test_message_reaction_controller_delete_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    reaction_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceMessageReactionController(request)
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "delete_workspace_message_reaction",
+        return_value=None,
+    ) as delete_reaction:
+        result = controller.delete(reaction_uuid)
+
+    assert result is None
+    delete_reaction.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        reaction_uuid=reaction_uuid,
+    )
+
+
 def test_stream_controller_hides_private_index():
     resource = controllers.WorkspaceStreamController.__resource__
 
@@ -501,6 +630,16 @@ def test_stream_route_allows_update():
 def test_message_route_allows_update_and_delete():
     assert ra_routes.UPDATE in routes.WorkspaceMessageRoute.__allow_methods__
     assert ra_routes.DELETE in routes.WorkspaceMessageRoute.__allow_methods__
+
+
+def test_message_reaction_route_allows_crud():
+    allowed_methods = routes.WorkspaceMessageReactionRoute.__allow_methods__
+
+    assert ra_routes.CREATE in allowed_methods
+    assert ra_routes.FILTER in allowed_methods
+    assert ra_routes.GET in allowed_methods
+    assert ra_routes.UPDATE in allowed_methods
+    assert ra_routes.DELETE in allowed_methods
 
 
 def test_stream_controller_archive_uses_context_scope():

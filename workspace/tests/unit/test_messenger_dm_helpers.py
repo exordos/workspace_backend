@@ -2253,6 +2253,272 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
+    def test_get_workspace_user_message_uuids_scopes_visible_messages(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        first_message_uuid = sys_uuid.uuid4()
+        second_message_uuid = sys_uuid.uuid4()
+        session = object()
+
+        class FakeWorkspaceUserMessage:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(
+                    return_value=[
+                        types.SimpleNamespace(uuid=first_message_uuid),
+                        types.SimpleNamespace(uuid=second_message_uuid),
+                    ]
+                )
+            )
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceUserMessage",
+            FakeWorkspaceUserMessage,
+        ):
+            result = dm_helpers.get_workspace_user_message_uuids(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        self.assertEqual([first_message_uuid, second_message_uuid], result)
+        filters = FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(user_uuid, filters["user_uuid"].value)
+        self.assertIs(
+            session,
+            FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs[
+                "session"
+            ],
+        )
+
+    def test_create_workspace_message_reaction_updated_events_sends_snapshots(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+        first_message = object()
+        second_message = object()
+
+        with mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_messages",
+            return_value=[first_message, second_message],
+        ) as get_user_messages, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_message_updated_event",
+        ) as create_event:
+            dm_helpers._create_workspace_message_reaction_updated_events(
+                project_id=project_id,
+                message_uuid=message_uuid,
+                session=session,
+            )
+
+        get_user_messages.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            session=session,
+        )
+        create_event.assert_has_calls(
+            [
+                mock.call(message=first_message, session=session),
+                mock.call(message=second_message, session=session),
+            ]
+        )
+
+    def test_create_workspace_message_reaction_checks_message_and_inserts(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        reaction_uuid = sys_uuid.uuid4()
+        session = object()
+        created_reaction = {}
+
+        class FakeWorkspaceMessageReactions:
+            def __init__(self, **kwargs):
+                created_reaction.update(kwargs)
+
+            def insert(self, session=None):
+                created_reaction["insert_session"] = session
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_message",
+            return_value=object(),
+        ) as get_user_message, mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ), mock.patch.object(
+            dm_helpers,
+            "_create_workspace_message_reaction_updated_events",
+        ) as create_events:
+            result = dm_helpers.create_workspace_message_reaction(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=reaction_uuid,
+                message_uuid=message_uuid,
+                emoji_name="thumbs_up",
+                session=session,
+            )
+
+        self.assertIsInstance(result, FakeWorkspaceMessageReactions)
+        self.assertEqual(reaction_uuid, created_reaction["uuid"])
+        self.assertEqual(project_id, created_reaction["project_id"])
+        self.assertEqual(user_uuid, created_reaction["user_uuid"])
+        self.assertEqual(message_uuid, created_reaction["message_uuid"])
+        self.assertEqual("thumbs_up", created_reaction["emoji_name"])
+        self.assertNotIn("status", created_reaction)
+        self.assertIs(session, created_reaction["insert_session"])
+        get_user_message.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=session,
+        )
+        create_events.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            session=session,
+        )
+
+    def test_update_workspace_message_reaction_scopes_and_checks_new_message(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        reaction_uuid = sys_uuid.uuid4()
+        old_message_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+        updated_reaction = {}
+
+        class ExistingReaction:
+            def __init__(self):
+                self.message_uuid = old_message_uuid
+
+            def update_dm(self, values):
+                updated_reaction["values"] = values
+
+            def update(self, session=None):
+                updated_reaction["update_session"] = session
+
+        existing_reaction = ExistingReaction()
+
+        class FakeWorkspaceMessageReactions:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_reaction)
+            )
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ), mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_message",
+            return_value=object(),
+        ) as get_user_message, mock.patch.object(
+            dm_helpers,
+            "_create_workspace_message_reaction_updated_events",
+        ) as create_events:
+            result = dm_helpers.update_workspace_message_reaction(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                reaction_uuid=reaction_uuid,
+                values={
+                    "message_uuid": message_uuid,
+                    "emoji_name": "heart",
+                    "project_id": sys_uuid.uuid4(),
+                    "user_uuid": sys_uuid.uuid4(),
+                    "uuid": sys_uuid.uuid4(),
+                },
+                session=session,
+            )
+
+        self.assertIs(existing_reaction, result)
+        filters = FakeWorkspaceMessageReactions.objects.get_one.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual(reaction_uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(user_uuid, filters["user_uuid"].value)
+        self.assertEqual(
+            {
+                "message_uuid": message_uuid,
+                "emoji_name": "heart",
+            },
+            updated_reaction["values"],
+        )
+        self.assertIs(session, updated_reaction["update_session"])
+        get_user_message.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=session,
+        )
+        create_events.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    message_uuid=old_message_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    message_uuid=message_uuid,
+                    session=session,
+                ),
+            ]
+        )
+
+    def test_delete_workspace_message_reaction_scopes_and_deletes(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        reaction_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+        deleted_reaction = {}
+
+        class ExistingReaction:
+            def __init__(self):
+                self.message_uuid = message_uuid
+
+            def delete(self, session=None):
+                deleted_reaction["delete_session"] = session
+
+        class FakeWorkspaceMessageReactions:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingReaction())
+            )
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ), mock.patch.object(
+            dm_helpers,
+            "_create_workspace_message_reaction_updated_events",
+        ) as create_events:
+            result = dm_helpers.delete_workspace_message_reaction(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                reaction_uuid=reaction_uuid,
+                session=session,
+            )
+
+        self.assertIsNone(result)
+        filters = FakeWorkspaceMessageReactions.objects.get_one.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual(reaction_uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(user_uuid, filters["user_uuid"].value)
+        self.assertIs(session, deleted_reaction["delete_session"])
+        create_events.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            session=session,
+        )
     def test_read_workspace_user_messages_updates_flags_and_read_event(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

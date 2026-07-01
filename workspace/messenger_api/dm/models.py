@@ -38,12 +38,6 @@ class SystemFolderType(str, enum.Enum):
     CREATED = base.FOLDER_SYSTEM_TYPE_CREATED
 
 
-class ReactionStatus(str, enum.Enum):
-    NEW = "new"
-    ACTIVE = "active"
-    DELETED = "deleted"
-
-
 ZulipSource = base.ZulipSource
 NativeSource = base.NativeSource
 SourceName = base.SourceName
@@ -372,10 +366,6 @@ class WorkspaceMessageReactions(
     )
     emoji_name = properties.property(
         types.String(max_length=128),
-        required=True,
-    )
-    status = properties.property(
-        types.Enum([s.value for s in ReactionStatus]),
         required=True,
     )
 

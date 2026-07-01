@@ -128,6 +128,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             "pinned": False,
             "starred": False,
             "is_own": False,
+            "reactions": {},
         }
         event = events.event_row_to_messenger_event(
             {
@@ -187,6 +188,9 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "pinned": False,
                     "starred": False,
                     "is_own": False,
+                    "reactions": {
+                        "heart": 2,
+                    },
                     "created_at": "2026-06-24 10:00:00.000000",
                     "updated_at": "2026-06-24 10:05:00.000000",
                 },
@@ -199,6 +203,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(str(message_uuid), event["message"]["uuid"])
         self.assertEqual(True, event["message"]["read"])
         self.assertEqual("edited", event["message"]["payload"]["content"])
+        self.assertEqual({"heart": 2}, event["message"]["reactions"])
 
     def test_event_row_to_messenger_event_uses_read_message_ids(self):
         user_uuid = sys_uuid.uuid4()
@@ -727,6 +732,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 payload.created_at
             ),
         )
+        self.assertEqual({}, payload.reactions)
 
     def test_messages_read_event_payload_accepts_message_ids(self):
         project_id = sys_uuid.uuid4()
@@ -1051,6 +1057,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("edited", created_event["payload"].payload.content)
         self.assertEqual(True, created_event["payload"].read)
+        self.assertEqual({}, created_event["payload"].reactions)
         self.assertEqual(updated_at, created_event["payload"].updated_at)
 
     def test_create_messages_read_event_uses_message_ids(self):

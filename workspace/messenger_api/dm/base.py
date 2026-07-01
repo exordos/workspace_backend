@@ -94,6 +94,10 @@ class WorkspaceUserMessageBase(
         types.Boolean(),
         default=False,
     )
+    reactions = properties.property(
+        types.Dict(),
+        default=dict,
+    )
 
 
 class WorkspaceFolderBase(

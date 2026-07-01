@@ -140,6 +140,17 @@ class WorkspaceMessageRoute(routes.Route):
     read_up_to = routes.action(WorkspaceMessageReadUpToAction, invoke=True)
 
 
+class WorkspaceMessageReactionRoute(routes.Route):
+    __controller__ = controllers.WorkspaceMessageReactionController
+    __allow_methods__ = [
+        routes.CREATE,
+        routes.FILTER,
+        routes.GET,
+        routes.UPDATE,
+        routes.DELETE,
+    ]
+
+
 class WorkspaceEventRoute(routes.Route):
     __controller__ = controllers.WorkspaceEventController
     __allow_methods__ = [
@@ -211,6 +222,7 @@ class ApiEndpointRoute(routes.Route):
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
     stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
+    message_reactions = routes.route(WorkspaceMessageReactionRoute)
     files = routes.route(WorkspaceFileRoute)
     events = routes.route(WorkspaceEventRoute)
     epoch = routes.route(WorkspaceEpochRoute)

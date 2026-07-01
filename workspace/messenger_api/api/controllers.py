@@ -510,6 +510,57 @@ class WorkspaceMessageController(
         )
 
 
+class WorkspaceMessageReactionController(
+    WorkspaceBaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceMessageReactions,
+        convert_underscore=False,
+        process_filters=True,
+    )
+
+    def get_autofilters(self):
+        project_id = self._get_project_id()
+        user_uuid = self._get_user_uuid()
+        message_uuids = messenger_dm_helpers.get_workspace_user_message_uuids(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+        return {
+            "project_id": dm_filters.EQ(project_id),
+            "message_uuid": dm_filters.In(message_uuids),
+        }
+
+    def _apply_autofilters(self, filters):
+        filter_parts = [filters, self.get_autofilters()]
+        filter_parts.extend(getattr(self, "_conditional_filters", []))
+        return dm_filters.AND(*filter_parts)
+
+    def create(self, **kwargs):
+        values = self._apply_autovalues(kwargs)
+        return messenger_dm_helpers.create_workspace_message_reaction(
+            project_id=values.pop("project_id", self._get_project_id()),
+            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
+            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            **values,
+        )
+
+    def update(self, uuid, **kwargs):
+        return messenger_dm_helpers.update_workspace_message_reaction(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            reaction_uuid=uuid,
+            values=kwargs,
+        )
+
+    def delete(self, uuid):
+        return messenger_dm_helpers.delete_workspace_message_reaction(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            reaction_uuid=uuid,
+        )
+
+
 class WorkspaceEventController(
     WorkspaceBaseResourceControllerPaginated,
 ):
