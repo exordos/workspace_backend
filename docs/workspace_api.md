@@ -1131,6 +1131,8 @@ than project-scoped.
 | `username` | string, 1..128 | Username. |
 | `source` | `iam` | User source. |
 | `status` | `active`, `idle`, `offline`, `do_not_disturb` | Presence status. |
+| `status_emoji` | string or `null`, max 64 | Custom presence emoji. |
+| `status_text` | string or `null`, max 256 | Custom presence text. |
 | `first_name` | string or `null` | First name. |
 | `last_name` | string or `null` | Last name. |
 | `email` | string or `null` | Email address. |
@@ -1145,14 +1147,19 @@ POST /api/messenger/v1/users/11111111-1111-1111-1111-111111111111/actions/presen
 Content-Type: application/json
 
 {
-  "status": "active"
+  "status": "active",
+  "emoji": "coffee",
+  "text": "Focusing"
 }
 ```
 
 The authenticated user may update only their own `user_uuid`. The request
 stores the supplied `status` (`active`, `idle`, `offline`, or `do_not_disturb`)
-and the current time in `last_ping_at`. Clients should repeat the presence
-update about every 30 seconds. The messenger worker marks users with
+and the current time in `last_ping_at`. Optional `emoji` and `text` fields are
+stored on the user profile as `status_emoji` and `status_text`; omitted optional
+fields keep their previous values, and explicit `null` clears them. Clients
+should repeat the presence update about every 30 seconds. The messenger worker
+marks users with
 `status != "offline"` and older-than-one-minute `last_ping_at` as `offline`.
 `last_ping_at` is required in storage and defaults to the user row creation
 time. Presence changes emit `user.updated` events with a full user snapshot to

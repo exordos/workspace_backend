@@ -109,7 +109,7 @@ def _get_stale_workspace_users(cutoff, session=None):
 
 
 def update_workspace_user_presence(project_id, user_uuid, current_user_uuid,
-                                   status, session=None):
+                                   values, session=None):
     if user_uuid != current_user_uuid:
         raise storage_exc.RecordNotFound(
             model=models.WorkspaceUser.__name__,
@@ -122,12 +122,9 @@ def update_workspace_user_presence(project_id, user_uuid, current_user_uuid,
         },
         session=session,
     )
-    user.update_dm(
-        values={
-            "status": status,
-            "last_ping_at": datetime.datetime.now(datetime.timezone.utc),
-        },
-    )
+    values = dict(values)
+    values["last_ping_at"] = datetime.datetime.now(datetime.timezone.utc)
+    user.update_dm(values=values)
     user.update(session=session)
     _create_workspace_user_updated_events(
         project_id=project_id,

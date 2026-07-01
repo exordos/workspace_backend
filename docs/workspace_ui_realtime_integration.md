@@ -446,13 +446,18 @@ POST /api/messenger/v1/users/{user_uuid}/actions/presence/invoke
 Content-Type: application/json
 
 {
-  "status": "active"
+  "status": "active",
+  "emoji": "coffee",
+  "text": "Focusing"
 }
 ```
 
 Send the request about every 30 seconds with one of `active`, `idle`, `offline`,
-or `do_not_disturb`. The backend writes `last_ping_at` for each presence update.
-The messenger worker marks users with `status !== "offline"` and
+or `do_not_disturb`. The optional `emoji` and `text` request fields update the
+user snapshot fields `status_emoji` and `status_text`; omit them to keep the
+previous custom status values, or send `null` to clear them. The backend writes
+`last_ping_at` for each presence update. The messenger worker marks users with
+`status !== "offline"` and
 older-than-one-minute `last_ping_at` as `offline`. `last_ping_at` is required in
 storage and defaults to the user row creation time. Presence changes emit
 `user.updated` events with a full user snapshot to every workspace user.

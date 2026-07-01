@@ -263,6 +263,14 @@ class UserUpdatedEventPayload(
         types.Enum(["active", "idle", "offline", "do_not_disturb"]),
         required=True,
     )
+    status_emoji = properties.property(
+        types.AllowNone(types.String(max_length=64)),
+        default=None,
+    )
+    status_text = properties.property(
+        types.AllowNone(types.String(max_length=256)),
+        default=None,
+    )
     first_name = properties.property(
         types.AllowNone(types.String(max_length=128)),
         default=None,

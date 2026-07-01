@@ -79,18 +79,24 @@ def test_user_presence_action_updates_current_user_presence(api, db):
 
     resp = api.post(
         f"{USERS}{api.user_uuid}/actions/presence/invoke",
-        json={"status": "idle"},
+        json={
+            "status": "idle",
+            "emoji": "coffee",
+            "text": "Focusing",
+        },
     )
     assert resp.status_code == 200, resp.text
     user = resp.json()
     assert user["uuid"] == str(api.user_uuid)
     assert user["status"] == "idle"
+    assert user["status_emoji"] == "coffee"
+    assert user["status_text"] == "Focusing"
     assert user["last_ping_at"] is not None
 
     with db.cursor() as cur:
         cur.execute(
             """
-            SELECT status, last_ping_at
+            SELECT status, status_emoji, status_text, last_ping_at
             FROM m_workspace_users
             WHERE uuid = %s
             """,
@@ -98,7 +104,9 @@ def test_user_presence_action_updates_current_user_presence(api, db):
         )
         row = cur.fetchone()
     assert row[0] == "idle"
-    assert row[1] is not None
+    assert row[1] == "coffee"
+    assert row[2] == "Focusing"
+    assert row[3] is not None
 
     with db.cursor() as cur:
         cur.execute(
@@ -119,7 +127,37 @@ def test_user_presence_action_updates_current_user_presence(api, db):
     for _, payload in event_rows:
         assert payload["username"] == username
         assert payload["status"] == "idle"
+        assert payload["status_emoji"] == "coffee"
+        assert payload["status_text"] == "Focusing"
         assert payload["last_ping_at"] is not None
+
+    resp = api.post(
+        f"{USERS}{api.user_uuid}/actions/presence/invoke",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "active"
+    assert resp.json()["status_emoji"] == "coffee"
+    assert resp.json()["status_text"] == "Focusing"
+
+    resp = api.post(
+        f"{USERS}{api.user_uuid}/actions/presence/invoke",
+        json={"status": "idle", "emoji": None, "text": None},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("status_emoji") is None
+    assert resp.json().get("status_text") is None
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT status_emoji, status_text
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (str(api.user_uuid),),
+        )
+        row = cur.fetchone()
+    assert row == (None, None)
 
     other_user_uuid = sys_uuid.uuid4()
     resp = api.post(

@@ -663,11 +663,16 @@ class WorkspaceUserController(
 
     @ra_actions.post
     def presence(self, resource, *args, **kwargs):
+        values = {"status": kwargs["status"]}
+        if "emoji" in kwargs:
+            values["status_emoji"] = kwargs["emoji"]
+        if "text" in kwargs:
+            values["status_text"] = kwargs["text"]
         return messenger_dm_helpers.update_workspace_user_presence(
             project_id=self._get_project_id(),
             user_uuid=resource.uuid,
             current_user_uuid=self._get_user_uuid(),
-            status=kwargs["status"],
+            values=values,
         )
 
 
