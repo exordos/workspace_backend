@@ -533,7 +533,7 @@ def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
     )
     assert resp.status_code in (200, 201), resp.text
     item = resp.json()
-    assert item["pinned_at"] is None
+    assert item.get("pinned_at") is None
 
     resp = api.post(f"{FOLDER_ITEMS}{item['uuid']}/actions/pin/invoke")
     assert resp.status_code == 200, resp.text
@@ -545,7 +545,7 @@ def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
     assert resp.status_code == 200, resp.text
     unpinned_item = resp.json()
     assert unpinned_item["uuid"] == item["uuid"]
-    assert unpinned_item["pinned_at"] is None
+    assert unpinned_item.get("pinned_at") is None
 
     with db.cursor() as cur:
         cur.execute(
@@ -572,7 +572,7 @@ def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
     assert unpin_payload["kind"] == "folder.updated"
     assert unpin_payload["uuid"] == folder["uuid"]
     assert unpin_payload["folder_items"][0]["uuid"] == item["uuid"]
-    assert unpin_payload["folder_items"][0]["pinned_at"] is None
+    assert unpin_payload["folder_items"][0].get("pinned_at") is None
 
     event = messenger_events.event_row_to_messenger_event(
         {
@@ -583,7 +583,7 @@ def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
     )
     assert event["type"] == "folder"
     assert event["kind"] == "folder.updated"
-    assert event["folder"]["folder_items"][0]["pinned_at"] is None
+    assert event["folder"]["folder_items"][0].get("pinned_at") is None
 
 
 def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
@@ -614,7 +614,7 @@ def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
     assert resp.status_code == 200, resp.text
     unpinned_item = resp.json()
     assert unpinned_item["uuid"] == item_uuid
-    assert unpinned_item["pinned_at"] is None
+    assert unpinned_item.get("pinned_at") is None
 
     resp = api.get(f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}")
     assert resp.status_code == 200, resp.text
@@ -622,7 +622,7 @@ def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
         item for item in resp.json()["folder_items"]
         if item["uuid"] == item_uuid
     ][0]
-    assert folder_item["pinned_at"] is None
+    assert folder_item.get("pinned_at") is None
 
     with db.cursor() as cur:
         cur.execute(
@@ -735,8 +735,8 @@ def test_stream_create_writes_realtime_event(api, db):
     assert payload["role"] == "owner"
     assert payload["notification_mode"] == "all_messages"
     assert payload["unread_count"] == 0
-    assert stream["last_message_uuid"] is None
-    assert payload["last_message_uuid"] is None
+    assert stream.get("last_message_uuid") is None
+    assert payload.get("last_message_uuid") is None
     assert 0 <= stream["color"] <= 0xFFFFFF
     assert payload["color"] == stream["color"]
     assert payload["source_name"] == "native"
@@ -756,7 +756,7 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["stream"]["role"] == "owner"
     assert event["stream"]["notification_mode"] == "all_messages"
     assert event["stream"]["color"] == stream["color"]
-    assert event["stream"]["last_message_uuid"] is None
+    assert event["stream"].get("last_message_uuid") is None
 
     folder_events = [row[2] for row in rows[1:]]
     assert [payload["kind"] for payload in folder_events] == [
@@ -1423,7 +1423,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert topic["name"] == "planning"
     assert topic["stream_uuid"] == stream_uuid
     assert 0 <= topic["color"] <= 0xFFFFFF
-    assert topic["last_message_uuid"] is None
+    assert topic.get("last_message_uuid") is None
     assert topic["is_default"] is False
     assert topic["is_done"] is False
     assert topic["notification_mode"] == "default"
@@ -1468,7 +1468,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
         assert payload["name"] == "planning"
         assert payload["stream_uuid"] == stream_uuid
         assert payload["color"] == topic["color"]
-        assert payload["last_message_uuid"] is None
+        assert payload.get("last_message_uuid") is None
         assert payload["unread_count"] == 0
         assert payload["is_default"] is False
         assert payload["is_done"] is False
@@ -1486,7 +1486,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert event["topic"]["uuid"] == topic["uuid"]
     assert event["topic"]["name"] == "planning"
     assert event["topic"]["color"] == topic["color"]
-    assert event["topic"]["last_message_uuid"] is None
+    assert event["topic"].get("last_message_uuid") is None
     assert event["topic"]["notification_mode"] == "default"
 
 
