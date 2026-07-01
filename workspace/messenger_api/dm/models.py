@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import enum
 
 from restalchemy.common import exceptions as ra_exc
@@ -183,6 +184,11 @@ class WorkspaceUserSource(str, enum.Enum):
     IAM = "iam"
 
 
+class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
+    def to_simple_type(self, value):
+        return value.isoformat()
+
+
 class WorkspaceUser(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
@@ -215,8 +221,8 @@ class WorkspaceUser(
         default=None,
     )
     last_ping_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
+        WorkspaceUserLastPingAtType(),
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
 
 

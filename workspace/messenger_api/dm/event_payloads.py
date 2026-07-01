@@ -234,6 +234,53 @@ class StreamBindingsCreatedEventPayload(
     )
 
 
+class UserUpdatedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+    models.ModelWithTimestamp,
+):
+    KIND = "user.updated"
+
+    created_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        read_only=True,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    username = properties.property(
+        types.String(min_length=1, max_length=128),
+        required=True,
+    )
+    source = properties.property(
+        types.Enum(["iam"]),
+        required=True,
+    )
+    status = properties.property(
+        types.Enum(["active", "idle", "offline", "do_not_disturb"]),
+        required=True,
+    )
+    first_name = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+    )
+    last_name = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+    )
+    email = properties.property(
+        types.AllowNone(types.String(max_length=256)),
+        default=None,
+    )
+    last_ping_at = properties.property(
+        MESSAGE_EVENT_TIMESTAMP_TYPE,
+        required=True,
+    )
+
+
 class FolderDeletedEventPayload(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
@@ -262,6 +309,7 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(TopicDeletedEventPayload),
     types_dynamic.KindModelType(StreamDeletedEventPayload),
     types_dynamic.KindModelType(StreamBindingsCreatedEventPayload),
+    types_dynamic.KindModelType(UserUpdatedEventPayload),
     types_dynamic.KindModelType(FolderDeletedEventPayload),
     types_dynamic.KindModelType(FolderItemDeletedEventPayload),
 )

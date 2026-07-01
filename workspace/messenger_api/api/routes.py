@@ -187,6 +187,10 @@ class WorkspaceStreamTopicReadAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
 
+class WorkspaceUserPresenceAction(routes.Action):
+    __controller__ = controllers.WorkspaceUserController
+
+
 class WorkspaceStreamTopicRoute(routes.Route):
     __controller__ = controllers.WorkspaceStreamTopicController
     __allow_methods__ = [
@@ -214,6 +218,8 @@ class WorkspaceUserRoute(routes.Route):
         routes.FILTER,
         routes.GET,
     ]
+
+    presence = routes.action(WorkspaceUserPresenceAction, invoke=True)
 
 
 class MeRoute(routes.Route):

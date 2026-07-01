@@ -2,7 +2,8 @@
 
 This document describes the current API contract implemented by
 `workspace-messenger-api` and the companion `workspace-messenger-events`
-websocket service.
+websocket service. Background presence maintenance is performed by
+`workspace-messenger-worker`, which is included in the deployment manifest.
 
 ## Runtime Entry Points
 
@@ -11,6 +12,7 @@ Direct local services:
 ```text
 REST API:       http://127.0.0.1:21081/v1
 WebSocket API:  ws://127.0.0.1:21082/v1/events/ws
+Worker:         workspace-messenger-worker
 OpenAPI spec:   http://127.0.0.1:21081/specifications/3.0.3
 ```
 
@@ -182,6 +184,7 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `POST` | `/v1/streams/{stream_uuid}/actions/archive/invoke` | Set `is_archived: true`. |
 | `POST` | `/v1/streams/{stream_uuid}/actions/unarchive/invoke` | Set `is_archived: false`. |
 | `POST` | `/v1/streams/{stream_uuid}/actions/notifications/invoke` | Set current user's stream notification mode. |
+| `POST` | `/v1/streams/{stream_uuid}/actions/read/invoke` | Mark all unread stream messages as read for the current user. |
 | `GET` | `/v1/stream_bindings/` | List stream bindings. |
 | `GET` | `/v1/stream_bindings/{binding_uuid}` | Get a stream binding. |
 | `PUT` | `/v1/stream_bindings/{binding_uuid}` | Update a stream binding. |
@@ -191,18 +194,32 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `GET` | `/v1/stream_topics/{topic_uuid}` | Get a topic. |
 | `PUT` | `/v1/stream_topics/{topic_uuid}` | Rename a topic; body must contain `name`. |
 | `DELETE` | `/v1/stream_topics/{topic_uuid}` | Delete a topic. |
-| `POST` | `/v1/stream_topics/{topic_uuid}/actions/toggle_done/invoke` | Toggle the current user's `is_done` flag. |
+| `POST` | `/v1/stream_topics/{topic_uuid}/toggle_done/` | Toggle the shared `is_done` flag for all topic users. |
 | `POST` | `/v1/stream_topics/{topic_uuid}/actions/notifications/invoke` | Set current user's topic notification mode. |
+| `POST` | `/v1/stream_topics/{topic_uuid}/actions/read/invoke` | Mark all unread topic messages as read for the current user. |
 | `GET` | `/v1/messages/` | List messages visible to the current IAM user. |
 | `POST` | `/v1/messages/` | Create a message. |
 | `GET` | `/v1/messages/{message_uuid}` | Get a message. |
 | `PUT` | `/v1/messages/{message_uuid}` | Update a message payload. |
 | `DELETE` | `/v1/messages/{message_uuid}` | Delete a message. |
 | `POST` | `/v1/messages/{message_uuid}/actions/read/invoke` | Mark message as read for the current user. |
+| `POST` | `/v1/messages/{message_uuid}/actions/read_up_to/invoke` | Mark unread messages in the same topic up to this message as read. |
+| `GET` | `/v1/message_reactions/` | List reactions for messages visible to the current IAM user. |
+| `POST` | `/v1/message_reactions/` | Create a message reaction. |
+| `GET` | `/v1/message_reactions/{reaction_uuid}` | Get a message reaction visible through message access. |
+| `PUT` | `/v1/message_reactions/{reaction_uuid}` | Update the current user's reaction. |
+| `DELETE` | `/v1/message_reactions/{reaction_uuid}` | Delete the current user's reaction. |
+| `GET` | `/v1/files/` | List files visible to the current IAM user. |
+| `POST` | `/v1/files/` | Create file metadata or upload multipart file data. |
+| `GET` | `/v1/files/{file_uuid}` | Get a visible file metadata record. |
+| `PUT` | `/v1/files/{file_uuid}` | Update an owned file metadata record. |
+| `DELETE` | `/v1/files/{file_uuid}` | Delete an owned file and its access rows. |
+| `GET` | `/v1/files/{file_uuid}/actions/download` | Download visible file bytes. |
 | `GET` | `/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/v1/users/` | List workspace users. |
 | `GET` | `/v1/users/{user_uuid}` | Get a workspace user. |
+| `POST` | `/v1/users/{user_uuid}/actions/presence/invoke` | Update current user's presence status and heartbeat timestamp. |
 | `GET` | `/v1/me/` | List routes below `/v1/me/`. |
 
 ## Server Settings
@@ -507,6 +524,8 @@ Supported source payloads:
 | `direct_user_uuid` | UUID | no | no | Other direct-chat participant. |
 | `private` | boolean | no | yes | Private stream flag. |
 | `is_archived` | boolean | no | action-managed | Archived flag. |
+| `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
+| `last_message_uuid` | UUID or `null` | no | yes | Latest message in the stream, or `null` when empty. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -551,6 +570,16 @@ Content-Type: application/json
 }
 ```
 
+Stream read action:
+
+```http
+POST /api/messenger/v1/streams/75309057-419c-4b12-a7c1-3932429ec4a6/actions/read/invoke
+Authorization: Bearer <access_token>
+```
+
+`read` marks all unread messages in the stream as read for the current user and
+returns the updated stream view.
+
 Realtime side effects:
 
 | Operation | Durable payload kind | Websocket event type | Websocket body |
@@ -560,6 +589,8 @@ Realtime side effects:
 | update stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
 | archive or unarchive stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
 | change stream notification mode | `stream.updated` | `stream` | Full user stream snapshot for the current user only. |
+| read stream messages | `messages.read` | `message` | `message_uuids` for messages that changed to read. |
+| read stream messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete stream | `stream.deleted` | `stream` | Only deleted stream `uuid`, sent to every stream user. |
 | delete stream | `folder.updated` | `folder` | Updated affected users' system/custom folder snapshots after the stream is removed. |
 | add stream binding | `stream.created` | `stream` | Added user's full user stream snapshot. |
@@ -628,6 +659,8 @@ custom folders. Other stream users do not receive a binding-delete event.
 | `name` | string, max 128 | yes | no | Topic name. |
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
 | `user_uuid` | UUID | no | yes | Current user in the topic view. |
+| `color` | integer `0..0xFFFFFF` | no | no | Topic color; generated randomly when omitted or `null`. |
+| `last_message_uuid` | UUID or `null` | no | yes | Latest message in the topic, or `null` when empty. |
 | `unread_count` | integer | no | yes | Current user's unread count for the topic. |
 | `is_default` | boolean | no | yes | Whether this is the stream default topic. |
 | `is_done` | boolean | no | action-managed | Current user's done flag. |
@@ -648,8 +681,8 @@ Create request:
 checks that the current user has a binding to the topic's stream before
 renaming the topic.
 
-`POST /v1/stream_topics/{topic_uuid}/actions/toggle_done/invoke` flips the
-current user's `is_done` flag and returns the updated topic view.
+`POST /v1/stream_topics/{topic_uuid}/toggle_done/` flips `is_done` for all
+topic users and returns the current user's updated topic view.
 
 `POST /v1/stream_topics/{topic_uuid}/actions/notifications/invoke` sets the
 current user's topic notification mode:
@@ -663,6 +696,16 @@ current user's topic notification mode:
 Allowed topic notification modes are `mute`, `default`, and `follow`. `unmute`
 is allowed only when the current user's stream notification mode is `muted`.
 
+Topic read action:
+
+```http
+POST /api/messenger/v1/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047/actions/read/invoke
+Authorization: Bearer <access_token>
+```
+
+`read` marks all unread messages in the topic as read for the current user and
+returns the updated topic view.
+
 Realtime side effects:
 
 | Operation | Durable payload kind | Websocket event type | Websocket body |
@@ -671,6 +714,8 @@ Realtime side effects:
 | rename topic | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | toggle done | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | change topic notification mode | `topic.updated` | `topic` | Full user topic snapshot for the current user only. |
+| read topic messages | `messages.read` | `message` | `message_uuids` for messages that changed to read. |
+| read topic messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. |
 
 ## Messages
@@ -694,7 +739,7 @@ The only supported message payload in v1 is markdown:
 | `uuid` | UUID | no | yes | Message identifier. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
-| `topic_uuid` | UUID | yes | no | Topic UUID; required by current code. |
+| `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. |
 | `author_uuid` | UUID | no | yes | Message author. |
 | `payload` | object | yes | no | Message payload. |
 | `user_uuid` | UUID | no | yes | Current user in the user message view. |
@@ -702,6 +747,7 @@ The only supported message payload in v1 is markdown:
 | `pinned` | boolean | no | yes | Current user's pinned flag. |
 | `starred` | boolean | no | yes | Current user's starred flag. |
 | `is_own` | boolean | no | yes | Whether `author_uuid` equals the current user. |
+| `reactions` | object | no | yes | Aggregated reaction counts keyed by `emoji_name`. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -736,6 +782,7 @@ Response example:
   "pinned": false,
   "starred": false,
   "is_own": true,
+  "reactions": {},
   "created_at": "2026-06-22T10:10:00Z",
   "updated_at": "2026-06-22T10:10:00Z"
 }
@@ -765,6 +812,18 @@ Authorization: Bearer <access_token>
 ```
 
 `read` sets the current user's message flag to `true` and returns the updated
+message view. If the message was unread, the backend emits `messages.read` with
+that message UUID and aggregate unread-count updates.
+
+Read up to action:
+
+```http
+POST /api/messenger/v1/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/read_up_to/invoke
+Authorization: Bearer <access_token>
+```
+
+`read_up_to` marks unread messages in the same topic as read up to and
+including the selected message's `created_at`, then returns the selected
 message view.
 
 Realtime side effects:
@@ -774,15 +833,114 @@ Realtime side effects:
 | create message | `message.created` | `message` | Full user message snapshot for every stream user. |
 | create unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the new message is unread. |
 | update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
-| read message | `message.updated` | `message` | Full user message snapshot for the current user. |
+| create/update/delete reaction | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
+| read message or read up to message | `messages.read` | `message` | `message_uuids` for messages that changed to read. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the deleted message was unread. |
 
+## Message Reactions
+
+Message reactions are stored in `m_workspace_message_reactions`. Reads are
+scoped to messages visible to the current IAM user. Creating, updating, or
+deleting a reaction emits `message.updated` events for every user that can see
+the message; the message snapshot contains aggregated `reactions`.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Reaction identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `message_uuid` | UUID | yes | no | Message being reacted to; must be visible to the current user. |
+| `user_uuid` | UUID | no | yes | User that owns the reaction. |
+| `emoji_name` | string, max 128 | yes | no | Emoji/reaction name. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Create request:
+
+```json
+{
+  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "emoji_name": "thumbs_up"
+}
+```
+
+The same user cannot create duplicate reactions with the same `message_uuid`
+and `emoji_name`. Any user that can see the message can list or get its
+reactions. Only the reaction owner can update or delete that reaction.
+
+The `reactions` field on message views is an aggregate map:
+
+```json
+{
+  "thumbs_up": 2,
+  "eyes": 1
+}
+```
+
+## Files
+
+Files are stored in `m_workspace_files`; visibility is stored separately in
+`m_workspace_file_accesses`. Creating a file grants access to every current
+stream recipient. Users added to a stream later receive access to existing
+stream files; users removed from a stream lose access to those stream files.
+
+| Field | Type | Required on JSON create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | File identifier. |
+| `project_id` | UUID | no | yes | IAM project scope; hidden in API responses. |
+| `user_uuid` | UUID | no | yes | Owner/uploader. |
+| `stream_uuid` | UUID | yes | no | Stream that owns the file access scope. |
+| `name` | string | yes | no | File display name. |
+| `description` | string | yes | no | File description. |
+| `content_type` | string | yes | no | MIME content type. |
+| `size_bytes` | integer | yes | no | File size in bytes. |
+| `hash` | string | yes | no | File hash, currently SHA-256 for multipart uploads. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+JSON metadata create request:
+
+```json
+{
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "name": "example.txt",
+  "description": "Example",
+  "content_type": "text/plain",
+  "size_bytes": 12,
+  "hash": "abc"
+}
+```
+
+Multipart upload request:
+
+```http
+POST /api/messenger/v1/files/
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data
+
+file=<binary file part>
+stream_uuid=75309057-419c-4b12-a7c1-3932429ec4a6
+name=example.txt
+description=Example
+```
+
+For multipart uploads, `file` and `stream_uuid` are required. `name` defaults to
+the uploaded filename and `description` defaults to an empty string. The backend
+stores the bytes, sets `content_type` from the uploaded part, calculates
+`size_bytes`, and writes a SHA-256 `hash`.
+
+`GET /v1/files/`, `GET /v1/files/{file_uuid}`, and
+`GET /v1/files/{file_uuid}/actions/download` require file access. `PUT` and
+`DELETE` require file ownership. Downloads return raw bytes with the stored
+`Content-Type` and a `Content-Disposition` attachment filename. File operations
+do not currently emit durable workspace realtime events.
+
 ## Events And Epoch
 
 Events are durable outbox rows stored in `m_workspace_events`. They are
-generated by stream, binding, topic, message, folder, and folder item changes.
+generated by stream, binding, topic, message, folder, folder item, and user
+changes.
 Events are always scoped to the affected `user_uuid`: message snapshots are
 per recipient, stream/topic/folder snapshots are per visible user, and delete
 events are sent only to users that need to remove local state. The event primary
@@ -816,6 +974,7 @@ Message event example:
       "pinned": false,
       "starred": false,
       "is_own": true,
+      "reactions": {},
       "created_at": "2026-06-22T10:10:00Z",
       "updated_at": "2026-06-22T10:10:00Z"
     },
@@ -905,6 +1064,26 @@ unlink local state. `stream.deleted`, `folder.deleted`, and
 }
 ```
 
+Read events contain the IDs that changed to read for the current user:
+
+```json
+{
+  "epoch_version": 128,
+  "uuid": "70678474-5c9f-4de3-9b41-020cd248eac4",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "messages.read",
+    "project_id": "22222222-2222-2222-2222-222222222222",
+    "message_uuids": [
+      "a93dca35-3061-4748-bda4-7f6f8c660ea5"
+    ]
+  },
+  "created_at": "2026-06-22T09:34:00Z",
+  "updated_at": "2026-06-22T09:34:00Z"
+}
+```
+
 Supported event payload kinds:
 
 | Payload kind | Produced by | REST payload |
@@ -917,8 +1096,10 @@ Supported event payload kinds:
 | `topic.updated` | `PUT /v1/stream_topics/{uuid}`, toggle done action, topic notification action, message unread-count changes | Full user topic snapshot. |
 | `topic.deleted` | `DELETE /v1/stream_topics/{uuid}` | Deleted topic `uuid` and `stream_uuid`. |
 | `message.created` | `POST /v1/messages/` | Full user message snapshot. |
-| `message.updated` | `PUT /v1/messages/{uuid}`, message read action | Full user message snapshot. |
+| `message.updated` | `PUT /v1/messages/{uuid}`, message reaction create/update/delete | Full user message snapshot. |
+| `messages.read` | message read, message read-up-to, topic read, and stream read actions | Project UUID and read `message_uuids`. |
 | `message.deleted` | `DELETE /v1/messages/{uuid}` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`. |
+| `user.updated` | presence action and stale-presence worker | Full workspace user snapshot for every workspace user. |
 | `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
 | `folder.updated` | stream create/delete, stream binding add/delete, message unread-count changes, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
 | `folder.deleted` | `DELETE /v1/folders/{uuid}` | Only deleted folder `uuid`. |
@@ -953,9 +1134,29 @@ than project-scoped.
 | `first_name` | string or `null` | First name. |
 | `last_name` | string or `null` | Last name. |
 | `email` | string or `null` | Email address. |
-| `last_ping_at` | datetime or `null` | Last ping timestamp. |
+| `last_ping_at` | datetime | Last ping timestamp. |
 | `created_at` | datetime | Creation time. |
 | `updated_at` | datetime | Update time. |
+
+Presence update:
+
+```http
+POST /api/messenger/v1/users/11111111-1111-1111-1111-111111111111/actions/presence/invoke
+Content-Type: application/json
+
+{
+  "status": "active"
+}
+```
+
+The authenticated user may update only their own `user_uuid`. The request
+stores the supplied `status` (`active`, `idle`, `offline`, or `do_not_disturb`)
+and the current time in `last_ping_at`. Clients should repeat the presence
+update about every 30 seconds. The messenger worker marks users with
+`status != "offline"` and older-than-one-minute `last_ping_at` as `offline`.
+`last_ping_at` is required in storage and defaults to the user row creation
+time. Presence changes emit `user.updated` events with a full user snapshot to
+every workspace user.
 
 ## WebSocket Realtime Summary
 
@@ -981,14 +1182,17 @@ normalized for dispatch:
 | Websocket `event.type` | `event.kind` | Body field |
 | --- | --- | --- |
 | `message` | omitted for `message.created`; `message.updated` or `message.deleted` otherwise | `message` |
+| `message` | `messages.read` | `message_uuids` |
 | `stream` | `stream.created`, `stream.updated`, `stream.deleted` | `stream` |
 | `stream_binding` | `stream_bindings.created` | `stream_uuid`, `stream_bindings` |
 | `topic` | `topic.created`, `topic.updated`, `topic.deleted` | `topic` |
+| `user` | `user.updated` | `user` |
 | `folder` | `folder.created`, `folder.updated`, `folder.deleted` | `folder` |
 | `folder_item` | `folder_item.deleted` | `folder_item` |
 
 Create/update events include full snapshots. Delete events are minimal and
 include only the identifiers documented in the event payload table above.
+`messages.read` events include only the `message_uuids` that changed to read.
 Folder create, folder update, and folder item add/pin/unpin events have
 `event.type: "folder"` and include a full folder snapshot:
 

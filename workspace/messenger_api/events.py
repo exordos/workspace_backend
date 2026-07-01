@@ -34,6 +34,7 @@ STREAM_DELETED_EVENT = event_payloads.StreamDeletedEventPayload.KIND
 STREAM_BINDINGS_CREATED_EVENT = (
     event_payloads.StreamBindingsCreatedEventPayload.KIND
 )
+USER_UPDATED_EVENT = event_payloads.UserUpdatedEventPayload.KIND
 TOPIC_CREATED_EVENT = event_payloads.TopicCreatedEventPayload.KIND
 TOPIC_UPDATED_EVENT = event_payloads.TopicUpdatedEventPayload.KIND
 TOPIC_DELETED_EVENT = event_payloads.TopicDeletedEventPayload.KIND
@@ -69,6 +70,9 @@ WORKSPACE_USER_TOPIC_FIELDS = tuple(
 WORKSPACE_USER_FOLDER_FIELDS = tuple(
     models.UserFolder.properties.properties
 )
+WORKSPACE_USER_FIELDS = tuple(
+    models.WorkspaceUser.properties.properties
+)
 
 
 def _to_uuid_string(value):
@@ -78,7 +82,7 @@ def _to_uuid_string(value):
 def _event_payload_value(name, value):
     if value is None:
         return None
-    if name in ("created_at", "updated_at"):
+    if name in ("created_at", "updated_at", "last_ping_at"):
         value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(
             value
         )
@@ -137,6 +141,13 @@ def _stream_binding_snapshot_from_mapping(value):
     return {
         name: _event_payload_value(name, _event_payload_get(value, name))
         for name in WORKSPACE_STREAM_BINDING_FIELDS
+    }
+
+
+def _user_from_event_payload(event_payload):
+    return {
+        name: _event_payload_value(name, _event_payload_get(event_payload, name))
+        for name in WORKSPACE_USER_FIELDS
     }
 
 
@@ -263,6 +274,13 @@ def event_row_to_messenger_event(row):
                 payload["stream_uuid"],
             ),
             "stream_bindings": _stream_bindings_from_event_payload(payload),
+        }
+    if payload["kind"] == USER_UPDATED_EVENT:
+        return {
+            "epoch_version": row["epoch_version"],
+            "type": "user",
+            "kind": payload["kind"],
+            "user": _user_from_event_payload(payload),
         }
     if payload["kind"] == FOLDER_DELETED_EVENT:
         return {
@@ -520,6 +538,22 @@ def create_stream_bindings_created_event(bindings, user_uuid, session=None):
         ),
     )
     return event.insert(session=session)
+
+
+def create_user_updated_events(user, project_id, recipient_user_uuids,
+                               session=None):
+    result = []
+    payload = event_payloads.UserUpdatedEventPayload(**dict(user))
+    for recipient_user_uuid in recipient_user_uuids:
+        event_uuid = sys_uuid.uuid4()
+        event = models.WorkspaceEvent(
+            uuid=event_uuid,
+            project_id=project_id,
+            user_uuid=recipient_user_uuid,
+            payload=payload,
+        )
+        result.append(event.insert(session=session))
+    return result
 
 
 def create_folder_updated_event(folder, session=None):

@@ -52,11 +52,7 @@ class WorkspaceBaseResourceControllerPaginated(
     )
 
     def _get_user_uuid(self):
-        ctx = self.get_context()
-        user_uuid = getattr(ctx, "user_uuid", None) if ctx is not None else None
-        if user_uuid is None:
-            raise ra_exc.ValidationErrorException()
-        return user_uuid
+        return self.get_context().user_uuid
 
     def _get_project_id(self):
         ctx = self.get_context()
@@ -658,6 +654,21 @@ class WorkspaceUserController(
         convert_underscore=False,
         process_filters=True,
     )
+
+    def _get_user_uuid(self):
+        return self.get_context().user_uuid
+
+    def _get_project_id(self):
+        return self.get_context().project_id
+
+    @ra_actions.post
+    def presence(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.update_workspace_user_presence(
+            project_id=self._get_project_id(),
+            user_uuid=resource.uuid,
+            current_user_uuid=self._get_user_uuid(),
+            status=kwargs["status"],
+        )
 
 
 class MeController(ra_controllers.RoutesListController):

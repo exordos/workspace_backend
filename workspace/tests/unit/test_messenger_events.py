@@ -656,6 +656,46 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(str(stream_uuid), event["stream_uuid"])
         self.assertEqual(stream_bindings, event["stream_bindings"])
 
+    def test_event_row_to_messenger_event_uses_user_snapshot(self):
+        user_uuid = sys_uuid.uuid4()
+        user = {
+            "uuid": str(user_uuid),
+            "username": "john",
+            "source": "iam",
+            "status": "idle",
+            "first_name": "John",
+            "last_name": "Smith",
+            "email": "john@example.com",
+            "last_ping_at": "2026-06-24T10:05:00.000000Z",
+            "created_at": "2026-06-24T10:00:00.000000Z",
+            "updated_at": "2026-06-24T10:05:00.000000Z",
+        }
+
+        event = events.event_row_to_messenger_event(
+            {
+                "epoch_version": 16,
+                "user_uuid": user_uuid,
+                "payload": {
+                    "kind": "user.updated",
+                    "uuid": str(user_uuid),
+                    "username": "john",
+                    "source": "iam",
+                    "status": "idle",
+                    "first_name": "John",
+                    "last_name": "Smith",
+                    "email": "john@example.com",
+                    "last_ping_at": "2026-06-24 10:05:00.000000",
+                    "created_at": "2026-06-24 10:00:00.000000",
+                    "updated_at": "2026-06-24 10:05:00.000000",
+                },
+            }
+        )
+
+        self.assertEqual(16, event["epoch_version"])
+        self.assertEqual("user", event["type"])
+        self.assertEqual("user.updated", event["kind"])
+        self.assertEqual(user, event["user"])
+
     def test_event_row_to_messenger_event_uses_deleted_folder_id(self):
         user_uuid = sys_uuid.uuid4()
         folder_uuid = sys_uuid.uuid4()
@@ -886,6 +926,41 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(stream_uuid, payload.stream_uuid)
         self.assertEqual(str(user_uuid), payload.stream_bindings[0]["user_uuid"])
+
+    def test_user_updated_event_payload_accepts_postgres_json_timestamp(self):
+        user_uuid = sys_uuid.uuid4()
+
+        payload = event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE.from_simple_type(
+            {
+                "kind": "user.updated",
+                "uuid": str(user_uuid),
+                "username": "john",
+                "source": "iam",
+                "status": "active",
+                "first_name": "John",
+                "last_name": "Smith",
+                "email": "john@example.com",
+                "last_ping_at": "2026-06-24T22:28:40.166369",
+                "created_at": "2026-06-24T22:28:34.166369",
+                "updated_at": "2026-06-24T22:28:40.166369",
+            }
+        )
+
+        self.assertIsInstance(payload, event_payloads.UserUpdatedEventPayload)
+        self.assertEqual(user_uuid, payload.uuid)
+        self.assertEqual("active", payload.status)
+        self.assertEqual(
+            "2026-06-24T22:28:40.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.last_ping_at
+            ),
+        )
+        self.assertEqual(
+            "2026-06-24T22:28:40.166369Z",
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
+                payload.updated_at
+            ),
+        )
 
     def test_topic_created_event_payload_accepts_postgres_json_timestamp(self):
         user_uuid = sys_uuid.uuid4()

@@ -20,6 +20,9 @@ The internal websocket service endpoint is `/v1/events/ws` on
 `127.0.0.1:21082`. UI code must use `/api/messenger/ws`; do not connect to the
 internal service path from the browser.
 
+Presence offline transitions are performed by `workspace-messenger-worker`,
+which is included in the deployment manifest.
+
 ## Authentication
 
 REST requests use the normal IAM bearer token:
@@ -78,6 +81,7 @@ handshake is closed with code `4400`.
       "pinned": false,
       "starred": false,
       "is_own": true,
+      "reactions": {},
       "created_at": "2026-06-22T10:10:00Z",
       "updated_at": "2026-06-22T10:10:00Z"
     },
@@ -91,7 +95,8 @@ All raw REST events use the same outbox envelope. Create/update payloads carry
 the persisted/view snapshot for the affected user. Delete payloads are minimal:
 `stream.deleted`, `folder.deleted`, and `folder_item.deleted` contain only
 `uuid`; `topic.deleted` contains `uuid` and `stream_uuid`; `message.deleted`
-contains `uuid`, `stream_uuid`, and `topic_uuid`.
+contains `uuid`, `stream_uuid`, and `topic_uuid`. `messages.read` contains
+`project_id` and the `message_uuids` that changed to read.
 
 Folder update raw REST event:
 
@@ -182,6 +187,26 @@ Delete raw REST events:
 }
 ```
 
+Read raw REST event:
+
+```json
+{
+  "epoch_version": 129,
+  "uuid": "6f3a6854-bca5-4a1d-8f68-6882af643f0f",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "messages.read",
+    "project_id": "22222222-2222-2222-2222-222222222222",
+    "message_uuids": [
+      "a93dca35-3061-4748-bda4-7f6f8c660ea5"
+    ]
+  },
+  "created_at": "2026-06-22T09:35:00Z",
+  "updated_at": "2026-06-22T09:35:00Z"
+}
+```
+
 For catch-up, request events strictly newer than the last successfully handled
 epoch:
 
@@ -243,9 +268,26 @@ Event frame:
       "pinned": false,
       "starred": false,
       "is_own": true,
+      "reactions": {},
       "created_at": "2026-06-22T10:10:00Z",
       "updated_at": "2026-06-22T10:10:00Z"
     }
+  }
+}
+```
+
+Read event frame:
+
+```json
+{
+  "type": "event",
+  "event": {
+    "epoch_version": 126,
+    "type": "message",
+    "kind": "messages.read",
+    "message_uuids": [
+      "a93dca35-3061-4748-bda4-7f6f8c660ea5"
+    ]
   }
 }
 ```
@@ -256,7 +298,7 @@ Stream create event frame:
 {
   "type": "event",
   "event": {
-    "epoch_version": 126,
+    "epoch_version": 127,
     "type": "stream",
     "kind": "stream.created",
     "stream": {
@@ -278,6 +320,8 @@ Stream create event frame:
       "private": false,
       "is_archived": false,
       "direct_user_uuid": null,
+      "color": 3750201,
+      "last_message_uuid": null,
       "created_at": "2026-06-22T09:30:00Z",
       "updated_at": "2026-06-22T09:30:00Z"
     }
@@ -302,7 +346,10 @@ the binding has been removed.
 When a new message is unread for a user, that user receives the message event
 and aggregate `topic.updated`, `stream.updated`, and `folder.updated` events.
 The same aggregate updates are sent when unread counts decrease because the
-user marks a message as read or because an unread message is deleted.
+user marks messages as read or because an unread message is deleted. Read
+actions also emit `messages.read` with the UUIDs that changed to read.
+Creating, updating, or deleting message reactions emits `message.updated` with
+the latest aggregated `reactions` map.
 
 Folder update event frame:
 
@@ -391,6 +438,25 @@ The client may respond with:
 }
 ```
 
+Presence is updated through REST, not through websocket `ping`/`pong`. While the
+user is connected, call:
+
+```http
+POST /api/messenger/v1/users/{user_uuid}/actions/presence/invoke
+Content-Type: application/json
+
+{
+  "status": "active"
+}
+```
+
+Send the request about every 30 seconds with one of `active`, `idle`, `offline`,
+or `do_not_disturb`. The backend writes `last_ping_at` for each presence update.
+The messenger worker marks users with `status !== "offline"` and
+older-than-one-minute `last_ping_at` as `offline`. `last_ping_at` is required in
+storage and defaults to the user row creation time. Presence changes emit
+`user.updated` events with a full user snapshot to every workspace user.
+
 After processing an event, the client may also acknowledge the latest handled
 cursor:
 
@@ -417,6 +483,11 @@ type WorkspaceRealtimeEvent = {
       type: "message";
       kind?: "message.updated";
       message: WorkspaceUserMessage;
+    }
+  | {
+      type: "message";
+      kind: "messages.read";
+      message_uuids: string[];
     }
   | {
       type: "message";
@@ -450,6 +521,11 @@ type WorkspaceRealtimeEvent = {
       topic: { uuid: string; stream_uuid: string };
     }
   | {
+      type: "user";
+      kind: "user.updated";
+      user: WorkspaceUser;
+    }
+  | {
       type: "folder";
       kind: "folder.created" | "folder.updated";
       folder: WorkspaceFolder;
@@ -471,11 +547,13 @@ REST `/events/` returns the raw outbox model, so the UI catch-up path must
 normalize `WorkspaceEventModel` to the same shape as websocket event frames.
 
 Current mapping. The `toWorkspaceUserMessage`, `toWorkspaceUserStream`,
-`toWorkspaceUserTopic`, and `toWorkspaceFolder` helpers should copy the same
+`toWorkspaceUserTopic`, `toWorkspaceUser`, and `toWorkspaceFolder` helpers
+should copy the same
 fields returned by the matching REST resource. In particular, keep
 `notification_mode` on streams, stream bindings, and topics, keep
-`is_archived` on streams, and keep `read`, `pinned`, `starred`, and `is_own`
-on messages.
+`is_archived`, `color`, and `last_message_uuid` on streams, keep `color` and
+`last_message_uuid` on topics, and keep `read`, `pinned`, `starred`, `is_own`,
+and `reactions` on messages.
 
 ```ts
 function normalizeWorkspaceEvent(
@@ -491,6 +569,14 @@ function normalizeWorkspaceEvent(
           ? { kind: "message.updated" as const }
           : {}),
         message: toWorkspaceUserMessage(model.payload),
+      };
+
+    case "messages.read":
+      return {
+        epoch_version: model.epoch_version,
+        type: "message",
+        kind: "messages.read",
+        message_uuids: model.payload.message_uuids,
       };
 
     case "message.deleted":
@@ -563,6 +649,14 @@ function normalizeWorkspaceEvent(
         },
       };
 
+    case "user.updated":
+      return {
+        epoch_version: model.epoch_version,
+        type: "user",
+        kind: "user.updated",
+        user: toWorkspaceUser(model.payload),
+      };
+
     case "folder.created":
     case "folder.updated":
       return {
@@ -599,15 +693,16 @@ function normalizeWorkspaceEvent(
 }
 ```
 
-The persisted event payload currently includes `read`, `pinned`, `starred`, and
-`is_own` for the recipient. UI code should prefer those backend values. A legacy
-fallback may compute missing values as:
+The persisted event payload currently includes `read`, `pinned`, `starred`,
+`is_own`, and `reactions` for the recipient. UI code should prefer those
+backend values. A legacy fallback may compute missing values as:
 
 ```ts
 const isOwn = message.author_uuid === currentUserUuid;
 const read = isOwn;
 const pinned = false;
 const starred = false;
+const reactions = {};
 ```
 
 Stream names, topic names, and user display names are intentionally not resolved
@@ -658,13 +753,14 @@ UUID.
 - The UI dispatch pipeline must be idempotent.
 - REST v1 supports `stream.created`, `stream.updated`, `stream.deleted`,
   `stream_bindings.created`, `topic.created`, `topic.updated`,
-  `topic.deleted`, `message.created`, `message.updated`, `message.deleted`,
-  `folder.created`, `folder.updated`, `folder.deleted`, and
-  `folder_item.deleted`.
+  `topic.deleted`, `message.created`, `message.updated`, `messages.read`,
+  `message.deleted`, `user.updated`, `folder.created`, `folder.updated`,
+  `folder.deleted`, and `folder_item.deleted`.
 - Websocket v1 emits `event.type === "stream"`, `event.type === "message"`,
   `event.type === "stream_binding"`, `event.type === "topic"`,
-  `event.type === "folder"`, and `event.type === "folder_item"`. All events
-  except `message.created` include `event.kind`.
+  `event.type === "user"`, `event.type === "folder"`, and
+  `event.type === "folder_item"`. All events except `message.created` include
+  `event.kind`.
 
 ## Manual Verification Checklist
 

@@ -46,6 +46,7 @@ TOPIC_NOTIFICATION_MODES = {
 MUTED_STREAM_TOPIC_NOTIFICATION_MODES = TOPIC_NOTIFICATION_MODES | {
     models.WorkspaceTopicNotificationMode.UNMUTE.value,
 }
+WORKSPACE_USER_OFFLINE_TIMEOUT = datetime.timedelta(minutes=1)
 
 
 def _random_color():
@@ -58,6 +59,101 @@ def _ensure_color(values):
         values["color"] is None
     ):
         values["color"] = _random_color()
+
+
+def _get_workspace_user_event_recipients(session=None):
+    users = models.WorkspaceUser.objects.get_all(
+        order_by={"uuid": "asc"},
+        session=session,
+    )
+    return [user.uuid for user in users]
+
+
+def _get_workspace_event_project_ids(session=None):
+    bindings = models.WorkspaceStreamBinding.objects.get_all(
+        order_by={"project_id": "asc"},
+        session=session,
+    )
+    events = models.WorkspaceEvent.objects.get_all(
+        order_by={"project_id": "asc"},
+        session=session,
+    )
+    project_ids = []
+    for item in list(bindings) + list(events):
+        if item.project_id not in project_ids:
+            project_ids.append(item.project_id)
+    return project_ids
+
+
+def _create_workspace_user_updated_events(project_id, user, session=None):
+    recipient_user_uuids = _get_workspace_user_event_recipients(
+        session=session,
+    )
+    return messenger_events.create_user_updated_events(
+        user=user,
+        project_id=project_id,
+        recipient_user_uuids=recipient_user_uuids,
+        session=session,
+    )
+
+
+def _get_stale_workspace_users(cutoff, session=None):
+    return models.WorkspaceUser.objects.get_all(
+        filters=dm_filters.AND(
+            {"status": dm_filters.NE(models.WorkspaceUserStatus.OFFLINE.value)},
+            {"last_ping_at": dm_filters.LE(cutoff)},
+        ),
+        order_by={"uuid": "asc"},
+        session=session,
+    )
+
+
+def update_workspace_user_presence(project_id, user_uuid, current_user_uuid,
+                                   status, session=None):
+    if user_uuid != current_user_uuid:
+        raise storage_exc.RecordNotFound(
+            model=models.WorkspaceUser.__name__,
+            filters={"uuid": user_uuid},
+        )
+
+    user = models.WorkspaceUser.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    user.update_dm(
+        values={
+            "status": status,
+            "last_ping_at": datetime.datetime.now(datetime.timezone.utc),
+        },
+    )
+    user.update(session=session)
+    _create_workspace_user_updated_events(
+        project_id=project_id,
+        user=user,
+        session=session,
+    )
+    return user
+
+
+def mark_stale_workspace_users_offline(now=None, session=None):
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - WORKSPACE_USER_OFFLINE_TIMEOUT
+    users = _get_stale_workspace_users(cutoff, session=session)
+    project_ids = _get_workspace_event_project_ids(session=session)
+    for user in users:
+        user.update_dm(
+            values={"status": models.WorkspaceUserStatus.OFFLINE.value},
+        )
+        user.update(session=session)
+        for project_id in project_ids:
+            _create_workspace_user_updated_events(
+                project_id=project_id,
+                user=user,
+                session=session,
+            )
+    return users
 
 
 def get_workspace_user_folder(project_id, user_uuid, folder_uuid,
@@ -613,9 +709,7 @@ def _create_workspace_stream_binding_message_flags(project_id, stream_uuid,
         str(project_id),
         str(stream_uuid),
     )
-    engine = models.WorkspaceUserMessageFlags._get_engine()
-    with engine.session_manager(session=session) as s:
-        s.execute(statement, values)
+    session.execute(statement, values)
 
 
 def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,

@@ -19,6 +19,8 @@ import logging
 from restalchemy.common import contexts
 from gcl_looper.services import basic
 
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
+
 LOG = logging.getLogger(__name__)
 
 
@@ -28,5 +30,7 @@ class MessengerWorkerAgent(basic.BasicService):
 
     def _iteration(self):
         ctx = contexts.Context()
-        with ctx.session_manager():
-            pass
+        with ctx.session_manager() as session:
+            messenger_dm_helpers.mark_stale_workspace_users_offline(
+                session=session,
+            )

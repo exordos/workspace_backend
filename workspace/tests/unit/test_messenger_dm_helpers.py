@@ -1075,36 +1075,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         project_id = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
-        session = object()
-        sql_session = types.SimpleNamespace(execute=mock.Mock())
+        session = types.SimpleNamespace(execute=mock.Mock())
 
-        class SessionContext:
-            def __enter__(self):
-                return sql_session
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
-
-        engine = types.SimpleNamespace(
-            session_manager=mock.Mock(return_value=SessionContext())
+        dm_helpers._create_workspace_stream_binding_message_flags(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_uuid=user_uuid,
+            session=session,
         )
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-        ) as flags_model:
-            flags_model._get_engine.return_value = engine
-            dm_helpers._create_workspace_stream_binding_message_flags(
-                project_id=project_id,
-                stream_uuid=stream_uuid,
-                user_uuid=user_uuid,
-                session=session,
-            )
-
-        flags_model._get_engine.assert_called_once_with()
-        engine.session_manager.assert_called_once_with(session=session)
-        sql_session.execute.assert_called_once()
-        statement, values = sql_session.execute.call_args.args
+        session.execute.assert_called_once()
+        statement, values = session.execute.call_args.args
         self.assertIn(
             'INSERT INTO "m_workspace_user_message_flags"',
             statement,

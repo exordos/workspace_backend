@@ -67,6 +67,143 @@ def test_user_get_by_uuid_uses_global_user_table(api, db):
     assert [user["uuid"] for user in resp.json()] == [str(user_uuid)]
 
 
+def test_user_presence_action_updates_current_user_presence(api, db):
+    username = f"user-{api.user_uuid}"
+    event_recipient_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, api.user_uuid, username)
+    conftest.seed_workspace_user(
+        db,
+        event_recipient_uuid,
+        f"user-{event_recipient_uuid}",
+    )
+
+    resp = api.post(
+        f"{USERS}{api.user_uuid}/actions/presence/invoke",
+        json={"status": "idle"},
+    )
+    assert resp.status_code == 200, resp.text
+    user = resp.json()
+    assert user["uuid"] == str(api.user_uuid)
+    assert user["status"] == "idle"
+    assert user["last_ping_at"] is not None
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT status, last_ping_at
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (str(api.user_uuid),),
+        )
+        row = cur.fetchone()
+    assert row[0] == "idle"
+    assert row[1] is not None
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'user.updated'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, str(api.user_uuid)),
+        )
+        event_rows = cur.fetchall()
+    event_recipient_uuids = {str(row[0]) for row in event_rows}
+    assert str(api.user_uuid) in event_recipient_uuids
+    assert str(event_recipient_uuid) in event_recipient_uuids
+    for _, payload in event_rows:
+        assert payload["username"] == username
+        assert payload["status"] == "idle"
+        assert payload["last_ping_at"] is not None
+
+    other_user_uuid = sys_uuid.uuid4()
+    resp = api.post(
+        f"{USERS}{api.user_uuid}/actions/presence/invoke",
+        user=other_user_uuid,
+        json={"status": "active"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+def test_user_status_is_offline_when_last_ping_is_stale(api, db):
+    user_uuid = sys_uuid.uuid4()
+    event_recipient_uuid = sys_uuid.uuid4()
+    username = f"user-{user_uuid}"
+    conftest.seed_workspace_user(db, user_uuid, username)
+    conftest.seed_workspace_user(
+        db,
+        event_recipient_uuid,
+        f"user-{event_recipient_uuid}",
+    )
+    conftest.seed_user_stream(db, api.project_id, api.user_uuid, "status-team")
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_users
+            SET status = 'active',
+                last_ping_at = NOW() - INTERVAL '2 minutes'
+            WHERE uuid = %s
+            """,
+            (str(user_uuid),),
+        )
+
+    messenger_dm_helpers.mark_stale_workspace_users_offline()
+
+    resp = api.get(f"{USERS}{user_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "offline"
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT status
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (str(user_uuid),),
+        )
+        assert cur.fetchone()[0] == "offline"
+
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'user.updated'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, str(user_uuid)),
+        )
+        event_rows = cur.fetchall()
+    event_recipient_uuids = {str(row[0]) for row in event_rows}
+    assert str(user_uuid) in event_recipient_uuids
+    assert str(event_recipient_uuid) in event_recipient_uuids
+    for _, payload in event_rows:
+        assert payload["username"] == username
+        assert payload["status"] == "offline"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_users
+            SET status = 'do_not_disturb',
+                last_ping_at = NOW()
+            WHERE uuid = %s
+            """,
+            (str(user_uuid),),
+        )
+
+    resp = api.get(f"{USERS}{user_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "do_not_disturb"
+
+
 # --------------------------------------------------------------------------- #
 # Files: metadata and local storage
 # --------------------------------------------------------------------------- #

@@ -320,18 +320,30 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
     return str(stream_uuid)
 
 
-def seed_workspace_user(conn, user_uuid, username):
+def seed_workspace_user(conn, user_uuid, username, status="active",
+                        last_ping_at=None):
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO m_workspace_users
-                (uuid, username, source, status, created_at, updated_at)
-            VALUES (%s, %s, 'iam', 'active', NOW(), NOW())
+                (uuid, username, source, status, last_ping_at,
+                 created_at, updated_at)
+            VALUES (
+                %s,
+                %s,
+                'iam',
+                %s,
+                COALESCE(%s::timestamp with time zone, NOW()),
+                NOW(),
+                NOW()
+            )
             ON CONFLICT (uuid) DO UPDATE
                 SET username = EXCLUDED.username,
+                    status = EXCLUDED.status,
+                    last_ping_at = EXCLUDED.last_ping_at,
                     updated_at = NOW()
             """,
-            (str(user_uuid), username),
+            (str(user_uuid), username, status, last_ping_at),
         )
 
 
