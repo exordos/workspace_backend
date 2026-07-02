@@ -234,6 +234,11 @@ def _database():
             "CREATE DATABASE workspace_test OWNER workspace;" % (TEST_DB_URL, exc)
         )
 
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS \"public\" CASCADE;")
+            cur.execute("CREATE SCHEMA \"public\";")
+
     engines.engine_factory.configure_factory(db_url=TEST_DB_URL)
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
