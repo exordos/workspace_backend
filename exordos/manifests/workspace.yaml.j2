@@ -60,8 +60,6 @@ resources:
           - size: 8
             image: "{{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace/{{ version }}/images/workspace-backend.raw.zst"
             label: root
-          - size: 20
-            label: data
 
   $core.secret.passwords:
     workspace_db_password:
@@ -111,11 +109,11 @@ resources:
 
   $s3aas.types.s3.instances:
     workspace_s3:
-      name: "workspace-s3"
+      name: "workspace-s3-service"
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       cpu: $workspace.imports.$var_default_cores:value
       ram: $workspace.imports.$var_default_ram:value
-      disk_size: 50
+      disk_size: 51
       nodes_number: 1
       kind: "single_node"
       version: $workspace.imports.$rustfs_1:uuid
