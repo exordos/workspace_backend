@@ -21,6 +21,7 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.messenger_api.dm import models
 
@@ -355,6 +356,20 @@ def _delete_workspace_stream_binding_file_accesses(project_id, stream_uuid,
 
 
 def create_workspace_file(project_id, user_uuid, uuid, session=None, **values):
+    if (
+        "storage_type" not in values
+        or "storage_id" not in values
+        or "storage_object_id" not in values
+    ):
+        storage_info = file_storage.get_workspace_file_storage_info(
+            file_uuid=uuid,
+            storage_type=values.get("storage_type"),
+            storage_object_id=values.get("storage_object_id"),
+        )
+        values.setdefault("storage_type", storage_info.storage_type)
+        values.setdefault("storage_id", storage_info.storage_id)
+        values.setdefault("storage_object_id", storage_info.storage_object_id)
+
     file = models.WorkspaceFile(
         uuid=uuid,
         project_id=project_id,

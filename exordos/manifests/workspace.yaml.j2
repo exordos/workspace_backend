@@ -9,12 +9,18 @@ requirements:
     from_version: "0.0.0"
   dbaas:
     from_version: "0.0.0"
+  s3aas:
+    from_version: "0.0.0"
 
 imports:
   pg18:
     element: "$dbaas"
     kind: "resource"
     link: "$dbaas.types.postgres.versions.$pg18"
+  rustfs_1:
+    element: "$s3aas"
+    kind: "resource"
+    link: "$s3aas.types.s3.versions.$rustfs_1"
   core_local_domain:
     element: "$core"
     kind: "resource"
@@ -64,6 +70,20 @@ resources:
       constructor:
         kind: plain
       method: AUTO_HEX
+    workspace_s3_access_key:
+      name: workspace_s3_access_key
+      description: "Workspace messenger files S3 access key"
+      default_length: 20
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_s3_secret_key:
+      name: workspace_s3_secret_key
+      description: "Workspace messenger files S3 secret key"
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
 
   $dbaas.types.postgres.instances:
     workspace_cluster_pg:
@@ -88,6 +108,66 @@ resources:
       name: workspace
       owner: $dbaas.types.postgres.instances.$workspace_cluster_pg.users.$workspace_db_user:uuid
       instance: $dbaas.types.postgres.instances.$workspace_cluster_pg:uuid
+
+  $s3aas.types.s3.instances:
+    workspace_s3:
+      name: "workspace-s3"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cpu: $workspace.imports.$var_default_cores:value
+      ram: $workspace.imports.$var_default_ram:value
+      disk_size: 50
+      nodes_number: 1
+      kind: "single_node"
+      version: $workspace.imports.$rustfs_1:uuid
+
+  $s3aas.types.s3.instances.$workspace_s3.buckets:
+    workspace_files_bucket:
+      name: "workspace-files"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+      versioning_enabled: false
+      quota_bytes: 0
+      object_lock_enabled: false
+      public: false
+
+  $s3aas.types.s3.instances.$workspace_s3.policies:
+    workspace_files_policy:
+      name: "workspace-files-policy"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+      content:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+              - "s3:ListBucket"
+            Resource:
+              - f"arn:aws:s3:::{$s3aas.types.s3.instances.$workspace_s3.buckets.$workspace_files_bucket:name}"
+              - f"arn:aws:s3:::{$s3aas.types.s3.instances.$workspace_s3.buckets.$workspace_files_bucket:name}/*"
+
+  $s3aas.types.s3.instances.$workspace_s3.users:
+    workspace_files_user:
+      name: "workspace-files"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+
+  $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user.policies:
+    workspace_files_policy_attachment:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      policy: $s3aas.types.s3.instances.$workspace_s3.policies.$workspace_files_policy:uuid
+      user: $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user:uuid
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+
+  $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user.access_keys:
+    workspace_files_access_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      access_key: $core.secret.passwords.$workspace_s3_access_key:value
+      secret_key: $core.secret.passwords.$workspace_s3_secret_key:value
+      user: $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user:uuid
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
 
   $core.config.configs:
     workspace_backend_config:
@@ -145,7 +225,16 @@ resources:
 
 
           [messenger_files]
+          default_type = s3
           storage_path = /var/lib/workspace/messenger/files
+
+
+          [messenger_files_s3]
+          endpoint_url = http://{$s3aas.types.s3.instances.$workspace_s3:join(ipsv4)}:9000
+          bucket_name = {$s3aas.types.s3.instances.$workspace_s3.buckets.$workspace_files_bucket:name}
+          access_key_id = {$core.secret.passwords.$workspace_s3_access_key:value}
+          secret_access_key = {$core.secret.passwords.$workspace_s3_secret_key:value}
+          region_name = us-east-1
           "
     workspace_backend_nginx:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"

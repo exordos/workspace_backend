@@ -1,0 +1,137 @@
+#    Copyright 2026 Genesis Corporation.
+#
+#    All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+import io
+import types
+import uuid as sys_uuid
+from unittest import mock
+
+from workspace.common import file_storage_opts
+from workspace.messenger_api import file_storage
+
+
+def _patch_conf(monkeypatch, tmp_path, default_type="file"):
+    conf = {
+        file_storage_opts.DOMAIN: types.SimpleNamespace(
+            default_type=default_type,
+            storage_path=str(tmp_path),
+        ),
+        file_storage_opts.S3_DOMAIN: types.SimpleNamespace(
+            endpoint_url="http://s3.local",
+            bucket_name="workspace-files",
+            access_key_id="access",
+            secret_access_key="secret",
+            region_name="us-east-1",
+        ),
+    }
+    monkeypatch.setattr(file_storage, "CONF", conf)
+
+
+def test_local_storage_saves_reads_and_deletes_file(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    data = b"local data"
+
+    storage_info = file_storage.save_workspace_file(
+        file_uuid=file_uuid,
+        data=data,
+    )
+
+    assert storage_info.storage_type == file_storage_opts.STORAGE_TYPE_FILE
+    assert storage_info.storage_id == ""
+    assert storage_info.storage_object_id == (
+        file_storage.get_workspace_file_object_id(file_uuid)
+    )
+    assert file_storage.read_workspace_file(
+        file_uuid=file_uuid,
+        storage_type=storage_info.storage_type,
+        storage_object_id=storage_info.storage_object_id,
+    ) == data
+
+    path = file_storage.get_workspace_file_path(file_uuid=file_uuid)
+    assert path.read_bytes() == data
+
+    file_storage.delete_workspace_file(
+        file_uuid=file_uuid,
+        storage_type=storage_info.storage_type,
+        storage_object_id=storage_info.storage_object_id,
+    )
+    assert not path.exists()
+
+
+def test_default_storage_type_selects_s3(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path, default_type="s3")
+    file_uuid = sys_uuid.uuid4()
+    storage = mock.Mock()
+    storage.save.return_value = file_storage.WorkspaceFileStorageInfo(
+        storage_type="s3",
+        storage_id="workspace-files",
+        storage_object_id="key",
+    )
+
+    with mock.patch.object(
+        file_storage,
+        "S3WorkspaceFileStorage",
+        return_value=storage,
+    ):
+        storage_info = file_storage.save_workspace_file(
+            file_uuid=file_uuid,
+            data=b"s3 data",
+        )
+
+    storage.save.assert_called_once_with(
+        file_uuid=file_uuid,
+        data=b"s3 data",
+        storage_object_id=None,
+    )
+    assert storage_info.storage_type == "s3"
+
+
+def test_s3_storage_uses_configured_bucket_and_key(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    client = mock.Mock()
+    client.get_object.return_value = {"Body": io.BytesIO(b"s3 data")}
+
+    storage = file_storage.S3WorkspaceFileStorage()
+    storage._client = client
+
+    storage_info = storage.save(file_uuid=file_uuid, data=b"s3 data")
+    data = storage.read(
+        file_uuid=file_uuid,
+        storage_object_id=storage_info.storage_object_id,
+    )
+    storage.delete(
+        file_uuid=file_uuid,
+        storage_object_id=storage_info.storage_object_id,
+    )
+
+    assert storage_info.storage_type == "s3"
+    assert storage_info.storage_id == "workspace-files"
+    assert data == b"s3 data"
+    client.put_object.assert_called_once_with(
+        Body=b"s3 data",
+        Bucket="workspace-files",
+        Key=storage_info.storage_object_id,
+    )
+    client.get_object.assert_called_once_with(
+        Bucket="workspace-files",
+        Key=storage_info.storage_object_id,
+    )
+    client.delete_object.assert_called_once_with(
+        Bucket="workspace-files",
+        Key=storage_info.storage_object_id,
+    )

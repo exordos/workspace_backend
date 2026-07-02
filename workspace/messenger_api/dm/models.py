@@ -24,6 +24,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
+from workspace.common import file_storage_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import event_payloads
 
@@ -260,6 +261,18 @@ class WorkspaceFile(
         required=True,
     )
     hash = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+    storage_type = properties.property(
+        types.Enum(file_storage_opts.STORAGE_TYPES),
+        default=file_storage_opts.STORAGE_TYPE_FILE,
+    )
+    storage_id = properties.property(
+        types.String(max_length=255),
+        default="",
+    )
+    storage_object_id = properties.property(
         types.String(min_length=1, max_length=255),
         required=True,
     )

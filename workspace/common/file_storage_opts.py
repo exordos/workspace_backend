@@ -18,10 +18,20 @@ from oslo_config import cfg
 
 
 DOMAIN = "messenger_files"
+S3_DOMAIN = "messenger_files_s3"
 ENV_STORAGE_PATH = "WORKSPACE_FILE_STORAGE_PATH"
 DEFAULT_STORAGE_PATH = "/var/lib/workspace/messenger/files"
+STORAGE_TYPE_FILE = "file"
+STORAGE_TYPE_S3 = "s3"
+STORAGE_TYPES = (STORAGE_TYPE_FILE, STORAGE_TYPE_S3)
 
 file_storage_opts = [
+    cfg.StrOpt(
+        "default-type",
+        default=STORAGE_TYPE_FILE,
+        choices=STORAGE_TYPES,
+        help="Default messenger file storage type",
+    ),
     cfg.StrOpt(
         "storage-path",
         default=DEFAULT_STORAGE_PATH,
@@ -29,6 +39,15 @@ file_storage_opts = [
     ),
 ]
 
+s3_storage_opts = [
+    cfg.StrOpt("endpoint-url", help="S3 endpoint URL"),
+    cfg.StrOpt("bucket-name", help="Name of the S3 bucket"),
+    cfg.StrOpt("access-key-id", help="AWS access key ID"),
+    cfg.StrOpt("secret-access-key", help="AWS secret access key"),
+    cfg.StrOpt("region-name", help="AWS region name"),
+]
+
 
 def register_opts(conf=cfg.CONF):
     conf.register_opts(file_storage_opts, DOMAIN)
+    conf.register_opts(s3_storage_opts, S3_DOMAIN)

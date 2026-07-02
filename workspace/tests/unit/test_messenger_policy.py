@@ -917,11 +917,21 @@ def test_file_controller_create_uses_context_scope():
     controller = controllers.WorkspaceFileController(request)
     returned_file = object()
 
+    storage_info = controllers.file_storage.WorkspaceFileStorageInfo(
+        storage_type="file",
+        storage_id="",
+        storage_object_id="aa/file",
+    )
+
     with mock.patch.object(
         controllers.messenger_dm_helpers,
         "create_workspace_file",
         return_value=returned_file,
-    ) as create_file:
+    ) as create_file, mock.patch.object(
+        controllers.file_storage,
+        "get_workspace_file_storage_info",
+        return_value=storage_info,
+    ) as get_storage_info:
         result = controller.create(
             project_id=sys_uuid.uuid4(),
             user_uuid=sys_uuid.uuid4(),
@@ -940,6 +950,13 @@ def test_file_controller_create_uses_context_scope():
     assert create_kwargs["stream_uuid"] == stream_uuid
     assert create_kwargs["name"] == "example.txt"
     assert create_kwargs["hash"] == "abc"
+    assert create_kwargs["storage_type"] == "file"
+    assert create_kwargs["storage_id"] == ""
+    assert create_kwargs["storage_object_id"] == "aa/file"
+    get_storage_info.assert_called_once_with(
+        file_uuid=create_kwargs["uuid"],
+        storage_type=None,
+    )
 
 
 def test_file_controller_autofilters_use_accesses():
@@ -989,15 +1006,23 @@ def test_file_controller_create_from_multipart_builds_file_metadata():
     parts = {
         "file": file_part,
         "stream_uuid": types.SimpleNamespace(value=str(stream_uuid)),
+        "storage_type": types.SimpleNamespace(value="s3"),
     }
     returned_file = object()
+    storage_info = controllers.file_storage.WorkspaceFileStorageInfo(
+        storage_type="s3",
+        storage_id="workspace-files",
+        storage_object_id="key",
+    )
 
     with mock.patch.object(
         controllers.messenger_dm_helpers,
         "create_workspace_file",
         return_value=returned_file,
     ) as create_file, mock.patch.object(
-        controllers.file_storage, "save_workspace_file"
+        controllers.file_storage,
+        "save_workspace_file",
+        return_value=storage_info,
     ) as save_file:
         result = controller.create(multipart=True, parts=parts)
 
@@ -1010,10 +1035,14 @@ def test_file_controller_create_from_multipart_builds_file_metadata():
     save_file.assert_called_once_with(
         file_uuid=create_kwargs["uuid"],
         data=data,
+        storage_type="s3",
     )
     assert create_kwargs["content_type"] == "text/plain"
     assert create_kwargs["size_bytes"] == len(data)
     assert create_kwargs["hash"] == hashlib.sha256(data).hexdigest()
+    assert create_kwargs["storage_type"] == "s3"
+    assert create_kwargs["storage_id"] == "workspace-files"
+    assert create_kwargs["storage_object_id"] == "key"
 
 
 def test_file_controller_download_returns_file_response():
@@ -1031,6 +1060,8 @@ def test_file_controller_download_returns_file_response():
         uuid=file_uuid,
         name='example "file".txt',
         content_type="text/plain",
+        storage_type="s3",
+        storage_object_id="key",
     )
     data = b"example data"
 
@@ -1041,9 +1072,61 @@ def test_file_controller_download_returns_file_response():
     ) as read_file:
         response = controller._download_file_response(resource)
 
-    read_file.assert_called_once_with(file_uuid=file_uuid)
+    read_file.assert_called_once_with(
+        file_uuid=file_uuid,
+        storage_type="s3",
+        storage_object_id="key",
+    )
     assert response.status_int == 200
     assert response.body == data
     assert response.content_type == "text/plain"
     content_disposition = response.headers["Content-Disposition"]
     assert 'filename="example \\"file\\".txt"' in content_disposition
+
+
+
+def test_file_controller_delete_removes_backend_object():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceFileController(request)
+    file = types.SimpleNamespace(
+        storage_type="s3",
+        storage_object_id="key",
+    )
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "get_workspace_owned_file",
+        return_value=file,
+    ) as get_file, mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "delete_workspace_file",
+    ) as delete_file, mock.patch.object(
+        controllers.file_storage,
+        "delete_workspace_file",
+    ) as delete_stored_file:
+        result = controller.delete(file_uuid)
+
+    assert result is delete_file.return_value
+    get_file.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        file_uuid=file_uuid,
+    )
+    delete_file.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        file_uuid=file_uuid,
+    )
+    delete_stored_file.assert_called_once_with(
+        file_uuid=file_uuid,
+        storage_type="s3",
+        storage_object_id="key",
+    )

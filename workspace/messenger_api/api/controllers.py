@@ -192,7 +192,7 @@ class WorkspaceFileController(
 ):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceFile,
-        hidden_fields=["project_id"],
+        hidden_fields=["project_id", "storage_id", "storage_object_id"],
         convert_underscore=False,
         process_filters=True,
     )
@@ -251,7 +251,14 @@ class WorkspaceFileController(
         file_part.file.seek(0)
 
         file_uuid = sys_uuid.uuid4()
-        file_storage.save_workspace_file(file_uuid=file_uuid, data=data)
+        storage_info = file_storage.save_workspace_file(
+            file_uuid=file_uuid,
+            data=data,
+            storage_type=self._get_optional_multipart_value(
+                parts,
+                "storage_type",
+            ),
+        )
         try:
             return messenger_dm_helpers.create_workspace_file(
                 project_id=self._get_project_id(),
@@ -271,9 +278,16 @@ class WorkspaceFileController(
                 content_type=file_part.type,
                 size_bytes=len(data),
                 hash=hashlib.sha256(data).hexdigest(),
+                storage_type=storage_info.storage_type,
+                storage_id=storage_info.storage_id,
+                storage_object_id=storage_info.storage_object_id,
             )
         except Exception:
-            file_storage.delete_workspace_file(file_uuid=file_uuid)
+            file_storage.delete_workspace_file(
+                file_uuid=file_uuid,
+                storage_type=storage_info.storage_type,
+                storage_object_id=storage_info.storage_object_id,
+            )
             raise
 
     def create(self, **kwargs):
@@ -282,10 +296,20 @@ class WorkspaceFileController(
             return self._create_from_multipart(parts)
 
         values = self._apply_autovalues(kwargs)
+        values.pop("storage_id", None)
+        values.pop("storage_object_id", None)
+        file_uuid = values.pop("uuid", None) or sys_uuid.uuid4()
+        storage_info = file_storage.get_workspace_file_storage_info(
+            file_uuid=file_uuid,
+            storage_type=values.pop("storage_type", None),
+        )
         return messenger_dm_helpers.create_workspace_file(
             project_id=values.pop("project_id", self._get_project_id()),
             user_uuid=values.pop("user_uuid", self._get_user_uuid()),
-            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            uuid=file_uuid,
+            storage_type=storage_info.storage_type,
+            storage_id=storage_info.storage_id,
+            storage_object_id=storage_info.storage_object_id,
             **values,
         )
 
@@ -293,6 +317,9 @@ class WorkspaceFileController(
         values = kwargs.copy()
         values.pop("project_id", None)
         values.pop("user_uuid", None)
+        values.pop("storage_type", None)
+        values.pop("storage_id", None)
+        values.pop("storage_object_id", None)
         return messenger_dm_helpers.update_workspace_file(
             project_id=self._get_project_id(),
             user_uuid=self._get_user_uuid(),
@@ -301,16 +328,29 @@ class WorkspaceFileController(
         )
 
     def delete(self, uuid):
+        file = messenger_dm_helpers.get_workspace_owned_file(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            file_uuid=uuid,
+        )
         result = messenger_dm_helpers.delete_workspace_file(
             project_id=self._get_project_id(),
             user_uuid=self._get_user_uuid(),
             file_uuid=uuid,
         )
-        file_storage.delete_workspace_file(file_uuid=uuid)
+        file_storage.delete_workspace_file(
+            file_uuid=uuid,
+            storage_type=file.storage_type,
+            storage_object_id=file.storage_object_id,
+        )
         return result
 
     def _download_file_response(self, resource):
-        data = file_storage.read_workspace_file(file_uuid=resource.uuid)
+        data = file_storage.read_workspace_file(
+            file_uuid=resource.uuid,
+            storage_type=resource.storage_type,
+            storage_object_id=resource.storage_object_id,
+        )
         return webob.Response(
             body=data,
             status=200,
@@ -336,6 +376,10 @@ WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
             "stream_uuid": {"format": "uuid", "type": "string"},
             "name": {"type": "string"},
             "description": {"type": "string"},
+            "storage_type": {
+                "enum": ["file", "s3"],
+                "type": "string",
+            },
         },
     ),
 )

@@ -3564,9 +3564,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 created_file["insert_session"] = session
 
+        storage_info = dm_helpers.file_storage.WorkspaceFileStorageInfo(
+            storage_type="file",
+            storage_id="",
+            storage_object_id="aa/file",
+        )
+
         with mock.patch.object(
             dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile
         ), mock.patch.object(
+            dm_helpers.file_storage,
+            "get_workspace_file_storage_info",
+            return_value=storage_info,
+        ) as get_storage_info, mock.patch.object(
             dm_helpers.models,
             "get_stream_recipients",
             return_value=[user_uuid, other_user_uuid],
@@ -3592,7 +3602,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(stream_uuid, created_file["stream_uuid"])
         self.assertEqual("example.txt", created_file["name"])
         self.assertEqual("abc", created_file["hash"])
+        self.assertEqual("file", created_file["storage_type"])
+        self.assertEqual("", created_file["storage_id"])
+        self.assertEqual("aa/file", created_file["storage_object_id"])
         self.assertIs(session, created_file["insert_session"])
+        get_storage_info.assert_called_once_with(
+            file_uuid=file_uuid,
+            storage_type=None,
+            storage_object_id=None,
+        )
         get_recipients.assert_called_once_with(
             project_id=project_id,
             stream_uuid=stream_uuid,
