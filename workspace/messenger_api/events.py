@@ -16,7 +16,12 @@
 
 import uuid as sys_uuid
 
+import webob
+from restalchemy.api import contexts as ra_contexts
+from restalchemy.api import packers as ra_packers
+from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
+from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import engines
 
 from workspace.messenger_api.dm import event_payloads
@@ -24,12 +29,25 @@ from workspace.messenger_api.dm import models
 
 
 EVENTS_CHANNEL = "workspace_events"
+MESSAGE_OBJECT_TYPE = "message"
+STREAM_OBJECT_TYPE = "stream"
+STREAM_BINDING_OBJECT_TYPE = "stream_binding"
+TOPIC_OBJECT_TYPE = "topic"
+USER_OBJECT_TYPE = "user"
+FOLDER_OBJECT_TYPE = "folder"
+FOLDER_ITEM_OBJECT_TYPE = "folder_item"
+CREATED_ACTION = "created"
+UPDATED_ACTION = "updated"
+DELETED_ACTION = "deleted"
+READ_ACTION = "read"
 MESSAGE_CREATED_EVENT = event_payloads.MessageCreatedEventPayload.KIND
 MESSAGE_UPDATED_EVENT = event_payloads.MessageUpdatedEventPayload.KIND
+MESSAGE_READ_EVENT = event_payloads.MessageReadEventPayload.KIND
 MESSAGES_READ_EVENT = event_payloads.MessagesReadEventPayload.KIND
 MESSAGE_DELETED_EVENT = event_payloads.MessageDeletedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
 STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
+STREAM_READ_EVENT = event_payloads.StreamReadEventPayload.KIND
 STREAM_DELETED_EVENT = event_payloads.StreamDeletedEventPayload.KIND
 STREAM_BINDINGS_CREATED_EVENT = (
     event_payloads.StreamBindingsCreatedEventPayload.KIND
@@ -37,6 +55,7 @@ STREAM_BINDINGS_CREATED_EVENT = (
 USER_UPDATED_EVENT = event_payloads.UserUpdatedEventPayload.KIND
 TOPIC_CREATED_EVENT = event_payloads.TopicCreatedEventPayload.KIND
 TOPIC_UPDATED_EVENT = event_payloads.TopicUpdatedEventPayload.KIND
+TOPIC_READ_EVENT = event_payloads.TopicReadEventPayload.KIND
 TOPIC_DELETED_EVENT = event_payloads.TopicDeletedEventPayload.KIND
 FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 FOLDER_UPDATED_EVENT = event_payloads.FolderUpdatedEventPayload.KIND
@@ -44,13 +63,33 @@ FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
 FOLDER_ITEM_DELETED_EVENT = (
     event_payloads.FolderItemDeletedEventPayload.KIND
 )
-FOLDER_EVENTS = (
-    FOLDER_CREATED_EVENT,
-    FOLDER_UPDATED_EVENT,
-)
-TOPIC_EVENTS = (
-    TOPIC_CREATED_EVENT,
-    TOPIC_UPDATED_EVENT,
+EVENT_METADATA = {
+    MESSAGE_CREATED_EVENT: (MESSAGE_OBJECT_TYPE, CREATED_ACTION),
+    MESSAGE_UPDATED_EVENT: (MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
+    MESSAGE_READ_EVENT: (MESSAGE_OBJECT_TYPE, READ_ACTION),
+    MESSAGES_READ_EVENT: (MESSAGE_OBJECT_TYPE, READ_ACTION),
+    MESSAGE_DELETED_EVENT: (MESSAGE_OBJECT_TYPE, DELETED_ACTION),
+    STREAM_CREATED_EVENT: (STREAM_OBJECT_TYPE, CREATED_ACTION),
+    STREAM_UPDATED_EVENT: (STREAM_OBJECT_TYPE, UPDATED_ACTION),
+    STREAM_READ_EVENT: (STREAM_OBJECT_TYPE, READ_ACTION),
+    STREAM_DELETED_EVENT: (STREAM_OBJECT_TYPE, DELETED_ACTION),
+    STREAM_BINDINGS_CREATED_EVENT: (
+        STREAM_BINDING_OBJECT_TYPE, CREATED_ACTION,
+    ),
+    USER_UPDATED_EVENT: (USER_OBJECT_TYPE, UPDATED_ACTION),
+    TOPIC_CREATED_EVENT: (TOPIC_OBJECT_TYPE, CREATED_ACTION),
+    TOPIC_UPDATED_EVENT: (TOPIC_OBJECT_TYPE, UPDATED_ACTION),
+    TOPIC_READ_EVENT: (TOPIC_OBJECT_TYPE, READ_ACTION),
+    TOPIC_DELETED_EVENT: (TOPIC_OBJECT_TYPE, DELETED_ACTION),
+    FOLDER_CREATED_EVENT: (FOLDER_OBJECT_TYPE, CREATED_ACTION),
+    FOLDER_UPDATED_EVENT: (FOLDER_OBJECT_TYPE, UPDATED_ACTION),
+    FOLDER_DELETED_EVENT: (FOLDER_OBJECT_TYPE, DELETED_ACTION),
+    FOLDER_ITEM_DELETED_EVENT: (FOLDER_ITEM_OBJECT_TYPE, DELETED_ACTION),
+}
+WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
+    model_class=models.WorkspaceEvent,
+    convert_underscore=False,
+    process_filters=True,
 )
 DEFAULT_EVENTS_LIMIT = 100
 MAX_EVENTS_LIMIT = 500
@@ -79,6 +118,13 @@ def _to_uuid_string(value):
     return str(value).lower()
 
 
+def _model_to_event_payload_value(value):
+    return {
+        name: _event_payload_value(name, prop.value)
+        for name, prop in value.properties.items()
+    }
+
+
 def _event_payload_value(name, value):
     if value is None:
         return None
@@ -87,8 +133,19 @@ def _event_payload_value(name, value):
             value
         )
         return event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
+    if isinstance(value, sys_uuid.UUID):
+        return _to_uuid_string(value)
     if name == "uuid" or name.endswith("uuid") or name == "project_id":
         return _to_uuid_string(value)
+    if hasattr(value, "properties") and hasattr(value.properties, "items"):
+        return _model_to_event_payload_value(value)
+    if isinstance(value, list):
+        return [_event_payload_value(name, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            item_name: _event_payload_value(item_name, item_value)
+            for item_name, item_value in value.items()
+        }
     return value
 
 
@@ -115,7 +172,7 @@ def _message_from_event_payload(event_payload):
 
 def _folder_from_event_payload(event_payload):
     return {
-        name: _event_payload_value(name, event_payload[name])
+        name: _event_payload_value(name, _event_payload_get(event_payload, name))
         for name in WORKSPACE_USER_FOLDER_FIELDS
     }
 
@@ -151,159 +208,93 @@ def _user_from_event_payload(event_payload):
     }
 
 
-def _stream_bindings_from_event_payload(event_payload):
-    return [
-        _stream_binding_snapshot_from_mapping(stream_binding)
-        for stream_binding in event_payload["stream_bindings"]
-    ]
+def _payload_with_kind(kind, payload):
+    result = {"kind": kind}
+    result.update(payload)
+    return result
 
 
-def _deleted_stream_from_event_payload(event_payload):
-    return {
-        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
-    }
+def _event_metadata_for_kind(kind):
+    try:
+        return EVENT_METADATA[kind]
+    except KeyError:
+        raise ra_exc.ValidationErrorException()
 
 
-def _deleted_topic_from_event_payload(event_payload):
-    return {
-        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
-        "stream_uuid": _event_payload_value(
-            "stream_uuid",
-            event_payload["stream_uuid"],
+def _event_row_get(row, name, default=None):
+    if hasattr(row, name):
+        return getattr(row, name)
+    try:
+        return row[name]
+    except (KeyError, TypeError):
+        return default
+
+
+def _event_row_uuid(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, sys_uuid.UUID):
+        return value
+    return sys_uuid.UUID(str(value))
+
+
+def _workspace_event_from_row(row):
+    if isinstance(row, models.WorkspaceEvent):
+        return row
+    payload = row["payload"]
+    object_type, action = _event_metadata_for_kind(payload["kind"])
+    schema_version = _event_row_get(row, "schema_version")
+    row_object_type = _event_row_get(row, "object_type")
+    row_action = _event_row_get(row, "action")
+    values = {
+        "schema_version": (
+            schema_version or models.WORKSPACE_EVENT_SCHEMA_VERSION
         ),
-    }
-
-
-def _deleted_message_from_event_payload(event_payload):
-    return {
-        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
-        "stream_uuid": _event_payload_value(
-            "stream_uuid",
-            event_payload["stream_uuid"],
+        "uuid": _event_row_uuid(_event_row_get(row, "uuid"), sys_uuid.uuid4()),
+        "epoch_version": _event_row_get(row, "epoch_version"),
+        "project_id": _event_row_uuid(
+            _event_row_get(row, "project_id") or payload.get("project_id"),
+            sys_uuid.uuid4(),
         ),
-        "topic_uuid": _event_payload_value(
-            "topic_uuid",
-            event_payload["topic_uuid"],
+        "user_uuid": _event_row_uuid(
+            _event_row_get(row, "user_uuid") or payload.get("user_uuid"),
+            sys_uuid.uuid4(),
         ),
+        "object_type": row_object_type or object_type,
+        "action": row_action or action,
+        "payload": payload,
     }
+    created_at = _event_row_get(row, "created_at")
+    updated_at = _event_row_get(row, "updated_at")
+    if created_at is not None:
+        values["created_at"] = created_at
+    if updated_at is not None:
+        values["updated_at"] = updated_at
+    return models.WorkspaceEvent(**values)
 
 
-def _read_message_uuids_from_event_payload(event_payload):
-    return [
-        _event_payload_value("uuid", message_uuid)
-        for message_uuid in event_payload["message_uuids"]
-    ]
+_PACKER_REQUEST = None
 
 
-def _deleted_folder_from_event_payload(event_payload):
-    return {
-        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
-    }
+def _get_packer_request():
+    global _PACKER_REQUEST
+    if _PACKER_REQUEST is None:
+        request = webob.Request.blank("/")
+        request.api_context = ra_contexts.RequestContext(request)
+        _PACKER_REQUEST = request
+    return _PACKER_REQUEST
 
 
-def _deleted_folder_item_from_event_payload(event_payload):
-    return {
-        "uuid": _event_payload_value("uuid", event_payload["uuid"]),
-    }
+def pack_workspace_event(event, request=None):
+    request = request or _get_packer_request()
+    return ra_packers.BaseResourcePacker(
+        WORKSPACE_EVENT_RESOURCE,
+        request,
+    ).pack(event)
 
 
 def event_row_to_messenger_event(row):
-    payload = row["payload"]
-    if payload["kind"] == MESSAGE_CREATED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "message",
-            "message": _message_from_event_payload(payload),
-        }
-    if payload["kind"] == MESSAGE_UPDATED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "message",
-            "kind": payload["kind"],
-            "message": _message_from_event_payload(payload),
-        }
-    if payload["kind"] == MESSAGES_READ_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "message",
-            "kind": payload["kind"],
-            "message_uuids": _read_message_uuids_from_event_payload(payload),
-        }
-    if payload["kind"] == MESSAGE_DELETED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "message",
-            "kind": payload["kind"],
-            "message": _deleted_message_from_event_payload(payload),
-        }
-    if payload["kind"] in (STREAM_CREATED_EVENT, STREAM_UPDATED_EVENT):
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "stream",
-            "kind": payload["kind"],
-            "stream": _stream_from_event_payload(payload),
-        }
-    if payload["kind"] == STREAM_DELETED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "stream",
-            "kind": payload["kind"],
-            "stream": _deleted_stream_from_event_payload(payload),
-        }
-    if payload["kind"] in TOPIC_EVENTS:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "topic",
-            "kind": payload["kind"],
-            "topic": _topic_from_event_payload(payload),
-        }
-    if payload["kind"] == TOPIC_DELETED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "topic",
-            "kind": payload["kind"],
-            "topic": _deleted_topic_from_event_payload(payload),
-        }
-    if payload["kind"] == STREAM_BINDINGS_CREATED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "stream_binding",
-            "kind": payload["kind"],
-            "stream_uuid": _event_payload_value(
-                "stream_uuid",
-                payload["stream_uuid"],
-            ),
-            "stream_bindings": _stream_bindings_from_event_payload(payload),
-        }
-    if payload["kind"] == USER_UPDATED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "user",
-            "kind": payload["kind"],
-            "user": _user_from_event_payload(payload),
-        }
-    if payload["kind"] == FOLDER_DELETED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "folder",
-            "kind": payload["kind"],
-            "folder": _deleted_folder_from_event_payload(payload),
-        }
-    if payload["kind"] == FOLDER_ITEM_DELETED_EVENT:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "folder_item",
-            "kind": payload["kind"],
-            "folder_item": _deleted_folder_item_from_event_payload(payload),
-        }
-    if payload["kind"] in FOLDER_EVENTS:
-        return {
-            "epoch_version": row["epoch_version"],
-            "type": "folder",
-            "kind": payload["kind"],
-            "folder": _folder_from_event_payload(payload),
-        }
-    raise ra_exc.ValidationErrorException()
+    return pack_workspace_event(_workspace_event_from_row(row))
 
 
 def _fetch_one(session, statement, values):
@@ -311,338 +302,288 @@ def _fetch_one(session, statement, values):
     return result.fetchone()
 
 
-def _fetch_all(session, statement, values):
-    result = session.execute(statement, values)
-    return list(result.fetchall())
+def _create_workspace_event(project_id, user_uuid, kind, payload, session=None):
+    object_type, action = _event_metadata_for_kind(kind)
+    event = models.WorkspaceEvent(
+        schema_version=models.WORKSPACE_EVENT_SCHEMA_VERSION,
+        uuid=sys_uuid.uuid4(),
+        project_id=project_id,
+        user_uuid=user_uuid,
+        object_type=object_type,
+        action=action,
+        payload=_payload_with_kind(kind, payload),
+    )
+    return event.insert(session=session)
 
 
 def create_message_events(project_id, message, recipients, session=None):
     if not recipients:
         return []
 
-    event_uuids = [str(sys_uuid.uuid4()) for _ in recipients]
-    recipient_uuids = [str(recipient_uuid) for recipient_uuid in recipients]
-    engine = engines.engine_factory.get_engine()
-    with engine.session_manager(session=session) as s:
-        rows = _fetch_all(
-            s,
-            """
-            WITH recipients AS (
-                SELECT *
-                FROM unnest(%s::uuid[], %s::uuid[]) AS r(
-                    event_uuid,
-                    user_uuid
-                )
-            ),
-            inserted AS (
-                INSERT INTO m_workspace_events
-                    (uuid, project_id, user_uuid, payload, created_at,
-                     updated_at)
-                SELECT
-                    r.event_uuid,
-                    um.project_id,
-                    um.user_uuid,
-                    to_jsonb(um) || jsonb_build_object(
-                        'kind', %s::text,
-                        'created_at', to_char(
-                            um.created_at,
-                            'YYYY-MM-DD HH24:MI:SS.US'
-                        ),
-                        'updated_at', to_char(
-                            um.updated_at,
-                            'YYYY-MM-DD HH24:MI:SS.US'
-                        )
-                    ),
-                    NOW(),
-                    NOW()
-                FROM recipients AS r
-                JOIN m_workspace_user_messages_view AS um
-                    ON  um.uuid = %s
-                    AND um.project_id = %s
-                    AND um.user_uuid = r.user_uuid
-                ORDER BY um.user_uuid
-                RETURNING epoch_version
-            )
-            SELECT epoch_version
-            FROM inserted
-            ORDER BY epoch_version
-            """,
-            (
-                event_uuids,
-                recipient_uuids,
-                MESSAGE_CREATED_EVENT,
-                str(message.uuid),
-                str(project_id),
-            ),
-        )
-
-    if len(rows) != len(recipients):
+    user_messages = models.WorkspaceUserMessage.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(message.uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.In(recipients),
+        },
+        order_by={"user_uuid": "asc"},
+        session=session,
+    )
+    if len(user_messages) != len(recipients):
         raise ra_exc.ValidationErrorException()
-    return [row["epoch_version"] for row in rows]
+
+    result = []
+    for user_message in user_messages:
+        epoch_version = _create_workspace_event(
+            project_id=user_message.project_id,
+            user_uuid=user_message.user_uuid,
+            kind=MESSAGE_CREATED_EVENT,
+            payload=_message_from_event_payload(user_message),
+            session=session,
+        )
+        result.append(epoch_version)
+    return sorted(result)
 
 
 def create_message_updated_event(message, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=message.project_id,
         user_uuid=message.user_uuid,
-        payload=event_payloads.MessageUpdatedEventPayload(
-            **dict(message)
-        ),
+        kind=MESSAGE_UPDATED_EVENT,
+        payload=_message_from_event_payload(message),
+        session=session,
     )
-    return event.insert(session=session)
+
+
+def create_message_read_event(message, session=None):
+    return _create_workspace_event(
+        project_id=message.project_id,
+        user_uuid=message.user_uuid,
+        kind=MESSAGE_READ_EVENT,
+        payload=_message_from_event_payload(message),
+        session=session,
+    )
 
 
 def create_messages_read_event(project_id, user_uuid, message_uuids,
                                session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.MessagesReadEventPayload(
-            project_id=project_id,
-            message_uuids=[
-                str(message_uuid) for message_uuid in message_uuids
+        kind=MESSAGES_READ_EVENT,
+        payload={
+            "project_id": _event_payload_value("project_id", project_id),
+            "message_uuids": [
+                _event_payload_value("uuid", message_uuid)
+                for message_uuid in message_uuids
             ],
-        ),
+        },
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_message_deleted_event(project_id, user_uuid, message_uuid,
                                  stream_uuid, topic_uuid, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.MessageDeletedEventPayload(
-            uuid=message_uuid,
-            stream_uuid=stream_uuid,
-            topic_uuid=topic_uuid,
-        ),
+        kind=MESSAGE_DELETED_EVENT,
+        payload={
+            "uuid": _event_payload_value("uuid", message_uuid),
+            "stream_uuid": _event_payload_value("stream_uuid", stream_uuid),
+            "topic_uuid": _event_payload_value("topic_uuid", topic_uuid),
+        },
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_folder_event(folder, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=folder.project_id,
         user_uuid=folder.user_uuid,
-        payload=event_payloads.FolderCreatedEventPayload(
-            **dict(folder)
-        ),
+        kind=FOLDER_CREATED_EVENT,
+        payload=_folder_from_event_payload(folder),
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_stream_event(stream, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=stream.project_id,
         user_uuid=stream.user_uuid,
-        payload=event_payloads.StreamCreatedEventPayload(
-            **dict(stream)
-        ),
+        kind=STREAM_CREATED_EVENT,
+        payload=_stream_from_event_payload(stream),
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_stream_updated_event(stream, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=stream.project_id,
         user_uuid=stream.user_uuid,
-        payload=event_payloads.StreamUpdatedEventPayload(
-            **dict(stream)
-        ),
+        kind=STREAM_UPDATED_EVENT,
+        payload=_stream_from_event_payload(stream),
+        session=session,
     )
-    return event.insert(session=session)
+
+
+def create_stream_read_event(stream, session=None):
+    return _create_workspace_event(
+        project_id=stream.project_id,
+        user_uuid=stream.user_uuid,
+        kind=STREAM_READ_EVENT,
+        payload=_stream_from_event_payload(stream),
+        session=session,
+    )
 
 
 def create_topic_event(topic, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=topic.project_id,
         user_uuid=topic.user_uuid,
-        payload=event_payloads.TopicCreatedEventPayload(
-            **dict(topic)
-        ),
+        kind=TOPIC_CREATED_EVENT,
+        payload=_topic_from_event_payload(topic),
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_topic_updated_event(topic, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=topic.project_id,
         user_uuid=topic.user_uuid,
-        payload=event_payloads.TopicUpdatedEventPayload(
-            **dict(topic)
-        ),
+        kind=TOPIC_UPDATED_EVENT,
+        payload=_topic_from_event_payload(topic),
+        session=session,
     )
-    return event.insert(session=session)
+
+
+def create_topic_read_event(topic, session=None):
+    return _create_workspace_event(
+        project_id=topic.project_id,
+        user_uuid=topic.user_uuid,
+        kind=TOPIC_READ_EVENT,
+        payload=_topic_from_event_payload(topic),
+        session=session,
+    )
 
 
 def create_topic_deleted_event(project_id, user_uuid, topic_uuid, stream_uuid,
                                session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.TopicDeletedEventPayload(
-            uuid=topic_uuid,
-            stream_uuid=stream_uuid,
-        ),
+        kind=TOPIC_DELETED_EVENT,
+        payload={
+            "uuid": _event_payload_value("uuid", topic_uuid),
+            "stream_uuid": _event_payload_value("stream_uuid", stream_uuid),
+        },
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_stream_deleted_event(project_id, user_uuid, stream_uuid,
                                 session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.StreamDeletedEventPayload(
-            uuid=stream_uuid,
-        ),
+        kind=STREAM_DELETED_EVENT,
+        payload={"uuid": _event_payload_value("uuid", stream_uuid)},
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_stream_bindings_created_event(bindings, user_uuid, session=None):
     binding = bindings[0]
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=binding.project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.StreamBindingsCreatedEventPayload(
-            project_id=binding.project_id,
-            stream_uuid=binding.stream_uuid,
-            stream_bindings=[
+        kind=STREAM_BINDINGS_CREATED_EVENT,
+        payload={
+            "uuid": _event_payload_value("uuid", binding.stream_uuid),
+            "items": [
                 _stream_binding_snapshot_from_mapping(stream_binding)
                 for stream_binding in bindings
             ],
-        ),
+        },
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_user_updated_events(user, project_id, recipient_user_uuids,
                                session=None):
     result = []
-    payload = event_payloads.UserUpdatedEventPayload(**dict(user))
+    payload = _user_from_event_payload(user)
     for recipient_user_uuid in recipient_user_uuids:
-        event_uuid = sys_uuid.uuid4()
-        event = models.WorkspaceEvent(
-            uuid=event_uuid,
-            project_id=project_id,
-            user_uuid=recipient_user_uuid,
-            payload=payload,
+        result.append(
+            _create_workspace_event(
+                project_id=project_id,
+                user_uuid=recipient_user_uuid,
+                kind=USER_UPDATED_EVENT,
+                payload=payload,
+                session=session,
+            )
         )
-        result.append(event.insert(session=session))
     return result
 
 
 def create_folder_updated_event(folder, session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=folder.project_id,
         user_uuid=folder.user_uuid,
-        payload=event_payloads.FolderUpdatedEventPayload(
-            **dict(folder)
-        ),
+        kind=FOLDER_UPDATED_EVENT,
+        payload=_folder_from_event_payload(folder),
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_folder_deleted_event(project_id, user_uuid, folder_uuid,
                                 session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.FolderDeletedEventPayload(
-            uuid=folder_uuid,
-        ),
+        kind=FOLDER_DELETED_EVENT,
+        payload={"uuid": _event_payload_value("uuid", folder_uuid)},
+        session=session,
     )
-    return event.insert(session=session)
 
 
 def create_folder_item_deleted_event(project_id, user_uuid, item_uuid,
                                      session=None):
-    event_uuid = sys_uuid.uuid4()
-    event = models.WorkspaceEvent(
-        uuid=event_uuid,
+    return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
-        payload=event_payloads.FolderItemDeletedEventPayload(
-            uuid=item_uuid,
-        ),
+        kind=FOLDER_ITEM_DELETED_EVENT,
+        payload={"uuid": _event_payload_value("uuid", item_uuid)},
+        session=session,
     )
-    return event.insert(session=session)
-
-
-def _event_rows_statement(where_clause):
-    return f"""
-        SELECT
-            e.epoch_version,
-            e.user_uuid,
-            e.payload
-        FROM m_workspace_events AS e
-        WHERE {where_clause}
-        ORDER BY e.epoch_version ASC
-        LIMIT %s
-    """
 
 
 def get_events_after(project_id, user_uuid, after_epoch_version=0,
                      limit=DEFAULT_EVENTS_LIMIT, session=None):
-    engine = engines.engine_factory.get_engine()
-    with engine.session_manager(session=session) as s:
-        rows = _fetch_all(
-            s,
-            _event_rows_statement(
-                """
-                e.project_id = %s
-                AND e.user_uuid = %s
-                AND e.epoch_version > %s
-                """
-            ),
-            (str(project_id), str(user_uuid), after_epoch_version, limit),
-        )
-    return [event_row_to_messenger_event(row) for row in rows]
+    events = models.WorkspaceEvent.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+            "epoch_version": dm_filters.GT(after_epoch_version),
+        },
+        order_by={"epoch_version": "asc"},
+        limit=limit,
+        session=session,
+    )
+    return [pack_workspace_event(event) for event in events]
 
 
 def get_event_for_user(project_id, user_uuid, epoch_version, session=None):
-    engine = engines.engine_factory.get_engine()
-    with engine.session_manager(session=session) as s:
-        row = _fetch_one(
-            s,
-            _event_rows_statement(
-                """
-                e.project_id = %s
-                AND e.user_uuid = %s
-                AND e.epoch_version = %s
-                """
-            ),
-            (str(project_id), str(user_uuid), epoch_version, 1),
-        )
-    return None if row is None else event_row_to_messenger_event(row)
+    events = models.WorkspaceEvent.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+            "epoch_version": dm_filters.EQ(epoch_version),
+        },
+        limit=1,
+        session=session,
+    )
+    return None if not events else pack_workspace_event(events[0])
 
 
 def get_current_epoch_version(project_id, user_uuid, session=None):

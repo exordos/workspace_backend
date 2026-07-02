@@ -59,9 +59,9 @@ write the current user and project scope.
 
 Workspace events are written to a durable outbox. REST catch-up uses
 `GET /v1/events/?epoch_version%3E=<last_epoch_version>&page_limit=500`, while
-live updates are delivered through the websocket service. Websocket frames are
-already normalized for UI dispatch; REST catch-up payloads are raw outbox
-models and must be normalized by the client.
+live updates are delivered through the websocket service. REST `/events/` and
+websocket messages use the same flat `schema_version: 1` event object; websocket
+messages are not wrapped in a `{type, event}` envelope.
 
 ## Local Development
 

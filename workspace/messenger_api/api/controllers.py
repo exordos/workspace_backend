@@ -604,11 +604,7 @@ class WorkspaceMessageReactionController(
 class WorkspaceEventController(
     WorkspaceBaseResourceControllerPaginated,
 ):
-    __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceEvent,
-        convert_underscore=False,
-        process_filters=True,
-    )
+    __resource__ = messenger_events.WORKSPACE_EVENT_RESOURCE
     __default_sort__ = {"epoch_version": "asc"}
 
 

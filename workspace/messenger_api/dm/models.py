@@ -26,7 +26,6 @@ from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
 from workspace.messenger_api.dm import base
-from workspace.messenger_api.dm import event_payloads
 
 
 class ChatType(str, enum.Enum):
@@ -397,6 +396,24 @@ class WorkspaceMessageReactions(
     )
 
 
+WORKSPACE_EVENT_SCHEMA_VERSION = 1
+WORKSPACE_EVENT_OBJECT_TYPES = (
+    "message",
+    "stream",
+    "stream_binding",
+    "topic",
+    "user",
+    "folder",
+    "folder_item",
+)
+WORKSPACE_EVENT_ACTIONS = (
+    "created",
+    "updated",
+    "deleted",
+    "read",
+)
+
+
 class WorkspaceEvent(
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
@@ -405,12 +422,24 @@ class WorkspaceEvent(
 ):
     __tablename__ = "m_workspace_events"
 
+    schema_version = properties.property(
+        types.Integer(min_value=1),
+        default=WORKSPACE_EVENT_SCHEMA_VERSION,
+    )
     epoch_version = properties.property(
         types.Integer(min_value=0),
         required=False,
     )
+    object_type = properties.property(
+        types.Enum(WORKSPACE_EVENT_OBJECT_TYPES),
+        required=True,
+    )
+    action = properties.property(
+        types.Enum(WORKSPACE_EVENT_ACTIONS),
+        required=True,
+    )
     payload = properties.property(
-        event_payloads.WORKSPACE_EVENT_PAYLOAD_TYPE,
+        types.Dict(),
         required=True,
     )
 

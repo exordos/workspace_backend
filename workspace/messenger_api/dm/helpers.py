@@ -867,6 +867,20 @@ def _get_workspace_user_stream_topics(project_id, topic_uuid, session=None):
     )
 
 
+def _create_workspace_stream_topic_events(project_id, topic_uuid, session=None):
+    user_topics = _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    for user_topic in user_topics:
+        messenger_events.create_topic_event(
+            topic=user_topic,
+            session=session,
+        )
+    return user_topics
+
+
 def _get_workspace_stream_topic_for_user(project_id, user_uuid, topic_uuid,
                                          session=None):
     topic = models.WorkspaceStreamTopic.objects.get_one(
@@ -904,17 +918,13 @@ def create_workspace_user_stream_topic(project_id, user_uuid, values,
         **values,
     )
     result = None
-    for user_topic in _get_workspace_user_stream_topics(
+    for user_topic in _create_workspace_stream_topic_events(
         project_id=project_id,
         topic_uuid=topic.uuid,
         session=session,
     ):
         if user_topic.user_uuid == user_uuid:
             result = user_topic
-        messenger_events.create_topic_event(
-            topic=user_topic,
-            session=session,
-        )
     return result
 
 
@@ -1155,7 +1165,7 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
             session=session,
         )
 
-    create_workspace_stream_topic_with_flags(
+    default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
         stream_uuid=stream.uuid,
         name="General Topic",
@@ -1183,6 +1193,11 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
             private=True,
             session=session,
         )
+    _create_workspace_stream_topic_events(
+        project_id=project_id,
+        topic_uuid=default_topic.uuid,
+        session=session,
+    )
     return result
 
 
@@ -1220,7 +1235,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
         session=session,
     )
 
-    create_workspace_stream_topic_with_flags(
+    default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
         stream_uuid=stream.uuid,
         name="General Topic",
@@ -1248,6 +1263,11 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
             private=False,
             session=session,
         )
+    _create_workspace_stream_topic_events(
+        project_id=project_id,
+        topic_uuid=default_topic.uuid,
+        session=session,
+    )
     return result
 
 
@@ -1789,13 +1809,6 @@ def _read_workspace_user_messages(project_id, user_uuid, messages,
         stream_uuid = message.stream_uuid
         if message.topic_uuid not in topic_uuids:
             topic_uuids.append(message.topic_uuid)
-    if message_uuids:
-        messenger_events.create_messages_read_event(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            message_uuids=message_uuids,
-            session=session,
-        )
     return stream_uuid, topic_uuids, message_uuids
 
 
@@ -1895,12 +1908,23 @@ def read_workspace_user_stream_messages(project_id, user_uuid, stream_uuid,
         stream_uuid=stream_uuid,
         session=session,
     )
-    _, topic_uuids, _ = _read_workspace_user_messages(
+    _, topic_uuids, message_uuids = _read_workspace_user_messages(
         project_id=project_id,
         user_uuid=user_uuid,
         messages=unread_messages,
         session=session,
     )
+    result = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    if message_uuids:
+        messenger_events.create_stream_read_event(
+            stream=result,
+            session=session,
+        )
     if topic_uuids:
         _create_unread_updated_events(
             project_id=project_id,
@@ -1909,12 +1933,7 @@ def read_workspace_user_stream_messages(project_id, user_uuid, stream_uuid,
             topic_uuids=topic_uuids,
             session=session,
         )
-    return get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-        session=session,
-    )
+    return result
 
 
 def read_workspace_user_stream_topic_messages(project_id, user_uuid,
@@ -1932,12 +1951,23 @@ def read_workspace_user_stream_topic_messages(project_id, user_uuid,
         topic_uuid=topic_uuid,
         session=session,
     )
-    _, topic_uuids, _ = _read_workspace_user_messages(
+    _, topic_uuids, message_uuids = _read_workspace_user_messages(
         project_id=project_id,
         user_uuid=user_uuid,
         messages=unread_messages,
         session=session,
     )
+    result = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+    if message_uuids:
+        messenger_events.create_topic_read_event(
+            topic=result,
+            session=session,
+        )
     if topic_uuids:
         _create_unread_updated_events(
             project_id=project_id,
@@ -1946,12 +1976,7 @@ def read_workspace_user_stream_topic_messages(project_id, user_uuid,
             topic_uuids=topic_uuids,
             session=session,
         )
-    return get_workspace_user_stream_topic(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        topic_uuid=topic_uuid,
-        session=session,
-    )
+    return result
 
 
 def read_workspace_user_topic_messages_to_message(project_id, user_uuid,
@@ -1970,12 +1995,23 @@ def read_workspace_user_topic_messages_to_message(project_id, user_uuid,
         created_at=current_message.created_at,
         session=session,
     )
-    stream_uuid, topic_uuids, _ = _read_workspace_user_messages(
+    stream_uuid, topic_uuids, message_uuids = _read_workspace_user_messages(
         project_id=project_id,
         user_uuid=user_uuid,
         messages=unread_messages,
         session=session,
     )
+    result = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        session=session,
+    )
+    if message_uuids:
+        messenger_events.create_message_read_event(
+            message=result,
+            session=session,
+        )
     if topic_uuids:
         _create_unread_updated_events(
             project_id=project_id,
@@ -1984,12 +2020,7 @@ def read_workspace_user_topic_messages_to_message(project_id, user_uuid,
             topic_uuids=topic_uuids,
             session=session,
         )
-    return get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-        session=session,
-    )
+    return result
 
 
 def read_workspace_user_message(project_id, user_uuid, message_uuid,
@@ -2019,10 +2050,8 @@ def read_workspace_user_message(project_id, user_uuid, message_uuid,
         session=session,
     )
     if not was_read:
-        messenger_events.create_messages_read_event(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            message_uuids=[message_uuid],
+        messenger_events.create_message_read_event(
+            message=result,
             session=session,
         )
         _create_message_unread_updated_events(

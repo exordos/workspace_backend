@@ -354,7 +354,7 @@ Authorization: Bearer <access_token>
 
 Realtime side effects:
 
-| Operation | Durable payload kind | Websocket event type | Websocket body |
+| Operation | payload.kind | object_type | Payload |
 | --- | --- | --- | --- |
 | create folder | `folder.created` | `folder` | Full folder snapshot. |
 | update folder | `folder.updated` | `folder` | Full folder snapshot. |
@@ -467,7 +467,7 @@ Authorization: Bearer <access_token>
 
 Realtime side effects:
 
-| Operation | Durable payload kind | Websocket event type | Websocket body |
+| Operation | payload.kind | object_type | Payload |
 | --- | --- | --- | --- |
 | add stream to folder | `folder.updated` | `folder` | Full parent folder snapshot with `folder_items`. |
 | pin stream in folder | `folder.updated` | `folder` | Full parent folder snapshot with updated `pinned_at`. |
@@ -585,14 +585,14 @@ returns the updated stream view.
 
 Realtime side effects:
 
-| Operation | Durable payload kind | Websocket event type | Websocket body |
+| Operation | payload.kind | object_type | Payload |
 | --- | --- | --- | --- |
 | create stream | `stream.created` | `stream` | Full user stream snapshot. |
 | create stream | `folder.updated` | `folder` | Updated `All chats` and `Channels`/`Personal` system folder snapshots. |
 | update stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
 | archive or unarchive stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
 | change stream notification mode | `stream.updated` | `stream` | Full user stream snapshot for the current user only. |
-| read stream messages | `messages.read` | `message` | `message_uuids` for messages that changed to read. |
+| read stream messages | `stream.read` | `stream` | Full user stream snapshot returned by the action. |
 | read stream messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete stream | `stream.deleted` | `stream` | Only deleted stream `uuid`, sent to every stream user. |
 | delete stream | `folder.updated` | `folder` | Updated affected users' system/custom folder snapshots after the stream is removed. |
@@ -711,13 +711,13 @@ returns the updated topic view.
 
 Realtime side effects:
 
-| Operation | Durable payload kind | Websocket event type | Websocket body |
+| Operation | payload.kind | object_type | Payload |
 | --- | --- | --- | --- |
 | create topic | `topic.created` | `topic` | Full user topic snapshot for every stream user. |
 | rename topic | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | toggle done | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | change topic notification mode | `topic.updated` | `topic` | Full user topic snapshot for the current user only. |
-| read topic messages | `messages.read` | `message` | `message_uuids` for messages that changed to read. |
+| read topic messages | `topic.read` | `topic` | Full user topic snapshot returned by the action. |
 | read topic messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. |
 
@@ -815,8 +815,8 @@ Authorization: Bearer <access_token>
 ```
 
 `read` sets the current user's message flag to `true` and returns the updated
-message view. If the message was unread, the backend emits `messages.read` with
-that message UUID and aggregate unread-count updates.
+message view. If the message was unread, the backend emits `message.read` with
+the full message snapshot and aggregate unread-count updates.
 
 Read up to action:
 
@@ -831,13 +831,13 @@ message view.
 
 Realtime side effects:
 
-| Operation | Durable payload kind | Websocket event type | Websocket body |
+| Operation | payload.kind | object_type | Payload |
 | --- | --- | --- | --- |
 | create message | `message.created` | `message` | Full user message snapshot for every stream user. |
 | create unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the new message is unread. |
 | update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
 | create/update/delete reaction | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
-| read message or read up to message | `messages.read` | `message` | `message_uuids` for messages that changed to read. |
+| read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the deleted message was unread. |
@@ -948,172 +948,101 @@ do not currently emit durable workspace realtime events.
 
 ## Events And Epoch
 
-Events are durable outbox rows stored in `m_workspace_events`. They are
-generated by stream, binding, topic, message, folder, folder item, and user
-changes.
-Events are always scoped to the affected `user_uuid`: message snapshots are
-per recipient, stream/topic/folder snapshots are per visible user, and delete
-events are sent only to users that need to remove local state. The event primary
-identifier is `epoch_version`, a monotonically increasing integer.
+Events are durable outbox rows stored in `m_workspace_events`. They are scoped to
+the affected `user_uuid`: message, stream, topic, folder, and user snapshots are
+created per visible recipient, while delete events are sent only to users that
+must remove local state. `epoch_version` is a monotonically increasing cursor.
 
-`GET /v1/events/` returns a standard RESTAlchemy list with no envelope. Events
-are sorted by `epoch_version` ascending by default.
-
-Message event example:
+`GET /v1/events/` returns events sorted by `epoch_version` ascending by default.
+REST `/events/` and websocket delivery use the same flat schema:
 
 ```json
-[
-  {
-    "epoch_version": 124,
-    "uuid": "0cb14b5a-6bf0-4de2-bdb5-4e98df4044e0",
-    "project_id": "22222222-2222-2222-2222-222222222222",
-    "user_uuid": "11111111-1111-1111-1111-111111111111",
-    "payload": {
-      "kind": "message.created",
-      "uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
-      "project_id": "22222222-2222-2222-2222-222222222222",
-      "user_uuid": "11111111-1111-1111-1111-111111111111",
-      "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
-      "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
-      "author_uuid": "11111111-1111-1111-1111-111111111111",
-      "payload": {
-        "kind": "markdown",
-        "content": "Hello, workspace"
-      },
-      "read": true,
-      "pinned": false,
-      "starred": false,
-      "is_own": true,
-      "reactions": {},
-      "created_at": "2026-06-22T10:10:00Z",
-      "updated_at": "2026-06-22T10:10:00Z"
-    },
-    "created_at": "2026-06-22T10:10:00Z",
-    "updated_at": "2026-06-22T10:10:00Z"
+{
+  "schema_version": 1,
+  "uuid": "event-uuid",
+  "epoch_version": 124,
+  "project_id": "project-uuid",
+  "user_uuid": "recipient-user-uuid",
+  "object_type": "message",
+  "action": "created",
+  "created_at": "2026-07-02T16:37:49.552044Z",
+  "updated_at": "2026-07-02T16:37:49.552047Z",
+  "payload": {
+    "kind": "message.created",
+    "uuid": "message-uuid",
+    "project_id": "project-uuid",
+    "user_uuid": "recipient-user-uuid",
+    "stream_uuid": "stream-uuid",
+    "topic_uuid": "topic-uuid",
+    "author_uuid": "author-user-uuid",
+    "payload": {"kind": "markdown", "content": "Hello"},
+    "read": true,
+    "pinned": false,
+    "starred": false,
+    "is_own": true,
+    "reactions": {},
+    "created_at": "2026-07-02T16:37:49.552044Z",
+    "updated_at": "2026-07-02T16:37:49.552047Z"
   }
-]
-```
-
-Folder create and update event payloads contain a full folder snapshot from
-`m_folders_view`. Adding a stream to a folder and pinning or unpinning a folder
-item also produce `folder.updated`, because the parent folder snapshot changed.
-
-Folder update event example:
-
-```json
-{
-  "epoch_version": 125,
-  "uuid": "dbf5f7ad-4fe5-4fe7-8fa7-cd5cf65ad573",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "payload": {
-    "kind": "folder.updated",
-    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
-    "project_id": "22222222-2222-2222-2222-222222222222",
-    "user_uuid": "11111111-1111-1111-1111-111111111111",
-    "title": "Inbox",
-    "background_color_value": 4280391411,
-    "system_type": "created",
-    "unread_count": 0,
-    "folder_items": [
-      {
-        "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
-        "project_id": "22222222-2222-2222-2222-222222222222",
-        "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
-        "user_uuid": "11111111-1111-1111-1111-111111111111",
-        "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
-        "chat_type": "stream",
-        "order_index": 10,
-        "pinned_at": "2026-06-22T09:31:00Z",
-        "unread_count": 0,
-        "created_at": "2026-06-22T09:30:00Z",
-        "updated_at": "2026-06-22T09:31:00Z"
-      }
-    ],
-    "created_at": "2026-06-22T09:30:00Z",
-    "updated_at": "2026-06-22T09:31:00Z"
-  },
-  "created_at": "2026-06-22T09:31:00Z",
-  "updated_at": "2026-06-22T09:31:00Z"
 }
 ```
 
-Delete events intentionally contain only the identifiers needed to remove or
-unlink local state. `stream.deleted`, `folder.deleted`, and
-`folder_item.deleted` contain only `uuid`; `topic.deleted` contains `uuid` and
-`stream_uuid`; `message.deleted` contains `uuid`, `stream_uuid`, and
-`topic_uuid`.
+Top-level fields describe the event row only. `payload.kind` is the only `kind`.
+Do not expect top-level `type`, `kind`, `stream_uuid`, or `topic_uuid`.
+
+Create, update, read, and action events carry the same full object snapshot that
+the current user receives from the corresponding REST endpoint/action response,
+plus `payload.kind`. Delete events are minimal:
+
+- `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
+- `topic.deleted`: `kind`, `uuid`, `stream_uuid`
+- `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`
+
+`stream_bindings.created` is a batch action payload:
 
 ```json
 {
-  "epoch_version": 126,
-  "uuid": "a1f9ddf2-b28c-4df0-89af-cab996ba43e1",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "payload": {
-    "kind": "folder.deleted",
-    "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210"
-  },
-  "created_at": "2026-06-22T09:32:00Z",
-  "updated_at": "2026-06-22T09:32:00Z"
+  "kind": "stream_bindings.created",
+  "uuid": "stream-uuid",
+  "items": [
+    {
+      "uuid": "binding-uuid",
+      "project_id": "project-uuid",
+      "stream_uuid": "stream-uuid",
+      "user_uuid": "added-user-uuid",
+      "who_uuid": "owner-user-uuid",
+      "role": "member",
+      "notification_mode": "all_messages",
+      "created_at": "2026-07-02T16:37:49.552044Z",
+      "updated_at": "2026-07-02T16:37:49.552047Z"
+    }
+  ]
 }
 ```
 
-```json
-{
-  "epoch_version": 127,
-  "uuid": "7ae06725-4d74-4704-97bb-ed8eceaef60e",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "payload": {
-    "kind": "folder_item.deleted",
-    "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50"
-  },
-  "created_at": "2026-06-22T09:33:00Z",
-  "updated_at": "2026-06-22T09:33:00Z"
-}
-```
+Read actions emit `message.read`, `topic.read`, or `stream.read` with the full
+action response object in `payload`. When unread counters change, the backend
+also emits `topic.updated`, `stream.updated`, and `folder.updated` events so UI
+badges can be updated from normal snapshots. Historical rows with
+`payload.kind == "messages.read"` are preserved as best-effort legacy events
+with `message_uuids`; new runtime events use the singular read kinds.
 
-Read events contain the IDs that changed to read for the current user:
+Supported values:
 
-```json
-{
-  "epoch_version": 128,
-  "uuid": "70678474-5c9f-4de3-9b41-020cd248eac4",
-  "project_id": "22222222-2222-2222-2222-222222222222",
-  "user_uuid": "11111111-1111-1111-1111-111111111111",
-  "payload": {
-    "kind": "messages.read",
-    "project_id": "22222222-2222-2222-2222-222222222222",
-    "message_uuids": [
-      "a93dca35-3061-4748-bda4-7f6f8c660ea5"
-    ]
-  },
-  "created_at": "2026-06-22T09:34:00Z",
-  "updated_at": "2026-06-22T09:34:00Z"
-}
-```
-
-Supported event payload kinds:
-
-| Payload kind | Produced by | REST payload |
+| object_type | action | payload.kind examples |
 | --- | --- | --- |
-| `stream.created` | `POST /v1/streams/`, `POST /v1/streams/{uuid}/actions/add_users/invoke` | Full user stream snapshot. |
-| `stream.updated` | `PUT /v1/streams/{uuid}`, archive/unarchive actions, stream notification action, message unread-count changes | Full user stream snapshot. |
-| `stream.deleted` | `DELETE /v1/streams/{uuid}`, `DELETE /v1/stream_bindings/{binding_uuid}` | Only stream `uuid`. |
-| `stream_bindings.created` | `POST /v1/streams/{uuid}/actions/add_users/invoke` | Stream UUID and full stream binding snapshots for the added batch. |
-| `topic.created` | `POST /v1/stream_topics/` | Full user topic snapshot. |
-| `topic.updated` | `PUT /v1/stream_topics/{uuid}`, toggle done action, topic notification action, message unread-count changes | Full user topic snapshot. |
-| `topic.deleted` | `DELETE /v1/stream_topics/{uuid}` | Deleted topic `uuid` and `stream_uuid`. |
-| `message.created` | `POST /v1/messages/` | Full user message snapshot. |
-| `message.updated` | `PUT /v1/messages/{uuid}`, message reaction create/update/delete | Full user message snapshot. |
-| `messages.read` | message read, message read-up-to, topic read, and stream read actions | Project UUID and read `message_uuids`. |
-| `message.deleted` | `DELETE /v1/messages/{uuid}` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`. |
-| `user.updated` | presence action and stale-presence worker | Full workspace user snapshot for every workspace user. |
-| `folder.created` | `POST /v1/folders/` | Full user folder snapshot. |
-| `folder.updated` | stream create/delete, stream binding add/delete, message unread-count changes, `PUT /v1/folders/{uuid}`, `POST /v1/folder_items/`, pin/unpin actions | Full user folder snapshot. |
-| `folder.deleted` | `DELETE /v1/folders/{uuid}` | Only deleted folder `uuid`. |
-| `folder_item.deleted` | `DELETE /v1/folder_items/{uuid}` | Only deleted folder item `uuid`. |
+| `message` | `created`, `updated`, `deleted`, `read` | `message.created`, `message.updated`, `message.deleted`, `message.read` |
+| `stream` | `created`, `updated`, `deleted`, `read` | `stream.created`, `stream.updated`, `stream.deleted`, `stream.read` |
+| `stream_binding` | `created` | `stream_bindings.created` |
+| `topic` | `created`, `updated`, `deleted`, `read` | `topic.created`, `topic.updated`, `topic.deleted`, `topic.read` |
+| `user` | `updated` | `user.updated` |
+| `folder` | `created`, `updated`, `deleted` | `folder.created`, `folder.updated`, `folder.deleted` |
+| `folder_item` | `deleted` | `folder_item.deleted` |
+
+The unification migration adds `schema_version`, `object_type`, and `action` to
+`m_workspace_events`, backfills them from `payload.kind`, converts legacy
+`stream_bindings.created` payloads to `items`, and leaves historical
+`messages.read` rows readable as legacy payloads.
 
 For strict catch-up after a processed cursor, use:
 
@@ -1121,13 +1050,11 @@ For strict catch-up after a processed cursor, use:
 GET /v1/events/?epoch_version%3E=<last_epoch_version>&page_limit=500
 ```
 
-`GET /v1/epoch/` returns the latest visible event epoch for the current IAM
-user, or `0` when there are no visible events:
+`GET /v1/epoch/` returns the latest visible event epoch for the current IAM user,
+or `0` when there are no visible events:
 
 ```json
-{
-  "epoch_version": 124
-}
+{"epoch_version": 124}
 ```
 
 ## Workspace Users
@@ -1163,27 +1090,17 @@ Content-Type: application/json
 }
 ```
 
-The authenticated user may update only their own `user_uuid`. The request
-stores the supplied `status` (`active`, `idle`, `offline`, or `do_not_disturb`)
-and the current time in `last_ping_at`. Optional `emoji` and `text` fields are
-stored on the user profile as `status_emoji` and `status_text`; omitted optional
-fields keep their previous values, and explicit `null` clears them. Clients
-should repeat the presence update about every 30 seconds. The messenger worker
-marks users with
-`status != "offline"` and older-than-one-minute `last_ping_at` as `offline`.
-`last_ping_at` is required in storage and defaults to the user row creation
-time. Presence changes emit `user.updated` events with a full user snapshot to
-every workspace user.
+The authenticated user may update only their own `user_uuid`. The request stores
+the supplied status and the current time in `last_ping_at`. Optional `emoji` and
+`text` fields are stored as `status_emoji` and `status_text`; omitted optional
+fields keep previous values, and explicit `null` clears them. The messenger
+worker marks stale users offline and emits `user.updated` events with full user
+snapshots.
 
 ## WebSocket Realtime Summary
 
-The websocket service uses the subprotocol `workspace.events.v1` and authenticates
-the bearer token from `Sec-WebSocket-Protocol`. The `last_epoch_version` query
-parameter is optional at protocol level and defaults to `0`, but UI clients
-should always pass their latest persisted cursor. Detailed UI integration rules
-are documented in `docs/workspace_ui_realtime_integration.md`.
-
-Connection example from browser code:
+The websocket service uses subprotocol `workspace.events.v1` and authenticates
+the bearer token from `Sec-WebSocket-Protocol`:
 
 ```ts
 const ws = new WebSocket(
@@ -1192,90 +1109,12 @@ const ws = new WebSocket(
 );
 ```
 
-The server sends dispatch-ready event frames. Raw REST events and websocket
-frames carry the same `epoch_version`, but websocket frames are already
-normalized for dispatch:
+After the connection is accepted, the server sends missed events newer than
+`last_epoch_version`, then live events. Each websocket message is the same flat
+event object returned by REST `/v1/events/`. The websocket service does not send
+public `hello` or `ping` frames and does not process client `pong` or `ack`
+frames. Reconnect and catch-up are driven by the persisted `last_epoch_version`
+cursor.
 
-| Websocket `event.type` | `event.kind` | Body field |
-| --- | --- | --- |
-| `message` | omitted for `message.created`; `message.updated` or `message.deleted` otherwise | `message` |
-| `message` | `messages.read` | `message_uuids` |
-| `stream` | `stream.created`, `stream.updated`, `stream.deleted` | `stream` |
-| `stream_binding` | `stream_bindings.created` | `stream_uuid`, `stream_bindings` |
-| `topic` | `topic.created`, `topic.updated`, `topic.deleted` | `topic` |
-| `user` | `user.updated` | `user` |
-| `folder` | `folder.created`, `folder.updated`, `folder.deleted` | `folder` |
-| `folder_item` | `folder_item.deleted` | `folder_item` |
-
-Create/update events include full snapshots. Delete events are minimal and
-include only the identifiers documented in the event payload table above.
-`messages.read` events include only the `message_uuids` that changed to read.
-Folder create, folder update, and folder item add/pin/unpin events have
-`event.type: "folder"` and include a full folder snapshot:
-
-```json
-{
-  "type": "event",
-  "event": {
-    "epoch_version": 125,
-    "type": "folder",
-    "kind": "folder.updated",
-    "folder": {
-      "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
-      "project_id": "22222222-2222-2222-2222-222222222222",
-      "user_uuid": "11111111-1111-1111-1111-111111111111",
-      "title": "Inbox",
-      "background_color_value": 4280391411,
-      "system_type": "created",
-      "unread_count": 0,
-      "folder_items": [
-        {
-          "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
-          "project_id": "22222222-2222-2222-2222-222222222222",
-          "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
-          "user_uuid": "11111111-1111-1111-1111-111111111111",
-          "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
-          "chat_type": "stream",
-          "order_index": 10,
-          "pinned_at": "2026-06-22T09:31:00Z",
-          "unread_count": 0,
-          "created_at": "2026-06-22T09:30:00Z",
-          "updated_at": "2026-06-22T09:31:00Z"
-        }
-      ],
-      "created_at": "2026-06-22T09:30:00Z",
-      "updated_at": "2026-06-22T09:31:00Z"
-    }
-  }
-}
-```
-
-Delete events are minimal:
-
-```json
-{
-  "type": "event",
-  "event": {
-    "epoch_version": 126,
-    "type": "folder",
-    "kind": "folder.deleted",
-    "folder": {
-      "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210"
-    }
-  }
-}
-```
-
-```json
-{
-  "type": "event",
-  "event": {
-    "epoch_version": 127,
-    "type": "folder_item",
-    "kind": "folder_item.deleted",
-    "folder_item": {
-      "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50"
-    }
-  }
-}
-```
+Detailed UI integration rules are documented in
+`docs/workspace_ui_realtime_integration.md`.

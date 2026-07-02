@@ -266,11 +266,15 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
         cur.execute(
             """
             INSERT INTO m_workspace_events
-                (uuid, project_id, user_uuid, payload, created_at, updated_at)
+                (uuid, project_id, user_uuid, schema_version, object_type, action,
+                 payload, created_at, updated_at)
             VALUES (
                 %s,
                 %s,
                 %s,
+                1,
+                'message',
+                'created',
                 jsonb_build_object(
                     'kind', 'message.created',
                     'uuid', %s::text,
@@ -304,11 +308,15 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
         cur.execute(
             """
             INSERT INTO m_workspace_events
-                (uuid, project_id, user_uuid, payload, created_at, updated_at)
+                (uuid, project_id, user_uuid, schema_version, object_type, action,
+                 payload, created_at, updated_at)
             VALUES (
                 %s,
                 %s,
                 %s,
+                1,
+                'user',
+                'updated',
                 jsonb_build_object(
                     'kind', 'user.updated',
                     'uuid', %s::text,
@@ -336,11 +344,15 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
         cur.execute(
             """
             INSERT INTO m_workspace_events
-                (uuid, project_id, user_uuid, payload, created_at, updated_at)
+                (uuid, project_id, user_uuid, schema_version, object_type, action,
+                 payload, created_at, updated_at)
             VALUES (
                 %s,
                 %s,
                 %s,
+                1,
+                'user',
+                'updated',
                 jsonb_build_object(
                     'kind', 'user.updated',
                     'project_id', %s::text,
@@ -385,13 +397,13 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
     event = messenger_models.WorkspaceEvent.objects.get_one(
         filters={"epoch_version": dm_filters.EQ(message_epoch_version)},
     )
-    assert str(event.payload.project_id) == str(project_id)
-    assert str(event.payload.user_uuid) == str(user_uuid)
+    assert event.payload["project_id"] == str(project_id)
+    assert event.payload["user_uuid"] == str(user_uuid)
 
     event = messenger_models.WorkspaceEvent.objects.get_one(
         filters={"epoch_version": dm_filters.EQ(clean_user_epoch_version)},
     )
-    assert event.payload.username == "clean-user"
+    assert event.payload["username"] == "clean-user"
 
     with db.cursor() as cur:
         cur.execute(
@@ -433,7 +445,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
     event = messenger_models.WorkspaceEvent.objects.get_one(
         filters={"epoch_version": dm_filters.EQ(damaged_user_epoch_version)},
     )
-    assert event.payload.username == "damaged-user"
+    assert event.payload["username"] == "damaged-user"
     assert project_id in messenger_dm_helpers._get_workspace_event_project_ids()
 
 
@@ -679,10 +691,10 @@ def test_folder_create_writes_realtime_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "folder"
-    assert event["kind"] == "folder.created"
-    assert event["folder"]["uuid"] == folder["uuid"]
-    assert event["folder"]["title"] == "Inbox"
+    assert event["object_type"] == "folder"
+    assert event["payload"]["kind"] == "folder.created"
+    assert event["payload"]["uuid"] == folder["uuid"]
+    assert event["payload"]["title"] == "Inbox"
 
 
 def test_folder_update_writes_realtime_event(api, db):
@@ -724,10 +736,10 @@ def test_folder_update_writes_realtime_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "folder"
-    assert event["kind"] == "folder.updated"
-    assert event["folder"]["uuid"] == folder["uuid"]
-    assert event["folder"]["title"] == "Archive"
+    assert event["object_type"] == "folder"
+    assert event["payload"]["kind"] == "folder.updated"
+    assert event["payload"]["uuid"] == folder["uuid"]
+    assert event["payload"]["title"] == "Archive"
 
 
 def test_folder_delete_writes_realtime_event(api, db):
@@ -768,9 +780,9 @@ def test_folder_delete_writes_realtime_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "folder"
-    assert event["kind"] == "folder.deleted"
-    assert event["folder"] == {"uuid": folder["uuid"]}
+    assert event["object_type"] == "folder"
+    assert event["payload"]["kind"] == "folder.deleted"
+    assert event["payload"] == payload
 
 
 def test_folder_item_create_writes_folder_updated_event(api, db):
@@ -827,10 +839,10 @@ def test_folder_item_create_writes_folder_updated_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "folder"
-    assert event["kind"] == "folder.updated"
-    assert event["folder"]["uuid"] == folder["uuid"]
-    assert event["folder"]["folder_items"][0]["stream_uuid"] == stream_uuid
+    assert event["object_type"] == "folder"
+    assert event["payload"]["kind"] == "folder.updated"
+    assert event["payload"]["uuid"] == folder["uuid"]
+    assert event["payload"]["folder_items"][0]["stream_uuid"] == stream_uuid
 
 
 def test_folder_item_delete_writes_deleted_event(api, db):
@@ -884,9 +896,9 @@ def test_folder_item_delete_writes_deleted_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "folder_item"
-    assert event["kind"] == "folder_item.deleted"
-    assert event["folder_item"] == {"uuid": item["uuid"]}
+    assert event["object_type"] == "folder_item"
+    assert event["payload"]["kind"] == "folder_item.deleted"
+    assert event["payload"] == payload
 
 
 def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
@@ -954,9 +966,9 @@ def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
             "payload": unpin_payload,
         }
     )
-    assert event["type"] == "folder"
-    assert event["kind"] == "folder.updated"
-    assert event["folder"]["folder_items"][0].get("pinned_at") is None
+    assert event["object_type"] == "folder"
+    assert event["payload"]["kind"] == "folder.updated"
+    assert event["payload"]["folder_items"][0].get("pinned_at") is None
 
 
 def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
@@ -1095,7 +1107,7 @@ def test_stream_create_writes_realtime_event(api, db):
         )
         rows = cur.fetchall()
 
-    assert len(rows) == 3
+    assert len(rows) == 4
     epoch_version, user_uuid, payload = rows[0]
     assert str(user_uuid) == str(api.user_uuid)
     assert payload["kind"] == "stream.created"
@@ -1122,16 +1134,43 @@ def test_stream_create_writes_realtime_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "stream"
-    assert event["kind"] == "stream.created"
-    assert event["stream"]["uuid"] == stream["uuid"]
-    assert event["stream"]["name"] == "Engineering"
-    assert event["stream"]["role"] == "owner"
-    assert event["stream"]["notification_mode"] == "all_messages"
-    assert event["stream"]["color"] == stream["color"]
-    assert event["stream"].get("last_message_uuid") is None
+    assert event["object_type"] == "stream"
+    assert event["payload"]["kind"] == "stream.created"
+    assert event["payload"]["uuid"] == stream["uuid"]
+    assert event["payload"]["name"] == "Engineering"
+    assert event["payload"]["role"] == "owner"
+    assert event["payload"]["notification_mode"] == "all_messages"
+    assert event["payload"]["color"] == stream["color"]
+    assert event["payload"].get("last_message_uuid") is None
 
-    folder_events = [row[2] for row in rows[1:]]
+    topic_epoch_version, topic_user_uuid, topic_payload = rows[3]
+    assert str(topic_user_uuid) == str(api.user_uuid)
+    assert topic_payload["kind"] == "topic.created"
+    assert topic_payload["name"] == "General Topic"
+    assert topic_payload["stream_uuid"] == stream["uuid"]
+    assert topic_payload["user_uuid"] == str(api.user_uuid)
+    assert topic_payload["project_id"] == str(api.project_id)
+    assert topic_payload["is_default"] is True
+    assert topic_payload["is_done"] is False
+    assert topic_payload["unread_count"] == 0
+    assert topic_payload["notification_mode"] == "default"
+    assert topic_payload.get("last_message_uuid") is None
+    assert 0 <= topic_payload["color"] <= 0xFFFFFF
+
+    topic_event = messenger_events.event_row_to_messenger_event(
+        {
+            "epoch_version": topic_epoch_version,
+            "user_uuid": api.user_uuid,
+            "payload": topic_payload,
+        }
+    )
+    assert topic_event["object_type"] == "topic"
+    assert topic_event["payload"]["kind"] == "topic.created"
+    assert topic_event["payload"]["uuid"] == topic_payload["uuid"]
+    assert topic_event["payload"]["name"] == "General Topic"
+    assert topic_event["payload"]["is_default"] is True
+
+    folder_events = [row[2] for row in rows[1:3]]
     assert [payload["kind"] for payload in folder_events] == [
         "folder.updated",
         "folder.updated",
@@ -1232,9 +1271,9 @@ def test_stream_notifications_are_user_scoped_and_write_event(api, db):
             "payload": payload,
         }
     )
-    assert event["type"] == "stream"
-    assert event["kind"] == "stream.updated"
-    assert event["stream"]["notification_mode"] == "mentions_only"
+    assert event["object_type"] == "stream"
+    assert event["payload"]["kind"] == "stream.updated"
+    assert event["payload"]["notification_mode"] == "mentions_only"
 
 
 def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
@@ -1580,25 +1619,25 @@ def test_stream_binding_create_notifies_added_user(api, db):
     assert [event["kind"] for event in owner_events] == [
         "stream_bindings.created",
     ]
-    assert owner_events[0]["stream_uuid"] == stream_uuid
+    assert owner_events[0]["uuid"] == stream_uuid
     assert [
         binding["user_uuid"]
-        for binding in owner_events[0]["stream_bindings"]
+        for binding in owner_events[0]["items"]
     ] == [
         str(target_user_uuid),
         str(second_target_user_uuid),
     ]
     assert {
         binding["who_uuid"]
-        for binding in owner_events[0]["stream_bindings"]
+        for binding in owner_events[0]["items"]
     } == {str(api.user_uuid)}
     assert {
         binding["role"]
-        for binding in owner_events[0]["stream_bindings"]
+        for binding in owner_events[0]["items"]
     } == {"member"}
     assert {
         binding["notification_mode"]
-        for binding in owner_events[0]["stream_bindings"]
+        for binding in owner_events[0]["items"]
     } == {"all_messages"}
 
 
@@ -1854,13 +1893,13 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
             "payload": event_rows[0][2],
         }
     )
-    assert event["type"] == "topic"
-    assert event["kind"] == "topic.created"
-    assert event["topic"]["uuid"] == topic["uuid"]
-    assert event["topic"]["name"] == "planning"
-    assert event["topic"]["color"] == topic["color"]
-    assert event["topic"].get("last_message_uuid") is None
-    assert event["topic"]["notification_mode"] == "default"
+    assert event["object_type"] == "topic"
+    assert event["payload"]["kind"] == "topic.created"
+    assert event["payload"]["uuid"] == topic["uuid"]
+    assert event["payload"]["name"] == "planning"
+    assert event["payload"]["color"] == topic["color"]
+    assert event["payload"].get("last_message_uuid") is None
+    assert event["payload"]["notification_mode"] == "default"
 
 
 def test_stream_topic_rename(api, db):
@@ -2266,20 +2305,30 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert other_payload["starred"] is False
     assert other_payload["is_own"] is False
     assert other_payload["reactions"] == {}
-    assert messenger_events.event_row_to_messenger_event(
+    packed_author_payload = messenger_events.event_row_to_messenger_event(
         {
             "epoch_version": 1,
             "user_uuid": api.user_uuid,
             "payload": author_payload,
         }
-    )["message"] == message
-    assert messenger_events.event_row_to_messenger_event(
+    )["payload"]
+    packed_other_payload = messenger_events.event_row_to_messenger_event(
         {
             "epoch_version": 2,
             "user_uuid": other_user,
             "payload": other_payload,
         }
-    )["message"] == other_message
+    )["payload"]
+    assert packed_author_payload["kind"] == "message.created"
+    assert packed_other_payload["kind"] == "message.created"
+    assert {
+        key: value for key, value in packed_author_payload.items()
+        if key != "kind"
+    } == message
+    assert {
+        key: value for key, value in packed_other_payload.items()
+        if key != "kind"
+    } == other_message
 
     author_resp = api.get(EVENTS, params={"page_limit": 100})
     assert author_resp.status_code == 200, author_resp.text
@@ -2411,13 +2460,14 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         read_events = [row[0] for row in cur.fetchall()]
 
     assert [event["kind"] for event in read_events] == [
-        "messages.read",
+        "message.read",
         "topic.updated",
         "stream.updated",
         "folder.updated",
         "folder.updated",
     ]
-    assert read_events[0]["message_uuids"] == [message_uuid]
+    assert read_events[0]["uuid"] == message_uuid
+    assert read_events[0]["read"] is True
     assert read_events[1]["unread_count"] == 0
     assert read_events[2]["unread_count"] == 0
     assert [event["unread_count"] for event in read_events[3:]] == [0, 0]

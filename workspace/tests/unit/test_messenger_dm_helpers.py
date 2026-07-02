@@ -55,6 +55,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         user_uuid = sys_uuid.uuid4()
         other_user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
         session = object()
         returned_stream = types.SimpleNamespace(
             uuid=stream_uuid,
@@ -125,8 +126,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers, "_random_color", return_value=12345
         ), mock.patch.object(
-            dm_helpers, "create_workspace_stream_topic_with_flags"
+            dm_helpers,
+            "create_workspace_stream_topic_with_flags",
+            return_value=types.SimpleNamespace(uuid=topic_uuid),
         ) as create_topic, mock.patch.object(
+            dm_helpers,
+            "_create_workspace_stream_topic_events",
+        ) as create_topic_events, mock.patch.object(
             dm_helpers, "get_workspace_user_folder", get_user_folder
         ), mock.patch.object(
             dm_helpers.messenger_events, "create_stream_event"
@@ -163,6 +169,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             name="General Topic",
             default_for_stream_uuid=stream_uuid,
+            session=session,
+        )
+        create_topic_events.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
             session=session,
         )
         get_user_streams.assert_called_once_with(
@@ -226,6 +237,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         user_uuid = sys_uuid.uuid4()
         direct_user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
         session = object()
         owner_stream = types.SimpleNamespace(
             uuid=stream_uuid,
@@ -305,8 +317,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers, "_random_color", return_value=23456
         ), mock.patch.object(
-            dm_helpers, "create_workspace_stream_topic_with_flags"
+            dm_helpers,
+            "create_workspace_stream_topic_with_flags",
+            return_value=types.SimpleNamespace(uuid=topic_uuid),
         ) as create_topic, mock.patch.object(
+            dm_helpers,
+            "_create_workspace_stream_topic_events",
+        ) as create_topic_events, mock.patch.object(
             dm_helpers, "get_workspace_user_folder", get_user_folder
         ), mock.patch.object(
             dm_helpers.messenger_events, "create_stream_event"
@@ -371,6 +388,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             name="General Topic",
             default_for_stream_uuid=stream_uuid,
+            session=session,
+        )
+        create_topic_events.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
             session=session,
         )
         create_event.assert_has_calls(
@@ -2531,7 +2553,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             message_uuid=message_uuid,
             session=session,
         )
-    def test_read_workspace_user_messages_updates_flags_and_read_event(self):
+    def test_read_workspace_user_messages_updates_flags_and_returns_ids(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
@@ -2604,12 +2626,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(message_uuid_1, first_filters["uuid"].value)
         self.assertEqual(message_uuid_2, second_filters["uuid"].value)
-        create_event.assert_called_once_with(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            message_uuids=[message_uuid_1, message_uuid_2],
-            session=session,
-        )
+        create_event.assert_not_called()
 
     def test_read_workspace_user_stream_messages_reads_all_unread_messages(self):
         project_id = sys_uuid.uuid4()
@@ -2633,8 +2650,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ) as get_unread, mock.patch.object(
             dm_helpers,
             "_read_workspace_user_messages",
-            return_value=(stream_uuid, [topic_uuid_1, topic_uuid_2], []),
+            return_value=(
+                stream_uuid,
+                [topic_uuid_1, topic_uuid_2],
+                [sys_uuid.uuid4()],
+            ),
         ) as read_messages, mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_read_event"
+        ) as create_read_event, mock.patch.object(
             dm_helpers, "_create_unread_updated_events"
         ) as create_unread_events:
             result = dm_helpers.read_workspace_user_stream_messages(
@@ -2673,6 +2696,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             messages=unread_messages,
             session=session,
         )
+        create_read_event.assert_called_once_with(
+            stream=returned_stream,
+            session=session,
+        )
         create_unread_events.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
@@ -2705,8 +2732,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ) as get_unread, mock.patch.object(
             dm_helpers,
             "_read_workspace_user_messages",
-            return_value=(stream_uuid, [topic_uuid], []),
+            return_value=(stream_uuid, [topic_uuid], [sys_uuid.uuid4()]),
         ) as read_messages, mock.patch.object(
+            dm_helpers.messenger_events, "create_topic_read_event"
+        ) as create_read_event, mock.patch.object(
             dm_helpers, "_create_unread_updated_events"
         ) as create_unread_events:
             result = dm_helpers.read_workspace_user_stream_topic_messages(
@@ -2744,6 +2773,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             messages=unread_messages,
+            session=session,
+        )
+        create_read_event.assert_called_once_with(
+            topic=returned_topic,
             session=session,
         )
         create_unread_events.assert_called_once_with(
@@ -2792,7 +2825,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             "WorkspaceUserMessageFlags",
             FakeWorkspaceUserMessageFlags,
         ), mock.patch.object(
-            dm_helpers.messenger_events, "create_messages_read_event"
+            dm_helpers.messenger_events, "create_message_read_event"
         ) as create_read_event, mock.patch.object(
             dm_helpers, "_create_message_unread_updated_events"
         ) as create_unread_events:
@@ -2824,9 +2857,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         FakeWorkspaceUserMessageFlags.objects.get_one.assert_called_once()
         create_read_event.assert_called_once_with(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            message_uuids=[message_uuid],
+            message=returned_message,
             session=session,
         )
         create_unread_events.assert_called_once_with(
@@ -2864,8 +2895,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ) as get_unread, mock.patch.object(
             dm_helpers,
             "_read_workspace_user_messages",
-            return_value=(stream_uuid, [topic_uuid], []),
+            return_value=(stream_uuid, [topic_uuid], [message_uuid]),
         ) as read_messages, mock.patch.object(
+            dm_helpers.messenger_events, "create_message_read_event"
+        ) as create_read_event, mock.patch.object(
             dm_helpers, "_create_unread_updated_events"
         ) as create_unread_events:
             result = dm_helpers.read_workspace_user_topic_messages_to_message(
@@ -2904,6 +2937,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             messages=unread_messages,
+            session=session,
+        )
+        create_read_event.assert_called_once_with(
+            message=returned_message,
             session=session,
         )
         create_unread_events.assert_called_once_with(

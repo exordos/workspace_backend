@@ -16,7 +16,6 @@
 
 import asyncio
 import contextlib
-import datetime
 import json
 import logging
 import uuid as sys_uuid
@@ -73,10 +72,6 @@ class ClientConnection:
 
 def _json_dumps(payload):
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
-
-
-def _utcnow_iso():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 class MessengerEventsWebsocketServer:
@@ -155,26 +150,8 @@ class MessengerEventsWebsocketServer:
         )
         self._add_connection(connection)
         try:
-            await self._send_json(
-                connection,
-                {
-                    "type": "hello",
-                    "user_uuid": str(user_uuid),
-                    "project_id": str(project_id),
-                    "epoch_version": messenger_events.get_current_epoch_version(
-                        project_id=project_id,
-                        user_uuid=user_uuid,
-                    ),
-                },
-            )
             await self._catch_up(connection)
-            heartbeat_task = asyncio.create_task(self._heartbeat(connection))
-            try:
-                await self._consume_client_frames(connection)
-            finally:
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
+            await self._consume_client_frames(connection)
         finally:
             self._remove_connection(connection)
 
@@ -202,13 +179,7 @@ class MessengerEventsWebsocketServer:
             )
 
     async def _send_event(self, connection, event):
-        await self._send_json(
-            connection,
-            {
-                "type": "event",
-                "event": event,
-            },
-        )
+        await self._send_json(connection, event)
         connection.last_epoch_version = max(
             connection.last_epoch_version,
             event["epoch_version"],
@@ -250,36 +221,8 @@ class MessengerEventsWebsocketServer:
             await connection.websocket.close(code=1011, reason="Event delivery failed")
 
     async def _consume_client_frames(self, connection):
-        async for raw_frame in connection.websocket:
-            try:
-                frame = json.loads(raw_frame)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(frame, dict):
-                continue
-            frame_type = frame.get("type")
-            if frame_type == "ack":
-                epoch_version = messenger_events.normalize_epoch_version(
-                    frame.get("epoch_version"),
-                    default=connection.last_epoch_version,
-                )
-                connection.last_epoch_version = max(
-                    connection.last_epoch_version,
-                    epoch_version,
-                )
-            elif frame_type == "pong":
-                continue
-
-    async def _heartbeat(self, connection):
-        while True:
-            await asyncio.sleep(self._heartbeat_interval)
-            await self._send_json(
-                connection,
-                {
-                    "type": "ping",
-                    "ts": _utcnow_iso(),
-                },
-            )
+        async for _raw_frame in connection.websocket:
+            continue
 
     async def _poll_connections(self):
         while True:
