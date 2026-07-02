@@ -1118,6 +1118,37 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         self.assertIn("not-a-role", error_context.exception.msg)
 
+    def test_create_workspace_stream_binding_message_flags_uses_engine_session(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        session = types.SimpleNamespace(execute=mock.Mock())
+
+        class SessionManager:
+            def __enter__(self):
+                return session
+
+            def __exit__(self, exc_type, exc, traceback):
+                return None
+
+        engine = types.SimpleNamespace(
+            session_manager=mock.Mock(return_value=SessionManager()),
+        )
+
+        with mock.patch.object(
+            dm_helpers.models.WorkspaceUserMessageFlags,
+            "_get_engine",
+            return_value=engine,
+        ):
+            dm_helpers._create_workspace_stream_binding_message_flags(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+            )
+
+        engine.session_manager.assert_called_once_with()
+        session.execute.assert_called_once()
+
     def test_get_or_create_workspace_stream_bindings_rejects_non_list_users(self):
         with self.assertRaises(
             messenger_exc.StreamBindingUsersPayloadError

@@ -17,13 +17,17 @@
 """End-to-end messenger API tests against a real server + test database."""
 
 import hashlib
+import importlib.util
 import io
 import uuid as sys_uuid
+
+from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import models as messenger_models
 from workspace.tests.integration import conftest
 
 
@@ -240,6 +244,197 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
     resp = api.get(f"{USERS}{user_uuid}")
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "do_not_disturb"
+
+
+def test_workspace_event_payload_identity_backfill_migration(_database, db):
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    clean_user_uuid = sys_uuid.uuid4()
+    damaged_user_uuid = sys_uuid.uuid4()
+
+    def run_migration(filename, module_name):
+        migration_path = conftest.MIGRATIONS_DIR / filename
+        spec = importlib.util.spec_from_file_location(module_name, migration_path)
+        migration = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        migration.migration_step.upgrade(db)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_events
+                (uuid, project_id, user_uuid, payload, created_at, updated_at)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                jsonb_build_object(
+                    'kind', 'message.created',
+                    'uuid', %s::text,
+                    'stream_uuid', %s::text,
+                    'topic_uuid', %s::text,
+                    'author_uuid', %s::text,
+                    'payload', jsonb_build_object(
+                        'kind', 'markdown',
+                        'content', 'legacy event'
+                    ),
+                    'created_at', '2026-07-02 12:00:00.000000',
+                    'updated_at', '2026-07-02 12:00:00.000000'
+                ),
+                NOW(),
+                NOW()
+            )
+            RETURNING epoch_version
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(project_id),
+                str(user_uuid),
+                str(message_uuid),
+                str(stream_uuid),
+                str(topic_uuid),
+                str(user_uuid),
+            ),
+        )
+        message_epoch_version = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            INSERT INTO m_workspace_events
+                (uuid, project_id, user_uuid, payload, created_at, updated_at)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                jsonb_build_object(
+                    'kind', 'user.updated',
+                    'uuid', %s::text,
+                    'created_at', '2026-07-02 12:00:00.000000',
+                    'updated_at', '2026-07-02 12:00:00.000000',
+                    'username', 'clean-user',
+                    'source', 'iam',
+                    'status', 'active',
+                    'last_ping_at', '2026-07-02 12:00:00.000000'
+                ),
+                NOW(),
+                NOW()
+            )
+            RETURNING epoch_version
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(project_id),
+                str(clean_user_uuid),
+                str(clean_user_uuid),
+            ),
+        )
+        clean_user_epoch_version = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            INSERT INTO m_workspace_events
+                (uuid, project_id, user_uuid, payload, created_at, updated_at)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                jsonb_build_object(
+                    'kind', 'user.updated',
+                    'project_id', %s::text,
+                    'uuid', %s::text,
+                    'created_at', '2026-07-02 12:00:00.000000',
+                    'updated_at', '2026-07-02 12:00:00.000000',
+                    'username', 'damaged-user',
+                    'source', 'iam',
+                    'status', 'active',
+                    'last_ping_at', '2026-07-02 12:00:00.000000'
+                ),
+                NOW(),
+                NOW()
+            )
+            RETURNING epoch_version
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(project_id),
+                str(damaged_user_uuid),
+                str(project_id),
+                str(damaged_user_uuid),
+            ),
+        )
+        damaged_user_epoch_version = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            SELECT payload->>'project_id', payload->>'user_uuid'
+            FROM m_workspace_events
+            WHERE epoch_version = %s
+            """,
+            (message_epoch_version,),
+        )
+        assert cur.fetchone() == (None, None)
+
+    run_migration(
+        "0061-backfill-workspace-event-payload-identity-fields-f25144.py",
+        "migration_0061",
+    )
+
+    event = messenger_models.WorkspaceEvent.objects.get_one(
+        filters={"epoch_version": dm_filters.EQ(message_epoch_version)},
+    )
+    assert str(event.payload.project_id) == str(project_id)
+    assert str(event.payload.user_uuid) == str(user_uuid)
+
+    event = messenger_models.WorkspaceEvent.objects.get_one(
+        filters={"epoch_version": dm_filters.EQ(clean_user_epoch_version)},
+    )
+    assert event.payload.username == "clean-user"
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload->>'project_id', payload->>'user_uuid'
+            FROM m_workspace_events
+            WHERE epoch_version = %s
+            """,
+            (message_epoch_version,),
+        )
+        assert cur.fetchone() == (str(project_id), str(user_uuid))
+
+        cur.execute(
+            """
+            SELECT payload->>'project_id'
+            FROM m_workspace_events
+            WHERE epoch_version = %s
+            """,
+            (clean_user_epoch_version,),
+        )
+        assert cur.fetchone()[0] is None
+
+    run_migration(
+        "0062-clean-invalid-workspace-event-payload-project-ids-82eab5.py",
+        "migration_0062",
+    )
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload->>'project_id'
+            FROM m_workspace_events
+            WHERE epoch_version = %s
+            """,
+            (damaged_user_epoch_version,),
+        )
+        assert cur.fetchone()[0] is None
+
+    event = messenger_models.WorkspaceEvent.objects.get_one(
+        filters={"epoch_version": dm_filters.EQ(damaged_user_epoch_version)},
+    )
+    assert event.payload.username == "damaged-user"
+    assert project_id in messenger_dm_helpers._get_workspace_event_project_ids()
 
 
 # --------------------------------------------------------------------------- #

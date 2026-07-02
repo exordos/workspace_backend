@@ -706,7 +706,13 @@ def _create_workspace_stream_binding_message_flags(project_id, stream_uuid,
         str(project_id),
         str(stream_uuid),
     )
-    session.execute(statement, values)
+    if session is not None:
+        session.execute(statement, values)
+        return
+
+    engine = models.WorkspaceUserMessageFlags._get_engine()
+    with engine.session_manager() as s:
+        s.execute(statement, values)
 
 
 def _get_or_create_workspace_stream_binding(project_id, stream_uuid, user_uuid,
