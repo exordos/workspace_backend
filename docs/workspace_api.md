@@ -888,13 +888,12 @@ Files are stored in `m_workspace_files`; visibility is stored separately in
 stream recipient. Users added to a stream later receive access to existing
 stream files; users removed from a stream lose access to those stream files.
 
-File bytes are stored under `messenger_files.storage_path`, which defaults to
+File bytes are stored through the configured messenger file storage backend.
+Local storage uses `messenger_files.storage_path`, which defaults to
 `/var/lib/workspace/messenger/files` and can be overridden with
-`WORKSPACE_FILE_STORAGE_PATH`. In deployment, the node has a second disk labeled
-`data`; bootstrap mounts it as persistent storage and migrates
-`/var/lib/workspace` there, so the configured file path remains stable while
-uploaded bytes live outside the replaceable root image. Nginx rejects multipart
-requests larger than `50m` before they reach `workspace-messenger-api`.
+`WORKSPACE_FILE_STORAGE_PATH`; S3 storage uses the `messenger_files_s3`
+configuration section. Nginx rejects multipart requests larger than `50m`
+before they reach `workspace-messenger-api`.
 
 | Field | Type | Required on JSON create | Read-only | Description |
 | --- | --- | --- | --- | --- |

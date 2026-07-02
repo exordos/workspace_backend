@@ -26,9 +26,9 @@ Nginx exposes the messenger services as:
 - OpenAPI spec: `/api/messenger/specifications/3.0.3`
 - Upload request limit: `50m`
 
-Deployment provisions a second compute disk labeled `data`; bootstrap mounts it
-as persistent storage and migrates `/var/lib/workspace` there, so uploaded files
-survive root image updates.
+Deployment stores uploaded files through the configured messenger file
+storage backend. For durable deployments prefer S3; local storage uses the node
+filesystem path configured in `messenger_files.storage_path`.
 
 ## API Surface
 
