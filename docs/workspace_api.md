@@ -28,6 +28,9 @@ OpenAPI spec:   /api/messenger/specifications/3.0.3
 The exact nginx location `/api/messenger/ws` is proxied to the websocket
 service endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
+The deployed nginx manifest sets `client_max_body_size 50m` for proxied
+requests.
+
 ## General Rules
 
 - Request and response bodies are JSON (`application/json`).
@@ -884,6 +887,14 @@ Files are stored in `m_workspace_files`; visibility is stored separately in
 `m_workspace_file_accesses`. Creating a file grants access to every current
 stream recipient. Users added to a stream later receive access to existing
 stream files; users removed from a stream lose access to those stream files.
+
+File bytes are stored under `messenger_files.storage_path`, which defaults to
+`/var/lib/workspace/messenger/files` and can be overridden with
+`WORKSPACE_FILE_STORAGE_PATH`. In deployment, the node has a second disk labeled
+`data`; bootstrap mounts it as persistent storage and migrates
+`/var/lib/workspace` there, so the configured file path remains stable while
+uploaded bytes live outside the replaceable root image. Nginx rejects multipart
+requests larger than `50m` before they reach `workspace-messenger-api`.
 
 | Field | Type | Required on JSON create | Read-only | Description |
 | --- | --- | --- | --- | --- |

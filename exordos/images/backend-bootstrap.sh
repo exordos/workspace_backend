@@ -25,6 +25,9 @@ WORKSPACE_CONFIG="$GC_CFG_DIR/workspace.conf"
 RUN_DIR="/run/workspace"
 READY_FILE="$RUN_DIR/bootstrap.ready"
 LOCK_FILE="$RUN_DIR/bootstrap.lock"
+WORKSPACE_DATA_DIR="/var/lib/workspace"
+
+source /usr/local/lib/exordos/lib_bootstrap.sh
 
 mkdir -p "$GC_CFG_DIR" "$RUN_DIR"
 
@@ -35,6 +38,25 @@ while [ ! -s "$WORKSPACE_CONFIG" ]; do
     echo "Waiting for workspace platform configs..."
     sleep 1
 done
+
+prepare_workspace_data_disk() {
+    local persistent_disk
+    persistent_disk=$(find_persistent_disk)
+    prepare_persistent_disk "$persistent_disk" "$PERSISTENT_MOUNT"
+
+    if [ -z "$persistent_disk" ]; then
+        echo "Workspace data disk was not detected; refusing to continue" >&2
+        exit 1
+    fi
+
+    mkdir -p "$WORKSPACE_DATA_DIR/messenger/files"
+    migrate_to_persistent \
+        "$WORKSPACE_DATA_DIR" \
+        "$PERSISTENT_MOUNT/var/lib/workspace"
+    persist_migrate_complete
+}
+
+prepare_workspace_data_disk
 
 eval "$(
     python3 - "$WORKSPACE_CONFIG" <<'PY'

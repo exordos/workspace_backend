@@ -58,9 +58,3 @@ if [ -s /run/nginx.pid ]; then
     nginx -s reload
     exit 0
 fi
-
-for unit_path in /etc/systemd/system/exordos_srv_workspace-nginx_*.service; do
-    [ -e "$unit_path" ] || continue
-    systemctl restart "$(basename "$unit_path")"
-    exit 0
-done

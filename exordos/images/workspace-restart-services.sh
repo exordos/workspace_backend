@@ -27,8 +27,8 @@ SERVICE_NAMES=(
 )
 
 for service_name in "${SERVICE_NAMES[@]}"; do
-    for unit_path in /etc/systemd/system/exordos_srv_"$service_name"_*.service; do
-        [ -e "$unit_path" ] || continue
-        systemctl restart "$(basename "$unit_path")"
-    done
+    pattern="(^|[ /])${service_name}([[:space:]]|$)"
+    if pgrep -f "$pattern" >/dev/null; then
+        pkill -TERM -f "$pattern" || true
+    fi
 done

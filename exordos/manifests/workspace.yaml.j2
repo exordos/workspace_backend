@@ -54,6 +54,8 @@ resources:
           - size: 8
             image: "{{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace/{{ version }}/images/workspace-backend.raw.zst"
             label: root
+          - size: 20
+            label: data
 
   $core.secret.passwords:
     workspace_db_password:
@@ -140,6 +142,10 @@ resources:
           catchup_limit = 500
           send_queue_limit = 32
           poll_interval = 3
+
+
+          [messenger_files]
+          storage_path = /var/lib/workspace/messenger/files
           "
     workspace_backend_nginx:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
@@ -160,6 +166,7 @@ resources:
           server {
               listen 80;
               server_name _;
+              client_max_body_size 50m;
 
               location /api/core/ {
                   proxy_pass http://workspace_core_api/api/core/;

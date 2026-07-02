@@ -24,6 +24,11 @@ Nginx exposes the messenger services as:
 - REST API: `/api/messenger/v1/...`
 - WebSocket API: `/api/messenger/ws?last_epoch_version=<number>`
 - OpenAPI spec: `/api/messenger/specifications/3.0.3`
+- Upload request limit: `50m`
+
+Deployment provisions a second compute disk labeled `data`; bootstrap mounts it
+as persistent storage and migrates `/var/lib/workspace` there, so uploaded files
+survive root image updates.
 
 ## API Surface
 

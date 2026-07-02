@@ -42,7 +42,8 @@ sudo apt update
 sudo apt install -y \
     libev-dev \
     nginx \
-    postgresql-client
+    postgresql-client \
+    procps
 
 sudo mkdir -p \
     "$GC_CFG_DIR" \
@@ -50,6 +51,7 @@ sudo mkdir -p \
     /etc/nginx/sites-available \
     /etc/nginx/sites-enabled \
     /etc/nginx/workspace.d \
+    /var/lib/workspace/messenger/files \
     /usr/local/bin
 sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 
@@ -67,4 +69,3 @@ for helper in "${WORKSPACE_HELPERS[@]}"; do
 done
 
 sudo rm -f /etc/nginx/sites-enabled/default
-sudo systemctl disable --now nginx || true
