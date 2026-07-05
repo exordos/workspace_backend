@@ -428,18 +428,20 @@ class ExternalAccountController(
 
     def create(self, **kwargs):
         values = kwargs.copy()
-        values["status"] = models.ExternalAccountStatus.NEW.value
         account_settings = values["account_settings"]
-        credentials = account_settings.credentials
-        server_url = values["server_url"]
-        client = zulip_client.ZulipClient(endpoint=server_url)
-        user_info = client.get_current_user_with_api_key(
-            login=credentials.login,
-            token=credentials.token,
-        )
-        account_settings.user_info = account_settings._get_zulip_user_info(
-            user=user_info,
-        )
+        values["account_type"] = account_settings.KIND
+        values["status"] = models.ExternalAccountStatus.NEW.value
+        if account_settings.KIND == models.ExternalAccountType.ZULIP.value:
+            credentials = account_settings.credentials
+            server_url = values["server_url"]
+            client = zulip_client.ZulipClient(endpoint=server_url)
+            user_info = client.get_current_user_with_api_key(
+                login=credentials.login,
+                token=credentials.token,
+            )
+            account_settings.user_info = account_settings._get_zulip_user_info(
+                user=user_info,
+            )
         account = super().create(**values)
         self._ensure_user_sync(account)
         return account

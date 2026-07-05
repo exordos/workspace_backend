@@ -27,6 +27,7 @@ from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
+from workspace.common.clients import iam as iam_client
 from workspace.common.clients import zulip as zulip_client
 from workspace.messenger_api.dm import base
 
@@ -240,6 +241,7 @@ class WorkspaceUser(
 
 class ExternalAccountType(str, enum.Enum):
     ZULIP = "zulip"
+    IAM = "iam"
 
 
 class ExternalAccountStatus(str, enum.Enum):
@@ -324,11 +326,11 @@ class ZulipExternalAccountUserInfoKind(types_dynamic.AbstractKindModel):
     )
 
 
-EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
+ZULIP_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ZulipExternalAccountCredentialsKind),
 )
 
-EXTERNAL_ACCOUNT_USER_INFO_TYPE = types_dynamic.KindModelSelectorType(
+ZULIP_EXTERNAL_ACCOUNT_USER_INFO_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ZulipExternalAccountUserInfoKind),
 )
 
@@ -337,11 +339,11 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
     KIND = ExternalAccountType.ZULIP.value
 
     credentials = properties.property(
-        types.AllowNone(EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
+        types.AllowNone(ZULIP_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
         default=None,
     )
     user_info = properties.property(
-        types.AllowNone(EXTERNAL_ACCOUNT_USER_INFO_TYPE),
+        types.AllowNone(ZULIP_EXTERNAL_ACCOUNT_USER_INFO_TYPE),
         default=None,
     )
 
@@ -490,8 +492,87 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
         )
 
 
+class IamExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.IAM.value
+
+    username = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    access_token = properties.property(
+        types.String(min_length=1, max_length=4096),
+        required=True,
+    )
+
+
+IAM_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(IamExternalAccountCredentialsKind),
+)
+
+
+class IamExternalAccountKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.IAM.value
+
+    credentials = properties.property(
+        IAM_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE,
+        required=True,
+    )
+
+    def sync_users(self, external_account):
+        users = self._get_iam_users(external_account=external_account)
+        synced_users = []
+        for user in users:
+            synced_users.append(self._sync_iam_user(user=user))
+
+        external_account.update_dm(
+            values={"status": ExternalAccountStatus.ACTIVE.value},
+        )
+        external_account.save()
+        return synced_users
+
+    def _get_iam_users(self, external_account):
+        client = iam_client.IamClient(endpoint=external_account.server_url)
+        return client.get_users(token=self.credentials.access_token)
+
+    def _sync_iam_user(self, user):
+        user_uuid = sys_uuid.UUID(user["uuid"])
+        status = WorkspaceUserStatus.ACTIVE.value
+        if user["status"] != "ACTIVE":
+            status = WorkspaceUserStatus.OFFLINE.value
+
+        values = {
+            "username": user["username"],
+            "source": WorkspaceUserSource.IAM.value,
+            "status": status,
+            "first_name": self._empty_to_none(user.get("first_name")),
+            "last_name": self._empty_to_none(user.get("last_name")),
+            "email": self._empty_to_none(user["email"]),
+        }
+        workspace_user = WorkspaceUser.objects.get_one_or_none(
+            filters={"uuid": dm_filters.EQ(user_uuid)},
+        )
+        if workspace_user is not None:
+            workspace_user.update_dm(values=values)
+            workspace_user.save()
+            return workspace_user
+
+        workspace_user = WorkspaceUser(
+            uuid=user_uuid,
+            **values,
+        )
+        workspace_user.insert()
+        return workspace_user
+
+    @staticmethod
+    def _empty_to_none(value):
+        if value == "":
+            return None
+        return value
+
+
 EXTERNAL_ACCOUNT_SETTINGS_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ZulipExternalAccountKind),
+    types_dynamic.KindModelType(IamExternalAccountKind),
 )
 
 
@@ -585,11 +666,7 @@ class ExternalAccountUserSync(
             return account
         return None
 
-    def sync(self):
-        external_account = self.get_external_account()
-        if external_account is None:
-            return
-        users = external_account.user_sync()
+    def _update_next_sync_at(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         self.update_dm(
             values={
@@ -603,6 +680,14 @@ class ExternalAccountUserSync(
             },
         )
         self.save()
+
+    def sync(self):
+        external_account = self.get_external_account()
+        if external_account is None:
+            self._update_next_sync_at()
+            return
+        users = external_account.user_sync()
+        self._update_next_sync_at()
         return users
 
 

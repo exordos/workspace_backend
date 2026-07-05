@@ -971,30 +971,51 @@ bridge worker promotes accounts to `active`.
 | `uuid` | UUID | no | yes | External account binding identifier. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `user_uuid` | UUID | no | yes | Workspace user owner. |
-| `account_type` | `zulip` | no | no | External account provider type. |
+| `server_url` | URL | yes | no | External provider server URL. |
+| `account_type` | `zulip`, `iam` | no | no | External account provider type. |
 | `status` | `new`, `active` | no | yes | Integration lifecycle status. |
 | `account_settings` | object | yes | no | Provider-specific settings with a `kind` discriminator. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
-The integration bridge worker tracks Zulip user import progress in
+The integration bridge worker tracks external user import progress in
 `m_external_account_user_syncs`. Each row stores `account_type`, a unique
-`server_url`, nullable `external_account_uuid`, `is_synced`, `last_synced_at`,
-and `next_sync_at`; this state is internal and has no public REST endpoint. The
-external account create flow creates a sync row for the Zulip server when it is
-missing. If the linked external account is deleted, `external_account_uuid` is
-set to `null`. For rows that have never been synced, `next_sync_at` is set to
-the current time.
+`server_url`, nullable `external_account_uuid`, `last_synced_at`, and
+`next_sync_at`; this state is internal and has no public REST endpoint. The
+external account create flow creates a sync row for the provider server when it
+is missing. If the linked external account is deleted, `external_account_uuid`
+is set to `null`. For rows that have never been synced, `next_sync_at` is set
+to the current time. IAM users are synced directly into `m_workspace_users`;
+there is no separate `workspace_iam_users` table.
 
 Zulip account create request:
 
 ```json
 {
+  "server_url": "https://zulip.example.com",
   "account_settings": {
     "kind": "zulip",
-    "login": "user@example.com",
-    "server_url": "https://zulip.example.com",
-    "token": "zulip-token"
+    "credentials": {
+      "kind": "zulip",
+      "login": "user@example.com",
+      "token": "zulip-token"
+    }
+  }
+}
+```
+
+IAM account create request:
+
+```json
+{
+  "server_url": "https://exordos.com/api/core/v1/iam/clients/default",
+  "account_settings": {
+    "kind": "iam",
+    "credentials": {
+      "kind": "iam",
+      "username": "admin",
+      "access_token": "access-token"
+    }
   }
 }
 ```

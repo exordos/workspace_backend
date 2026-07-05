@@ -28,12 +28,22 @@ from workspace.messenger_api.dm import models
 
 
 def _zulip_account_settings(user_info=None):
+    user_info = user_info or _zulip_user_info()
     return models.ZulipExternalAccountKind(
         credentials=models.ZulipExternalAccountCredentialsKind(
             login="user@example.com",
             token="zulip-token",
         ),
         user_info=user_info,
+    )
+
+
+def _zulip_account_settings_without_user_info():
+    return models.ZulipExternalAccountKind(
+        credentials=models.ZulipExternalAccountCredentialsKind(
+            login="user@example.com",
+            token="zulip-token",
+        ),
     )
 
 
@@ -59,6 +69,54 @@ def _zulip_profile():
     }
 
 
+def _zulip_user_info(profile=None):
+    profile = profile or _zulip_profile()
+    return models.ZulipExternalAccountUserInfoKind(
+        email=profile["email"],
+        user_id=profile["user_id"],
+        avatar_version=profile["avatar_version"],
+        is_admin=profile["is_admin"],
+        is_owner=profile["is_owner"],
+        is_guest=profile["is_guest"],
+        role=profile["role"],
+        is_bot=profile["is_bot"],
+        full_name=profile["full_name"],
+        timezone=profile["timezone"],
+        is_active=profile["is_active"],
+        date_joined=profile["date_joined"],
+        delivery_email=profile["delivery_email"],
+        avatar_url=profile["avatar_url"],
+    )
+
+
+def _iam_account_settings():
+    return models.IamExternalAccountKind(
+        credentials=models.IamExternalAccountCredentialsKind(
+            username="admin",
+            access_token="iam-token",
+        ),
+    )
+
+
+def _iam_user():
+    return {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "username": "admin",
+        "description": "This is Admin",
+        "created_at": "2025-08-12T10:13:49.963391Z",
+        "updated_at": "2025-08-20T07:23:41.032313Z",
+        "status": "ACTIVE",
+        "type": "user",
+        "first_name": "Admin",
+        "last_name": "Admin",
+        "surname": "",
+        "phone": "",
+        "email": "admin@genesis-core.tech",
+        "email_verified": False,
+        "otp_enabled": False,
+    }
+
+
 def test_external_account_stores_zulip_credentials_kind():
     account = models.ExternalAccount(
         project_id=sys_uuid.uuid4(),
@@ -80,7 +138,69 @@ def test_external_account_stores_zulip_credentials_kind():
             "login": "user@example.com",
             "token": "zulip-token",
         },
-        "user_info": None,
+        "user_info": {
+            "kind": "zulip",
+            "email": "user32@zulip.genesis-core.tech",
+            "user_id": 32,
+            "avatar_version": 2,
+            "is_admin": False,
+            "is_owner": False,
+            "is_guest": False,
+            "role": 400,
+            "is_bot": False,
+            "full_name": "Phoenix",
+            "timezone": "Europe/Moscow",
+            "is_active": True,
+            "date_joined": "2026-05-14T22:36+00:00",
+            "delivery_email": "cassi+phoenix@genesis-corporation.ru",
+            "avatar_url": (
+                "/user_avatars/2/"
+                "c8fa2d4dcb2a15d1e57b80b0f904f44110ddeea7.png"
+            ),
+        },
+    }
+
+
+def test_external_account_settings_parses_zulip_create_payload():
+    account_settings = (
+        models.EXTERNAL_ACCOUNT_SETTINGS_TYPE.from_simple_type(
+            {
+                "kind": "zulip",
+                "credentials": {
+                    "kind": "zulip",
+                    "login": "infra@genesis-corporation.ru",
+                    "token": "zulip-token",
+                },
+            },
+        )
+    )
+
+    assert account_settings.credentials.login == (
+        "infra@genesis-corporation.ru"
+    )
+    assert account_settings.credentials.token == "zulip-token"
+    assert account_settings.user_info is None
+
+
+def test_external_account_stores_iam_credentials_kind():
+    account = models.ExternalAccount(
+        project_id=sys_uuid.uuid4(),
+        user_uuid=sys_uuid.uuid4(),
+        server_url="https://iam.example.com",
+        account_type="iam",
+        account_settings=_iam_account_settings(),
+    )
+
+    data = account._get_prepared_data()
+
+    assert data["account_type"] == "iam"
+    assert data["account_settings"] == {
+        "kind": "iam",
+        "credentials": {
+            "kind": "iam",
+            "username": "admin",
+            "access_token": "iam-token",
+        },
     }
 
 
@@ -110,8 +230,21 @@ def test_external_account_user_sync_stores_sync_state():
     assert before <= next_sync_at <= after
 
 
+def test_external_account_user_sync_stores_iam_type():
+    user_sync = models.ExternalAccountUserSync(
+        project_id=sys_uuid.uuid4(),
+        account_type="iam",
+        server_url="https://iam.example.com",
+    )
+
+    data = user_sync._get_prepared_data()
+
+    assert data["account_type"] == "iam"
+    assert data["server_url"] == "https://iam.example.com"
+
+
 def test_zulip_external_account_kind_gets_users():
-    account_settings = _zulip_account_settings()
+    account_settings = _zulip_account_settings_without_user_info()
     external_account = models.ExternalAccount(
         project_id=sys_uuid.uuid4(),
         user_uuid=sys_uuid.uuid4(),
@@ -385,7 +518,7 @@ def test_external_account_updates_zulip_external_account():
         server_url="https://zulip.example.com",
         account_settings=models.ZulipExternalAccountKind(
             credentials=None,
-            user_info=None,
+            user_info=_zulip_user_info(),
         ),
     )
     external_account.save = mock.Mock()
@@ -402,6 +535,70 @@ def test_external_account_updates_zulip_external_account():
     assert external_account.account_settings.user_info is user_info
     assert external_account.status == "active"
     external_account.save.assert_called_once_with()
+
+
+def test_iam_external_account_kind_syncs_users_and_marks_account_active():
+    account = models.ExternalAccount(
+        project_id=sys_uuid.uuid4(),
+        user_uuid=sys_uuid.uuid4(),
+        server_url="https://iam.example.com",
+        account_type="iam",
+        account_settings=_iam_account_settings(),
+    )
+    account.save = mock.Mock()
+    workspace_user = models.WorkspaceUser(
+        uuid=sys_uuid.UUID("00000000-0000-0000-0000-000000000000"),
+        username="admin",
+    )
+
+    with (
+        mock.patch.object(
+            account.account_settings,
+            "_get_iam_users",
+            return_value=[_iam_user()],
+        ) as get_iam_users,
+        mock.patch.object(
+            account.account_settings,
+            "_sync_iam_user",
+            return_value=workspace_user,
+        ) as sync_iam_user,
+    ):
+        users = account.account_settings.sync_users(external_account=account)
+
+    assert users == [workspace_user]
+    assert account.status == "active"
+    get_iam_users.assert_called_once_with(external_account=account)
+    sync_iam_user.assert_called_once_with(user=_iam_user())
+    account.save.assert_called_once_with()
+
+
+def test_iam_external_account_kind_creates_workspace_user():
+    account_settings = _iam_account_settings()
+
+    with (
+        mock.patch.object(
+            orm.ObjectCollection,
+            "get_one_or_none",
+            return_value=None,
+        ) as get_one_or_none,
+        mock.patch.object(models.WorkspaceUser, "insert") as insert,
+    ):
+        workspace_user = account_settings._sync_iam_user(user=_iam_user())
+
+    assert workspace_user.uuid == sys_uuid.UUID(
+        "00000000-0000-0000-0000-000000000000",
+    )
+    assert workspace_user.username == "admin"
+    assert workspace_user.source == "iam"
+    assert workspace_user.status == "active"
+    assert workspace_user.first_name == "Admin"
+    assert workspace_user.last_name == "Admin"
+    assert workspace_user.email == "admin@genesis-core.tech"
+    filters = get_one_or_none.call_args.kwargs["filters"]
+    assert filters["uuid"].value == sys_uuid.UUID(
+        "00000000-0000-0000-0000-000000000000",
+    )
+    insert.assert_called_once_with()
 
 
 def test_external_account_normalizes_empty_zulip_user_fields():
@@ -509,6 +706,35 @@ def test_external_account_user_sync_updates_schedule_after_sync():
     save.assert_called_once_with()
 
 
+def test_external_account_user_sync_updates_schedule_without_external_account():
+    user_sync = models.ExternalAccountUserSync(
+        project_id=sys_uuid.uuid4(),
+        account_type="iam",
+        server_url="https://iam.example.com",
+    )
+    save = mock.Mock()
+    user_sync.save = save
+
+    before = datetime.datetime.now(datetime.timezone.utc)
+    with mock.patch.object(
+        user_sync,
+        "get_external_account",
+        mock.Mock(return_value=None),
+    ):
+        users = user_sync.sync()
+    after = datetime.datetime.now(datetime.timezone.utc)
+
+    assert users is None
+    assert before <= user_sync.last_synced_at <= after
+    assert user_sync.next_sync_at == (
+        user_sync.last_synced_at
+        + datetime.timedelta(
+            minutes=models.ExternalAccountUserSync.SYNC_INTERVAL_MINUTES,
+        )
+    )
+    save.assert_called_once_with()
+
+
 def test_external_account_controller_uses_workspace_scope():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
@@ -541,7 +767,7 @@ def test_external_account_controller_create_fetches_zulip_profile():
             ),
         ),
     )
-    account_settings = _zulip_account_settings()
+    account_settings = _zulip_account_settings_without_user_info()
     created_sync = {}
 
     class FakeExternalAccountUserSync:
@@ -683,6 +909,64 @@ def test_external_account_controller_create_binds_existing_user_sync():
         "external_account_uuid": account.uuid,
     }
     assert existing_sync.updated is True
+    FakeExternalAccountUserSync.objects.get_one_or_none.assert_called_once()
+
+
+def test_external_account_controller_create_iam_account_creates_user_sync():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    controller = controllers.ExternalAccountController(
+        SimpleNamespace(
+            context=SimpleNamespace(
+                project_id=project_id,
+                user_uuid=user_uuid,
+            ),
+        ),
+    )
+    created_sync = {}
+
+    class FakeExternalAccountUserSync:
+        objects = SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=None),
+        )
+
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+        def insert(self):
+            created_sync.update(self.values)
+
+    with (
+        mock.patch.object(
+            controllers.zulip_client,
+            "ZulipClient",
+        ) as client_cls,
+        mock.patch.object(models.ExternalAccount, "insert") as insert,
+        mock.patch.object(
+            models,
+            "ExternalAccountUserSync",
+            FakeExternalAccountUserSync,
+        ),
+    ):
+        account = controller.create(
+            server_url=(
+                "https://exordos.com/api/core/v1/iam/clients/default"
+            ),
+            account_settings=_iam_account_settings(),
+        )
+
+    client_cls.assert_not_called()
+    assert account.project_id == project_id
+    assert account.user_uuid == user_uuid
+    assert account.account_type == "iam"
+    assert account.status == "new"
+    insert.assert_called_once_with()
+    assert created_sync == {
+        "project_id": project_id,
+        "account_type": "iam",
+        "server_url": "https://exordos.com/api/core/v1/iam/clients/default",
+        "external_account_uuid": account.uuid,
+    }
     FakeExternalAccountUserSync.objects.get_one_or_none.assert_called_once()
 
 

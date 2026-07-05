@@ -30,20 +30,31 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    def _get_unsynced_user_providers(self):
+    def _get_unsynced_user_providers(self, account_type):
         now = datetime.datetime.now(datetime.timezone.utc)
         return models.ExternalAccountUserSync.objects.get_all(
-            filters=dm_filters.AND(
-                {"next_sync_at": dm_filters.IsNot(None)},
-                {"next_sync_at": dm_filters.LE(now)},
-            ),
-            order_by={"next_sync_at": "asc", "uuid": "asc"},
+            filters={
+                "account_type": dm_filters.EQ(account_type),
+                "next_sync_at": dm_filters.LE(now),
+            },
+        )
+
+    def _sync_user_providers(self, account_type):
+        user_providers = self._get_unsynced_user_providers(
+            account_type=account_type,
+        )
+        for provider in user_providers:
+            provider.sync()
+
+    def _sync_iam_users(self):
+        self._sync_user_providers(
+            account_type=models.ExternalAccountType.IAM.value,
         )
 
     def _sync_users(self):
-        user_providers = self._get_unsynced_user_providers()
-        for provider in user_providers:
-            provider.sync()
+        self._sync_user_providers(
+            account_type=models.ExternalAccountType.ZULIP.value,
+        )
 
     def _iteration(self):
         ctx = contexts.Context()
