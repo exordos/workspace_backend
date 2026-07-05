@@ -57,6 +57,19 @@
             "subProcess": true
         },
         {
+            "name": "Python Debugger: Integration Bridge Worker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": ".tox/develop/bin/workspace-integration-bridge-worker",
+            "args": [
+                "--config-file",
+                "etc/workspace/workspace.conf"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true
+        },
+        {
             "name": "Python Debugger: Apply Migrations",
             "type": "debugpy",
             "request": "launch",

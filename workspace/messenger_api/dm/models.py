@@ -16,6 +16,7 @@
 
 import datetime
 import enum
+import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
@@ -26,6 +27,7 @@ from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
+from workspace.common.clients import zulip as zulip_client
 from workspace.messenger_api.dm import base
 
 
@@ -183,6 +185,7 @@ class WorkspaceUserStatus(str, enum.Enum):
 
 class WorkspaceUserSource(str, enum.Enum):
     IAM = "iam"
+    ZULIP = "zulip"
 
 
 class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
@@ -244,21 +247,247 @@ class ExternalAccountStatus(str, enum.Enum):
     ACTIVE = "active"
 
 
-class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
+DEFAULT_ZULIP_TIMEZONE = "Europe/Moscow"
+
+
+class ZulipExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
     KIND = ExternalAccountType.ZULIP.value
 
     login = properties.property(
         types.String(min_length=1, max_length=256),
         required=True,
     )
-    server_url = properties.property(
-        types.Url(),
-        required=True,
-    )
     token = properties.property(
         types.String(min_length=1, max_length=4096),
         required=True,
     )
+
+
+class ZulipExternalAccountUserInfoKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.ZULIP.value
+
+    email = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    user_id = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    avatar_version = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    is_admin = properties.property(
+        types.Boolean(),
+        required=True,
+    )
+    is_owner = properties.property(
+        types.Boolean(),
+        required=True,
+    )
+    is_guest = properties.property(
+        types.Boolean(),
+        required=True,
+    )
+    role = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    is_bot = properties.property(
+        types.Boolean(),
+        required=True,
+    )
+    full_name = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    timezone = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=128)),
+        default=DEFAULT_ZULIP_TIMEZONE,
+    )
+    is_active = properties.property(
+        types.Boolean(),
+        required=True,
+    )
+    date_joined = properties.property(
+        types.String(min_length=1, max_length=64),
+        required=True,
+    )
+    delivery_email = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=256)),
+        default=None,
+    )
+    avatar_url = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=2048)),
+        default=None,
+    )
+
+
+EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(ZulipExternalAccountCredentialsKind),
+)
+
+EXTERNAL_ACCOUNT_USER_INFO_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(ZulipExternalAccountUserInfoKind),
+)
+
+
+class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.ZULIP.value
+
+    credentials = properties.property(
+        types.AllowNone(EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
+        default=None,
+    )
+    user_info = properties.property(
+        types.AllowNone(EXTERNAL_ACCOUNT_USER_INFO_TYPE),
+        default=None,
+    )
+
+    def sync_users(self, external_account):
+        users = self._get_zulip_users(external_account=external_account)
+        external_accounts_by_user = (
+            self._get_external_accounts_by_server_url_and_user_id(
+                external_account=external_account,
+            )
+        )
+        synced_accounts = []
+        for user in users:
+            user_info = self._get_zulip_user_info(user=user)
+            user_key = (external_account.server_url, user_info.user_id)
+            synced_account = external_accounts_by_user.get(
+                user_key,
+            )
+            if synced_account is None:
+                synced_account = self._create_zulip_external_account(
+                    external_account=external_account,
+                    user=user,
+                    user_info=user_info,
+                )
+                external_accounts_by_user[user_key] = synced_account
+            else:
+                self._update_zulip_external_account(
+                    external_account=synced_account,
+                    user_info=user_info,
+                )
+            synced_accounts.append(synced_account)
+
+        external_account.update_dm(
+            values={"status": ExternalAccountStatus.ACTIVE.value},
+        )
+        external_account.save()
+        return synced_accounts
+
+    def _get_zulip_users(self, external_account):
+        credentials = self.credentials
+        client = zulip_client.ZulipClient(endpoint=external_account.server_url)
+        users = client.get_users_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+        )
+        return users
+
+    def _get_external_accounts_by_server_url_and_user_id(self, external_account):
+        accounts = type(external_account).objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "account_type": dm_filters.EQ(external_account.account_type),
+                "server_url": dm_filters.EQ(external_account.server_url),
+            },
+            order_by={"created_at": "asc", "uuid": "asc"},
+        )
+        return {
+            (
+                account.server_url,
+                account.account_settings.user_info.user_id,
+            ): account
+            for account in accounts
+            if (
+                account.server_url == external_account.server_url
+                and account.account_settings.user_info is not None
+            )
+        }
+
+    def _create_zulip_external_account(
+        self,
+        external_account,
+        user,
+        user_info,
+    ):
+        workspace_user = self._get_or_create_workspace_user(user=user)
+        synced_account = type(external_account)(
+            project_id=external_account.project_id,
+            user_uuid=workspace_user.uuid,
+            server_url=external_account.server_url,
+            account_type=external_account.account_type,
+            status=ExternalAccountStatus.ACTIVE.value,
+            account_settings=ZulipExternalAccountKind(
+                credentials=None,
+                user_info=user_info,
+            ),
+        )
+        synced_account.insert()
+        return synced_account
+
+    def _update_zulip_external_account(self, external_account, user_info):
+        external_account.account_settings.user_info = user_info
+        external_account.update_dm(
+            values={"status": ExternalAccountStatus.ACTIVE.value},
+        )
+        external_account.save()
+        return external_account
+
+    def _get_or_create_workspace_user(self, user):
+        email = self._empty_to_none(user["delivery_email"])
+        if email is not None:
+            workspace_users = WorkspaceUser.objects.get_all(
+                filters={"email": dm_filters.EQ(email)},
+            )
+            for workspace_user in workspace_users:
+                return workspace_user
+
+        workspace_user = WorkspaceUser(
+            uuid=sys_uuid.uuid4(),
+            username=user["full_name"],
+            source=WorkspaceUserSource.ZULIP.value,
+            email=email,
+        )
+        workspace_user.insert()
+        return workspace_user
+
+    @staticmethod
+    def _empty_to_none(value):
+        if value == "":
+            return None
+        return value
+
+    @staticmethod
+    def _empty_to_default(value, default):
+        if value == "":
+            return default
+        return value
+
+    def _get_zulip_user_info(self, user):
+        return ZulipExternalAccountUserInfoKind(
+            email=user["email"],
+            user_id=user["user_id"],
+            avatar_version=user["avatar_version"],
+            is_admin=user["is_admin"],
+            is_owner=user["is_owner"],
+            is_guest=user["is_guest"],
+            role=user["role"],
+            is_bot=user["is_bot"],
+            full_name=user["full_name"],
+            timezone=self._empty_to_default(
+                user["timezone"],
+                DEFAULT_ZULIP_TIMEZONE,
+            ),
+            is_active=user["is_active"],
+            date_joined=user["date_joined"],
+            delivery_email=self._empty_to_none(user["delivery_email"]),
+            avatar_url=self._empty_to_none(user["avatar_url"]),
+        )
 
 
 EXTERNAL_ACCOUNT_SETTINGS_TYPE = types_dynamic.KindModelSelectorType(
@@ -278,6 +507,10 @@ class ExternalAccount(
         types.UUID(),
         required=True,
     )
+    server_url = properties.property(
+        types.Url(),
+        required=True,
+    )
     account_type = properties.property(
         types.Enum([account_type.value for account_type in ExternalAccountType]),
         default=ExternalAccountType.ZULIP.value,
@@ -291,6 +524,9 @@ class ExternalAccount(
         required=True,
     )
 
+    def user_sync(self):
+        return self.account_settings.sync_users(external_account=self)
+
 
 class ExternalAccountUserSync(
     models.ModelWithUUID,
@@ -299,6 +535,7 @@ class ExternalAccountUserSync(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_external_account_user_syncs"
+    SYNC_INTERVAL_MINUTES = 5
 
     account_type = properties.property(
         types.Enum([account_type.value for account_type in ExternalAccountType]),
@@ -312,10 +549,6 @@ class ExternalAccountUserSync(
         types.AllowNone(types.UUID()),
         default=None,
     )
-    is_synced = properties.property(
-        types.Boolean(),
-        default=False,
-    )
     last_synced_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()),
         default=None,
@@ -324,6 +557,53 @@ class ExternalAccountUserSync(
         types.AllowNone(types.UTCDateTimeZ()),
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
+
+    def get_external_account(self):
+        if self.external_account_uuid is None:
+            return self._select_external_account()
+        return ExternalAccount.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(self.external_account_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
+            },
+        )
+
+    def _select_external_account(self):
+        accounts = ExternalAccount.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(self.project_id),
+                "account_type": dm_filters.EQ(self.account_type),
+                "server_url": dm_filters.EQ(self.server_url),
+            },
+            order_by={"created_at": "asc", "uuid": "asc"},
+        )
+        for account in accounts:
+            self.update_dm(
+                values={"external_account_uuid": account.uuid},
+            )
+            self.save()
+            return account
+        return None
+
+    def sync(self):
+        external_account = self.get_external_account()
+        if external_account is None:
+            return
+        users = external_account.user_sync()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.update_dm(
+            values={
+                "last_synced_at": now,
+                "next_sync_at": (
+                    now
+                    + datetime.timedelta(
+                        minutes=self.SYNC_INTERVAL_MINUTES,
+                    )
+                ),
+            },
+        )
+        self.save()
+        return users
 
 
 class WorkspaceFile(

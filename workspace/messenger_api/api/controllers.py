@@ -403,11 +403,10 @@ class ExternalAccountController(
 
     @staticmethod
     def _ensure_user_sync(account):
-        server_url = account.account_settings.server_url
         user_sync = models.ExternalAccountUserSync.objects.get_one_or_none(
             filters={
                 "account_type": dm_filters.EQ(account.account_type),
-                "server_url": dm_filters.EQ(server_url),
+                "server_url": dm_filters.EQ(account.server_url),
             },
         )
         if user_sync is not None:
@@ -421,7 +420,7 @@ class ExternalAccountController(
         user_sync = models.ExternalAccountUserSync(
             project_id=account.project_id,
             account_type=account.account_type,
-            server_url=server_url,
+            server_url=account.server_url,
             external_account_uuid=account.uuid,
         )
         user_sync.insert()
@@ -431,10 +430,15 @@ class ExternalAccountController(
         values = kwargs.copy()
         values["status"] = models.ExternalAccountStatus.NEW.value
         account_settings = values["account_settings"]
-        client = zulip_client.ZulipClient(endpoint=account_settings.server_url)
-        client.get_current_user_with_api_key(
-            login=account_settings.login,
-            token=account_settings.token,
+        credentials = account_settings.credentials
+        server_url = values["server_url"]
+        client = zulip_client.ZulipClient(endpoint=server_url)
+        user_info = client.get_current_user_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+        )
+        account_settings.user_info = account_settings._get_zulip_user_info(
+            user=user_info,
         )
         account = super().create(**values)
         self._ensure_user_sync(account)

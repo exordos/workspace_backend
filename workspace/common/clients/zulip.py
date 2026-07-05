@@ -14,27 +14,47 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import base64
 from typing import Any, Dict, Optional
 
 from bazooka import common
 from bazooka import client as bz_client
+
+try:
+    import zulip
+except ImportError:
+    zulip = None
 
 
 class ZulipClient(common.RESTClientMixIn):
     """Client for interacting with Zulip API.
 
     Currently supports fetching information about the current user
-    via the `json/users/me` endpoint.
+    via the official Zulip Python SDK for API key authentication.
     """
 
     ME_PATH_AUTH = "api/v1/users/me"
     ME_PATH_COOKIE = "json/users/me"
 
-    def __init__(self, endpoint: str, timeout: int = 5):
+    def __init__(self, endpoint: str, timeout: int = 5, client_cls=None):
         super().__init__()
         self._client = bz_client.Client(default_timeout=timeout)
+        self._sdk_client_cls = client_cls
         self._endpoint = endpoint
+
+    def _get_sdk_client_cls(self):
+        if self._sdk_client_cls is not None:
+            return self._sdk_client_cls
+        if zulip is None:
+            raise ImportError("The official zulip Python SDK is not installed")
+        return zulip.Client
+
+    def _get_sdk_client(self, login: str, token: str):
+        client_cls = self._get_sdk_client_cls()
+        return client_cls(
+            email=login,
+            api_key=token,
+            site=self._endpoint,
+        )
 
     def get_current_user(self, headers: Dict[str, str]) -> Dict[str, Any]:
         """Fetch raw information about the current user.
@@ -56,11 +76,17 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
     ) -> Dict[str, Any]:
-        raw_credentials = f"{login}:{token}".encode("utf-8")
-        credentials = base64.b64encode(raw_credentials).decode("ascii")
-        return self.get_current_user(
-            headers={"Authorization": f"Basic {credentials}"},
-        )
+        client = self._get_sdk_client(login=login, token=token)
+        return client.get_profile()
+
+    def get_users_with_api_key(
+        self,
+        login: str,
+        token: str,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        data = client.get_members()
+        return data["members"]
 
     def get_current_user_id(self, headers: Dict[str, str]) -> Optional[int]:
         """Extract current user's numeric ID from Zulip response.
