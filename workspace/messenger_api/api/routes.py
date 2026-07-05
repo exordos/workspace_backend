@@ -85,6 +85,16 @@ class WorkspaceFileRoute(routes.Route):
     download = routes.action(WorkspaceFileDownloadAction)
 
 
+class ExternalAccountRoute(routes.Route):
+    __controller__ = controllers.ExternalAccountController
+    __allow_methods__ = [
+        routes.CREATE,
+        routes.FILTER,
+        routes.GET,
+        routes.UPDATE,
+    ]
+
+
 class FolderRoute(routes.Route):
     __controller__ = controllers.FolderController
     __allow_methods__ = [
@@ -243,6 +253,7 @@ class ApiEndpointRoute(routes.Route):
     messages = routes.route(WorkspaceMessageRoute)
     message_reactions = routes.route(WorkspaceMessageReactionRoute)
     files = routes.route(WorkspaceFileRoute)
+    external_accounts = routes.route(ExternalAccountRoute)
     events = routes.route(WorkspaceEventRoute)
     epoch = routes.route(WorkspaceEpochRoute)
     users = routes.route(WorkspaceUserRoute)

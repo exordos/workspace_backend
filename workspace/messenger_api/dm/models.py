@@ -22,6 +22,7 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
+from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
@@ -231,6 +232,54 @@ class WorkspaceUser(
     last_ping_at = properties.property(
         WorkspaceUserLastPingAtType(),
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+
+
+class ExternalAccountType(str, enum.Enum):
+    ZULIP = "zulip"
+
+
+class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.ZULIP.value
+
+    login = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    token = properties.property(
+        types.String(min_length=1, max_length=4096),
+        required=True,
+    )
+
+
+EXTERNAL_ACCOUNT_SETTINGS_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(ZulipExternalAccountKind),
+)
+
+
+class ExternalAccount(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "external_accounts"
+
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    external_user_id = properties.property(
+        types.String(min_length=1, max_length=128),
+        required=True,
+    )
+    account_type = properties.property(
+        types.Enum([account_type.value for account_type in ExternalAccountType]),
+        default=ExternalAccountType.ZULIP.value,
+    )
+    account_settings = properties.property(
+        EXTERNAL_ACCOUNT_SETTINGS_TYPE,
+        required=True,
     )
 
 

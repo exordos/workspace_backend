@@ -391,6 +391,16 @@ WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
 )
 
 
+class ExternalAccountController(
+    WorkspaceBaseResourceControllerPaginated,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.ExternalAccount,
+        convert_underscore=False,
+        process_filters=True,
+    )
+
+
 class WorkspaceStreamController(
     WorkspaceBaseResourceControllerPaginated,
 ):

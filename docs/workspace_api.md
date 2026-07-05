@@ -218,6 +218,10 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `PUT` | `/v1/files/{file_uuid}` | Update an owned file metadata record. |
 | `DELETE` | `/v1/files/{file_uuid}` | Delete an owned file and its access rows. |
 | `GET` | `/v1/files/{file_uuid}/actions/download` | Download visible file bytes. |
+| `GET` | `/v1/external_accounts/` | List current user's external accounts. |
+| `POST` | `/v1/external_accounts/` | Create an external account binding. |
+| `GET` | `/v1/external_accounts/{external_account_uuid}` | Get an external account binding. |
+| `PUT` | `/v1/external_accounts/{external_account_uuid}` | Update an external account binding. |
 | `GET` | `/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/v1/users/` | List workspace users. |
@@ -948,6 +952,36 @@ stores the bytes, sets `content_type` from the uploaded part, calculates
 `DELETE` require file ownership. Downloads return raw bytes with the stored
 `Content-Type` and a `Content-Disposition` attachment filename. File operations
 do not currently emit durable workspace realtime events.
+
+## External Accounts
+
+External accounts are stored in `external_accounts` and scoped to the current
+IAM `project_id` and `user_uuid`. Request `project_id` and `user_uuid` values are
+ignored; the backend always writes values from the authenticated context.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | External account binding identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `user_uuid` | UUID | no | yes | Workspace user owner. |
+| `external_user_id` | string | yes | no | Provider-side user id. |
+| `account_type` | `zulip` | no | no | External account provider type. |
+| `account_settings` | object | yes | no | Provider-specific settings with a `kind` discriminator. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Zulip account create request:
+
+```json
+{
+  "external_user_id": "42",
+  "account_settings": {
+    "kind": "zulip",
+    "login": "user@example.com",
+    "token": "zulip-token"
+  }
+}
+```
 
 ## Events And Epoch
 
