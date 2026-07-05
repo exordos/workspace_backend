@@ -230,7 +230,9 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 `GET /v1/server_settings` is public and does not require `Authorization`. It is
 implemented by middleware and does not use the resource router. Unsupported
 query parameters are reported in
-`ignored_parameters_unsupported`.
+`ignored_parameters_unsupported`. `realm_url` and `realm_uri` are derived from
+the request `Host` header and `X-Forwarded-Proto` when a reverse proxy provides
+it.
 
 Example response:
 
@@ -255,13 +257,14 @@ Example response:
   "push_notifications_enabled": true,
   "email_auth_enabled": true,
   "require_email_format_usernames": true,
-  "realm_url": "https://zulip.genesis-core.tech",
-  "realm_name": "Genesis Corporation",
-  "realm_icon": "/user_avatars/2/realm/icon.png?version=2",
-  "realm_description": "<p>The coolest place in the universe.</p>",
+  "realm_url": "https://workspace.example.com",
+  "realm_name": "Exordos Workspace",
+  "realm_icon": "",
+  "realm_description": "<p>Exordos Workspace messenger.</p>",
   "realm_web_public_access_enabled": false,
+  "meet_url": "https://meet.genesis-core.tech",
   "external_authentication_methods": [],
-  "realm_uri": "https://zulip.genesis-core.tech"
+  "realm_uri": "https://workspace.example.com"
 }
 ```
 

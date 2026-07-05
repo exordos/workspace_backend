@@ -29,7 +29,7 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
             application=mock.Mock(side_effect=AssertionError("unexpected app call")),
         )
 
-    def test_returns_zulip_like_server_settings(self):
+    def test_returns_workspace_server_settings(self):
         req = webob.Request.blank(
             "/v1/server_settings",
             base_url="http://127.0.0.1:3000",
@@ -42,10 +42,28 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
         self.assertEqual(response.content_type, "application/json")
         self.assertEqual(result["result"], "success")
         self.assertEqual(result["msg"], "Welcome to Exordos Workspace")
-        self.assertEqual(result["realm_url"], "https://zulip.genesis-core.tech")
-        self.assertEqual(result["realm_uri"], "https://zulip.genesis-core.tech")
+        self.assertEqual(result["realm_url"], "http://127.0.0.1:3000")
+        self.assertEqual(result["realm_uri"], "http://127.0.0.1:3000")
+        self.assertEqual(result["realm_name"], "Exordos Workspace")
+        self.assertEqual(result["realm_icon"], "")
+        self.assertEqual(result["meet_url"], "https://meet.genesis-core.tech")
         self.assertTrue(result["authentication_methods"]["password"])
         self.assertEqual(result["external_authentication_methods"], [])
+
+    def test_uses_forwarded_proto_for_realm_url(self):
+        req = webob.Request.blank(
+            "/v1/server_settings",
+            headers={
+                "Host": "workspace.exordos.local",
+                "X-Forwarded-Proto": "https",
+            },
+        )
+
+        response = req.get_response(self._make_app())
+        result = json.loads(response.text)
+
+        self.assertEqual(result["realm_url"], "https://workspace.exordos.local")
+        self.assertEqual(result["realm_uri"], "https://workspace.exordos.local")
 
     def test_reports_unsupported_parameters(self):
         req = webob.Request.blank(

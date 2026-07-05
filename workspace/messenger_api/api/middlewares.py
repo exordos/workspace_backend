@@ -30,7 +30,13 @@ def _normalize_path(path):
     return path.rstrip("/") or "/"
 
 
+def _get_realm_url(req):
+    proto = req.headers.get("X-Forwarded-Proto", req.scheme)
+    return f"{proto}://{req.headers['Host']}"
+
+
 def build_server_settings(req):
+    realm_url = _get_realm_url(req)
     result = {
         "result": "success",
         "msg": "Welcome to Exordos Workspace",
@@ -51,13 +57,14 @@ def build_server_settings(req):
         "push_notifications_enabled": True,
         "email_auth_enabled": True,
         "require_email_format_usernames": True,
-        "realm_url": "https://zulip.genesis-core.tech",
-        "realm_name": "Genesis Corporation",
-        "realm_icon": "/user_avatars/2/realm/icon.png?version=2",
-        "realm_description": "<p>The coolest place in the universe.</p>",
+        "realm_url": realm_url,
+        "realm_name": "Exordos Workspace",
+        "realm_icon": "",
+        "realm_description": "<p>Exordos Workspace messenger.</p>",
         "realm_web_public_access_enabled": False,
+        "meet_url": "https://meet.genesis-core.tech",
         "external_authentication_methods": [],
-        "realm_uri": "https://zulip.genesis-core.tech"
+        "realm_uri": realm_url
     }
     if req.GET:
         result["ignored_parameters_unsupported"] = sorted(req.GET)
