@@ -52,4 +52,5 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
 
     def _run_iteration(self):
         LOG.debug("Workspace integration bridge worker iteration")
+        self._sync_iam_users()
         self._sync_users()
