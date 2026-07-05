@@ -33,7 +33,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
     def upgrade(self, session):
         session.execute(
             """
-            CREATE TABLE IF NOT EXISTS "external_accounts" (
+            CREATE TABLE IF NOT EXISTS "m_external_accounts" (
                 "uuid" UUID PRIMARY KEY,
                 "project_id" UUID NOT NULL,
                 "user_uuid" UUID NOT NULL,
@@ -42,11 +42,11 @@ class MigrationStep(migrations.AbstractMigrationStep):
                 "account_settings" JSONB NOT NULL,
                 "created_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                 "updated_at" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-                CONSTRAINT "external_accounts_user_uuid_fkey"
+                CONSTRAINT "m_external_accounts_user_uuid_fkey"
                     FOREIGN KEY ("user_uuid")
                     REFERENCES "m_workspace_users" ("uuid")
                     ON DELETE CASCADE,
-                CONSTRAINT "external_accounts_account_type_check"
+                CONSTRAINT "m_external_accounts_account_type_check"
                     CHECK ("account_type" IN ('zulip'))
             );
             """
@@ -54,34 +54,34 @@ class MigrationStep(migrations.AbstractMigrationStep):
         session.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
-                "external_accounts_project_user_account_type_idx"
-                ON "external_accounts"
+                "m_external_accounts_project_user_account_type_idx"
+                ON "m_external_accounts"
                     ("project_id", "user_uuid", "account_type");
             """
         )
         session.execute(
             """
-            CREATE INDEX IF NOT EXISTS "external_accounts_project_id_idx"
-                ON "external_accounts" ("project_id");
+            CREATE INDEX IF NOT EXISTS "m_external_accounts_project_id_idx"
+                ON "m_external_accounts" ("project_id");
             """
         )
         session.execute(
             """
-            CREATE INDEX IF NOT EXISTS "external_accounts_user_uuid_idx"
-                ON "external_accounts" ("user_uuid");
+            CREATE INDEX IF NOT EXISTS "m_external_accounts_user_uuid_idx"
+                ON "m_external_accounts" ("user_uuid");
             """
         )
         session.execute(
             """
-            CREATE INDEX IF NOT EXISTS "external_accounts_account_type_idx"
-                ON "external_accounts" ("account_type");
+            CREATE INDEX IF NOT EXISTS "m_external_accounts_account_type_idx"
+                ON "m_external_accounts" ("account_type");
             """
         )
         session.execute(
             """
             CREATE INDEX IF NOT EXISTS
-                "external_accounts_project_type_external_user_id_idx"
-                ON "external_accounts"
+                "m_external_accounts_project_type_external_user_id_idx"
+                ON "m_external_accounts"
                     ("project_id", "account_type", "external_user_id");
             """
         )
@@ -89,7 +89,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
     def downgrade(self, session):
         session.execute(
             """
-            DROP TABLE IF EXISTS "external_accounts";
+            DROP TABLE IF EXISTS "m_external_accounts";
             """
         )
 

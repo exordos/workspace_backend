@@ -267,7 +267,7 @@ class ExternalAccount(
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
-    __tablename__ = "external_accounts"
+    __tablename__ = "m_external_accounts"
 
     user_uuid = properties.property(
         types.UUID(),

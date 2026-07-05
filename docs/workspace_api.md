@@ -958,7 +958,7 @@ do not currently emit durable workspace realtime events.
 
 ## External Accounts
 
-External accounts are stored in `external_accounts` and scoped to the current
+External accounts are stored in `m_external_accounts` and scoped to the current
 IAM `project_id` and `user_uuid`. Request `project_id`, `user_uuid`, and
 `external_user_id` values are ignored on create; the backend always writes
 scope values from the authenticated context and fetches `external_user_id` from
