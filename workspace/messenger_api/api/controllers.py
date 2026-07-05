@@ -401,6 +401,32 @@ class ExternalAccountController(
         process_filters=True,
     )
 
+    @staticmethod
+    def _ensure_user_sync(account):
+        server_url = account.account_settings.server_url
+        user_sync = models.ExternalAccountUserSync.objects.get_one_or_none(
+            filters={
+                "account_type": dm_filters.EQ(account.account_type),
+                "server_url": dm_filters.EQ(server_url),
+            },
+        )
+        if user_sync is not None:
+            if user_sync.external_account_uuid is None:
+                user_sync.update_dm(
+                    values={"external_account_uuid": account.uuid},
+                )
+                user_sync.update()
+            return user_sync
+
+        user_sync = models.ExternalAccountUserSync(
+            project_id=account.project_id,
+            account_type=account.account_type,
+            server_url=server_url,
+            external_account_uuid=account.uuid,
+        )
+        user_sync.insert()
+        return user_sync
+
     def create(self, **kwargs):
         values = kwargs.copy()
         values["status"] = models.ExternalAccountStatus.NEW.value
@@ -410,7 +436,9 @@ class ExternalAccountController(
             login=account_settings.login,
             token=account_settings.token,
         )
-        return super().create(**values)
+        account = super().create(**values)
+        self._ensure_user_sync(account)
+        return account
 
 
 class WorkspaceStreamController(

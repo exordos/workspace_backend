@@ -92,6 +92,7 @@ class ExternalAccountRoute(routes.Route):
         routes.FILTER,
         routes.GET,
         routes.UPDATE,
+        routes.DELETE,
     ]
 
 

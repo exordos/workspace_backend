@@ -322,7 +322,7 @@ class ExternalAccountUserSync(
     )
     next_sync_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
 
 

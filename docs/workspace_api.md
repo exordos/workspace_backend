@@ -225,6 +225,7 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `POST` | `/v1/external_accounts/` | Create an external account binding. |
 | `GET` | `/v1/external_accounts/{external_account_uuid}` | Get an external account binding. |
 | `PUT` | `/v1/external_accounts/{external_account_uuid}` | Update an external account binding. |
+| `DELETE` | `/v1/external_accounts/{external_account_uuid}` | Delete an external account binding. |
 | `GET` | `/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/v1/users/` | List workspace users. |
@@ -979,7 +980,11 @@ bridge worker promotes accounts to `active`.
 The integration bridge worker tracks Zulip user import progress in
 `m_external_account_user_syncs`. Each row stores `account_type`, a unique
 `server_url`, nullable `external_account_uuid`, `is_synced`, `last_synced_at`,
-and `next_sync_at`; this state is internal and has no public REST endpoint.
+and `next_sync_at`; this state is internal and has no public REST endpoint. The
+external account create flow creates a sync row for the Zulip server when it is
+missing. If the linked external account is deleted, `external_account_uuid` is
+set to `null`. For rows that have never been synced, `next_sync_at` is set to
+the current time.
 
 Zulip account create request:
 
