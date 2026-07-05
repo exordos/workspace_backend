@@ -1,8 +1,6 @@
-#!/usr/bin/env bash
-
-# Copyright 2026 Genesis Corporation.
+#    Copyright 2026 Genesis Corporation.
 #
-# All Rights Reserved.
+#    All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -15,21 +13,3 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
-set -eu
-set -o pipefail
-
-SERVICE_NAMES=(
-    workspace-user-api
-    workspace-messenger-api
-    workspace-messenger-worker
-    workspace-integration-bridge-worker
-    workspace-messenger-events
-)
-
-for service_name in "${SERVICE_NAMES[@]}"; do
-    pattern="(^|[ /])${service_name}([[:space:]]|$)"
-    if pgrep -f "$pattern" >/dev/null; then
-        pkill -TERM -f "$pattern" || true
-    fi
-done

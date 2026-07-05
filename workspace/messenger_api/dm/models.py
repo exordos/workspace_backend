@@ -246,6 +246,10 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
         types.String(min_length=1, max_length=256),
         required=True,
     )
+    server_url = properties.property(
+        types.Url(),
+        required=True,
+    )
     token = properties.property(
         types.String(min_length=1, max_length=4096),
         required=True,

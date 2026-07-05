@@ -28,6 +28,7 @@ WORKSPACE_BINARIES=(
     workspace-user-api
     workspace-messenger-api
     workspace-messenger-worker
+    workspace-integration-bridge-worker
     workspace-messenger-events
 )
 WORKSPACE_HELPERS=(

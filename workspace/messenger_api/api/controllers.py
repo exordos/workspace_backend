@@ -28,6 +28,7 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
+from workspace.common.clients import zulip as zulip_client
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import versions
@@ -399,6 +400,17 @@ class ExternalAccountController(
         convert_underscore=False,
         process_filters=True,
     )
+
+    def create(self, **kwargs):
+        values = kwargs.copy()
+        account_settings = values["account_settings"]
+        client = zulip_client.ZulipClient(endpoint=account_settings.server_url)
+        profile = client.get_current_user_with_api_key(
+            login=account_settings.login,
+            token=account_settings.token,
+        )
+        values["external_user_id"] = str(profile["user_id"])
+        return super().create(**values)
 
 
 class WorkspaceStreamController(

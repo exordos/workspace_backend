@@ -3,7 +3,9 @@
 This document describes the current API contract implemented by
 `workspace-messenger-api` and the companion `workspace-messenger-events`
 websocket service. Background presence maintenance is performed by
-`workspace-messenger-worker`, which is included in the deployment manifest.
+`workspace-messenger-worker`. External integration bridge work runs in
+`workspace-integration-bridge-worker`. Both workers are included in the
+deployment manifest.
 
 ## Runtime Entry Points
 
@@ -13,6 +15,7 @@ Direct local services:
 REST API:       http://127.0.0.1:21081/v1
 WebSocket API:  ws://127.0.0.1:21082/v1/events/ws
 Worker:         workspace-messenger-worker
+Bridge worker:  workspace-integration-bridge-worker
 OpenAPI spec:   http://127.0.0.1:21081/specifications/3.0.3
 ```
 
@@ -956,15 +959,17 @@ do not currently emit durable workspace realtime events.
 ## External Accounts
 
 External accounts are stored in `external_accounts` and scoped to the current
-IAM `project_id` and `user_uuid`. Request `project_id` and `user_uuid` values are
-ignored; the backend always writes values from the authenticated context.
+IAM `project_id` and `user_uuid`. Request `project_id`, `user_uuid`, and
+`external_user_id` values are ignored on create; the backend always writes
+scope values from the authenticated context and fetches `external_user_id` from
+the external provider profile before inserting the row.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | External account binding identifier. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `user_uuid` | UUID | no | yes | Workspace user owner. |
-| `external_user_id` | string | yes | no | Provider-side user id. |
+| `external_user_id` | string | no | yes | Provider-side user id fetched from the external profile. |
 | `account_type` | `zulip` | no | no | External account provider type. |
 | `account_settings` | object | yes | no | Provider-specific settings with a `kind` discriminator. |
 | `created_at` | datetime | no | yes | Creation time. |
@@ -974,10 +979,10 @@ Zulip account create request:
 
 ```json
 {
-  "external_user_id": "42",
   "account_settings": {
     "kind": "zulip",
     "login": "user@example.com",
+    "server_url": "https://zulip.example.com",
     "token": "zulip-token"
   }
 }

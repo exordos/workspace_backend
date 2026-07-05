@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import base64
 from typing import Any, Dict, Optional
 
 from bazooka import common
@@ -49,6 +50,17 @@ class ZulipClient(common.RESTClientMixIn):
             url = self._build_resource_uri([self.ME_PATH_AUTH])
         response = self._client.get(url, headers=headers)
         return response.json()
+
+    def get_current_user_with_api_key(
+        self,
+        login: str,
+        token: str,
+    ) -> Dict[str, Any]:
+        raw_credentials = f"{login}:{token}".encode("utf-8")
+        credentials = base64.b64encode(raw_credentials).decode("ascii")
+        return self.get_current_user(
+            headers={"Authorization": f"Basic {credentials}"},
+        )
 
     def get_current_user_id(self, headers: Dict[str, str]) -> Optional[int]:
         """Extract current user's numeric ID from Zulip response.

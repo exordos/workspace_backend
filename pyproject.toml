@@ -125,6 +125,7 @@ where = ["."]
 workspace-user-api = "workspace.cmd.user_api:main"
 workspace-messenger-api = "workspace.cmd.messenger_api:main"
 workspace-messenger-worker = "workspace.cmd.messenger_worker:main"
+workspace-integration-bridge-worker = "workspace.cmd.workspace_integration_bridge_worker:main"
 workspace-messenger-events = "workspace.cmd.messenger_events:main"
 
 [tool.uv]

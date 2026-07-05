@@ -384,6 +384,21 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-wait-ready
+    workspace_integration_bridge_worker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-integration-bridge-worker
+      path: /usr/bin/workspace-integration-bridge-worker --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
     workspace_messenger_events:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-events

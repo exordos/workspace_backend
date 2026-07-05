@@ -17,6 +17,7 @@ Direct local services:
 - REST API: `http://127.0.0.1:21081/v1`
 - WebSocket API: `ws://127.0.0.1:21082/v1/events/ws`
 - Messenger worker: `workspace-messenger-worker`
+- Integration bridge worker: `workspace-integration-bridge-worker`
 - OpenAPI spec: `http://127.0.0.1:21081/specifications/3.0.3`
 
 Nginx exposes the messenger services as:
