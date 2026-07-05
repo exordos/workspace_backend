@@ -426,24 +426,81 @@ class ExternalAccountController(
         user_sync.insert()
         return user_sync
 
+    @staticmethod
+    def _get_zulip_user_info(server_url, account_settings):
+        credentials = account_settings.credentials
+        client = zulip_client.ZulipClient(endpoint=server_url)
+        user_info = client.get_current_user_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+        )
+        return account_settings._get_zulip_user_info(user=user_info)
+
+    @staticmethod
+    def _reject_user_info_from_api(account_settings):
+        if (
+            account_settings.KIND == models.ExternalAccountType.ZULIP.value
+            and account_settings.user_info is not None
+        ):
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def _reject_iam_account_from_api(account_settings):
+        if account_settings.KIND == models.ExternalAccountType.IAM.value:
+            raise ra_exc.ValidationErrorException()
+
+    def _validate_zulip_credentials_update(self, account, values):
+        if "account_settings" not in values:
+            return
+
+        account_settings = values["account_settings"]
+        self._reject_iam_account_from_api(account_settings)
+        self._reject_user_info_from_api(account_settings)
+        if account_settings.KIND != models.ExternalAccountType.ZULIP.value:
+            return
+
+        if account_settings.credentials is None:
+            return
+
+        server_url = account.server_url
+        if "server_url" in values:
+            server_url = values["server_url"]
+        user_info = self._get_zulip_user_info(
+            server_url=server_url,
+            account_settings=account_settings,
+        )
+        current_user_info = None
+        if account.account_settings.KIND == models.ExternalAccountType.ZULIP.value:
+            current_user_info = account.account_settings.user_info
+        if (
+            current_user_info is not None
+            and user_info.user_id != current_user_info.user_id
+        ):
+            raise ra_exc.ValidationErrorException()
+        account_settings.user_info = user_info
+
     def create(self, **kwargs):
         values = kwargs.copy()
         account_settings = values["account_settings"]
+        self._reject_iam_account_from_api(account_settings)
+        self._reject_user_info_from_api(account_settings)
         values["account_type"] = account_settings.KIND
         values["status"] = models.ExternalAccountStatus.NEW.value
         if account_settings.KIND == models.ExternalAccountType.ZULIP.value:
-            credentials = account_settings.credentials
-            server_url = values["server_url"]
-            client = zulip_client.ZulipClient(endpoint=server_url)
-            user_info = client.get_current_user_with_api_key(
-                login=credentials.login,
-                token=credentials.token,
-            )
-            account_settings.user_info = account_settings._get_zulip_user_info(
-                user=user_info,
+            account_settings.user_info = self._get_zulip_user_info(
+                server_url=values["server_url"],
+                account_settings=account_settings,
             )
         account = super().create(**values)
         self._ensure_user_sync(account)
+        return account
+
+    def update(self, uuid, **kwargs):
+        account = self.get(uuid=uuid)
+        values = self._apply_autovalues(kwargs)
+        self._validate_zulip_credentials_update(account, values)
+        account.update_dm(values=values)
+        account.update()
         return account
 
 

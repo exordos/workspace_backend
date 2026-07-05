@@ -965,6 +965,11 @@ are ignored on create; the backend always writes scope values from the
 authenticated context. Zulip credentials are checked against the external
 provider before the row is inserted. New rows stay in `new`; the integration
 bridge worker promotes accounts to `active`.
+Zulip `user_info` is server-managed: clients must not send it in create or
+update payloads. When credentials are updated, the backend fetches the Zulip
+profile for those credentials and rejects the update if the returned `user_id`
+does not match the account's stored `user_info.user_id`. IAM external accounts
+are internal-only and cannot be created through the public API.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -999,22 +1004,6 @@ Zulip account create request:
       "kind": "zulip",
       "login": "user@example.com",
       "token": "zulip-token"
-    }
-  }
-}
-```
-
-IAM account create request:
-
-```json
-{
-  "server_url": "https://exordos.com/api/core/v1/iam/clients/default",
-  "account_settings": {
-    "kind": "iam",
-    "credentials": {
-      "kind": "iam",
-      "username": "admin",
-      "access_token": "access-token"
     }
   }
 }

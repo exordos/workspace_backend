@@ -19,6 +19,8 @@ import uuid as sys_uuid
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.api import routes as ra_routes
 from restalchemy.storage.sql import orm
 
@@ -855,7 +857,7 @@ def test_external_account_controller_create_binds_existing_user_sync():
             ),
         ),
     )
-    account_settings = _zulip_account_settings()
+    account_settings = _zulip_account_settings_without_user_info()
 
     class ExistingSync:
         def __init__(self):
@@ -912,7 +914,7 @@ def test_external_account_controller_create_binds_existing_user_sync():
     FakeExternalAccountUserSync.objects.get_one_or_none.assert_called_once()
 
 
-def test_external_account_controller_create_iam_account_creates_user_sync():
+def test_external_account_controller_create_rejects_zulip_user_info():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
@@ -923,51 +925,215 @@ def test_external_account_controller_create_iam_account_creates_user_sync():
             ),
         ),
     )
-    created_sync = {}
+    account_settings = _zulip_account_settings()
 
-    class FakeExternalAccountUserSync:
-        objects = SimpleNamespace(
-            get_one_or_none=mock.Mock(return_value=None),
-        )
-
-        def __init__(self, **kwargs):
-            self.values = kwargs
-
-        def insert(self):
-            created_sync.update(self.values)
-
-    with (
-        mock.patch.object(
-            controllers.zulip_client,
-            "ZulipClient",
-        ) as client_cls,
-        mock.patch.object(models.ExternalAccount, "insert") as insert,
-        mock.patch.object(
-            models,
-            "ExternalAccountUserSync",
-            FakeExternalAccountUserSync,
-        ),
-    ):
-        account = controller.create(
-            server_url=(
-                "https://exordos.com/api/core/v1/iam/clients/default"
-            ),
-            account_settings=_iam_account_settings(),
-        )
+    with mock.patch.object(
+        controllers.zulip_client,
+        "ZulipClient",
+    ) as client_cls:
+        with mock.patch.object(models.ExternalAccount, "insert") as insert:
+            with pytest.raises(ra_exc.ValidationErrorException):
+                controller.create(
+                    server_url="https://zulip.example.com",
+                    account_settings=account_settings,
+                )
 
     client_cls.assert_not_called()
-    assert account.project_id == project_id
-    assert account.user_uuid == user_uuid
-    assert account.account_type == "iam"
-    assert account.status == "new"
-    insert.assert_called_once_with()
-    assert created_sync == {
-        "project_id": project_id,
-        "account_type": "iam",
-        "server_url": "https://exordos.com/api/core/v1/iam/clients/default",
-        "external_account_uuid": account.uuid,
-    }
-    FakeExternalAccountUserSync.objects.get_one_or_none.assert_called_once()
+    insert.assert_not_called()
+
+
+def test_external_account_controller_create_rejects_iam_account():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    controller = controllers.ExternalAccountController(
+        SimpleNamespace(
+            context=SimpleNamespace(
+                project_id=project_id,
+                user_uuid=user_uuid,
+            ),
+        ),
+    )
+
+    with mock.patch.object(
+        controllers.zulip_client,
+        "ZulipClient",
+    ) as client_cls:
+        with mock.patch.object(models.ExternalAccount, "insert") as insert:
+            with mock.patch.object(
+                models,
+                "ExternalAccountUserSync",
+            ) as user_sync_cls:
+                with pytest.raises(ra_exc.ValidationErrorException):
+                    controller.create(
+                        server_url=(
+                            "https://exordos.com/api/core/v1/iam/clients/"
+                            "default"
+                        ),
+                        account_settings=_iam_account_settings(),
+                    )
+
+    client_cls.assert_not_called()
+    insert.assert_not_called()
+    user_sync_cls.assert_not_called()
+
+
+def test_external_account_controller_update_rejects_zulip_user_info():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    controller = controllers.ExternalAccountController(
+        SimpleNamespace(
+            context=SimpleNamespace(
+                project_id=project_id,
+                user_uuid=user_uuid,
+            ),
+        ),
+    )
+    account = models.ExternalAccount(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        server_url="https://zulip.example.com",
+        account_settings=_zulip_account_settings(),
+    )
+    account.update = mock.Mock()
+    account_settings = _zulip_account_settings()
+
+    with mock.patch.object(controller, "get", return_value=account):
+        with mock.patch.object(
+            controllers.zulip_client,
+            "ZulipClient",
+        ) as client_cls:
+            with pytest.raises(ra_exc.ValidationErrorException):
+                controller.update(
+                    uuid=account.uuid,
+                    account_settings=account_settings,
+                )
+
+    client_cls.assert_not_called()
+    account.update.assert_not_called()
+    assert account.account_settings is not account_settings
+
+
+def test_external_account_controller_update_rejects_iam_account():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    controller = controllers.ExternalAccountController(
+        SimpleNamespace(
+            context=SimpleNamespace(
+                project_id=project_id,
+                user_uuid=user_uuid,
+            ),
+        ),
+    )
+    account = models.ExternalAccount(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        server_url="https://zulip.example.com",
+        account_settings=_zulip_account_settings(),
+    )
+    account.update = mock.Mock()
+    account_settings = _iam_account_settings()
+
+    with mock.patch.object(controller, "get", return_value=account):
+        with pytest.raises(ra_exc.ValidationErrorException):
+            controller.update(
+                uuid=account.uuid,
+                account_settings=account_settings,
+            )
+
+    account.update.assert_not_called()
+    assert account.account_settings is not account_settings
+
+
+def test_external_account_controller_update_rejects_other_zulip_user():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    controller = controllers.ExternalAccountController(
+        SimpleNamespace(
+            context=SimpleNamespace(
+                project_id=project_id,
+                user_uuid=user_uuid,
+            ),
+        ),
+    )
+    account = models.ExternalAccount(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        server_url="https://zulip.example.com",
+        account_settings=_zulip_account_settings(),
+    )
+    account.update = mock.Mock()
+    new_profile = _zulip_profile()
+    new_profile["user_id"] = 64
+    new_settings = _zulip_account_settings_without_user_info()
+
+    with mock.patch.object(controller, "get", return_value=account):
+        with mock.patch.object(
+            controllers.zulip_client,
+            "ZulipClient",
+        ) as client_cls:
+            client = client_cls.return_value
+            client.get_current_user_with_api_key.return_value = new_profile
+
+            with pytest.raises(ra_exc.ValidationErrorException):
+                controller.update(
+                    uuid=account.uuid,
+                    account_settings=new_settings,
+                )
+
+    client_cls.assert_called_once_with(endpoint="https://zulip.example.com")
+    client.get_current_user_with_api_key.assert_called_once_with(
+        login="user@example.com",
+        token="zulip-token",
+    )
+    account.update.assert_not_called()
+    assert account.account_settings is not new_settings
+
+
+def test_external_account_controller_update_accepts_same_zulip_user():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    controller = controllers.ExternalAccountController(
+        SimpleNamespace(
+            context=SimpleNamespace(
+                project_id=project_id,
+                user_uuid=user_uuid,
+            ),
+        ),
+    )
+    account = models.ExternalAccount(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        server_url="https://zulip.example.com",
+        account_settings=_zulip_account_settings(),
+    )
+    account.update = mock.Mock()
+    new_profile = _zulip_profile()
+    new_profile["full_name"] = "Phoenix Updated"
+    new_settings = _zulip_account_settings_without_user_info()
+
+    with mock.patch.object(controller, "get", return_value=account):
+        with mock.patch.object(
+            controllers.zulip_client,
+            "ZulipClient",
+        ) as client_cls:
+            client = client_cls.return_value
+            client.get_current_user_with_api_key.return_value = new_profile
+
+            updated_account = controller.update(
+                uuid=account.uuid,
+                account_settings=new_settings,
+            )
+
+    assert updated_account is account
+    client_cls.assert_called_once_with(endpoint="https://zulip.example.com")
+    client.get_current_user_with_api_key.assert_called_once_with(
+        login="user@example.com",
+        token="zulip-token",
+    )
+    assert account.account_settings is new_settings
+    assert account.account_settings.user_info.user_id == 32
+    assert account.account_settings.user_info.full_name == "Phoenix Updated"
+    account.update.assert_called_once_with()
 
 
 def test_external_account_route_allows_delete():
