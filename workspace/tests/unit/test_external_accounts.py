@@ -29,7 +29,6 @@ def test_external_account_stores_zulip_credentials_kind():
     account = models.ExternalAccount(
         project_id=sys_uuid.uuid4(),
         user_uuid=sys_uuid.uuid4(),
-        external_user_id="42",
         account_settings=models.ZulipExternalAccountKind(
             login="user@example.com",
             server_url="https://zulip.example.com",
@@ -41,13 +40,32 @@ def test_external_account_stores_zulip_credentials_kind():
 
     assert "project_id" in data
     assert data["account_type"] == "zulip"
-    assert data["external_user_id"] == "42"
+    assert data["status"] == "new"
+    assert "external_user_id" not in data
     assert data["account_settings"] == {
         "kind": "zulip",
         "login": "user@example.com",
         "server_url": "https://zulip.example.com",
         "token": "zulip-token",
     }
+
+
+def test_external_account_user_sync_stores_sync_state():
+    project_id = sys_uuid.uuid4()
+    user_sync = models.ExternalAccountUserSync(
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+
+    data = user_sync._get_prepared_data()
+
+    assert data["project_id"] == str(project_id)
+    assert data["account_type"] == "zulip"
+    assert data["server_url"] == "https://zulip.example.com"
+    assert data["external_account_uuid"] is None
+    assert data["is_synced"] is False
+    assert data["last_synced_at"] is None
+    assert data["next_sync_at"] is None
 
 
 def test_external_account_controller_uses_workspace_scope():
@@ -99,7 +117,6 @@ def test_external_account_controller_create_fetches_zulip_profile():
         client.get_current_user_with_api_key.return_value = {"user_id": 42}
 
         account = controller.create(
-            external_user_id="ignored-client-value",
             account_settings=account_settings,
         )
 
@@ -110,7 +127,7 @@ def test_external_account_controller_create_fetches_zulip_profile():
     )
     assert account.project_id == project_id
     assert account.user_uuid == user_uuid
-    assert account.external_user_id == "42"
+    assert account.status == "new"
     assert account.account_settings is account_settings
     insert.assert_called_once_with()
 

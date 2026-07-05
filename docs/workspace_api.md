@@ -959,21 +959,27 @@ do not currently emit durable workspace realtime events.
 ## External Accounts
 
 External accounts are stored in `m_external_accounts` and scoped to the current
-IAM `project_id` and `user_uuid`. Request `project_id`, `user_uuid`, and
-`external_user_id` values are ignored on create; the backend always writes
-scope values from the authenticated context and fetches `external_user_id` from
-the external provider profile before inserting the row.
+IAM `project_id` and `user_uuid`. Request `project_id` and `user_uuid` values
+are ignored on create; the backend always writes scope values from the
+authenticated context. Zulip credentials are checked against the external
+provider before the row is inserted. New rows stay in `new`; the integration
+bridge worker promotes accounts to `active`.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | External account binding identifier. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `user_uuid` | UUID | no | yes | Workspace user owner. |
-| `external_user_id` | string | no | yes | Provider-side user id fetched from the external profile. |
 | `account_type` | `zulip` | no | no | External account provider type. |
+| `status` | `new`, `active` | no | yes | Integration lifecycle status. |
 | `account_settings` | object | yes | no | Provider-specific settings with a `kind` discriminator. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
+
+The integration bridge worker tracks Zulip user import progress in
+`m_external_account_user_syncs`. Each row stores `account_type`, a unique
+`server_url`, nullable `external_account_uuid`, `is_synced`, `last_synced_at`,
+and `next_sync_at`; this state is internal and has no public REST endpoint.
 
 Zulip account create request:
 

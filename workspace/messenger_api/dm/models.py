@@ -239,6 +239,11 @@ class ExternalAccountType(str, enum.Enum):
     ZULIP = "zulip"
 
 
+class ExternalAccountStatus(str, enum.Enum):
+    NEW = "new"
+    ACTIVE = "active"
+
+
 class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
     KIND = ExternalAccountType.ZULIP.value
 
@@ -273,17 +278,51 @@ class ExternalAccount(
         types.UUID(),
         required=True,
     )
-    external_user_id = properties.property(
-        types.String(min_length=1, max_length=128),
-        required=True,
-    )
     account_type = properties.property(
         types.Enum([account_type.value for account_type in ExternalAccountType]),
         default=ExternalAccountType.ZULIP.value,
     )
+    status = properties.property(
+        types.Enum([status.value for status in ExternalAccountStatus]),
+        default=ExternalAccountStatus.NEW.value,
+    )
     account_settings = properties.property(
         EXTERNAL_ACCOUNT_SETTINGS_TYPE,
         required=True,
+    )
+
+
+class ExternalAccountUserSync(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_external_account_user_syncs"
+
+    account_type = properties.property(
+        types.Enum([account_type.value for account_type in ExternalAccountType]),
+        default=ExternalAccountType.ZULIP.value,
+    )
+    server_url = properties.property(
+        types.Url(),
+        required=True,
+    )
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    is_synced = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    last_synced_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
+    next_sync_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
     )
 
 

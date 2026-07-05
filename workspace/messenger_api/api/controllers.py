@@ -403,13 +403,13 @@ class ExternalAccountController(
 
     def create(self, **kwargs):
         values = kwargs.copy()
+        values["status"] = models.ExternalAccountStatus.NEW.value
         account_settings = values["account_settings"]
         client = zulip_client.ZulipClient(endpoint=account_settings.server_url)
-        profile = client.get_current_user_with_api_key(
+        client.get_current_user_with_api_key(
             login=account_settings.login,
             token=account_settings.token,
         )
-        values["external_user_id"] = str(profile["user_id"])
         return super().create(**values)
 
 
