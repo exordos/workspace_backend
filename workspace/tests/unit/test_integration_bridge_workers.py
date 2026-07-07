@@ -618,6 +618,7 @@ def test_add_message_executes_with_cache():
             "subject": "deploys",
             "sender_id": 24,
             "content": "hello",
+            "flags": ["read"],
             "timestamp": 1770998098,
         },
     )
@@ -638,7 +639,7 @@ def test_add_message_executes_with_cache():
         "invite_only": False,
         "announce": False,
         "is_archived": False,
-        "subscriber_ids": [24],
+        "subscriber_ids": [24, 10],
         "event_type": "message",
     }
     assert cache.calls == [
@@ -665,6 +666,7 @@ def test_add_message_executes_with_cache():
                 "message_id": 100,
                 "sender_id": 24,
                 "content": "hello",
+                "read": True,
                 "created_at": datetime.datetime.fromtimestamp(
                     1770998098,
                     tz=datetime.timezone.utc,
@@ -751,6 +753,7 @@ def test_add_private_message_executes_with_cache():
             ],
             "sender_id": 8,
             "content": "hello private",
+            "flags": [],
             "timestamp": 1772202531,
         },
     )
@@ -799,6 +802,7 @@ def test_add_private_message_executes_with_cache():
                 "message_id": 101,
                 "sender_id": 8,
                 "content": "hello private",
+                "read": False,
                 "created_at": datetime.datetime.fromtimestamp(
                     1772202531,
                     tz=datetime.timezone.utc,

@@ -539,7 +539,27 @@ class WorkspaceIntegrationBridgeCache:
                 entity_id=entity_id,
                 workspace_uuid=message.uuid,
             )
-        return self._messages[cache_key]
+        message = self._messages[cache_key]
+        self._sync_message_read_flag(
+            external_account=external_account,
+            message=message,
+            message_info=message_info,
+        )
+        return message
+
+    def _sync_message_read_flag(
+        self,
+        external_account,
+        message,
+        message_info,
+    ):
+        if not message_info["read"]:
+            return
+        messenger_dm_helpers.read_workspace_user_message(
+            project_id=external_account.project_id,
+            user_uuid=external_account.user_uuid,
+            message_uuid=message.uuid,
+        )
 
 
 class WorkspaceIntegrationBridgeWorker(basic.BasicService):

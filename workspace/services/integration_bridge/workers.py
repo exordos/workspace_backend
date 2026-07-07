@@ -153,6 +153,13 @@ class AddMessage:
             for recipient in self.message["display_recipient"]
         ]
 
+    def _get_stream_subscriber_ids(self):
+        subscriber_ids = [self.message["sender_id"]]
+        user_id = self.external_account.account_settings.user_info.user_id
+        if user_id not in subscriber_ids:
+            subscriber_ids.append(user_id)
+        return subscriber_ids
+
     def _get_private_stream_info(self):
         return {
             "type": self.message["type"],
@@ -185,7 +192,7 @@ class AddMessage:
             "invite_only": False,
             "announce": False,
             "is_archived": False,
-            "subscriber_ids": [self.message["sender_id"]],
+            "subscriber_ids": self._get_stream_subscriber_ids(),
             "event_type": "message",
         }
 
@@ -200,6 +207,7 @@ class AddMessage:
             "message_id": self.message["id"],
             "sender_id": self.message["sender_id"],
             "content": self.message["content"],
+            "read": "read" in self.message["flags"],
             "created_at": timestamp,
             "updated_at": timestamp,
         }
