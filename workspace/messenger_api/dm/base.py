@@ -35,6 +35,54 @@ def random_color():
     return random.randint(0, COLOR_MAX_VALUE)
 
 
+class ZulipSource(types_dynamic.AbstractKindModel):
+    KIND = "zulip"
+
+    stream_id = properties.property(
+        types.Integer(min_value=0, max_value=2**31 - 1),
+        required=True,
+    )
+    server_url = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
+    topic_name = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+    )
+    message_id = properties.property(
+        types.AllowNone(types.Integer(min_value=0, max_value=2**63 - 1)),
+        default=None,
+    )
+
+
+class NativeSource(types_dynamic.AbstractKindModel):
+    KIND = "native"
+
+
+class SourceName(str, enum.Enum):
+    ZULIP = ZulipSource.KIND
+    NATIVE = NativeSource.KIND
+
+
+def native_source():
+    return NativeSource()
+
+
+class WorkspaceSourceBase(models.Model):
+    source_name = properties.property(
+        types.Enum([source.value for source in SourceName]),
+        default=SourceName.NATIVE.value,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
+        ),
+        default=native_source,
+    )
+
+
 class UserScopedModelWithUUID(models.ModelWithUUID):
     user_uuid = properties.property(
         types.UUID(),
@@ -47,7 +95,7 @@ class UserScopedModelWithUUID(models.ModelWithUUID):
         return {"uuid": cls.properties.properties["uuid"]}
 
 
-class WorkspaceMessageFieldsBase(models.Model):
+class WorkspaceMessageFieldsBase(WorkspaceSourceBase):
     stream_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -131,24 +179,6 @@ class WorkspaceUserFolderBase(
         types.List(),
         default=list,
     )
-
-
-class ZulipSource(types_dynamic.AbstractKindModel):
-    KIND = "zulip"
-
-    stream_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
-        required=True,
-    )
-
-
-class NativeSource(types_dynamic.AbstractKindModel):
-    KIND = "native"
-
-
-class SourceName(str, enum.Enum):
-    ZULIP = ZulipSource.KIND
-    NATIVE = NativeSource.KIND
 
 
 class WorkspaceStreamRole(str, enum.Enum):

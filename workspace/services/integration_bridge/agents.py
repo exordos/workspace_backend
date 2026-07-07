@@ -17,43 +17,165 @@
 import datetime
 import logging
 import queue
+import uuid as sys_uuid
 
 from gcl_looper.services import basic
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 from workspace.services.integration_bridge import workers
 
 LOG = logging.getLogger(__name__)
 SYNC_QUEUE_TIMEOUT = 0.1
+RETRY_COMMAND_DELAY = datetime.timedelta(seconds=30)
+DEFAULT_SYNC_QUEUE_BATCH_LIMIT = 100
 
 
 class RetryCommandLater(Exception):
     pass
 
 
+class SyncStreamsNeeded(RetryCommandLater):
+    def __init__(self, external_account, stream_id):
+        self.external_account = external_account
+        self.stream_id = stream_id
+        super().__init__(
+            "Postpone Zulip item because stream %s from %s was not resolved" %
+            (stream_id, external_account.server_url),
+        )
+
+
 class WorkspaceIntegrationBridgeCache:
     def __init__(self):
         self._streams = {}
+        self._topics = {}
+        self._messages = {}
+        self._processed_entities = {}
         self._user_uuids = {}
         self._stream_bindings = set()
 
+    def _processed_entity_cache_key(
+        self,
+        external_account,
+        entity_type,
+        entity_id,
+    ):
+        return (
+            external_account.project_id,
+            external_account.server_url,
+            entity_type,
+            str(entity_id),
+        )
+
+    def _get_processed_workspace_uuid(
+        self,
+        external_account,
+        entity_type,
+        entity_id,
+    ):
+        cache_key = self._processed_entity_cache_key(
+            external_account=external_account,
+            entity_type=entity_type,
+            entity_id=entity_id,
+        )
+        if cache_key in self._processed_entities:
+            workspace_uuid = self._processed_entities[cache_key]
+            LOG.info(
+                "Duplicate Zulip %s %s from %s mapped to workspace %s",
+                entity_type,
+                entity_id,
+                external_account.server_url,
+                workspace_uuid,
+            )
+            return workspace_uuid
+
+        processed = models.ZulipProcessedEntity.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "server_url": dm_filters.EQ(external_account.server_url),
+                "entity_type": dm_filters.EQ(entity_type),
+                "entity_id": dm_filters.EQ(str(entity_id)),
+            },
+        )
+        if processed is None:
+            return None
+
+        self._processed_entities[cache_key] = processed.workspace_uuid
+        LOG.info(
+            "Duplicate Zulip %s %s from %s mapped to workspace %s",
+            entity_type,
+            entity_id,
+            external_account.server_url,
+            processed.workspace_uuid,
+        )
+        return processed.workspace_uuid
+
+    def _save_processed_entity(
+        self,
+        external_account,
+        entity_type,
+        entity_id,
+        workspace_uuid,
+    ):
+        processed = models.ZulipProcessedEntity(
+            uuid=sys_uuid.uuid4(),
+            project_id=external_account.project_id,
+            server_url=external_account.server_url,
+            entity_type=entity_type,
+            entity_id=str(entity_id),
+            workspace_uuid=workspace_uuid,
+        )
+        processed.insert()
+        cache_key = self._processed_entity_cache_key(
+            external_account=external_account,
+            entity_type=entity_type,
+            entity_id=entity_id,
+        )
+        self._processed_entities[cache_key] = workspace_uuid
+        LOG.info(
+            "Processed Zulip %s %s from %s mapped to workspace %s",
+            entity_type,
+            entity_id,
+            external_account.server_url,
+            workspace_uuid,
+        )
+
     def get_or_create_stream(self, external_account, stream_info):
         stream_id = stream_info["stream_id"]
+        entity_type = self._get_stream_entity_type(stream_info)
+        processed_uuid = self._get_processed_workspace_uuid(
+            external_account=external_account,
+            entity_type=entity_type,
+            entity_id=stream_id,
+        )
         cache_key = (
             external_account.project_id,
             external_account.server_url,
             stream_info["type"],
             stream_id,
         )
-        if cache_key not in self._streams:
+        if processed_uuid is not None and cache_key not in self._streams:
+            self._streams[cache_key] = models.WorkspaceStream.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(processed_uuid),
+                    "project_id": dm_filters.EQ(external_account.project_id),
+                },
+            )
+        elif cache_key not in self._streams:
             stream = self._load_or_create_stream(
                 external_account=external_account,
                 stream_info=stream_info,
             )
             self._streams[cache_key] = stream
+            self._save_processed_entity(
+                external_account=external_account,
+                entity_type=entity_type,
+                entity_id=stream_id,
+                workspace_uuid=stream.uuid,
+            )
         stream = self._streams[cache_key]
         self._bind_stream_users(
             external_account=external_account,
@@ -66,9 +188,20 @@ class WorkspaceIntegrationBridgeCache:
     def _is_private_stream_info(stream_info):
         return stream_info["type"] == "private"
 
-    def _is_matching_stream(self, stream, stream_info):
+    def _get_stream_entity_type(self, stream_info):
+        if self._is_private_stream_info(stream_info):
+            return "private_stream"
+        return "stream"
+
+    def _is_matching_stream(self, external_account, stream, stream_info):
+        server_url = getattr(
+            stream.source,
+            "server_url",
+            external_account.server_url,
+        )
         return (
             stream.source.stream_id == stream_info["stream_id"] and
+            server_url == external_account.server_url and
             getattr(stream, "private", False) ==
             self._is_private_stream_info(stream_info)
         )
@@ -81,13 +214,25 @@ class WorkspaceIntegrationBridgeCache:
             },
         ):
             if self._is_matching_stream(
+                external_account=external_account,
                 stream=stream,
                 stream_info=stream_info,
             ):
                 return stream
+        if self._should_request_stream_sync(stream_info):
+            raise SyncStreamsNeeded(
+                external_account=external_account,
+                stream_id=stream_info["stream_id"],
+            )
         return self._create_stream(
             external_account=external_account,
             stream_info=stream_info,
+        )
+
+    def _should_request_stream_sync(self, stream_info):
+        return (
+            stream_info["type"] == "stream" and
+            stream_info.get("event_type") == "message"
         )
 
     def _get_zulip_user_uuid(self, external_account, user_id):
@@ -96,12 +241,30 @@ class WorkspaceIntegrationBridgeCache:
             external_account.server_url,
             user_id,
         )
-        if cache_key not in self._user_uuids:
-            self._user_uuids[cache_key] = self._load_zulip_user_uuid(
+        if (
+            cache_key not in self._user_uuids or
+            self._user_uuids[cache_key] is None
+        ):
+            user_uuid = self._load_zulip_user_uuid(
                 external_account=external_account,
                 user_id=user_id,
             )
+            if user_uuid is not None:
+                self._user_uuids[cache_key] = user_uuid
+            return user_uuid
         return self._user_uuids[cache_key]
+
+    def _get_required_zulip_user_uuid(self, external_account, user_id):
+        user_uuid = self._get_zulip_user_uuid(
+            external_account=external_account,
+            user_id=user_id,
+        )
+        if user_uuid is None:
+            raise RetryCommandLater(
+                "Postpone Zulip item because user %s was not resolved" %
+                user_id,
+            )
+        return user_uuid
 
     def _load_zulip_user_uuid(self, external_account, user_id):
         cache_key = (
@@ -203,7 +366,7 @@ class WorkspaceIntegrationBridgeCache:
             default_topic_name = stream_info["default_topic_name"]
         else:
             default_topic_name = "General Topic"
-        user_uuid = self._get_zulip_user_uuid(
+        user_uuid = self._get_required_zulip_user_uuid(
             external_account=external_account,
             user_id=stream_info["creator_id"],
         )
@@ -213,7 +376,10 @@ class WorkspaceIntegrationBridgeCache:
             "name": stream_info["display_recipient"],
             "description": stream_info["description"],
             "source_name": models.SourceName.ZULIP.value,
-            "source": models.ZulipSource(stream_id=stream_id),
+            "source": models.ZulipSource(
+                stream_id=stream_id,
+                server_url=external_account.server_url,
+            ),
             "invite_only": stream_info["invite_only"],
             "announce": stream_info["announce"],
             "is_archived": stream_info["is_archived"],
@@ -230,12 +396,169 @@ class WorkspaceIntegrationBridgeCache:
             **values
         )
 
+    def _build_zulip_topic_source(
+        self,
+        external_account,
+        stream_info,
+        topic_name,
+    ):
+        return models.ZulipSource(
+            stream_id=stream_info["stream_id"],
+            server_url=external_account.server_url,
+            topic_name=topic_name,
+        )
+
+    def _build_zulip_message_source(
+        self,
+        external_account,
+        stream_info,
+        topic_name,
+        message_info,
+    ):
+        return models.ZulipSource(
+            stream_id=stream_info["stream_id"],
+            server_url=external_account.server_url,
+            topic_name=topic_name,
+            message_id=message_info["message_id"],
+        )
+
+    def get_or_create_topic(
+        self,
+        external_account,
+        stream,
+        stream_info,
+        topic_name,
+    ):
+        entity_id = "%s/%s" % (stream_info["stream_id"], topic_name)
+        processed_uuid = self._get_processed_workspace_uuid(
+            external_account=external_account,
+            entity_type="topic",
+            entity_id=entity_id,
+        )
+        cache_key = (
+            external_account.project_id,
+            external_account.server_url,
+            stream.uuid,
+            topic_name,
+        )
+        if processed_uuid is not None and cache_key not in self._topics:
+            self._topics[cache_key] = (
+                models.WorkspaceStreamTopic.objects.get_one(
+                    filters={
+                        "uuid": dm_filters.EQ(processed_uuid),
+                        "project_id": dm_filters.EQ(
+                            external_account.project_id,
+                        ),
+                        "stream_uuid": dm_filters.EQ(stream.uuid),
+                    },
+                )
+            )
+        elif cache_key not in self._topics:
+            source = self._build_zulip_topic_source(
+                external_account=external_account,
+                stream_info=stream_info,
+                topic_name=topic_name,
+            )
+            topic = (
+                messenger_dm_helpers
+                .get_or_create_workspace_stream_topic_with_flags(
+                    project_id=external_account.project_id,
+                    stream_uuid=stream.uuid,
+                    name=topic_name,
+                    source_name=models.SourceName.ZULIP.value,
+                    source=source,
+                )
+            )
+            self._topics[cache_key] = topic
+            self._save_processed_entity(
+                external_account=external_account,
+                entity_type="topic",
+                entity_id=entity_id,
+                workspace_uuid=topic.uuid,
+            )
+        return self._topics[cache_key]
+
+    def get_or_create_message(
+        self,
+        external_account,
+        stream,
+        topic,
+        stream_info,
+        topic_name,
+        message_info,
+    ):
+        entity_id = message_info["message_id"]
+        user_uuid = self._get_required_zulip_user_uuid(
+            external_account=external_account,
+            user_id=message_info["sender_id"],
+        )
+        processed_uuid = self._get_processed_workspace_uuid(
+            external_account=external_account,
+            entity_type="message",
+            entity_id=entity_id,
+        )
+        cache_key = (
+            external_account.project_id,
+            external_account.server_url,
+            message_info["message_id"],
+        )
+        if processed_uuid is not None and cache_key not in self._messages:
+            self._messages[cache_key] = (
+                messenger_dm_helpers.get_workspace_user_message(
+                    project_id=external_account.project_id,
+                    user_uuid=user_uuid,
+                    message_uuid=processed_uuid,
+                )
+            )
+        elif cache_key not in self._messages:
+            source = self._build_zulip_message_source(
+                external_account=external_account,
+                stream_info=stream_info,
+                topic_name=topic_name,
+                message_info=message_info,
+            )
+            message = (
+                messenger_dm_helpers.get_or_create_workspace_user_message(
+                    project_id=external_account.project_id,
+                    user_uuid=user_uuid,
+                    stream_uuid=stream.uuid,
+                    topic_uuid=topic.uuid,
+                    payload=message_payloads.MarkdownPayload(
+                        content=message_info["content"],
+                    ),
+                    source_name=models.SourceName.ZULIP.value,
+                    source=source,
+                    created_at=message_info["created_at"],
+                    updated_at=message_info["updated_at"],
+                )
+            )
+            self._messages[cache_key] = message
+            self._save_processed_entity(
+                external_account=external_account,
+                entity_type="message",
+                entity_id=entity_id,
+                workspace_uuid=message.uuid,
+            )
+        return self._messages[cache_key]
+
 
 class WorkspaceIntegrationBridgeWorker(basic.BasicService):
-    def __init__(self, **kwargs):
+    def __init__(
+        self,
+        sync_queue_batch_limit=DEFAULT_SYNC_QUEUE_BATCH_LIMIT,
+        **kwargs
+    ):
         super().__init__(**kwargs)
+        self._sync_queue_batch_limit = sync_queue_batch_limit
         self._workers = {}
-        self._sync_queue = queue.Queue()
+        self._worker_input_queues = {}
+        self._worker_accounts = {}
+        self._sync_queue = queue.PriorityQueue()
+        self._postponed_commands = []
+        self._last_sync_queue_stats = None
+        self._message_sync_worker_key = None
+        self._stream_sync_event_owners = set()
+        self._zulip_message_anchors = {}
         self._cache = WorkspaceIntegrationBridgeCache()
 
     def _get_unsynced_user_providers(self, account_type):
@@ -270,16 +593,13 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             self._run_iteration()
 
     def _clear_finished_workers(self):
-        for user_uuid, worker in list(self._workers.items()):
+        for worker_key, worker in list(self._workers.items()):
             if hasattr(worker, "is_alive") and not worker.is_alive():
-                del self._workers[user_uuid]
-
-    def _has_active_workers(self):
-        return any(
-            worker.is_alive()
-            for worker in self._workers.values()
-            if hasattr(worker, "is_alive")
-        )
+                del self._workers[worker_key]
+                self._worker_input_queues.pop(worker_key, None)
+                self._worker_accounts.pop(worker_key, None)
+                if self._message_sync_worker_key == worker_key:
+                    self._message_sync_worker_key = None
 
     def _start_bridges(self):
         self._clear_finished_workers()
@@ -290,49 +610,260 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 ),
             },
         )
+        first_worker_key = None
         for user in all_users:
             if user.account_settings.credentials is None:
                 continue
-            if user.user_uuid in self._workers:
+            worker_key = self._get_zulip_message_anchor_key(user)
+            if first_worker_key is None:
+                first_worker_key = worker_key
+            if worker_key in self._workers:
                 continue
 
+            LOG.info(
+                "Start Zulip bridge worker for %s",
+                user.server_url,
+            )
+            input_queue = queue.Queue()
             worker = workers.ZulipBridgeWorker(
                 external_account=user,
-                sync_queue=self._sync_queue,
+                input_queue=input_queue,
+                output_queue=self._sync_queue,
             )
             worker.start()
-            self._workers[user.user_uuid] = worker
+            self._workers[worker_key] = worker
+            self._worker_input_queues[worker_key] = input_queue
+            self._worker_accounts[worker_key] = user
+
+        if first_worker_key is not None:
+            self._request_zulip_message_sync(first_worker_key)
+
+    def _get_zulip_message_anchor_key(self, external_account):
+        return (
+            external_account.project_id,
+            external_account.server_url,
+            external_account.user_uuid,
+        )
+
+    def _get_zulip_message_anchor(self, external_account):
+        return self._zulip_message_anchors.get(
+            self._get_zulip_message_anchor_key(external_account),
+            0,
+        )
+
+    def _set_zulip_message_anchor(self, anchor_key, message_id):
+        current_message_id = self._zulip_message_anchors.get(anchor_key, 0)
+        if message_id <= current_message_id:
+            return
+        self._zulip_message_anchors[anchor_key] = message_id
+
+    def _clear_zulip_message_sync(self, worker_key):
+        if self._message_sync_worker_key == worker_key:
+            self._message_sync_worker_key = None
+
+    def _request_zulip_message_sync(self, worker_key):
+        if self._message_sync_worker_key is not None:
+            return
+        external_account = self._worker_accounts[worker_key]
+        initial_message_anchor = self._get_zulip_message_anchor(
+            external_account,
+        )
+        LOG.info(
+            "Request Zulip message sync for %s from anchor %s",
+            external_account.server_url,
+            initial_message_anchor,
+        )
+        self._message_sync_worker_key = worker_key
+        self._worker_input_queues[worker_key].put(
+            workers.SyncMessages(
+                initial_message_anchor=initial_message_anchor,
+                on_message_anchor_update=(
+                    lambda message_id, worker_key=worker_key:
+                    self._set_zulip_message_anchor(worker_key, message_id)
+                ),
+                on_finished=(
+                    lambda worker_key=worker_key:
+                    self._clear_zulip_message_sync(worker_key)
+                ),
+            ),
+        )
+
+    def _clear_zulip_stream_sync(self, event_owner):
+        self._stream_sync_event_owners.discard(event_owner)
+
+    def _get_zulip_worker_key(self, event_owner):
+        if event_owner in self._workers:
+            return event_owner
+        for worker_key in self._workers:
+            return worker_key
+        return None
+
+    def _request_zulip_stream_sync(self, command):
+        event_owner = command.event_owner
+        if event_owner in self._stream_sync_event_owners:
+            return
+        worker_key = self._get_zulip_worker_key(event_owner)
+        if worker_key is None:
+            return
+        external_account = self._worker_accounts[worker_key]
+        self._stream_sync_event_owners.add(event_owner)
+        LOG.info(
+            "Request Zulip stream sync for %s",
+            external_account.server_url,
+        )
+        self._worker_input_queues[worker_key].put(
+            workers.SyncStreams(
+                event_owner=event_owner,
+            ),
+        )
+
+    def _get_sync_queue_stats(self):
+        queued = self._sync_queue.qsize()
+        postponed = len(self._postponed_commands)
+        return queued, postponed, queued + postponed
+
+    def _put_sync_command(self, command):
+        workers.put_sync_response(self._sync_queue, command)
+
+    def _has_pending_stream_sync(self):
+        return bool(self._stream_sync_event_owners)
+
+    def _can_process_sync_command(self, command):
+        if not self._has_pending_stream_sync():
+            return True
+        return isinstance(
+            command,
+            (
+                workers.AddStream,
+                workers.SyncStreamsFinished,
+            ),
+        )
+
+    def _execute_sync_command(self, command):
+        result = command.execute(cache=self._cache)
+        if isinstance(command, workers.SyncStreamsFinished):
+            self._clear_zulip_stream_sync(command.event_owner)
+            LOG.info(
+                "Finished Zulip stream sync for event owner %s",
+                command.event_owner,
+            )
+        return result
+
+    def _log_sync_queue_length(self, force=False):
+        stats = self._get_sync_queue_stats()
+        if not force and stats == self._last_sync_queue_stats:
+            return
+        self._last_sync_queue_stats = stats
+        LOG.info(
+            "Zulip sync queue length: queued=%s postponed=%s total=%s",
+            stats[0],
+            stats[1],
+            stats[2],
+        )
+
+    def _release_postponed_commands(self):
+        if not self._postponed_commands:
+            return
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        postponed_commands = []
+        released_count = 0
+        for retry_at, command in self._postponed_commands:
+            if retry_at > now:
+                postponed_commands.append((retry_at, command))
+                continue
+            self._put_sync_command(command)
+            released_count += 1
+
+        self._postponed_commands = postponed_commands
+        if released_count:
+            LOG.info(
+                "Released %s postponed Zulip sync commands",
+                released_count,
+            )
+            self._log_sync_queue_length(force=True)
 
     def _process_sync_queue(self):
+        handled_count = 0
+        processed_count = 0
         retry_commands = []
+        deferred_commands = []
+        self._release_postponed_commands()
+        self._log_sync_queue_length()
         try:
-            while True:
+            while handled_count < self._sync_queue_batch_limit:
                 try:
-                    command = self._sync_queue.get(
+                    response = self._sync_queue.get(
                         timeout=SYNC_QUEUE_TIMEOUT,
                     )
                 except queue.Empty:
                     self._clear_finished_workers()
-                    if (
-                        not self._has_active_workers() and
-                        self._sync_queue.empty()
-                    ):
-                        return
-                    continue
+                    self._release_postponed_commands()
+                    return
 
+                command = workers.get_sync_response_command(response)
+                handled_count += 1
+                if not self._can_process_sync_command(command):
+                    deferred_commands.append(command)
+                    continue
+                processed_count += 1
                 try:
-                    stream = command.execute(cache=self._cache)
-                except RetryCommandLater as exc:
+                    stream = self._execute_sync_command(command)
+                except SyncStreamsNeeded as exc:
+                    retry_at = (
+                        datetime.datetime.now(datetime.timezone.utc) +
+                        RETRY_COMMAND_DELAY
+                    )
                     LOG.warning("%s", exc)
-                    retry_commands.append(command)
+                    self._request_zulip_stream_sync(command)
+                    retry_commands.append((retry_at, command))
+                    continue
+                except RetryCommandLater as exc:
+                    retry_at = (
+                        datetime.datetime.now(datetime.timezone.utc) +
+                        RETRY_COMMAND_DELAY
+                    )
+                    LOG.warning("%s", exc)
+                    retry_commands.append((retry_at, command))
                     continue
                 LOG.debug(
                     "Processed workspace integration command: %s",
                     stream,
                 )
+            LOG.info(
+                "Zulip sync queue batch limit reached: "
+                "handled=%s processed=%s limit=%s",
+                handled_count,
+                processed_count,
+                self._sync_queue_batch_limit,
+            )
         finally:
-            for command in retry_commands:
-                self._sync_queue.put(command)
+            self._postponed_commands.extend(retry_commands)
+            for command in deferred_commands:
+                self._put_sync_command(command)
+            if retry_commands:
+                LOG.info(
+                    "Postponed %s Zulip sync commands for retry",
+                    len(retry_commands),
+                )
+                self._log_sync_queue_length(force=True)
+            if deferred_commands:
+                LOG.info(
+                    "Deferred %s Zulip sync commands until stream sync "
+                    "is finished",
+                    len(deferred_commands),
+                )
+                self._log_sync_queue_length(force=True)
+            if handled_count:
+                LOG.info(
+                    (
+                        "Handled %s Zulip sync commands in current batch, "
+                        "processed %s"
+                    ),
+                    handled_count,
+                    processed_count,
+                )
+                self._log_sync_queue_length(force=True)
 
     def _run_iteration(self):
         LOG.debug("Workspace integration bridge worker iteration")

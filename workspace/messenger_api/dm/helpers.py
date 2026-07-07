@@ -778,8 +778,51 @@ def get_or_create_workspace_stream_bindings(project_id, stream_uuid, who_uuid,
     return result
 
 
-def create_workspace_stream_topic_with_flags(project_id, session=None,
-                                             **kwargs):
+def _normalize_source_name(source_name):
+    if hasattr(source_name, "value"):
+        return source_name.value
+    return source_name
+
+
+def _get_source_stream_id(source):
+    if hasattr(source, "stream_id"):
+        return source.stream_id
+    return source["stream_id"]
+
+
+def _get_source_server_url(source):
+    if hasattr(source, "server_url"):
+        return source.server_url
+    return source.get("server_url")
+
+
+def _build_topic_source(source_name, source, topic_name):
+    source_name = _normalize_source_name(source_name)
+    if source_name == models.SourceName.ZULIP.value:
+        return models.ZulipSource(
+            stream_id=_get_source_stream_id(source),
+            server_url=_get_source_server_url(source),
+            topic_name=topic_name,
+        )
+    return models.NativeSource()
+
+
+def _get_default_topic_source_fields(fields, topic_name):
+    source_name = _normalize_source_name(
+        fields.get("source_name", models.SourceName.NATIVE.value),
+    )
+    source = fields.get("source", models.NativeSource())
+    return {
+        "source_name": source_name,
+        "source": _build_topic_source(
+            source_name=source_name,
+            source=source,
+            topic_name=topic_name,
+        ),
+    }
+
+
+def create_workspace_stream_topic_with_flags(project_id, **kwargs):
     topic_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
     _ensure_color(kwargs)
     topic = models.WorkspaceStreamTopic(
@@ -787,7 +830,7 @@ def create_workspace_stream_topic_with_flags(project_id, session=None,
         project_id=project_id,
         **kwargs,
     )
-    topic.insert(session=session)
+    topic.insert()
 
     bindings = models.WorkspaceStreamBinding.objects.get_all(
         filters={
@@ -802,9 +845,36 @@ def create_workspace_stream_topic_with_flags(project_id, session=None,
             project_id=project_id,
             is_done=False,
         )
-        flags.insert(session=session)
+        flags.insert()
 
     return topic
+
+
+def get_or_create_workspace_stream_topic_with_flags(
+    project_id,
+    stream_uuid,
+    source_name,
+    source,
+    **kwargs
+):
+    source_name = _normalize_source_name(source_name)
+    existing = models.WorkspaceStreamTopic.objects.get_one_or_none(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+            "source_name": dm_filters.EQ(source_name),
+            "source": dm_filters.EQ(source),
+        },
+    )
+    if existing is not None:
+        return existing
+    return create_workspace_stream_topic_with_flags(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        source_name=source_name,
+        source=source,
+        **kwargs,
+    )
 
 
 def get_workspace_user_stream_topic(project_id, user_uuid, topic_uuid):
@@ -869,7 +939,6 @@ def create_workspace_user_stream_topic(project_id, user_uuid, values,
     )
     topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
-        session=session,
         **values,
     )
     result = None
@@ -1116,7 +1185,7 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
         stream_uuid=stream.uuid,
         name=default_topic_name,
         default_for_stream_uuid=stream.uuid,
-        session=session,
+        **_get_default_topic_source_fields(kwargs, default_topic_name),
     )
 
     result = None
@@ -1188,7 +1257,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
         stream_uuid=stream.uuid,
         name=default_topic_name,
         default_for_stream_uuid=stream.uuid,
-        session=session,
+        **_get_default_topic_source_fields(kwargs, default_topic_name),
     )
 
     result = None
@@ -1772,6 +1841,31 @@ def create_workspace_user_message(project_id, user_uuid, session=None,
         project_id=project_id,
         user_uuid=user_uuid,
         message_uuid=message.uuid,
+    )
+
+
+def get_or_create_workspace_user_message(project_id, user_uuid, **kwargs):
+    if "source_name" in kwargs and "source" in kwargs:
+        source_name = _normalize_source_name(kwargs["source_name"])
+        existing = models.WorkspaceMessage.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "source_name": dm_filters.EQ(source_name),
+                "source": dm_filters.EQ(kwargs["source"]),
+            },
+        )
+        if existing is not None:
+            return get_workspace_user_message(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=existing.uuid,
+            )
+        kwargs["source_name"] = source_name
+
+    return create_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        **kwargs,
     )
 
 

@@ -28,7 +28,17 @@ from workspace.services.integration_bridge import agents
 DOMAIN = "workspace_integration_bridge_worker"
 
 
+worker_cli_opts = [
+    cfg.IntOpt(
+        "sync-queue-batch-limit",
+        default=agents.DEFAULT_SYNC_QUEUE_BATCH_LIMIT,
+        help="Maximum Zulip sync queue commands to process in one iteration",
+    ),
+]
+
+
 CONF = cfg.CONF
+CONF.register_cli_opts(worker_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
 
 
@@ -40,6 +50,7 @@ def main():
 
     service = agents.WorkspaceIntegrationBridgeWorker(
         iter_min_period=3,
+        sync_queue_batch_limit=CONF[DOMAIN].sync_queue_batch_limit,
     )
 
     service.add_setup(

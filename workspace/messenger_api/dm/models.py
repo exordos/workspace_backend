@@ -50,6 +50,39 @@ WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
 
+ZULIP_PROCESSED_ENTITY_TYPES = (
+    "stream",
+    "private_stream",
+    "topic",
+    "message",
+)
+
+
+class ZulipProcessedEntity(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_zulip_processed_entities"
+
+    server_url = properties.property(
+        types.String(min_length=1, max_length=2048),
+        required=True,
+    )
+    entity_type = properties.property(
+        types.Enum(ZULIP_PROCESSED_ENTITY_TYPES),
+        required=True,
+    )
+    entity_id = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    workspace_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+
 
 class Folder(
     base.WorkspaceFolderBase,
@@ -932,6 +965,7 @@ class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
+    base.WorkspaceSourceBase,
     models.CustomPropertiesMixin,
     orm.SQLStorableMixin,
 ):
@@ -973,6 +1007,7 @@ class WorkspaceUserTopic(
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
     models.ModelWithTimestamp,
+    base.WorkspaceSourceBase,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_user_topics_view"

@@ -171,8 +171,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             name="zulip",
             default_for_stream_uuid=stream_uuid,
-            session=session,
+            source_name="native",
+            source=mock.ANY,
         )
+        self.assertEqual("native", create_topic.call_args.kwargs["source"].KIND)
         create_topic_events.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
@@ -386,8 +388,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             name="General Topic",
             default_for_stream_uuid=stream_uuid,
-            session=session,
+            source_name="native",
+            source=mock.ANY,
         )
+        self.assertEqual("native", create_topic.call_args.kwargs["source"].KIND)
         create_topic_events.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
@@ -1517,7 +1521,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
-        session = object()
         created_topic = {}
         created_flags = []
 
@@ -1565,12 +1568,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 uuid=topic_uuid,
                 stream_uuid=stream_uuid,
                 name="Planning",
-                session=session,
             )
 
         self.assertEqual(topic_uuid, topic.uuid)
         self.assertEqual(445566, created_topic["color"])
-        self.assertIs(session, created_topic["insert_session"])
+        self.assertIsNone(created_topic["insert_session"])
         FakeWorkspaceStreamBinding.objects.get_all.assert_called_once()
         filters = FakeWorkspaceStreamBinding.objects.get_all.call_args.kwargs[
             "filters"
@@ -1588,7 +1590,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     "user_uuid": user_uuid,
                     "project_id": project_id,
                     "is_done": False,
-                    "insert_session": session,
+                    "insert_session": None,
                 }
             ],
             created_flags,
@@ -1637,7 +1639,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         FakeStreamBinding.objects.get_one.assert_called_once()
         create_topic.assert_called_once_with(
             project_id=project_id,
-            session=session,
             name="Planning",
             stream_uuid=stream_uuid,
         )

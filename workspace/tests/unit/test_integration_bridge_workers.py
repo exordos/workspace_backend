@@ -64,7 +64,9 @@ class FakeZulipClient:
 
 def _external_account():
     return SimpleNamespace(
+        project_id="project",
         server_url="https://zulip.example.com",
+        user_uuid="bridge-user",
         account_settings=SimpleNamespace(
             credentials=SimpleNamespace(
                 login="user@example.com",
@@ -84,10 +86,12 @@ def test_zulip_bridge_worker_fetches_messages():
     FakeZulipClient.calls = []
     FakeZulipClient.pages = [[{"id": 100, "content": "hello"}]]
     external_account = _external_account()
-    sync_queue = object()
+    input_queue = object()
+    output_queue = object()
     worker = workers.ZulipBridgeWorker(
         external_account=external_account,
-        sync_queue=sync_queue,
+        input_queue=input_queue,
+        output_queue=output_queue,
         client_cls=FakeZulipClient,
     )
 
@@ -100,7 +104,8 @@ def test_zulip_bridge_worker_fetches_messages():
         },
     ]
     assert worker._external_account is external_account
-    assert worker._sync_queue is sync_queue
+    assert worker._input_queue is input_queue
+    assert worker._output_queue is output_queue
     assert not hasattr(worker, "message_filters")
     assert FakeZulipClient.init_endpoint == "https://zulip.example.com"
     assert FakeZulipClient.calls == [
@@ -133,7 +138,8 @@ def test_zulip_bridge_worker_fetches_streams():
     ]
     worker = workers.ZulipBridgeWorker(
         external_account=_external_account(),
-        sync_queue=object(),
+        input_queue=object(),
+        output_queue=object(),
         client_cls=FakeZulipClient,
     )
 
@@ -166,7 +172,8 @@ def test_zulip_bridge_worker_fetches_stream_subscribers():
     }
     worker = workers.ZulipBridgeWorker(
         external_account=_external_account(),
-        sync_queue=object(),
+        input_queue=object(),
+        output_queue=object(),
         client_cls=FakeZulipClient,
     )
 
@@ -187,10 +194,34 @@ def test_zulip_bridge_worker_fetches_stream_subscribers():
     ]
 
 
-def test_zulip_bridge_worker_run_fetches_all_messages_and_processes_them():
+def test_zulip_bridge_worker_waits_for_commands_by_default():
+    input_queue = queue.Queue()
+    FakeZulipClient.calls = []
+    FakeZulipClient.stream_calls = []
+    FakeZulipClient.subscriber_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=input_queue,
+        output_queue=queue.PriorityQueue(),
+        client_cls=FakeZulipClient,
+    )
+
+    worker.start()
+    input_queue.put(workers.StopWorker())
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert FakeZulipClient.calls == []
+    assert FakeZulipClient.stream_calls == []
+    assert FakeZulipClient.subscriber_calls == []
+
+
+def test_zulip_bridge_worker_commands_sync_streams_and_messages():
     events = []
+    anchor_updates = []
     processed_messages = []
     processed_streams = []
+    output_queue = queue.PriorityQueue()
     FakeZulipClient.calls = []
     FakeZulipClient.stream_calls = []
     FakeZulipClient.subscriber_calls = []
@@ -243,7 +274,8 @@ def test_zulip_bridge_worker_run_fetches_all_messages_and_processes_them():
     ]
     worker = workers.ZulipBridgeWorker(
         external_account=_external_account(),
-        sync_queue=queue.Queue(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
         client_cls=FakeZulipClient,
     )
 
@@ -255,13 +287,25 @@ def test_zulip_bridge_worker_run_fetches_all_messages_and_processes_them():
         events.append("stream")
 
     def process_message(message):
+        if not worker._should_process_message(message):
+            return
         processed_messages.append(message)
         events.append("message")
 
     worker._process_stream = process_stream
     worker._process_message = process_message
 
-    worker.run()
+    event_owner = (
+        "project",
+        "https://zulip.example.com",
+        "bridge-user",
+    )
+    workers.SyncStreams(
+        event_owner=event_owner,
+    ).execute(worker)
+    workers.SyncMessages(
+        on_message_anchor_update=anchor_updates.append,
+    ).execute(worker)
 
     assert processed_streams == [
         {
@@ -290,7 +334,16 @@ def test_zulip_bridge_worker_run_fetches_all_messages_and_processes_them():
             "content": "middle",
         },
     ]
-    assert events == ["stream", "message", "message"]
+    assert events == [
+        "stream",
+        "message",
+        "message",
+    ]
+    assert anchor_updates == [100, 101, 102, 103]
+    response = output_queue.get_nowait()
+    sync_finished = workers.get_sync_response_command(response)
+    assert isinstance(sync_finished, workers.SyncStreamsFinished)
+    assert sync_finished.event_owner == event_owner
     assert not hasattr(worker, "messages")
     assert FakeZulipClient.stream_calls == [
         {
@@ -339,27 +392,105 @@ def test_zulip_bridge_worker_run_fetches_all_messages_and_processes_them():
     ]
 
 
-def test_zulip_bridge_worker_processes_message_with_sync_queue():
-    sync_queue = queue.Queue()
+def test_zulip_bridge_worker_uses_initial_message_anchor():
+    FakeZulipClient.calls = []
+    FakeZulipClient.stream_calls = []
+    FakeZulipClient.subscriber_calls = []
+    FakeZulipClient.streams = []
+    FakeZulipClient.subscribers = {}
+    FakeZulipClient.pages = [[]]
     worker = workers.ZulipBridgeWorker(
         external_account=_external_account(),
-        sync_queue=sync_queue,
+        input_queue=queue.Queue(),
+        output_queue=queue.PriorityQueue(),
         client_cls=FakeZulipClient,
     )
-    message = {"id": 100, "content": "hello"}
+
+    workers.SyncMessages(initial_message_anchor=103).execute(worker)
+
+    assert FakeZulipClient.calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "message_filters": {
+                "anchor": 103,
+                "num_before": 0,
+                "num_after": 100,
+                "apply_markdown": False,
+            },
+        },
+    ]
+
+
+def test_zulip_bridge_worker_can_skip_stream_sync():
+    FakeZulipClient.calls = []
+    FakeZulipClient.stream_calls = []
+    FakeZulipClient.subscriber_calls = []
+    FakeZulipClient.streams = [
+        {
+            "stream_id": 3,
+            "name": "general",
+            "description": "General stream",
+            "creator_id": 24,
+            "date_created": 1776940760,
+            "invite_only": False,
+            "is_archived": False,
+            "is_announcement_only": False,
+        },
+    ]
+    FakeZulipClient.subscribers = {
+        3: [10, 24],
+    }
+    FakeZulipClient.pages = [[]]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=queue.PriorityQueue(),
+        client_cls=FakeZulipClient,
+    )
+
+    workers.SyncMessages(initial_message_anchor=103).execute(worker)
+
+    assert FakeZulipClient.stream_calls == []
+    assert FakeZulipClient.subscriber_calls == []
+    assert FakeZulipClient.calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "message_filters": {
+                "anchor": 103,
+                "num_before": 0,
+                "num_after": 100,
+                "apply_markdown": False,
+            },
+        },
+    ]
+
+
+def test_zulip_bridge_worker_processes_message_with_output_queue():
+    output_queue = queue.PriorityQueue()
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+    message = {"id": 100, "sender_id": 8, "content": "hello"}
 
     worker._process_message(message)
 
-    add_message = sync_queue.get_nowait()
+    response = output_queue.get_nowait()
+    add_message = workers.get_sync_response_command(response)
     assert add_message.external_account is worker._external_account
     assert add_message.message == message
 
 
-def test_zulip_bridge_worker_processes_stream_with_sync_queue():
-    sync_queue = queue.Queue()
+def test_zulip_bridge_worker_processes_stream_with_output_queue():
+    output_queue = queue.PriorityQueue()
     worker = workers.ZulipBridgeWorker(
         external_account=_external_account(),
-        sync_queue=sync_queue,
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
         client_cls=FakeZulipClient,
     )
     stream = {
@@ -375,15 +506,58 @@ def test_zulip_bridge_worker_processes_stream_with_sync_queue():
 
     worker._process_stream(stream, subscriber_ids=[10, 24])
 
-    add_stream = sync_queue.get_nowait()
+    response = output_queue.get_nowait()
+    add_stream = workers.get_sync_response_command(response)
     assert add_stream.external_account is worker._external_account
     assert add_stream.stream == stream
     assert add_stream.subscriber_ids == [10, 24]
 
 
+def test_zulip_bridge_worker_prioritizes_stream_responses():
+    output_queue = queue.PriorityQueue()
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+    message = {
+        "id": 100,
+        "sender_id": 8,
+        "content": "hello",
+        "type": "stream",
+    }
+    stream = {
+        "stream_id": 3,
+        "name": "general",
+        "description": "General stream",
+        "creator_id": 24,
+        "date_created": 1776940760,
+        "invite_only": True,
+        "is_archived": True,
+        "is_announcement_only": True,
+    }
+
+    worker._process_message(message)
+    worker._process_stream(stream, subscriber_ids=[10, 24])
+
+    first_response = output_queue.get_nowait()
+    second_response = output_queue.get_nowait()
+    assert isinstance(
+        workers.get_sync_response_command(first_response),
+        workers.AddStream,
+    )
+    assert isinstance(
+        workers.get_sync_response_command(second_response),
+        workers.AddMessage,
+    )
+
+
 def test_add_message_executes_with_cache():
     external_account = _external_account()
     stream = object()
+    topic = object()
+    message = object()
 
     class FakeCache:
         def __init__(self):
@@ -391,43 +565,114 @@ def test_add_message_executes_with_cache():
 
         def get_or_create_stream(self, external_account, stream_info):
             self.calls.append({
+                "method": "get_or_create_stream",
                 "external_account": external_account,
                 "stream_info": stream_info,
             })
             return stream
 
+        def get_or_create_topic(
+            self,
+            external_account,
+            stream,
+            stream_info,
+            topic_name,
+        ):
+            self.calls.append({
+                "method": "get_or_create_topic",
+                "external_account": external_account,
+                "stream": stream,
+                "stream_info": stream_info,
+                "topic_name": topic_name,
+            })
+            return topic
+
+        def get_or_create_message(
+            self,
+            external_account,
+            stream,
+            topic,
+            stream_info,
+            topic_name,
+            message_info,
+        ):
+            self.calls.append({
+                "method": "get_or_create_message",
+                "external_account": external_account,
+                "stream": stream,
+                "topic": topic,
+                "stream_info": stream_info,
+                "topic_name": topic_name,
+                "message_info": message_info,
+            })
+            return message
+
     cache = FakeCache()
     command = workers.AddMessage(
         external_account=external_account,
         message={
+            "id": 100,
             "type": "stream",
             "stream_id": 3,
             "display_recipient": "general",
+            "subject": "deploys",
             "sender_id": 24,
+            "content": "hello",
             "timestamp": 1770998098,
         },
     )
 
     result = command.execute(cache=cache)
 
-    assert result is stream
+    assert result is message
+    stream_info = {
+        "type": "stream",
+        "stream_id": 3,
+        "display_recipient": "general",
+        "description": "",
+        "creator_id": 24,
+        "timestamp": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+        "invite_only": False,
+        "announce": False,
+        "is_archived": False,
+        "subscriber_ids": [24],
+        "event_type": "message",
+    }
     assert cache.calls == [
         {
+            "method": "get_or_create_stream",
             "external_account": external_account,
-            "stream_info": {
-                "type": "stream",
-                "stream_id": 3,
-                "display_recipient": "general",
-                "description": "",
-                "creator_id": 24,
-                "timestamp": datetime.datetime.fromtimestamp(
+            "stream_info": stream_info,
+        },
+        {
+            "method": "get_or_create_topic",
+            "external_account": external_account,
+            "stream": stream,
+            "stream_info": stream_info,
+            "topic_name": "deploys",
+        },
+        {
+            "method": "get_or_create_message",
+            "external_account": external_account,
+            "stream": stream,
+            "topic": topic,
+            "stream_info": stream_info,
+            "topic_name": "deploys",
+            "message_info": {
+                "message_id": 100,
+                "sender_id": 24,
+                "content": "hello",
+                "created_at": datetime.datetime.fromtimestamp(
                     1770998098,
                     tz=datetime.timezone.utc,
                 ),
-                "invite_only": False,
-                "announce": False,
-                "is_archived": False,
-                "subscriber_ids": [24],
+                "updated_at": datetime.datetime.fromtimestamp(
+                    1770998098,
+                    tz=datetime.timezone.utc,
+                ),
             },
         },
     ]
@@ -436,6 +681,8 @@ def test_add_message_executes_with_cache():
 def test_add_private_message_executes_with_cache():
     external_account = _external_account()
     stream = object()
+    topic = object()
+    message = object()
 
     class FakeCache:
         def __init__(self):
@@ -443,15 +690,53 @@ def test_add_private_message_executes_with_cache():
 
         def get_or_create_stream(self, external_account, stream_info):
             self.calls.append({
+                "method": "get_or_create_stream",
                 "external_account": external_account,
                 "stream_info": stream_info,
             })
             return stream
 
+        def get_or_create_topic(
+            self,
+            external_account,
+            stream,
+            stream_info,
+            topic_name,
+        ):
+            self.calls.append({
+                "method": "get_or_create_topic",
+                "external_account": external_account,
+                "stream": stream,
+                "stream_info": stream_info,
+                "topic_name": topic_name,
+            })
+            return topic
+
+        def get_or_create_message(
+            self,
+            external_account,
+            stream,
+            topic,
+            stream_info,
+            topic_name,
+            message_info,
+        ):
+            self.calls.append({
+                "method": "get_or_create_message",
+                "external_account": external_account,
+                "stream": stream,
+                "topic": topic,
+                "stream_info": stream_info,
+                "topic_name": topic_name,
+                "message_info": message_info,
+            })
+            return message
+
     cache = FakeCache()
     command = workers.AddMessage(
         external_account=external_account,
         message={
+            "id": 101,
             "type": "private",
             "recipient_id": 79,
             "display_recipient": [
@@ -465,31 +750,63 @@ def test_add_private_message_executes_with_cache():
                 },
             ],
             "sender_id": 8,
+            "content": "hello private",
             "timestamp": 1772202531,
         },
     )
 
     result = command.execute(cache=cache)
 
-    assert result is stream
+    assert result is message
+    stream_info = {
+        "type": "private",
+        "stream_id": 79,
+        "display_recipient": "admin, gmelikov",
+        "description": "",
+        "creator_id": 10,
+        "timestamp": datetime.datetime.fromtimestamp(
+            1772202531,
+            tz=datetime.timezone.utc,
+        ),
+        "invite_only": True,
+        "announce": False,
+        "is_archived": False,
+        "subscriber_ids": [8, 10],
+        "default_topic_name": "zulip",
+        "event_type": "message",
+    }
     assert cache.calls == [
         {
+            "method": "get_or_create_stream",
             "external_account": external_account,
-            "stream_info": {
-                "type": "private",
-                "stream_id": 79,
-                "display_recipient": "admin, gmelikov",
-                "description": "",
-                "creator_id": 10,
-                "timestamp": datetime.datetime.fromtimestamp(
+            "stream_info": stream_info,
+        },
+        {
+            "method": "get_or_create_topic",
+            "external_account": external_account,
+            "stream": stream,
+            "stream_info": stream_info,
+            "topic_name": "zulip",
+        },
+        {
+            "method": "get_or_create_message",
+            "external_account": external_account,
+            "stream": stream,
+            "topic": topic,
+            "stream_info": stream_info,
+            "topic_name": "zulip",
+            "message_info": {
+                "message_id": 101,
+                "sender_id": 8,
+                "content": "hello private",
+                "created_at": datetime.datetime.fromtimestamp(
                     1772202531,
                     tz=datetime.timezone.utc,
                 ),
-                "invite_only": True,
-                "announce": False,
-                "is_archived": False,
-                "subscriber_ids": [8, 10],
-                "default_topic_name": "zulip",
+                "updated_at": datetime.datetime.fromtimestamp(
+                    1772202531,
+                    tz=datetime.timezone.utc,
+                ),
             },
         },
     ]
@@ -546,6 +863,7 @@ def test_add_stream_executes_with_cache():
                 "announce": True,
                 "is_archived": True,
                 "subscriber_ids": [10, 24],
+                "event_type": "stream",
             },
         },
     ]
