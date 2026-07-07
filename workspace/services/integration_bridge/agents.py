@@ -32,6 +32,7 @@ LOG = logging.getLogger(__name__)
 SYNC_QUEUE_TIMEOUT = 0.1
 RETRY_COMMAND_DELAY = datetime.timedelta(seconds=30)
 DEFAULT_SYNC_QUEUE_BATCH_LIMIT = 100
+NO_VALUE = object()
 
 
 class RetryCommandLater(Exception):
@@ -577,8 +578,8 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         self._postponed_commands = []
         self._last_sync_queue_stats = None
         self._message_sync_worker_key = None
+        self._queue_recreate_worker_keys = set()
         self._stream_sync_event_owners = set()
-        self._zulip_message_anchors = {}
         self._cache = WorkspaceIntegrationBridgeCache()
 
     def _get_unsynced_user_providers(self, account_type):
@@ -620,6 +621,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 self._worker_accounts.pop(worker_key, None)
                 if self._message_sync_worker_key == worker_key:
                     self._message_sync_worker_key = None
+                self._queue_recreate_worker_keys.discard(worker_key)
 
     def _start_bridges(self):
         self._clear_finished_workers()
@@ -634,7 +636,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         for user in all_users:
             if user.account_settings.credentials is None:
                 continue
-            worker_key = self._get_zulip_message_anchor_key(user)
+            worker_key = self._get_zulip_worker_key(user)
             if first_worker_key is None:
                 first_worker_key = worker_key
             if worker_key in self._workers:
@@ -658,49 +660,68 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         if first_worker_key is not None:
             self._request_zulip_message_sync(first_worker_key)
 
-    def _get_zulip_message_anchor_key(self, external_account):
+    def _get_zulip_worker_key(self, external_account):
         return (
             external_account.project_id,
             external_account.server_url,
             external_account.user_uuid,
         )
 
-    def _get_zulip_message_anchor(self, external_account):
-        return self._zulip_message_anchors.get(
-            self._get_zulip_message_anchor_key(external_account),
-            0,
-        )
-
-    def _set_zulip_message_anchor(self, anchor_key, message_id):
-        current_message_id = self._zulip_message_anchors.get(anchor_key, 0)
-        if message_id <= current_message_id:
-            return
-        self._zulip_message_anchors[anchor_key] = message_id
-
     def _clear_zulip_message_sync(self, worker_key):
         if self._message_sync_worker_key == worker_key:
             self._message_sync_worker_key = None
+
+    def _clear_zulip_queue_recreate(self, worker_key):
+        self._queue_recreate_worker_keys.discard(worker_key)
+
+    def _get_or_create_zulip_queue_state(self, external_account):
+        queue_state = models.ZulipEventQueueState.objects.get_one_or_none(
+            filters={
+                "external_account_uuid": dm_filters.EQ(
+                    external_account.uuid,
+                ),
+            },
+        )
+        if queue_state is not None:
+            return queue_state
+
+        queue_state = models.ZulipEventQueueState(
+            uuid=sys_uuid.uuid4(),
+            project_id=external_account.project_id,
+            external_account_uuid=external_account.uuid,
+            server_url=external_account.server_url,
+            user_uuid=external_account.user_uuid,
+        )
+        queue_state.insert()
+        return queue_state
 
     def _request_zulip_message_sync(self, worker_key):
         if self._message_sync_worker_key is not None:
             return
         external_account = self._worker_accounts[worker_key]
-        initial_message_anchor = self._get_zulip_message_anchor(
+        queue_state = self._get_or_create_zulip_queue_state(
             external_account,
         )
+        if queue_state.queue_id is None:
+            self._request_zulip_queue_recreate(worker_key)
+            return
         LOG.info(
-            "Request Zulip message sync for %s from anchor %s",
+            (
+                "Request Zulip message sync for %s "
+                "queue=%s event=%s message=%s"
+            ),
             external_account.server_url,
-            initial_message_anchor,
+            queue_state.queue_id,
+            queue_state.last_event_id,
+            queue_state.last_message_id,
         )
         self._message_sync_worker_key = worker_key
         self._worker_input_queues[worker_key].put(
             workers.SyncMessages(
-                initial_message_anchor=initial_message_anchor,
-                on_message_anchor_update=(
-                    lambda message_id, worker_key=worker_key:
-                    self._set_zulip_message_anchor(worker_key, message_id)
-                ),
+                queue_id=queue_state.queue_id,
+                last_event_id=queue_state.last_event_id,
+                last_message_id=queue_state.last_message_id,
+                is_synced=queue_state.is_synced,
                 on_finished=(
                     lambda worker_key=worker_key:
                     self._clear_zulip_message_sync(worker_key)
@@ -708,10 +729,34 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             ),
         )
 
+    def _request_zulip_queue_recreate(self, worker_key):
+        if worker_key in self._queue_recreate_worker_keys:
+            return
+        external_account = self._worker_accounts[worker_key]
+        queue_state = self._get_or_create_zulip_queue_state(
+            external_account,
+        )
+        self._queue_recreate_worker_keys.add(worker_key)
+        self._update_external_account_zulip_queue_state(
+            external_account=external_account,
+            queue_id=None,
+            is_synced=False,
+        )
+        LOG.info(
+            "Request Zulip queue recreate for %s from message anchor %s",
+            external_account.server_url,
+            queue_state.last_message_id,
+        )
+        self._worker_input_queues[worker_key].put(
+            workers.CreateZulipQueueAndFetchMessages(
+                last_message_id=queue_state.last_message_id,
+            ),
+        )
+
     def _clear_zulip_stream_sync(self, event_owner):
         self._stream_sync_event_owners.discard(event_owner)
 
-    def _get_zulip_worker_key(self, event_owner):
+    def _get_zulip_worker_key_by_event_owner(self, event_owner):
         if event_owner in self._workers:
             return event_owner
         for worker_key in self._workers:
@@ -722,7 +767,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         event_owner = command.event_owner
         if event_owner in self._stream_sync_event_owners:
             return
-        worker_key = self._get_zulip_worker_key(event_owner)
+        worker_key = self._get_zulip_worker_key_by_event_owner(event_owner)
         if worker_key is None:
             return
         external_account = self._worker_accounts[worker_key]
@@ -760,7 +805,18 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         )
 
     def _execute_sync_command(self, command):
+        if isinstance(command, workers.UpdateZulipQueueState):
+            self._update_zulip_queue_state(command)
+            return None
+        if isinstance(command, workers.ZulipQueueFailed):
+            self._handle_zulip_queue_failed(command)
+            return None
+        if isinstance(command, workers.FinishZulipMessageCatchUp):
+            self._finish_zulip_message_catch_up(command)
+            return None
         result = command.execute(cache=self._cache)
+        if isinstance(command, workers.AddMessage):
+            self._update_zulip_queue_state_for_message(command)
         if isinstance(command, workers.SyncStreamsFinished):
             self._clear_zulip_stream_sync(command.event_owner)
             LOG.info(
@@ -768,6 +824,97 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 command.event_owner,
             )
         return result
+
+    def _handle_zulip_queue_failed(self, command):
+        worker_key = self._get_zulip_worker_key_by_event_owner(
+            command.event_owner,
+        )
+        if worker_key is None:
+            return
+        self._clear_zulip_message_sync(worker_key)
+        self._request_zulip_queue_recreate(worker_key)
+
+    def _finish_zulip_message_catch_up(self, command):
+        self._update_external_account_zulip_queue_state(
+            external_account=command.external_account,
+            last_message_id=command.last_message_id,
+            is_synced=True,
+        )
+
+    def _update_zulip_queue_state_for_message(self, command):
+        self._update_external_account_zulip_queue_state(
+            external_account=command.external_account,
+            last_event_id=command.event_id,
+            last_message_id=command.message["id"],
+        )
+
+    def _update_zulip_queue_state(self, command):
+        values = {
+            "external_account": command.external_account,
+            "last_event_id": command.last_event_id,
+            "last_message_id": command.last_message_id,
+            "is_synced": command.is_synced,
+        }
+        if command.queue_id is not workers.NO_VALUE:
+            values["queue_id"] = command.queue_id
+        self._update_external_account_zulip_queue_state(**values)
+        if (
+            command.queue_id is not workers.NO_VALUE and
+            command.queue_id is not None
+        ):
+            self._clear_zulip_queue_recreate(command.event_owner)
+
+    def _update_external_account_zulip_queue_state(
+        self,
+        external_account,
+        queue_id=NO_VALUE,
+        last_event_id=None,
+        last_message_id=None,
+        is_synced=None,
+    ):
+        queue_state = self._get_or_create_zulip_queue_state(
+            external_account,
+        )
+        changed = False
+        queue_id_changed = (
+            queue_id is not NO_VALUE and
+            queue_id != queue_state.queue_id
+        )
+        if queue_id_changed:
+            queue_state.queue_id = queue_id
+            changed = True
+        if last_event_id is not None and (
+            queue_id_changed or last_event_id > queue_state.last_event_id
+        ):
+            queue_state.last_event_id = last_event_id
+            changed = True
+        if (
+            last_message_id is not None and
+            last_message_id > queue_state.last_message_id
+        ):
+            queue_state.last_message_id = last_message_id
+            changed = True
+        if is_synced is not None and is_synced != queue_state.is_synced:
+            queue_state.is_synced = is_synced
+            changed = True
+        if not changed:
+            return
+        queue_state.update_dm(
+            values={
+                "queue_id": queue_state.queue_id,
+                "last_event_id": queue_state.last_event_id,
+                "last_message_id": queue_state.last_message_id,
+                "is_synced": queue_state.is_synced,
+            },
+        )
+        queue_state.update()
+        LOG.info(
+            "Updated Zulip queue state for %s: queue=%s event=%s message=%s",
+            external_account.server_url,
+            queue_state.queue_id,
+            queue_state.last_event_id,
+            queue_state.last_message_id,
+        )
 
     def _log_sync_queue_length(self, force=False):
         stats = self._get_sync_queue_stats()

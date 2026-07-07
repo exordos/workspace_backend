@@ -34,6 +34,25 @@ class FakeZulipProcessedEntity:
         type(self).inserted.append(self)
 
 
+class FakeZulipQueueState:
+    def __init__(
+        self,
+        queue_id="queue-1",
+        last_event_id=42,
+        last_message_id=103,
+        is_synced=True,
+    ):
+        self.queue_id = queue_id
+        self.last_event_id = last_event_id
+        self.last_message_id = last_message_id
+        self.is_synced = is_synced
+        self.update_dm = mock.Mock(side_effect=self._update_dm)
+        self.update = mock.Mock()
+
+    def _update_dm(self, values):
+        self.__dict__.update(values)
+
+
 def _patch_zulip_processed_entities(return_value=None):
     FakeZulipProcessedEntity.inserted = []
     FakeZulipProcessedEntity.objects = SimpleNamespace(
@@ -145,11 +164,12 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     worker._workers = {first_worker_key: existing_worker}
     worker._worker_input_queues = {first_worker_key: existing_input_queue}
     worker._worker_accounts = {first_worker_key: first_user}
-    worker._zulip_message_anchors[(
-        "project",
-        "https://zulip.example.com",
-        "first-user",
-    )] = 42
+    queue_state = SimpleNamespace(
+        queue_id="queue-1",
+        last_event_id=42,
+        last_message_id=103,
+        is_synced=True,
+    )
 
     with mock.patch.object(
         agents.models,
@@ -161,7 +181,12 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
             "ZulipBridgeWorker",
             FakeZulipBridgeWorker,
         ):
-            worker._start_bridges()
+            with mock.patch.object(
+                worker,
+                "_get_or_create_zulip_queue_state",
+                mock.Mock(return_value=queue_state),
+            ):
+                worker._start_bridges()
 
     FakeExternalAccount.objects.get_all.assert_called_once()
     filters = FakeExternalAccount.objects.get_all.call_args.kwargs["filters"]
@@ -182,19 +207,10 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     assert worker._message_sync_worker_key == first_worker_key
     sync_message = existing_input_queue.get_nowait()
     assert isinstance(sync_message, agents.workers.SyncMessages)
-    assert sync_message.initial_message_anchor == 42
-    sync_message.on_message_anchor_update(41)
-    assert worker._zulip_message_anchors[(
-        "project",
-        "https://zulip.example.com",
-        "first-user",
-    )] == 42
-    sync_message.on_message_anchor_update(43)
-    assert worker._zulip_message_anchors[(
-        "project",
-        "https://zulip.example.com",
-        "first-user",
-    )] == 43
+    assert sync_message.queue_id == "queue-1"
+    assert sync_message.last_event_id == 42
+    assert sync_message.last_message_id == 103
+    assert sync_message.is_synced is True
     sync_message.on_finished()
     assert worker._message_sync_worker_key is None
     FakeZulipBridgeWorker.instances[0].start.assert_called_once_with()
@@ -212,10 +228,18 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
             "ZulipBridgeWorker",
             FakeZulipBridgeWorker,
         ):
-            worker._start_bridges()
+            with mock.patch.object(
+                worker,
+                "_get_or_create_zulip_queue_state",
+                mock.Mock(return_value=queue_state),
+            ):
+                worker._start_bridges()
 
     sync_message = existing_input_queue.get_nowait()
-    assert sync_message.initial_message_anchor == 43
+    assert sync_message.queue_id == "queue-1"
+    assert sync_message.last_event_id == 42
+    assert sync_message.last_message_id == 103
+    assert sync_message.is_synced is True
 
 
 def test_bridge_cache_gets_existing_stream_once():
@@ -895,6 +919,150 @@ def test_bridge_worker_requeues_retryable_commands():
 
     response = worker._sync_queue.get_nowait()
     assert agents.workers.get_sync_response_command(response) is command
+
+
+def test_bridge_worker_requests_queue_recreate_without_queue_id():
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    event_owner = (
+        "project",
+        "https://zulip.example.com",
+        "bridge-user",
+    )
+    input_queue = queue.Queue()
+    queue_state = FakeZulipQueueState(
+        queue_id=None,
+        last_event_id=-1,
+        last_message_id=103,
+        is_synced=False,
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._workers[event_owner] = object()
+    worker._worker_input_queues[event_owner] = input_queue
+    worker._worker_accounts[event_owner] = external_account
+
+    with mock.patch.object(
+        worker,
+        "_get_or_create_zulip_queue_state",
+        mock.Mock(return_value=queue_state),
+    ):
+        worker._request_zulip_message_sync(event_owner)
+
+    command = input_queue.get_nowait()
+    assert isinstance(
+        command,
+        agents.workers.CreateZulipQueueAndFetchMessages,
+    )
+    assert command.last_message_id == 103
+    assert worker._message_sync_worker_key is None
+    assert worker._queue_recreate_worker_keys == {event_owner}
+
+
+def test_bridge_worker_recreates_queue_after_failed_queue_event():
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    event_owner = (
+        "project",
+        "https://zulip.example.com",
+        "bridge-user",
+    )
+    input_queue = queue.Queue()
+    queue_state = FakeZulipQueueState(
+        queue_id="dead-queue",
+        last_event_id=42,
+        last_message_id=103,
+        is_synced=True,
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._workers[event_owner] = object()
+    worker._worker_input_queues[event_owner] = input_queue
+    worker._worker_accounts[event_owner] = external_account
+    worker._message_sync_worker_key = event_owner
+    worker._put_sync_command(
+        agents.workers.ZulipQueueFailed(
+            external_account=external_account,
+        ),
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_or_create_zulip_queue_state",
+        mock.Mock(return_value=queue_state),
+    ):
+        with mock.patch.object(agents, "SYNC_QUEUE_TIMEOUT", 0):
+            worker._process_sync_queue()
+
+    command = input_queue.get_nowait()
+    assert isinstance(
+        command,
+        agents.workers.CreateZulipQueueAndFetchMessages,
+    )
+    assert command.last_message_id == 103
+    assert worker._message_sync_worker_key is None
+    assert worker._queue_recreate_worker_keys == {event_owner}
+    assert queue_state.queue_id is None
+    assert queue_state.is_synced is False
+    queue_state.update.assert_called_once_with()
+
+
+def test_bridge_worker_marks_queue_synced_on_catch_up_barrier():
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    queue_state = FakeZulipQueueState(is_synced=False)
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    command = agents.workers.FinishZulipMessageCatchUp(
+        external_account=external_account,
+        last_message_id=104,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_or_create_zulip_queue_state",
+        mock.Mock(return_value=queue_state),
+    ):
+        worker._execute_sync_command(command)
+
+    assert queue_state.is_synced is True
+    assert queue_state.last_message_id == 104
+    queue_state.update.assert_called_once_with()
+
+
+def test_bridge_worker_updates_message_anchor_without_clearing_queue_id():
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    queue_state = FakeZulipQueueState(
+        queue_id="queue-1",
+        last_event_id=42,
+        last_message_id=103,
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    command = agents.workers.UpdateZulipQueueState(
+        external_account=external_account,
+        last_message_id=104,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_or_create_zulip_queue_state",
+        mock.Mock(return_value=queue_state),
+    ):
+        worker._execute_sync_command(command)
+
+    assert queue_state.queue_id == "queue-1"
+    assert queue_state.last_message_id == 104
+    queue_state.update.assert_called_once_with()
 
 
 def test_bridge_worker_requests_stream_sync_and_retries_command():

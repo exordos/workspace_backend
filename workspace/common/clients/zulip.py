@@ -98,6 +98,30 @@ class ZulipClient(common.RESTClientMixIn):
         data = client.get_messages(message_filters)
         return data["messages"]
 
+    def register_message_event_queue_with_api_key(
+        self,
+        login: str,
+        token: str,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.register(
+            event_types=["message"],
+            apply_markdown=False,
+        )
+
+    def get_events_with_api_key(
+        self,
+        login: str,
+        token: str,
+        queue_id: str,
+        last_event_id: int,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.get_events(
+            queue_id=queue_id,
+            last_event_id=last_event_id,
+        )
+
     def get_streams_with_api_key(
         self,
         login: str,

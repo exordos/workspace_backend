@@ -84,6 +84,44 @@ class ZulipProcessedEntity(
     )
 
 
+class ZulipEventQueueState(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_zulip_event_queue_states"
+
+    external_account_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    server_url = properties.property(
+        types.Url(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    queue_id = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=256)),
+        default=None,
+    )
+    last_event_id = properties.property(
+        types.Integer(),
+        default=-1,
+    )
+    last_message_id = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    is_synced = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+
+
 class Folder(
     base.WorkspaceFolderBase,
     orm.SQLStorableMixin,
