@@ -14,10 +14,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import urllib.parse
 from typing import Any, Dict, Optional
 
 from bazooka import common
 from bazooka import client as bz_client
+import requests
 
 try:
     import zulip
@@ -37,6 +39,7 @@ class ZulipClient(common.RESTClientMixIn):
 
     def __init__(self, endpoint: str, timeout: int = 5, client_cls=None):
         super().__init__()
+        self._timeout = timeout
         self._client = bz_client.Client(default_timeout=timeout)
         self._sdk_client_cls = client_cls
         self._endpoint = endpoint
@@ -149,6 +152,27 @@ class ZulipClient(common.RESTClientMixIn):
     ):
         client = self._get_sdk_client(login=login, token=token)
         return client.delete_message(message_id)
+
+    def download_file_with_api_key(
+        self,
+        login: str,
+        token: str,
+        url: str,
+    ):
+        file_url = urllib.parse.urljoin(
+            f"{self._endpoint.rstrip('/')}/",
+            url.lstrip("/"),
+        )
+        response = requests.get(
+            file_url,
+            auth=(login, token),
+            timeout=self._timeout,
+        )
+        response.raise_for_status()
+        return {
+            "content": response.content,
+            "content_type": response.headers.get("Content-Type"),
+        }
 
     def register_message_event_queue_with_api_key(
         self,

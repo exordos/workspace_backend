@@ -29,6 +29,8 @@ dependencies = [
     "boto3>=1.37.11,<2.0.0",  # Apache-2.0
     "websockets>=10.4,<13.0",  # BSD License (BSD-3-Clause)
     "zulip>=0.9.0,<0.9.1",  # Apache-2.0
+    "filetype>=1.2.0,<2.0.0",  # MIT License (MIT)
+    "pillow>=10.0.0,<13.0.0",  # HPND License
 ]
 [project.urls]
 homepage = "https://github.com/infraguys/workspace/"

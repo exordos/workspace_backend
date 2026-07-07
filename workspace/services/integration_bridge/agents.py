@@ -15,14 +15,25 @@
 #    under the License.
 
 import datetime
+import email.message
+import hashlib
+import io
 import logging
+import mimetypes
 import queue
+import re
+import urllib.parse
 import uuid as sys_uuid
 
+import filetype
 from gcl_looper.services import basic
+from PIL import Image
+from PIL import UnidentifiedImageError
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
+from workspace.common.clients import zulip as zulip_client
+from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
@@ -40,6 +51,11 @@ OUTBOUND_PROCESSING_STATUS = "processing"
 OUTBOUND_SENT_STATUS = "sent"
 OUTBOUND_SKIPPED_STATUS = "skipped"
 OUTBOUND_FAILED_STATUS = "failed"
+DEFAULT_FILE_CONTENT_TYPE = "application/octet-stream"
+ZULIP_UPLOAD_PATH = "/user_uploads/"
+ZULIP_FILE_LINK_RE = re.compile(
+    r"(?P<bang>!?)\[(?P<name>[^\]]*)\]\((?P<url>[^)\s]+)\)"
+)
 OUTBOUND_EVENT_COLUMNS = (
     "epoch_version",
     "uuid",
@@ -567,6 +583,297 @@ class WorkspaceIntegrationBridgeCache:
             )
         return self._topics[cache_key]
 
+    def preprocess_zulip_message(self, external_account, stream, message_info):
+        content = message_info["content"]
+        processed_content = ZULIP_FILE_LINK_RE.sub(
+            lambda match: self._preprocess_zulip_file_link(
+                external_account=external_account,
+                stream=stream,
+                message_info=message_info,
+                match=match,
+            ),
+            content,
+        )
+        if processed_content == content:
+            return message_info
+        processed_info = dict(message_info)
+        processed_info["content"] = processed_content
+        return processed_info
+
+    def _preprocess_zulip_file_link(
+        self,
+        external_account,
+        stream,
+        message_info,
+        match,
+    ):
+        url = match.group("url")
+        if not self._is_zulip_file_url(
+            external_account=external_account,
+            url=url,
+        ):
+            return match.group(0)
+        try:
+            return self._download_zulip_file_link(
+                external_account=external_account,
+                stream=stream,
+                message_info=message_info,
+                match=match,
+            )
+        except Exception as exc:
+            raise RetryCommandLater(
+                "Postpone Zulip message %s because file %s was not imported" %
+                (message_info["message_id"], url),
+            ) from exc
+
+    def _is_zulip_file_url(self, external_account, url):
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme:
+            server = urllib.parse.urlparse(external_account.server_url)
+            return (
+                parsed.netloc == server.netloc and
+                parsed.path.startswith(ZULIP_UPLOAD_PATH)
+            )
+        return parsed.path.startswith(ZULIP_UPLOAD_PATH)
+
+    def _download_zulip_file_link(
+        self,
+        external_account,
+        stream,
+        message_info,
+        match,
+    ):
+        url = match.group("url")
+        file_name = self._get_zulip_file_name(match=match, url=url)
+        response = self._download_zulip_file(
+            external_account=external_account,
+            url=url,
+        )
+        data = response["content"]
+        metadata = self._get_zulip_file_metadata(
+            file_name=file_name,
+            header_content_type=response["content_type"],
+            data=data,
+            url=url,
+        )
+        file = self._create_workspace_file_from_zulip(
+            external_account=external_account,
+            stream=stream,
+            message_info=message_info,
+            file_name=file_name,
+            content_type=metadata["content_type"],
+            data=data,
+        )
+        urn = self._build_workspace_file_urn(
+            file=file,
+            file_name=file_name,
+            metadata=metadata,
+        )
+        prefix = "!" if urn.startswith("urn:image:") else ""
+        return f"{prefix}[{file_name}]({urn})"
+
+    def _get_zulip_file_name(self, match, url):
+        name = urllib.parse.unquote(match.group("name").strip())
+        if name:
+            return name
+        path = urllib.parse.urlparse(url).path
+        return urllib.parse.unquote(path.rsplit("/", 1)[-1])
+
+    def _download_zulip_file(self, external_account, url):
+        credentials = external_account.account_settings.credentials
+        client = zulip_client.ZulipClient(endpoint=external_account.server_url)
+        return client.download_file_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            url=url,
+        )
+
+    def _get_zulip_file_metadata(
+        self,
+        file_name,
+        header_content_type,
+        data,
+        url,
+    ):
+        image_metadata = self._get_image_file_metadata(data)
+        content_type = self._get_zulip_file_content_type(
+            file_name=file_name,
+            header_content_type=header_content_type,
+            data=data,
+            image_metadata=image_metadata,
+        )
+        width = image_metadata.get("width")
+        height = image_metadata.get("height")
+        if width is None or height is None:
+            dimensions = self._get_media_dimensions_from_url(
+                content_type=content_type,
+                url=url,
+            )
+            if dimensions is not None:
+                width, height = dimensions
+        return {
+            "content_type": content_type,
+            "width": width,
+            "height": height,
+            "size": len(data),
+        }
+
+    def _get_zulip_file_content_type(
+        self,
+        file_name,
+        header_content_type,
+        data,
+        image_metadata,
+    ):
+        detected_type = self._detect_file_content_type(data)
+        if detected_type is None:
+            detected_type = image_metadata.get("content_type")
+        parsed_type = self._parse_content_type(header_content_type)
+        guessed_type = self._guess_file_content_type(file_name)
+        if detected_type is not None:
+            return self._select_content_type(
+                content_type=detected_type,
+                guessed_type=guessed_type,
+            )
+        return self._select_content_type(
+            content_type=parsed_type,
+            guessed_type=guessed_type,
+        )
+
+    def _select_content_type(self, content_type, guessed_type):
+        if (
+            guessed_type is not None and
+            content_type in (None, DEFAULT_FILE_CONTENT_TYPE)
+        ):
+            return guessed_type
+        return content_type or guessed_type or DEFAULT_FILE_CONTENT_TYPE
+
+    def _detect_file_content_type(self, data):
+        detected_type = filetype.guess(data)
+        if detected_type is None:
+            return None
+        return detected_type.mime
+
+    def _get_image_file_metadata(self, data):
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+                return {
+                    "content_type": Image.MIME.get(image.format),
+                    "width": width,
+                    "height": height,
+                }
+        except (UnidentifiedImageError, OSError):
+            return {}
+
+    def _parse_content_type(self, content_type):
+        if not content_type:
+            return None
+        message = email.message.Message()
+        message["Content-Type"] = content_type
+        return message.get_content_type()
+
+    def _guess_file_content_type(self, file_name):
+        guess_file_type = getattr(mimetypes, "guess_file_type", None)
+        if guess_file_type is not None:
+            return guess_file_type(file_name)[0]
+        return mimetypes.guess_type(file_name)[0]
+
+    def _create_workspace_file_from_zulip(
+        self,
+        external_account,
+        stream,
+        message_info,
+        file_name,
+        content_type,
+        data,
+    ):
+        file_uuid = sys_uuid.uuid4()
+        storage_info = file_storage.save_workspace_file(
+            file_uuid=file_uuid,
+            data=data,
+        )
+        user_uuid = self._get_required_zulip_user_uuid(
+            external_account=external_account,
+            user_id=message_info["sender_id"],
+        )
+        try:
+            return messenger_dm_helpers.create_workspace_file(
+                project_id=external_account.project_id,
+                user_uuid=user_uuid,
+                uuid=file_uuid,
+                stream_uuid=stream.uuid,
+                name=file_name,
+                description="",
+                content_type=content_type,
+                size_bytes=len(data),
+                hash=hashlib.sha256(data).hexdigest(),
+                storage_type=storage_info.storage_type,
+                storage_id=storage_info.storage_id,
+                storage_object_id=storage_info.storage_object_id,
+            )
+        except Exception:
+            file_storage.delete_workspace_file(
+                file_uuid=file_uuid,
+                storage_type=storage_info.storage_type,
+                storage_object_id=storage_info.storage_object_id,
+            )
+            raise
+
+    def _build_workspace_file_urn(
+        self,
+        file,
+        file_name,
+        metadata,
+    ):
+        content_type = metadata["content_type"]
+        file_type = self._get_workspace_file_urn_type(content_type)
+        urn_metadata = [
+            ("name", file_name),
+            ("content_type", content_type),
+        ]
+        width = metadata["width"]
+        height = metadata["height"]
+        if width is not None and height is not None:
+            urn_metadata.extend([
+                ("w", width),
+                ("h", height),
+            ])
+        urn_metadata.append(("size", metadata["size"]))
+        query = urllib.parse.urlencode(urn_metadata)
+        return f"urn:{file_type}:{file.uuid}?{query}"
+
+    def _get_workspace_file_urn_type(self, content_type):
+        maintype = self._get_content_maintype(content_type)
+        if maintype in ("image", "video"):
+            return maintype
+        return "file"
+
+    def _get_media_dimensions_from_url(self, content_type, url):
+        maintype = self._get_content_maintype(content_type)
+        if maintype not in ("image", "video"):
+            return None
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        width = self._get_int_query_value(query, "w")
+        height = self._get_int_query_value(query, "h")
+        if width is None or height is None:
+            return None
+        return width, height
+
+    def _get_content_maintype(self, content_type):
+        message = email.message.Message()
+        message["Content-Type"] = content_type
+        return message.get_content_maintype()
+
+    def _get_int_query_value(self, query, name):
+        values = query.get(name)
+        if not values:
+            return None
+        value = int(values[0])
+        if value <= 0:
+            return None
+        return value
+
     def get_or_create_message(
         self,
         external_account,
@@ -600,6 +907,11 @@ class WorkspaceIntegrationBridgeCache:
                 )
             )
         elif cache_key not in self._messages:
+            message_info = self.preprocess_zulip_message(
+                external_account=external_account,
+                stream=stream,
+                message_info=message_info,
+            )
             source = self._build_zulip_message_source(
                 external_account=external_account,
                 stream_info=stream_info,

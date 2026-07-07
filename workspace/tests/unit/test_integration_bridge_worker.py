@@ -15,11 +15,14 @@
 #    under the License.
 
 import datetime
+import io
 import queue
 import uuid as sys_uuid
 
 from types import SimpleNamespace
 from unittest import mock
+
+from PIL import Image
 
 from workspace.services.integration_bridge import agents
 
@@ -115,6 +118,134 @@ def _patch_zulip_processed_entities(return_value=None):
         "ZulipProcessedEntity",
         FakeZulipProcessedEntity,
     )
+
+
+def test_bridge_cache_preprocesses_zulip_file_links():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    image_data = io.BytesIO()
+    image = Image.new("RGB", (1280, 720))
+    image.save(image_data, format="PNG")
+    png_data = image_data.getvalue()
+    external_account = SimpleNamespace(
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            credentials=SimpleNamespace(
+                login="user@example.com",
+                token="zulip-token",
+            ),
+        ),
+    )
+    stream = SimpleNamespace(uuid=stream_uuid)
+    message_info = {
+        "message_id": 42,
+        "sender_id": 24,
+        "content": (
+            "see ![photo.png](/user_uploads/1/photo.png) "
+            "and [site](https://example.com)"
+        ),
+    }
+    storage_info = agents.file_storage.WorkspaceFileStorageInfo(
+        storage_type="file",
+        storage_id="",
+        storage_object_id="aa/file",
+    )
+    created_file = SimpleNamespace(uuid=file_uuid)
+
+    class FakeZulipClient:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+
+        def download_file_with_api_key(self, login, token, url):
+            assert self.endpoint == "https://zulip.example.com"
+            assert login == "user@example.com"
+            assert token == "zulip-token"
+            assert url == "/user_uploads/1/photo.png"
+            return {
+                "content": png_data,
+                "content_type": "application/octet-stream",
+            }
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
+
+    with mock.patch.object(
+        agents.zulip_client,
+        "ZulipClient",
+        FakeZulipClient,
+    ), mock.patch.object(
+        agents.file_storage,
+        "save_workspace_file",
+        return_value=storage_info,
+    ) as save_file, mock.patch.object(
+        agents.file_storage,
+        "delete_workspace_file",
+    ) as delete_file, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "create_workspace_file",
+        return_value=created_file,
+    ) as create_file:
+        result = cache.preprocess_zulip_message(
+            external_account=external_account,
+            stream=stream,
+            message_info=message_info,
+        )
+
+    assert result["content"] == (
+        f"see ![photo.png](urn:image:{file_uuid}?"
+        f"name=photo.png&content_type=image%2Fpng&"
+        f"w=1280&h=720&size={len(png_data)}) "
+        "and [site](https://example.com)"
+    )
+    assert message_info["content"] == (
+        "see ![photo.png](/user_uploads/1/photo.png) "
+        "and [site](https://example.com)"
+    )
+    cache._get_required_zulip_user_uuid.assert_called_once_with(
+        external_account=external_account,
+        user_id=24,
+    )
+    save_file.assert_called_once_with(file_uuid=mock.ANY, data=png_data)
+    create_file.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        uuid=mock.ANY,
+        stream_uuid=stream_uuid,
+        name="photo.png",
+        description="",
+        content_type="image/png",
+        size_bytes=len(png_data),
+        hash=agents.hashlib.sha256(png_data).hexdigest(),
+        storage_type="file",
+        storage_id="",
+        storage_object_id="aa/file",
+    )
+    assert create_file.call_args.kwargs["uuid"] == (
+        save_file.call_args.kwargs["file_uuid"]
+    )
+    delete_file.assert_not_called()
+
+
+def test_bridge_cache_uses_filetype_for_video_metadata():
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    mp4_data = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+
+    metadata = cache._get_zulip_file_metadata(
+        file_name="clip.bin",
+        header_content_type="application/octet-stream",
+        data=mp4_data,
+        url="/user_uploads/1/clip.bin?w=1920&h=1080",
+    )
+
+    assert metadata == {
+        "content_type": "video/mp4",
+        "width": 1920,
+        "height": 1080,
+        "size": len(mp4_data),
+    }
 
 
 def test_outbound_event_filter_uses_author_event_only():
@@ -1485,6 +1616,72 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
             message_uuid="message-uuid",
         ),
     ]
+
+
+def test_bridge_cache_skips_file_preprocessing_for_processed_message():
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="reader-user",
+        server_url="https://zulip.example.com",
+    )
+    stream = SimpleNamespace(uuid="stream-uuid")
+    topic = SimpleNamespace(uuid="topic-uuid")
+    message = SimpleNamespace(uuid="message-uuid")
+    stream_info = {
+        "stream_id": 3,
+    }
+    message_info = {
+        "message_id": 100,
+        "sender_id": 24,
+        "content": "![photo.png](/user_uploads/1/photo.png)",
+        "read": False,
+        "created_at": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+        "updated_at": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+    }
+    processed = SimpleNamespace(workspace_uuid="message-uuid")
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_required_zulip_user_uuid",
+        mock.Mock(return_value="author-user"),
+    ), mock.patch.object(
+        cache,
+        "preprocess_zulip_message",
+        mock.Mock(),
+    ) as preprocess_message, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_workspace_user_message",
+        mock.Mock(return_value=message),
+    ) as get_message, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_or_create_workspace_user_message",
+        mock.Mock(),
+    ) as get_or_create_message:
+        with _patch_zulip_processed_entities(processed):
+            result = cache.get_or_create_message(
+                external_account=external_account,
+                stream=stream,
+                topic=topic,
+                stream_info=stream_info,
+                topic_name="deploys",
+                message_info=message_info,
+            )
+
+    assert result is message
+    preprocess_message.assert_not_called()
+    get_or_create_message.assert_not_called()
+    get_message.assert_called_once_with(
+        project_id="project",
+        user_uuid="author-user",
+        message_uuid="message-uuid",
+    )
 
 
 def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():

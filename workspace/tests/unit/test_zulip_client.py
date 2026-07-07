@@ -14,6 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 from workspace.common.clients import zulip
 
 
@@ -253,6 +255,35 @@ def test_zulip_client_deletes_message_with_official_sdk():
 
     assert result == {"result": "success"}
     assert FakeZulipSdkClient.deleted_message_id == 12345
+
+
+def test_zulip_client_downloads_file_with_api_key():
+    response = mock.Mock()
+    response.content = b"file-data"
+    response.headers = {"Content-Type": "image/png"}
+    client = zulip.ZulipClient(endpoint="https://zulip.example.com")
+
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        result = client.download_file_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            url="/user_uploads/1/photo.png",
+        )
+
+    assert result == {
+        "content": b"file-data",
+        "content_type": "image/png",
+    }
+    request.assert_called_once_with(
+        "https://zulip.example.com/user_uploads/1/photo.png",
+        auth=("user@example.com", "zulip-token"),
+        timeout=5,
+    )
+    response.raise_for_status.assert_called_once_with()
 
 
 def test_zulip_client_gets_streams_with_official_sdk():

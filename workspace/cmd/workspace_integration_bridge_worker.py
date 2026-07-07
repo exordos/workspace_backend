@@ -22,6 +22,7 @@ from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
+from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.services.integration_bridge import agents
 
@@ -40,6 +41,7 @@ worker_cli_opts = [
 CONF = cfg.CONF
 CONF.register_cli_opts(worker_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
+file_storage_opts.register_opts(CONF)
 
 
 def main():
