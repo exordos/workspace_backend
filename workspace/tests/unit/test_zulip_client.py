@@ -27,6 +27,7 @@ class FakeZulipSdkClient:
     sent_message = None
     updated_message = None
     deleted_message_id = None
+    uploaded_file = None
 
     def __init__(self, email, api_key, site):
         self.init_values = {
@@ -103,6 +104,16 @@ class FakeZulipSdkClient:
     def delete_message(self, message_id):
         type(self).deleted_message_id = message_id
         return {"result": "success"}
+
+    def upload_file(self, file):
+        type(self).uploaded_file = {
+            "name": file.name,
+            "data": file.read(),
+        }
+        return {
+            "result": "success",
+            "uri": "/user_uploads/1/report.pdf",
+        }
 
 
 def test_zulip_client_uses_official_sdk_for_profile():
@@ -255,6 +266,29 @@ def test_zulip_client_deletes_message_with_official_sdk():
 
     assert result == {"result": "success"}
     assert FakeZulipSdkClient.deleted_message_id == 12345
+
+
+def test_zulip_client_uploads_file_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.upload_file_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        file_name="report.pdf",
+        data=b"pdf-data",
+    )
+
+    assert result == {
+        "result": "success",
+        "uri": "/user_uploads/1/report.pdf",
+    }
+    assert FakeZulipSdkClient.uploaded_file == {
+        "name": "report.pdf",
+        "data": b"pdf-data",
+    }
 
 
 def test_zulip_client_downloads_file_with_api_key():

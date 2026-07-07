@@ -19,9 +19,14 @@ import datetime
 import itertools
 import logging
 import queue
+import re
 import threading
+import urllib.parse
+import uuid as sys_uuid
 
 from workspace.common.clients import zulip as zulip_client
+from workspace.messenger_api import file_storage
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 
 
 LOG = logging.getLogger(__name__)
@@ -39,6 +44,14 @@ MAX_SYNC_QUEUE_SIZE = 1000
 SYNC_QUEUE_PUT_TIMEOUT = 1
 _SYNC_RESPONSE_SEQUENCE = itertools.count()
 NO_VALUE = object()
+WORKSPACE_FILE_LINK_RE = re.compile(
+    r"(?P<bang>!?)\[(?P<name>[^\]]*)\]\((?P<url>[^)\s]+)\)"
+)
+WORKSPACE_FILE_URN_TYPES = {
+    "file",
+    "image",
+    "video",
+}
 
 
 class PrioritizedSyncResponse:
@@ -706,6 +719,84 @@ class ZulipBridgeWorker(threading.Thread):
             stream_id=stream["stream_id"],
         )
 
+    def _convert_workspace_file_links(self, content):
+        uploaded_files = {}
+        return WORKSPACE_FILE_LINK_RE.sub(
+            lambda match: self._convert_workspace_file_link(
+                match=match,
+                uploaded_files=uploaded_files,
+            ),
+            content,
+        )
+
+    def _convert_workspace_file_link(self, match, uploaded_files):
+        parsed_urn = self._parse_workspace_file_urn(match.group("url"))
+        if parsed_urn is None:
+            return match.group(0)
+        file_type, file_uuid, params = parsed_urn
+        if file_uuid not in uploaded_files:
+            file = messenger_dm_helpers.get_workspace_user_file(
+                project_id=self._external_account.project_id,
+                user_uuid=self._external_account.user_uuid,
+                file_uuid=file_uuid,
+            )
+            uploaded_files[file_uuid] = self._upload_workspace_file(
+                file=file,
+                file_name=self._get_workspace_file_name(
+                    file=file,
+                    match=match,
+                    params=params,
+                ),
+            )
+        file_name = self._get_workspace_file_name(
+            file=uploaded_files[file_uuid]["file"],
+            match=match,
+            params=params,
+        )
+        prefix = "!" if file_type == "image" else ""
+        return f"{prefix}[{file_name}]({uploaded_files[file_uuid]['uri']})"
+
+    def _parse_workspace_file_urn(self, url):
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "urn":
+            return None
+        urn_parts = parsed.path.split(":", 1)
+        if len(urn_parts) != 2 or urn_parts[0] not in WORKSPACE_FILE_URN_TYPES:
+            return None
+        return (
+            urn_parts[0],
+            sys_uuid.UUID(urn_parts[1]),
+            urllib.parse.parse_qs(parsed.query),
+        )
+
+    def _get_workspace_file_name(self, file, match, params):
+        names = params.get("name")
+        if names:
+            return names[0]
+        link_name = match.group("name").strip()
+        if link_name:
+            return link_name
+        return file.name
+
+    def _upload_workspace_file(self, file, file_name):
+        data = file_storage.read_workspace_file(
+            file_uuid=file.uuid,
+            storage_type=file.storage_type,
+            storage_object_id=file.storage_object_id,
+        )
+        credentials = self._get_credentials()
+        client = self._get_client()
+        response = client.upload_file_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            file_name=file_name,
+            data=data,
+        )
+        return {
+            "file": file,
+            "uri": response["uri"],
+        }
+
     def send_message(self, stream_name, topic_name, content):
         credentials = self._get_credentials()
         client = self._get_client()
@@ -714,7 +805,7 @@ class ZulipBridgeWorker(threading.Thread):
             token=credentials.token,
             stream_name=stream_name,
             topic_name=topic_name,
-            content=content,
+            content=self._convert_workspace_file_links(content),
         )
         return data["id"]
 
@@ -725,7 +816,7 @@ class ZulipBridgeWorker(threading.Thread):
             login=credentials.login,
             token=credentials.token,
             recipient_ids=recipient_ids,
-            content=content,
+            content=self._convert_workspace_file_links(content),
         )
         return data["id"]
 
@@ -736,7 +827,7 @@ class ZulipBridgeWorker(threading.Thread):
             login=credentials.login,
             token=credentials.token,
             message_id=message_id,
-            content=content,
+            content=self._convert_workspace_file_links(content),
         )
 
     def delete_message(self, message_id):

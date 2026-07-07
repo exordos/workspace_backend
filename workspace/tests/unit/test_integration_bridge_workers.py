@@ -17,7 +17,9 @@
 import datetime
 import queue
 import threading
+import uuid as sys_uuid
 from types import SimpleNamespace
+from unittest import mock
 
 from workspace.services.integration_bridge import workers
 
@@ -36,6 +38,7 @@ class FakeZulipClient:
     event_pages = None
     send_calls = None
     send_private_calls = None
+    upload_calls = None
     update_calls = None
     delete_calls = None
 
@@ -134,6 +137,15 @@ class FakeZulipClient:
             "message_id": message_id,
         })
         return {"result": "success"}
+
+    def upload_file_with_api_key(self, login, token, file_name, data):
+        type(self).upload_calls.append({
+            "login": login,
+            "token": token,
+            "file_name": file_name,
+            "data": data,
+        })
+        return {"uri": f"/user_uploads/1/{file_name}"}
 
 
 def _external_account():
@@ -841,6 +853,70 @@ def test_send_zulip_message_command_sends_and_reports_message_id():
     assert command.zulip_message_id == 12345
 
 
+def test_send_zulip_message_command_uploads_workspace_file_links():
+    output_queue = queue.PriorityQueue()
+    file_uuid = sys_uuid.UUID("41f23f93-b87c-47a4-9a12-1fcbd2719e78")
+    file = SimpleNamespace(
+        uuid=file_uuid,
+        name="photo.png",
+        storage_type="file",
+        storage_object_id="41/file",
+    )
+    FakeZulipClient.send_calls = []
+    FakeZulipClient.upload_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    with mock.patch.object(
+        workers.messenger_dm_helpers,
+        "get_workspace_user_file",
+        return_value=file,
+    ) as get_file, mock.patch.object(
+        workers.file_storage,
+        "read_workspace_file",
+        return_value=b"image-data",
+    ) as read_file:
+        workers.SendZulipMessage(
+            epoch_version=55,
+            message_uuid="message-uuid",
+            stream_name="general",
+            topic_name="deploys",
+            content=(
+                f"see ![photo.png](urn:image:{file_uuid}?"
+                "name=photo.png&content_type=image%2Fpng&size=10)"
+            ),
+        ).execute(worker)
+
+    get_file.assert_called_once_with(
+        project_id="project",
+        user_uuid="bridge-user",
+        file_uuid=file_uuid,
+    )
+    read_file.assert_called_once_with(
+        file_uuid=file_uuid,
+        storage_type="file",
+        storage_object_id="41/file",
+    )
+    assert FakeZulipClient.upload_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "file_name": "photo.png",
+            "data": b"image-data",
+        },
+    ]
+    assert FakeZulipClient.send_calls[0]["content"] == (
+        "see ![photo.png](/user_uploads/1/photo.png)"
+    )
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+
+
 def test_send_zulip_private_message_command_sends_and_reports_message_id():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.send_private_calls = []
@@ -928,6 +1004,56 @@ def test_update_zulip_message_command_updates_and_reports_success():
     command = workers.get_sync_response_command(response)
     assert isinstance(command, workers.ZulipMessageUpdated)
     assert command.epoch_version == 56
+
+
+def test_update_zulip_message_command_uploads_workspace_file_links():
+    output_queue = queue.PriorityQueue()
+    file_uuid = sys_uuid.UUID("9a0a7297-d98f-4d13-a946-85f172630a9d")
+    file = SimpleNamespace(
+        uuid=file_uuid,
+        name="report.pdf",
+        storage_type="file",
+        storage_object_id="9a/file",
+    )
+    FakeZulipClient.update_calls = []
+    FakeZulipClient.upload_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    with mock.patch.object(
+        workers.messenger_dm_helpers,
+        "get_workspace_user_file",
+        return_value=file,
+    ), mock.patch.object(
+        workers.file_storage,
+        "read_workspace_file",
+        return_value=b"pdf-data",
+    ):
+        workers.UpdateZulipMessage(
+            epoch_version=56,
+            message_uuid="message-uuid",
+            message_id=12345,
+            content=f"[report.pdf](urn:file:{file_uuid}?name=report.pdf)",
+        ).execute(worker)
+
+    assert FakeZulipClient.upload_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "file_name": "report.pdf",
+            "data": b"pdf-data",
+        },
+    ]
+    assert FakeZulipClient.update_calls[0]["content"] == (
+        "[report.pdf](/user_uploads/1/report.pdf)"
+    )
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageUpdated)
 
 
 def test_delete_zulip_message_command_deletes_and_reports_success():

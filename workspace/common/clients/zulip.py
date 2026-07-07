@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import io
 import urllib.parse
 from typing import Any, Dict, Optional
 
@@ -152,6 +153,18 @@ class ZulipClient(common.RESTClientMixIn):
     ):
         client = self._get_sdk_client(login=login, token=token)
         return client.delete_message(message_id)
+
+    def upload_file_with_api_key(
+        self,
+        login: str,
+        token: str,
+        file_name: str,
+        data: bytes,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        file = io.BytesIO(data)
+        file.name = file_name
+        return client.upload_file(file)
 
     def download_file_with_api_key(
         self,
