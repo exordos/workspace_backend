@@ -147,6 +147,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 description="Engineering workspace",
                 source_name="native",
                 source={"kind": "native"},
+                default_topic_name="zulip",
                 session=session,
             )
 
@@ -157,6 +158,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual("Engineering", created_stream["name"])
         self.assertEqual("native", created_stream["source_name"])
         self.assertEqual(12345, created_stream["color"])
+        self.assertNotIn("default_topic_name", created_stream)
         self.assertIs(session, created_stream["insert_session"])
         self.assertEqual(project_id, created_binding["project_id"])
         self.assertEqual(stream_uuid, created_binding["stream_uuid"])
@@ -167,7 +169,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         create_topic.assert_called_once_with(
             project_id=project_id,
             stream_uuid=stream_uuid,
-            name="General Topic",
+            name="zulip",
             default_for_stream_uuid=stream_uuid,
             session=session,
         )

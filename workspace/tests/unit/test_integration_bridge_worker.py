@@ -389,14 +389,220 @@ def test_bridge_cache_creates_missing_stream_once():
     )
 
 
+def test_bridge_cache_creates_missing_private_stream_with_zulip_topic():
+    public_stream_with_same_id = SimpleNamespace(
+        uuid="public-stream-uuid",
+        user_uuid="public-owner",
+        private=False,
+        source=SimpleNamespace(stream_id=79),
+    )
+    created_stream = SimpleNamespace(
+        uuid="private-stream-uuid",
+        user_uuid="gmelikov-user",
+    )
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="gmelikov-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "private",
+        "stream_id": 79,
+        "display_recipient": "admin, gmelikov",
+        "description": "",
+        "creator_id": 10,
+        "timestamp": 1772202531,
+        "invite_only": True,
+        "announce": False,
+        "is_archived": False,
+        "subscriber_ids": [8, 10],
+        "default_topic_name": "zulip",
+    }
+
+    class FakeWorkspaceStream:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[public_stream_with_same_id]),
+        )
+
+    admin_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="admin-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=8),
+        ),
+    )
+    gmelikov_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="gmelikov-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=10),
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(
+                return_value=[
+                    admin_account,
+                    gmelikov_account,
+                ],
+            ),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceStream",
+        FakeWorkspaceStream,
+    ):
+        with mock.patch.object(
+            agents.models,
+            "ExternalAccount",
+            FakeExternalAccount,
+        ):
+            with mock.patch.object(
+                agents.messenger_dm_helpers,
+                "get_or_create_workspace_user_stream",
+                mock.Mock(return_value=created_stream),
+            ) as get_or_create_stream:
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "get_or_create_workspace_stream_bindings",
+                    mock.Mock(),
+                ) as get_or_create_bindings:
+                    stream = cache.get_or_create_stream(
+                        external_account=external_account,
+                        stream_info=stream_info,
+                    )
+
+    assert stream is created_stream
+    get_or_create_stream.assert_called_once()
+    call_kwargs = get_or_create_stream.call_args.kwargs
+    assert call_kwargs["project_id"] == "project"
+    assert call_kwargs["user_uuid"] == "gmelikov-user"
+    assert call_kwargs["name"] == "admin, gmelikov"
+    assert call_kwargs["description"] == ""
+    assert call_kwargs["source_name"] == "zulip"
+    assert call_kwargs["source"].kind == "zulip"
+    assert call_kwargs["source"].stream_id == 79
+    assert call_kwargs["invite_only"] is True
+    assert call_kwargs["announce"] is False
+    assert call_kwargs["direct_user_uuid"] == "admin-user"
+    assert call_kwargs["is_archived"] is False
+    assert call_kwargs["default_topic_name"] == "zulip"
+    get_or_create_bindings.assert_called_once_with(
+        project_id="project",
+        stream_uuid="private-stream-uuid",
+        who_uuid="gmelikov-user",
+        role_user_uuids={
+            "member": [
+                "admin-user",
+            ],
+        },
+    )
+
+
+def test_bridge_cache_retries_private_stream_without_direct_user():
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="gmelikov-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "private",
+        "stream_id": 79,
+        "display_recipient": "gmelikov",
+        "description": "",
+        "creator_id": 10,
+        "timestamp": 1772202531,
+        "invite_only": True,
+        "announce": False,
+        "is_archived": False,
+        "subscriber_ids": [10],
+        "default_topic_name": "zulip",
+    }
+
+    class FakeWorkspaceStream:
+        objects = SimpleNamespace(get_all=mock.Mock(return_value=[]))
+
+    gmelikov_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="gmelikov-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=10),
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[gmelikov_account]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceStream",
+        FakeWorkspaceStream,
+    ):
+        with mock.patch.object(
+            agents.models,
+            "ExternalAccount",
+            FakeExternalAccount,
+        ):
+            with mock.patch.object(
+                agents.messenger_dm_helpers,
+                "get_or_create_workspace_user_stream",
+                mock.Mock(),
+            ) as get_or_create_stream:
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "get_or_create_workspace_stream_bindings",
+                    mock.Mock(),
+                ) as get_or_create_bindings:
+                    try:
+                        cache.get_or_create_stream(
+                            external_account=external_account,
+                            stream_info=stream_info,
+                        )
+                    except agents.RetryCommandLater:
+                        pass
+                    else:
+                        assert False
+
+    get_or_create_stream.assert_not_called()
+    get_or_create_bindings.assert_not_called()
+
+
+def test_bridge_worker_requeues_retryable_commands():
+    command = SimpleNamespace(
+        execute=mock.Mock(side_effect=agents.RetryCommandLater()),
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._sync_queue.put(command)
+
+    with mock.patch.object(agents, "SYNC_QUEUE_TIMEOUT", 0):
+        worker._process_sync_queue()
+
+    command.execute.assert_called_once_with(cache=worker._cache)
+    assert worker._sync_queue.get_nowait() is command
+
+
 def test_bridge_worker_iteration_syncs_users():
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
     with mock.patch.object(worker, "_sync_iam_users") as sync_iam_users:
         with mock.patch.object(worker, "_sync_zulip_users") as sync_zulip_users:
             with mock.patch.object(worker, "_start_bridges") as start_bridges:
-                worker._run_iteration()
+                with mock.patch.object(
+                    worker,
+                    "_process_sync_queue",
+                ) as process_sync_queue:
+                    worker._run_iteration()
 
     sync_iam_users.assert_called_once_with()
     sync_zulip_users.assert_called_once_with()
     start_bridges.assert_called_once_with()
+    process_sync_queue.assert_called_once_with()

@@ -1071,6 +1071,7 @@ def update_workspace_user_stream_topic_notifications(
 def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
                                                  direct_user_uuid, stream_uuid,
                                                  session=None, **kwargs):
+    default_topic_name = kwargs.pop("default_topic_name", "General Topic")
     private_index = build_private_stream_index(user_uuid, direct_user_uuid)
     for existing in models.WorkspaceStream.objects.get_all(
         filters={
@@ -1113,7 +1114,7 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
     default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
         stream_uuid=stream.uuid,
-        name="General Topic",
+        name=default_topic_name,
         default_for_stream_uuid=stream.uuid,
         session=session,
     )
@@ -1150,6 +1151,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
                                         **kwargs):
     stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
     direct_user_uuid = kwargs.pop("direct_user_uuid", None)
+    default_topic_name = kwargs.pop("default_topic_name", "General Topic")
     kwargs.pop("private", None)
     if kwargs.pop("private_index", None) is not None:
         raise messenger_exc.PrivateIndexIsTechnicalFieldError()
@@ -1159,6 +1161,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
             user_uuid=user_uuid,
             direct_user_uuid=direct_user_uuid,
             stream_uuid=stream_uuid,
+            default_topic_name=default_topic_name,
             session=session,
             **kwargs,
         )
@@ -1183,7 +1186,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
     default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
         stream_uuid=stream.uuid,
-        name="General Topic",
+        name=default_topic_name,
         default_for_stream_uuid=stream.uuid,
         session=session,
     )

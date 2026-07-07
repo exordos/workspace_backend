@@ -21,24 +21,60 @@ import threading
 from workspace.common.clients import zulip as zulip_client
 
 
+ZULIP_PRIVATE_TOPIC_NAME = "zulip"
+
+
 class AddMessage:
     def __init__(self, external_account, message):
         self.external_account = external_account
         self.message = message
 
+    def _get_timestamp(self):
+        return datetime.datetime.fromtimestamp(
+            self.message["timestamp"],
+            tz=datetime.timezone.utc,
+        )
+
+    def _get_private_display_recipient(self):
+        return ", ".join(
+            recipient["full_name"]
+            for recipient in self.message["display_recipient"]
+        )
+
+    def _get_private_subscriber_ids(self):
+        return [
+            recipient["id"]
+            for recipient in self.message["display_recipient"]
+        ]
+
+    def _get_private_stream_info(self):
+        return {
+            "type": self.message["type"],
+            "stream_id": self.message["recipient_id"],
+            "display_recipient": self._get_private_display_recipient(),
+            "description": "",
+            "creator_id": (
+                self.external_account.account_settings.user_info.user_id
+            ),
+            "timestamp": self._get_timestamp(),
+            "invite_only": True,
+            "announce": False,
+            "is_archived": False,
+            "subscriber_ids": self._get_private_subscriber_ids(),
+            "default_topic_name": ZULIP_PRIVATE_TOPIC_NAME,
+        }
+
     def _get_stream_info(self):
-        if 'stream_id' not in self.message:
-            print(self.message)
+        if self.message["type"] == "private":
+            return self._get_private_stream_info()
+
         return {
             "type": self.message["type"],
             "stream_id": self.message["stream_id"],
             "display_recipient": self.message["display_recipient"],
             "description": "",
             "creator_id": self.message["sender_id"],
-            "timestamp": datetime.datetime.fromtimestamp(
-                self.message["timestamp"],
-                tz=datetime.timezone.utc,
-            ),
+            "timestamp": self._get_timestamp(),
             "invite_only": False,
             "announce": False,
             "is_archived": False,

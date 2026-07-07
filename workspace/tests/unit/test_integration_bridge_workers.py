@@ -433,6 +433,68 @@ def test_add_message_executes_with_cache():
     ]
 
 
+def test_add_private_message_executes_with_cache():
+    external_account = _external_account()
+    stream = object()
+
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def get_or_create_stream(self, external_account, stream_info):
+            self.calls.append({
+                "external_account": external_account,
+                "stream_info": stream_info,
+            })
+            return stream
+
+    cache = FakeCache()
+    command = workers.AddMessage(
+        external_account=external_account,
+        message={
+            "type": "private",
+            "recipient_id": 79,
+            "display_recipient": [
+                {
+                    "id": 8,
+                    "full_name": "admin",
+                },
+                {
+                    "id": 10,
+                    "full_name": "gmelikov",
+                },
+            ],
+            "sender_id": 8,
+            "timestamp": 1772202531,
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is stream
+    assert cache.calls == [
+        {
+            "external_account": external_account,
+            "stream_info": {
+                "type": "private",
+                "stream_id": 79,
+                "display_recipient": "admin, gmelikov",
+                "description": "",
+                "creator_id": 10,
+                "timestamp": datetime.datetime.fromtimestamp(
+                    1772202531,
+                    tz=datetime.timezone.utc,
+                ),
+                "invite_only": True,
+                "announce": False,
+                "is_archived": False,
+                "subscriber_ids": [8, 10],
+                "default_topic_name": "zulip",
+            },
+        },
+    ]
+
+
 def test_add_stream_executes_with_cache():
     external_account = _external_account()
     stream = object()
