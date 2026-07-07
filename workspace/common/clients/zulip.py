@@ -88,6 +88,42 @@ class ZulipClient(common.RESTClientMixIn):
         data = client.get_members()
         return data["members"]
 
+    def get_messages_with_api_key(
+        self,
+        login: str,
+        token: str,
+        message_filters: Dict[str, Any],
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        data = client.get_messages(message_filters)
+        return data["messages"]
+
+    def get_streams_with_api_key(
+        self,
+        login: str,
+        token: str,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        stream_filters = {
+            "include_all": True,
+            "exclude_archived": False,
+        }
+        data = client.get_streams(**stream_filters)
+        return data["streams"]
+
+    def get_stream_subscribers_with_api_key(
+        self,
+        login: str,
+        token: str,
+        stream_id: int,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        data = client.call_endpoint(
+            url=f"streams/{stream_id}/members",
+            method="GET",
+        )
+        return data["subscribers"]
+
     def get_current_user_id(self, headers: Dict[str, str]) -> Optional[int]:
         """Extract current user's numeric ID from Zulip response.
 

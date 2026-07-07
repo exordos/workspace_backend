@@ -200,25 +200,21 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=other_user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=other_user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
-                    session=session,
                 ),
             ]
         )
@@ -408,25 +404,21 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=direct_user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=direct_user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
-                    session=session,
                 ),
             ]
         )
@@ -659,7 +651,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         create_stream_event.assert_called_once_with(
             stream=user_stream,
@@ -671,13 +662,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
-                    session=session,
                 ),
             ]
         )
@@ -898,14 +887,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         get_folder_targets.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             private=False,
-            session=session,
         )
         delete_file_accesses.assert_called_once_with(
             project_id=project_id,
@@ -1275,7 +1262,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         FakeWorkspaceStream.objects.get_one.assert_called_once()
         filters = FakeWorkspaceStream.objects.get_one.call_args.kwargs["filters"]
@@ -1349,7 +1335,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         create_event.assert_called_once_with(
             stream=returned_stream,
@@ -1428,7 +1413,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         create_stream_deleted.assert_has_calls(
             [
@@ -1591,6 +1575,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ]
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
         self.assertEqual(project_id, filters["project_id"].value)
+        self.assertNotIn(
+            "session",
+            FakeWorkspaceStreamBinding.objects.get_all.call_args.kwargs,
+        )
         self.assertEqual(
             [
                 {
@@ -1654,7 +1642,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_topics.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
-            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -1715,12 +1702,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
-            session=session,
         )
         get_topics.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
-            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -1771,12 +1756,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
-            session=session,
         )
         get_topics.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
-            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -1845,19 +1828,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
-            session=session,
         )
         get_topics.assert_has_calls(
             [
                 mock.call(
                     project_id=project_id,
                     topic_uuid=topic_uuid,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     topic_uuid=topic_uuid,
-                    session=session,
                 ),
             ]
         )
@@ -1928,13 +1908,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
-                    session=session,
                 ),
             ]
         )
@@ -1942,7 +1920,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         set_notification.assert_called_once_with(
             project_id=project_id,
@@ -2110,7 +2087,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
 
     def test_create_workspace_user_message_uses_stream_default_topic(self):
@@ -2212,7 +2188,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
 
     def test_update_workspace_user_message_updates_payload_and_sends_events(self):
@@ -2267,18 +2242,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
         get_author_message.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
         get_user_messages.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
-            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -2312,7 +2284,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             result = dm_helpers.get_workspace_user_message_uuids(
                 project_id=project_id,
                 user_uuid=user_uuid,
-                session=session,
             )
 
         self.assertEqual([first_message_uuid, second_message_uuid], result)
@@ -2321,11 +2292,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ]
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
-        self.assertIs(
-            session,
-            FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs[
-                "session"
-            ],
+        self.assertNotIn(
+            "session",
+            FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs,
         )
 
     def test_create_workspace_message_reaction_updated_events_sends_snapshots(self):
@@ -2352,7 +2321,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_user_messages.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
-            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -2409,7 +2377,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
         create_events.assert_called_once_with(
             project_id=project_id,
@@ -2488,7 +2455,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
         create_events.assert_has_calls(
             [
@@ -2674,13 +2640,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     stream_uuid=stream_uuid,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     stream_uuid=stream_uuid,
-                    session=session,
                 ),
             ]
         )
@@ -2688,7 +2652,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         read_messages.assert_called_once_with(
             project_id=project_id,
@@ -2752,13 +2715,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
-                    session=session,
                 ),
             ]
         )
@@ -2767,7 +2728,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
-            session=session,
         )
         read_messages.assert_called_once_with(
             project_id=project_id,
@@ -2845,13 +2805,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     message_uuid=message_uuid,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     message_uuid=message_uuid,
-                    session=session,
                 ),
             ]
         )
@@ -2915,13 +2873,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     message_uuid=message_uuid,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     message_uuid=message_uuid,
-                    session=session,
                 ),
             ]
         )
@@ -2931,7 +2887,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
             created_at=created_at,
-            session=session,
         )
         read_messages.assert_called_once_with(
             project_id=project_id,
@@ -3010,13 +2965,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
-            session=session,
         )
         get_stream.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            session=session,
         )
         FakeFolderItem.objects.get_all.assert_called_once()
         filters = FakeFolderItem.objects.get_all.call_args.kwargs["filters"]
@@ -3029,19 +2982,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
-                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=custom_folder_uuid,
-                    session=session,
                 ),
             ],
             get_folder.call_args_list,
@@ -3118,18 +3068,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
         get_author_message.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
         )
         get_user_messages.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
-            session=session,
         )
         create_deleted_event.assert_has_calls(
             [
@@ -3205,7 +3152,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
-            session=session,
         )
 
     def test_create_workspace_user_folder_item_updates_folder_event(self):
@@ -3263,7 +3209,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
-            session=session,
         )
         create_event.assert_called_once_with(
             folder=returned_folder,
@@ -3273,7 +3218,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             item_uuid=item_uuid,
-            session=session,
         )
 
     def test_delete_workspace_user_folder_item_deletes_event_with_item_id(self):
@@ -3367,7 +3311,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
-            session=session,
         )
         create_event.assert_called_once_with(
             folder=returned_folder,
@@ -3377,7 +3320,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             item_uuid=item_uuid,
-            session=session,
         )
 
     def test_unpin_workspace_user_folder_item_updates_folder_event(self):
@@ -3431,7 +3373,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
-            session=session,
         )
         create_event.assert_called_once_with(
             folder=returned_folder,
@@ -3441,7 +3382,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             item_uuid=item_uuid,
-            session=session,
         )
 
     def test_update_workspace_user_folder_updates_event_and_returns_view(self):
@@ -3491,7 +3431,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
-            session=session,
         )
         create_event.assert_called_once_with(
             folder=returned_folder,
@@ -3700,7 +3639,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_files.assert_called_once_with(
             project_id=project_id,
             stream_uuid=stream_uuid,
-            session=session,
         )
         get_access.assert_has_calls(
             [
@@ -3756,7 +3694,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_files.assert_called_once_with(
             project_id=project_id,
             stream_uuid=stream_uuid,
-            session=session,
         )
         self.assertEqual(2, get_one_or_none.call_count)
         first_filters = get_one_or_none.call_args_list[0].kwargs["filters"]
@@ -3868,7 +3805,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             file_uuid=file_uuid,
-            session=session,
         )
         self.assertEqual({"name": "renamed.txt"}, updated_file["values"])
         self.assertIs(session, updated_file["update_session"])
@@ -3903,7 +3839,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             file_uuid=file_uuid,
-            session=session,
         )
         self.assertIs(session, deleted_file["delete_session"])
 

@@ -179,10 +179,11 @@ class ApiClient:
     overridden per call to test cross-user isolation.
     """
 
-    def __init__(self, base_url, user_uuid, project_id):
+    def __init__(self, base_url, user_uuid, project_id, user_seeder=None):
         self.base_url = base_url.rstrip("/")
         self.user_uuid = str(user_uuid)
         self.project_id = str(project_id)
+        self._user_seeder = user_seeder
 
     def _headers(self, user=None, project=None):
         return {
@@ -191,6 +192,8 @@ class ApiClient:
         }
 
     def request(self, method, path, user=None, project=None, **kwargs):
+        if self._user_seeder is not None:
+            self._user_seeder(str(user or self.user_uuid))
         return requests.request(
             method,
             self.base_url + path,
@@ -270,12 +273,18 @@ def http_server(_database):
 
 
 @pytest.fixture
-def api(http_server):
+def api(http_server, db):
     """API client scoped to a fresh, unique (user, project) pair per test."""
+    user_uuid = sys_uuid.uuid4()
     return ApiClient(
         base_url=http_server,
-        user_uuid=sys_uuid.uuid4(),
+        user_uuid=user_uuid,
         project_id=sys_uuid.uuid4(),
+        user_seeder=lambda value: seed_workspace_user(
+            db,
+            value,
+            f"user-{value}",
+        ),
     )
 
 
@@ -299,6 +308,7 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
 
     Returns the ``uuid`` of the created ``m_workspace_user_streams`` row.
     """
+    seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     stream_uuid = sys_uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
@@ -354,6 +364,7 @@ def seed_workspace_user(conn, user_uuid, username, status="active",
 
 def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid,
                              role="member"):
+    seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     with conn.cursor() as cur:
         cur.execute(
             """

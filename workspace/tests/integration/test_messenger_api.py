@@ -254,6 +254,16 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
     topic_uuid = sys_uuid.uuid4()
     clean_user_uuid = sys_uuid.uuid4()
     damaged_user_uuid = sys_uuid.uuid4()
+    for workspace_user_uuid in (
+        user_uuid,
+        clean_user_uuid,
+        damaged_user_uuid,
+    ):
+        conftest.seed_workspace_user(
+            db,
+            workspace_user_uuid,
+            f"user-{workspace_user_uuid}",
+        )
 
     def run_migration(filename, module_name):
         migration_path = conftest.MIGRATIONS_DIR / filename
@@ -656,6 +666,66 @@ def test_folder_crud_roundtrip(api):
     assert resp.status_code == 404, resp.text
 
 
+def test_system_folders_exist_for_user_without_streams(api, db):
+    conftest.seed_workspace_user(
+        db,
+        api.user_uuid,
+        f"user-{api.user_uuid}",
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts
+                (uuid, project_id, user_uuid, server_url, account_type,
+                 status, account_settings, created_at, updated_at)
+            VALUES
+                (%s, %s, %s, 'https://iam.example.local', 'iam', 'active',
+                 %s::jsonb, NOW(), NOW())
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                api.user_uuid,
+                (
+                    '{"kind": "iam", "credentials": {"kind": "iam", '
+                    '"username": "admin", "access_token": "token"}}'
+                ),
+            ),
+        )
+
+    resp = api.get(FOLDERS)
+    assert resp.status_code == 200, resp.text
+    folders_by_uuid = {
+        folder["uuid"]: folder
+        for folder in resp.json()
+    }
+    expected_folders = {
+        str(messenger_dm_helpers.ALL_CHATS_FOLDER_UUID): "All chats",
+        str(messenger_dm_helpers.PERSONAL_FOLDER_UUID): "Personal",
+        str(messenger_dm_helpers.CHANNELS_FOLDER_UUID): "Channels",
+    }
+    assert {
+        uuid: folders_by_uuid[uuid]["title"]
+        for uuid in expected_folders
+    } == expected_folders
+    assert all(
+        folders_by_uuid[uuid]["folder_items"] == []
+        for uuid in expected_folders
+    )
+    assert all(
+        folders_by_uuid[uuid]["background_color_value"] == 11184810
+        for uuid in expected_folders
+    )
+
+    for folder_uuid, title in expected_folders.items():
+        resp = api.get(f"{FOLDERS}{folder_uuid}")
+        assert resp.status_code == 200, resp.text
+        folder = resp.json()
+        assert folder["title"] == title
+        assert folder["background_color_value"] == 11184810
+        assert folder["folder_items"] == []
+
+
 def test_folder_create_writes_realtime_event(api, db):
     resp = api.post(FOLDERS, json={"title": "Inbox"})
     assert resp.status_code in (200, 201), resp.text
@@ -1035,14 +1105,23 @@ def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
 
 def test_folders_are_scoped_to_the_authenticated_user(api):
     other_user = sys_uuid.uuid4()
+    system_folder_titles = {"All chats", "Personal", "Channels"}
 
     api.post(FOLDERS, json={"title": "mine"})
     api.post(FOLDERS, json={"title": "theirs"}, user=other_user)
 
-    titles = [f["title"] for f in api.get(FOLDERS).json()]
+    titles = [
+        f["title"]
+        for f in api.get(FOLDERS).json()
+        if f["title"] not in system_folder_titles
+    ]
     assert titles == ["mine"]
 
-    other_titles = [f["title"] for f in api.get(FOLDERS, user=other_user).json()]
+    other_titles = [
+        f["title"]
+        for f in api.get(FOLDERS, user=other_user).json()
+        if f["title"] not in system_folder_titles
+    ]
     assert other_titles == ["theirs"]
 
 
@@ -1427,6 +1506,11 @@ def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
 
 def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     direct_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        direct_user_uuid,
+        f"user-{direct_user_uuid}",
+    )
     expected_index = ":".join(
         sorted([str(api.user_uuid), str(direct_user_uuid)])
     )
@@ -1527,6 +1611,12 @@ def test_stream_binding_create_notifies_added_user(api, db):
     )
     target_user_uuid = sys_uuid.uuid4()
     second_target_user_uuid = sys_uuid.uuid4()
+    for target_uuid in (target_user_uuid, second_target_user_uuid):
+        conftest.seed_workspace_user(
+            db,
+            target_uuid,
+            f"user-{target_uuid}",
+        )
     file_resp = api.post(
         FILES,
         json={
@@ -1760,16 +1850,28 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
     assert [str(row[0]) for row in event_rows] == [
         str(target_user_uuid),
         str(target_user_uuid),
+        str(target_user_uuid),
+        str(target_user_uuid),
     ]
     events = [row[1] for row in event_rows]
     assert [event["kind"] for event in events] == [
         "stream.deleted",
         "folder.updated",
+        "folder.updated",
+        "folder.updated",
     ]
     assert events[0]["uuid"] == stream_uuid
     assert [(event["uuid"], event["title"]) for event in events[1:]] == [
+        ("00000000-0000-0000-0000-000000000000", "All chats"),
+        ("00000000-0000-0000-0000-000000000002", "Channels"),
         (folder["uuid"], "Watched"),
     ]
+    for event in events[1:]:
+        assert all(
+            item["stream_uuid"] != stream_uuid
+            for item in event["folder_items"]
+        )
+
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):
     seeded = {

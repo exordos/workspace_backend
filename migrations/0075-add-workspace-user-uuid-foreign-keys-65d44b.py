@@ -17,6 +17,9 @@
 from restalchemy.storage.sql import migrations
 
 
+SYSTEM_USER_UUID = "00000000-0000-0000-0000-000000000000"
+
+
 USER_UUID_FOREIGN_KEYS = (
     ("m_external_accounts", "m_external_accounts_user_uuid_fkey"),
     ("m_folder_items", "m_folder_items_user_uuid_fkey"),
@@ -59,6 +62,24 @@ class MigrationStep(migrations.AbstractMigrationStep):
         return False
 
     def upgrade(self, session):
+        session.execute(
+            f"""
+            INSERT INTO "m_workspace_users"
+                ("uuid", "username", "source", "status", "last_ping_at",
+                 "created_at", "updated_at")
+            VALUES
+                (
+                    '{SYSTEM_USER_UUID}'::uuid,
+                    'system-{SYSTEM_USER_UUID}',
+                    'iam',
+                    'offline',
+                    NOW(),
+                    '2000-01-01 00:00:00'::timestamp,
+                    '2000-01-01 00:00:00'::timestamp
+                )
+            ON CONFLICT ("uuid") DO NOTHING;
+            """
+        )
         session.execute(
             """
             ALTER TABLE IF EXISTS "m_external_accounts"

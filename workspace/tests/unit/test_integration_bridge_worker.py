@@ -31,7 +31,7 @@ def test_bridge_worker_syncs_due_user_providers():
         "ExternalAccountUserSync",
         FakeExternalAccountUserSync,
     ):
-        agents.WorkspaceIntegrationBridgeWorker()._sync_users()
+        agents.WorkspaceIntegrationBridgeWorker()._sync_zulip_users()
 
     FakeExternalAccountUserSync.objects.get_all.assert_called_once()
     filters = FakeExternalAccountUserSync.objects.get_all.call_args.kwargs[
@@ -62,14 +62,341 @@ def test_bridge_worker_syncs_due_iam_user_providers():
     provider.sync.assert_called_once_with()
 
 
+def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
+    credentials = object()
+    first_user = SimpleNamespace(
+        user_uuid="first-user",
+        account_settings=SimpleNamespace(credentials=credentials),
+    )
+    second_user = SimpleNamespace(
+        user_uuid="second-user",
+        account_settings=SimpleNamespace(credentials=credentials),
+    )
+    skipped_user = SimpleNamespace(
+        user_uuid="skipped-user",
+        account_settings=SimpleNamespace(credentials=None),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(
+                return_value=[first_user, second_user, skipped_user],
+            ),
+        )
+
+    class FakeZulipBridgeWorker:
+        instances = []
+
+        def __init__(self, external_account, sync_queue):
+            self.external_account = external_account
+            self.sync_queue = sync_queue
+            self.start = mock.Mock()
+            type(self).instances.append(self)
+
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    existing_worker = object()
+    worker._workers = {"first-user": existing_worker}
+
+    with mock.patch.object(
+        agents.models,
+        "ExternalAccount",
+        FakeExternalAccount,
+    ):
+        with mock.patch.object(
+            agents.workers,
+            "ZulipBridgeWorker",
+            FakeZulipBridgeWorker,
+        ):
+            worker._start_bridges()
+
+    FakeExternalAccount.objects.get_all.assert_called_once()
+    filters = FakeExternalAccount.objects.get_all.call_args.kwargs["filters"]
+    assert filters["account_type"].value == "zulip"
+    assert worker._workers["first-user"] is existing_worker
+    assert worker._workers["second-user"] is FakeZulipBridgeWorker.instances[0]
+    assert "skipped-user" not in worker._workers
+    assert FakeZulipBridgeWorker.instances[0].external_account is second_user
+    assert FakeZulipBridgeWorker.instances[0].sync_queue is worker._sync_queue
+    FakeZulipBridgeWorker.instances[0].start.assert_called_once_with()
+
+
+def test_bridge_cache_gets_existing_stream_once():
+    existing_stream = SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+        source=SimpleNamespace(stream_id=3),
+    )
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "stream",
+        "stream_id": 3,
+        "display_recipient": "general",
+        "description": "General stream",
+        "creator_id": 24,
+        "timestamp": 1770998098,
+        "invite_only": True,
+        "announce": True,
+        "is_archived": True,
+        "subscriber_ids": [],
+    }
+
+    class FakeWorkspaceStream:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[existing_stream]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceStream",
+        FakeWorkspaceStream,
+    ):
+        stream = cache.get_or_create_stream(
+            external_account=external_account,
+            stream_info=stream_info,
+        )
+        cached_stream = cache.get_or_create_stream(
+            external_account=external_account,
+            stream_info=stream_info,
+        )
+
+    assert stream is existing_stream
+    assert cached_stream is existing_stream
+    FakeWorkspaceStream.objects.get_all.assert_called_once()
+    filters = FakeWorkspaceStream.objects.get_all.call_args.kwargs["filters"]
+    assert filters["project_id"].value == "project"
+    assert filters["source_name"].value == "zulip"
+
+
+def test_bridge_cache_binds_existing_stream_users_once():
+    existing_stream = SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+        source=SimpleNamespace(stream_id=3),
+    )
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "stream",
+        "stream_id": 3,
+        "display_recipient": "general",
+        "description": "General stream",
+        "creator_id": 24,
+        "timestamp": 1770998098,
+        "invite_only": True,
+        "announce": True,
+        "is_archived": True,
+        "subscriber_ids": [24, 25],
+    }
+
+    class FakeWorkspaceStream:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[existing_stream]),
+        )
+
+    creator_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="creator-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=24),
+        ),
+    )
+    member_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="member-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=25),
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[creator_account, member_account]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceStream",
+        FakeWorkspaceStream,
+    ):
+        with mock.patch.object(
+            agents.models,
+            "ExternalAccount",
+            FakeExternalAccount,
+        ):
+            with mock.patch.object(
+                agents.messenger_dm_helpers,
+                "get_or_create_workspace_stream_bindings",
+                mock.Mock(),
+            ) as get_or_create_bindings:
+                stream = cache.get_or_create_stream(
+                    external_account=external_account,
+                    stream_info=stream_info,
+                )
+                cached_stream = cache.get_or_create_stream(
+                    external_account=external_account,
+                    stream_info=stream_info,
+                )
+
+    assert stream is existing_stream
+    assert cached_stream is existing_stream
+    get_or_create_bindings.assert_called_once_with(
+        project_id="project",
+        stream_uuid="stream-uuid",
+        who_uuid="creator-user",
+        role_user_uuids={
+            "member": [
+                "member-user",
+            ],
+        },
+    )
+
+
+def test_bridge_cache_creates_missing_stream_once():
+    created_stream = SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+    )
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "stream",
+        "stream_id": 3,
+        "display_recipient": "general",
+        "description": "General stream",
+        "creator_id": 24,
+        "timestamp": 1770998098,
+        "invite_only": True,
+        "announce": True,
+        "is_archived": True,
+        "subscriber_ids": [10, 24, 25],
+    }
+
+    class FakeWorkspaceStream:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[]),
+        )
+
+    creator_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="creator-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=24),
+        ),
+    )
+    bridge_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=10),
+        ),
+    )
+    member_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="member-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=25),
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(
+                return_value=[
+                    bridge_account,
+                    creator_account,
+                    member_account,
+                ],
+            ),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceStream",
+        FakeWorkspaceStream,
+    ):
+        with mock.patch.object(
+            agents.models,
+            "ExternalAccount",
+            FakeExternalAccount,
+        ):
+            with mock.patch.object(
+                agents.messenger_dm_helpers,
+                "get_or_create_workspace_user_stream",
+                mock.Mock(return_value=created_stream),
+            ) as get_or_create_stream:
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "get_or_create_workspace_stream_bindings",
+                    mock.Mock(),
+                ) as get_or_create_bindings:
+                    stream = cache.get_or_create_stream(
+                        external_account=external_account,
+                        stream_info=stream_info,
+                    )
+                    cached_stream = cache.get_or_create_stream(
+                        external_account=external_account,
+                        stream_info=stream_info,
+                    )
+
+    assert stream is created_stream
+    assert cached_stream is created_stream
+    FakeWorkspaceStream.objects.get_all.assert_called_once()
+    FakeExternalAccount.objects.get_all.assert_called_once()
+    filters = FakeExternalAccount.objects.get_all.call_args.kwargs["filters"]
+    assert filters["project_id"].value == "project"
+    assert filters["account_type"].value == "zulip"
+    assert filters["server_url"].value == "https://zulip.example.com"
+    get_or_create_stream.assert_called_once()
+    call_kwargs = get_or_create_stream.call_args.kwargs
+    assert call_kwargs["project_id"] == "project"
+    assert call_kwargs["user_uuid"] == "creator-user"
+    assert call_kwargs["name"] == "general"
+    assert call_kwargs["description"] == "General stream"
+    assert call_kwargs["source_name"] == "zulip"
+    assert call_kwargs["source"].kind == "zulip"
+    assert call_kwargs["source"].stream_id == 3
+    assert call_kwargs["invite_only"] is True
+    assert call_kwargs["announce"] is True
+    assert call_kwargs["is_archived"] is True
+    get_or_create_bindings.assert_called_once_with(
+        project_id="project",
+        stream_uuid="stream-uuid",
+        who_uuid="creator-user",
+        role_user_uuids={
+            "member": [
+                "bridge-user",
+                "member-user",
+            ],
+        },
+    )
+
+
 def test_bridge_worker_iteration_syncs_users():
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with (
-        mock.patch.object(worker, "_sync_iam_users") as sync_iam_users,
-        mock.patch.object(worker, "_sync_users") as sync_users,
-    ):
-        worker._run_iteration()
+    with mock.patch.object(worker, "_sync_iam_users") as sync_iam_users:
+        with mock.patch.object(worker, "_sync_zulip_users") as sync_zulip_users:
+            with mock.patch.object(worker, "_start_bridges") as start_bridges:
+                worker._run_iteration()
 
     sync_iam_users.assert_called_once_with()
-    sync_users.assert_called_once_with()
+    sync_zulip_users.assert_called_once_with()
+    start_bridges.assert_called_once_with()

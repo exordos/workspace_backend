@@ -19,6 +19,9 @@ from workspace.common.clients import zulip
 
 class FakeZulipSdkClient:
     init_values = None
+    stream_filters = None
+    subscriber_call = None
+    subscriber_response = None
 
     def __init__(self, email, api_key, site):
         self.init_values = {
@@ -43,6 +46,43 @@ class FakeZulipSdkClient:
                 },
             ],
         }
+
+    def get_messages(self, message_filters):
+        return {
+            "result": "success",
+            "messages": [
+                {
+                    "id": 100,
+                    "content": "hello",
+                    "filters": message_filters,
+                },
+            ],
+        }
+
+    def get_streams(self, **stream_filters):
+        type(self).stream_filters = stream_filters
+        return {
+            "result": "success",
+            "streams": [
+                {
+                    "stream_id": 3,
+                    "name": "general",
+                    "description": "General stream",
+                    "creator_id": 24,
+                    "date_created": 1776940760,
+                    "invite_only": False,
+                    "is_archived": False,
+                    "is_announcement_only": False,
+                },
+            ],
+        }
+
+    def call_endpoint(self, url, method):
+        type(self).subscriber_call = {
+            "url": url,
+            "method": method,
+        }
+        return type(self).subscriber_response
 
 
 def test_zulip_client_uses_official_sdk_for_profile():
@@ -83,3 +123,81 @@ def test_zulip_client_gets_members_with_official_sdk():
             "full_name": "User Example",
         },
     ]
+
+
+def test_zulip_client_gets_messages_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+    message_filters = {
+        "anchor": "newest",
+        "num_before": 10,
+        "num_after": 0,
+    }
+
+    messages = client.get_messages_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        message_filters=message_filters,
+    )
+
+    assert messages == [
+        {
+            "id": 100,
+            "content": "hello",
+            "filters": message_filters,
+        },
+    ]
+
+
+def test_zulip_client_gets_streams_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    streams = client.get_streams_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+    )
+
+    assert streams == [
+        {
+            "stream_id": 3,
+            "name": "general",
+            "description": "General stream",
+            "creator_id": 24,
+            "date_created": 1776940760,
+            "invite_only": False,
+            "is_archived": False,
+            "is_announcement_only": False,
+        },
+    ]
+    assert FakeZulipSdkClient.stream_filters == {
+        "include_all": True,
+        "exclude_archived": False,
+    }
+
+
+def test_zulip_client_gets_stream_subscribers_with_official_sdk():
+    FakeZulipSdkClient.subscriber_response = {
+        "result": "success",
+        "subscribers": [10, 24],
+    }
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    subscriber_ids = client.get_stream_subscribers_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        stream_id=3,
+    )
+
+    assert subscriber_ids == [10, 24]
+    assert FakeZulipSdkClient.subscriber_call == {
+        "url": "streams/3/members",
+        "method": "GET",
+    }
