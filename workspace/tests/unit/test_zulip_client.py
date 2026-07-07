@@ -14,7 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from unittest import mock
+import unittest.mock as mock
 
 from workspace.common.clients import zulip
 
@@ -28,6 +28,9 @@ class FakeZulipSdkClient:
     updated_message = None
     deleted_message_id = None
     uploaded_file = None
+    registered_queue = None
+    register_calls = []
+    register_responses = None
 
     def __init__(self, email, api_key, site):
         self.init_values = {
@@ -89,6 +92,21 @@ class FakeZulipSdkClient:
             "method": method,
         }
         return type(self).subscriber_response
+
+    def register(self, event_types, **kwargs):
+        call = {
+            "event_types": event_types,
+            "kwargs": kwargs,
+        }
+        type(self).registered_queue = call
+        type(self).register_calls.append(call)
+        if type(self).register_responses is not None:
+            return type(self).register_responses.pop(0)
+        return {
+            "result": "success",
+            "queue_id": "queue-1",
+            "last_event_id": 42,
+        }
 
     def send_message(self, request):
         type(self).sent_message = request
@@ -178,6 +196,96 @@ def test_zulip_client_gets_messages_with_official_sdk():
             "id": 100,
             "content": "hello",
             "filters": message_filters,
+        },
+    ]
+
+
+def test_zulip_client_registers_message_event_queue_with_update_and_delete():
+    FakeZulipSdkClient.register_calls = []
+    FakeZulipSdkClient.register_responses = None
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.register_message_event_queue_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+    )
+
+    assert result == {
+        "result": "success",
+        "queue_id": "queue-1",
+        "last_event_id": 42,
+    }
+    assert FakeZulipSdkClient.registered_queue == {
+        "event_types": [
+            "message",
+            "update_message",
+            "delete_message",
+        ],
+        "kwargs": {
+            "apply_markdown": False,
+            "client_capabilities": {
+                "notification_settings_null": True,
+                "bulk_message_deletion": True,
+            },
+        },
+    }
+
+
+def test_zulip_client_registers_all_events_when_filtered_queue_fails():
+    FakeZulipSdkClient.register_calls = []
+    FakeZulipSdkClient.register_responses = [
+        {
+            "result": "error",
+            "msg": "Unknown event type delete_message",
+        },
+        {
+            "result": "success",
+            "queue_id": "queue-1",
+            "last_event_id": 42,
+        },
+    ]
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.register_message_event_queue_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+    )
+
+    assert result == {
+        "result": "success",
+        "queue_id": "queue-1",
+        "last_event_id": 42,
+    }
+    assert FakeZulipSdkClient.register_calls == [
+        {
+            "event_types": [
+                "message",
+                "update_message",
+                "delete_message",
+            ],
+            "kwargs": {
+                "apply_markdown": False,
+                "client_capabilities": {
+                    "notification_settings_null": True,
+                    "bulk_message_deletion": True,
+                },
+            },
+        },
+        {
+            "event_types": None,
+            "kwargs": {
+                "apply_markdown": False,
+                "client_capabilities": {
+                    "notification_settings_null": True,
+                    "bulk_message_deletion": True,
+                },
+            },
         },
     ]
 

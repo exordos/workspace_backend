@@ -193,6 +193,10 @@ class AddMessage:
         self.message = message
         self.event_id = event_id
 
+    @property
+    def last_message_id(self):
+        return self.message["id"]
+
     def _get_timestamp(self):
         return datetime.datetime.fromtimestamp(
             self.message["timestamp"],
@@ -309,6 +313,68 @@ class AddMessage:
             stream_info=stream_info,
             topic_name=self._get_topic_name(),
             message_info=self._get_message_info(),
+        )
+
+
+class UpdateMessage:
+    priority = SYNC_RESPONSE_PRIORITY_MESSAGE
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+        self.message_id = event["message_id"]
+
+    @property
+    def last_message_id(self):
+        return max(self.event.get("message_ids", [self.message_id]))
+
+    def _get_sender_id(self):
+        return self.event.get("sender_id") or self.event.get("user_id")
+
+    def _get_updated_at(self):
+        edit_timestamp = self.event.get("edit_timestamp")
+        if edit_timestamp is None:
+            return None
+        return datetime.datetime.fromtimestamp(
+            edit_timestamp,
+            tz=datetime.timezone.utc,
+        )
+
+    def execute(self, cache):
+        return cache.update_message(
+            external_account=self.external_account,
+            message_info={
+                "message_id": self.message_id,
+                "sender_id": self._get_sender_id(),
+                "content": self.event["content"],
+                "updated_at": self._get_updated_at(),
+            },
+        )
+
+
+class DeleteMessage:
+    priority = SYNC_RESPONSE_PRIORITY_MESSAGE
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+        if "message_ids" in event:
+            self.message_ids = event["message_ids"]
+        else:
+            self.message_ids = [event["message_id"]]
+
+    @property
+    def last_message_id(self):
+        return max(self.message_ids)
+
+    def execute(self, cache):
+        return cache.delete_messages(
+            external_account=self.external_account,
+            message_ids=self.message_ids,
         )
 
 
@@ -659,6 +725,10 @@ class ZulipBridgeWorker(threading.Thread):
             login=credentials.login,
             token=credentials.token,
         )
+        if "queue_id" not in data or "last_event_id" not in data:
+            raise RuntimeError(
+                "Zulip message event queue registration failed: %s" % data,
+            )
         queue_id = data["queue_id"]
         last_event_id = data["last_event_id"]
         self._put_zulip_queue_state(
@@ -916,6 +986,30 @@ class ZulipBridgeWorker(threading.Thread):
         )
         return True
 
+    def _process_message_update(self, event):
+        if event.get("rendering_only") or "content" not in event:
+            return False
+        put_sync_response(
+            self._output_queue,
+            UpdateMessage(
+                external_account=self._external_account,
+                event=event,
+            ),
+        )
+        return True
+
+    def _process_message_delete(self, event):
+        if "message_ids" not in event and "message_id" not in event:
+            return False
+        put_sync_response(
+            self._output_queue,
+            DeleteMessage(
+                external_account=self._external_account,
+                event=event,
+            ),
+        )
+        return True
+
     def _catch_up_messages(self, last_message_id):
         message_filters = dict(self.DEFAULT_MESSAGE_FILTERS)
         message_filters["anchor"] = last_message_id
@@ -952,6 +1046,26 @@ class ZulipBridgeWorker(threading.Thread):
             self._finish_zulip_message_catch_up(last_message_id)
         return last_message_id
 
+    def _get_event_message_ids(self, event):
+        if event["type"] == "message":
+            return [event["message"]["id"]]
+        if "message_ids" in event:
+            return event["message_ids"]
+        if "message_id" in event:
+            return [event["message_id"]]
+        return []
+
+    def _process_event(self, event):
+        event_type = event["type"]
+        if event_type == "message":
+            message = self._get_message_from_event(event)
+            return self._process_message(message, event_id=event["id"])
+        if event_type == "update_message":
+            return self._process_message_update(event)
+        if event_type == "delete_message":
+            return self._process_message_delete(event)
+        return False
+
     def _sync_message_events(
         self,
         queue_id,
@@ -970,14 +1084,14 @@ class ZulipBridgeWorker(threading.Thread):
         event_last_message_id = last_message_id
         for event in events:
             event_last_event_id = event["id"]
-            if event["type"] != "message":
-                continue
-            message = self._get_message_from_event(event)
-            message_id = message["id"]
-            if self._process_message(message, event_id=event["id"]):
+            message_ids = self._get_event_message_ids(event)
+            if self._process_event(event):
                 seen_processable_message = True
-            if message_id > event_last_message_id:
-                event_last_message_id = message_id
+            if message_ids:
+                event_last_message_id = max(
+                    event_last_message_id,
+                    max(message_ids),
+                )
 
         if not seen_processable_message:
             self._put_zulip_queue_state(

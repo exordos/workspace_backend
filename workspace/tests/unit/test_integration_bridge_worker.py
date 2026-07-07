@@ -17,12 +17,11 @@
 import datetime
 import io
 import queue
+import types
+import unittest.mock as mock
 import uuid as sys_uuid
 
-from types import SimpleNamespace
-from unittest import mock
-
-from PIL import Image
+from PIL import Image as pil_image
 
 from workspace.services.integration_bridge import agents
 
@@ -55,7 +54,7 @@ def test_zulip_outbound_event_state_restores_retry_at_with_timezone_offset():
 
 class FakeZulipProcessedEntity:
     inserted = []
-    objects = SimpleNamespace(get_one_or_none=mock.Mock(return_value=None))
+    objects = types.SimpleNamespace(get_one_or_none=mock.Mock(return_value=None))
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
@@ -71,11 +70,15 @@ class FakeZulipQueueState:
         last_event_id=42,
         last_message_id=103,
         is_synced=True,
+        subscription_version=(
+            agents.zulip_client.MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION
+        ),
     ):
         self.queue_id = queue_id
         self.last_event_id = last_event_id
         self.last_message_id = last_message_id
         self.is_synced = is_synced
+        self.subscription_version = subscription_version
         self.update_dm = mock.Mock(side_effect=self._update_dm)
         self.update = mock.Mock()
 
@@ -108,9 +111,20 @@ class FakeOutboundState:
         self.__dict__.update(values)
 
 
+class FakeZulipOutboundEventState:
+    inserted = []
+    objects = types.SimpleNamespace(get_one_or_none=mock.Mock(return_value=None))
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def insert(self):
+        type(self).inserted.append(self)
+
+
 def _patch_zulip_processed_entities(return_value=None):
     FakeZulipProcessedEntity.inserted = []
-    FakeZulipProcessedEntity.objects = SimpleNamespace(
+    FakeZulipProcessedEntity.objects = types.SimpleNamespace(
         get_one_or_none=mock.Mock(return_value=return_value),
     )
     return mock.patch.object(
@@ -126,20 +140,20 @@ def test_bridge_cache_preprocesses_zulip_file_links():
     file_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
     image_data = io.BytesIO()
-    image = Image.new("RGB", (1280, 720))
+    image = pil_image.new("RGB", (1280, 720))
     image.save(image_data, format="PNG")
     png_data = image_data.getvalue()
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id=project_id,
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            credentials=SimpleNamespace(
+        account_settings=types.SimpleNamespace(
+            credentials=types.SimpleNamespace(
                 login="user@example.com",
                 token="zulip-token",
             ),
         ),
     )
-    stream = SimpleNamespace(uuid=stream_uuid)
+    stream = types.SimpleNamespace(uuid=stream_uuid)
     message_info = {
         "message_id": 42,
         "sender_id": 24,
@@ -153,7 +167,7 @@ def test_bridge_cache_preprocesses_zulip_file_links():
         storage_id="",
         storage_object_id="aa/file",
     )
-    created_file = SimpleNamespace(uuid=file_uuid)
+    created_file = types.SimpleNamespace(uuid=file_uuid)
 
     class FakeZulipClient:
         def __init__(self, endpoint):
@@ -248,42 +262,248 @@ def test_bridge_cache_uses_filetype_for_video_metadata():
     }
 
 
+def test_bridge_cache_updates_zulip_message_and_skips_outbound_event():
+    project_id = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        uuid=account_uuid,
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+    message = types.SimpleNamespace(
+        uuid=message_uuid,
+        user_uuid=sys_uuid.uuid4(),
+        stream_uuid=stream_uuid,
+    )
+    updated_message = types.SimpleNamespace(uuid=message_uuid)
+    last_event = types.SimpleNamespace(epoch_version=70)
+    update_event = types.SimpleNamespace(
+        epoch_version=71,
+        payload={"uuid": str(message_uuid)},
+    )
+    unrelated_event = types.SimpleNamespace(
+        epoch_version=72,
+        payload={"uuid": str(sys_uuid.uuid4())},
+    )
+
+    class FakeWorkspaceMessage:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=message),
+        )
+
+    class FakeWorkspaceEvent:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(
+                side_effect=[
+                    [last_event],
+                    [update_event, unrelated_event],
+                ],
+            ),
+        )
+
+    FakeZulipOutboundEventState.inserted = []
+    FakeZulipOutboundEventState.objects = types.SimpleNamespace(
+        get_one_or_none=mock.Mock(return_value=None),
+    )
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_processed_workspace_uuid",
+        mock.Mock(return_value=message_uuid),
+    ), mock.patch.object(
+        cache,
+        "preprocess_zulip_message",
+        mock.Mock(return_value={
+            "message_id": 104,
+            "sender_id": 8,
+            "content": "edited workspace",
+        }),
+    ) as preprocess, mock.patch.object(
+        agents.models,
+        "WorkspaceMessage",
+        FakeWorkspaceMessage,
+    ), mock.patch.object(
+        agents.models,
+        "WorkspaceEvent",
+        FakeWorkspaceEvent,
+    ), mock.patch.object(
+        agents.models,
+        "ZulipOutboundEventState",
+        FakeZulipOutboundEventState,
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "update_workspace_user_message",
+        mock.Mock(return_value=updated_message),
+    ) as update_workspace_message:
+        result = cache.update_message(
+            external_account=external_account,
+            message_info={
+                "message_id": 104,
+                "sender_id": 8,
+                "content": "edited zulip",
+            },
+        )
+
+    assert result is updated_message
+    preprocess.assert_called_once_with(
+        external_account=external_account,
+        stream=types.SimpleNamespace(uuid=stream_uuid),
+        message_info={
+            "message_id": 104,
+            "sender_id": 8,
+            "content": "edited zulip",
+        },
+    )
+    update_workspace_message.assert_called_once()
+    update_kwargs = update_workspace_message.call_args.kwargs
+    assert update_kwargs["project_id"] == project_id
+    assert update_kwargs["user_uuid"] == message.user_uuid
+    assert update_kwargs["message_uuid"] == message_uuid
+    assert update_kwargs["values"]["payload"].content == "edited workspace"
+    cache_key = (
+        project_id,
+        "https://zulip.example.com",
+        104,
+    )
+    assert cache._messages[cache_key] is updated_message
+    assert len(FakeZulipOutboundEventState.inserted) == 1
+    state = FakeZulipOutboundEventState.inserted[0]
+    assert state.project_id == project_id
+    assert state.epoch_version == 71
+    assert state.external_account_uuid == account_uuid
+    assert state.status == agents.OUTBOUND_SKIPPED_STATUS
+
+
+def test_bridge_cache_deletes_zulip_message_and_skips_outbound_event():
+    project_id = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        uuid=account_uuid,
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+    message = types.SimpleNamespace(
+        uuid=message_uuid,
+        user_uuid=sys_uuid.uuid4(),
+    )
+    last_event = types.SimpleNamespace(epoch_version=80)
+    delete_event = types.SimpleNamespace(
+        epoch_version=81,
+        payload={"uuid": str(message_uuid)},
+    )
+
+    class FakeWorkspaceMessage:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=message),
+        )
+
+    class FakeWorkspaceEvent:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(
+                side_effect=[
+                    [last_event],
+                    [delete_event],
+                ],
+            ),
+        )
+
+    FakeZulipOutboundEventState.inserted = []
+    FakeZulipOutboundEventState.objects = types.SimpleNamespace(
+        get_one_or_none=mock.Mock(return_value=None),
+    )
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._messages[
+        (
+            project_id,
+            "https://zulip.example.com",
+            104,
+        )
+    ] = message
+    with mock.patch.object(
+        cache,
+        "_get_processed_workspace_uuid",
+        mock.Mock(return_value=message_uuid),
+    ), mock.patch.object(
+        agents.models,
+        "WorkspaceMessage",
+        FakeWorkspaceMessage,
+    ), mock.patch.object(
+        agents.models,
+        "WorkspaceEvent",
+        FakeWorkspaceEvent,
+    ), mock.patch.object(
+        agents.models,
+        "ZulipOutboundEventState",
+        FakeZulipOutboundEventState,
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "delete_workspace_user_message",
+        mock.Mock(),
+    ) as delete_workspace_message:
+        results = cache.delete_messages(
+            external_account=external_account,
+            message_ids=[104],
+        )
+
+    assert results == [message]
+    delete_workspace_message.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=message.user_uuid,
+        message_uuid=message_uuid,
+    )
+    cache_key = (
+        project_id,
+        "https://zulip.example.com",
+        104,
+    )
+    assert cache_key not in cache._messages
+    assert len(FakeZulipOutboundEventState.inserted) == 1
+    state = FakeZulipOutboundEventState.inserted[0]
+    assert state.project_id == project_id
+    assert state.epoch_version == 81
+    assert state.external_account_uuid == account_uuid
+    assert state.status == agents.OUTBOUND_SKIPPED_STATUS
+
+
 def test_outbound_event_filter_uses_author_event_only():
     worker = agents.WorkspaceIntegrationBridgeWorker()
-    author_event = SimpleNamespace(
+    author_event = types.SimpleNamespace(
         action="created",
         user_uuid="author-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "zulip",
-            "source": SimpleNamespace(message_id=None),
+            "source": types.SimpleNamespace(message_id=None),
         },
     )
-    recipient_event = SimpleNamespace(
+    recipient_event = types.SimpleNamespace(
         action="created",
         user_uuid="recipient-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "zulip",
-            "source": SimpleNamespace(message_id=None),
+            "source": types.SimpleNamespace(message_id=None),
         },
     )
-    native_event = SimpleNamespace(
+    native_event = types.SimpleNamespace(
         action="created",
         user_uuid="author-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "native",
-            "source": SimpleNamespace(message_id=None),
+            "source": types.SimpleNamespace(message_id=None),
         },
     )
-    inbound_event = SimpleNamespace(
+    inbound_event = types.SimpleNamespace(
         action="created",
         user_uuid="author-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "zulip",
-            "source": SimpleNamespace(message_id=12345),
+            "source": types.SimpleNamespace(message_id=12345),
         },
     )
 
@@ -306,7 +526,7 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     now = datetime.datetime.now(datetime.timezone.utc)
-    session = SimpleNamespace(
+    session = types.SimpleNamespace(
         execute=mock.Mock(
             return_value=FakeQueryResult([
                 {
@@ -328,7 +548,7 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
             ]),
         ),
     )
-    context = SimpleNamespace(get_session=mock.Mock(return_value=session))
+    context = types.SimpleNamespace(get_session=mock.Mock(return_value=session))
     worker = agents.WorkspaceIntegrationBridgeWorker()
     worker._last_outbound_event_epoch = 55
 
@@ -350,21 +570,21 @@ def test_dispatch_zulip_outbound_state_uses_author_worker_queue():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     command = object()
     state = FakeOutboundState()
-    event = SimpleNamespace(
+    event = types.SimpleNamespace(
         action="created",
         user_uuid="author-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "zulip",
-            "source": SimpleNamespace(message_id=None),
+            "source": types.SimpleNamespace(message_id=None),
         },
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         uuid="account-uuid",
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="author-user",
-        account_settings=SimpleNamespace(credentials=object()),
+        account_settings=types.SimpleNamespace(credentials=object()),
     )
     author_key = (
         "project",
@@ -408,21 +628,21 @@ def test_dispatch_zulip_outbound_state_uses_author_worker_queue():
 def test_dispatch_zulip_outbound_state_retries_without_credentials():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     state = FakeOutboundState()
-    event = SimpleNamespace(
+    event = types.SimpleNamespace(
         action="created",
         user_uuid="author-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "zulip",
-            "source": SimpleNamespace(message_id=None),
+            "source": types.SimpleNamespace(message_id=None),
         },
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         uuid="account-uuid",
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="author-user",
-        account_settings=SimpleNamespace(credentials=None),
+        account_settings=types.SimpleNamespace(credentials=None),
     )
 
     with mock.patch.object(
@@ -445,13 +665,13 @@ def test_dispatch_zulip_outbound_state_retries_without_credentials():
 def test_dispatch_zulip_outbound_state_skips_inbound_created_event():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     state = FakeOutboundState()
-    event = SimpleNamespace(
+    event = types.SimpleNamespace(
         action="created",
         user_uuid="author-user",
         payload={
             "author_uuid": "author-user",
             "source_name": "zulip",
-            "source": SimpleNamespace(message_id=12345),
+            "source": types.SimpleNamespace(message_id=12345),
         },
     )
 
@@ -475,8 +695,8 @@ def test_dispatch_zulip_outbound_state_skips_inbound_created_event():
 def test_save_zulip_processed_message_casts_message_uuid():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     message_uuid = sys_uuid.uuid4()
-    command = SimpleNamespace(
-        external_account=SimpleNamespace(
+    command = types.SimpleNamespace(
+        external_account=types.SimpleNamespace(
             project_id="project",
             server_url="https://zulip.example.com",
             user_uuid="author-user",
@@ -498,7 +718,7 @@ def test_zulip_sent_result_error_marks_outbound_failed_without_retry():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     state = FakeOutboundState(status="processing", attempts=1)
     command = agents.workers.ZulipMessageSent(
-        external_account=SimpleNamespace(
+        external_account=types.SimpleNamespace(
             project_id="project",
             server_url="https://zulip.example.com",
             user_uuid="author-user",
@@ -540,7 +760,7 @@ def test_expired_processing_outbound_state_is_failed_not_redispatched():
     )
 
     class FakeZulipOutboundEventState:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(
                 side_effect=[
                     [expired_state],
@@ -568,7 +788,7 @@ def test_expired_processing_outbound_state_is_failed_not_redispatched():
 
 def test_build_send_zulip_message_command_uses_direct_private_recipient():
     worker = agents.WorkspaceIntegrationBridgeWorker()
-    event = SimpleNamespace(
+    event = types.SimpleNamespace(
         epoch_version=55,
         project_id="project",
         payload={
@@ -578,25 +798,25 @@ def test_build_send_zulip_message_command_uses_direct_private_recipient():
             },
         },
     )
-    message = SimpleNamespace(
+    message = types.SimpleNamespace(
         stream_uuid="stream-uuid",
         topic_uuid="topic-uuid",
         source={
             "server_url": "https://zulip.example.com",
         },
     )
-    stream = SimpleNamespace(
+    stream = types.SimpleNamespace(
         private=True,
         direct_user_uuid="recipient-user",
     )
-    recipient_account = SimpleNamespace(
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=42),
+    recipient_account = types.SimpleNamespace(
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=42),
         ),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_one_or_none=mock.Mock(return_value=recipient_account),
         )
 
@@ -693,10 +913,10 @@ def test_bridge_worker_shutdown_stops_workers_and_drains_output_queue():
 
 
 def test_bridge_worker_syncs_due_user_providers():
-    provider = SimpleNamespace(sync=mock.Mock())
+    provider = types.SimpleNamespace(sync=mock.Mock())
 
     class FakeExternalAccountUserSync:
-        objects = SimpleNamespace(get_all=mock.Mock(return_value=[provider]))
+        objects = types.SimpleNamespace(get_all=mock.Mock(return_value=[provider]))
 
     with mock.patch.object(
         agents.models,
@@ -714,10 +934,10 @@ def test_bridge_worker_syncs_due_user_providers():
 
 
 def test_bridge_worker_syncs_due_iam_user_providers():
-    provider = SimpleNamespace(sync=mock.Mock())
+    provider = types.SimpleNamespace(sync=mock.Mock())
 
     class FakeExternalAccountUserSync:
-        objects = SimpleNamespace(get_all=mock.Mock(return_value=[provider]))
+        objects = types.SimpleNamespace(get_all=mock.Mock(return_value=[provider]))
 
     with mock.patch.object(
         agents.models,
@@ -736,25 +956,25 @@ def test_bridge_worker_syncs_due_iam_user_providers():
 
 def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     credentials = object()
-    first_user = SimpleNamespace(
+    first_user = types.SimpleNamespace(
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="first-user",
-        account_settings=SimpleNamespace(credentials=credentials),
+        account_settings=types.SimpleNamespace(credentials=credentials),
     )
-    second_user = SimpleNamespace(
+    second_user = types.SimpleNamespace(
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="second-user",
-        account_settings=SimpleNamespace(credentials=credentials),
+        account_settings=types.SimpleNamespace(credentials=credentials),
     )
-    skipped_user = SimpleNamespace(
+    skipped_user = types.SimpleNamespace(
         user_uuid="skipped-user",
-        account_settings=SimpleNamespace(credentials=None),
+        account_settings=types.SimpleNamespace(credentials=None),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(
                 return_value=[first_user, second_user, skipped_user],
             ),
@@ -791,7 +1011,7 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     worker._workers = {first_worker_key: existing_worker}
     worker._worker_input_queues = {first_worker_key: existing_input_queue}
     worker._worker_accounts = {first_worker_key: first_user}
-    queue_state = SimpleNamespace(
+    queue_state = types.SimpleNamespace(
         queue_id="queue-1",
         last_event_id=42,
         last_message_id=103,
@@ -891,12 +1111,12 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
 
 
 def test_bridge_cache_gets_existing_stream_once():
-    existing_stream = SimpleNamespace(
+    existing_stream = types.SimpleNamespace(
         uuid="stream-uuid",
         user_uuid="creator-user",
-        source=SimpleNamespace(stream_id=3),
+        source=types.SimpleNamespace(stream_id=3),
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="user",
         server_url="https://zulip.example.com",
@@ -915,7 +1135,7 @@ def test_bridge_cache_gets_existing_stream_once():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[existing_stream]),
         )
 
@@ -944,12 +1164,12 @@ def test_bridge_cache_gets_existing_stream_once():
 
 
 def test_bridge_cache_binds_existing_stream_users_once():
-    existing_stream = SimpleNamespace(
+    existing_stream = types.SimpleNamespace(
         uuid="stream-uuid",
         user_uuid="creator-user",
-        source=SimpleNamespace(stream_id=3),
+        source=types.SimpleNamespace(stream_id=3),
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -968,29 +1188,29 @@ def test_bridge_cache_binds_existing_stream_users_once():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[existing_stream]),
         )
 
-    creator_account = SimpleNamespace(
+    creator_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="creator-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=24),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=24),
         ),
     )
-    member_account = SimpleNamespace(
+    member_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="member-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=25),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=25),
         ),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[creator_account, member_account]),
         )
 
@@ -1035,11 +1255,11 @@ def test_bridge_cache_binds_existing_stream_users_once():
 
 
 def test_bridge_cache_creates_missing_stream_once():
-    created_stream = SimpleNamespace(
+    created_stream = types.SimpleNamespace(
         uuid="stream-uuid",
         user_uuid="creator-user",
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1058,37 +1278,37 @@ def test_bridge_cache_creates_missing_stream_once():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[]),
         )
 
-    creator_account = SimpleNamespace(
+    creator_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="creator-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=24),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=24),
         ),
     )
-    bridge_account = SimpleNamespace(
+    bridge_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=10),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=10),
         ),
     )
-    member_account = SimpleNamespace(
+    member_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="member-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=25),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=25),
         ),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(
                 return_value=[
                     bridge_account,
@@ -1163,17 +1383,17 @@ def test_bridge_cache_creates_missing_stream_once():
 
 
 def test_bridge_cache_creates_missing_private_stream_with_zulip_topic():
-    public_stream_with_same_id = SimpleNamespace(
+    public_stream_with_same_id = types.SimpleNamespace(
         uuid="public-stream-uuid",
         user_uuid="public-owner",
         private=False,
-        source=SimpleNamespace(stream_id=79),
+        source=types.SimpleNamespace(stream_id=79),
     )
-    created_stream = SimpleNamespace(
+    created_stream = types.SimpleNamespace(
         uuid="private-stream-uuid",
         user_uuid="gmelikov-user",
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="gmelikov-user",
         server_url="https://zulip.example.com",
@@ -1193,29 +1413,29 @@ def test_bridge_cache_creates_missing_private_stream_with_zulip_topic():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[public_stream_with_same_id]),
         )
 
-    admin_account = SimpleNamespace(
+    admin_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="admin-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=8),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=8),
         ),
     )
-    gmelikov_account = SimpleNamespace(
+    gmelikov_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="gmelikov-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=10),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=10),
         ),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(
                 return_value=[
                     admin_account,
@@ -1279,11 +1499,11 @@ def test_bridge_cache_creates_missing_private_stream_with_zulip_topic():
 
 
 def test_bridge_cache_creates_missing_private_group_stream():
-    created_stream = SimpleNamespace(
+    created_stream = types.SimpleNamespace(
         uuid="private-group-stream-uuid",
         user_uuid="admin-user",
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="admin-user",
         server_url="https://zulip.example.com",
@@ -1303,45 +1523,45 @@ def test_bridge_cache_creates_missing_private_group_stream():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[]),
         )
 
-    admin_account = SimpleNamespace(
+    admin_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="admin-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=8),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=8),
         ),
     )
-    eugene_account = SimpleNamespace(
+    eugene_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="eugene-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=9),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=9),
         ),
     )
-    gmelikov_account = SimpleNamespace(
+    gmelikov_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="gmelikov-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=10),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=10),
         ),
     )
-    anton_account = SimpleNamespace(
+    anton_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="anton-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=15),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=15),
         ),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(
                 return_value=[
                     admin_account,
@@ -1415,7 +1635,7 @@ def test_bridge_cache_creates_missing_private_group_stream():
 
 
 def test_bridge_cache_retries_private_stream_without_direct_user():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="gmelikov-user",
         server_url="https://zulip.example.com",
@@ -1435,19 +1655,19 @@ def test_bridge_cache_retries_private_stream_without_direct_user():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(get_all=mock.Mock(return_value=[]))
+        objects = types.SimpleNamespace(get_all=mock.Mock(return_value=[]))
 
-    gmelikov_account = SimpleNamespace(
+    gmelikov_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="gmelikov-user",
         server_url="https://zulip.example.com",
-        account_settings=SimpleNamespace(
-            user_info=SimpleNamespace(user_id=10),
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=10),
         ),
     )
 
     class FakeExternalAccount:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_all=mock.Mock(return_value=[gmelikov_account]),
         )
 
@@ -1488,7 +1708,7 @@ def test_bridge_cache_retries_private_stream_without_direct_user():
 
 
 def test_bridge_cache_requests_stream_sync_for_missing_message_stream():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1508,7 +1728,7 @@ def test_bridge_cache_requests_stream_sync_for_missing_message_stream():
     }
 
     class FakeWorkspaceStream:
-        objects = SimpleNamespace(get_all=mock.Mock(return_value=[]))
+        objects = types.SimpleNamespace(get_all=mock.Mock(return_value=[]))
 
     cache = agents.WorkspaceIntegrationBridgeCache()
     with _patch_zulip_processed_entities():
@@ -1530,19 +1750,19 @@ def test_bridge_cache_requests_stream_sync_for_missing_message_stream():
 
 
 def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
-    first_account = SimpleNamespace(
+    first_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="first-user",
         server_url="https://zulip.example.com",
     )
-    second_account = SimpleNamespace(
+    second_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="second-user",
         server_url="https://zulip.example.com",
     )
-    stream = SimpleNamespace(uuid="stream-uuid")
-    topic = SimpleNamespace(uuid="topic-uuid")
-    message = SimpleNamespace(uuid="message-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid")
+    topic = types.SimpleNamespace(uuid="topic-uuid")
+    message = types.SimpleNamespace(uuid="message-uuid")
     stream_info = {
         "stream_id": 3,
     }
@@ -1619,14 +1839,14 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
 
 
 def test_bridge_cache_skips_file_preprocessing_for_processed_message():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="reader-user",
         server_url="https://zulip.example.com",
     )
-    stream = SimpleNamespace(uuid="stream-uuid")
-    topic = SimpleNamespace(uuid="topic-uuid")
-    message = SimpleNamespace(uuid="message-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid")
+    topic = types.SimpleNamespace(uuid="topic-uuid")
+    message = types.SimpleNamespace(uuid="message-uuid")
     stream_info = {
         "stream_id": 3,
     }
@@ -1644,7 +1864,7 @@ def test_bridge_cache_skips_file_preprocessing_for_processed_message():
             tz=datetime.timezone.utc,
         ),
     }
-    processed = SimpleNamespace(workspace_uuid="message-uuid")
+    processed = types.SimpleNamespace(workspace_uuid="message-uuid")
 
     cache = agents.WorkspaceIntegrationBridgeCache()
     with mock.patch.object(
@@ -1685,14 +1905,14 @@ def test_bridge_cache_skips_file_preprocessing_for_processed_message():
 
 
 def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="reader-user",
         server_url="https://zulip.example.com",
     )
-    stream = SimpleNamespace(uuid="stream-uuid")
-    topic = SimpleNamespace(uuid="topic-uuid")
-    message = SimpleNamespace(uuid="message-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid")
+    topic = types.SimpleNamespace(uuid="topic-uuid")
+    message = types.SimpleNamespace(uuid="message-uuid")
     stream_info = {
         "stream_id": 3,
     }
@@ -1746,7 +1966,7 @@ def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
 
 
 def test_bridge_worker_requeues_retryable_commands():
-    command = SimpleNamespace(
+    command = types.SimpleNamespace(
         execute=mock.Mock(side_effect=agents.RetryCommandLater()),
     )
     worker = agents.WorkspaceIntegrationBridgeWorker()
@@ -1771,8 +1991,50 @@ def test_bridge_worker_requeues_retryable_commands():
     assert agents.workers.get_sync_response_command(response) is command
 
 
+def test_bridge_worker_resets_stale_zulip_queue_subscription_version():
+    external_account = types.SimpleNamespace(
+        server_url="https://zulip.example.com",
+    )
+    queue_state = FakeZulipQueueState(
+        queue_id="old-queue",
+        last_event_id=42,
+        last_message_id=103,
+        is_synced=True,
+        subscription_version=1,
+    )
+
+    result = (
+        agents.WorkspaceIntegrationBridgeWorker()
+        ._ensure_zulip_queue_subscription_version(
+            external_account=external_account,
+            queue_state=queue_state,
+        )
+    )
+
+    assert result is queue_state
+    assert queue_state.queue_id is None
+    assert queue_state.last_event_id == -1
+    assert queue_state.last_message_id == 103
+    assert queue_state.is_synced is False
+    assert queue_state.subscription_version == (
+        agents.zulip_client.MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION
+    )
+    queue_state.update_dm.assert_called_once_with(
+        values={
+            "queue_id": None,
+            "last_event_id": -1,
+            "last_message_id": 103,
+            "is_synced": False,
+            "subscription_version": (
+                agents.zulip_client.MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION
+            ),
+        },
+    )
+    queue_state.update.assert_called_once_with()
+
+
 def test_bridge_worker_requests_queue_recreate_without_queue_id():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1812,7 +2074,7 @@ def test_bridge_worker_requests_queue_recreate_without_queue_id():
 
 
 def test_bridge_worker_recreates_queue_after_failed_queue_event():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1862,7 +2124,7 @@ def test_bridge_worker_recreates_queue_after_failed_queue_event():
 
 
 def test_bridge_worker_marks_queue_synced_on_catch_up_barrier():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1887,7 +2149,7 @@ def test_bridge_worker_marks_queue_synced_on_catch_up_barrier():
 
 
 def test_bridge_worker_updates_message_anchor_without_clearing_queue_id():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1916,7 +2178,7 @@ def test_bridge_worker_updates_message_anchor_without_clearing_queue_id():
 
 
 def test_bridge_worker_requests_stream_sync_and_retries_command():
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1926,7 +2188,7 @@ def test_bridge_worker_requests_stream_sync_and_retries_command():
         "https://zulip.example.com",
         "bridge-user",
     )
-    command = SimpleNamespace(
+    command = types.SimpleNamespace(
         external_account=external_account,
         event_owner=event_owner,
         execute=mock.Mock(
@@ -1962,7 +2224,7 @@ def test_bridge_worker_defers_non_stream_commands_during_stream_sync():
         "https://zulip.example.com",
         "bridge-user",
     )
-    command = SimpleNamespace(execute=mock.Mock(return_value="processed"))
+    command = types.SimpleNamespace(execute=mock.Mock(return_value="processed"))
     worker = agents.WorkspaceIntegrationBridgeWorker()
     worker._stream_sync_event_owners.add(event_owner)
     worker._put_sync_command(command)
@@ -1981,7 +2243,7 @@ def test_bridge_worker_processes_stream_commands_during_stream_sync():
         "https://zulip.example.com",
         "bridge-user",
     )
-    external_account = SimpleNamespace(
+    external_account = types.SimpleNamespace(
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="bridge-user",
@@ -2000,7 +2262,7 @@ def test_bridge_worker_processes_stream_commands_during_stream_sync():
         },
     )
     stream_command.execute = mock.Mock(return_value="stream")
-    message_command = SimpleNamespace(
+    message_command = types.SimpleNamespace(
         execute=mock.Mock(return_value="message"),
     )
     worker = agents.WorkspaceIntegrationBridgeWorker()
@@ -2025,7 +2287,7 @@ def test_bridge_worker_releases_stream_sync_barrier_on_finished_response():
         "https://zulip.example.com",
         "bridge-user",
     )
-    command = SimpleNamespace(execute=mock.Mock(return_value="processed"))
+    command = types.SimpleNamespace(execute=mock.Mock(return_value="processed"))
     worker = agents.WorkspaceIntegrationBridgeWorker()
     worker._stream_sync_event_owners.add(event_owner)
     worker._put_sync_command(command)
@@ -2042,7 +2304,7 @@ def test_bridge_worker_releases_stream_sync_barrier_on_finished_response():
 
 def test_bridge_worker_processes_sync_queue_in_batches():
     commands = [
-        SimpleNamespace(execute=mock.Mock(return_value="processed"))
+        types.SimpleNamespace(execute=mock.Mock(return_value="processed"))
         for _ in range(3)
     ]
     worker = agents.WorkspaceIntegrationBridgeWorker(

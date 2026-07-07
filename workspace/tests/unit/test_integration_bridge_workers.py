@@ -17,9 +17,11 @@
 import datetime
 import queue
 import threading
+import types
+import unittest.mock as mock
 import uuid as sys_uuid
-from types import SimpleNamespace
-from unittest import mock
+
+import pytest
 
 from workspace.services.integration_bridge import workers
 
@@ -149,16 +151,16 @@ class FakeZulipClient:
 
 
 def _external_account():
-    return SimpleNamespace(
+    return types.SimpleNamespace(
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="bridge-user",
-        account_settings=SimpleNamespace(
-            credentials=SimpleNamespace(
+        account_settings=types.SimpleNamespace(
+            credentials=types.SimpleNamespace(
                 login="user@example.com",
                 token="zulip-token",
             ),
-            user_info=SimpleNamespace(user_id=10),
+            user_info=types.SimpleNamespace(user_id=10),
         ),
     )
 
@@ -238,6 +240,30 @@ def test_zulip_bridge_worker_registers_message_event_queue():
     assert command.queue_id == "queue-1"
     assert command.last_event_id == 42
     assert command.is_synced is False
+
+
+def test_zulip_bridge_worker_reports_message_event_queue_register_error():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.register_calls = []
+    FakeZulipClient.registered_queue = {
+        "result": "error",
+        "msg": "Unknown event type delete_message",
+    }
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        worker.register_message_event_queue()
+
+    assert "Zulip message event queue registration failed" in str(
+        exc_info.value,
+    )
+    assert "Unknown event type delete_message" in str(exc_info.value)
+    assert output_queue.empty()
 
 
 def test_zulip_bridge_worker_fetches_events():
@@ -665,6 +691,167 @@ def test_zulip_bridge_worker_syncs_message_event():
     assert command.event_id == 43
 
 
+def test_zulip_bridge_worker_syncs_message_update_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 44,
+                    "type": "update_message",
+                    "user_id": 8,
+                    "message_id": 104,
+                    "message_ids": [104],
+                    "content": "edited",
+                    "edit_timestamp": 1770998100,
+                    "rendering_only": False,
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=43,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 44
+    assert last_message_id == 104
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.UpdateMessage)
+    assert command.event_id == 44
+    assert command.last_message_id == 104
+    assert command.event["content"] == "edited"
+
+
+def test_zulip_bridge_worker_syncs_message_delete_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 45,
+                    "type": "delete_message",
+                    "message_type": "stream",
+                    "stream_id": 3,
+                    "topic": "deploys",
+                    "message_ids": [104, 105],
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=44,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 45
+    assert last_message_id == 105
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.DeleteMessage)
+    assert command.event_id == 45
+    assert command.last_message_id == 105
+    assert command.message_ids == [104, 105]
+
+
+def test_zulip_bridge_worker_syncs_single_message_delete_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 45,
+                    "type": "delete_message",
+                    "message_type": "stream",
+                    "stream_id": 3,
+                    "topic": "deploys",
+                    "message_id": 104,
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=44,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 45
+    assert last_message_id == 104
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.DeleteMessage)
+    assert command.event_id == 45
+    assert command.last_message_id == 104
+    assert command.message_ids == [104]
+
+
+def test_zulip_bridge_worker_skips_rendering_only_message_update_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 44,
+                    "type": "update_message",
+                    "user_id": None,
+                    "message_id": 104,
+                    "message_ids": [104],
+                    "rendering_only": True,
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=43,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 44
+    assert last_message_id == 104
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.UpdateZulipQueueState)
+    assert command.last_event_id == 44
+    assert command.last_message_id == 104
+
+
 def test_zulip_bridge_worker_reports_dead_message_queue():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.calls = []
@@ -856,7 +1043,7 @@ def test_send_zulip_message_command_sends_and_reports_message_id():
 def test_send_zulip_message_command_uploads_workspace_file_links():
     output_queue = queue.PriorityQueue()
     file_uuid = sys_uuid.UUID("41f23f93-b87c-47a4-9a12-1fcbd2719e78")
-    file = SimpleNamespace(
+    file = types.SimpleNamespace(
         uuid=file_uuid,
         name="photo.png",
         storage_type="file",
@@ -1009,7 +1196,7 @@ def test_update_zulip_message_command_updates_and_reports_success():
 def test_update_zulip_message_command_uploads_workspace_file_links():
     output_queue = queue.PriorityQueue()
     file_uuid = sys_uuid.UUID("9a0a7297-d98f-4d13-a946-85f172630a9d")
-    file = SimpleNamespace(
+    file = types.SimpleNamespace(
         uuid=file_uuid,
         name="report.pdf",
         storage_type="file",
@@ -1496,6 +1683,96 @@ def test_add_private_message_executes_with_cache():
                     tz=datetime.timezone.utc,
                 ),
             },
+        },
+    ]
+
+
+def test_update_message_executes_with_cache():
+    external_account = _external_account()
+    message = object()
+
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def update_message(self, external_account, message_info):
+            self.calls.append({
+                "external_account": external_account,
+                "message_info": message_info,
+            })
+            return message
+
+    cache = FakeCache()
+    command = workers.UpdateMessage(
+        external_account=external_account,
+        event={
+            "id": 45,
+            "type": "update_message",
+            "user_id": 8,
+            "message_id": 101,
+            "message_ids": [101],
+            "content": "edited",
+            "edit_timestamp": 1772202600,
+            "rendering_only": False,
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is message
+    assert command.event_id == 45
+    assert command.last_message_id == 101
+    assert cache.calls == [
+        {
+            "external_account": external_account,
+            "message_info": {
+                "message_id": 101,
+                "sender_id": 8,
+                "content": "edited",
+                "updated_at": datetime.datetime.fromtimestamp(
+                    1772202600,
+                    tz=datetime.timezone.utc,
+                ),
+            },
+        },
+    ]
+
+
+def test_delete_message_executes_with_cache():
+    external_account = _external_account()
+    messages = [object()]
+
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def delete_messages(self, external_account, message_ids):
+            self.calls.append({
+                "external_account": external_account,
+                "message_ids": message_ids,
+            })
+            return messages
+
+    cache = FakeCache()
+    command = workers.DeleteMessage(
+        external_account=external_account,
+        event={
+            "id": 46,
+            "type": "delete_message",
+            "message_type": "stream",
+            "message_ids": [101, 102],
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is messages
+    assert command.event_id == 46
+    assert command.last_message_id == 102
+    assert cache.calls == [
+        {
+            "external_account": external_account,
+            "message_ids": [101, 102],
         },
     ]
 

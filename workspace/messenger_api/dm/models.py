@@ -127,6 +127,10 @@ class ZulipEventQueueState(
         types.Boolean(),
         default=False,
     )
+    subscription_version = properties.property(
+        types.Integer(min_value=1),
+        default=1,
+    )
 
 
 class ZulipOutboundRetryAtType(types.UTCDateTimeZ):

@@ -15,8 +15,8 @@
 #    under the License.
 
 import io
+import typing
 import urllib.parse
-from typing import Any, Dict, Optional
 
 from bazooka import common
 from bazooka import client as bz_client
@@ -26,6 +26,13 @@ try:
     import zulip
 except ImportError:
     zulip = None
+
+MESSAGE_EVENT_TYPES = [
+    "message",
+    "update_message",
+    "delete_message",
+]
+MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 2
 
 
 class ZulipClient(common.RESTClientMixIn):
@@ -60,7 +67,10 @@ class ZulipClient(common.RESTClientMixIn):
             site=self._endpoint,
         )
 
-    def get_current_user(self, headers: Dict[str, str]) -> Dict[str, Any]:
+    def get_current_user(
+        self,
+        headers: typing.Dict[str, str],
+    ) -> typing.Dict[str, typing.Any]:
         """Fetch raw information about the current user.
 
         This method directly returns the JSON decoded response from Zulip.
@@ -79,7 +89,7 @@ class ZulipClient(common.RESTClientMixIn):
         self,
         login: str,
         token: str,
-    ) -> Dict[str, Any]:
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
         return client.get_profile()
 
@@ -96,7 +106,7 @@ class ZulipClient(common.RESTClientMixIn):
         self,
         login: str,
         token: str,
-        message_filters: Dict[str, Any],
+        message_filters: typing.Dict[str, typing.Any],
     ):
         client = self._get_sdk_client(login=login, token=token)
         data = client.get_messages(message_filters)
@@ -187,15 +197,38 @@ class ZulipClient(common.RESTClientMixIn):
             "content_type": response.headers.get("Content-Type"),
         }
 
+    def _register_message_event_queue(self, client, event_types):
+        return client.register(
+            event_types=event_types,
+            apply_markdown=False,
+            client_capabilities={
+                "notification_settings_null": True,
+                "bulk_message_deletion": True,
+            },
+        )
+
+    def _is_registered_event_queue(self, data):
+        return (
+            data.get("result") == "success" and
+            "queue_id" in data and
+            "last_event_id" in data
+        )
+
     def register_message_event_queue_with_api_key(
         self,
         login: str,
         token: str,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.register(
-            event_types=["message"],
-            apply_markdown=False,
+        data = self._register_message_event_queue(
+            client=client,
+            event_types=MESSAGE_EVENT_TYPES,
+        )
+        if self._is_registered_event_queue(data):
+            return data
+        return self._register_message_event_queue(
+            client=client,
+            event_types=None,
         )
 
     def get_events_with_api_key(
@@ -237,7 +270,10 @@ class ZulipClient(common.RESTClientMixIn):
         )
         return data["subscribers"]
 
-    def get_current_user_id(self, headers: Dict[str, str]) -> Optional[int]:
+    def get_current_user_id(
+        self,
+        headers: typing.Dict[str, str],
+    ) -> typing.Optional[int]:
         """Extract current user's numeric ID from Zulip response.
 
         Expected response format (simplified)::

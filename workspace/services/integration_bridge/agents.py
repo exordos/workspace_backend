@@ -22,13 +22,13 @@ import logging
 import mimetypes
 import queue
 import re
+import types
 import urllib.parse
 import uuid as sys_uuid
 
 import filetype
+from PIL import Image as pil_image
 from gcl_looper.services import basic
-from PIL import Image
-from PIL import UnidentifiedImageError
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
@@ -756,14 +756,14 @@ class WorkspaceIntegrationBridgeCache:
 
     def _get_image_file_metadata(self, data):
         try:
-            with Image.open(io.BytesIO(data)) as image:
+            with pil_image.open(io.BytesIO(data)) as image:
                 width, height = image.size
                 return {
-                    "content_type": Image.MIME.get(image.format),
+                    "content_type": pil_image.MIME.get(image.format),
                     "width": width,
                     "height": height,
                 }
-        except (UnidentifiedImageError, OSError):
+        except (pil_image.UnidentifiedImageError, OSError):
             return {}
 
     def _parse_content_type(self, content_type):
@@ -948,6 +948,139 @@ class WorkspaceIntegrationBridgeCache:
         )
         return message
 
+    def _get_zulip_workspace_message(self, external_account, message_id):
+        message_uuid = self._get_processed_workspace_uuid(
+            external_account=external_account,
+            entity_type="message",
+            entity_id=message_id,
+        )
+        if message_uuid is None:
+            return None
+        return models.WorkspaceMessage.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "uuid": dm_filters.EQ(message_uuid),
+            },
+        )
+
+    def _get_last_workspace_event_epoch(self, project_id):
+        events = models.WorkspaceEvent.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+            },
+            order_by={"epoch_version": "desc"},
+            limit=1,
+        )
+        if not events:
+            return 0
+        return events[0].epoch_version
+
+    def _mark_inbound_zulip_events_skipped(
+        self,
+        external_account,
+        action,
+        message_uuid,
+        after_epoch,
+    ):
+        events = models.WorkspaceEvent.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "object_type": dm_filters.EQ("message"),
+                "action": dm_filters.EQ(action),
+                "epoch_version": dm_filters.GT(after_epoch),
+            },
+            order_by={"epoch_version": "asc"},
+        )
+        for event in events:
+            if event.payload["uuid"] != str(message_uuid):
+                continue
+            state = models.ZulipOutboundEventState.objects.get_one_or_none(
+                filters={
+                    "epoch_version": dm_filters.EQ(event.epoch_version),
+                },
+            )
+            if state is not None:
+                continue
+            state = models.ZulipOutboundEventState(
+                uuid=sys_uuid.uuid4(),
+                project_id=external_account.project_id,
+                epoch_version=event.epoch_version,
+                external_account_uuid=external_account.uuid,
+                status=OUTBOUND_SKIPPED_STATUS,
+            )
+            state.insert()
+
+    def update_message(self, external_account, message_info):
+        message = self._get_zulip_workspace_message(
+            external_account=external_account,
+            message_id=message_info["message_id"],
+        )
+        if message is None:
+            return None
+        message_info = self.preprocess_zulip_message(
+            external_account=external_account,
+            stream=types.SimpleNamespace(uuid=message.stream_uuid),
+            message_info=message_info,
+        )
+        before_epoch = self._get_last_workspace_event_epoch(
+            external_account.project_id,
+        )
+        result = messenger_dm_helpers.update_workspace_user_message(
+            project_id=external_account.project_id,
+            user_uuid=message.user_uuid,
+            message_uuid=message.uuid,
+            values={
+                "payload": message_payloads.MarkdownPayload(
+                    content=message_info["content"],
+                ),
+            },
+        )
+        cache_key = (
+            external_account.project_id,
+            external_account.server_url,
+            message_info["message_id"],
+        )
+        self._messages[cache_key] = result
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            action="updated",
+            message_uuid=message.uuid,
+            after_epoch=before_epoch,
+        )
+        return result
+
+    def delete_messages(self, external_account, message_ids):
+        results = []
+        for message_id in message_ids:
+            message = self._get_zulip_workspace_message(
+                external_account=external_account,
+                message_id=message_id,
+            )
+            if message is None:
+                continue
+            before_epoch = self._get_last_workspace_event_epoch(
+                external_account.project_id,
+            )
+            messenger_dm_helpers.delete_workspace_user_message(
+                project_id=external_account.project_id,
+                user_uuid=message.user_uuid,
+                message_uuid=message.uuid,
+            )
+            cache_key = (
+                external_account.project_id,
+                external_account.server_url,
+                message_id,
+            )
+            self._messages.pop(cache_key, None)
+            self._mark_inbound_zulip_events_skipped(
+                external_account=external_account,
+                action="deleted",
+                message_uuid=message.uuid,
+                after_epoch=before_epoch,
+            )
+            results.append(message)
+        return results
+
     def _sync_message_read_flag(
         self,
         external_account,
@@ -1115,6 +1248,41 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
     def _clear_zulip_queue_recreate(self, worker_key):
         self._queue_recreate_worker_keys.discard(worker_key)
 
+    def _ensure_zulip_queue_subscription_version(
+        self,
+        external_account,
+        queue_state,
+    ):
+        subscription_version = (
+            zulip_client.MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION
+        )
+        if queue_state.subscription_version == subscription_version:
+            return queue_state
+        LOG.info(
+            (
+                "Reset Zulip queue for %s because subscription version "
+                "changed from %s to %s"
+            ),
+            external_account.server_url,
+            queue_state.subscription_version,
+            subscription_version,
+        )
+        queue_state.queue_id = None
+        queue_state.last_event_id = -1
+        queue_state.is_synced = False
+        queue_state.subscription_version = subscription_version
+        queue_state.update_dm(
+            values={
+                "queue_id": queue_state.queue_id,
+                "last_event_id": queue_state.last_event_id,
+                "last_message_id": queue_state.last_message_id,
+                "is_synced": queue_state.is_synced,
+                "subscription_version": queue_state.subscription_version,
+            },
+        )
+        queue_state.update()
+        return queue_state
+
     def _get_or_create_zulip_queue_state(self, external_account):
         queue_state = models.ZulipEventQueueState.objects.get_one_or_none(
             filters={
@@ -1124,7 +1292,10 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             },
         )
         if queue_state is not None:
-            return queue_state
+            return self._ensure_zulip_queue_subscription_version(
+                external_account=external_account,
+                queue_state=queue_state,
+            )
 
         queue_state = models.ZulipEventQueueState(
             uuid=sys_uuid.uuid4(),
@@ -1132,6 +1303,9 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             external_account_uuid=external_account.uuid,
             server_url=external_account.server_url,
             user_uuid=external_account.user_uuid,
+            subscription_version=(
+                zulip_client.MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION
+            ),
         )
         queue_state.insert()
         return queue_state
@@ -1732,7 +1906,14 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             self._handle_zulip_message_failed(command)
             return None
         result = command.execute(cache=self._cache)
-        if isinstance(command, workers.AddMessage):
+        if isinstance(
+            command,
+            (
+                workers.AddMessage,
+                workers.UpdateMessage,
+                workers.DeleteMessage,
+            ),
+        ):
             self._update_zulip_queue_state_for_message(command)
         if isinstance(command, workers.SyncStreamsFinished):
             self._clear_zulip_stream_sync(command.event_owner)
@@ -1762,7 +1943,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         self._update_external_account_zulip_queue_state(
             external_account=command.external_account,
             last_event_id=command.event_id,
-            last_message_id=command.message["id"],
+            last_message_id=command.last_message_id,
         )
 
     def _update_zulip_queue_state(self, command):
@@ -1793,6 +1974,9 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             external_account,
         )
         changed = False
+        subscription_version = (
+            zulip_client.MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION
+        )
         queue_id_changed = (
             queue_id is not NO_VALUE and
             queue_id != queue_state.queue_id
@@ -1814,6 +1998,9 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         if is_synced is not None and is_synced != queue_state.is_synced:
             queue_state.is_synced = is_synced
             changed = True
+        if queue_state.subscription_version != subscription_version:
+            queue_state.subscription_version = subscription_version
+            changed = True
         if not changed:
             return
         queue_state.update_dm(
@@ -1822,6 +2009,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 "last_event_id": queue_state.last_event_id,
                 "last_message_id": queue_state.last_message_id,
                 "is_synced": queue_state.is_synced,
+                "subscription_version": queue_state.subscription_version,
             },
         )
         queue_state.update()

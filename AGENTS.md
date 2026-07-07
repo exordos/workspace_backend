@@ -5,6 +5,7 @@
 - The project virtual environment is in `.tox/develop`.
 - Repository content must be written in English unless explicitly requested otherwise.
 - Before making changes, inspect the project style and follow it.
+- Import modules only; do not import classes, functions, or constants directly.
 - For required dict values, use `value = data[key]`, not `data.get(key)`.
 - Write minimal code without extra defensive checks for every possible case.
 - Let domain models perform data validation; do not duplicate model validation in controllers or helpers.
