@@ -98,6 +98,58 @@ class ZulipClient(common.RESTClientMixIn):
         data = client.get_messages(message_filters)
         return data["messages"]
 
+    def send_message_with_api_key(
+        self,
+        login: str,
+        token: str,
+        stream_name: str,
+        topic_name: str,
+        content: str,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.send_message({
+            "type": "stream",
+            "to": stream_name,
+            "topic": topic_name,
+            "content": content,
+        })
+
+    def send_private_message_with_api_key(
+        self,
+        login: str,
+        token: str,
+        recipient_ids: list[int],
+        content: str,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.send_message({
+            "type": "direct",
+            "to": recipient_ids,
+            "content": content,
+        })
+
+    def update_message_with_api_key(
+        self,
+        login: str,
+        token: str,
+        message_id: int,
+        content: str,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.update_message({
+            "message_id": message_id,
+            "content": content,
+        })
+
+    def delete_message_with_api_key(
+        self,
+        login: str,
+        token: str,
+        message_id: int,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.delete_message(message_id)
+
     def register_message_event_queue_with_api_key(
         self,
         login: str,

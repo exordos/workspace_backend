@@ -32,7 +32,58 @@ LOG = logging.getLogger(__name__)
 SYNC_QUEUE_TIMEOUT = 0.1
 RETRY_COMMAND_DELAY = datetime.timedelta(seconds=30)
 DEFAULT_SYNC_QUEUE_BATCH_LIMIT = 100
+DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT = 100
 NO_VALUE = object()
+OUTBOUND_EVENT_ACTIONS = ("created", "updated", "deleted")
+OUTBOUND_PENDING_STATUS = "pending"
+OUTBOUND_PROCESSING_STATUS = "processing"
+OUTBOUND_SENT_STATUS = "sent"
+OUTBOUND_SKIPPED_STATUS = "skipped"
+OUTBOUND_FAILED_STATUS = "failed"
+OUTBOUND_EVENT_COLUMNS = (
+    "epoch_version",
+    "uuid",
+    "project_id",
+    "user_uuid",
+    "payload",
+    "created_at",
+    "updated_at",
+    "schema_version",
+    "object_type",
+    "action",
+)
+OUTBOUND_EVENTS_QUERY = """
+SELECT
+    e.epoch_version,
+    e.uuid,
+    e.project_id,
+    e.user_uuid,
+    e.payload,
+    e.created_at,
+    e.updated_at,
+    e.schema_version,
+    e.object_type,
+    e.action
+FROM m_workspace_events AS e
+WHERE e.object_type = 'message'
+  AND e.action IN ('created', 'updated', 'deleted')
+  AND e.epoch_version > %s
+  AND e.payload->>'source_name' = 'zulip'
+  AND e.payload ? 'author_uuid'
+  AND e.payload ? 'source'
+  AND e.user_uuid::text = e.payload->>'author_uuid'
+  AND (
+      e.action <> 'created'
+      OR e.payload #>> '{source,message_id}' IS NULL
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM m_zulip_outbound_event_states AS s
+      WHERE s.epoch_version = e.epoch_version
+  )
+ORDER BY e.epoch_version ASC
+LIMIT %s
+"""
 
 
 class RetryCommandLater(Exception):
@@ -189,6 +240,21 @@ class WorkspaceIntegrationBridgeCache:
     def _is_private_stream_info(stream_info):
         return stream_info["type"] == "private"
 
+    def _get_private_subscriber_ids(self, stream_info):
+        return set(stream_info["subscriber_ids"])
+
+    def _is_private_direct_stream_info(self, stream_info):
+        return (
+            self._is_private_stream_info(stream_info) and
+            len(self._get_private_subscriber_ids(stream_info)) == 2
+        )
+
+    def _is_private_group_stream_info(self, stream_info):
+        return (
+            self._is_private_stream_info(stream_info) and
+            len(self._get_private_subscriber_ids(stream_info)) > 2
+        )
+
     def _get_stream_entity_type(self, stream_info):
         if self._is_private_stream_info(stream_info):
             return "private_stream"
@@ -200,12 +266,19 @@ class WorkspaceIntegrationBridgeCache:
             "server_url",
             external_account.server_url,
         )
-        return (
+        matches = (
             stream.source.stream_id == stream_info["stream_id"] and
             server_url == external_account.server_url and
             getattr(stream, "private", False) ==
             self._is_private_stream_info(stream_info)
         )
+        if not matches:
+            return False
+        if self._is_private_direct_stream_info(stream_info):
+            return getattr(stream, "direct_user_uuid", None) is not None
+        if self._is_private_group_stream_info(stream_info):
+            return getattr(stream, "direct_user_uuid", None) is None
+        return matches
 
     def _load_or_create_stream(self, external_account, stream_info):
         for stream in models.WorkspaceStream.objects.get_all(
@@ -387,12 +460,27 @@ class WorkspaceIntegrationBridgeCache:
             "default_topic_name": default_topic_name,
         }
         if self._is_private_stream_info(stream_info):
-            direct_user_uuid = self._get_private_direct_user_uuid(
-                external_account=external_account,
-                stream_info=stream_info,
-                user_uuid=user_uuid,
-            )
-            values["direct_user_uuid"] = direct_user_uuid
+            if self._is_private_group_stream_info(stream_info):
+                return messenger_dm_helpers.create_workspace_private_group_stream(
+                    **values
+                )
+            if self._is_private_direct_stream_info(stream_info):
+                direct_user_uuid = self._get_private_direct_user_uuid(
+                    external_account=external_account,
+                    stream_info=stream_info,
+                    user_uuid=user_uuid,
+                )
+                values["direct_user_uuid"] = direct_user_uuid
+            else:
+                raise RetryCommandLater(
+                    (
+                        "Postpone Zulip private stream %s because no direct "
+                        "user was resolved from subscriber ids %s"
+                    ) % (
+                        stream_info["stream_id"],
+                        stream_info["subscriber_ids"],
+                    ),
+                )
         return messenger_dm_helpers.get_or_create_workspace_user_stream(
             **values
         )
@@ -572,15 +660,25 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         super().__init__(**kwargs)
         self._sync_queue_batch_limit = sync_queue_batch_limit
         self._workers = {}
+        self._history_workers = {}
         self._worker_input_queues = {}
+        self._worker_history_input_queues = {}
         self._worker_accounts = {}
-        self._sync_queue = queue.PriorityQueue()
+        self._sync_queue = queue.PriorityQueue(
+            maxsize=workers.MAX_SYNC_QUEUE_SIZE,
+        )
         self._postponed_commands = []
         self._last_sync_queue_stats = None
         self._message_sync_worker_key = None
         self._queue_recreate_worker_keys = set()
         self._stream_sync_event_owners = set()
         self._cache = WorkspaceIntegrationBridgeCache()
+        self._last_outbound_event_epoch = 0
+        self._stopping = False
+
+    def stop(self):
+        LOG.info("Stop workspace integration bridge worker")
+        self._stopping = True
 
     def _get_unsynced_user_providers(self, account_type):
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -618,10 +716,19 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             if hasattr(worker, "is_alive") and not worker.is_alive():
                 del self._workers[worker_key]
                 self._worker_input_queues.pop(worker_key, None)
-                self._worker_accounts.pop(worker_key, None)
+        for worker_key, worker in list(self._history_workers.items()):
+            if hasattr(worker, "is_alive") and not worker.is_alive():
+                del self._history_workers[worker_key]
+                self._worker_history_input_queues.pop(worker_key, None)
                 if self._message_sync_worker_key == worker_key:
                     self._message_sync_worker_key = None
                 self._queue_recreate_worker_keys.discard(worker_key)
+        for worker_key in list(self._worker_accounts):
+            if (
+                worker_key not in self._workers and
+                worker_key not in self._history_workers
+            ):
+                self._worker_accounts.pop(worker_key, None)
 
     def _start_bridges(self):
         self._clear_finished_workers()
@@ -639,23 +746,39 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             worker_key = self._get_zulip_worker_key(user)
             if first_worker_key is None:
                 first_worker_key = worker_key
-            if worker_key in self._workers:
-                continue
-
-            LOG.info(
-                "Start Zulip bridge worker for %s",
-                user.server_url,
-            )
-            input_queue = queue.Queue()
-            worker = workers.ZulipBridgeWorker(
-                external_account=user,
-                input_queue=input_queue,
-                output_queue=self._sync_queue,
-            )
-            worker.start()
-            self._workers[worker_key] = worker
-            self._worker_input_queues[worker_key] = input_queue
             self._worker_accounts[worker_key] = user
+            if worker_key not in self._workers:
+                LOG.info(
+                    "Start Zulip bridge worker for %s",
+                    user.server_url,
+                )
+                input_queue = queue.Queue(maxsize=workers.MAX_SYNC_QUEUE_SIZE)
+                worker = workers.ZulipBridgeWorker(
+                    external_account=user,
+                    input_queue=input_queue,
+                    output_queue=self._sync_queue,
+                )
+                worker.start()
+                self._workers[worker_key] = worker
+                self._worker_input_queues[worker_key] = input_queue
+            if worker_key not in self._history_workers:
+                LOG.info(
+                    "Start Zulip history bridge worker for %s",
+                    user.server_url,
+                )
+                history_input_queue = queue.Queue(
+                    maxsize=workers.MAX_SYNC_QUEUE_SIZE,
+                )
+                history_worker = workers.ZulipBridgeWorker(
+                    external_account=user,
+                    input_queue=history_input_queue,
+                    output_queue=self._sync_queue,
+                )
+                history_worker.start()
+                self._history_workers[worker_key] = history_worker
+                self._worker_history_input_queues[worker_key] = (
+                    history_input_queue
+                )
 
         if first_worker_key is not None:
             self._request_zulip_message_sync(first_worker_key)
@@ -665,6 +788,12 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             external_account.project_id,
             external_account.server_url,
             external_account.user_uuid,
+        )
+
+    def _get_history_input_queue(self, worker_key):
+        return (
+            self._worker_history_input_queues.get(worker_key) or
+            self._worker_input_queues.get(worker_key)
         )
 
     def _clear_zulip_message_sync(self, worker_key):
@@ -716,7 +845,11 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             queue_state.last_message_id,
         )
         self._message_sync_worker_key = worker_key
-        self._worker_input_queues[worker_key].put(
+        input_queue = self._get_history_input_queue(worker_key)
+        if input_queue is None:
+            self._clear_zulip_message_sync(worker_key)
+            return
+        input_queue.put(
             workers.SyncMessages(
                 queue_id=queue_state.queue_id,
                 last_event_id=queue_state.last_event_id,
@@ -747,7 +880,11 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             external_account.server_url,
             queue_state.last_message_id,
         )
-        self._worker_input_queues[worker_key].put(
+        input_queue = self._get_history_input_queue(worker_key)
+        if input_queue is None:
+            self._clear_zulip_queue_recreate(worker_key)
+            return
+        input_queue.put(
             workers.CreateZulipQueueAndFetchMessages(
                 last_message_id=queue_state.last_message_id,
             ),
@@ -776,7 +913,11 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             "Request Zulip stream sync for %s",
             external_account.server_url,
         )
-        self._worker_input_queues[worker_key].put(
+        input_queue = self._get_history_input_queue(worker_key)
+        if input_queue is None:
+            self._clear_zulip_stream_sync(event_owner)
+            return
+        input_queue.put(
             workers.SyncStreams(
                 event_owner=event_owner,
             ),
@@ -789,6 +930,370 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
 
     def _put_sync_command(self, command):
         workers.put_sync_response(self._sync_queue, command)
+
+    def _get_outbound_event_state(self, epoch_version):
+        return models.ZulipOutboundEventState.objects.get_one_or_none(
+            filters={
+                "epoch_version": dm_filters.EQ(epoch_version),
+            },
+        )
+
+    def _create_outbound_event_state(self, event, external_account):
+        state = models.ZulipOutboundEventState(
+            uuid=sys_uuid.uuid4(),
+            project_id=event.project_id,
+            epoch_version=event.epoch_version,
+            external_account_uuid=external_account.uuid,
+        )
+        state.insert()
+        return state
+
+    def _update_outbound_event_state(self, state, **values):
+        state.update_dm(values=values)
+        state.update()
+
+    def _set_outbound_retry(self, state, error):
+        self._update_outbound_event_state(
+            state,
+            status=OUTBOUND_PENDING_STATUS,
+            attempts=state.attempts + 1,
+            next_retry_at=(
+                datetime.datetime.now(datetime.timezone.utc) +
+                RETRY_COMMAND_DELAY
+            ),
+            last_error=error,
+        )
+
+    def _set_outbound_processing(self, state):
+        self._update_outbound_event_state(
+            state,
+            status=OUTBOUND_PROCESSING_STATUS,
+            attempts=state.attempts + 1,
+            next_retry_at=(
+                datetime.datetime.now(datetime.timezone.utc) +
+                RETRY_COMMAND_DELAY
+            ),
+            last_error=None,
+        )
+
+    def _set_outbound_done(self, state, status=OUTBOUND_SENT_STATUS):
+        self._update_outbound_event_state(
+            state,
+            status=status,
+            next_retry_at=None,
+            last_error=None,
+        )
+
+    def _set_outbound_failed(self, state, error):
+        self._update_outbound_event_state(
+            state,
+            status=OUTBOUND_FAILED_STATUS,
+            next_retry_at=None,
+            last_error=error,
+        )
+
+    @staticmethod
+    def _source_value(source, name):
+        if hasattr(source, name):
+            return getattr(source, name)
+        return source.get(name)
+
+    @staticmethod
+    def _uuid_value(value):
+        if isinstance(value, sys_uuid.UUID):
+            return value
+        return sys_uuid.UUID(str(value))
+
+    def _is_zulip_outbound_event(self, event):
+        payload = event.payload
+        if (
+            "source_name" not in payload or
+            "author_uuid" not in payload or
+            "source" not in payload
+        ):
+            return False
+        if payload["source_name"] != models.SourceName.ZULIP.value:
+            return False
+        if (
+            event.action == "created" and
+            self._source_value(payload["source"], "message_id") is not None
+        ):
+            return False
+        return str(event.user_uuid) == str(payload["author_uuid"])
+
+    def _get_zulip_outbound_external_account(self, event):
+        payload = event.payload
+        source = payload["source"]
+        return models.ExternalAccount.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(event.project_id),
+                "account_type": dm_filters.EQ(
+                    models.ExternalAccountType.ZULIP.value,
+                ),
+                "server_url": dm_filters.EQ(
+                    self._source_value(source, "server_url"),
+                ),
+                "user_uuid": dm_filters.EQ(payload["author_uuid"]),
+            },
+        )
+
+    def _get_ready_outbound_event_states(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        states = models.ZulipOutboundEventState.objects.get_all(
+            filters={
+                "status": dm_filters.EQ(OUTBOUND_PENDING_STATUS),
+            },
+            order_by={"epoch_version": "asc"},
+            limit=DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT,
+        )
+        return [
+            state for state in states
+            if state.next_retry_at is None or state.next_retry_at <= now
+        ]
+
+    def _fail_expired_outbound_processing_states(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        states = models.ZulipOutboundEventState.objects.get_all(
+            filters={
+                "status": dm_filters.EQ(OUTBOUND_PROCESSING_STATUS),
+            },
+            order_by={"epoch_version": "asc"},
+            limit=DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT,
+        )
+        for state in states:
+            if state.next_retry_at is None or state.next_retry_at <= now:
+                self._set_outbound_failed(
+                    state,
+                    "Zulip outbound command processing expired",
+                )
+
+    @staticmethod
+    def _restore_outbound_event(row):
+        return models.WorkspaceEvent.restore_from_storage(**{
+            column: row[column]
+            for column in OUTBOUND_EVENT_COLUMNS
+        })
+
+    def _get_new_outbound_events(self):
+        result = contexts.Context().get_session().execute(
+            OUTBOUND_EVENTS_QUERY,
+            (
+                self._last_outbound_event_epoch,
+                DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT,
+            ),
+        )
+        return [
+            self._restore_outbound_event(row)
+            for row in result.fetchall()
+        ]
+
+    def _discover_zulip_outbound_events(self):
+        events = self._get_new_outbound_events()
+        for event in events:
+            if event.epoch_version > self._last_outbound_event_epoch:
+                self._last_outbound_event_epoch = event.epoch_version
+            if not self._is_zulip_outbound_event(event):
+                continue
+            if self._get_outbound_event_state(event.epoch_version) is not None:
+                continue
+            external_account = self._get_zulip_outbound_external_account(event)
+            if external_account is None:
+                LOG.warning(
+                    "Skip Zulip outbound event %s because author account "
+                    "was not resolved",
+                    event.epoch_version,
+                )
+                continue
+            self._create_outbound_event_state(
+                event=event,
+                external_account=external_account,
+            )
+
+    def _get_workspace_message(self, event):
+        return models.WorkspaceMessage.objects.get_one_or_none(
+            filters={
+                "uuid": dm_filters.EQ(event.payload["uuid"]),
+                "project_id": dm_filters.EQ(event.project_id),
+            },
+        )
+
+    def _get_workspace_stream(self, event, stream_uuid):
+        return models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(stream_uuid),
+                "project_id": dm_filters.EQ(event.project_id),
+            },
+        )
+
+    def _get_workspace_topic(self, event, topic_uuid):
+        return models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(topic_uuid),
+                "project_id": dm_filters.EQ(event.project_id),
+            },
+        )
+
+    def _get_outbound_message_content(self, event):
+        return event.payload["payload"]["content"]
+
+    def _get_zulip_private_recipient_id(self, event, message, stream):
+        if stream.direct_user_uuid is None:
+            return None
+        server_url = self._source_value(message.source, "server_url")
+        external_account = models.ExternalAccount.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(event.project_id),
+                "account_type": dm_filters.EQ(
+                    models.ExternalAccountType.ZULIP.value,
+                ),
+                "server_url": dm_filters.EQ(server_url),
+                "user_uuid": dm_filters.EQ(stream.direct_user_uuid),
+            },
+        )
+        if external_account is None:
+            raise RetryCommandLater(
+                "Postpone Zulip private message because recipient account "
+                "was not resolved",
+            )
+        if external_account.account_settings.user_info is None:
+            raise RetryCommandLater(
+                "Postpone Zulip private message because recipient user_info "
+                "is missing",
+            )
+        return external_account.account_settings.user_info.user_id
+
+    def _build_send_zulip_message_command(self, event):
+        message = self._get_workspace_message(event)
+        if message is None:
+            return None
+        stream = self._get_workspace_stream(event, message.stream_uuid)
+        if stream.private:
+            recipient_id = self._get_zulip_private_recipient_id(
+                event=event,
+                message=message,
+                stream=stream,
+            )
+            if recipient_id is None:
+                return None
+            return workers.SendZulipPrivateMessage(
+                epoch_version=event.epoch_version,
+                message_uuid=event.payload["uuid"],
+                recipient_ids=[recipient_id],
+                content=self._get_outbound_message_content(event),
+            )
+        topic = self._get_workspace_topic(event, message.topic_uuid)
+        topic_name = self._source_value(message.source, "topic_name")
+        if topic_name is None:
+            topic_name = topic.name
+        return workers.SendZulipMessage(
+            epoch_version=event.epoch_version,
+            message_uuid=event.payload["uuid"],
+            stream_name=stream.name,
+            topic_name=topic_name,
+            content=self._get_outbound_message_content(event),
+        )
+
+    def _build_update_zulip_message_command(self, event):
+        message = self._get_workspace_message(event)
+        if message is None:
+            return None
+        message_id = self._source_value(message.source, "message_id")
+        if message_id is None:
+            raise RetryCommandLater(
+                "Postpone Zulip message update because message_id is missing",
+            )
+        return workers.UpdateZulipMessage(
+            epoch_version=event.epoch_version,
+            message_uuid=event.payload["uuid"],
+            message_id=message_id,
+            content=self._get_outbound_message_content(event),
+        )
+
+    def _build_delete_zulip_message_command(self, event):
+        source = event.payload["source"]
+        message_id = self._source_value(source, "message_id")
+        if message_id is None:
+            raise RetryCommandLater(
+                "Postpone Zulip message delete because message_id is missing",
+            )
+        return workers.DeleteZulipMessage(
+            epoch_version=event.epoch_version,
+            message_uuid=event.payload["uuid"],
+            message_id=message_id,
+        )
+
+    def _build_zulip_outbound_command(self, event):
+        if event.action == "created":
+            return self._build_send_zulip_message_command(event)
+        if event.action == "updated":
+            return self._build_update_zulip_message_command(event)
+        if event.action == "deleted":
+            return self._build_delete_zulip_message_command(event)
+        return None
+
+    def _get_zulip_outbound_event(self, state):
+        return models.WorkspaceEvent.objects.get_one(
+            filters={
+                "epoch_version": dm_filters.EQ(state.epoch_version),
+                "project_id": dm_filters.EQ(state.project_id),
+            },
+        )
+
+    def _get_zulip_outbound_account(self, state):
+        return models.ExternalAccount.objects.get_one_or_none(
+            filters={
+                "uuid": dm_filters.EQ(state.external_account_uuid),
+                "project_id": dm_filters.EQ(state.project_id),
+            },
+        )
+
+    def _dispatch_zulip_outbound_state(self, state):
+        event = self._get_zulip_outbound_event(state)
+        if not self._is_zulip_outbound_event(event):
+            self._set_outbound_done(state, status=OUTBOUND_SKIPPED_STATUS)
+            return
+        external_account = self._get_zulip_outbound_account(state)
+        if external_account is None:
+            self._set_outbound_retry(
+                state,
+                "Zulip external account was not resolved",
+            )
+            return
+        if external_account.account_settings.credentials is None:
+            self._set_outbound_retry(
+                state,
+                "Zulip external account credentials are missing",
+            )
+            return
+        worker_key = self._get_zulip_worker_key(external_account)
+        input_queue = self._worker_input_queues.get(worker_key)
+        if input_queue is None:
+            self._set_outbound_retry(
+                state,
+                "Zulip bridge worker is not running",
+            )
+            return
+        command = self._build_zulip_outbound_command(event)
+        if command is None:
+            self._set_outbound_done(state, status=OUTBOUND_SKIPPED_STATUS)
+            return
+        try:
+            self._set_outbound_processing(state)
+            input_queue.put_nowait(command)
+        except queue.Full:
+            self._set_outbound_retry(
+                state,
+                "Zulip bridge worker input queue is full",
+            )
+
+    def _dispatch_zulip_outbound_events(self):
+        self._discover_zulip_outbound_events()
+        self._fail_expired_outbound_processing_states()
+        for state in self._get_ready_outbound_event_states():
+            try:
+                self._dispatch_zulip_outbound_state(state)
+            except RetryCommandLater as exc:
+                self._set_outbound_retry(state, str(exc))
 
     def _has_pending_stream_sync(self):
         return bool(self._stream_sync_event_owners)
@@ -804,6 +1309,85 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             ),
         )
 
+    def _get_outbound_state_for_command(self, command):
+        return self._get_outbound_event_state(command.epoch_version)
+
+    def _update_sent_zulip_message_source(self, command):
+        message_uuid = self._uuid_value(command.message_uuid)
+        message = models.WorkspaceMessage.objects.get_one_or_none(
+            filters={
+                "uuid": dm_filters.EQ(message_uuid),
+                "project_id": dm_filters.EQ(command.external_account.project_id),
+            },
+        )
+        if message is None:
+            return
+        source = message.source
+        message.update_dm(
+            values={
+                "source": models.ZulipSource(
+                    stream_id=self._source_value(source, "stream_id"),
+                    server_url=(
+                        self._source_value(source, "server_url") or
+                        command.external_account.server_url
+                    ),
+                    topic_name=self._source_value(source, "topic_name"),
+                    message_id=command.zulip_message_id,
+                ),
+            },
+        )
+        message.update()
+
+    def _save_zulip_processed_message(self, command):
+        message_uuid = self._uuid_value(command.message_uuid)
+        existing = models.ZulipProcessedEntity.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(command.external_account.project_id),
+                "server_url": dm_filters.EQ(
+                    command.external_account.server_url,
+                ),
+                "entity_type": dm_filters.EQ("message"),
+                "entity_id": dm_filters.EQ(str(command.zulip_message_id)),
+            },
+        )
+        if existing is not None:
+            return
+        processed = models.ZulipProcessedEntity(
+            uuid=sys_uuid.uuid4(),
+            project_id=command.external_account.project_id,
+            server_url=command.external_account.server_url,
+            entity_type="message",
+            entity_id=str(command.zulip_message_id),
+            workspace_uuid=message_uuid,
+        )
+        processed.insert()
+
+    def _handle_zulip_message_sent(self, command):
+        self._update_sent_zulip_message_source(command)
+        self._save_zulip_processed_message(command)
+        state = self._get_outbound_state_for_command(command)
+        if state is not None:
+            self._set_outbound_done(state)
+
+    def _handle_zulip_outbound_done(self, command):
+        state = self._get_outbound_state_for_command(command)
+        if state is not None:
+            self._set_outbound_done(state)
+
+    def _handle_zulip_message_failed(self, command):
+        state = self._get_outbound_state_for_command(command)
+        if state is not None:
+            self._set_outbound_retry(state, command.error)
+
+    def _handle_zulip_outbound_result_error(self, command, exc):
+        LOG.exception(
+            "Failed to handle Zulip outbound result for epoch %s",
+            command.epoch_version,
+        )
+        state = self._get_outbound_state_for_command(command)
+        if state is not None:
+            self._set_outbound_failed(state, str(exc))
+
     def _execute_sync_command(self, command):
         if isinstance(command, workers.UpdateZulipQueueState):
             self._update_zulip_queue_state(command)
@@ -813,6 +1397,27 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             return None
         if isinstance(command, workers.FinishZulipMessageCatchUp):
             self._finish_zulip_message_catch_up(command)
+            return None
+        if isinstance(command, workers.ZulipMessageSent):
+            try:
+                self._handle_zulip_message_sent(command)
+            except Exception as exc:
+                self._handle_zulip_outbound_result_error(command, exc)
+            return None
+        if isinstance(
+            command,
+            (
+                workers.ZulipMessageUpdated,
+                workers.ZulipMessageDeleted,
+            ),
+        ):
+            try:
+                self._handle_zulip_outbound_done(command)
+            except Exception as exc:
+                self._handle_zulip_outbound_result_error(command, exc)
+            return None
+        if isinstance(command, workers.ZulipMessageFailed):
+            self._handle_zulip_message_failed(command)
             return None
         result = command.execute(cache=self._cache)
         if isinstance(command, workers.AddMessage):
@@ -1032,9 +1637,75 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 )
                 self._log_sync_queue_length(force=True)
 
+    def _request_worker_group_stop(self, workers_map, input_queues):
+        for worker_key, worker in list(workers_map.items()):
+            worker.stop()
+            input_queue = input_queues.get(worker_key)
+            if input_queue is None:
+                continue
+            try:
+                input_queue.put_nowait(workers.StopWorker())
+            except queue.Full:
+                LOG.warning(
+                    "Zulip worker input queue %s is full during shutdown",
+                    worker_key,
+                )
+
+    def _request_workers_stop(self):
+        self._request_worker_group_stop(
+            self._workers,
+            self._worker_input_queues,
+        )
+        self._request_worker_group_stop(
+            self._history_workers,
+            self._worker_history_input_queues,
+        )
+
+    def _join_stopped_workers(self):
+        for worker in list(self._workers.values()):
+            if hasattr(worker, "join"):
+                worker.join(timeout=0.5)
+        for worker in list(self._history_workers.values()):
+            if hasattr(worker, "join"):
+                worker.join(timeout=0.5)
+        self._clear_finished_workers()
+
+    def _drain_sync_queue_for_shutdown(self):
+        while True:
+            try:
+                response = self._sync_queue.get_nowait()
+            except queue.Empty:
+                return
+            command = workers.get_sync_response_command(response)
+            try:
+                self._execute_sync_command(command)
+            except RetryCommandLater as exc:
+                retry_at = (
+                    datetime.datetime.now(datetime.timezone.utc) +
+                    RETRY_COMMAND_DELAY
+                )
+                LOG.warning("%s", exc)
+                self._postponed_commands.append((retry_at, command))
+
+    def _shutdown_iteration(self):
+        self._request_workers_stop()
+        self._join_stopped_workers()
+        self._drain_sync_queue_for_shutdown()
+        if (
+            self._workers or
+            self._history_workers or
+            not self._sync_queue.empty()
+        ):
+            return
+        super().stop()
+
     def _run_iteration(self):
         LOG.debug("Workspace integration bridge worker iteration")
+        if self._stopping:
+            self._shutdown_iteration()
+            return
         self._sync_iam_users()
         self._sync_zulip_users()
         self._start_bridges()
+        self._dispatch_zulip_outbound_events()
         self._process_sync_queue()

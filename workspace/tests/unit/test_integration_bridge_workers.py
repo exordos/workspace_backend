@@ -16,6 +16,7 @@
 
 import datetime
 import queue
+import threading
 from types import SimpleNamespace
 
 from workspace.services.integration_bridge import workers
@@ -33,6 +34,10 @@ class FakeZulipClient:
     registered_queue = None
     event_calls = None
     event_pages = None
+    send_calls = None
+    send_private_calls = None
+    update_calls = None
+    delete_calls = None
 
     def __init__(self, endpoint):
         type(self).init_endpoint = endpoint
@@ -80,6 +85,55 @@ class FakeZulipClient:
             "last_event_id": last_event_id,
         })
         return type(self).event_pages.pop(0)
+
+    def send_message_with_api_key(
+        self,
+        login,
+        token,
+        stream_name,
+        topic_name,
+        content,
+    ):
+        type(self).send_calls.append({
+            "login": login,
+            "token": token,
+            "stream_name": stream_name,
+            "topic_name": topic_name,
+            "content": content,
+        })
+        return {"id": 12345}
+
+    def send_private_message_with_api_key(
+        self,
+        login,
+        token,
+        recipient_ids,
+        content,
+    ):
+        type(self).send_private_calls.append({
+            "login": login,
+            "token": token,
+            "recipient_ids": recipient_ids,
+            "content": content,
+        })
+        return {"id": 12345}
+
+    def update_message_with_api_key(self, login, token, message_id, content):
+        type(self).update_calls.append({
+            "login": login,
+            "token": token,
+            "message_id": message_id,
+            "content": content,
+        })
+        return {"result": "success"}
+
+    def delete_message_with_api_key(self, login, token, message_id):
+        type(self).delete_calls.append({
+            "login": login,
+            "token": token,
+            "message_id": message_id,
+        })
+        return {"result": "success"}
 
 
 def _external_account():
@@ -630,6 +684,37 @@ def test_zulip_bridge_worker_reports_dead_message_queue():
     assert FakeZulipClient.calls == []
 
 
+def test_zulip_bridge_worker_reports_message_queue_without_events_as_dead():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.calls = []
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "result": "success",
+            "msg": "",
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.SyncMessages(
+        queue_id="dead-queue",
+        last_event_id=42,
+        last_message_id=103,
+        is_synced=False,
+    ).execute(worker)
+
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipQueueFailed)
+    assert command.external_account is worker._external_account
+    assert FakeZulipClient.calls == []
+
+
 def test_zulip_bridge_worker_creates_queue_before_catch_up():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.register_calls = []
@@ -719,6 +804,204 @@ def test_zulip_bridge_worker_processes_stream_with_output_queue():
     assert add_stream.external_account is worker._external_account
     assert add_stream.stream == stream
     assert add_stream.subscriber_ids == [10, 24]
+
+
+def test_send_zulip_message_command_sends_and_reports_message_id():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.send_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.SendZulipMessage(
+        epoch_version=55,
+        message_uuid="message-uuid",
+        stream_name="general",
+        topic_name="deploys",
+        content="hello",
+    ).execute(worker)
+
+    assert FakeZulipClient.send_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "stream_name": "general",
+            "topic_name": "deploys",
+            "content": "hello",
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+    assert command.epoch_version == 55
+    assert command.message_uuid == "message-uuid"
+    assert command.zulip_message_id == 12345
+
+
+def test_send_zulip_private_message_command_sends_and_reports_message_id():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.send_private_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.SendZulipPrivateMessage(
+        epoch_version=55,
+        message_uuid="message-uuid",
+        recipient_ids=[42],
+        content="hello",
+    ).execute(worker)
+
+    assert FakeZulipClient.send_private_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "recipient_ids": [42],
+            "content": "hello",
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+    assert command.epoch_version == 55
+    assert command.message_uuid == "message-uuid"
+    assert command.zulip_message_id == 12345
+
+
+def test_zulip_message_sent_is_processed_before_inbound_add_message():
+    output_queue = queue.PriorityQueue()
+    external_account = _external_account()
+    workers.put_sync_response(
+        output_queue,
+        workers.AddMessage(
+            external_account=external_account,
+            message={"id": 12345, "timestamp": 1776940760},
+        ),
+    )
+    workers.put_sync_response(
+        output_queue,
+        workers.ZulipMessageSent(
+            external_account=external_account,
+            epoch_version=55,
+            message_uuid="message-uuid",
+            zulip_message_id=12345,
+        ),
+    )
+
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+
+
+def test_update_zulip_message_command_updates_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.update_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.UpdateZulipMessage(
+        epoch_version=56,
+        message_uuid="message-uuid",
+        message_id=12345,
+        content="edited",
+    ).execute(worker)
+
+    assert FakeZulipClient.update_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "message_id": 12345,
+            "content": "edited",
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageUpdated)
+    assert command.epoch_version == 56
+
+
+def test_delete_zulip_message_command_deletes_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.delete_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.DeleteZulipMessage(
+        epoch_version=57,
+        message_uuid="message-uuid",
+        message_id=12345,
+    ).execute(worker)
+
+    assert FakeZulipClient.delete_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "message_id": 12345,
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageDeleted)
+    assert command.epoch_version == 57
+
+
+def test_put_sync_response_waits_when_output_queue_is_full():
+    output_queue = queue.PriorityQueue(maxsize=1)
+    output_queue.put(workers.PrioritizedSyncResponse(0, object()))
+    command = workers.ZulipQueueFailed(external_account=_external_account())
+    thread = threading.Thread(
+        target=workers.put_sync_response,
+        args=(output_queue, command),
+    )
+
+    thread.start()
+    thread.join(timeout=0.05)
+    assert thread.is_alive()
+    output_queue.get_nowait()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    response = output_queue.get_nowait()
+    assert workers.get_sync_response_command(response) is command
+
+
+def test_stopped_zulip_bridge_worker_does_not_execute_normal_commands():
+    executed = []
+    input_queue = queue.Queue()
+
+    class NormalCommand:
+        def execute(self, worker):
+            executed.append(worker)
+
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=input_queue,
+        output_queue=queue.PriorityQueue(),
+        client_cls=FakeZulipClient,
+    )
+
+    worker.start()
+    worker.stop()
+    input_queue.put(NormalCommand())
+    input_queue.put(workers.StopWorker())
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert executed == []
 
 
 def test_zulip_bridge_worker_prioritizes_stream_responses():
@@ -902,6 +1185,57 @@ def test_add_message_treats_missing_flags_as_unread():
     message_info = command._get_message_info()
 
     assert message_info["read"] is False
+
+
+def test_add_message_skips_single_subscriber_private_message():
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def get_or_create_stream(self, external_account, stream_info):
+            self.calls.append("get_or_create_stream")
+
+        def get_or_create_topic(
+            self,
+            external_account,
+            stream,
+            stream_info,
+            topic_name,
+        ):
+            self.calls.append("get_or_create_topic")
+
+        def get_or_create_message(
+            self,
+            external_account,
+            stream,
+            topic,
+            stream_info,
+            topic_name,
+            message_info,
+        ):
+            self.calls.append("get_or_create_message")
+
+    cache = FakeCache()
+    command = workers.AddMessage(
+        external_account=_external_account(),
+        message={
+            "id": 82,
+            "type": "private",
+            "recipient_id": 82,
+            "display_recipient": [
+                {"id": 8, "full_name": "Admin"},
+            ],
+            "sender_id": 8,
+            "content": "self dm",
+            "flags": [],
+            "timestamp": 1770998098,
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is None
+    assert cache.calls == []
 
 
 def test_add_private_message_executes_with_cache():

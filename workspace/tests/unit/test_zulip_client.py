@@ -22,6 +22,9 @@ class FakeZulipSdkClient:
     stream_filters = None
     subscriber_call = None
     subscriber_response = None
+    sent_message = None
+    updated_message = None
+    deleted_message_id = None
 
     def __init__(self, email, api_key, site):
         self.init_values = {
@@ -83,6 +86,21 @@ class FakeZulipSdkClient:
             "method": method,
         }
         return type(self).subscriber_response
+
+    def send_message(self, request):
+        type(self).sent_message = request
+        return {
+            "result": "success",
+            "id": 12345,
+        }
+
+    def update_message(self, request):
+        type(self).updated_message = request
+        return {"result": "success"}
+
+    def delete_message(self, message_id):
+        type(self).deleted_message_id = message_id
+        return {"result": "success"}
 
 
 def test_zulip_client_uses_official_sdk_for_profile():
@@ -149,6 +167,92 @@ def test_zulip_client_gets_messages_with_official_sdk():
             "filters": message_filters,
         },
     ]
+
+
+def test_zulip_client_sends_message_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.send_message_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        stream_name="general",
+        topic_name="deploys",
+        content="hello",
+    )
+
+    assert result == {
+        "result": "success",
+        "id": 12345,
+    }
+    assert FakeZulipSdkClient.sent_message == {
+        "type": "stream",
+        "to": "general",
+        "topic": "deploys",
+        "content": "hello",
+    }
+
+
+def test_zulip_client_sends_private_message_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.send_private_message_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        recipient_ids=[42],
+        content="hello",
+    )
+
+    assert result == {
+        "result": "success",
+        "id": 12345,
+    }
+    assert FakeZulipSdkClient.sent_message == {
+        "type": "direct",
+        "to": [42],
+        "content": "hello",
+    }
+
+
+def test_zulip_client_updates_message_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.update_message_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        message_id=12345,
+        content="edited",
+    )
+
+    assert result == {"result": "success"}
+    assert FakeZulipSdkClient.updated_message == {
+        "message_id": 12345,
+        "content": "edited",
+    }
+
+
+def test_zulip_client_deletes_message_with_official_sdk():
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.delete_message_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        message_id=12345,
+    )
+
+    assert result == {"result": "success"}
+    assert FakeZulipSdkClient.deleted_message_id == 12345
 
 
 def test_zulip_client_gets_streams_with_official_sdk():

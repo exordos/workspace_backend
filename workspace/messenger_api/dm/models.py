@@ -56,6 +56,13 @@ ZULIP_PROCESSED_ENTITY_TYPES = (
     "topic",
     "message",
 )
+ZULIP_OUTBOUND_EVENT_STATUSES = (
+    "pending",
+    "processing",
+    "sent",
+    "skipped",
+    "failed",
+)
 
 
 class ZulipProcessedEntity(
@@ -119,6 +126,53 @@ class ZulipEventQueueState(
     is_synced = properties.property(
         types.Boolean(),
         default=False,
+    )
+
+
+class ZulipOutboundRetryAtType(types.UTCDateTimeZ):
+    def from_simple_type(self, value):
+        try:
+            return super().from_simple_type(value)
+        except ValueError:
+            if not isinstance(value, str):
+                raise
+            parsed = datetime.datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+
+
+class ZulipOutboundEventState(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_zulip_outbound_event_states"
+
+    epoch_version = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    external_account_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    status = properties.property(
+        types.Enum(ZULIP_OUTBOUND_EVENT_STATUSES),
+        default="pending",
+    )
+    attempts = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    next_retry_at = properties.property(
+        types.AllowNone(ZulipOutboundRetryAtType()),
+        default=None,
+    )
+    last_error = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
     )
 
 

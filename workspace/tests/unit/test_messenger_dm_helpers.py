@@ -438,6 +438,144 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(4, create_folder_event.call_count)
 
+    def test_create_workspace_private_group_stream(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        owner_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+        )
+        all_folder = types.SimpleNamespace(
+            uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+        personal_folder = types.SimpleNamespace(
+            uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+            user_uuid=user_uuid,
+        )
+        created_stream = {}
+        created_bindings = []
+
+        class FakeWorkspaceStream:
+            def __init__(self, **kwargs):
+                created_stream.update(kwargs)
+                self.uuid = kwargs["uuid"]
+                self.project_id = kwargs["project_id"]
+                self.user_uuid = kwargs["user_uuid"]
+
+            def insert(self, session=None):
+                created_stream["insert_session"] = session
+
+        class FakeWorkspaceStreamBinding:
+            def __init__(self, **kwargs):
+                self._values = kwargs
+                created_bindings.append(self._values)
+
+            def insert(self, session=None):
+                self._values["insert_session"] = session
+
+        class FakeWorkspaceUserStream:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(return_value=[owner_stream]),
+            )
+
+        get_user_folder = mock.Mock(
+            side_effect=[
+                all_folder,
+                personal_folder,
+            ]
+        )
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStreamBinding",
+            FakeWorkspaceStreamBinding,
+        ), mock.patch.object(
+            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+        ), mock.patch.object(
+            dm_helpers, "_random_color", return_value=23456
+        ), mock.patch.object(
+            dm_helpers,
+            "create_workspace_stream_topic_with_flags",
+            return_value=types.SimpleNamespace(uuid=topic_uuid),
+        ) as create_topic, mock.patch.object(
+            dm_helpers,
+            "_create_workspace_stream_topic_events",
+        ) as create_topic_events, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", get_user_folder
+        ), mock.patch.object(
+            dm_helpers.messenger_events, "create_stream_event"
+        ) as create_event, mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_folder_event:
+            result = dm_helpers.create_workspace_private_group_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=stream_uuid,
+                name="Zulip group DM",
+                description="Private group chat",
+                source_name="zulip",
+                source={"kind": "zulip", "stream_id": 20},
+                default_topic_name="zulip",
+                session=session,
+            )
+
+        self.assertIs(owner_stream, result)
+        self.assertEqual(True, created_stream["private"])
+        self.assertNotIn("direct_user_uuid", created_stream)
+        self.assertNotIn("private_index", created_stream)
+        self.assertEqual(23456, created_stream["color"])
+        self.assertIs(session, created_stream["insert_session"])
+        self.assertEqual(1, len(created_bindings))
+        self.assertEqual(user_uuid, created_bindings[0]["user_uuid"])
+        self.assertEqual("owner", created_bindings[0]["role"])
+        self.assertEqual(user_uuid, created_bindings[0]["who_uuid"])
+        create_topic.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            name="zulip",
+            default_for_stream_uuid=stream_uuid,
+            source_name="zulip",
+            source=mock.ANY,
+        )
+        self.assertEqual("zulip", create_topic.call_args.kwargs["source"].KIND)
+        self.assertEqual(20, create_topic.call_args.kwargs["source"].stream_id)
+        create_topic_events.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+        create_event.assert_called_once_with(
+            stream=owner_stream,
+            session=session,
+        )
+        get_user_folder.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                ),
+            ]
+        )
+        create_folder_event.assert_has_calls(
+            [
+                mock.call(folder=all_folder, session=session),
+                mock.call(folder=personal_folder, session=session),
+            ]
+        )
+        self.assertEqual(2, create_folder_event.call_count)
+
     def test_get_or_create_workspace_user_stream_with_direct_user_returns_existing(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -2003,6 +2141,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         returned_message = object()
         created_message = {}
         created_flags = []
+        source_fields = {
+            "source_name": dm_helpers.models.SourceName.NATIVE.value,
+            "source": dm_helpers.models.NativeSource(),
+        }
 
         class FakeWorkspaceMessage:
             def __init__(self, **kwargs):
@@ -2040,6 +2182,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             dm_helpers, "_create_messages_unread_updated_events"
         ) as create_unread_events, mock.patch.object(
             dm_helpers,
+            "_get_message_topic_source_fields",
+            return_value=source_fields,
+        ) as get_topic_source_fields, mock.patch.object(
+            dm_helpers,
             "get_workspace_user_message",
             return_value=returned_message,
         ) as get_user_message:
@@ -2057,6 +2203,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(message_uuid, created_message["uuid"])
         self.assertEqual(project_id, created_message["project_id"])
         self.assertEqual(user_uuid, created_message["user_uuid"])
+        self.assertEqual("native", created_message["source_name"])
+        self.assertIs(source_fields["source"], created_message["source"])
         self.assertIs(session, created_message["insert_session"])
         self.assertIs(session, created_message["recipients_session"])
         self.assertEqual(
@@ -2079,6 +2227,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             created_flags,
         )
         create_message_events.assert_called_once()
+        get_topic_source_fields.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
         create_unread_events.assert_called_once_with(
             project_id=project_id,
             user_uuids=[other_user_uuid],
@@ -2102,8 +2255,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         returned_message = object()
         created_message = {}
         created_flags = []
+        topic_source = dm_helpers.models.NativeSource()
         get_default_topic = mock.Mock(
-            return_value=types.SimpleNamespace(uuid=topic_uuid)
+            return_value=types.SimpleNamespace(
+                uuid=topic_uuid,
+                source_name=dm_helpers.models.SourceName.NATIVE.value,
+                source=topic_source,
+            )
         )
 
         class FakeWorkspaceMessage:
@@ -2162,11 +2320,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         self.assertIs(returned_message, result)
         self.assertEqual(topic_uuid, created_message["topic_uuid"])
+        self.assertEqual("native", created_message["source_name"])
+        self.assertIsInstance(
+            created_message["source"],
+            dm_helpers.models.NativeSource,
+        )
         self.assertIs(session, created_message["insert_session"])
-        filters = get_default_topic.call_args.kwargs["filters"]
+        self.assertEqual(2, get_default_topic.call_count)
+        filters = get_default_topic.call_args_list[0].kwargs["filters"]
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
         self.assertEqual(stream_uuid, filters["default_for_stream_uuid"].value)
+        source_filters = get_default_topic.call_args_list[1].kwargs["filters"]
+        self.assertEqual(project_id, source_filters["project_id"].value)
+        self.assertEqual(topic_uuid, source_filters["uuid"].value)
         self.assertEqual(
             [
                 {
@@ -2267,7 +2434,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         user_uuid = sys_uuid.uuid4()
         first_message_uuid = sys_uuid.uuid4()
         second_message_uuid = sys_uuid.uuid4()
-        session = object()
 
         class FakeWorkspaceUserMessage:
             objects = types.SimpleNamespace(
@@ -3024,6 +3190,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         message_uuid = sys_uuid.uuid4()
         session = object()
         deleted_message = {}
+        source = dm_helpers.models.NativeSource()
         current_message = types.SimpleNamespace(
             user_uuid=user_uuid,
             read=True,
@@ -3035,8 +3202,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         class ExistingMessage:
             def __init__(self):
+                self.user_uuid = user_uuid
                 self.stream_uuid = stream_uuid
                 self.topic_uuid = topic_uuid
+                self.source_name = dm_helpers.models.SourceName.NATIVE.value
+                self.source = source
 
             def delete(self, session=None):
                 deleted_message["delete_session"] = session
@@ -3089,6 +3259,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     message_uuid=message_uuid,
                     stream_uuid=stream_uuid,
                     topic_uuid=topic_uuid,
+                    author_uuid=user_uuid,
+                    source_name="native",
+                    source=source,
                     session=session,
                 ),
                 mock.call(
@@ -3097,6 +3270,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     message_uuid=message_uuid,
                     stream_uuid=stream_uuid,
                     topic_uuid=topic_uuid,
+                    author_uuid=user_uuid,
+                    source_name="native",
+                    source=source,
                     session=session,
                 ),
             ]

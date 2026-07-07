@@ -796,6 +796,12 @@ def _get_source_server_url(source):
     return source.get("server_url")
 
 
+def _get_source_topic_name(source):
+    if hasattr(source, "topic_name"):
+        return source.topic_name
+    return source.get("topic_name")
+
+
 def _build_topic_source(source_name, source, topic_name):
     source_name = _normalize_source_name(source_name)
     if source_name == models.SourceName.ZULIP.value:
@@ -803,6 +809,18 @@ def _build_topic_source(source_name, source, topic_name):
             stream_id=_get_source_stream_id(source),
             server_url=_get_source_server_url(source),
             topic_name=topic_name,
+        )
+    return models.NativeSource()
+
+
+def _build_message_source(source_name, source):
+    source_name = _normalize_source_name(source_name)
+    if source_name == models.SourceName.ZULIP.value:
+        return models.ZulipSource(
+            stream_id=_get_source_stream_id(source),
+            server_url=_get_source_server_url(source),
+            topic_name=_get_source_topic_name(source),
+            message_id=None,
         )
     return models.NativeSource()
 
@@ -818,6 +836,23 @@ def _get_default_topic_source_fields(fields, topic_name):
             source_name=source_name,
             source=source,
             topic_name=topic_name,
+        ),
+    }
+
+
+def _get_message_topic_source_fields(project_id, topic_uuid, session=None):
+    topic = models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "uuid": dm_filters.EQ(topic_uuid),
+        },
+        session=session,
+    )
+    return {
+        "source_name": topic.source_name,
+        "source": _build_message_source(
+            source_name=topic.source_name,
+            source=topic.source,
         ),
     }
 
@@ -1193,6 +1228,69 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
         filters={
             "project_id": dm_filters.EQ(project_id),
             "private_index": dm_filters.EQ(private_index),
+        },
+        session=session,
+    ):
+        if user_stream.user_uuid == user_uuid:
+            result = user_stream
+        messenger_events.create_stream_event(
+            stream=user_stream,
+            session=session,
+        )
+        _create_stream_folder_updated_events(
+            project_id=project_id,
+            user_uuid=user_stream.user_uuid,
+            private=True,
+            session=session,
+        )
+    _create_workspace_stream_topic_events(
+        project_id=project_id,
+        topic_uuid=default_topic.uuid,
+        session=session,
+    )
+    return result
+
+
+def create_workspace_private_group_stream(project_id, user_uuid, session=None,
+                                          **kwargs):
+    stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
+    default_topic_name = kwargs.pop("default_topic_name", "General Topic")
+    kwargs.pop("private", None)
+    kwargs.pop("direct_user_uuid", None)
+    if kwargs.pop("private_index", None) is not None:
+        raise messenger_exc.PrivateIndexIsTechnicalFieldError()
+
+    _ensure_color(kwargs)
+    stream = models.WorkspaceStream(
+        uuid=stream_uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        private=True,
+        **kwargs,
+    )
+    stream.insert(session=session)
+
+    _create_owner_binding(
+        project_id=project_id,
+        stream_uuid=stream.uuid,
+        user_uuid=user_uuid,
+        who_uuid=user_uuid,
+        session=session,
+    )
+
+    default_topic = create_workspace_stream_topic_with_flags(
+        project_id=project_id,
+        stream_uuid=stream.uuid,
+        name=default_topic_name,
+        default_for_stream_uuid=stream.uuid,
+        **_get_default_topic_source_fields(kwargs, default_topic_name),
+    )
+
+    result = None
+    for user_stream in models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(stream.uuid),
+            "project_id": dm_filters.EQ(project_id),
         },
         session=session,
     ):
@@ -1804,6 +1902,14 @@ def create_workspace_user_message(project_id, user_uuid, session=None,
             stream_uuid=kwargs["stream_uuid"],
         )
         kwargs["topic_uuid"] = topic.uuid
+    if "source_name" not in kwargs or "source" not in kwargs:
+        kwargs.update(
+            _get_message_topic_source_fields(
+                project_id=project_id,
+                topic_uuid=kwargs["topic_uuid"],
+                session=session,
+            ),
+        )
 
     message = models.WorkspaceMessage(
         uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
@@ -2084,6 +2190,9 @@ def delete_workspace_user_message(project_id, user_uuid, message_uuid,
             message_uuid=message_uuid,
             stream_uuid=message.stream_uuid,
             topic_uuid=message.topic_uuid,
+            author_uuid=message.user_uuid,
+            source_name=message.source_name,
+            source=message.source,
             session=session,
         )
 

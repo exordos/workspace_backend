@@ -383,7 +383,8 @@ def create_messages_read_event(project_id, user_uuid, message_uuids,
 
 
 def create_message_deleted_event(project_id, user_uuid, message_uuid,
-                                 stream_uuid, topic_uuid, session=None):
+                                 stream_uuid, topic_uuid, author_uuid,
+                                 source_name, source, session=None):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -392,6 +393,9 @@ def create_message_deleted_event(project_id, user_uuid, message_uuid,
             "uuid": _event_payload_value("uuid", message_uuid),
             "stream_uuid": _event_payload_value("stream_uuid", stream_uuid),
             "topic_uuid": _event_payload_value("topic_uuid", topic_uuid),
+            "author_uuid": _event_payload_value("author_uuid", author_uuid),
+            "source_name": _event_payload_value("source_name", source_name),
+            "source": _event_payload_value("source", source),
         },
         session=session,
     )

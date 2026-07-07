@@ -16,11 +16,38 @@
 
 import datetime
 import queue
+import uuid as sys_uuid
 
 from types import SimpleNamespace
 from unittest import mock
 
 from workspace.services.integration_bridge import agents
+
+
+def test_zulip_outbound_event_state_restores_retry_at_with_timezone_offset():
+    state = agents.models.ZulipOutboundEventState.restore_from_storage(
+        uuid=sys_uuid.uuid4(),
+        project_id=sys_uuid.uuid4(),
+        created_at=datetime.datetime.now(datetime.timezone.utc),
+        updated_at=datetime.datetime.now(datetime.timezone.utc),
+        epoch_version=55,
+        external_account_uuid=sys_uuid.uuid4(),
+        status="pending",
+        attempts=1,
+        next_retry_at="2026-07-07 17:41:45.043680+03:00",
+        last_error=None,
+    )
+
+    assert state.next_retry_at == datetime.datetime(
+        2026,
+        7,
+        7,
+        14,
+        41,
+        45,
+        43680,
+        tzinfo=datetime.timezone.utc,
+    )
 
 
 class FakeZulipProcessedEntity:
@@ -53,6 +80,31 @@ class FakeZulipQueueState:
         self.__dict__.update(values)
 
 
+class FakeOutboundState:
+    def __init__(
+        self,
+        epoch_version=55,
+        project_id="project",
+        external_account_uuid="account-uuid",
+        status="pending",
+        attempts=0,
+        next_retry_at=None,
+        last_error=None,
+    ):
+        self.epoch_version = epoch_version
+        self.project_id = project_id
+        self.external_account_uuid = external_account_uuid
+        self.status = status
+        self.attempts = attempts
+        self.next_retry_at = next_retry_at
+        self.last_error = last_error
+        self.update_dm = mock.Mock(side_effect=self._update_dm)
+        self.update = mock.Mock()
+
+    def _update_dm(self, values):
+        self.__dict__.update(values)
+
+
 def _patch_zulip_processed_entities(return_value=None):
     FakeZulipProcessedEntity.inserted = []
     FakeZulipProcessedEntity.objects = SimpleNamespace(
@@ -63,6 +115,450 @@ def _patch_zulip_processed_entities(return_value=None):
         "ZulipProcessedEntity",
         FakeZulipProcessedEntity,
     )
+
+
+def test_outbound_event_filter_uses_author_event_only():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    author_event = SimpleNamespace(
+        action="created",
+        user_uuid="author-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "zulip",
+            "source": SimpleNamespace(message_id=None),
+        },
+    )
+    recipient_event = SimpleNamespace(
+        action="created",
+        user_uuid="recipient-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "zulip",
+            "source": SimpleNamespace(message_id=None),
+        },
+    )
+    native_event = SimpleNamespace(
+        action="created",
+        user_uuid="author-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "native",
+            "source": SimpleNamespace(message_id=None),
+        },
+    )
+    inbound_event = SimpleNamespace(
+        action="created",
+        user_uuid="author-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "zulip",
+            "source": SimpleNamespace(message_id=12345),
+        },
+    )
+
+    assert worker._is_zulip_outbound_event(author_event)
+    assert not worker._is_zulip_outbound_event(recipient_event)
+    assert not worker._is_zulip_outbound_event(native_event)
+    assert not worker._is_zulip_outbound_event(inbound_event)
+
+
+class FakeQueryResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+def test_get_new_outbound_events_uses_candidate_json_filter():
+    event_uuid = sys_uuid.uuid4()
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    session = SimpleNamespace(
+        execute=mock.Mock(
+            return_value=FakeQueryResult([
+                {
+                    "epoch_version": 56,
+                    "uuid": event_uuid,
+                    "project_id": project_id,
+                    "user_uuid": user_uuid,
+                    "payload": {
+                        "author_uuid": str(user_uuid),
+                        "source_name": "zulip",
+                        "source": {"message_id": None},
+                    },
+                    "created_at": now,
+                    "updated_at": now,
+                    "schema_version": 1,
+                    "object_type": "message",
+                    "action": "created",
+                },
+            ]),
+        ),
+    )
+    context = SimpleNamespace(get_session=mock.Mock(return_value=session))
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._last_outbound_event_epoch = 55
+
+    with mock.patch.object(agents.contexts, "Context", return_value=context):
+        events = worker._get_new_outbound_events()
+
+    statement, values = session.execute.call_args.args
+    assert "e.payload->>'source_name' = 'zulip'" in statement
+    assert "e.user_uuid::text = e.payload->>'author_uuid'" in statement
+    assert "e.payload #>> '{source,message_id}' IS NULL" in statement
+    assert "m_zulip_outbound_event_states" in statement
+    assert values == (55, agents.DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT)
+    assert len(events) == 1
+    assert events[0].epoch_version == 56
+    assert events[0].uuid == event_uuid
+
+
+def test_dispatch_zulip_outbound_state_uses_author_worker_queue():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    command = object()
+    state = FakeOutboundState()
+    event = SimpleNamespace(
+        action="created",
+        user_uuid="author-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "zulip",
+            "source": SimpleNamespace(message_id=None),
+        },
+    )
+    external_account = SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        server_url="https://zulip.example.com",
+        user_uuid="author-user",
+        account_settings=SimpleNamespace(credentials=object()),
+    )
+    author_key = (
+        "project",
+        "https://zulip.example.com",
+        "author-user",
+    )
+    other_key = (
+        "project",
+        "https://zulip.example.com",
+        "other-user",
+    )
+    author_queue = queue.Queue()
+    other_queue = queue.Queue()
+    worker._worker_input_queues = {
+        author_key: author_queue,
+        other_key: other_queue,
+    }
+
+    with mock.patch.object(
+        worker,
+        "_get_zulip_outbound_event",
+        mock.Mock(return_value=event),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_outbound_account",
+        mock.Mock(return_value=external_account),
+    ), mock.patch.object(
+        worker,
+        "_build_zulip_outbound_command",
+        mock.Mock(return_value=command),
+    ):
+        worker._dispatch_zulip_outbound_state(state)
+
+    assert author_queue.get_nowait() is command
+    assert other_queue.empty()
+    assert state.status == "processing"
+    assert state.attempts == 1
+    assert state.last_error is None
+
+
+def test_dispatch_zulip_outbound_state_retries_without_credentials():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    state = FakeOutboundState()
+    event = SimpleNamespace(
+        action="created",
+        user_uuid="author-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "zulip",
+            "source": SimpleNamespace(message_id=None),
+        },
+    )
+    external_account = SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        server_url="https://zulip.example.com",
+        user_uuid="author-user",
+        account_settings=SimpleNamespace(credentials=None),
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_zulip_outbound_event",
+        mock.Mock(return_value=event),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_outbound_account",
+        mock.Mock(return_value=external_account),
+    ):
+        worker._dispatch_zulip_outbound_state(state)
+
+    assert state.status == "pending"
+    assert state.attempts == 1
+    assert state.next_retry_at is not None
+    assert state.last_error == "Zulip external account credentials are missing"
+
+
+def test_dispatch_zulip_outbound_state_skips_inbound_created_event():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    state = FakeOutboundState()
+    event = SimpleNamespace(
+        action="created",
+        user_uuid="author-user",
+        payload={
+            "author_uuid": "author-user",
+            "source_name": "zulip",
+            "source": SimpleNamespace(message_id=12345),
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_zulip_outbound_event",
+        mock.Mock(return_value=event),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_outbound_account",
+        mock.Mock(),
+    ) as get_account:
+        worker._dispatch_zulip_outbound_state(state)
+
+    get_account.assert_not_called()
+    assert state.status == "skipped"
+    assert state.next_retry_at is None
+    assert state.last_error is None
+
+
+def test_save_zulip_processed_message_casts_message_uuid():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    message_uuid = sys_uuid.uuid4()
+    command = SimpleNamespace(
+        external_account=SimpleNamespace(
+            project_id="project",
+            server_url="https://zulip.example.com",
+            user_uuid="author-user",
+        ),
+        message_uuid=str(message_uuid),
+        zulip_message_id=12345,
+    )
+
+    with _patch_zulip_processed_entities():
+        worker._save_zulip_processed_message(command)
+
+    assert len(FakeZulipProcessedEntity.inserted) == 1
+    processed = FakeZulipProcessedEntity.inserted[0]
+    assert processed.workspace_uuid == message_uuid
+    assert processed.entity_id == "12345"
+
+
+def test_zulip_sent_result_error_marks_outbound_failed_without_retry():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    state = FakeOutboundState(status="processing", attempts=1)
+    command = agents.workers.ZulipMessageSent(
+        external_account=SimpleNamespace(
+            project_id="project",
+            server_url="https://zulip.example.com",
+            user_uuid="author-user",
+        ),
+        epoch_version=55,
+        message_uuid=str(sys_uuid.uuid4()),
+        zulip_message_id=12345,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_handle_zulip_message_sent",
+        mock.Mock(side_effect=RuntimeError("local boom")),
+    ), mock.patch.object(
+        worker,
+        "_get_outbound_state_for_command",
+        mock.Mock(return_value=state),
+    ):
+        worker._execute_sync_command(command)
+
+    assert state.status == "failed"
+    assert state.attempts == 1
+    assert state.next_retry_at is None
+    assert state.last_error == "local boom"
+
+
+def test_expired_processing_outbound_state_is_failed_not_redispatched():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expired_state = FakeOutboundState(
+        status="processing",
+        attempts=1,
+        next_retry_at=now - datetime.timedelta(seconds=1),
+    )
+    pending_state = FakeOutboundState(
+        epoch_version=56,
+        status="pending",
+        attempts=0,
+        next_retry_at=None,
+    )
+
+    class FakeZulipOutboundEventState:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(
+                side_effect=[
+                    [expired_state],
+                    [pending_state],
+                ],
+            ),
+        )
+
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    with mock.patch.object(
+        agents.models,
+        "ZulipOutboundEventState",
+        FakeZulipOutboundEventState,
+    ):
+        worker._fail_expired_outbound_processing_states()
+        ready_states = worker._get_ready_outbound_event_states()
+
+    assert expired_state.status == "failed"
+    assert expired_state.next_retry_at is None
+    assert expired_state.last_error == (
+        "Zulip outbound command processing expired"
+    )
+    assert ready_states == [pending_state]
+
+
+def test_build_send_zulip_message_command_uses_direct_private_recipient():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = SimpleNamespace(
+        epoch_version=55,
+        project_id="project",
+        payload={
+            "uuid": "message-uuid",
+            "payload": {
+                "content": "hello",
+            },
+        },
+    )
+    message = SimpleNamespace(
+        stream_uuid="stream-uuid",
+        topic_uuid="topic-uuid",
+        source={
+            "server_url": "https://zulip.example.com",
+        },
+    )
+    stream = SimpleNamespace(
+        private=True,
+        direct_user_uuid="recipient-user",
+    )
+    recipient_account = SimpleNamespace(
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=42),
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=recipient_account),
+        )
+
+    with mock.patch.object(
+        worker,
+        "_get_workspace_message",
+        mock.Mock(return_value=message),
+    ), mock.patch.object(
+        worker,
+        "_get_workspace_stream",
+        mock.Mock(return_value=stream),
+    ), mock.patch.object(
+        worker,
+        "_get_workspace_topic",
+        mock.Mock(),
+    ) as get_topic, mock.patch.object(
+        agents.models,
+        "ExternalAccount",
+        FakeExternalAccount,
+    ):
+        command = worker._build_send_zulip_message_command(event)
+
+    assert isinstance(command, agents.workers.SendZulipPrivateMessage)
+    assert command.epoch_version == 55
+    assert command.message_uuid == "message-uuid"
+    assert command.recipient_ids == [42]
+    assert command.content == "hello"
+    get_topic.assert_not_called()
+    filters = FakeExternalAccount.objects.get_one_or_none.call_args.kwargs[
+        "filters"
+    ]
+    assert filters["project_id"].value == "project"
+    assert filters["account_type"].value == "zulip"
+    assert filters["server_url"].value == "https://zulip.example.com"
+    assert filters["user_uuid"].value == "recipient-user"
+
+
+def test_bridge_worker_shutdown_stops_workers_and_drains_output_queue():
+    class FakeWorker:
+        def __init__(self):
+            self.stopped = False
+            self.joined = False
+
+        def stop(self):
+            self.stopped = True
+
+        def join(self, timeout=None):
+            self.joined = True
+
+        def is_alive(self):
+            return False
+
+    bridge_worker = agents.WorkspaceIntegrationBridgeWorker()
+    bridge_worker._enabled = True
+    fake_worker = FakeWorker()
+    fake_history_worker = FakeWorker()
+    worker_key = (
+        "project",
+        "https://zulip.example.com",
+        "author-user",
+    )
+    input_queue = queue.Queue()
+    history_input_queue = queue.Queue()
+    bridge_worker._workers = {worker_key: fake_worker}
+    bridge_worker._history_workers = {worker_key: fake_history_worker}
+    bridge_worker._worker_input_queues = {worker_key: input_queue}
+    bridge_worker._worker_history_input_queues = {
+        worker_key: history_input_queue,
+    }
+    bridge_worker._worker_accounts = {worker_key: object()}
+    command = object()
+    agents.workers.put_sync_response(bridge_worker._sync_queue, command)
+
+    with mock.patch.object(
+        bridge_worker,
+        "_execute_sync_command",
+        mock.Mock(),
+    ) as execute_command:
+        bridge_worker._shutdown_iteration()
+
+    assert fake_worker.stopped
+    assert fake_worker.joined
+    assert fake_history_worker.stopped
+    assert fake_history_worker.joined
+    assert isinstance(input_queue.get_nowait(), agents.workers.StopWorker)
+    assert isinstance(
+        history_input_queue.get_nowait(),
+        agents.workers.StopWorker,
+    )
+    execute_command.assert_called_once_with(command)
+    assert bridge_worker._workers == {}
+    assert bridge_worker._history_workers == {}
+    assert not bridge_worker._enabled
 
 
 def test_bridge_worker_syncs_due_user_providers():
@@ -192,20 +688,34 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     filters = FakeExternalAccount.objects.get_all.call_args.kwargs["filters"]
     assert filters["account_type"].value == "zulip"
     assert worker._workers[first_worker_key] is existing_worker
-    assert worker._workers[second_worker_key] is (
+    assert worker._history_workers[first_worker_key] is (
         FakeZulipBridgeWorker.instances[0]
+    )
+    assert worker._workers[second_worker_key] is (
+        FakeZulipBridgeWorker.instances[1]
+    )
+    assert worker._history_workers[second_worker_key] is (
+        FakeZulipBridgeWorker.instances[2]
     )
     assert (
         "project",
         "https://zulip.example.com",
         "skipped-user",
     ) not in worker._workers
-    assert FakeZulipBridgeWorker.instances[0].external_account is second_user
+    assert (
+        "project",
+        "https://zulip.example.com",
+        "skipped-user",
+    ) not in worker._history_workers
+    assert FakeZulipBridgeWorker.instances[0].external_account is first_user
+    assert FakeZulipBridgeWorker.instances[1].external_account is second_user
+    assert FakeZulipBridgeWorker.instances[2].external_account is second_user
     assert FakeZulipBridgeWorker.instances[0].output_queue is (
         worker._sync_queue
     )
     assert worker._message_sync_worker_key == first_worker_key
-    sync_message = existing_input_queue.get_nowait()
+    assert existing_input_queue.empty()
+    sync_message = FakeZulipBridgeWorker.instances[0].input_queue.get_nowait()
     assert isinstance(sync_message, agents.workers.SyncMessages)
     assert sync_message.queue_id == "queue-1"
     assert sync_message.last_event_id == 42
@@ -214,9 +724,16 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     sync_message.on_finished()
     assert worker._message_sync_worker_key is None
     FakeZulipBridgeWorker.instances[0].start.assert_called_once_with()
+    FakeZulipBridgeWorker.instances[1].start.assert_called_once_with()
+    FakeZulipBridgeWorker.instances[2].start.assert_called_once_with()
 
+    existing_history_input_queue = queue.Queue()
     worker._workers = {first_worker_key: existing_worker}
     worker._worker_input_queues = {first_worker_key: existing_input_queue}
+    worker._history_workers = {first_worker_key: existing_worker}
+    worker._worker_history_input_queues = {
+        first_worker_key: existing_history_input_queue,
+    }
     worker._worker_accounts = {first_worker_key: first_user}
     with mock.patch.object(
         agents.models,
@@ -235,7 +752,7 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
             ):
                 worker._start_bridges()
 
-    sync_message = existing_input_queue.get_nowait()
+    sync_message = existing_history_input_queue.get_nowait()
     assert sync_message.queue_id == "queue-1"
     assert sync_message.last_event_id == 42
     assert sync_message.last_message_id == 103
@@ -625,6 +1142,142 @@ def test_bridge_cache_creates_missing_private_stream_with_zulip_topic():
         role_user_uuids={
             "member": [
                 "admin-user",
+            ],
+        },
+    )
+
+
+def test_bridge_cache_creates_missing_private_group_stream():
+    created_stream = SimpleNamespace(
+        uuid="private-group-stream-uuid",
+        user_uuid="admin-user",
+    )
+    external_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="admin-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "private",
+        "stream_id": 20,
+        "display_recipient": "admin, Eugene Frolov, gmelikov, Anton",
+        "description": "",
+        "creator_id": 8,
+        "timestamp": 1772202531,
+        "invite_only": True,
+        "announce": False,
+        "is_archived": False,
+        "subscriber_ids": [8, 9, 10, 15],
+        "default_topic_name": "zulip",
+    }
+
+    class FakeWorkspaceStream:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(return_value=[]),
+        )
+
+    admin_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="admin-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=8),
+        ),
+    )
+    eugene_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="eugene-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=9),
+        ),
+    )
+    gmelikov_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="gmelikov-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=10),
+        ),
+    )
+    anton_account = SimpleNamespace(
+        project_id="project",
+        user_uuid="anton-user",
+        server_url="https://zulip.example.com",
+        account_settings=SimpleNamespace(
+            user_info=SimpleNamespace(user_id=15),
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = SimpleNamespace(
+            get_all=mock.Mock(
+                return_value=[
+                    admin_account,
+                    eugene_account,
+                    gmelikov_account,
+                    anton_account,
+                ],
+            ),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with _patch_zulip_processed_entities():
+        with mock.patch.object(
+            agents.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with mock.patch.object(
+                agents.models,
+                "ExternalAccount",
+                FakeExternalAccount,
+            ):
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "create_workspace_private_group_stream",
+                    mock.Mock(return_value=created_stream),
+                ) as create_group_stream:
+                    with mock.patch.object(
+                        agents.messenger_dm_helpers,
+                        "get_or_create_workspace_user_stream",
+                        mock.Mock(),
+                    ) as get_or_create_stream:
+                        with mock.patch.object(
+                            agents.messenger_dm_helpers,
+                            "get_or_create_workspace_stream_bindings",
+                            mock.Mock(),
+                        ) as get_or_create_bindings:
+                            stream = cache.get_or_create_stream(
+                                external_account=external_account,
+                                stream_info=stream_info,
+                            )
+
+    assert stream is created_stream
+    get_or_create_stream.assert_not_called()
+    create_group_stream.assert_called_once()
+    call_kwargs = create_group_stream.call_args.kwargs
+    assert call_kwargs["project_id"] == "project"
+    assert call_kwargs["user_uuid"] == "admin-user"
+    assert call_kwargs["name"] == "admin, Eugene Frolov, gmelikov, Anton"
+    assert call_kwargs["description"] == ""
+    assert call_kwargs["source_name"] == "zulip"
+    assert call_kwargs["source"].kind == "zulip"
+    assert call_kwargs["source"].stream_id == 20
+    assert call_kwargs["invite_only"] is True
+    assert call_kwargs["announce"] is False
+    assert call_kwargs["is_archived"] is False
+    assert call_kwargs["default_topic_name"] == "zulip"
+    assert "direct_user_uuid" not in call_kwargs
+    get_or_create_bindings.assert_called_once_with(
+        project_id="project",
+        stream_uuid="private-group-stream-uuid",
+        who_uuid="admin-user",
+        role_user_uuids={
+            "member": [
+                "eugene-user",
+                "gmelikov-user",
+                "anton-user",
             ],
         },
     )
@@ -1218,11 +1871,16 @@ def test_bridge_worker_iteration_syncs_users():
             with mock.patch.object(worker, "_start_bridges") as start_bridges:
                 with mock.patch.object(
                     worker,
-                    "_process_sync_queue",
-                ) as process_sync_queue:
-                    worker._run_iteration()
+                    "_dispatch_zulip_outbound_events",
+                ) as dispatch_zulip_outbound_events:
+                    with mock.patch.object(
+                        worker,
+                        "_process_sync_queue",
+                    ) as process_sync_queue:
+                        worker._run_iteration()
 
     sync_iam_users.assert_called_once_with()
     sync_zulip_users.assert_called_once_with()
     start_bridges.assert_called_once_with()
+    dispatch_zulip_outbound_events.assert_called_once_with()
     process_sync_queue.assert_called_once_with()

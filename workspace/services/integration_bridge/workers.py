@@ -30,10 +30,13 @@ MIN_ZULIP_USER_ID = 8
 SYNC_RESPONSE_PRIORITY_STREAM = 0
 SYNC_RESPONSE_PRIORITY_STREAM_FINISHED = 1
 SYNC_RESPONSE_PRIORITY_SYNC_STARTED = 5
+SYNC_RESPONSE_PRIORITY_OUTBOUND = 6
 SYNC_RESPONSE_PRIORITY_MESSAGE = 10
 SYNC_RESPONSE_PRIORITY_STATE = 20
 SYNC_RESPONSE_PRIORITY_SYNC_FINISHED = 30
 SYNC_RESPONSE_PRIORITY_DEFAULT = SYNC_RESPONSE_PRIORITY_MESSAGE
+MAX_SYNC_QUEUE_SIZE = 1000
+SYNC_QUEUE_PUT_TIMEOUT = 1
 _SYNC_RESPONSE_SEQUENCE = itertools.count()
 NO_VALUE = object()
 
@@ -55,16 +58,23 @@ class PrioritizedSyncResponse:
 
 
 def put_sync_response(output_queue, command):
-    output_queue.put(
-        PrioritizedSyncResponse(
-            priority=getattr(
-                command,
-                "priority",
-                SYNC_RESPONSE_PRIORITY_DEFAULT,
-            ),
-            command=command,
+    response = PrioritizedSyncResponse(
+        priority=getattr(
+            command,
+            "priority",
+            SYNC_RESPONSE_PRIORITY_DEFAULT,
         ),
+        command=command,
     )
+    while True:
+        try:
+            output_queue.put(response, timeout=SYNC_QUEUE_PUT_TIMEOUT)
+            return
+        except queue.Full:
+            LOG.warning(
+                "Zulip sync output queue is full, waiting to enqueue %s",
+                command.__class__.__name__,
+            )
 
 
 def get_sync_response_command(response):
@@ -231,6 +241,12 @@ class AddMessage:
             "event_type": "message",
         }
 
+    def _should_skip_stream_info(self, stream_info):
+        return (
+            stream_info["type"] == "private" and
+            len(set(stream_info["subscriber_ids"])) < 2
+        )
+
     def _get_topic_name(self):
         if self.message["type"] == "private":
             return ZULIP_PRIVATE_TOPIC_NAME
@@ -254,6 +270,15 @@ class AddMessage:
 
     def execute(self, cache):
         stream_info = self._get_stream_info()
+        if self._should_skip_stream_info(stream_info):
+            LOG.warning(
+                "Skip unsupported Zulip private message %s from %s "
+                "with subscriber ids %s",
+                self.message["id"],
+                self.external_account.server_url,
+                stream_info["subscriber_ids"],
+            )
+            return None
         stream = cache.get_or_create_stream(
             external_account=self.external_account,
             stream_info=stream_info,
@@ -362,6 +387,201 @@ class ZulipQueueFailed:
         return None
 
 
+class ZulipOutboundResponse:
+    priority = SYNC_RESPONSE_PRIORITY_OUTBOUND
+
+    def __init__(self, external_account, epoch_version, message_uuid):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.epoch_version = epoch_version
+        self.message_uuid = message_uuid
+
+    def execute(self, cache):
+        return None
+
+
+class ZulipMessageSent(ZulipOutboundResponse):
+    def __init__(
+        self,
+        external_account,
+        epoch_version,
+        message_uuid,
+        zulip_message_id,
+    ):
+        super().__init__(
+            external_account=external_account,
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.zulip_message_id = zulip_message_id
+
+
+class ZulipMessageUpdated(ZulipOutboundResponse):
+    pass
+
+
+class ZulipMessageDeleted(ZulipOutboundResponse):
+    pass
+
+
+class ZulipMessageFailed(ZulipOutboundResponse):
+    def __init__(
+        self,
+        external_account,
+        epoch_version,
+        message_uuid,
+        error,
+    ):
+        super().__init__(
+            external_account=external_account,
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.error = error
+
+
+class ZulipOutboundCommand:
+    def __init__(self, epoch_version, message_uuid):
+        self.epoch_version = epoch_version
+        self.message_uuid = message_uuid
+
+    def _put_failed(self, worker, exc):
+        put_sync_response(
+            worker.output_queue,
+            ZulipMessageFailed(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+                error=str(exc),
+            ),
+        )
+
+
+class SendZulipMessage(ZulipOutboundCommand):
+    def __init__(
+        self,
+        epoch_version,
+        message_uuid,
+        stream_name,
+        topic_name,
+        content,
+    ):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.stream_name = stream_name
+        self.topic_name = topic_name
+        self.content = content
+
+    def execute(self, worker):
+        try:
+            zulip_message_id = worker.send_message(
+                stream_name=self.stream_name,
+                topic_name=self.topic_name,
+                content=self.content,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipMessageSent(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+                zulip_message_id=zulip_message_id,
+            ),
+        )
+
+
+class SendZulipPrivateMessage(ZulipOutboundCommand):
+    def __init__(
+        self,
+        epoch_version,
+        message_uuid,
+        recipient_ids,
+        content,
+    ):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.recipient_ids = recipient_ids
+        self.content = content
+
+    def execute(self, worker):
+        try:
+            zulip_message_id = worker.send_private_message(
+                recipient_ids=self.recipient_ids,
+                content=self.content,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipMessageSent(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+                zulip_message_id=zulip_message_id,
+            ),
+        )
+
+
+class UpdateZulipMessage(ZulipOutboundCommand):
+    def __init__(self, epoch_version, message_uuid, message_id, content):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.message_id = message_id
+        self.content = content
+
+    def execute(self, worker):
+        try:
+            worker.update_message(
+                message_id=self.message_id,
+                content=self.content,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipMessageUpdated(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+            ),
+        )
+
+
+class DeleteZulipMessage(ZulipOutboundCommand):
+    def __init__(self, epoch_version, message_uuid, message_id):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.message_id = message_id
+
+    def execute(self, worker):
+        try:
+            worker.delete_message(message_id=self.message_id)
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipMessageDeleted(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+            ),
+        )
+
+
 class ZulipBridgeWorker(threading.Thread):
     DEFAULT_MESSAGE_FILTERS = {
         "anchor": 0,
@@ -386,6 +606,10 @@ class ZulipBridgeWorker(threading.Thread):
     @property
     def output_queue(self):
         return self._output_queue
+
+    @property
+    def external_account(self):
+        return self._external_account
 
     def stop(self):
         self._stopped = True
@@ -455,6 +679,14 @@ class ZulipBridgeWorker(threading.Thread):
             data.get("code") == "BAD_EVENT_QUEUE_ID"
         ):
             raise BadZulipEventQueue()
+        if "events" not in data:
+            LOG.warning(
+                "Zulip message event queue %s for %s returned no events: %s",
+                queue_id,
+                self._external_account.server_url,
+                data,
+            )
+            raise BadZulipEventQueue()
         return data["events"]
 
     def fetch_streams(self):
@@ -472,6 +704,48 @@ class ZulipBridgeWorker(threading.Thread):
             login=credentials.login,
             token=credentials.token,
             stream_id=stream["stream_id"],
+        )
+
+    def send_message(self, stream_name, topic_name, content):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        data = client.send_message_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            stream_name=stream_name,
+            topic_name=topic_name,
+            content=content,
+        )
+        return data["id"]
+
+    def send_private_message(self, recipient_ids, content):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        data = client.send_private_message_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            recipient_ids=recipient_ids,
+            content=content,
+        )
+        return data["id"]
+
+    def update_message(self, message_id, content):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        return client.update_message_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            message_id=message_id,
+            content=content,
+        )
+
+    def delete_message(self, message_id):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        return client.delete_message_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            message_id=message_id,
         )
 
     def _put_zulip_queue_state(
@@ -675,6 +949,8 @@ class ZulipBridgeWorker(threading.Thread):
                 return
 
     def _execute_command(self, command):
+        if self._stopped and not isinstance(command, StopWorker):
+            return
         try:
             command.execute(self)
         except Exception:

@@ -94,6 +94,21 @@ class MessageDeletedEventPayload(
         types.UUID(),
         required=True,
     )
+    author_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    source_name = properties.property(
+        types.Enum([source.value for source in base.SourceName]),
+        required=True,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(base.ZulipSource),
+            types_dynamic.KindModelType(base.NativeSource),
+        ),
+        required=True,
+    )
 
 
 class FolderEventPayloadBase(

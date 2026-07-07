@@ -876,7 +876,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_event["payload"]["items"][0]["created_at"],
         )
 
-    def test_create_delete_events_use_minimal_payload(self):
+    def test_create_delete_events_use_expected_payload(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
@@ -904,6 +904,14 @@ class MessengerEventsTestCase(unittest.TestCase):
                     message_uuid=message_uuid,
                     stream_uuid=stream_uuid,
                     topic_uuid=topic_uuid,
+                    author_uuid=user_uuid,
+                    source_name="zulip",
+                    source=models.ZulipSource(
+                        stream_id=3,
+                        server_url="https://zulip.example.com",
+                        topic_name="deploys",
+                        message_id=12345,
+                    ),
                 ),
                 events.create_folder_deleted_event(
                     project_id=project_id,
@@ -935,6 +943,18 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual(str(message_uuid), created_events[2]["payload"]["uuid"])
         self.assertEqual(str(topic_uuid), created_events[2]["payload"]["topic_uuid"])
+        self.assertEqual(str(user_uuid), created_events[2]["payload"]["author_uuid"])
+        self.assertEqual("zulip", created_events[2]["payload"]["source_name"])
+        self.assertEqual(
+            {
+                "kind": "zulip",
+                "stream_id": 3,
+                "server_url": "https://zulip.example.com",
+                "topic_name": "deploys",
+                "message_id": 12345,
+            },
+            created_events[2]["payload"]["source"],
+        )
         self._assert_created_event_contract(
             created_events[3], "folder", "deleted", "folder.deleted"
         )
