@@ -30,6 +30,7 @@ from workspace.messenger_api.dm import models
 
 EVENTS_CHANNEL = "workspace_events"
 MESSAGE_OBJECT_TYPE = "message"
+MESSAGE_REACTION_OBJECT_TYPE = "message_reaction"
 STREAM_OBJECT_TYPE = "stream"
 STREAM_BINDING_OBJECT_TYPE = "stream_binding"
 TOPIC_OBJECT_TYPE = "topic"
@@ -45,6 +46,15 @@ MESSAGE_UPDATED_EVENT = event_payloads.MessageUpdatedEventPayload.KIND
 MESSAGE_READ_EVENT = event_payloads.MessageReadEventPayload.KIND
 MESSAGES_READ_EVENT = event_payloads.MessagesReadEventPayload.KIND
 MESSAGE_DELETED_EVENT = event_payloads.MessageDeletedEventPayload.KIND
+MESSAGE_REACTION_CREATED_EVENT = (
+    event_payloads.MessageReactionCreatedEventPayload.KIND
+)
+MESSAGE_REACTION_UPDATED_EVENT = (
+    event_payloads.MessageReactionUpdatedEventPayload.KIND
+)
+MESSAGE_REACTION_DELETED_EVENT = (
+    event_payloads.MessageReactionDeletedEventPayload.KIND
+)
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
 STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
 STREAM_READ_EVENT = event_payloads.StreamReadEventPayload.KIND
@@ -69,6 +79,15 @@ EVENT_METADATA = {
     MESSAGE_READ_EVENT: (MESSAGE_OBJECT_TYPE, READ_ACTION),
     MESSAGES_READ_EVENT: (MESSAGE_OBJECT_TYPE, READ_ACTION),
     MESSAGE_DELETED_EVENT: (MESSAGE_OBJECT_TYPE, DELETED_ACTION),
+    MESSAGE_REACTION_CREATED_EVENT: (
+        MESSAGE_REACTION_OBJECT_TYPE, CREATED_ACTION,
+    ),
+    MESSAGE_REACTION_UPDATED_EVENT: (
+        MESSAGE_REACTION_OBJECT_TYPE, UPDATED_ACTION,
+    ),
+    MESSAGE_REACTION_DELETED_EVENT: (
+        MESSAGE_REACTION_OBJECT_TYPE, DELETED_ACTION,
+    ),
     STREAM_CREATED_EVENT: (STREAM_OBJECT_TYPE, CREATED_ACTION),
     STREAM_UPDATED_EVENT: (STREAM_OBJECT_TYPE, UPDATED_ACTION),
     STREAM_READ_EVENT: (STREAM_OBJECT_TYPE, READ_ACTION),
@@ -397,6 +416,81 @@ def create_message_deleted_event(project_id, user_uuid, message_uuid,
             "source_name": _event_payload_value("source_name", source_name),
             "source": _event_payload_value("source", source),
         },
+        session=session,
+    )
+
+
+def _message_reaction_event_payload(reaction, message, **values):
+    payload = {
+        "uuid": _event_payload_value("uuid", reaction.uuid),
+        "project_id": _event_payload_value("project_id", reaction.project_id),
+        "message_uuid": _event_payload_value(
+            "message_uuid",
+            reaction.message_uuid,
+        ),
+        "user_uuid": _event_payload_value("user_uuid", reaction.user_uuid),
+        "emoji_name": _event_payload_value(
+            "emoji_name",
+            reaction.emoji_name,
+        ),
+        "source_name": _event_payload_value(
+            "source_name",
+            message.source_name,
+        ),
+        "source": _event_payload_value("source", message.source),
+    }
+    payload.update(values)
+    return payload
+
+
+def create_message_reaction_created_event(reaction, message, session=None):
+    return _create_workspace_event(
+        project_id=reaction.project_id,
+        user_uuid=reaction.user_uuid,
+        kind=MESSAGE_REACTION_CREATED_EVENT,
+        payload=_message_reaction_event_payload(reaction, message),
+        session=session,
+    )
+
+
+def create_message_reaction_updated_event(
+    reaction,
+    message,
+    old_message,
+    old_emoji_name,
+    session=None,
+):
+    return _create_workspace_event(
+        project_id=reaction.project_id,
+        user_uuid=reaction.user_uuid,
+        kind=MESSAGE_REACTION_UPDATED_EVENT,
+        payload=_message_reaction_event_payload(
+            reaction,
+            message,
+            old_message_uuid=_event_payload_value(
+                "message_uuid",
+                old_message.uuid,
+            ),
+            old_emoji_name=_event_payload_value(
+                "emoji_name",
+                old_emoji_name,
+            ),
+            old_source_name=_event_payload_value(
+                "source_name",
+                old_message.source_name,
+            ),
+            old_source=_event_payload_value("source", old_message.source),
+        ),
+        session=session,
+    )
+
+
+def create_message_reaction_deleted_event(reaction, message, session=None):
+    return _create_workspace_event(
+        project_id=reaction.project_id,
+        user_uuid=reaction.user_uuid,
+        kind=MESSAGE_REACTION_DELETED_EVENT,
+        payload=_message_reaction_event_payload(reaction, message),
         session=session,
     )
 

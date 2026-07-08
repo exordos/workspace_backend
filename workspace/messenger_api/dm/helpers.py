@@ -1740,7 +1740,7 @@ def _create_workspace_message_reaction_updated_events(project_id,
 def create_workspace_message_reaction(project_id, user_uuid, session=None,
                                       **kwargs):
     message_uuid = kwargs["message_uuid"]
-    get_workspace_user_message(
+    message = get_workspace_user_message(
         project_id=project_id,
         user_uuid=user_uuid,
         message_uuid=message_uuid,
@@ -1752,6 +1752,11 @@ def create_workspace_message_reaction(project_id, user_uuid, session=None,
         **kwargs,
     )
     reaction.insert(session=session)
+    messenger_events.create_message_reaction_created_event(
+        reaction=reaction,
+        message=message,
+        session=session,
+    )
     _create_workspace_message_reaction_updated_events(
         project_id=project_id,
         message_uuid=message_uuid,
@@ -1768,8 +1773,15 @@ def update_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
         reaction_uuid=reaction_uuid,
     )
     old_message_uuid = reaction.message_uuid
+    old_emoji_name = reaction.emoji_name
+    old_message = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=old_message_uuid,
+    )
+    new_message = old_message
     if "message_uuid" in values:
-        get_workspace_user_message(
+        new_message = get_workspace_user_message(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=values["message_uuid"],
@@ -1780,6 +1792,13 @@ def update_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
     reaction.update_dm(values=values)
     reaction.update(session=session)
     new_message_uuid = values.get("message_uuid", old_message_uuid)
+    messenger_events.create_message_reaction_updated_event(
+        reaction=reaction,
+        message=new_message,
+        old_message=old_message,
+        old_emoji_name=old_emoji_name,
+        session=session,
+    )
     _create_workspace_message_reaction_updated_events(
         project_id=project_id,
         message_uuid=old_message_uuid,
@@ -1802,7 +1821,17 @@ def delete_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
         reaction_uuid=reaction_uuid,
     )
     message_uuid = reaction.message_uuid
+    message = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+    )
     reaction.delete(session=session)
+    messenger_events.create_message_reaction_deleted_event(
+        reaction=reaction,
+        message=message,
+        session=session,
+    )
     _create_workspace_message_reaction_updated_events(
         project_id=project_id,
         message_uuid=message_uuid,

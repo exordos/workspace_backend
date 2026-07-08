@@ -27,6 +27,7 @@ class FakeZulipSdkClient:
     sent_message = None
     updated_message = None
     deleted_message_id = None
+    reaction_calls = []
     uploaded_file = None
     registered_queue = None
     register_calls = []
@@ -86,11 +87,16 @@ class FakeZulipSdkClient:
             ],
         }
 
-    def call_endpoint(self, url, method):
-        type(self).subscriber_call = {
+    def call_endpoint(self, url, method, request=None):
+        call = {
             "url": url,
             "method": method,
+            "request": request,
         }
+        type(self).subscriber_call = call
+        if "reactions" in url:
+            type(self).reaction_calls.append(call)
+            return {"result": "success"}
         return type(self).subscriber_response
 
     def register(self, event_types, **kwargs):
@@ -221,6 +227,7 @@ def test_zulip_client_registers_message_event_queue_with_update_and_delete():
     assert FakeZulipSdkClient.registered_queue == {
         "event_types": [
             "message",
+            "reaction",
             "update_message",
             "delete_message",
         ],
@@ -266,6 +273,7 @@ def test_zulip_client_registers_all_events_when_filtered_queue_fails():
         {
             "event_types": [
                 "message",
+                "reaction",
                 "update_message",
                 "delete_message",
             ],
@@ -338,6 +346,64 @@ def test_zulip_client_sends_private_message_with_official_sdk():
         "to": [42],
         "content": "hello",
     }
+
+
+def test_zulip_client_adds_reaction_with_official_sdk():
+    FakeZulipSdkClient.reaction_calls = []
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.add_reaction_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        message_id=12345,
+        emoji_name="thumbs_up",
+    )
+
+    assert result == {"result": "success"}
+    assert FakeZulipSdkClient.reaction_calls == [
+        {
+            "url": "messages/12345/reactions",
+            "method": "POST",
+            "request": {
+                "emoji_name": "thumbs_up",
+                "emoji_code": None,
+                "reaction_type": None,
+            },
+        },
+    ]
+
+
+def test_zulip_client_removes_reaction_with_official_sdk():
+    FakeZulipSdkClient.reaction_calls = []
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    result = client.remove_reaction_with_api_key(
+        login="user@example.com",
+        token="zulip-token",
+        message_id=12345,
+        emoji_name="thumbs_up",
+        emoji_code="1f44d",
+        reaction_type="unicode_emoji",
+    )
+
+    assert result == {"result": "success"}
+    assert FakeZulipSdkClient.reaction_calls == [
+        {
+            "url": "messages/12345/reactions",
+            "method": "DELETE",
+            "request": {
+                "emoji_name": "thumbs_up",
+                "emoji_code": "1f44d",
+                "reaction_type": "unicode_emoji",
+            },
+        },
+    ]
 
 
 def test_zulip_client_updates_message_with_official_sdk():
@@ -477,4 +543,5 @@ def test_zulip_client_gets_stream_subscribers_with_official_sdk():
     assert FakeZulipSdkClient.subscriber_call == {
         "url": "streams/3/members",
         "method": "GET",
+        "request": None,
     }

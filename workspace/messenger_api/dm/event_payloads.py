@@ -109,6 +109,69 @@ class MessageDeletedEventPayload(
         ),
         required=True,
     )
+class MessageReactionEventPayloadBase(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+    models.ModelWithProject,
+):
+    message_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    emoji_name = properties.property(
+        types.String(max_length=128),
+        required=True,
+    )
+    source_name = properties.property(
+        types.Enum([source.value for source in base.SourceName]),
+        required=True,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(base.ZulipSource),
+            types_dynamic.KindModelType(base.NativeSource),
+        ),
+        required=True,
+    )
+    old_message_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    old_emoji_name = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+    )
+    old_source_name = properties.property(
+        types.AllowNone(
+            types.Enum([source.value for source in base.SourceName]),
+        ),
+        default=None,
+    )
+    old_source = properties.property(
+        types.AllowNone(
+            types_dynamic.KindModelSelectorType(
+                types_dynamic.KindModelType(base.ZulipSource),
+                types_dynamic.KindModelType(base.NativeSource),
+            ),
+        ),
+        default=None,
+    )
+
+
+class MessageReactionCreatedEventPayload(MessageReactionEventPayloadBase):
+    KIND = "message_reaction.created"
+
+
+class MessageReactionUpdatedEventPayload(MessageReactionEventPayloadBase):
+    KIND = "message_reaction.updated"
+
+
+class MessageReactionDeletedEventPayload(MessageReactionEventPayloadBase):
+    KIND = "message_reaction.deleted"
 
 
 class FolderEventPayloadBase(
@@ -332,6 +395,9 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageReadEventPayload),
     types_dynamic.KindModelType(MessagesReadEventPayload),
     types_dynamic.KindModelType(MessageDeletedEventPayload),
+    types_dynamic.KindModelType(MessageReactionCreatedEventPayload),
+    types_dynamic.KindModelType(MessageReactionUpdatedEventPayload),
+    types_dynamic.KindModelType(MessageReactionDeletedEventPayload),
     types_dynamic.KindModelType(FolderCreatedEventPayload),
     types_dynamic.KindModelType(FolderUpdatedEventPayload),
     types_dynamic.KindModelType(StreamCreatedEventPayload),

@@ -378,6 +378,56 @@ class DeleteMessage:
         )
 
 
+class AddMessageReaction:
+    priority = SYNC_RESPONSE_PRIORITY_MESSAGE
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+        self.message_id = event["message_id"]
+
+    @property
+    def last_message_id(self):
+        return self.message_id
+
+    def execute(self, cache):
+        return cache.add_message_reaction(
+            external_account=self.external_account,
+            reaction_info={
+                "message_id": self.message_id,
+                "user_id": self.event["user_id"],
+                "emoji_name": self.event["emoji_name"],
+            },
+        )
+
+
+class RemoveMessageReaction:
+    priority = SYNC_RESPONSE_PRIORITY_MESSAGE
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+        self.message_id = event["message_id"]
+
+    @property
+    def last_message_id(self):
+        return self.message_id
+
+    def execute(self, cache):
+        return cache.remove_message_reaction(
+            external_account=self.external_account,
+            reaction_info={
+                "message_id": self.message_id,
+                "user_id": self.event["user_id"],
+                "emoji_name": self.event["emoji_name"],
+            },
+        )
+
+
 class AddStream:
     priority = SYNC_RESPONSE_PRIORITY_STREAM
 
@@ -500,6 +550,18 @@ class ZulipMessageUpdated(ZulipOutboundResponse):
 
 
 class ZulipMessageDeleted(ZulipOutboundResponse):
+    pass
+
+
+class ZulipReactionAdded(ZulipOutboundResponse):
+    pass
+
+
+class ZulipReactionRemoved(ZulipOutboundResponse):
+    pass
+
+
+class ZulipReactionUpdated(ZulipOutboundResponse):
     pass
 
 
@@ -654,6 +716,132 @@ class DeleteZulipMessage(ZulipOutboundCommand):
         put_sync_response(
             worker.output_queue,
             ZulipMessageDeleted(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+            ),
+        )
+
+
+class AddZulipReaction(ZulipOutboundCommand):
+    def __init__(
+        self,
+        epoch_version,
+        message_uuid,
+        message_id,
+        emoji_name,
+        emoji_code=None,
+        reaction_type=None,
+    ):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.message_id = message_id
+        self.emoji_name = emoji_name
+        self.emoji_code = emoji_code
+        self.reaction_type = reaction_type
+
+    def execute(self, worker):
+        try:
+            worker.add_reaction(
+                message_id=self.message_id,
+                emoji_name=self.emoji_name,
+                emoji_code=self.emoji_code,
+                reaction_type=self.reaction_type,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipReactionAdded(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+            ),
+        )
+
+
+class RemoveZulipReaction(ZulipOutboundCommand):
+    def __init__(
+        self,
+        epoch_version,
+        message_uuid,
+        message_id,
+        emoji_name,
+        emoji_code=None,
+        reaction_type=None,
+    ):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.message_id = message_id
+        self.emoji_name = emoji_name
+        self.emoji_code = emoji_code
+        self.reaction_type = reaction_type
+
+    def execute(self, worker):
+        try:
+            worker.remove_reaction(
+                message_id=self.message_id,
+                emoji_name=self.emoji_name,
+                emoji_code=self.emoji_code,
+                reaction_type=self.reaction_type,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipReactionRemoved(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.message_uuid,
+            ),
+        )
+
+
+class UpdateZulipReaction(ZulipOutboundCommand):
+    def __init__(
+        self,
+        epoch_version,
+        message_uuid,
+        old_message_id,
+        old_emoji_name,
+        message_id,
+        emoji_name,
+    ):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=message_uuid,
+        )
+        self.old_message_id = old_message_id
+        self.old_emoji_name = old_emoji_name
+        self.message_id = message_id
+        self.emoji_name = emoji_name
+
+    def execute(self, worker):
+        try:
+            if (
+                self.old_message_id is not None
+                and self.old_emoji_name is not None
+            ):
+                worker.remove_reaction(
+                    message_id=self.old_message_id,
+                    emoji_name=self.old_emoji_name,
+                )
+            worker.add_reaction(
+                message_id=self.message_id,
+                emoji_name=self.emoji_name,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipReactionUpdated(
                 external_account=worker.external_account,
                 epoch_version=self.epoch_version,
                 message_uuid=self.message_uuid,
@@ -909,6 +1097,42 @@ class ZulipBridgeWorker(threading.Thread):
             message_id=message_id,
         )
 
+    def add_reaction(
+        self,
+        message_id,
+        emoji_name,
+        emoji_code=None,
+        reaction_type=None,
+    ):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        return client.add_reaction_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            message_id=message_id,
+            emoji_name=emoji_name,
+            emoji_code=emoji_code,
+            reaction_type=reaction_type,
+        )
+
+    def remove_reaction(
+        self,
+        message_id,
+        emoji_name,
+        emoji_code=None,
+        reaction_type=None,
+    ):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        return client.remove_reaction_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            message_id=message_id,
+            emoji_name=emoji_name,
+            emoji_code=emoji_code,
+            reaction_type=reaction_type,
+        )
+
     def _put_zulip_queue_state(
         self,
         queue_id=NO_VALUE,
@@ -1010,6 +1234,22 @@ class ZulipBridgeWorker(threading.Thread):
         )
         return True
 
+    def _process_reaction(self, event):
+        command_cls = {
+            "add": AddMessageReaction,
+            "remove": RemoveMessageReaction,
+        }.get(event["op"])
+        if command_cls is None:
+            return False
+        put_sync_response(
+            self._output_queue,
+            command_cls(
+                external_account=self._external_account,
+                event=event,
+            ),
+        )
+        return True
+
     def _catch_up_messages(self, last_message_id):
         message_filters = dict(self.DEFAULT_MESSAGE_FILTERS)
         message_filters["anchor"] = last_message_id
@@ -1064,6 +1304,8 @@ class ZulipBridgeWorker(threading.Thread):
             return self._process_message_update(event)
         if event_type == "delete_message":
             return self._process_message_delete(event)
+        if event_type == "reaction":
+            return self._process_reaction(event)
         return False
 
     def _sync_message_events(

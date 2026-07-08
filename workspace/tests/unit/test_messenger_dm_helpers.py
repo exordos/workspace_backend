@@ -2525,14 +2525,18 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             dm_helpers,
             "_create_workspace_message_reaction_updated_events",
         ) as create_events:
-            result = dm_helpers.create_workspace_message_reaction(
-                project_id=project_id,
-                user_uuid=user_uuid,
-                uuid=reaction_uuid,
-                message_uuid=message_uuid,
-                emoji_name="thumbs_up",
-                session=session,
-            )
+            with mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_reaction_created_event",
+            ) as create_reaction_event:
+                result = dm_helpers.create_workspace_message_reaction(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    uuid=reaction_uuid,
+                    message_uuid=message_uuid,
+                    emoji_name="thumbs_up",
+                    session=session,
+                )
 
         self.assertIsInstance(result, FakeWorkspaceMessageReactions)
         self.assertEqual(reaction_uuid, created_reaction["uuid"])
@@ -2546,6 +2550,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
+        )
+        create_reaction_event.assert_called_once_with(
+            reaction=result,
+            message=get_user_message.return_value,
+            session=session,
         )
         create_events.assert_called_once_with(
             project_id=project_id,
@@ -2565,6 +2574,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class ExistingReaction:
             def __init__(self):
                 self.message_uuid = old_message_uuid
+                self.emoji_name = "thumbs_up"
 
             def update_dm(self, values):
                 updated_reaction["values"] = values
@@ -2573,6 +2583,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 updated_reaction["update_session"] = session
 
         existing_reaction = ExistingReaction()
+        old_message = object()
+        new_message = object()
 
         class FakeWorkspaceMessageReactions:
             objects = types.SimpleNamespace(
@@ -2586,11 +2598,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         ), mock.patch.object(
             dm_helpers,
             "get_workspace_user_message",
-            return_value=object(),
+            side_effect=[old_message, new_message],
         ) as get_user_message, mock.patch.object(
             dm_helpers,
             "_create_workspace_message_reaction_updated_events",
-        ) as create_events:
+        ) as create_events, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_message_reaction_updated_event",
+        ) as create_reaction_event:
             result = dm_helpers.update_workspace_message_reaction(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2620,10 +2635,24 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             updated_reaction["values"],
         )
         self.assertIs(session, updated_reaction["update_session"])
-        get_user_message.assert_called_once_with(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            message_uuid=message_uuid,
+        get_user_message.assert_has_calls([
+            mock.call(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=old_message_uuid,
+            ),
+            mock.call(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+            ),
+        ])
+        create_reaction_event.assert_called_once_with(
+            reaction=existing_reaction,
+            message=new_message,
+            old_message=old_message,
+            old_emoji_name="thumbs_up",
+            session=session,
         )
         create_events.assert_has_calls(
             [
@@ -2650,7 +2679,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         class ExistingReaction:
             def __init__(self):
+                self.uuid = reaction_uuid
                 self.message_uuid = message_uuid
+                self.user_uuid = user_uuid
 
             def delete(self, session=None):
                 deleted_reaction["delete_session"] = session
@@ -2666,8 +2697,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             FakeWorkspaceMessageReactions,
         ), mock.patch.object(
             dm_helpers,
+            "get_workspace_user_message",
+            return_value=object(),
+        ) as get_user_message, mock.patch.object(
+            dm_helpers,
             "_create_workspace_message_reaction_updated_events",
-        ) as create_events:
+        ) as create_events, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_message_reaction_deleted_event",
+        ) as create_reaction_event:
             result = dm_helpers.delete_workspace_message_reaction(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2683,6 +2721,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
         self.assertIs(session, deleted_reaction["delete_session"])
+        get_user_message.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+        )
+        create_reaction_event.assert_called_once_with(
+            reaction=mock.ANY,
+            message=get_user_message.return_value,
+            session=session,
+        )
         create_events.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,

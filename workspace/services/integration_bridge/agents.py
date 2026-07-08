@@ -81,16 +81,28 @@ SELECT
     e.object_type,
     e.action
 FROM m_workspace_events AS e
-WHERE e.object_type = 'message'
-  AND e.action IN ('created', 'updated', 'deleted')
-  AND e.epoch_version > %s
-  AND e.payload->>'source_name' = 'zulip'
-  AND e.payload ? 'author_uuid'
-  AND e.payload ? 'source'
-  AND e.user_uuid::text = e.payload->>'author_uuid'
+WHERE e.epoch_version > %s
   AND (
-      e.action <> 'created'
-      OR e.payload #>> '{source,message_id}' IS NULL
+      (
+          e.object_type = 'message'
+          AND e.action IN ('created', 'updated', 'deleted')
+          AND e.payload->>'source_name' = 'zulip'
+          AND e.payload ? 'author_uuid'
+          AND e.payload ? 'source'
+          AND e.user_uuid::text = e.payload->>'author_uuid'
+          AND (
+              e.action <> 'created'
+              OR e.payload #>> '{source,message_id}' IS NULL
+          )
+      )
+      OR (
+          e.object_type = 'message_reaction'
+          AND e.action IN ('created', 'updated', 'deleted')
+          AND e.payload->>'source_name' = 'zulip'
+          AND e.payload ? 'user_uuid'
+          AND e.payload ? 'source'
+          AND e.user_uuid::text = e.payload->>'user_uuid'
+      )
   )
   AND NOT EXISTS (
       SELECT 1
@@ -978,21 +990,22 @@ class WorkspaceIntegrationBridgeCache:
     def _mark_inbound_zulip_events_skipped(
         self,
         external_account,
+        object_type,
         action,
-        message_uuid,
+        payload_uuid,
         after_epoch,
     ):
         events = models.WorkspaceEvent.objects.get_all(
             filters={
                 "project_id": dm_filters.EQ(external_account.project_id),
-                "object_type": dm_filters.EQ("message"),
+                "object_type": dm_filters.EQ(object_type),
                 "action": dm_filters.EQ(action),
                 "epoch_version": dm_filters.GT(after_epoch),
             },
             order_by={"epoch_version": "asc"},
         )
         for event in events:
-            if event.payload["uuid"] != str(message_uuid):
+            if event.payload["uuid"] != str(payload_uuid):
                 continue
             state = models.ZulipOutboundEventState.objects.get_one_or_none(
                 filters={
@@ -1043,8 +1056,9 @@ class WorkspaceIntegrationBridgeCache:
         self._messages[cache_key] = result
         self._mark_inbound_zulip_events_skipped(
             external_account=external_account,
+            object_type="message",
             action="updated",
-            message_uuid=message.uuid,
+            payload_uuid=message.uuid,
             after_epoch=before_epoch,
         )
         return result
@@ -1074,12 +1088,99 @@ class WorkspaceIntegrationBridgeCache:
             self._messages.pop(cache_key, None)
             self._mark_inbound_zulip_events_skipped(
                 external_account=external_account,
+                object_type="message",
                 action="deleted",
-                message_uuid=message.uuid,
+                payload_uuid=message.uuid,
                 after_epoch=before_epoch,
             )
             results.append(message)
         return results
+
+    def _get_message_reaction(self, external_account, reaction_info):
+        message = self._get_zulip_workspace_message(
+            external_account=external_account,
+            message_id=reaction_info["message_id"],
+        )
+        if message is None:
+            return None, None, None
+        user_uuid = self._get_required_zulip_user_uuid(
+            external_account=external_account,
+            user_id=reaction_info["user_id"],
+        )
+        reaction = models.WorkspaceMessageReactions.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "message_uuid": dm_filters.EQ(message.uuid),
+                "user_uuid": dm_filters.EQ(user_uuid),
+                "emoji_name": dm_filters.EQ(reaction_info["emoji_name"]),
+            },
+        )
+        return message, user_uuid, reaction
+
+    def add_message_reaction(self, external_account, reaction_info):
+        message, user_uuid, reaction = self._get_message_reaction(
+            external_account=external_account,
+            reaction_info=reaction_info,
+        )
+        if message is None:
+            return None
+        if reaction is not None:
+            return reaction
+        before_epoch = self._get_last_workspace_event_epoch(
+            external_account.project_id,
+        )
+        reaction = messenger_dm_helpers.create_workspace_message_reaction(
+            project_id=external_account.project_id,
+            user_uuid=user_uuid,
+            message_uuid=message.uuid,
+            emoji_name=reaction_info["emoji_name"],
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="message_reaction",
+            action="created",
+            payload_uuid=reaction.uuid,
+            after_epoch=before_epoch,
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="message",
+            action="updated",
+            payload_uuid=message.uuid,
+            after_epoch=before_epoch,
+        )
+        return reaction
+
+    def remove_message_reaction(self, external_account, reaction_info):
+        message, user_uuid, reaction = self._get_message_reaction(
+            external_account=external_account,
+            reaction_info=reaction_info,
+        )
+        if message is None or reaction is None:
+            return None
+        before_epoch = self._get_last_workspace_event_epoch(
+            external_account.project_id,
+        )
+        messenger_dm_helpers.delete_workspace_message_reaction(
+            project_id=external_account.project_id,
+            user_uuid=user_uuid,
+            reaction_uuid=reaction.uuid,
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="message_reaction",
+            action="deleted",
+            payload_uuid=reaction.uuid,
+            after_epoch=before_epoch,
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="message",
+            action="updated",
+            payload_uuid=message.uuid,
+            after_epoch=before_epoch,
+        )
+        return reaction
 
     def _sync_message_read_flag(
         self,
@@ -1494,18 +1595,30 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         payload = event.payload
         if (
             "source_name" not in payload or
-            "author_uuid" not in payload or
             "source" not in payload
         ):
             return False
         if payload["source_name"] != models.SourceName.ZULIP.value:
             return False
-        if (
-            event.action == "created" and
-            self._source_value(payload["source"], "message_id") is not None
-        ):
-            return False
-        return str(event.user_uuid) == str(payload["author_uuid"])
+        if event.object_type == "message":
+            if "author_uuid" not in payload:
+                return False
+            if (
+                event.action == "created" and
+                self._source_value(payload["source"], "message_id") is not None
+            ):
+                return False
+            return str(event.user_uuid) == str(payload["author_uuid"])
+        if event.object_type == "message_reaction":
+            if "user_uuid" not in payload:
+                return False
+            return str(event.user_uuid) == str(payload["user_uuid"])
+        return False
+
+    def _get_zulip_outbound_user_uuid(self, event):
+        if event.object_type == "message_reaction":
+            return event.payload["user_uuid"]
+        return event.payload["author_uuid"]
 
     def _get_zulip_outbound_external_account(self, event):
         payload = event.payload
@@ -1519,7 +1632,9 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 "server_url": dm_filters.EQ(
                     self._source_value(source, "server_url"),
                 ),
-                "user_uuid": dm_filters.EQ(payload["author_uuid"]),
+                "user_uuid": dm_filters.EQ(
+                    self._get_zulip_outbound_user_uuid(event),
+                ),
             },
         )
 
@@ -1622,6 +1737,42 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
     def _get_outbound_message_content(self, event):
         return event.payload["payload"]["content"]
 
+    def _get_previous_message_event_payload(self, event):
+        result = contexts.Context().get_session().execute(
+            """
+            SELECT payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND object_type = 'message'
+              AND action IN ('created', 'updated')
+              AND epoch_version < %s
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (
+                event.project_id,
+                event.epoch_version,
+                event.payload["uuid"],
+            ),
+        )
+        row = result.fetchone()
+        if row is None:
+            return None
+        return row["payload"]
+
+    def _message_payload_content(self, payload):
+        return payload["payload"]["content"]
+
+    def _message_content_changed(self, event):
+        previous_payload = self._get_previous_message_event_payload(event)
+        if previous_payload is None:
+            return True
+        return (
+            self._message_payload_content(previous_payload) !=
+            self._message_payload_content(event.payload)
+        )
+
     def _get_zulip_private_recipient_id(self, event, message, stream):
         if stream.direct_user_uuid is None:
             return None
@@ -1680,6 +1831,8 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         )
 
     def _build_update_zulip_message_command(self, event):
+        if not self._message_content_changed(event):
+            return None
         message = self._get_workspace_message(event)
         if message is None:
             return None
@@ -1708,7 +1861,62 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             message_id=message_id,
         )
 
+    def _get_reaction_message_id(self, event, source_name="source"):
+        message_id = self._source_value(event.payload[source_name], "message_id")
+        if message_id is None:
+            raise RetryCommandLater(
+                "Postpone Zulip reaction because message_id is missing",
+            )
+        return message_id
+
+    def _build_add_zulip_reaction_command(self, event):
+        return workers.AddZulipReaction(
+            epoch_version=event.epoch_version,
+            message_uuid=event.payload["message_uuid"],
+            message_id=self._get_reaction_message_id(event),
+            emoji_name=event.payload["emoji_name"],
+        )
+
+    def _build_remove_zulip_reaction_command(self, event):
+        return workers.RemoveZulipReaction(
+            epoch_version=event.epoch_version,
+            message_uuid=event.payload["message_uuid"],
+            message_id=self._get_reaction_message_id(event),
+            emoji_name=event.payload["emoji_name"],
+        )
+
+    def _old_reaction_source_is_zulip(self, event):
+        return event.payload.get("old_source_name") == (
+            models.SourceName.ZULIP.value
+        )
+
+    def _get_old_reaction_message_id(self, event):
+        if not self._old_reaction_source_is_zulip(event):
+            return None
+        return self._get_reaction_message_id(event, source_name="old_source")
+
+    def _build_update_zulip_reaction_command(self, event):
+        return workers.UpdateZulipReaction(
+            epoch_version=event.epoch_version,
+            message_uuid=event.payload["message_uuid"],
+            old_message_id=self._get_old_reaction_message_id(event),
+            old_emoji_name=event.payload.get("old_emoji_name"),
+            message_id=self._get_reaction_message_id(event),
+            emoji_name=event.payload["emoji_name"],
+        )
+
+    def _build_zulip_reaction_outbound_command(self, event):
+        if event.action == "created":
+            return self._build_add_zulip_reaction_command(event)
+        if event.action == "updated":
+            return self._build_update_zulip_reaction_command(event)
+        if event.action == "deleted":
+            return self._build_remove_zulip_reaction_command(event)
+        return None
+
     def _build_zulip_outbound_command(self, event):
+        if event.object_type == "message_reaction":
+            return self._build_zulip_reaction_outbound_command(event)
         if event.action == "created":
             return self._build_send_zulip_message_command(event)
         if event.action == "updated":
@@ -1895,6 +2103,9 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             (
                 workers.ZulipMessageUpdated,
                 workers.ZulipMessageDeleted,
+                workers.ZulipReactionAdded,
+                workers.ZulipReactionRemoved,
+                workers.ZulipReactionUpdated,
             ),
         ):
             try:
@@ -1912,6 +2123,8 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 workers.AddMessage,
                 workers.UpdateMessage,
                 workers.DeleteMessage,
+                workers.AddMessageReaction,
+                workers.RemoveMessageReaction,
             ),
         ):
             self._update_zulip_queue_state_for_message(command)

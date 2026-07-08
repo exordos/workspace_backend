@@ -43,6 +43,8 @@ class FakeZulipClient:
     upload_calls = None
     update_calls = None
     delete_calls = None
+    add_reaction_calls = None
+    remove_reaction_calls = None
 
     def __init__(self, endpoint):
         type(self).init_endpoint = endpoint
@@ -137,6 +139,44 @@ class FakeZulipClient:
             "login": login,
             "token": token,
             "message_id": message_id,
+        })
+        return {"result": "success"}
+
+    def add_reaction_with_api_key(
+        self,
+        login,
+        token,
+        message_id,
+        emoji_name,
+        emoji_code=None,
+        reaction_type=None,
+    ):
+        type(self).add_reaction_calls.append({
+            "login": login,
+            "token": token,
+            "message_id": message_id,
+            "emoji_name": emoji_name,
+            "emoji_code": emoji_code,
+            "reaction_type": reaction_type,
+        })
+        return {"result": "success"}
+
+    def remove_reaction_with_api_key(
+        self,
+        login,
+        token,
+        message_id,
+        emoji_name,
+        emoji_code=None,
+        reaction_type=None,
+    ):
+        type(self).remove_reaction_calls.append({
+            "login": login,
+            "token": token,
+            "message_id": message_id,
+            "emoji_name": emoji_name,
+            "emoji_code": emoji_code,
+            "reaction_type": reaction_type,
         })
         return {"result": "success"}
 
@@ -813,6 +853,90 @@ def test_zulip_bridge_worker_syncs_single_message_delete_event():
     assert command.message_ids == [104]
 
 
+def test_zulip_bridge_worker_syncs_reaction_add_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 46,
+                    "type": "reaction",
+                    "op": "add",
+                    "message_id": 104,
+                    "user_id": 24,
+                    "emoji_name": "thumbs_up",
+                    "emoji_code": "1f44d",
+                    "reaction_type": "unicode_emoji",
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=45,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 46
+    assert last_message_id == 104
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.AddMessageReaction)
+    assert command.event_id == 46
+    assert command.last_message_id == 104
+    assert command.event["emoji_name"] == "thumbs_up"
+
+
+def test_zulip_bridge_worker_syncs_reaction_remove_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 47,
+                    "type": "reaction",
+                    "op": "remove",
+                    "message_id": 104,
+                    "user_id": 24,
+                    "emoji_name": "thumbs_up",
+                    "emoji_code": "1f44d",
+                    "reaction_type": "unicode_emoji",
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=46,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 47
+    assert last_message_id == 104
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.RemoveMessageReaction)
+    assert command.event_id == 47
+    assert command.last_message_id == 104
+    assert command.event["emoji_name"] == "thumbs_up"
+
+
 def test_zulip_bridge_worker_skips_rendering_only_message_update_event():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.event_calls = []
@@ -1270,6 +1394,100 @@ def test_delete_zulip_message_command_deletes_and_reports_success():
     command = workers.get_sync_response_command(response)
     assert isinstance(command, workers.ZulipMessageDeleted)
     assert command.epoch_version == 57
+
+
+def test_add_zulip_reaction_command_adds_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.add_reaction_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.AddZulipReaction(
+        epoch_version=58,
+        message_uuid="message-uuid",
+        message_id=12345,
+        emoji_name="thumbs_up",
+    ).execute(worker)
+
+    assert FakeZulipClient.add_reaction_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "message_id": 12345,
+            "emoji_name": "thumbs_up",
+            "emoji_code": None,
+            "reaction_type": None,
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipReactionAdded)
+    assert command.epoch_version == 58
+
+
+def test_remove_zulip_reaction_command_removes_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.remove_reaction_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.RemoveZulipReaction(
+        epoch_version=59,
+        message_uuid="message-uuid",
+        message_id=12345,
+        emoji_name="thumbs_up",
+    ).execute(worker)
+
+    assert FakeZulipClient.remove_reaction_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "message_id": 12345,
+            "emoji_name": "thumbs_up",
+            "emoji_code": None,
+            "reaction_type": None,
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipReactionRemoved)
+    assert command.epoch_version == 59
+
+
+def test_update_zulip_reaction_command_removes_then_adds_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.add_reaction_calls = []
+    FakeZulipClient.remove_reaction_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.UpdateZulipReaction(
+        epoch_version=60,
+        message_uuid="message-uuid",
+        old_message_id=12345,
+        old_emoji_name="heart",
+        message_id=12345,
+        emoji_name="thumbs_up",
+    ).execute(worker)
+
+    assert FakeZulipClient.remove_reaction_calls[0]["emoji_name"] == "heart"
+    assert FakeZulipClient.add_reaction_calls[0]["emoji_name"] == "thumbs_up"
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipReactionUpdated)
+    assert command.epoch_version == 60
 
 
 def test_put_sync_response_waits_when_output_queue_is_full():
@@ -1773,6 +1991,96 @@ def test_delete_message_executes_with_cache():
         {
             "external_account": external_account,
             "message_ids": [101, 102],
+        },
+    ]
+
+
+def test_add_message_reaction_executes_with_cache():
+    external_account = _external_account()
+    reaction = object()
+
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def add_message_reaction(self, external_account, reaction_info):
+            self.calls.append({
+                "external_account": external_account,
+                "reaction_info": reaction_info,
+            })
+            return reaction
+
+    cache = FakeCache()
+    command = workers.AddMessageReaction(
+        external_account=external_account,
+        event={
+            "id": 48,
+            "type": "reaction",
+            "op": "add",
+            "message_id": 101,
+            "user_id": 24,
+            "emoji_name": "thumbs_up",
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is reaction
+    assert command.event_id == 48
+    assert command.last_message_id == 101
+    assert cache.calls == [
+        {
+            "external_account": external_account,
+            "reaction_info": {
+                "message_id": 101,
+                "user_id": 24,
+                "emoji_name": "thumbs_up",
+            },
+        },
+    ]
+
+
+def test_remove_message_reaction_executes_with_cache():
+    external_account = _external_account()
+    reaction = object()
+
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def remove_message_reaction(self, external_account, reaction_info):
+            self.calls.append({
+                "external_account": external_account,
+                "reaction_info": reaction_info,
+            })
+            return reaction
+
+    cache = FakeCache()
+    command = workers.RemoveMessageReaction(
+        external_account=external_account,
+        event={
+            "id": 49,
+            "type": "reaction",
+            "op": "remove",
+            "message_id": 101,
+            "user_id": 24,
+            "emoji_name": "thumbs_up",
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is reaction
+    assert command.event_id == 49
+    assert command.last_message_id == 101
+    assert cache.calls == [
+        {
+            "external_account": external_account,
+            "reaction_info": {
+                "message_id": 101,
+                "user_id": 24,
+                "emoji_name": "thumbs_up",
+            },
         },
     ]
 

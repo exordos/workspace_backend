@@ -163,6 +163,38 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertNotIn("message", event)
         self.assertNotIn("kind", event)
 
+    def test_event_row_to_messenger_event_preserves_reaction_event(self):
+        reaction_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        payload = {
+            "kind": "message_reaction.created",
+            "uuid": str(reaction_uuid),
+            "project_id": str(sys_uuid.uuid4()),
+            "message_uuid": str(message_uuid),
+            "user_uuid": str(user_uuid),
+            "emoji_name": "thumbs_up",
+            "source_name": "zulip",
+            "source": {
+                "kind": "zulip",
+                "stream_id": 17,
+                "server_url": "https://zulip.example.test",
+                "topic_name": "general",
+                "message_id": 42,
+            },
+        }
+        row = self._workspace_event_row(
+            payload=payload,
+            object_type="message_reaction",
+            action="created",
+        )
+
+        event = events.event_row_to_messenger_event(row)
+
+        self.assertEqual("message_reaction", event["object_type"])
+        self.assertEqual("created", event["action"])
+        self.assertEqual(payload, event["payload"])
+
     def test_event_row_to_messenger_event_preserves_delete_payload(self):
         topic_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()

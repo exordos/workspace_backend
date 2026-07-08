@@ -985,6 +985,7 @@ class WorkspaceMessageReactions(
 WORKSPACE_EVENT_SCHEMA_VERSION = 1
 WORKSPACE_EVENT_OBJECT_TYPES = (
     "message",
+    "message_reaction",
     "stream",
     "stream_binding",
     "topic",

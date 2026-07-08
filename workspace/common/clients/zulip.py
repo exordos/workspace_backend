@@ -29,10 +29,11 @@ except ImportError:
 
 MESSAGE_EVENT_TYPES = [
     "message",
+    "reaction",
     "update_message",
     "delete_message",
 ]
-MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 2
+MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 3
 
 
 class ZulipClient(common.RESTClientMixIn):
@@ -163,6 +164,46 @@ class ZulipClient(common.RESTClientMixIn):
     ):
         client = self._get_sdk_client(login=login, token=token)
         return client.delete_message(message_id)
+
+    def add_reaction_with_api_key(
+        self,
+        login: str,
+        token: str,
+        message_id: int,
+        emoji_name: str,
+        emoji_code: typing.Optional[str] = None,
+        reaction_type: typing.Optional[str] = None,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.call_endpoint(
+            url=f"messages/{message_id}/reactions",
+            method="POST",
+            request={
+                "emoji_name": emoji_name,
+                "emoji_code": emoji_code,
+                "reaction_type": reaction_type,
+            },
+        )
+
+    def remove_reaction_with_api_key(
+        self,
+        login: str,
+        token: str,
+        message_id: int,
+        emoji_name: str,
+        emoji_code: typing.Optional[str] = None,
+        reaction_type: typing.Optional[str] = None,
+    ):
+        client = self._get_sdk_client(login=login, token=token)
+        return client.call_endpoint(
+            url=f"messages/{message_id}/reactions",
+            method="DELETE",
+            request={
+                "emoji_name": emoji_name,
+                "emoji_code": emoji_code,
+                "reaction_type": reaction_type,
+            },
+        )
 
     def upload_file_with_api_key(
         self,

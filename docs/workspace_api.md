@@ -847,7 +847,8 @@ Realtime side effects:
 | create message | `message.created` | `message` | Full user message snapshot for every stream user. |
 | create unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the new message is unread. |
 | update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
-| create/update/delete reaction | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
+| create/update/delete reaction | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` | `message_reaction` | Reaction snapshot for the acting user. |
+| create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
 | read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`, sent to every stream user. |
@@ -857,8 +858,9 @@ Realtime side effects:
 
 Message reactions are stored in `m_workspace_message_reactions`. Reads are
 scoped to messages visible to the current IAM user. Creating, updating, or
-deleting a reaction emits `message.updated` events for every user that can see
-the message; the message snapshot contains aggregated `reactions`.
+deleting a reaction emits a `message_reaction.*` event for the acting user and
+`message.updated` events for every user that can see the message; the message
+snapshot contains aggregated `reactions`.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -891,6 +893,11 @@ The `reactions` field on message views is an aggregate map:
   "eyes": 1
 }
 ```
+
+Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
+`user_uuid`, `emoji_name`, `source_name`, and `source`. For
+`message_reaction.updated`, `old_message_uuid`, `old_emoji_name`,
+`old_source_name`, and `old_source` describe the previous reaction target.
 
 ## Files
 

@@ -2894,7 +2894,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         ]
         cur.execute(
             """
-            SELECT user_uuid, payload
+            SELECT object_type, action, user_uuid, payload
             FROM m_workspace_events
             WHERE project_id = %s
                 AND epoch_version > %s
@@ -2903,8 +2903,8 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
             (api.project_id, before_reactions_epoch),
         )
         reaction_event_rows = [
-            (str(user_uuid), payload)
-            for user_uuid, payload in cur.fetchall()
+            (object_type, action, str(user_uuid), payload)
+            for object_type, action, user_uuid, payload in cur.fetchall()
         ]
 
     assert stored_reactions == [
@@ -2919,22 +2919,68 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         {"eyes": 1, "heart": 1, "thumbs_up": 1},
         {"heart": 1, "thumbs_up": 1},
     ]
-    assert len(reaction_event_rows) == len(expected_reaction_snapshots) * 2
+    message_event_rows = [
+        row for row in reaction_event_rows
+        if row[0] == "message"
+    ]
+    reaction_state_event_rows = [
+        row for row in reaction_event_rows
+        if row[0] == "message_reaction"
+    ]
+    assert len(message_event_rows) == len(expected_reaction_snapshots) * 2
+    assert all(
+        action == "updated" and payload["kind"] == "message.updated"
+        for _, action, _, payload in message_event_rows
+    )
     assert all(
         payload["kind"] == "message.updated"
-        for _, payload in reaction_event_rows
+        for _, _, _, payload in message_event_rows
     )
     assert all(
         payload["uuid"] == message_uuid
-        for _, payload in reaction_event_rows
+        for _, _, _, payload in message_event_rows
     )
     for index, expected_reactions in enumerate(expected_reaction_snapshots):
-        group = reaction_event_rows[index * 2:index * 2 + 2]
-        assert {user_uuid for user_uuid, _ in group} == expected_event_users
+        group = message_event_rows[index * 2:index * 2 + 2]
+        assert {user_uuid for _, _, user_uuid, _ in group} == expected_event_users
         assert all(
             payload["reactions"] == expected_reactions
-            for _, payload in group
+            for _, _, _, payload in group
         )
+
+    expected_reaction_events = [
+        ("created", str(api.user_uuid), reaction_uuid, "thumbs_up"),
+        ("created", str(api.user_uuid), second_reaction_uuid, "eyes"),
+        ("created", str(other_user), other_reaction_uuid, "thumbs_up"),
+        ("updated", str(api.user_uuid), reaction_uuid, "heart"),
+        ("deleted", str(api.user_uuid), second_reaction_uuid, "eyes"),
+    ]
+    assert len(reaction_state_event_rows) == len(expected_reaction_events)
+    for event_row, expected in zip(
+        reaction_state_event_rows,
+        expected_reaction_events,
+    ):
+        _, action, event_user_uuid, payload = event_row
+        expected_action, expected_user_uuid, expected_uuid, expected_emoji = (
+            expected
+        )
+        assert action == expected_action
+        assert event_user_uuid == expected_user_uuid
+        assert payload["kind"] == f"message_reaction.{expected_action}"
+        assert payload["uuid"] == expected_uuid
+        assert payload["message_uuid"] == message_uuid
+        assert payload["user_uuid"] == expected_user_uuid
+        assert payload["emoji_name"] == expected_emoji
+        assert payload["source_name"] == "native"
+        assert payload["source"]["kind"] == "native"
+        if expected_action == "updated":
+            assert payload["old_message_uuid"] == message_uuid
+            assert payload["old_emoji_name"] == "thumbs_up"
+            assert payload["old_source_name"] == "native"
+            assert payload["old_source"]["kind"] == "native"
+        else:
+            assert "old_message_uuid" not in payload
+            assert "old_emoji_name" not in payload
 
 
 def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
