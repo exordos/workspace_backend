@@ -1058,6 +1058,17 @@ class WorkspaceEvent(
         return self.epoch_version
 
 
+class WorkspaceProject(
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_projects_view"
+
+    @classmethod
+    def get_id_property(cls):
+        return {"project_id": cls.properties.properties["project_id"]}
+
+
 class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,

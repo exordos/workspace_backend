@@ -50,6 +50,39 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         return ExistingStream(**kwargs)
 
+    def test_get_workspace_event_project_ids_uses_project_view(self):
+        first_project_id = sys_uuid.uuid4()
+        second_project_id = sys_uuid.uuid4()
+        get_all = mock.Mock(
+            return_value=[
+                types.SimpleNamespace(project_id=first_project_id),
+                types.SimpleNamespace(project_id=second_project_id),
+            ],
+        )
+
+        class FakeWorkspaceProject:
+            objects = types.SimpleNamespace(get_all=get_all)
+
+        with mock.patch.object(
+            dm_helpers.models, "WorkspaceProject", FakeWorkspaceProject,
+        ):
+            result = dm_helpers._get_workspace_event_project_ids()
+
+        self.assertEqual([first_project_id, second_project_id], result)
+        get_all.assert_called_once_with(order_by={"project_id": "asc"})
+
+    def test_mark_stale_workspace_users_offline_skips_projects_without_users(self):
+        with mock.patch.object(
+            dm_helpers, "_get_stale_workspace_users", return_value=[],
+        ) as get_users, mock.patch.object(
+            dm_helpers, "_get_workspace_event_project_ids",
+        ) as get_project_ids:
+            result = dm_helpers.mark_stale_workspace_users_offline()
+
+        self.assertEqual([], result)
+        get_users.assert_called_once()
+        get_project_ids.assert_not_called()
+
     def test_get_or_create_workspace_user_stream_creates_topic_event_and_returns_view(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

@@ -70,17 +70,10 @@ def _get_workspace_user_event_recipients():
 
 
 def _get_workspace_event_project_ids():
-    bindings = models.WorkspaceStreamBinding.objects.get_all(
+    projects = models.WorkspaceProject.objects.get_all(
         order_by={"project_id": "asc"},
     )
-    events = models.WorkspaceEvent.objects.get_all(
-        order_by={"project_id": "asc"},
-    )
-    project_ids = []
-    for item in list(bindings) + list(events):
-        if item.project_id not in project_ids:
-            project_ids.append(item.project_id)
-    return project_ids
+    return [project.project_id for project in projects]
 
 
 def _create_workspace_user_updated_events(project_id, user, session=None):
@@ -132,7 +125,10 @@ def update_workspace_user_presence(project_id, user_uuid, current_user_uuid,
 def mark_stale_workspace_users_offline(now=None, session=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     cutoff = now - WORKSPACE_USER_OFFLINE_TIMEOUT
-    users = _get_stale_workspace_users(cutoff)
+    users = list(_get_stale_workspace_users(cutoff))
+    if not users:
+        return users
+
     project_ids = _get_workspace_event_project_ids()
     for user in users:
         user.update_dm(
