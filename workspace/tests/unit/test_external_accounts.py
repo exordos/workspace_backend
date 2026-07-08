@@ -15,8 +15,8 @@
 #    under the License.
 
 import datetime
+import types
 import uuid as sys_uuid
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -326,7 +326,7 @@ def test_external_account_sync_creates_external_account_for_zulip_user():
         mock.patch.object(
             account_settings,
             "_get_or_create_workspace_user",
-            return_value=SimpleNamespace(uuid=workspace_user_uuid),
+            return_value=types.SimpleNamespace(uuid=workspace_user_uuid),
         ) as get_workspace_user,
         mock.patch.object(models.ExternalAccount, "insert") as insert_account,
     ):
@@ -678,7 +678,7 @@ def test_external_account_creates_workspace_user_without_empty_email():
 
 
 def test_external_account_user_sync_updates_schedule_after_sync():
-    account = SimpleNamespace(user_sync=mock.Mock(return_value=["user"]))
+    account = types.SimpleNamespace(user_sync=mock.Mock(return_value=["user"]))
     user_sync = models.ExternalAccountUserSync(
         project_id=sys_uuid.uuid4(),
         server_url="https://zulip.example.com",
@@ -741,8 +741,8 @@ def test_external_account_controller_uses_workspace_scope():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -762,8 +762,8 @@ def test_external_account_controller_create_fetches_zulip_profile():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -773,7 +773,7 @@ def test_external_account_controller_create_fetches_zulip_profile():
     created_sync = {}
 
     class FakeExternalAccountUserSync:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_one_or_none=mock.Mock(return_value=None),
         )
 
@@ -850,8 +850,8 @@ def test_external_account_controller_create_binds_existing_user_sync():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -876,7 +876,7 @@ def test_external_account_controller_create_binds_existing_user_sync():
     existing_sync = ExistingSync()
 
     class FakeExternalAccountUserSync:
-        objects = SimpleNamespace(
+        objects = types.SimpleNamespace(
             get_one_or_none=mock.Mock(return_value=existing_sync),
         )
 
@@ -918,8 +918,8 @@ def test_external_account_controller_create_rejects_zulip_user_info():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -946,8 +946,8 @@ def test_external_account_controller_create_rejects_iam_account():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -981,8 +981,8 @@ def test_external_account_controller_update_rejects_zulip_user_info():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -1017,8 +1017,8 @@ def test_external_account_controller_update_rejects_iam_account():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -1048,8 +1048,8 @@ def test_external_account_controller_update_rejects_other_zulip_user():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
@@ -1093,8 +1093,8 @@ def test_external_account_controller_update_accepts_same_zulip_user():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     controller = controllers.ExternalAccountController(
-        SimpleNamespace(
-            context=SimpleNamespace(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
                 project_id=project_id,
                 user_uuid=user_uuid,
             ),
