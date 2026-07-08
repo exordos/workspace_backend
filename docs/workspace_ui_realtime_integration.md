@@ -68,6 +68,10 @@ schema. There is no outer `{ "type": "event", "event": ... }` wrapper.
       "kind": "markdown",
       "content": "Hello"
     },
+    "source_name": "native",
+    "source": {
+      "kind": "native"
+    },
     "read": true,
     "pinned": false,
     "starred": false,
@@ -94,7 +98,16 @@ Delete events are minimal and contain `payload.kind`, the deleted object's
 
 - `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`
-- `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`
+- `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
+  `author_uuid`, `source_name`, `source`
+
+Message reaction changes emit `message_reaction.created`,
+`message_reaction.updated`, or `message_reaction.deleted` for the acting user.
+The payload contains `uuid`, `project_id`, `message_uuid`, `user_uuid`,
+`emoji_name`, `source_name`, and `source`. Update events may also contain
+`old_message_uuid`, `old_emoji_name`, `old_source_name`, and `old_source`.
+The backend also emits `message.updated` snapshots with updated aggregate
+`reactions` for users that can see the message.
 
 Batch stream binding creation uses `payload.items`:
 
@@ -144,6 +157,7 @@ Supported `object_type` and `action` values:
 | object_type | actions |
 | --- | --- |
 | `message` | `created`, `updated`, `deleted`, `read` |
+| `message_reaction` | `created`, `updated`, `deleted` |
 | `stream` | `created`, `updated`, `deleted`, `read` |
 | `stream_binding` | `created` |
 | `topic` | `created`, `updated`, `deleted`, `read` |

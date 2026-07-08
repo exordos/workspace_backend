@@ -515,10 +515,20 @@ Supported source payloads:
   "source_name": "zulip",
   "source": {
     "kind": "zulip",
-    "stream_id": 123
+    "stream_id": 123,
+    "server_url": "https://zulip.example.com",
+    "topic_name": null,
+    "message_id": null
   }
 }
 ```
+
+For Zulip source payloads, `stream_id` is required. `server_url`,
+`topic_name`, and `message_id` may be `null` while the integration bridge is
+still syncing the object. Zulip-backed streams should include `server_url`;
+topics and messages inherit source data from their parent stream/topic, then
+the bridge fills `topic_name` and `message_id` when the external Zulip state is
+known.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -679,6 +689,8 @@ custom folders. Other stream users do not receive a binding-delete event.
 | `is_default` | boolean | no | yes | Whether this is the stream default topic. |
 | `is_done` | boolean | no | action-managed | Current user's done flag. |
 | `notification_mode` | `mute`, `default`, `unmute`, `follow` | no | user-scoped action-managed | Current user's topic notification mode; defaults to `default`. |
+| `source_name` | `native`, `zulip` | no | no | Topic source name; defaults to `native` when omitted. |
+| `source` | object | no | no | Topic source payload. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -762,6 +774,8 @@ The only supported message payload in v1 is markdown:
 | `starred` | boolean | no | yes | Current user's starred flag. |
 | `is_own` | boolean | no | yes | Whether `author_uuid` equals the current user. |
 | `reactions` | object | no | yes | Aggregated reaction counts keyed by `emoji_name`. |
+| `source_name` | `native`, `zulip` | no | no | Message source name; defaults from the selected topic when omitted. |
+| `source` | object | no | no | Message source payload; Zulip `message_id` can be `null` until outbound sync succeeds. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -790,6 +804,10 @@ Response example:
   "payload": {
     "kind": "markdown",
     "content": "Hello, workspace"
+  },
+  "source_name": "native",
+  "source": {
+    "kind": "native"
   },
   "user_uuid": "11111111-1111-1111-1111-111111111111",
   "read": true,
@@ -851,7 +869,7 @@ Realtime side effects:
 | create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
 | read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
-| delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, and `topic_uuid`, sent to every stream user. |
+| delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the deleted message was unread. |
 
 ## Message Reactions
@@ -1046,6 +1064,8 @@ REST `/events/` and websocket delivery use the same flat schema:
     "topic_uuid": "topic-uuid",
     "author_uuid": "author-user-uuid",
     "payload": {"kind": "markdown", "content": "Hello"},
+    "source_name": "native",
+    "source": {"kind": "native"},
     "read": true,
     "pinned": false,
     "starred": false,
@@ -1066,7 +1086,8 @@ plus `payload.kind`. Delete events are minimal:
 
 - `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
 - `topic.deleted`: `kind`, `uuid`, `stream_uuid`
-- `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`
+- `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
+  `author_uuid`, `source_name`, `source`
 
 `stream_bindings.created` is a batch action payload:
 
@@ -1102,6 +1123,7 @@ Supported values:
 | object_type | action | payload.kind examples |
 | --- | --- | --- |
 | `message` | `created`, `updated`, `deleted`, `read` | `message.created`, `message.updated`, `message.deleted`, `message.read` |
+| `message_reaction` | `created`, `updated`, `deleted` | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` |
 | `stream` | `created`, `updated`, `deleted`, `read` | `stream.created`, `stream.updated`, `stream.deleted`, `stream.read` |
 | `stream_binding` | `created` | `stream_bindings.created` |
 | `topic` | `created`, `updated`, `deleted`, `read` | `topic.created`, `topic.updated`, `topic.deleted`, `topic.read` |
