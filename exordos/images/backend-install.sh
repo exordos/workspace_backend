@@ -57,7 +57,7 @@ sudo mkdir -p \
 sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 
 cd "$GC_PATH"
-uv sync
+uv sync --locked --no-dev
 
 for binary in "${WORKSPACE_BINARIES[@]}"; do
     sudo ln -sf "$VENV_PATH/bin/$binary" "/usr/bin/$binary"
