@@ -29,6 +29,19 @@ NGINX_ENABLED="/etc/nginx/sites-enabled/workspace.conf"
 OLD_NGINX_CONFIG="/etc/nginx/conf.d/workspace.conf"
 CORE_UPSTREAM="/etc/nginx/workspace.d/core-upstream.conf"
 
+disable_packaged_nginx_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet nginx.service; then
+            systemctl stop nginx.service
+        fi
+
+        systemctl disable nginx.service >/dev/null 2>&1 || true
+        systemctl reset-failed nginx.service >/dev/null 2>&1 || true
+    fi
+
+    rm -f /etc/systemd/system/multi-user.target.wants/nginx.service
+}
+
 wait_for_nginx_configs() {
     while [ ! -s "$NGINX_CONFIG" ] || [ ! -s "$CORE_UPSTREAM" ]; do
         echo "Waiting for workspace nginx platform configs..."
@@ -44,6 +57,7 @@ else
     fi
 fi
 
+disable_packaged_nginx_service
 rm -f /etc/nginx/sites-enabled/default
 rm -f "$OLD_NGINX_CONFIG"
 mkdir -p "$(dirname "$NGINX_CONFIG")" "$(dirname "$NGINX_ENABLED")"

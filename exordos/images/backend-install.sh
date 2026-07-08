@@ -39,6 +39,15 @@ WORKSPACE_HELPERS=(
     workspace-wait-ready.sh:workspace-wait-ready
 )
 
+disable_packaged_nginx_service() {
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl disable --now nginx.service >/dev/null 2>&1 || true
+        sudo systemctl reset-failed nginx.service >/dev/null 2>&1 || true
+    fi
+
+    sudo rm -f /etc/systemd/system/multi-user.target.wants/nginx.service
+}
+
 sudo apt update
 sudo apt install -y \
     libev-dev \
@@ -70,3 +79,4 @@ for helper in "${WORKSPACE_HELPERS[@]}"; do
 done
 
 sudo rm -f /etc/nginx/sites-enabled/default
+disable_packaged_nginx_service
