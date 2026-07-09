@@ -172,6 +172,61 @@ def test_user_presence_action_updates_current_user_presence(api, db):
     assert resp.status_code == 404, resp.text
 
 
+def test_user_presence_action_skips_event_for_heartbeat(api, db):
+    username = f"user-{api.user_uuid}"
+    conftest.seed_workspace_user(db, api.user_uuid, username)
+    heartbeat_api = conftest.ApiClient(
+        base_url=api.base_url,
+        user_uuid=api.user_uuid,
+        project_id=api.project_id,
+    )
+
+    resp = heartbeat_api.post(
+        f"{USERS}{api.user_uuid}/actions/presence/invoke",
+        json={"status": "idle"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*), max(last_ping_at)
+            FROM m_workspace_events AS events
+            JOIN m_workspace_users AS users
+                ON users.uuid = %s
+            WHERE events.project_id = %s
+                AND events.payload->>'kind' = 'user.updated'
+                AND events.payload->>'uuid' = %s
+            """,
+            (str(api.user_uuid), api.project_id, str(api.user_uuid)),
+        )
+        first_event_count, first_ping_at = cur.fetchone()
+
+    resp = heartbeat_api.post(
+        f"{USERS}{api.user_uuid}/actions/presence/invoke",
+        json={"status": "idle"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*), max(last_ping_at)
+            FROM m_workspace_events AS events
+            JOIN m_workspace_users AS users
+                ON users.uuid = %s
+            WHERE events.project_id = %s
+                AND events.payload->>'kind' = 'user.updated'
+                AND events.payload->>'uuid' = %s
+            """,
+            (str(api.user_uuid), api.project_id, str(api.user_uuid)),
+        )
+        second_event_count, second_ping_at = cur.fetchone()
+
+    assert second_event_count == first_event_count
+    assert second_ping_at >= first_ping_at
+
+
 def test_user_status_is_offline_when_last_ping_is_stale(api, db):
     user_uuid = sys_uuid.uuid4()
     event_recipient_uuid = sys_uuid.uuid4()
@@ -229,6 +284,21 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
     for _, payload in event_rows:
         assert payload["username"] == username
         assert payload["status"] == "offline"
+
+    messenger_dm_helpers.mark_stale_workspace_users_offline()
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'kind' = 'user.updated'
+                AND payload->>'uuid' = %s
+            """,
+            (api.project_id, str(user_uuid)),
+        )
+        assert cur.fetchone()[0] == len(event_rows)
 
     with db.cursor() as cur:
         cur.execute(

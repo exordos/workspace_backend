@@ -33,7 +33,18 @@ worker_cli_opts = [
     cfg.IntOpt(
         "sync-queue-batch-limit",
         default=agents.DEFAULT_SYNC_QUEUE_BATCH_LIMIT,
-        help="Maximum Zulip sync queue commands to process in one iteration",
+        help=(
+            "Deprecated compatibility option; Zulip sync queue is drained "
+            "until empty in each iteration"
+        ),
+    ),
+    cfg.IntOpt(
+        "history-sync-task-batch-limit",
+        default=agents.DEFAULT_HISTORY_SYNC_TASK_BATCH_LIMIT,
+        help=(
+            "Deprecated compatibility option; one Zulip history sync task is "
+            "processed in each iteration"
+        ),
     ),
 ]
 
@@ -51,8 +62,11 @@ def main():
     log = logging.getLogger(__name__)
 
     service = agents.WorkspaceIntegrationBridgeWorker(
-        iter_min_period=3,
+        iter_min_period=1,
         sync_queue_batch_limit=CONF[DOMAIN].sync_queue_batch_limit,
+        history_sync_task_batch_limit=(
+            CONF[DOMAIN].history_sync_task_batch_limit
+        ),
     )
 
     service.add_setup(

@@ -581,7 +581,7 @@ def test_iam_external_account_kind_creates_workspace_user():
         mock.patch.object(
             orm.ObjectCollection,
             "get_one_or_none",
-            return_value=None,
+            side_effect=[None, None],
         ) as get_one_or_none,
         mock.patch.object(models.WorkspaceUser, "insert") as insert,
     ):
@@ -596,11 +596,68 @@ def test_iam_external_account_kind_creates_workspace_user():
     assert workspace_user.first_name == "Admin"
     assert workspace_user.last_name == "Admin"
     assert workspace_user.email == "admin@genesis-core.tech"
-    filters = get_one_or_none.call_args.kwargs["filters"]
-    assert filters["uuid"].value == sys_uuid.UUID(
+    uuid_filters = get_one_or_none.call_args_list[0].kwargs["filters"]
+    username_filters = get_one_or_none.call_args_list[1].kwargs["filters"]
+    assert uuid_filters["uuid"].value == sys_uuid.UUID(
         "00000000-0000-0000-0000-000000000000",
     )
+    assert username_filters["username"].value == "admin"
     insert.assert_called_once_with()
+
+
+def test_iam_external_account_kind_updates_workspace_user_by_username():
+    account_settings = _iam_account_settings()
+    workspace_user = models.WorkspaceUser(
+        uuid=sys_uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        username="admin",
+        source="iam",
+    )
+    workspace_user.save = mock.Mock()
+
+    with mock.patch.object(
+        orm.ObjectCollection,
+        "get_one_or_none",
+        side_effect=[None, workspace_user],
+    ) as get_one_or_none:
+        synced_user = account_settings._sync_iam_user(user=_iam_user())
+
+    assert synced_user is workspace_user
+    assert workspace_user.uuid == sys_uuid.UUID(
+        "11111111-1111-1111-1111-111111111111",
+    )
+    assert workspace_user.username == "admin"
+    assert workspace_user.status == "active"
+    assert workspace_user.first_name == "Admin"
+    assert workspace_user.last_name == "Admin"
+    assert workspace_user.email == "admin@genesis-core.tech"
+    username_filters = get_one_or_none.call_args_list[1].kwargs["filters"]
+    assert username_filters["username"].value == "admin"
+    workspace_user.save.assert_called_once_with()
+
+
+def test_iam_external_account_kind_skips_unchanged_workspace_user_save():
+    account_settings = _iam_account_settings()
+    workspace_user = models.WorkspaceUser(
+        uuid=sys_uuid.UUID("00000000-0000-0000-0000-000000000000"),
+        username="admin",
+        source="iam",
+        status="idle",
+        first_name="Admin",
+        last_name="Admin",
+        email="admin@genesis-core.tech",
+    )
+    workspace_user.save = mock.Mock()
+
+    with mock.patch.object(
+        orm.ObjectCollection,
+        "get_one_or_none",
+        return_value=workspace_user,
+    ):
+        synced_user = account_settings._sync_iam_user(user=_iam_user())
+
+    assert synced_user is workspace_user
+    assert workspace_user.status == "idle"
+    workspace_user.save.assert_not_called()
 
 
 def test_external_account_normalizes_empty_zulip_user_fields():

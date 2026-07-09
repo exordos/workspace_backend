@@ -48,6 +48,11 @@ MUTED_STREAM_TOPIC_NOTIFICATION_MODES = TOPIC_NOTIFICATION_MODES | {
     models.WorkspaceTopicNotificationMode.UNMUTE.value,
 }
 WORKSPACE_USER_OFFLINE_TIMEOUT = datetime.timedelta(minutes=1)
+WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
+    "status",
+    "status_emoji",
+    "status_text",
+)
 
 
 def _random_color():
@@ -96,6 +101,16 @@ def _get_stale_workspace_users(cutoff):
     )
 
 
+def _should_create_workspace_user_presence_event(user, values):
+    for field_name in WORKSPACE_USER_PRESENCE_EVENT_FIELDS:
+        if (
+            field_name in values
+            and getattr(user, field_name) != values[field_name]
+        ):
+            return True
+    return False
+
+
 def update_workspace_user_presence(project_id, user_uuid, current_user_uuid,
                                    values, session=None):
     if user_uuid != current_user_uuid:
@@ -111,14 +126,19 @@ def update_workspace_user_presence(project_id, user_uuid, current_user_uuid,
         session=session,
     )
     values = dict(values)
+    should_create_event = _should_create_workspace_user_presence_event(
+        user=user,
+        values=values,
+    )
     values["last_ping_at"] = datetime.datetime.now(datetime.timezone.utc)
     user.update_dm(values=values)
     user.update(session=session)
-    _create_workspace_user_updated_events(
-        project_id=project_id,
-        user=user,
-        session=session,
-    )
+    if should_create_event:
+        _create_workspace_user_updated_events(
+            project_id=project_id,
+            user=user,
+            session=session,
+        )
     return user
 
 

@@ -15,6 +15,7 @@
 #    under the License.
 
 import io
+import json
 import typing
 import urllib.parse
 
@@ -34,6 +35,14 @@ MESSAGE_EVENT_TYPES = [
     "delete_message",
 ]
 MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 3
+MESSAGE_EVENT_REGISTER_TIMEOUT = 30
+MESSAGE_EVENT_LONGPOLL_TIMEOUT = 10
+MESSAGE_FETCH_TIMEOUT = 30
+USER_FETCH_TIMEOUT = 30
+STREAM_FETCH_TIMEOUT = 30
+STREAM_MEMBERS_FETCH_TIMEOUT = 30
+INVALID_MESSAGE_CODE = "BAD_REQUEST"
+INVALID_MESSAGE_MSG = "Invalid message(s)"
 
 
 class ZulipClient(common.RESTClientMixIn):
@@ -68,6 +77,63 @@ class ZulipClient(common.RESTClientMixIn):
             site=self._endpoint,
         )
 
+    def _build_api_url(self, path: str):
+        return urllib.parse.urljoin(
+            f"{self._endpoint.rstrip('/')}/",
+            f"api/v1/{path.lstrip('/')}",
+        )
+
+    def _format_api_params(
+        self,
+        params: typing.Optional[typing.Dict[str, typing.Any]],
+    ):
+        if params is None:
+            return None
+        formatted = {}
+        for key, value in params.items():
+            if value is None:
+                continue
+            if isinstance(value, (bool, list, dict)):
+                value = json.dumps(value)
+            formatted[key] = value
+        return formatted
+
+    def _get_api_json_with_api_key(
+        self,
+        login: str,
+        token: str,
+        path: str,
+        params: typing.Optional[typing.Dict[str, typing.Any]] = None,
+        timeout: typing.Optional[int] = None,
+    ):
+        if timeout is None:
+            timeout = self._timeout
+        response = requests.get(
+            self._build_api_url(path),
+            auth=(login, token),
+            params=self._format_api_params(params),
+            timeout=timeout,
+        )
+        return response.json()
+
+    def _post_api_json_with_api_key(
+        self,
+        login: str,
+        token: str,
+        path: str,
+        data: typing.Optional[typing.Dict[str, typing.Any]] = None,
+        timeout: typing.Optional[int] = None,
+    ):
+        if timeout is None:
+            timeout = self._timeout
+        response = requests.post(
+            self._build_api_url(path),
+            auth=(login, token),
+            data=self._format_api_params(data),
+            timeout=timeout,
+        )
+        return response.json()
+
     def get_current_user(
         self,
         headers: typing.Dict[str, str],
@@ -91,16 +157,24 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
     ) -> typing.Dict[str, typing.Any]:
-        client = self._get_sdk_client(login=login, token=token)
-        return client.get_profile()
+        return self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="users/me",
+            timeout=USER_FETCH_TIMEOUT,
+        )
 
     def get_users_with_api_key(
         self,
         login: str,
         token: str,
     ):
-        client = self._get_sdk_client(login=login, token=token)
-        data = client.get_members()
+        data = self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="users",
+            timeout=USER_FETCH_TIMEOUT,
+        )
         return data["members"]
 
     def get_messages_with_api_key(
@@ -109,9 +183,37 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         message_filters: typing.Dict[str, typing.Any],
     ):
-        client = self._get_sdk_client(login=login, token=token)
-        data = client.get_messages(message_filters)
+        data = self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="messages",
+            params=message_filters,
+            timeout=MESSAGE_FETCH_TIMEOUT,
+        )
         return data["messages"]
+
+    def get_message_with_api_key(
+        self,
+        login: str,
+        token: str,
+        message_id: int,
+    ):
+        data = self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path=f"messages/{message_id}",
+            params={
+                "apply_markdown": False,
+                "allow_empty_topic_name": True,
+            },
+            timeout=MESSAGE_FETCH_TIMEOUT,
+        )
+        if (
+            data.get("code") == INVALID_MESSAGE_CODE and
+            data.get("msg") == INVALID_MESSAGE_MSG
+        ):
+            return None
+        return data["message"]
 
     def send_message_with_api_key(
         self,
@@ -238,14 +340,20 @@ class ZulipClient(common.RESTClientMixIn):
             "content_type": response.headers.get("Content-Type"),
         }
 
-    def _register_message_event_queue(self, client, event_types):
-        return client.register(
-            event_types=event_types,
-            apply_markdown=False,
-            client_capabilities={
-                "notification_settings_null": True,
-                "bulk_message_deletion": True,
+    def _register_message_event_queue(self, login, token, event_types):
+        return self._post_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="register",
+            data={
+                "event_types": event_types,
+                "apply_markdown": False,
+                "client_capabilities": {
+                    "notification_settings_null": True,
+                    "bulk_message_deletion": True,
+                },
             },
+            timeout=MESSAGE_EVENT_REGISTER_TIMEOUT,
         )
 
     def _is_registered_event_queue(self, data):
@@ -260,15 +368,16 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
     ):
-        client = self._get_sdk_client(login=login, token=token)
         data = self._register_message_event_queue(
-            client=client,
+            login=login,
+            token=token,
             event_types=MESSAGE_EVENT_TYPES,
         )
         if self._is_registered_event_queue(data):
             return data
         return self._register_message_event_queue(
-            client=client,
+            login=login,
+            token=token,
             event_types=None,
         )
 
@@ -279,10 +388,15 @@ class ZulipClient(common.RESTClientMixIn):
         queue_id: str,
         last_event_id: int,
     ):
-        client = self._get_sdk_client(login=login, token=token)
-        return client.get_events(
-            queue_id=queue_id,
-            last_event_id=last_event_id,
+        return self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="events",
+            params={
+                "queue_id": queue_id,
+                "last_event_id": last_event_id,
+            },
+            timeout=MESSAGE_EVENT_LONGPOLL_TIMEOUT,
         )
 
     def get_streams_with_api_key(
@@ -290,12 +404,16 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
     ):
-        client = self._get_sdk_client(login=login, token=token)
-        stream_filters = {
-            "include_all": True,
-            "exclude_archived": False,
-        }
-        data = client.get_streams(**stream_filters)
+        data = self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="streams",
+            params={
+                "include_all": True,
+                "exclude_archived": False,
+            },
+            timeout=STREAM_FETCH_TIMEOUT,
+        )
         return data["streams"]
 
     def get_stream_subscribers_with_api_key(
@@ -304,10 +422,11 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         stream_id: int,
     ):
-        client = self._get_sdk_client(login=login, token=token)
-        data = client.call_endpoint(
-            url=f"streams/{stream_id}/members",
-            method="GET",
+        data = self._get_api_json_with_api_key(
+            login=login,
+            token=token,
+            path=f"streams/{stream_id}/members",
+            timeout=STREAM_MEMBERS_FETCH_TIMEOUT,
         )
         return data["subscribers"]
 

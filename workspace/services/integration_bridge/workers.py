@@ -24,6 +24,8 @@ import threading
 import urllib.parse
 import uuid as sys_uuid
 
+import requests
+
 from workspace.common.clients import zulip as zulip_client
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
@@ -35,6 +37,7 @@ MIN_ZULIP_USER_ID = 8
 SYNC_RESPONSE_PRIORITY_STREAM = 0
 SYNC_RESPONSE_PRIORITY_STREAM_FINISHED = 1
 SYNC_RESPONSE_PRIORITY_SYNC_STARTED = 5
+SYNC_RESPONSE_PRIORITY_QUEUE_CREATED = 6
 SYNC_RESPONSE_PRIORITY_OUTBOUND = 6
 SYNC_RESPONSE_PRIORITY_MESSAGE = 10
 SYNC_RESPONSE_PRIORITY_STATE = 20
@@ -105,6 +108,17 @@ class BadZulipEventQueue(Exception):
     pass
 
 
+def should_process_message(message):
+    if message["sender_id"] >= MIN_ZULIP_USER_ID:
+        return True
+    LOG.debug(
+        "Skip Zulip system message %s from user %s",
+        message["id"],
+        message["sender_id"],
+    )
+    return False
+
+
 class SyncStreams:
     def __init__(self, event_owner):
         self.event_owner = event_owner
@@ -149,31 +163,28 @@ class SyncMessages:
             worker.sync_messages(
                 queue_id=self.queue_id,
                 last_event_id=self.last_event_id,
-                last_message_id=self.last_message_id,
-                is_synced=self.is_synced,
             )
         finally:
             if self.on_finished is not None:
                 self.on_finished()
 
 
-class CreateZulipQueueAndFetchMessages:
+class CreateZulipEventQueue:
     def __init__(
         self,
-        last_message_id=0,
         on_finished=None,
     ):
-        self.last_message_id = last_message_id
         self.on_finished = on_finished
 
     def execute(self, worker):
         try:
-            worker.create_queue_and_fetch_messages(
-                last_message_id=self.last_message_id,
-            )
+            worker.create_queue()
         finally:
             if self.on_finished is not None:
                 self.on_finished()
+
+
+CreateZulipQueueAndFetchMessages = CreateZulipEventQueue
 
 
 def get_event_owner(external_account):
@@ -261,7 +272,7 @@ class AddMessage:
     def _should_skip_stream_info(self, stream_info):
         return (
             stream_info["type"] == "private" and
-            len(set(stream_info["subscriber_ids"])) < 2
+            len(set(stream_info["subscriber_ids"])) != 2
         )
 
     def _get_topic_name(self):
@@ -286,6 +297,8 @@ class AddMessage:
         }
 
     def execute(self, cache):
+        if not should_process_message(self.message):
+            return None
         stream_info = self._get_stream_info()
         if self._should_skip_stream_info(stream_info):
             LOG.warning(
@@ -507,6 +520,17 @@ class FinishZulipMessageCatchUp:
 
 class ZulipQueueFailed:
     priority = SYNC_RESPONSE_PRIORITY_SYNC_STARTED
+
+    def __init__(self, external_account):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+
+    def execute(self, cache):
+        return None
+
+
+class ZulipEventQueueCreated:
+    priority = SYNC_RESPONSE_PRIORITY_QUEUE_CREATED
 
     def __init__(self, external_account):
         self.external_account = external_account
@@ -925,6 +949,12 @@ class ZulipBridgeWorker(threading.Thread):
             is_synced=False,
             priority=SYNC_RESPONSE_PRIORITY_SYNC_STARTED,
         )
+        put_sync_response(
+            self._output_queue,
+            ZulipEventQueueCreated(
+                external_account=self._external_account,
+            ),
+        )
         LOG.info(
             "Registered Zulip message event queue %s for %s",
             queue_id,
@@ -942,6 +972,8 @@ class ZulipBridgeWorker(threading.Thread):
                 queue_id=queue_id,
                 last_event_id=last_event_id,
             )
+        except requests.exceptions.ReadTimeout:
+            return []
         except Exception as exc:
             if "BAD_EVENT_QUEUE_ID" in str(exc):
                 raise BadZulipEventQueue() from exc
@@ -1188,14 +1220,7 @@ class ZulipBridgeWorker(threading.Thread):
         )
 
     def _should_process_message(self, message):
-        if message["sender_id"] >= MIN_ZULIP_USER_ID:
-            return True
-        LOG.debug(
-            "Skip Zulip system message %s from user %s",
-            message["id"],
-            message["sender_id"],
-        )
-        return False
+        return should_process_message(message)
 
     def _process_message(self, message, event_id=None):
         if not self._should_process_message(message):
@@ -1348,34 +1373,18 @@ class ZulipBridgeWorker(threading.Thread):
             message["flags"] = event["flags"]
         return message
 
-    def create_queue_and_fetch_messages(self, last_message_id=0):
+    def create_queue(self):
         self.register_message_event_queue()
-        self._catch_up_messages(last_message_id)
+
+    def create_queue_and_fetch_messages(self, last_message_id=0):
+        self.create_queue()
 
     def sync_messages(
         self,
         queue_id,
         last_event_id=-1,
-        last_message_id=0,
-        is_synced=False,
     ):
-        if not is_synced:
-            try:
-                last_event_id, last_message_id = self._sync_message_events(
-                    queue_id=queue_id,
-                    last_event_id=last_event_id,
-                    last_message_id=last_message_id,
-                )
-            except BadZulipEventQueue:
-                LOG.warning(
-                    "Zulip message event queue %s for %s is dead",
-                    queue_id,
-                    self._external_account.server_url,
-                )
-                self._fail_zulip_queue()
-                return
-            last_message_id = self._catch_up_messages(last_message_id)
-
+        last_message_id = 0
         while not self._stopped:
             self._process_pending_commands()
             if self._stopped:

@@ -63,6 +63,11 @@ ZULIP_OUTBOUND_EVENT_STATUSES = (
     "skipped",
     "failed",
 )
+ZULIP_HISTORY_SYNC_TASK_STATUSES = (
+    "pending",
+    "done",
+    "failed",
+)
 
 
 class ZulipProcessedEntity(
@@ -130,6 +135,44 @@ class ZulipEventQueueState(
     subscription_version = properties.property(
         types.Integer(min_value=1),
         default=1,
+    )
+
+
+class ZulipHistorySyncTask(
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_zulip_history_sync_tasks"
+
+    external_account_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    server_url = properties.property(
+        types.Url(),
+        required=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    from_message_id = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    to_message_id = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    status = properties.property(
+        types.Enum(ZULIP_HISTORY_SYNC_TASK_STATUSES),
+        default="pending",
+    )
+    last_error = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
     )
 
 
@@ -677,12 +720,16 @@ class IamExternalAccountKind(types_dynamic.AbstractKindModel):
             "last_name": self._empty_to_none(user.get("last_name")),
             "email": self._empty_to_none(user["email"]),
         }
-        workspace_user = WorkspaceUser.objects.get_one_or_none(
-            filters={"uuid": dm_filters.EQ(user_uuid)},
+        workspace_user = self._get_workspace_user_for_iam_sync(
+            user_uuid=user_uuid,
+            username=user["username"],
         )
         if workspace_user is not None:
-            workspace_user.update_dm(values=values)
-            workspace_user.save()
+            values.pop("status")
+            self._update_workspace_user_if_changed(
+                workspace_user=workspace_user,
+                values=values,
+            )
             return workspace_user
 
         workspace_user = WorkspaceUser(
@@ -691,6 +738,26 @@ class IamExternalAccountKind(types_dynamic.AbstractKindModel):
         )
         workspace_user.insert()
         return workspace_user
+
+    def _update_workspace_user_if_changed(self, workspace_user, values):
+        changed_values = {
+            name: value for name, value in values.items()
+            if getattr(workspace_user, name) != value
+        }
+        if not changed_values:
+            return
+        workspace_user.update_dm(values=changed_values)
+        workspace_user.save()
+
+    def _get_workspace_user_for_iam_sync(self, user_uuid, username):
+        workspace_user = WorkspaceUser.objects.get_one_or_none(
+            filters={"uuid": dm_filters.EQ(user_uuid)},
+        )
+        if workspace_user is not None:
+            return workspace_user
+        return WorkspaceUser.objects.get_one_or_none(
+            filters={"username": dm_filters.EQ(username)},
+        )
 
     @staticmethod
     def _empty_to_none(value):

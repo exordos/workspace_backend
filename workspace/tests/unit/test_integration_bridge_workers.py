@@ -91,7 +91,10 @@ class FakeZulipClient:
             "queue_id": queue_id,
             "last_event_id": last_event_id,
         })
-        return type(self).event_pages.pop(0)
+        event_page = type(self).event_pages.pop(0)
+        if isinstance(event_page, Exception):
+            raise event_page
+        return event_page
 
     def send_message_with_api_key(
         self,
@@ -336,6 +339,34 @@ def test_zulip_bridge_worker_fetches_events():
             "type": "heartbeat",
         },
     ]
+    assert FakeZulipClient.event_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "queue_id": "queue-1",
+            "last_event_id": 42,
+        },
+    ]
+
+
+def test_zulip_bridge_worker_treats_event_read_timeout_as_empty_batch():
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        workers.requests.exceptions.ReadTimeout("long poll timeout"),
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=queue.PriorityQueue(),
+        client_cls=FakeZulipClient,
+    )
+
+    events = worker.fetch_events(
+        queue_id="queue-1",
+        last_event_id=42,
+    )
+
+    assert events == []
     assert FakeZulipClient.event_calls == [
         {
             "login": "user@example.com",
@@ -1038,7 +1069,7 @@ def test_zulip_bridge_worker_reports_message_queue_without_events_as_dead():
     assert FakeZulipClient.calls == []
 
 
-def test_zulip_bridge_worker_creates_queue_before_catch_up():
+def test_zulip_bridge_worker_creates_queue_and_reports_created_event():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.register_calls = []
     FakeZulipClient.registered_queue = {
@@ -1054,9 +1085,7 @@ def test_zulip_bridge_worker_creates_queue_before_catch_up():
         client_cls=FakeZulipClient,
     )
 
-    workers.CreateZulipQueueAndFetchMessages(
-        last_message_id=103,
-    ).execute(worker)
+    workers.CreateZulipEventQueue().execute(worker)
 
     first_response = output_queue.get_nowait()
     second_response = output_queue.get_nowait()
@@ -1066,20 +1095,9 @@ def test_zulip_bridge_worker_creates_queue_before_catch_up():
     assert first_command.queue_id == "queue-1"
     assert first_command.last_event_id == 42
     assert first_command.is_synced is False
-    assert isinstance(second_command, workers.FinishZulipMessageCatchUp)
-    assert second_command.last_message_id == 103
-    assert FakeZulipClient.calls == [
-        {
-            "login": "user@example.com",
-            "token": "zulip-token",
-            "message_filters": {
-                "anchor": 103,
-                "num_before": 0,
-                "num_after": 100,
-                "apply_markdown": False,
-            },
-        },
-    ]
+    assert isinstance(second_command, workers.ZulipEventQueueCreated)
+    assert second_command.external_account is worker._external_account
+    assert FakeZulipClient.calls == []
 
 
 def test_zulip_bridge_worker_processes_message_with_output_queue():
@@ -1758,6 +1776,109 @@ def test_add_message_skips_single_subscriber_private_message():
             ],
             "sender_id": 8,
             "content": "self dm",
+            "flags": [],
+            "timestamp": 1770998098,
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is None
+    assert cache.calls == []
+
+
+def test_add_message_skips_group_private_message():
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def get_or_create_stream(self, external_account, stream_info):
+            self.calls.append("get_or_create_stream")
+
+        def get_or_create_topic(
+            self,
+            external_account,
+            stream,
+            stream_info,
+            topic_name,
+        ):
+            self.calls.append("get_or_create_topic")
+
+        def get_or_create_message(
+            self,
+            external_account,
+            stream,
+            topic,
+            stream_info,
+            topic_name,
+            message_info,
+        ):
+            self.calls.append("get_or_create_message")
+
+    cache = FakeCache()
+    command = workers.AddMessage(
+        external_account=_external_account(),
+        message={
+            "id": 83,
+            "type": "private",
+            "recipient_id": 83,
+            "display_recipient": [
+                {"id": 8, "full_name": "Admin"},
+                {"id": 9, "full_name": "Eugene"},
+                {"id": 10, "full_name": "Gmelikov"},
+            ],
+            "sender_id": 8,
+            "content": "group dm",
+            "flags": [],
+            "timestamp": 1770998098,
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is None
+    assert cache.calls == []
+
+
+def test_add_message_skips_system_user_message():
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def get_or_create_stream(self, external_account, stream_info):
+            self.calls.append("get_or_create_stream")
+
+        def get_or_create_topic(
+            self,
+            external_account,
+            stream,
+            stream_info,
+            topic_name,
+        ):
+            self.calls.append("get_or_create_topic")
+
+        def get_or_create_message(
+            self,
+            external_account,
+            stream,
+            topic,
+            stream_info,
+            topic_name,
+            message_info,
+        ):
+            self.calls.append("get_or_create_message")
+
+    cache = FakeCache()
+    command = workers.AddMessage(
+        external_account=_external_account(),
+        message={
+            "id": 84,
+            "type": "stream",
+            "stream_id": 3,
+            "display_recipient": "general",
+            "subject": "deploys",
+            "sender_id": 7,
+            "content": "system message",
             "flags": [],
             "timestamp": 1770998098,
         },

@@ -28,10 +28,12 @@ class FakeZulipSdkClient:
     updated_message = None
     deleted_message_id = None
     reaction_calls = []
+    message_call = None
     uploaded_file = None
     registered_queue = None
     register_calls = []
     register_responses = None
+    event_call = None
 
     def __init__(self, email, api_key, site):
         self.init_values = {
@@ -87,12 +89,54 @@ class FakeZulipSdkClient:
             ],
         }
 
-    def call_endpoint(self, url, method, request=None):
+    def call_endpoint(
+        self,
+        url,
+        method,
+        request=None,
+        timeout=None,
+        **kwargs,
+    ):
         call = {
             "url": url,
             "method": method,
             "request": request,
+            "timeout": timeout,
         }
+        if url == "messages":
+            type(self).message_call = call
+            return {
+                "result": "success",
+                "messages": [
+                    {
+                        "id": 100,
+                        "content": "hello",
+                        "filters": request,
+                    },
+                ],
+            }
+        if url == "messages/404":
+            type(self).message_call = call
+            return {
+                "result": "error",
+                "code": "BAD_REQUEST",
+                "msg": "Invalid message(s)",
+            }
+        if url.startswith("messages/") and "reactions" not in url:
+            type(self).message_call = call
+            return {
+                "result": "success",
+                "message": {
+                    "id": 100,
+                    "content": "hello",
+                },
+            }
+        if url == "events":
+            type(self).event_call = call
+            return {
+                "result": "success",
+                "events": [],
+            }
         type(self).subscriber_call = call
         if "reactions" in url:
             type(self).reaction_calls.append(call)
@@ -140,35 +184,60 @@ class FakeZulipSdkClient:
         }
 
 
-def test_zulip_client_uses_official_sdk_for_profile():
+def test_zulip_client_gets_profile_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {"result": "success", "user_id": 42}
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
         client_cls=FakeZulipSdkClient,
     )
 
-    data = client.get_current_user_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        data = client.get_current_user_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+        )
 
     assert data == {"result": "success", "user_id": 42}
-    assert FakeZulipSdkClient.init_values == {
-        "email": "user@example.com",
-        "api_key": "zulip-token",
-        "site": "https://zulip.example.com",
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/users/me",
+        auth=("user@example.com", "zulip-token"),
+        params=None,
+        timeout=zulip.USER_FETCH_TIMEOUT,
+    )
+
+
+def test_zulip_client_gets_members_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "success",
+        "members": [
+            {
+                "user_id": 42,
+                "email": "user@example.com",
+                "delivery_email": "user@example.com",
+                "full_name": "User Example",
+            },
+        ],
     }
-
-
-def test_zulip_client_gets_members_with_official_sdk():
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
         client_cls=FakeZulipSdkClient,
     )
 
-    members = client.get_users_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        members = client.get_users_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+        )
 
     assert members == [
         {
@@ -178,9 +247,25 @@ def test_zulip_client_gets_members_with_official_sdk():
             "full_name": "User Example",
         },
     ]
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/users",
+        auth=("user@example.com", "zulip-token"),
+        params=None,
+        timeout=zulip.USER_FETCH_TIMEOUT,
+    )
 
 
-def test_zulip_client_gets_messages_with_official_sdk():
+def test_zulip_client_gets_messages_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "success",
+        "messages": [
+            {
+                "id": 100,
+                "content": "hello",
+            },
+        ],
+    }
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
         client_cls=FakeZulipSdkClient,
@@ -191,111 +276,257 @@ def test_zulip_client_gets_messages_with_official_sdk():
         "num_after": 0,
     }
 
-    messages = client.get_messages_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-        message_filters=message_filters,
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        messages = client.get_messages_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            message_filters=message_filters,
+        )
 
     assert messages == [
         {
             "id": 100,
             "content": "hello",
-            "filters": message_filters,
         },
     ]
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/messages",
+        auth=("user@example.com", "zulip-token"),
+        params=message_filters,
+        timeout=zulip.MESSAGE_FETCH_TIMEOUT,
+    )
+
+
+def test_zulip_client_gets_single_message_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "success",
+        "message": {
+            "id": 100,
+            "content": "hello",
+        },
+    }
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        message = client.get_message_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            message_id=100,
+        )
+
+    assert message == {
+        "id": 100,
+        "content": "hello",
+    }
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/messages/100",
+        auth=("user@example.com", "zulip-token"),
+        params={
+            "apply_markdown": "false",
+            "allow_empty_topic_name": "true",
+        },
+        timeout=zulip.MESSAGE_FETCH_TIMEOUT,
+    )
+
+
+def test_zulip_client_returns_none_for_invalid_single_message():
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "error",
+        "code": "BAD_REQUEST",
+        "msg": "Invalid message(s)",
+    }
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        message = client.get_message_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            message_id=404,
+        )
+
+    assert message is None
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/messages/404",
+        auth=("user@example.com", "zulip-token"),
+        params={
+            "apply_markdown": "false",
+            "allow_empty_topic_name": "true",
+        },
+        timeout=zulip.MESSAGE_FETCH_TIMEOUT,
+    )
 
 
 def test_zulip_client_registers_message_event_queue_with_update_and_delete():
-    FakeZulipSdkClient.register_calls = []
-    FakeZulipSdkClient.register_responses = None
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "success",
+        "queue_id": "queue-1",
+        "last_event_id": 42,
+    }
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
         client_cls=FakeZulipSdkClient,
     )
 
-    result = client.register_message_event_queue_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "post",
+        return_value=response,
+    ) as request:
+        result = client.register_message_event_queue_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+        )
 
     assert result == {
         "result": "success",
         "queue_id": "queue-1",
         "last_event_id": 42,
     }
-    assert FakeZulipSdkClient.registered_queue == {
-        "event_types": [
-            "message",
-            "reaction",
-            "update_message",
-            "delete_message",
-        ],
-        "kwargs": {
-            "apply_markdown": False,
-            "client_capabilities": {
-                "notification_settings_null": True,
-                "bulk_message_deletion": True,
-            },
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/register",
+        auth=("user@example.com", "zulip-token"),
+        data={
+            "event_types": (
+                '["message", "reaction", "update_message", '
+                '"delete_message"]'
+            ),
+            "apply_markdown": "false",
+            "client_capabilities": (
+                "{"
+                '"notification_settings_null": true, '
+                '"bulk_message_deletion": true'
+                "}"
+            ),
         },
-    }
+        timeout=zulip.MESSAGE_EVENT_REGISTER_TIMEOUT,
+    )
 
 
 def test_zulip_client_registers_all_events_when_filtered_queue_fails():
-    FakeZulipSdkClient.register_calls = []
-    FakeZulipSdkClient.register_responses = [
-        {
-            "result": "error",
-            "msg": "Unknown event type delete_message",
-        },
-        {
-            "result": "success",
-            "queue_id": "queue-1",
-            "last_event_id": 42,
-        },
-    ]
+    filtered_response = mock.Mock()
+    filtered_response.json.return_value = {
+        "result": "error",
+        "msg": "Unknown event type delete_message",
+    }
+    fallback_response = mock.Mock()
+    fallback_response.json.return_value = {
+        "result": "success",
+        "queue_id": "queue-1",
+        "last_event_id": 42,
+    }
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
         client_cls=FakeZulipSdkClient,
     )
 
-    result = client.register_message_event_queue_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "post",
+        side_effect=[filtered_response, fallback_response],
+    ) as request:
+        result = client.register_message_event_queue_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+        )
 
     assert result == {
         "result": "success",
         "queue_id": "queue-1",
         "last_event_id": 42,
     }
-    assert FakeZulipSdkClient.register_calls == [
-        {
-            "event_types": [
-                "message",
-                "reaction",
-                "update_message",
-                "delete_message",
-            ],
-            "kwargs": {
-                "apply_markdown": False,
-                "client_capabilities": {
-                    "notification_settings_null": True,
-                    "bulk_message_deletion": True,
-                },
+    assert request.call_args_list == [
+        mock.call(
+            "https://zulip.example.com/api/v1/register",
+            auth=("user@example.com", "zulip-token"),
+            data={
+                "event_types": (
+                    '["message", "reaction", "update_message", '
+                    '"delete_message"]'
+                ),
+                "apply_markdown": "false",
+                "client_capabilities": (
+                    "{"
+                    '"notification_settings_null": true, '
+                    '"bulk_message_deletion": true'
+                    "}"
+                ),
             },
-        },
-        {
-            "event_types": None,
-            "kwargs": {
-                "apply_markdown": False,
-                "client_capabilities": {
-                    "notification_settings_null": True,
-                    "bulk_message_deletion": True,
-                },
+            timeout=zulip.MESSAGE_EVENT_REGISTER_TIMEOUT,
+        ),
+        mock.call(
+            "https://zulip.example.com/api/v1/register",
+            auth=("user@example.com", "zulip-token"),
+            data={
+                "apply_markdown": "false",
+                "client_capabilities": (
+                    "{"
+                    '"notification_settings_null": true, '
+                    '"bulk_message_deletion": true'
+                    "}"
+                ),
             },
-        },
+            timeout=zulip.MESSAGE_EVENT_REGISTER_TIMEOUT,
+        ),
     ]
+
+
+def test_zulip_client_gets_events_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "success",
+        "events": [],
+    }
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        result = client.get_events_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            queue_id="queue-1",
+            last_event_id=42,
+        )
+
+    assert result == {
+        "result": "success",
+        "events": [],
+    }
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/events",
+        auth=("user@example.com", "zulip-token"),
+        params={
+            "queue_id": "queue-1",
+            "last_event_id": 42,
+        },
+        timeout=zulip.MESSAGE_EVENT_LONGPOLL_TIMEOUT,
+    )
 
 
 def test_zulip_client_sends_message_with_official_sdk():
@@ -372,6 +603,7 @@ def test_zulip_client_adds_reaction_with_official_sdk():
                 "emoji_code": None,
                 "reaction_type": None,
             },
+            "timeout": None,
         },
     ]
 
@@ -402,6 +634,7 @@ def test_zulip_client_removes_reaction_with_official_sdk():
                 "emoji_code": "1f44d",
                 "reaction_type": "unicode_emoji",
             },
+            "timeout": None,
         },
     ]
 
@@ -494,16 +727,37 @@ def test_zulip_client_downloads_file_with_api_key():
     response.raise_for_status.assert_called_once_with()
 
 
-def test_zulip_client_gets_streams_with_official_sdk():
+def test_zulip_client_gets_streams_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {
+        "result": "success",
+        "streams": [
+            {
+                "stream_id": 3,
+                "name": "general",
+                "description": "General stream",
+                "creator_id": 24,
+                "date_created": 1776940760,
+                "invite_only": False,
+                "is_archived": False,
+                "is_announcement_only": False,
+            },
+        ],
+    }
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
         client_cls=FakeZulipSdkClient,
     )
 
-    streams = client.get_streams_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        streams = client.get_streams_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+        )
 
     assert streams == [
         {
@@ -517,14 +771,20 @@ def test_zulip_client_gets_streams_with_official_sdk():
             "is_announcement_only": False,
         },
     ]
-    assert FakeZulipSdkClient.stream_filters == {
-        "include_all": True,
-        "exclude_archived": False,
-    }
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/streams",
+        auth=("user@example.com", "zulip-token"),
+        params={
+            "include_all": "true",
+            "exclude_archived": "false",
+        },
+        timeout=zulip.STREAM_FETCH_TIMEOUT,
+    )
 
 
-def test_zulip_client_gets_stream_subscribers_with_official_sdk():
-    FakeZulipSdkClient.subscriber_response = {
+def test_zulip_client_gets_stream_subscribers_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {
         "result": "success",
         "subscribers": [10, 24],
     }
@@ -533,15 +793,21 @@ def test_zulip_client_gets_stream_subscribers_with_official_sdk():
         client_cls=FakeZulipSdkClient,
     )
 
-    subscriber_ids = client.get_stream_subscribers_with_api_key(
-        login="user@example.com",
-        token="zulip-token",
-        stream_id=3,
-    )
+    with mock.patch.object(
+        zulip.requests,
+        "get",
+        return_value=response,
+    ) as request:
+        subscriber_ids = client.get_stream_subscribers_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            stream_id=3,
+        )
 
     assert subscriber_ids == [10, 24]
-    assert FakeZulipSdkClient.subscriber_call == {
-        "url": "streams/3/members",
-        "method": "GET",
-        "request": None,
-    }
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/streams/3/members",
+        auth=("user@example.com", "zulip-token"),
+        params=None,
+        timeout=zulip.STREAM_MEMBERS_FETCH_TIMEOUT,
+    )

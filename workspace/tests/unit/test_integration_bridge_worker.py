@@ -58,6 +58,11 @@ class FakeZulipProcessedEntity:
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+        self.update_dm = mock.Mock(side_effect=self._update_dm)
+        self.update = mock.Mock()
+
+    def _update_dm(self, values):
+        self.__dict__.update(values)
 
     def insert(self):
         type(self).inserted.append(self)
@@ -109,6 +114,26 @@ class FakeOutboundState:
 
     def _update_dm(self, values):
         self.__dict__.update(values)
+
+
+class FakeZulipHistorySyncTask:
+    inserted = []
+    deleted = []
+    objects = types.SimpleNamespace(get_all=mock.Mock(return_value=[]))
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+        self.update_dm = mock.Mock(side_effect=self._update_dm)
+        self.update = mock.Mock()
+
+    def _update_dm(self, values):
+        self.__dict__.update(values)
+
+    def insert(self):
+        type(self).inserted.append(self)
+
+    def delete(self):
+        type(self).deleted.append(self)
 
 
 class FakeZulipOutboundEventState:
@@ -241,6 +266,58 @@ def test_bridge_cache_preprocesses_zulip_file_links():
         save_file.call_args.kwargs["file_uuid"]
     )
     delete_file.assert_not_called()
+
+
+def test_bridge_cache_uses_placeholder_when_zulip_file_import_fails():
+    external_account = types.SimpleNamespace(
+        project_id=sys_uuid.uuid4(),
+        server_url="https://zulip.example.com",
+        account_settings=types.SimpleNamespace(
+            credentials=types.SimpleNamespace(
+                login="user@example.com",
+                token="zulip-token",
+            ),
+        ),
+    )
+    stream = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+    message_info = {
+        "message_id": 42,
+        "sender_id": 24,
+        "content": "see ![photo.png](/user_uploads/1/photo.png)",
+    }
+
+    class FakeZulipClient:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+
+        def download_file_with_api_key(self, login, token, url):
+            raise RuntimeError("download boom")
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+
+    with mock.patch.object(
+        agents.zulip_client,
+        "ZulipClient",
+        FakeZulipClient,
+    ):
+        result = cache.preprocess_zulip_message(
+            external_account=external_account,
+            stream=stream,
+            message_info=message_info,
+        )
+
+    assert result["content"] == (
+        "see ![photo.png]"
+        "(urn:zulip-file:download-failed?"
+        "name=photo.png&source_url=%2Fuser_uploads%2F1%2Fphoto.png&"
+        "status=download_failed)"
+    )
+    assert cache.pop_file_import_errors() == [
+        (
+            "Failed to import Zulip file /user_uploads/1/photo.png "
+            "for message 42: download boom"
+        ),
+    ]
 
 
 def test_bridge_cache_uses_filetype_for_video_metadata():
@@ -1219,20 +1296,14 @@ def test_bridge_worker_shutdown_stops_workers_and_drains_output_queue():
     bridge_worker = agents.WorkspaceIntegrationBridgeWorker()
     bridge_worker._enabled = True
     fake_worker = FakeWorker()
-    fake_history_worker = FakeWorker()
     worker_key = (
         "project",
         "https://zulip.example.com",
         "author-user",
     )
     input_queue = queue.Queue()
-    history_input_queue = queue.Queue()
     bridge_worker._workers = {worker_key: fake_worker}
-    bridge_worker._history_workers = {worker_key: fake_history_worker}
     bridge_worker._worker_input_queues = {worker_key: input_queue}
-    bridge_worker._worker_history_input_queues = {
-        worker_key: history_input_queue,
-    }
     bridge_worker._worker_accounts = {worker_key: object()}
     command = object()
     agents.workers.put_sync_response(bridge_worker._sync_queue, command)
@@ -1246,16 +1317,9 @@ def test_bridge_worker_shutdown_stops_workers_and_drains_output_queue():
 
     assert fake_worker.stopped
     assert fake_worker.joined
-    assert fake_history_worker.stopped
-    assert fake_history_worker.joined
     assert isinstance(input_queue.get_nowait(), agents.workers.StopWorker)
-    assert isinstance(
-        history_input_queue.get_nowait(),
-        agents.workers.StopWorker,
-    )
     execute_command.assert_called_once_with(command)
     assert bridge_worker._workers == {}
-    assert bridge_worker._history_workers == {}
     assert not bridge_worker._enabled
 
 
@@ -1386,53 +1450,40 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     filters = FakeExternalAccount.objects.get_all.call_args.kwargs["filters"]
     assert filters["account_type"].value == "zulip"
     assert worker._workers[first_worker_key] is existing_worker
-    assert worker._history_workers[first_worker_key] is (
-        FakeZulipBridgeWorker.instances[0]
-    )
     assert worker._workers[second_worker_key] is (
-        FakeZulipBridgeWorker.instances[1]
-    )
-    assert worker._history_workers[second_worker_key] is (
-        FakeZulipBridgeWorker.instances[2]
+        FakeZulipBridgeWorker.instances[0]
     )
     assert (
         "project",
         "https://zulip.example.com",
         "skipped-user",
     ) not in worker._workers
-    assert (
-        "project",
-        "https://zulip.example.com",
-        "skipped-user",
-    ) not in worker._history_workers
-    assert FakeZulipBridgeWorker.instances[0].external_account is first_user
-    assert FakeZulipBridgeWorker.instances[1].external_account is second_user
-    assert FakeZulipBridgeWorker.instances[2].external_account is second_user
+    assert FakeZulipBridgeWorker.instances[0].external_account is second_user
     assert FakeZulipBridgeWorker.instances[0].output_queue is (
         worker._sync_queue
     )
-    assert worker._message_sync_worker_key == first_worker_key
-    assert existing_input_queue.empty()
-    sync_message = FakeZulipBridgeWorker.instances[0].input_queue.get_nowait()
-    assert isinstance(sync_message, agents.workers.SyncMessages)
-    assert sync_message.queue_id == "queue-1"
-    assert sync_message.last_event_id == 42
-    assert sync_message.last_message_id == 103
-    assert sync_message.is_synced is True
-    sync_message.on_finished()
-    assert worker._message_sync_worker_key is None
+    assert worker._message_sync_worker_keys == {
+        first_worker_key,
+        second_worker_key,
+    }
+    first_sync_message = existing_input_queue.get_nowait()
+    assert isinstance(first_sync_message, agents.workers.SyncMessages)
+    assert first_sync_message.queue_id == "queue-1"
+    assert first_sync_message.last_event_id == 42
+    assert first_sync_message.last_message_id == 103
+    assert first_sync_message.is_synced is True
+    second_sync_message = FakeZulipBridgeWorker.instances[0].input_queue.get_nowait()
+    assert isinstance(second_sync_message, agents.workers.SyncMessages)
+    assert second_sync_message.queue_id == "queue-1"
+    assert second_sync_message.last_event_id == 42
+    first_sync_message.on_finished()
+    assert worker._message_sync_worker_keys == {second_worker_key}
     FakeZulipBridgeWorker.instances[0].start.assert_called_once_with()
-    FakeZulipBridgeWorker.instances[1].start.assert_called_once_with()
-    FakeZulipBridgeWorker.instances[2].start.assert_called_once_with()
 
-    existing_history_input_queue = queue.Queue()
     worker._workers = {first_worker_key: existing_worker}
     worker._worker_input_queues = {first_worker_key: existing_input_queue}
-    worker._history_workers = {first_worker_key: existing_worker}
-    worker._worker_history_input_queues = {
-        first_worker_key: existing_history_input_queue,
-    }
     worker._worker_accounts = {first_worker_key: first_user}
+    worker._message_sync_worker_keys = set()
     with mock.patch.object(
         agents.models,
         "ExternalAccount",
@@ -1450,7 +1501,7 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
             ):
                 worker._start_bridges()
 
-    sync_message = existing_history_input_queue.get_nowait()
+    sync_message = existing_input_queue.get_nowait()
     assert sync_message.queue_id == "queue-1"
     assert sync_message.last_event_id == 42
     assert sync_message.last_message_id == 103
@@ -1510,6 +1561,70 @@ def test_bridge_cache_gets_existing_stream_once():
     assert filters["source_name"].value == "zulip"
 
 
+def test_bridge_cache_skips_seen_stream_until_subscription_reset():
+    existing_stream = types.SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+        name="old-general",
+        description="Old description",
+        invite_only=False,
+        announce=False,
+        is_archived=False,
+        source=types.SimpleNamespace(stream_id=3),
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "stream",
+        "stream_id": 3,
+        "display_recipient": "general",
+        "description": "General stream",
+        "creator_id": 24,
+        "timestamp": 1770998098,
+        "invite_only": True,
+        "announce": True,
+        "is_archived": True,
+        "subscriber_ids": [],
+    }
+
+    class FakeWorkspaceStream:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[existing_stream]),
+            get_one_or_none=mock.Mock(return_value=existing_stream),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with _patch_zulip_processed_entities():
+        with mock.patch.object(
+            agents.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with mock.patch.object(
+                agents.messenger_dm_helpers,
+                "update_workspace_user_stream",
+                mock.Mock(),
+            ) as update_stream:
+                cache.get_or_create_stream(
+                    external_account=external_account,
+                    stream_info=stream_info,
+                )
+                cache.get_or_create_stream(
+                    external_account=external_account,
+                    stream_info=stream_info,
+                )
+                cache.reset_subscription_cache(external_account)
+                cache.get_or_create_stream(
+                    external_account=external_account,
+                    stream_info=stream_info,
+                )
+
+    assert update_stream.call_count == 2
+
+
 def test_bridge_cache_binds_existing_stream_users_once():
     existing_stream = types.SimpleNamespace(
         uuid="stream-uuid",
@@ -1517,6 +1632,7 @@ def test_bridge_cache_binds_existing_stream_users_once():
         source=types.SimpleNamespace(stream_id=3),
     )
     external_account = types.SimpleNamespace(
+        uuid="account-uuid",
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1607,6 +1723,7 @@ def test_bridge_cache_creates_missing_stream_once():
         user_uuid="creator-user",
     )
     external_account = types.SimpleNamespace(
+        uuid="account-uuid",
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -2185,7 +2302,7 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
     ]
 
 
-def test_bridge_cache_skips_file_preprocessing_for_processed_message():
+def test_bridge_cache_preprocesses_existing_processed_message():
     external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="reader-user",
@@ -2221,15 +2338,83 @@ def test_bridge_cache_skips_file_preprocessing_for_processed_message():
     ), mock.patch.object(
         cache,
         "preprocess_zulip_message",
-        mock.Mock(),
+        mock.Mock(return_value=message_info),
     ) as preprocess_message, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_workspace_user_message",
-        mock.Mock(return_value=message),
-    ) as get_message, mock.patch.object(
         agents.messenger_dm_helpers,
         "get_or_create_workspace_user_message",
         mock.Mock(),
+    ) as get_or_create_message, mock.patch.object(
+        agents.models.WorkspaceUserMessage,
+        "objects",
+        types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=message),
+        ),
+    ) as user_messages:
+        with _patch_zulip_processed_entities(processed):
+            result = cache.get_or_create_message(
+                external_account=external_account,
+                stream=stream,
+                topic=topic,
+                stream_info=stream_info,
+                topic_name="deploys",
+                message_info=message_info,
+            )
+
+    assert result is message
+    preprocess_message.assert_called_once_with(
+        external_account=external_account,
+        stream=stream,
+        message_info=message_info,
+    )
+    get_or_create_message.assert_not_called()
+    user_messages.get_one_or_none.assert_called_once()
+
+
+def test_bridge_cache_rebinds_stale_processed_message():
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="reader-user",
+        server_url="https://zulip.example.com",
+    )
+    stream = types.SimpleNamespace(uuid="stream-uuid")
+    topic = types.SimpleNamespace(uuid="topic-uuid")
+    message = types.SimpleNamespace(uuid="new-message-uuid")
+    stream_info = {
+        "stream_id": 3,
+    }
+    message_info = {
+        "message_id": 100,
+        "sender_id": 24,
+        "content": "hello",
+        "read": False,
+        "created_at": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+        "updated_at": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+    }
+    processed = FakeZulipProcessedEntity(
+        workspace_uuid="missing-message-uuid",
+    )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_required_zulip_user_uuid",
+        mock.Mock(return_value="author-user"),
+    ), mock.patch.object(
+        agents.models.WorkspaceUserMessage,
+        "objects",
+        types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=None),
+        ),
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_or_create_workspace_user_message",
+        mock.Mock(return_value=message),
     ) as get_or_create_message:
         with _patch_zulip_processed_entities(processed):
             result = cache.get_or_create_message(
@@ -2242,13 +2427,9 @@ def test_bridge_cache_skips_file_preprocessing_for_processed_message():
             )
 
     assert result is message
-    preprocess_message.assert_not_called()
-    get_or_create_message.assert_not_called()
-    get_message.assert_called_once_with(
-        project_id="project",
-        user_uuid="author-user",
-        message_uuid="message-uuid",
-    )
+    get_or_create_message.assert_called_once()
+    assert processed.workspace_uuid == "new-message-uuid"
+    processed.update.assert_called_once_with()
 
 
 def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
@@ -2413,11 +2594,438 @@ def test_bridge_worker_requests_queue_recreate_without_queue_id():
     command = input_queue.get_nowait()
     assert isinstance(
         command,
-        agents.workers.CreateZulipQueueAndFetchMessages,
+        agents.workers.CreateZulipEventQueue,
     )
-    assert command.last_message_id == 103
-    assert worker._message_sync_worker_key is None
+    assert worker._message_sync_worker_keys == set()
     assert worker._queue_recreate_worker_keys == {event_owner}
+
+
+def test_bridge_worker_rebuilds_history_tasks_from_latest_message():
+    external_account = types.SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    pending_task = types.SimpleNamespace(delete=mock.Mock())
+    failed_task = types.SimpleNamespace(delete=mock.Mock())
+    done_task = types.SimpleNamespace(delete=mock.Mock())
+    FakeZulipHistorySyncTask.inserted = []
+    FakeZulipHistorySyncTask.objects = types.SimpleNamespace(
+        get_all=mock.Mock(side_effect=[
+            [pending_task],
+            [failed_task],
+            [done_task],
+        ]),
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(
+        agents.models,
+        "ZulipHistorySyncTask",
+        FakeZulipHistorySyncTask,
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_latest_message_id",
+        mock.Mock(return_value=250),
+    ):
+        created = worker._rebuild_zulip_history_sync_tasks(external_account)
+
+    assert created == 3
+    pending_task.delete.assert_called_once_with()
+    failed_task.delete.assert_called_once_with()
+    done_task.delete.assert_not_called()
+    assert [
+        (
+            task.from_message_id,
+            task.to_message_id,
+            task.status,
+        )
+        for task in FakeZulipHistorySyncTask.inserted
+    ] == [
+        (0, 99, "pending"),
+        (100, 199, "pending"),
+        (200, 250, "pending"),
+    ]
+
+
+def test_bridge_worker_processes_new_queue_by_rebuilding_history_tasks():
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    event_owner = (
+        "project",
+        "https://zulip.example.com",
+        "bridge-user",
+    )
+    input_queue = queue.Queue()
+    queue_state = FakeZulipQueueState(
+        queue_id="queue-1",
+        last_event_id=42,
+        last_message_id=0,
+        is_synced=False,
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._workers[event_owner] = object()
+    worker._worker_input_queues[event_owner] = input_queue
+    worker._worker_accounts[event_owner] = external_account
+    worker._cache = types.SimpleNamespace(
+        reset_subscription_cache=mock.Mock(),
+    )
+    command = agents.workers.ZulipEventQueueCreated(
+        external_account=external_account,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_rebuild_zulip_history_sync_tasks",
+        mock.Mock(return_value=3),
+    ) as rebuild_tasks, mock.patch.object(
+        worker,
+        "_get_or_create_zulip_queue_state",
+        mock.Mock(return_value=queue_state),
+    ):
+        worker._execute_sync_command(command)
+
+    worker._cache.reset_subscription_cache.assert_called_once_with(
+        external_account,
+    )
+    rebuild_tasks.assert_called_once_with(external_account=external_account)
+    sync_command = input_queue.get_nowait()
+    assert isinstance(sync_command, agents.workers.SyncMessages)
+    assert sync_command.queue_id == "queue-1"
+    assert worker._queue_recreate_worker_keys == set()
+    assert worker._message_sync_worker_keys == {event_owner}
+
+
+def test_bridge_worker_processes_one_history_task_newest_messages_first():
+    task = FakeZulipHistorySyncTask(
+        uuid="task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=100,
+        to_message_id=199,
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        server_url="https://zulip.example.com",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(
+        worker,
+        "_get_next_zulip_history_sync_task",
+        mock.Mock(return_value=task),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_history_task_external_account",
+        mock.Mock(return_value=external_account),
+    ), mock.patch.object(
+        worker,
+        "_fetch_zulip_history_task_messages",
+        mock.Mock(return_value=[
+            {"id": 101},
+            {"id": 199},
+            {"id": 150},
+        ]),
+    ), mock.patch.object(
+        worker,
+        "_sync_zulip_history_task_message",
+        mock.Mock(return_value=[]),
+    ) as sync_message, mock.patch.object(
+        worker,
+        "_has_pending_zulip_history_sync_tasks",
+        mock.Mock(return_value=False),
+    ), mock.patch.object(
+        worker,
+        "_update_external_account_zulip_queue_state",
+        mock.Mock(),
+    ) as update_queue_state:
+        worker._process_zulip_history_sync_task()
+
+    assert [
+        call.kwargs["message"]["id"]
+        for call in sync_message.call_args_list
+    ] == [199, 150, 101]
+    assert task.status == "done"
+    assert task.last_error is None
+    task.update.assert_called_once_with()
+    update_queue_state.assert_called_once_with(
+        external_account=external_account,
+        is_synced=True,
+    )
+
+
+def test_bridge_worker_fetches_only_history_task_range_size():
+    task = FakeZulipHistorySyncTask(
+        uuid="task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=5700,
+        to_message_id=5709,
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        server_url="https://zulip.example.com",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(
+        worker,
+        "_fetch_zulip_messages",
+        mock.Mock(return_value=[]),
+    ) as fetch_messages:
+        worker._fetch_zulip_history_task_messages(
+            external_account=external_account,
+            task=task,
+        )
+
+    fetch_messages.assert_called_once_with(
+        external_account=external_account,
+        message_filters={
+            "anchor": 5699,
+            "num_before": 0,
+            "num_after": 10,
+        },
+    )
+
+
+def test_bridge_worker_fetches_single_history_task_message_directly():
+    task = FakeZulipHistorySyncTask(
+        uuid="task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=5749,
+        to_message_id=5749,
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        server_url="https://zulip.example.com",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(
+        worker,
+        "_fetch_zulip_message",
+        mock.Mock(return_value={"id": 5749}),
+    ) as fetch_message, mock.patch.object(
+        worker,
+        "_fetch_zulip_messages",
+        mock.Mock(return_value=[]),
+    ) as fetch_messages:
+        messages = worker._fetch_zulip_history_task_messages(
+            external_account=external_account,
+            task=task,
+        )
+
+    assert messages == [{"id": 5749}]
+    fetch_message.assert_called_once_with(
+        external_account=external_account,
+        message_id=5749,
+    )
+    fetch_messages.assert_not_called()
+
+
+def test_bridge_worker_treats_invalid_single_history_message_as_empty_range():
+    task = FakeZulipHistorySyncTask(
+        uuid="task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=5749,
+        to_message_id=5749,
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        server_url="https://zulip.example.com",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(
+        worker,
+        "_fetch_zulip_message",
+        mock.Mock(return_value=None),
+    ) as fetch_message, mock.patch.object(
+        worker,
+        "_fetch_zulip_messages",
+        mock.Mock(return_value=[]),
+    ) as fetch_messages:
+        messages = worker._fetch_zulip_history_task_messages(
+            external_account=external_account,
+            task=task,
+        )
+
+    assert messages == []
+    fetch_message.assert_called_once_with(
+        external_account=external_account,
+        message_id=5749,
+    )
+    fetch_messages.assert_not_called()
+
+
+def test_bridge_worker_prefers_pending_history_tasks_without_error():
+    errored_task = FakeZulipHistorySyncTask(
+        uuid="errored-task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=5700,
+        to_message_id=5700,
+        status="pending",
+        last_error="timeout",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(
+        agents.models,
+        "ZulipHistorySyncTask",
+        FakeZulipHistorySyncTask,
+    ):
+        FakeZulipHistorySyncTask.objects = types.SimpleNamespace(
+            get_all=mock.Mock(side_effect=[[], [errored_task]]),
+        )
+        result = worker._get_next_zulip_history_sync_task()
+
+    assert result is errored_task
+    first_filters = (
+        FakeZulipHistorySyncTask.objects
+        .get_all.call_args_list[0].kwargs["filters"]
+    )
+    assert first_filters["status"].value == "pending"
+    assert first_filters["last_error"].value is None
+
+
+def test_bridge_worker_keeps_retryable_history_task_pending():
+    task = FakeZulipHistorySyncTask(
+        uuid="task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=100,
+        to_message_id=199,
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    error = agents.SyncStreamsNeeded(
+        external_account=external_account,
+        stream_id=3,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_next_zulip_history_sync_task",
+        mock.Mock(return_value=task),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_history_task_external_account",
+        mock.Mock(return_value=external_account),
+    ), mock.patch.object(
+        worker,
+        "_fetch_zulip_history_task_messages",
+        mock.Mock(return_value=[{"id": 199}]),
+    ), mock.patch.object(
+        worker,
+        "_sync_zulip_history_task_message",
+        mock.Mock(side_effect=error),
+    ), mock.patch.object(
+        worker,
+        "_request_zulip_stream_sync",
+        mock.Mock(),
+    ) as request_stream_sync:
+        worker._process_zulip_history_sync_task()
+
+    request_stream_sync.assert_called_once_with(error)
+    assert task.status == "pending"
+    assert "stream 3" in task.last_error
+    task.update.assert_called_once_with()
+
+
+def test_bridge_worker_splits_network_error_history_task():
+    task = FakeZulipHistorySyncTask(
+        uuid="task-uuid",
+        project_id="project",
+        external_account_uuid="account-uuid",
+        from_message_id=100,
+        to_message_id=119,
+    )
+    external_account = types.SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    error = agents.requests.exceptions.ReadTimeout("slow Zulip response")
+
+    with mock.patch.object(
+        worker,
+        "_get_next_zulip_history_sync_task",
+        mock.Mock(return_value=task),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_history_task_external_account",
+        mock.Mock(return_value=external_account),
+    ), mock.patch.object(
+        worker,
+        "_fetch_zulip_history_task_messages",
+        mock.Mock(side_effect=error),
+    ), mock.patch.object(
+        agents.models,
+        "ZulipHistorySyncTask",
+        FakeZulipHistorySyncTask,
+    ):
+        FakeZulipHistorySyncTask.inserted = []
+        FakeZulipHistorySyncTask.deleted = []
+        should_continue = worker._process_zulip_history_sync_task()
+
+    assert should_continue is False
+    assert FakeZulipHistorySyncTask.deleted == [task]
+    assert [
+        (
+            created.from_message_id,
+            created.to_message_id,
+            created.status,
+            created.last_error,
+        )
+        for created in FakeZulipHistorySyncTask.inserted
+    ] == [
+        (100, 109, "pending", None),
+        (110, 119, "pending", None),
+    ]
+    task.update.assert_not_called()
+
+
+def test_bridge_worker_processes_one_history_task_per_iteration():
+    worker = agents.WorkspaceIntegrationBridgeWorker(
+        history_sync_task_batch_limit=2,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_process_zulip_history_sync_task",
+        mock.Mock(side_effect=[True, True, True]),
+    ) as process_task:
+        worker._process_zulip_history_sync_tasks()
+
+    assert process_task.call_count == 1
+
+
+def test_bridge_worker_processes_one_history_task_even_on_retryable_error():
+    worker = agents.WorkspaceIntegrationBridgeWorker(
+        history_sync_task_batch_limit=20,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_process_zulip_history_sync_task",
+        mock.Mock(side_effect=[True, False, True]),
+    ) as process_task:
+        worker._process_zulip_history_sync_tasks()
+
+    assert process_task.call_count == 1
 
 
 def test_bridge_worker_recreates_queue_after_failed_queue_event():
@@ -2442,7 +3050,7 @@ def test_bridge_worker_recreates_queue_after_failed_queue_event():
     worker._workers[event_owner] = object()
     worker._worker_input_queues[event_owner] = input_queue
     worker._worker_accounts[event_owner] = external_account
-    worker._message_sync_worker_key = event_owner
+    worker._message_sync_worker_keys = {event_owner}
     worker._put_sync_command(
         agents.workers.ZulipQueueFailed(
             external_account=external_account,
@@ -2460,10 +3068,9 @@ def test_bridge_worker_recreates_queue_after_failed_queue_event():
     command = input_queue.get_nowait()
     assert isinstance(
         command,
-        agents.workers.CreateZulipQueueAndFetchMessages,
+        agents.workers.CreateZulipEventQueue,
     )
-    assert command.last_message_id == 103
-    assert worker._message_sync_worker_key is None
+    assert worker._message_sync_worker_keys == set()
     assert worker._queue_recreate_worker_keys == {event_owner}
     assert queue_state.queue_id is None
     assert queue_state.is_synced is False
@@ -2649,7 +3256,7 @@ def test_bridge_worker_releases_stream_sync_barrier_on_finished_response():
     command.execute.assert_called_once_with(cache=worker._cache)
 
 
-def test_bridge_worker_processes_sync_queue_in_batches():
+def test_bridge_worker_drains_sync_queue_in_one_iteration():
     commands = [
         types.SimpleNamespace(execute=mock.Mock(return_value="processed"))
         for _ in range(3)
@@ -2664,29 +3271,52 @@ def test_bridge_worker_processes_sync_queue_in_batches():
 
     commands[0].execute.assert_called_once_with(cache=worker._cache)
     commands[1].execute.assert_called_once_with(cache=worker._cache)
-    commands[2].execute.assert_not_called()
-    response = worker._sync_queue.get_nowait()
-    assert agents.workers.get_sync_response_command(response) is commands[2]
+    commands[2].execute.assert_called_once_with(cache=worker._cache)
+    assert worker._sync_queue.empty()
+
+
+def test_bridge_worker_uses_short_sync_queue_empty_wait():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._sync_queue = types.SimpleNamespace(
+        qsize=mock.Mock(return_value=0),
+        get=mock.Mock(side_effect=queue.Empty),
+    )
+
+    worker._process_sync_queue()
+
+    assert agents.SYNC_QUEUE_TIMEOUT == 0.01
+    worker._sync_queue.get.assert_called_once_with(
+        timeout=agents.SYNC_QUEUE_TIMEOUT,
+    )
 
 
 def test_bridge_worker_iteration_syncs_users():
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with mock.patch.object(worker, "_sync_iam_users") as sync_iam_users:
-        with mock.patch.object(worker, "_sync_zulip_users") as sync_zulip_users:
-            with mock.patch.object(worker, "_start_bridges") as start_bridges:
-                with mock.patch.object(
-                    worker,
-                    "_dispatch_zulip_outbound_events",
-                ) as dispatch_zulip_outbound_events:
-                    with mock.patch.object(
-                        worker,
-                        "_process_sync_queue",
-                    ) as process_sync_queue:
-                        worker._run_iteration()
+    with mock.patch.object(
+        worker,
+        "_sync_iam_users",
+    ) as sync_iam_users, mock.patch.object(
+        worker,
+        "_sync_zulip_users",
+    ) as sync_zulip_users, mock.patch.object(
+        worker,
+        "_start_bridges",
+    ) as start_bridges, mock.patch.object(
+        worker,
+        "_dispatch_zulip_outbound_events",
+    ) as dispatch_zulip_outbound_events, mock.patch.object(
+        worker,
+        "_process_zulip_history_sync_tasks",
+    ) as process_history_tasks, mock.patch.object(
+        worker,
+        "_process_sync_queue",
+    ) as process_sync_queue:
+        worker._run_iteration()
 
     sync_iam_users.assert_called_once_with()
     sync_zulip_users.assert_called_once_with()
     start_bridges.assert_called_once_with()
     dispatch_zulip_outbound_events.assert_called_once_with()
+    process_history_tasks.assert_called_once_with()
     process_sync_queue.assert_called_once_with()
