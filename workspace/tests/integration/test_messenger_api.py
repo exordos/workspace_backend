@@ -65,6 +65,9 @@ def test_user_get_by_uuid_uses_global_user_table(api, db):
     user = resp.json()
     assert user["uuid"] == str(user_uuid)
     assert user["username"] == username
+    assert user["avatar"] == (
+        messenger_models.build_workspace_user_default_avatar(user_uuid)
+    )
 
     resp = api.get(USERS, params={"username": username})
     assert resp.status_code == 200, resp.text
@@ -92,6 +95,9 @@ def test_user_presence_action_updates_current_user_presence(api, db):
     assert resp.status_code == 200, resp.text
     user = resp.json()
     assert user["uuid"] == str(api.user_uuid)
+    assert user["avatar"] == (
+        messenger_models.build_workspace_user_default_avatar(api.user_uuid)
+    )
     assert user["status"] == "idle"
     assert user["status_emoji"] == "coffee"
     assert user["status_text"] == "Focusing"
@@ -130,6 +136,9 @@ def test_user_presence_action_updates_current_user_presence(api, db):
     assert str(event_recipient_uuid) in event_recipient_uuids
     for _, payload in event_rows:
         assert payload["username"] == username
+        assert payload["avatar"] == (
+            messenger_models.build_workspace_user_default_avatar(api.user_uuid)
+        )
         assert payload["status"] == "idle"
         assert payload["status_emoji"] == "coffee"
         assert payload["status_text"] == "Focusing"
@@ -405,6 +414,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
                     'username', 'clean-user',
                     'source', 'iam',
                     'status', 'active',
+                    'avatar', 'urn:gavatar:' || %s::text,
                     'last_ping_at', '2026-07-02 12:00:00.000000'
                 ),
                 NOW(),
@@ -415,6 +425,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
             (
                 str(sys_uuid.uuid4()),
                 str(project_id),
+                str(clean_user_uuid),
                 str(clean_user_uuid),
                 str(clean_user_uuid),
             ),
@@ -442,6 +453,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
                     'username', 'damaged-user',
                     'source', 'iam',
                     'status', 'active',
+                    'avatar', 'urn:gavatar:' || %s::text,
                     'last_ping_at', '2026-07-02 12:00:00.000000'
                 ),
                 NOW(),
@@ -454,6 +466,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
                 str(project_id),
                 str(damaged_user_uuid),
                 str(project_id),
+                str(damaged_user_uuid),
                 str(damaged_user_uuid),
             ),
         )

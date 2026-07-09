@@ -1199,13 +1199,14 @@ than project-scoped.
 | --- | --- | --- |
 | `uuid` | UUID | User identifier. |
 | `username` | string, 1..128 | Username. |
-| `source` | `iam` | User source. |
+| `source` | `iam`, `zulip` | User source. |
 | `status` | `active`, `idle`, `offline`, `do_not_disturb` | Presence status. |
 | `status_emoji` | string or `null`, max 64 | Custom presence emoji. |
 | `status_text` | string or `null`, max 256 | Custom presence text. |
 | `first_name` | string or `null` | First name. |
 | `last_name` | string or `null` | Last name. |
 | `email` | string or `null` | Email address. |
+| `avatar` | URN string | User avatar. Defaults to `urn:gavatar:<user-uuid>`. Supported values are `urn:gavatar:<user-uuid>`, `urn:image:<uuid>`, and `urn:url:http(s)://...`. |
 | `last_ping_at` | datetime | Last ping timestamp. |
 | `created_at` | datetime | Creation time. |
 | `updated_at` | datetime | Update time. |
@@ -1228,7 +1229,7 @@ the supplied status and the current time in `last_ping_at`. Optional `emoji` and
 `text` fields are stored as `status_emoji` and `status_text`; omitted optional
 fields keep previous values, and explicit `null` clears them. The messenger
 worker marks stale users offline and emits `user.updated` events with full user
-snapshots.
+snapshots, including `avatar`, to all Workspace users in every project.
 
 ## WebSocket Realtime Summary
 

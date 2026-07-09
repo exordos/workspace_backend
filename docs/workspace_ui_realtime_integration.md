@@ -224,4 +224,4 @@ For message payloads, v1 supports markdown payloads:
 
 Presence is updated through REST `users/{uuid}/actions/presence/invoke`. The
 worker marks stale users offline and emits `user.updated` events with full user
-snapshots.
+snapshots, including the `avatar` URN.

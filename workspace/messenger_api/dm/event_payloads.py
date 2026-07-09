@@ -22,6 +22,7 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
 from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import models as messenger_models
 
 
 class MessageEventTimestampType(types.UTCDateTimeZ):
@@ -365,7 +366,10 @@ class UserUpdatedEventPayload(
         required=True,
     )
     source = properties.property(
-        types.Enum(["iam"]),
+        types.Enum([
+            messenger_models.WorkspaceUserSource.IAM.value,
+            messenger_models.WorkspaceUserSource.ZULIP.value,
+        ]),
         required=True,
     )
     status = properties.property(
@@ -391,6 +395,10 @@ class UserUpdatedEventPayload(
     email = properties.property(
         types.AllowNone(types.String(max_length=256)),
         default=None,
+    )
+    avatar = properties.property(
+        messenger_models.WorkspaceUserAvatarType(),
+        required=True,
     )
     last_ping_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,

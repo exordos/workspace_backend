@@ -596,6 +596,9 @@ def test_iam_external_account_kind_creates_workspace_user():
     assert workspace_user.first_name == "Admin"
     assert workspace_user.last_name == "Admin"
     assert workspace_user.email == "admin@genesis-core.tech"
+    assert workspace_user.avatar == (
+        models.build_workspace_user_default_avatar(workspace_user.uuid)
+    )
     uuid_filters = get_one_or_none.call_args_list[0].kwargs["filters"]
     username_filters = get_one_or_none.call_args_list[1].kwargs["filters"]
     assert uuid_filters["uuid"].value == sys_uuid.UUID(
@@ -603,6 +606,36 @@ def test_iam_external_account_kind_creates_workspace_user():
     )
     assert username_filters["username"].value == "admin"
     insert.assert_called_once_with()
+
+
+def test_workspace_user_avatar_accepts_supported_urns():
+    user_uuid = sys_uuid.uuid4()
+    image_uuid = sys_uuid.uuid4()
+
+    default_user = models.WorkspaceUser(
+        uuid=user_uuid,
+        username="admin",
+    )
+    image_user = models.WorkspaceUser(
+        uuid=user_uuid,
+        username="admin",
+        avatar=f"urn:image:{image_uuid}",
+    )
+    url_user = models.WorkspaceUser(
+        uuid=user_uuid,
+        username="admin",
+        avatar="urn:url:https://example.com/avatar.png",
+    )
+
+    assert default_user.avatar == f"urn:gavatar:{user_uuid}"
+    assert image_user.avatar == f"urn:image:{image_uuid}"
+    assert url_user.avatar == "urn:url:https://example.com/avatar.png"
+    with pytest.raises(ra_exc.TypeError):
+        models.WorkspaceUser(
+            uuid=user_uuid,
+            username="admin",
+            avatar="https://example.com/avatar.png",
+        )
 
 
 def test_iam_external_account_kind_updates_workspace_user_by_username():
@@ -714,6 +747,10 @@ def test_external_account_creates_workspace_user_by_email_for_new_zulip_account(
     assert workspace_user.username == "Phoenix"
     assert workspace_user.email == "cassi+phoenix@genesis-corporation.ru"
     assert workspace_user.source == "zulip"
+    assert workspace_user.avatar == (
+        models.build_workspace_user_default_avatar(workspace_user.uuid)
+    )
+    assert not workspace_user.avatar.startswith("urn:url:")
     filters = get_all.call_args.kwargs["filters"]
     assert filters["email"].value == "cassi+phoenix@genesis-corporation.ru"
     insert.assert_called_once_with()

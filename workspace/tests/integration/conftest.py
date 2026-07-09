@@ -50,6 +50,7 @@ from workspace.common import file_storage_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
+from workspace.messenger_api.dm import models as messenger_models
 
 
 # --------------------------------------------------------------------------- #
@@ -337,16 +338,18 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
 
 def seed_workspace_user(conn, user_uuid, username, status="active",
                         last_ping_at=None):
+    avatar = messenger_models.build_workspace_user_default_avatar(user_uuid)
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO m_workspace_users
-                (uuid, username, source, status, last_ping_at,
+                (uuid, username, source, status, avatar, last_ping_at,
                  created_at, updated_at)
             VALUES (
                 %s,
                 %s,
                 'iam',
+                %s,
                 %s,
                 COALESCE(%s::timestamp with time zone, NOW()),
                 NOW(),
@@ -355,10 +358,14 @@ def seed_workspace_user(conn, user_uuid, username, status="active",
             ON CONFLICT (uuid) DO UPDATE
                 SET username = EXCLUDED.username,
                     status = EXCLUDED.status,
+                    avatar = COALESCE(
+                        m_workspace_users.avatar,
+                        EXCLUDED.avatar
+                    ),
                     last_ping_at = EXCLUDED.last_ping_at,
                     updated_at = NOW()
             """,
-            (str(user_uuid), username, status, last_ping_at),
+            (str(user_uuid), username, status, avatar, last_ping_at),
         )
 
 

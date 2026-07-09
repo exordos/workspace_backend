@@ -366,12 +366,68 @@ class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
         return value.isoformat()
 
 
+WORKSPACE_USER_AVATAR_MAX_LENGTH = 2048
+WORKSPACE_USER_DEFAULT_AVATAR_PREFIX = "urn:gavatar:"
+WORKSPACE_USER_IMAGE_AVATAR_PREFIX = "urn:image:"
+WORKSPACE_USER_URL_AVATAR_PREFIX = "urn:url:"
+
+
+def build_workspace_user_default_avatar(user_uuid):
+    return "%s%s" % (WORKSPACE_USER_DEFAULT_AVATAR_PREFIX, user_uuid)
+
+
+class WorkspaceUserAvatarType(types.String):
+    def __init__(self):
+        super(WorkspaceUserAvatarType, self).__init__(
+            min_length=1,
+            max_length=WORKSPACE_USER_AVATAR_MAX_LENGTH,
+        )
+
+    def validate(self, value):
+        return super(WorkspaceUserAvatarType, self).validate(
+            value,
+        ) and self._is_workspace_user_avatar_urn(value)
+
+    def _is_workspace_user_avatar_urn(self, value):
+        return (
+            self._is_uuid_urn(value, WORKSPACE_USER_IMAGE_AVATAR_PREFIX)
+            or self._is_url_urn(value)
+            or self._is_uuid_urn(value, WORKSPACE_USER_DEFAULT_AVATAR_PREFIX)
+        )
+
+    @staticmethod
+    def _is_uuid_urn(value, prefix):
+        if not value.startswith(prefix):
+            return False
+        try:
+            sys_uuid.UUID(value[len(prefix):])
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _is_url_urn(value):
+        if not value.startswith(WORKSPACE_USER_URL_AVATAR_PREFIX):
+            return False
+        url = value[len(WORKSPACE_USER_URL_AVATAR_PREFIX):]
+        return url.startswith("http://") or url.startswith("https://")
+
+
 class WorkspaceUser(
     models.ModelWithUUID,
     models.ModelWithTimestamp,
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_users"
+
+    def pour(self, **kwargs):
+        if "uuid" not in kwargs:
+            kwargs["uuid"] = sys_uuid.uuid4()
+        if "avatar" not in kwargs or kwargs["avatar"] is None:
+            kwargs["avatar"] = build_workspace_user_default_avatar(
+                kwargs["uuid"],
+            )
+        super(WorkspaceUser, self).pour(**kwargs)
 
     username = properties.property(
         types.String(min_length=1, max_length=128),
@@ -404,6 +460,10 @@ class WorkspaceUser(
     email = properties.property(
         types.AllowNone(types.String(max_length=256)),
         default=None,
+    )
+    avatar = properties.property(
+        WorkspaceUserAvatarType(),
+        required=True,
     )
     last_ping_at = properties.property(
         WorkspaceUserLastPingAtType(),

@@ -549,8 +549,10 @@ notification bots, which can appear in stream history without a normal synced
 Zulip user account. The same fallback sender is used when importing attachments
 from that message.
 
-Zulip `user_id`, email, name, and avatar/source data are saved so that later
-messages from the same user link to the same Workspace row.
+Zulip `user_id`, email, name, and source data are saved so that later messages
+from the same user link to the same Workspace row. Zulip `avatar_url` stays in
+external-account user metadata; Workspace user `avatar` defaults to
+`urn:gavatar:<user-uuid>` and is not replaced with a Zulip URL automatically.
 
 IAM remains the external source for corporate users, but the absence of an IAM
 row does not block Zulip history import. If a canonical IAM row for the same
