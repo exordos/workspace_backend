@@ -34,6 +34,7 @@ from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 LOG = logging.getLogger(__name__)
 ZULIP_PRIVATE_TOPIC_NAME = "zulip"
 MIN_ZULIP_USER_ID = 8
+ZULIP_STREAM_POST_POLICY_ADMINS = 2
 SYNC_RESPONSE_PRIORITY_STREAM = 0
 SYNC_RESPONSE_PRIORITY_STREAM_FINISHED = 1
 SYNC_RESPONSE_PRIORITY_SYNC_STARTED = 5
@@ -454,18 +455,44 @@ class RemoveMessageReaction:
 
 class AddStream:
     priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
 
-    def __init__(self, external_account, stream, subscriber_ids=None):
+    def __init__(
+        self,
+        external_account,
+        stream,
+        subscriber_ids=None,
+        event_id=None,
+    ):
         self.external_account = external_account
         self.event_owner = get_event_owner(external_account)
         self.stream = stream
         self.subscriber_ids = subscriber_ids or []
+        self.event_id = event_id
 
     def _get_creator_id(self):
         creator_id = self.stream["creator_id"]
         if creator_id is None:
             return self.external_account.account_settings.user_info.user_id
         return creator_id
+
+    def _get_announce(self):
+        if "is_announcement_only" in self.stream:
+            return self.stream["is_announcement_only"]
+        if "stream_post_policy" in self.stream:
+            return (
+                self.stream["stream_post_policy"] ==
+                ZULIP_STREAM_POST_POLICY_ADMINS
+            )
+        return False
+
+    def _get_subscriber_ids(self):
+        if self.subscriber_ids:
+            return self.subscriber_ids
+        if "subscribers" in self.stream:
+            return self.stream["subscribers"]
+        return []
 
     def _get_stream_info(self):
         return {
@@ -479,9 +506,9 @@ class AddStream:
                 tz=datetime.timezone.utc,
             ),
             "invite_only": self.stream["invite_only"],
-            "announce": self.stream["is_announcement_only"],
+            "announce": self._get_announce(),
             "is_archived": self.stream["is_archived"],
-            "subscriber_ids": self.subscriber_ids,
+            "subscriber_ids": self._get_subscriber_ids(),
             "event_type": "stream",
         }
 
@@ -490,6 +517,183 @@ class AddStream:
             external_account=self.external_account,
             stream_info=self._get_stream_info(),
         )
+
+
+class UpdateStream:
+    priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+
+    def _get_values(self):
+        property_name = self.event["property"]
+        if property_name == "name":
+            return {"name": self.event["value"]}
+        if property_name == "description":
+            return {"description": self.event["value"]}
+        if property_name == "invite_only":
+            return {"invite_only": self.event["value"]}
+        if property_name == "is_archived":
+            return {"is_archived": self.event["value"]}
+        if property_name == "is_announcement_only":
+            return {"announce": self.event["value"]}
+        if property_name == "stream_post_policy":
+            return {
+                "announce": (
+                    self.event["value"] == ZULIP_STREAM_POST_POLICY_ADMINS
+                ),
+            }
+        return {}
+
+    def execute(self, cache):
+        return cache.update_stream(
+            external_account=self.external_account,
+            stream_id=self.event["stream_id"],
+            values=self._get_values(),
+        )
+
+
+class DeleteStream:
+    priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+
+    def _get_stream_ids(self):
+        if "stream_ids" in self.event:
+            return self.event["stream_ids"]
+        return [
+            stream["stream_id"]
+            for stream in self.event["streams"]
+        ]
+
+    def execute(self, cache):
+        for stream_id in self._get_stream_ids():
+            if self.event.get("for_archiving"):
+                cache.update_stream(
+                    external_account=self.external_account,
+                    stream_id=stream_id,
+                    values={"is_archived": True},
+                )
+                continue
+            cache.remove_stream_binding(
+                external_account=self.external_account,
+                stream_id=stream_id,
+            )
+
+
+class AddSubscription:
+    priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+
+    def execute(self, cache):
+        streams = []
+        for subscription in self.event["subscriptions"]:
+            streams.append(
+                cache.get_or_create_stream(
+                    external_account=self.external_account,
+                    stream_info=AddStream(
+                        external_account=self.external_account,
+                        stream=subscription,
+                    )._get_stream_info(),
+                ),
+            )
+        return streams
+
+
+class RemoveSubscription:
+    priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+
+    def execute(self, cache):
+        for subscription in self.event["subscriptions"]:
+            cache.remove_stream_binding(
+                external_account=self.external_account,
+                stream_id=subscription["stream_id"],
+            )
+
+
+class UpdateSubscription:
+    priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+
+    def execute(self, cache):
+        return None
+
+
+class PeerSubscription:
+    priority = SYNC_RESPONSE_PRIORITY_STREAM
+    message_ids = []
+    last_message_id = 0
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+
+    def _get_stream_ids(self):
+        if "stream_ids" in self.event:
+            return self.event["stream_ids"]
+        return [self.event["stream_id"]]
+
+    def _get_user_ids(self):
+        if "user_ids" in self.event:
+            return self.event["user_ids"]
+        return [self.event["user_id"]]
+
+
+class AddPeerSubscription(PeerSubscription):
+    def execute(self, cache):
+        for stream_id in self._get_stream_ids():
+            for user_id in self._get_user_ids():
+                cache.add_stream_binding(
+                    external_account=self.external_account,
+                    stream_id=stream_id,
+                    user_id=user_id,
+                )
+
+
+class RemovePeerSubscription(PeerSubscription):
+    def execute(self, cache):
+        for stream_id in self._get_stream_ids():
+            for user_id in self._get_user_ids():
+                cache.remove_stream_binding(
+                    external_account=self.external_account,
+                    stream_id=stream_id,
+                    user_id=user_id,
+                )
 
 
 class UpdateZulipQueueState:
@@ -1220,13 +1424,14 @@ class ZulipBridgeWorker(threading.Thread):
             ),
         )
 
-    def _process_stream(self, stream, subscriber_ids=None):
+    def _process_stream(self, stream, subscriber_ids=None, event_id=None):
         put_sync_response(
             self._output_queue,
             AddStream(
                 external_account=self._external_account,
                 stream=stream,
                 subscriber_ids=subscriber_ids,
+                event_id=event_id,
             ),
         )
 
@@ -1274,6 +1479,50 @@ class ZulipBridgeWorker(threading.Thread):
         command_cls = {
             "add": AddMessageReaction,
             "remove": RemoveMessageReaction,
+        }.get(event["op"])
+        if command_cls is None:
+            return False
+        put_sync_response(
+            self._output_queue,
+            command_cls(
+                external_account=self._external_account,
+                event=event,
+            ),
+        )
+        return True
+
+    def _process_stream_event(self, event):
+        if event["op"] == "create":
+            for stream in event["streams"]:
+                self._process_stream(stream, event_id=event["id"])
+            return bool(event["streams"])
+        if event["op"] == "update":
+            put_sync_response(
+                self._output_queue,
+                UpdateStream(
+                    external_account=self._external_account,
+                    event=event,
+                ),
+            )
+            return True
+        if event["op"] == "delete":
+            put_sync_response(
+                self._output_queue,
+                DeleteStream(
+                    external_account=self._external_account,
+                    event=event,
+                ),
+            )
+            return True
+        return False
+
+    def _process_subscription_event(self, event):
+        command_cls = {
+            "add": AddSubscription,
+            "remove": RemoveSubscription,
+            "update": UpdateSubscription,
+            "peer_add": AddPeerSubscription,
+            "peer_remove": RemovePeerSubscription,
         }.get(event["op"])
         if command_cls is None:
             return False
@@ -1342,6 +1591,10 @@ class ZulipBridgeWorker(threading.Thread):
             return self._process_message_delete(event)
         if event_type == "reaction":
             return self._process_reaction(event)
+        if event_type == "stream":
+            return self._process_stream_event(event)
+        if event_type == "subscription":
+            return self._process_subscription_event(event)
         return False
 
     def _sync_message_events(

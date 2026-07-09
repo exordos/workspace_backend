@@ -33,8 +33,10 @@ MESSAGE_EVENT_TYPES = [
     "reaction",
     "update_message",
     "delete_message",
+    "stream",
+    "subscription",
 ]
-MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 3
+MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 4
 MESSAGE_EVENT_REGISTER_TIMEOUT = 30
 MESSAGE_EVENT_LONGPOLL_TIMEOUT = 10
 MESSAGE_FETCH_TIMEOUT = 30
@@ -349,6 +351,7 @@ class ZulipClient(common.RESTClientMixIn):
                 "event_types": event_types,
                 "apply_markdown": False,
                 "client_capabilities": {
+                    "archived_channels": True,
                     "notification_settings_null": True,
                     "bulk_message_deletion": True,
                 },

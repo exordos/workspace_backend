@@ -1006,6 +1006,319 @@ def test_zulip_bridge_worker_syncs_reaction_remove_event():
     assert command.event["emoji_name"] == "thumbs_up"
 
 
+def test_zulip_bridge_worker_syncs_stream_create_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 48,
+                    "type": "stream",
+                    "op": "create",
+                    "streams": [
+                        {
+                            "stream_id": 3,
+                            "name": "general",
+                            "description": "General stream",
+                            "creator_id": 24,
+                            "date_created": 1776940760,
+                            "invite_only": False,
+                            "is_archived": False,
+                            "stream_post_policy": 2,
+                            "subscribers": [10, 24],
+                        },
+                    ],
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=47,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 48
+    assert last_message_id == 103
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.AddStream)
+    assert command.event_id == 48
+    stream_info = command._get_stream_info()
+    assert stream_info["stream_id"] == 3
+    assert stream_info["subscriber_ids"] == [10, 24]
+    assert stream_info["announce"] is True
+
+
+def test_zulip_bridge_worker_syncs_stream_update_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 49,
+                    "type": "stream",
+                    "op": "update",
+                    "stream_id": 3,
+                    "name": "general",
+                    "property": "name",
+                    "value": "announcements",
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=48,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 49
+    assert last_message_id == 103
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.UpdateStream)
+    assert command.event_id == 49
+    cache = types.SimpleNamespace(update_stream=mock.Mock())
+    command.execute(cache)
+    cache.update_stream.assert_called_once_with(
+        external_account=worker.external_account,
+        stream_id=3,
+        values={"name": "announcements"},
+    )
+
+
+def test_zulip_bridge_worker_syncs_stream_delete_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 50,
+                    "type": "stream",
+                    "op": "delete",
+                    "stream_ids": [3],
+                    "streams": [{"stream_id": 3}],
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=49,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 50
+    assert last_message_id == 103
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.DeleteStream)
+    assert command.event_id == 50
+    cache = types.SimpleNamespace(remove_stream_binding=mock.Mock())
+    command.execute(cache)
+    cache.remove_stream_binding.assert_called_once_with(
+        external_account=worker.external_account,
+        stream_id=3,
+    )
+
+
+def test_zulip_bridge_worker_syncs_subscription_add_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 51,
+                    "type": "subscription",
+                    "op": "add",
+                    "subscriptions": [
+                        {
+                            "stream_id": 3,
+                            "name": "general",
+                            "description": "General stream",
+                            "creator_id": 24,
+                            "date_created": 1776940760,
+                            "invite_only": False,
+                            "is_archived": False,
+                            "is_announcement_only": False,
+                            "subscribers": [10, 24],
+                        },
+                    ],
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=50,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 51
+    assert last_message_id == 103
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.AddSubscription)
+    assert command.event_id == 51
+    cache = types.SimpleNamespace(get_or_create_stream=mock.Mock())
+    command.execute(cache)
+    stream_info = cache.get_or_create_stream.call_args.kwargs["stream_info"]
+    assert stream_info["stream_id"] == 3
+    assert stream_info["subscriber_ids"] == [10, 24]
+
+
+def test_zulip_bridge_worker_syncs_subscription_peer_events():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 52,
+                    "type": "subscription",
+                    "op": "peer_add",
+                    "stream_ids": [3, 4],
+                    "user_ids": [24, 25],
+                },
+                {
+                    "id": 53,
+                    "type": "subscription",
+                    "op": "peer_remove",
+                    "stream_ids": [3],
+                    "user_ids": [25],
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=51,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 53
+    assert last_message_id == 103
+    first_response = output_queue.get_nowait()
+    second_response = output_queue.get_nowait()
+    add_command = workers.get_sync_response_command(first_response)
+    remove_command = workers.get_sync_response_command(second_response)
+    assert isinstance(add_command, workers.AddPeerSubscription)
+    assert isinstance(remove_command, workers.RemovePeerSubscription)
+    cache = types.SimpleNamespace(
+        add_stream_binding=mock.Mock(),
+        remove_stream_binding=mock.Mock(),
+    )
+    add_command.execute(cache)
+    remove_command.execute(cache)
+    cache.add_stream_binding.assert_has_calls(
+        [
+            mock.call(
+                external_account=worker.external_account,
+                stream_id=3,
+                user_id=24,
+            ),
+            mock.call(
+                external_account=worker.external_account,
+                stream_id=3,
+                user_id=25,
+            ),
+            mock.call(
+                external_account=worker.external_account,
+                stream_id=4,
+                user_id=24,
+            ),
+            mock.call(
+                external_account=worker.external_account,
+                stream_id=4,
+                user_id=25,
+            ),
+        ],
+    )
+    cache.remove_stream_binding.assert_called_once_with(
+        external_account=worker.external_account,
+        stream_id=3,
+        user_id=25,
+    )
+
+
+def test_zulip_bridge_worker_syncs_subscription_update_as_noop_command():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 54,
+                    "type": "subscription",
+                    "op": "update",
+                    "stream_id": 3,
+                    "property": "pin_to_top",
+                    "value": True,
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=53,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 54
+    assert last_message_id == 103
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.UpdateSubscription)
+    assert command.event_id == 54
+
+
 def test_zulip_bridge_worker_skips_rendering_only_message_update_event():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.event_calls = []

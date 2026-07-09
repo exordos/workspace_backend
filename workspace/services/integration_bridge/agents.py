@@ -439,12 +439,18 @@ class WorkspaceIntegrationBridgeCache:
             entity_type=entity_type,
             entity_id=stream_id,
         ):
+            self._bind_stream_users(
+                external_account=external_account,
+                stream=stream,
+                subscriber_ids=stream_info["subscriber_ids"],
+            )
             return stream
-        self._sync_stream_info(
-            external_account=external_account,
-            stream=stream,
-            stream_info=stream_info,
-        )
+        if self._should_sync_stream_info(stream_info):
+            self._sync_stream_info(
+                external_account=external_account,
+                stream=stream,
+                stream_info=stream_info,
+            )
         self._bind_stream_users(
             external_account=external_account,
             stream=stream,
@@ -456,6 +462,171 @@ class WorkspaceIntegrationBridgeCache:
             entity_id=stream_id,
         )
         return stream
+
+    def _get_workspace_stream_by_zulip_id(self, external_account, stream_id):
+        cache_key = (
+            external_account.project_id,
+            external_account.server_url,
+            "stream",
+            stream_id,
+        )
+        if cache_key in self._streams:
+            return self._streams[cache_key]
+
+        processed_uuid = self._get_processed_workspace_uuid(
+            external_account=external_account,
+            entity_type="stream",
+            entity_id=stream_id,
+        )
+        if processed_uuid is not None:
+            stream = models.WorkspaceStream.objects.get_one_or_none(
+                filters={
+                    "uuid": dm_filters.EQ(processed_uuid),
+                    "project_id": dm_filters.EQ(external_account.project_id),
+                },
+            )
+            if stream is None:
+                self._log_stale_processed_entity(
+                    external_account=external_account,
+                    entity_type="stream",
+                    entity_id=stream_id,
+                    workspace_uuid=processed_uuid,
+                )
+            else:
+                self._streams[cache_key] = stream
+                return stream
+
+        for stream in models.WorkspaceStream.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "source_name": dm_filters.EQ(models.SourceName.ZULIP.value),
+            },
+        ):
+            source = getattr(stream, "source", None)
+            server_url = getattr(
+                source,
+                "server_url",
+                external_account.server_url,
+            )
+            if (
+                getattr(source, "stream_id", None) == stream_id and
+                server_url == external_account.server_url and
+                not getattr(stream, "private", False)
+            ):
+                self._streams[cache_key] = stream
+                self._save_processed_entity(
+                    external_account=external_account,
+                    entity_type="stream",
+                    entity_id=stream_id,
+                    workspace_uuid=stream.uuid,
+                )
+                return stream
+        return None
+
+    def _get_required_workspace_stream_by_zulip_id(
+        self,
+        external_account,
+        stream_id,
+    ):
+        stream = self._get_workspace_stream_by_zulip_id(
+            external_account=external_account,
+            stream_id=stream_id,
+        )
+        if stream is None:
+            raise SyncStreamsNeeded(
+                external_account=external_account,
+                stream_id=stream_id,
+            )
+        return stream
+
+    def update_stream(self, external_account, stream_id, values):
+        if not values:
+            return None
+        stream = self._get_required_workspace_stream_by_zulip_id(
+            external_account=external_account,
+            stream_id=stream_id,
+        )
+        update_values = {}
+        for key, value in values.items():
+            if hasattr(stream, key) and getattr(stream, key) == value:
+                continue
+            update_values[key] = value
+        if not update_values:
+            return stream
+        result = messenger_dm_helpers.update_workspace_user_stream(
+            project_id=external_account.project_id,
+            user_uuid=stream.user_uuid,
+            stream_uuid=stream.uuid,
+            values=update_values,
+        )
+        for key, value in update_values.items():
+            if hasattr(stream, key):
+                setattr(stream, key, value)
+        return result
+
+    def add_stream_binding(self, external_account, stream_id, user_id):
+        stream = self._get_required_workspace_stream_by_zulip_id(
+            external_account=external_account,
+            stream_id=stream_id,
+        )
+        user_uuid = self._get_required_zulip_user_uuid(
+            external_account=external_account,
+            user_id=user_id,
+        )
+        self._bind_stream_user(
+            external_account=external_account,
+            stream=stream,
+            user_uuid=user_uuid,
+        )
+
+    def _get_workspace_stream_binding(self, external_account, stream,
+                                      user_uuid):
+        return models.WorkspaceStreamBinding.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "stream_uuid": dm_filters.EQ(stream.uuid),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+        )
+
+    def remove_stream_binding(
+        self,
+        external_account,
+        stream_id,
+        user_id=None,
+    ):
+        stream = self._get_workspace_stream_by_zulip_id(
+            external_account=external_account,
+            stream_id=stream_id,
+        )
+        if stream is None:
+            return None
+        if user_id is None:
+            user_uuid = external_account.user_uuid
+        else:
+            user_uuid = self._get_zulip_user_uuid(
+                external_account=external_account,
+                user_id=user_id,
+            )
+        if user_uuid is None:
+            return None
+        binding = self._get_workspace_stream_binding(
+            external_account=external_account,
+            stream=stream,
+            user_uuid=user_uuid,
+        )
+        if binding is None:
+            return None
+        cache_key = (
+            external_account.project_id,
+            stream.uuid,
+            user_uuid,
+        )
+        self._stream_bindings.discard(cache_key)
+        return messenger_dm_helpers.delete_workspace_stream_binding(
+            project_id=external_account.project_id,
+            binding_uuid=binding.uuid,
+        )
 
     def pop_file_import_errors(self):
         errors = self._file_import_errors
@@ -496,6 +667,12 @@ class WorkspaceIntegrationBridgeCache:
             user_uuid=stream.user_uuid,
             stream_uuid=stream.uuid,
             values=values,
+        )
+
+    def _should_sync_stream_info(self, stream_info):
+        return not (
+            stream_info["type"] == "stream" and
+            stream_info.get("event_type") == "message"
         )
 
     @staticmethod
@@ -3004,15 +3181,26 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             self._handle_zulip_message_failed(command)
             return None
         result = command.execute(cache=self._cache)
-        if isinstance(
-            command,
-            (
-                workers.AddMessage,
-                workers.UpdateMessage,
-                workers.DeleteMessage,
-                workers.AddMessageReaction,
-                workers.RemoveMessageReaction,
-            ),
+        message_queue_state_commands = (
+            workers.AddMessage,
+            workers.UpdateMessage,
+            workers.DeleteMessage,
+            workers.AddMessageReaction,
+            workers.RemoveMessageReaction,
+        )
+        realtime_queue_state_commands = (
+            workers.AddStream,
+            workers.UpdateStream,
+            workers.DeleteStream,
+            workers.AddSubscription,
+            workers.RemoveSubscription,
+            workers.UpdateSubscription,
+            workers.AddPeerSubscription,
+            workers.RemovePeerSubscription,
+        )
+        if isinstance(command, message_queue_state_commands) or (
+            isinstance(command, realtime_queue_state_commands) and
+            getattr(command, "event_id", None) is not None
         ):
             self._update_zulip_queue_state_for_message(command)
         if isinstance(command, workers.SyncStreamsFinished):

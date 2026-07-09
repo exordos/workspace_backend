@@ -409,11 +409,12 @@ def test_zulip_client_registers_message_event_queue_with_update_and_delete():
         data={
             "event_types": (
                 '["message", "reaction", "update_message", '
-                '"delete_message"]'
+                '"delete_message", "stream", "subscription"]'
             ),
             "apply_markdown": "false",
             "client_capabilities": (
                 "{"
+                '"archived_channels": true, '
                 '"notification_settings_null": true, '
                 '"bulk_message_deletion": true'
                 "}"
@@ -462,11 +463,12 @@ def test_zulip_client_registers_all_events_when_filtered_queue_fails():
             data={
                 "event_types": (
                     '["message", "reaction", "update_message", '
-                    '"delete_message"]'
+                    '"delete_message", "stream", "subscription"]'
                 ),
                 "apply_markdown": "false",
                 "client_capabilities": (
                     "{"
+                    '"archived_channels": true, '
                     '"notification_settings_null": true, '
                     '"bulk_message_deletion": true'
                     "}"
@@ -481,6 +483,7 @@ def test_zulip_client_registers_all_events_when_filtered_queue_fails():
                 "apply_markdown": "false",
                 "client_capabilities": (
                     "{"
+                    '"archived_channels": true, '
                     '"notification_settings_null": true, '
                     '"bulk_message_deletion": true'
                     "}"

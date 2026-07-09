@@ -130,6 +130,11 @@ On every iteration, the main agent runs `_start_bridges()`:
    (together with `UpdateZulipQueueState` to save `queue_id` and `last_event_id`
    in the database).
 
+The queue subscription requests message, reaction, message update/delete,
+stream, and subscription events. It declares the Zulip `archived_channels`
+client capability so channel archiving is delivered as a stream state update
+instead of a stream deletion event when the server supports that behavior.
+
 The agent must be able to stop any `ZulipBridgeWorker` at any time through
 `worker.stop()`. The worker sets `_stopped` and exits synchronization loops.
 After `worker.stop()` is called, the worker must finish within **10 seconds**.
@@ -517,10 +522,11 @@ able to create a missing stream and topic:
 | A task contains a message in an unknown public stream | The worker requests the stream and subscribers from Zulip, creates the stream and topic, and continues the task |
 | A task contains a message in a personal chat | The worker builds the stream from message data, creates the `"zulip"` topic, and continues the task |
 
-After creating or updating a stream, the bridge must refresh participant
-bindings: new Zulip subscribers are added as members, and unsubscribed
-participants are removed from bindings or marked inactive according to the
-Workspace model.
+After creating a stream from full Zulip stream/subscription data, the bridge
+must refresh participant bindings. Realtime subscription events then keep those
+bindings current: `peer_add` adds newly visible subscribers as members, and
+`peer_remove`, `remove`, or a stream visibility delete removes the affected
+Workspace stream binding.
 
 ### Outbound Synchronization
 
@@ -576,6 +582,8 @@ unit/integration tests. Required test groups:
   duplicates;
 - matching a Zulip user by link, then by email, then creating an imported user;
 - importing public stream/topic;
+- realtime inbound stream create/update/delete and subscription membership
+  events;
 - importing private 1:1 and skipping group private chats;
 - importing files into Workspace storage and replacing links with Workspace URNs;
 - inserting a placeholder link when file download fails;
