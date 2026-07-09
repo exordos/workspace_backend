@@ -986,6 +986,34 @@ def test_outbound_event_filter_uses_author_event_only():
             "notification_mode": "all_messages",
         },
     )
+    topic_event = types.SimpleNamespace(
+        object_type="topic",
+        action="updated",
+        user_uuid="topic-user",
+        payload={
+            "user_uuid": "topic-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(
+                stream_id=3,
+                topic_name="General Topic",
+            ),
+            "notification_mode": "mute",
+        },
+    )
+    recipient_topic_event = types.SimpleNamespace(
+        object_type="topic",
+        action="updated",
+        user_uuid="recipient-user",
+        payload={
+            "user_uuid": "topic-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(
+                stream_id=3,
+                topic_name="General Topic",
+            ),
+            "notification_mode": "mute",
+        },
+    )
 
     assert worker._is_zulip_outbound_event(author_event)
     assert not worker._is_zulip_outbound_event(recipient_event)
@@ -995,6 +1023,8 @@ def test_outbound_event_filter_uses_author_event_only():
     assert not worker._is_zulip_outbound_event(recipient_reaction_event)
     assert worker._is_zulip_outbound_event(stream_event)
     assert not worker._is_zulip_outbound_event(recipient_stream_event)
+    assert worker._is_zulip_outbound_event(topic_event)
+    assert not worker._is_zulip_outbound_event(recipient_topic_event)
 
 
 class FakeQueryResult:
@@ -1047,6 +1077,8 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
     assert "e.object_type = 'stream'" in statement
     assert "e.payload ? 'notification_mode'" in statement
     assert "e.payload #>> '{source,stream_id}' IS NOT NULL" in statement
+    assert "e.object_type = 'topic'" in statement
+    assert "e.payload #>> '{source,topic_name}' IS NOT NULL" in statement
     assert "previous.payload->>'notification_mode'" in statement
     assert "IS DISTINCT FROM e.payload->>'notification_mode'" in statement
     assert "e.payload #>> '{source,message_id}' IS NULL" in statement
@@ -1216,6 +1248,60 @@ def test_dispatch_zulip_stream_outbound_state_uses_stream_user_worker_queue():
         worker._dispatch_zulip_outbound_state(state)
 
     assert stream_user_queue.get_nowait() is command
+    assert other_queue.empty()
+    assert state.status == "processing"
+
+
+def test_dispatch_zulip_topic_outbound_state_uses_topic_user_worker_queue():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    command = object()
+    state = FakeOutboundState()
+    event = types.SimpleNamespace(
+        object_type="topic",
+        action="updated",
+        user_uuid="topic-user",
+        payload={
+            "user_uuid": "topic-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(
+                stream_id=3,
+                topic_name="General Topic",
+            ),
+            "notification_mode": "mute",
+        },
+    )
+    external_account = types.SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        server_url="https://zulip.example.com",
+        user_uuid="topic-user",
+        account_settings=types.SimpleNamespace(credentials=object()),
+    )
+    topic_user_queue = queue.Queue()
+    other_queue = queue.Queue()
+    worker._worker_input_queues = {
+        ("project", "https://zulip.example.com", "topic-user"): (
+            topic_user_queue
+        ),
+        ("project", "https://zulip.example.com", "other-user"): other_queue,
+    }
+
+    with mock.patch.object(
+        worker,
+        "_get_zulip_outbound_event",
+        mock.Mock(return_value=event),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_outbound_account",
+        mock.Mock(return_value=external_account),
+    ), mock.patch.object(
+        worker,
+        "_build_zulip_outbound_command",
+        mock.Mock(return_value=command),
+    ):
+        worker._dispatch_zulip_outbound_state(state)
+
+    assert topic_user_queue.get_nowait() is command
     assert other_queue.empty()
     assert state.status == "processing"
 
@@ -1603,6 +1689,89 @@ def test_build_zulip_stream_subscription_outbound_command_maps_mentions():
             "value": False,
         },
     ]
+
+
+def test_build_zulip_user_topic_outbound_command_mutes_topic():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        object_type="topic",
+        action="updated",
+        epoch_version=66,
+        payload={
+            "uuid": "topic-uuid",
+            "source": types.SimpleNamespace(
+                stream_id=27,
+                topic_name="General Topic",
+            ),
+            "notification_mode": "mute",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_topic_notification_mode_changed",
+        mock.Mock(return_value=True),
+    ):
+        command = worker._build_zulip_outbound_command(event)
+
+    assert isinstance(command, agents.workers.UpdateZulipUserTopic)
+    assert command.epoch_version == 66
+    assert command.topic_uuid == "topic-uuid"
+    assert command.stream_id == 27
+    assert command.topic == "General Topic"
+    assert command.visibility_policy == 1
+
+
+def test_build_zulip_user_topic_outbound_command_maps_follow_topic():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        object_type="topic",
+        action="updated",
+        epoch_version=67,
+        payload={
+            "uuid": "topic-uuid",
+            "source": types.SimpleNamespace(
+                stream_id=27,
+                topic_name="General Topic",
+            ),
+            "notification_mode": "follow",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_topic_notification_mode_changed",
+        mock.Mock(return_value=True),
+    ):
+        command = worker._build_zulip_outbound_command(event)
+
+    assert command.visibility_policy == 3
+
+
+def test_build_zulip_user_topic_outbound_command_skips_unchanged():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        object_type="topic",
+        action="updated",
+        epoch_version=66,
+        payload={
+            "uuid": "topic-uuid",
+            "source": types.SimpleNamespace(
+                stream_id=27,
+                topic_name="General Topic",
+            ),
+            "notification_mode": "mute",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_topic_notification_mode_changed",
+        mock.Mock(return_value=False),
+    ):
+        command = worker._build_zulip_outbound_command(event)
+
+    assert command is None
 
 
 def test_build_send_zulip_message_command_uses_direct_private_recipient():

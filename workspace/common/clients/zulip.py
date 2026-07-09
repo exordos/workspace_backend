@@ -45,6 +45,7 @@ USER_FETCH_TIMEOUT = 30
 STREAM_FETCH_TIMEOUT = 30
 STREAM_MEMBERS_FETCH_TIMEOUT = 30
 SUBSCRIPTION_UPDATE_TIMEOUT = 30
+USER_TOPIC_UPDATE_TIMEOUT = 30
 INVALID_MESSAGE_CODE = "BAD_REQUEST"
 INVALID_MESSAGE_MSG = "Invalid message(s)"
 
@@ -325,6 +326,26 @@ class ZulipClient(common.RESTClientMixIn):
                 "subscription_data": subscription_data,
             },
             timeout=SUBSCRIPTION_UPDATE_TIMEOUT,
+        )
+
+    def update_user_topic_with_api_key(
+        self,
+        login: str,
+        token: str,
+        stream_id: int,
+        topic: str,
+        visibility_policy: int,
+    ):
+        return self._post_api_json_with_api_key(
+            login=login,
+            token=token,
+            path="user_topics",
+            data={
+                "stream_id": stream_id,
+                "topic": topic,
+                "visibility_policy": visibility_policy,
+            },
+            timeout=USER_TOPIC_UPDATE_TIMEOUT,
         )
 
     def upload_file_with_api_key(

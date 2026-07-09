@@ -136,6 +136,32 @@ WHERE e.epoch_version > %s
           ) IS DISTINCT FROM e.payload->>'notification_mode'
           AND e.user_uuid::text = e.payload->>'user_uuid'
       )
+      OR (
+          e.object_type = 'topic'
+          AND e.action = 'updated'
+          AND e.payload->>'source_name' = 'zulip'
+          AND e.payload ? 'user_uuid'
+          AND e.payload ? 'source'
+          AND e.payload ? 'notification_mode'
+          AND e.payload #>> '{source,stream_id}' IS NOT NULL
+          AND e.payload #>> '{source,topic_name}' IS NOT NULL
+          AND COALESCE(
+              (
+                  SELECT previous.payload->>'notification_mode'
+                  FROM m_workspace_events AS previous
+                  WHERE previous.project_id = e.project_id
+                    AND previous.object_type = 'topic'
+                    AND previous.action IN ('created', 'updated')
+                    AND previous.epoch_version < e.epoch_version
+                    AND previous.payload->>'uuid' = e.payload->>'uuid'
+                    AND previous.user_uuid = e.user_uuid
+                  ORDER BY previous.epoch_version DESC
+                  LIMIT 1
+              ),
+              e.payload->>'notification_mode'
+          ) IS DISTINCT FROM e.payload->>'notification_mode'
+          AND e.user_uuid::text = e.payload->>'user_uuid'
+      )
   )
   AND NOT EXISTS (
       SELECT 1
@@ -180,6 +206,12 @@ ZULIP_STREAM_NOTIFICATION_MODE_SUBSCRIPTION_CHANGES = {
             "value": False,
         },
     ),
+}
+ZULIP_TOPIC_NOTIFICATION_MODE_VISIBILITY_POLICIES = {
+    models.WorkspaceTopicNotificationMode.DEFAULT.value: 0,
+    models.WorkspaceTopicNotificationMode.MUTE.value: 1,
+    models.WorkspaceTopicNotificationMode.UNMUTE.value: 2,
+    models.WorkspaceTopicNotificationMode.FOLLOW.value: 3,
 }
 
 
@@ -2867,7 +2899,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             if "user_uuid" not in payload:
                 return False
             return str(event.user_uuid) == str(payload["user_uuid"])
-        if event.object_type == "stream":
+        if event.object_type in ("stream", "topic"):
             if event.action != "updated":
                 return False
             if "user_uuid" not in payload:
@@ -2876,7 +2908,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         return False
 
     def _get_zulip_outbound_user_uuid(self, event):
-        if event.object_type == "stream":
+        if event.object_type in ("stream", "topic"):
             return event.payload["user_uuid"]
         if event.object_type == "message_reaction":
             return event.payload["user_uuid"]
@@ -3070,6 +3102,41 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             event.payload["notification_mode"]
         )
 
+    def _get_previous_topic_event_payload(self, event):
+        result = contexts.Context().get_session().execute(
+            """
+            SELECT payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND object_type = 'topic'
+              AND action IN ('created', 'updated')
+              AND epoch_version < %s
+              AND payload->>'uuid' = %s
+              AND user_uuid = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (
+                event.project_id,
+                event.epoch_version,
+                event.payload["uuid"],
+                event.user_uuid,
+            ),
+        )
+        row = result.fetchone()
+        if row is None:
+            return None
+        return row["payload"]
+
+    def _topic_notification_mode_changed(self, event):
+        previous_payload = self._get_previous_topic_event_payload(event)
+        if previous_payload is None:
+            return False
+        return (
+            previous_payload["notification_mode"] !=
+            event.payload["notification_mode"]
+        )
+
     def _get_zulip_private_recipient_id(self, event, message, stream):
         if stream.direct_user_uuid is None:
             return None
@@ -3243,9 +3310,41 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             subscription_data=self._get_stream_subscription_data(event),
         )
 
+    def _get_topic_visibility_policy(self, event):
+        notification_mode = event.payload["notification_mode"]
+        return ZULIP_TOPIC_NOTIFICATION_MODE_VISIBILITY_POLICIES[
+            notification_mode
+        ]
+
+    def _build_update_zulip_user_topic_command(self, event):
+        if event.action != "updated":
+            return None
+        if not self._topic_notification_mode_changed(event):
+            return None
+        source = event.payload["source"]
+        stream_id = self._source_value(source, "stream_id")
+        if stream_id is None:
+            raise RetryCommandLater(
+                "Postpone Zulip topic update because stream_id is missing",
+            )
+        topic_name = self._source_value(source, "topic_name")
+        if topic_name is None:
+            raise RetryCommandLater(
+                "Postpone Zulip topic update because topic_name is missing",
+            )
+        return workers.UpdateZulipUserTopic(
+            epoch_version=event.epoch_version,
+            topic_uuid=event.payload["uuid"],
+            stream_id=stream_id,
+            topic=topic_name,
+            visibility_policy=self._get_topic_visibility_policy(event),
+        )
+
     def _build_zulip_outbound_command(self, event):
         if event.object_type == "stream":
             return self._build_update_zulip_stream_subscription_command(event)
+        if event.object_type == "topic":
+            return self._build_update_zulip_user_topic_command(event)
         if event.object_type == "message_reaction":
             return self._build_zulip_reaction_outbound_command(event)
         if event.action == "created":
@@ -3441,6 +3540,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 workers.ZulipReactionRemoved,
                 workers.ZulipReactionUpdated,
                 workers.ZulipSubscriptionUpdated,
+                workers.ZulipUserTopicUpdated,
             ),
         ):
             try:

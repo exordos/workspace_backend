@@ -908,6 +908,10 @@ class ZulipSubscriptionUpdated(ZulipOutboundResponse):
     pass
 
 
+class ZulipUserTopicUpdated(ZulipOutboundResponse):
+    pass
+
+
 class ZulipMessageFailed(ZulipOutboundResponse):
     def __init__(
         self,
@@ -1219,6 +1223,44 @@ class UpdateZulipStreamSubscription(ZulipOutboundCommand):
         )
 
 
+class UpdateZulipUserTopic(ZulipOutboundCommand):
+    def __init__(
+        self,
+        epoch_version,
+        topic_uuid,
+        stream_id,
+        topic,
+        visibility_policy,
+    ):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=topic_uuid,
+        )
+        self.topic_uuid = topic_uuid
+        self.stream_id = stream_id
+        self.topic = topic
+        self.visibility_policy = visibility_policy
+
+    def execute(self, worker):
+        try:
+            worker.update_user_topic(
+                stream_id=self.stream_id,
+                topic=self.topic,
+                visibility_policy=self.visibility_policy,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipUserTopicUpdated(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.topic_uuid,
+            ),
+        )
+
+
 class ZulipBridgeWorker(threading.Thread):
     DEFAULT_MESSAGE_FILTERS = {
         "anchor": 0,
@@ -1518,6 +1560,17 @@ class ZulipBridgeWorker(threading.Thread):
             login=credentials.login,
             token=credentials.token,
             subscription_data=subscription_data,
+        )
+
+    def update_user_topic(self, stream_id, topic, visibility_policy):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        return client.update_user_topic_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            stream_id=stream_id,
+            topic=topic,
+            visibility_policy=visibility_policy,
         )
 
     def _put_zulip_queue_state(

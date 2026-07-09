@@ -20,7 +20,7 @@ The first version must implement:
 - outbound message operations: send, edit, and delete;
 - outbound reactions;
 - outbound read/unread through the existing Workspace flags mechanism;
-- outbound per-user stream notification mode changes;
+- outbound per-user stream and topic notification mode changes;
 - diagnostics through logs and database tables;
 - backend unit/integration tests.
 
@@ -46,7 +46,7 @@ synchronizes data between Zulip and Workspace Messenger in both directions:
   `m_workspace_events` for the UI.
 - **Outbound (Workspace -> Zulip):** user actions in Workspace for objects with
   `source_name = zulip` are delivered back to Zulip on behalf of that user:
-  message send, edit, delete, reactions, read/unread, and per-user stream
+  message send, edit, delete, reactions, read/unread, and per-user stream/topic
   notification mode changes. Stream/topic management, subscribe/unsubscribe,
   participant, and role management remain outside the first outbound version.
 
@@ -71,7 +71,7 @@ The service inherits from `BasicService` and runs one iteration roughly every
   sent back to Zulip, but the next resynchronization gives priority to the Zulip
   state.
 - First-version bidirectional synchronization includes messages, edits, deletes,
-  reactions, read/unread, and per-user stream notification mode changes.
+  reactions, read/unread, and per-user stream/topic notification mode changes.
   Stream/topic renames, subscriptions, unsubscriptions, participants, and roles
   are synchronized inbound, but outbound changes for those objects are not part
   of the first version.
@@ -160,8 +160,10 @@ outstanding:
 - `attachment` and `submessage`: handle attachment lifecycle changes and Zulip
   interactive submessages separately from message content import if Workspace
   starts exposing those concepts.
-- `user_topic`, `muted_topics`, `muted_users`, and `alert_words`: map personal
-  mute, topic, and alert preferences where Workspace has matching settings.
+- `user_topic`, `muted_topics`, `muted_users`, and `alert_words`: consume
+  Zulip-originated personal mute, topic, and alert preferences where Workspace
+  has matching settings. Workspace-originated topic notification mode changes
+  are handled by outbound `/user_topics` updates.
 - `channel_folder`: map Zulip channel folders if Workspace adds a corresponding
   channel grouping feature.
 - Organization/admin configuration events such as `realm`, `realm_domains`,
@@ -586,7 +588,8 @@ The first-version outbound scope includes:
 - adding and removing reactions;
 - read/unread actions through existing Workspace flags;
 - per-user stream notification mode changes through Zulip subscription
-  properties.
+- per-user topic notification mode changes through Zulip user-topic visibility
+  policies.
 
 The first-version outbound scope does not include:
 
@@ -601,6 +604,12 @@ to `is_muted = false`; `mentions_only` unmutes the stream and disables explicit
 desktop, audible, push, and email notification toggles for that user. Inbound
 Zulip subscription updates are marked as already applied so they do not echo
 back to Zulip as outbound commands.
+
+When a Workspace user changes notification mode for a Zulip-backed topic, the
+bridge sends `/user_topics` from that user's Zulip account. Workspace `default`,
+`mute`, `unmute`, and `follow` map to Zulip visibility policies `0`, `1`, `2`,
+and `3`. Only real notification mode changes are sent; no-op topic updates are
+skipped before creating outbound work.
 
 An outbound action is executed on behalf of the Workspace user who performed the
 action, through that user's connected Zulip account. For example, deleting a

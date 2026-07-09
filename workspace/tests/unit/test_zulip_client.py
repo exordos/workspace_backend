@@ -682,6 +682,40 @@ def test_zulip_client_updates_subscription_settings_with_api_key():
     )
 
 
+def test_zulip_client_updates_user_topic_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {"result": "success"}
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    with mock.patch.object(
+        zulip.requests,
+        "post",
+        return_value=response,
+    ) as request:
+        result = client.update_user_topic_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            stream_id=27,
+            topic="General Topic",
+            visibility_policy=1,
+        )
+
+    assert result == {"result": "success"}
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/user_topics",
+        auth=("user@example.com", "zulip-token"),
+        data={
+            "stream_id": 27,
+            "topic": "General Topic",
+            "visibility_policy": 1,
+        },
+        timeout=zulip.USER_TOPIC_UPDATE_TIMEOUT,
+    )
+
+
 def test_zulip_client_updates_message_with_official_sdk():
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",

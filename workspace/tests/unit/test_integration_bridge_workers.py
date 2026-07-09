@@ -46,6 +46,7 @@ class FakeZulipClient:
     add_reaction_calls = None
     remove_reaction_calls = None
     update_subscription_calls = None
+    update_user_topic_calls = None
 
     def __init__(self, endpoint):
         type(self).init_endpoint = endpoint
@@ -194,6 +195,23 @@ class FakeZulipClient:
             "login": login,
             "token": token,
             "subscription_data": subscription_data,
+        })
+        return {"result": "success"}
+
+    def update_user_topic_with_api_key(
+        self,
+        login,
+        token,
+        stream_id,
+        topic,
+        visibility_policy,
+    ):
+        type(self).update_user_topic_calls.append({
+            "login": login,
+            "token": token,
+            "stream_id": stream_id,
+            "topic": topic,
+            "visibility_policy": visibility_policy,
         })
         return {"result": "success"}
 
@@ -2112,6 +2130,39 @@ def test_update_zulip_stream_subscription_command_updates_and_reports_success():
     command = workers.get_sync_response_command(response)
     assert isinstance(command, workers.ZulipSubscriptionUpdated)
     assert command.epoch_version == 61
+
+
+def test_update_zulip_user_topic_command_updates_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.update_user_topic_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.UpdateZulipUserTopic(
+        epoch_version=62,
+        topic_uuid="topic-uuid",
+        stream_id=27,
+        topic="General Topic",
+        visibility_policy=1,
+    ).execute(worker)
+
+    assert FakeZulipClient.update_user_topic_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "stream_id": 27,
+            "topic": "General Topic",
+            "visibility_policy": 1,
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipUserTopicUpdated)
+    assert command.epoch_version == 62
 
 
 def test_put_sync_response_waits_when_output_queue_is_full():
