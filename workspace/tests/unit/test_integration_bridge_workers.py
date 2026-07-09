@@ -45,6 +45,7 @@ class FakeZulipClient:
     delete_calls = None
     add_reaction_calls = None
     remove_reaction_calls = None
+    update_subscription_calls = None
 
     def __init__(self, endpoint):
         type(self).init_endpoint = endpoint
@@ -180,6 +181,19 @@ class FakeZulipClient:
             "emoji_name": emoji_name,
             "emoji_code": emoji_code,
             "reaction_type": reaction_type,
+        })
+        return {"result": "success"}
+
+    def update_subscription_settings_with_api_key(
+        self,
+        login,
+        token,
+        subscription_data,
+    ):
+        type(self).update_subscription_calls.append({
+            "login": login,
+            "token": token,
+            "subscription_data": subscription_data,
         })
         return {"result": "success"}
 
@@ -1429,7 +1443,7 @@ def test_zulip_bridge_worker_syncs_subscription_peer_events():
     )
 
 
-def test_zulip_bridge_worker_syncs_subscription_update_as_noop_command():
+def test_zulip_bridge_worker_syncs_subscription_update_event():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.event_calls = []
     FakeZulipClient.event_pages = [
@@ -1440,8 +1454,8 @@ def test_zulip_bridge_worker_syncs_subscription_update_as_noop_command():
                     "type": "subscription",
                     "op": "update",
                     "stream_id": 3,
-                    "property": "pin_to_top",
-                    "value": True,
+                    "property": "in_home_view",
+                    "value": False,
                 },
             ],
         },
@@ -1465,6 +1479,58 @@ def test_zulip_bridge_worker_syncs_subscription_update_as_noop_command():
     command = workers.get_sync_response_command(response)
     assert isinstance(command, workers.UpdateSubscription)
     assert command.event_id == 54
+    cache = types.SimpleNamespace(update_stream_subscription=mock.Mock())
+    command.execute(cache)
+    cache.update_stream_subscription.assert_called_once_with(
+        external_account=worker.external_account,
+        stream_id=3,
+        values={"notification_mode": "muted"},
+    )
+
+
+def test_update_subscription_syncs_notification_event():
+    external_account = _external_account()
+    cache = types.SimpleNamespace(update_stream_subscription=mock.Mock())
+    event = {
+        "id": 55,
+        "type": "subscription",
+        "op": "update",
+        "stream_id": 3,
+        "property": "desktop_notifications",
+        "value": False,
+    }
+
+    workers.UpdateSubscription(
+        external_account=external_account,
+        event=event,
+    ).execute(cache)
+
+    cache.update_stream_subscription.assert_called_once_with(
+        external_account=external_account,
+        stream_id=3,
+        values={"notification_mode": "mentions_only"},
+    )
+
+
+def test_update_subscription_skips_unsupported_property():
+    external_account = _external_account()
+    cache = types.SimpleNamespace(update_stream_subscription=mock.Mock())
+    event = {
+        "id": 56,
+        "type": "subscription",
+        "op": "update",
+        "stream_id": 3,
+        "property": "pin_to_top",
+        "value": True,
+    }
+
+    result = workers.UpdateSubscription(
+        external_account=external_account,
+        event=event,
+    ).execute(cache)
+
+    assert result is None
+    cache.update_stream_subscription.assert_not_called()
 
 
 def test_zulip_bridge_worker_skips_rendering_only_message_update_event():
@@ -2005,6 +2071,47 @@ def test_update_zulip_reaction_command_removes_then_adds_and_reports_success():
     command = workers.get_sync_response_command(response)
     assert isinstance(command, workers.ZulipReactionUpdated)
     assert command.epoch_version == 60
+
+
+def test_update_zulip_stream_subscription_command_updates_and_reports_success():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.update_subscription_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    workers.UpdateZulipStreamSubscription(
+        epoch_version=61,
+        stream_uuid="stream-uuid",
+        subscription_data=[
+            {
+                "stream_id": 3,
+                "property": "is_muted",
+                "value": False,
+            },
+        ],
+    ).execute(worker)
+
+    assert FakeZulipClient.update_subscription_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "subscription_data": [
+                {
+                    "stream_id": 3,
+                    "property": "is_muted",
+                    "value": False,
+                },
+            ],
+        },
+    ]
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipSubscriptionUpdated)
+    assert command.epoch_version == 61
 
 
 def test_put_sync_response_waits_when_output_queue_is_full():

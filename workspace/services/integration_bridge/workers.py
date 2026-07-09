@@ -60,6 +60,15 @@ ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS = {
     "read": "read",
     "starred": "starred",
 }
+WORKSPACE_STREAM_NOTIFICATION_MENTIONS_ONLY = "mentions_only"
+WORKSPACE_STREAM_NOTIFICATION_MUTED = "muted"
+WORKSPACE_STREAM_NOTIFICATION_ALL_MESSAGES = "all_messages"
+ZULIP_SUBSCRIPTION_NOTIFICATION_PROPERTIES = (
+    "audible_notifications",
+    "desktop_notifications",
+    "email_notifications",
+    "push_notifications",
+)
 
 
 class PrioritizedSyncResponse:
@@ -709,8 +718,38 @@ class UpdateSubscription:
         self.event = event
         self.event_id = event["id"]
 
-    def execute(self, cache):
+    def _get_notification_mode(self):
+        property_name = self.event["property"]
+        value = self.event["value"]
+        if property_name == "is_muted":
+            if value:
+                return WORKSPACE_STREAM_NOTIFICATION_MUTED
+            return WORKSPACE_STREAM_NOTIFICATION_ALL_MESSAGES
+        if property_name == "in_home_view":
+            if value:
+                return WORKSPACE_STREAM_NOTIFICATION_ALL_MESSAGES
+            return WORKSPACE_STREAM_NOTIFICATION_MUTED
+        if property_name in ZULIP_SUBSCRIPTION_NOTIFICATION_PROPERTIES:
+            if value is False:
+                return WORKSPACE_STREAM_NOTIFICATION_MENTIONS_ONLY
+            return WORKSPACE_STREAM_NOTIFICATION_ALL_MESSAGES
         return None
+
+    def _get_values(self):
+        notification_mode = self._get_notification_mode()
+        if notification_mode is None:
+            return {}
+        return {"notification_mode": notification_mode}
+
+    def execute(self, cache):
+        values = self._get_values()
+        if not values:
+            return None
+        return cache.update_stream_subscription(
+            external_account=self.external_account,
+            stream_id=self.event["stream_id"],
+            values=values,
+        )
 
 
 class PeerSubscription:
@@ -862,6 +901,10 @@ class ZulipReactionRemoved(ZulipOutboundResponse):
 
 
 class ZulipReactionUpdated(ZulipOutboundResponse):
+    pass
+
+
+class ZulipSubscriptionUpdated(ZulipOutboundResponse):
     pass
 
 
@@ -1145,6 +1188,33 @@ class UpdateZulipReaction(ZulipOutboundCommand):
                 external_account=worker.external_account,
                 epoch_version=self.epoch_version,
                 message_uuid=self.message_uuid,
+            ),
+        )
+
+
+class UpdateZulipStreamSubscription(ZulipOutboundCommand):
+    def __init__(self, epoch_version, stream_uuid, subscription_data):
+        super().__init__(
+            epoch_version=epoch_version,
+            message_uuid=stream_uuid,
+        )
+        self.stream_uuid = stream_uuid
+        self.subscription_data = subscription_data
+
+    def execute(self, worker):
+        try:
+            worker.update_subscription_settings(
+                subscription_data=self.subscription_data,
+            )
+        except Exception as exc:
+            self._put_failed(worker, exc)
+            return
+        put_sync_response(
+            worker.output_queue,
+            ZulipSubscriptionUpdated(
+                external_account=worker.external_account,
+                epoch_version=self.epoch_version,
+                message_uuid=self.stream_uuid,
             ),
         )
 
@@ -1439,6 +1509,15 @@ class ZulipBridgeWorker(threading.Thread):
             emoji_name=emoji_name,
             emoji_code=emoji_code,
             reaction_type=reaction_type,
+        )
+
+    def update_subscription_settings(self, subscription_data):
+        credentials = self._get_credentials()
+        client = self._get_client()
+        return client.update_subscription_settings_with_api_key(
+            login=credentials.login,
+            token=credentials.token,
+            subscription_data=subscription_data,
         )
 
     def _put_zulip_queue_state(

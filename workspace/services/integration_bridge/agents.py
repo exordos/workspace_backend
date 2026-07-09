@@ -111,6 +111,31 @@ WHERE e.epoch_version > %s
           AND e.payload ? 'source'
           AND e.user_uuid::text = e.payload->>'user_uuid'
       )
+      OR (
+          e.object_type = 'stream'
+          AND e.action = 'updated'
+          AND e.payload->>'source_name' = 'zulip'
+          AND e.payload ? 'user_uuid'
+          AND e.payload ? 'source'
+          AND e.payload ? 'notification_mode'
+          AND e.payload #>> '{source,stream_id}' IS NOT NULL
+          AND COALESCE(
+              (
+                  SELECT previous.payload->>'notification_mode'
+                  FROM m_workspace_events AS previous
+                  WHERE previous.project_id = e.project_id
+                    AND previous.object_type = 'stream'
+                    AND previous.action IN ('created', 'updated')
+                    AND previous.epoch_version < e.epoch_version
+                    AND previous.payload->>'uuid' = e.payload->>'uuid'
+                    AND previous.user_uuid = e.user_uuid
+                  ORDER BY previous.epoch_version DESC
+                  LIMIT 1
+              ),
+              e.payload->>'notification_mode'
+          ) IS DISTINCT FROM e.payload->>'notification_mode'
+          AND e.user_uuid::text = e.payload->>'user_uuid'
+      )
   )
   AND NOT EXISTS (
       SELECT 1
@@ -120,6 +145,42 @@ WHERE e.epoch_version > %s
 ORDER BY e.epoch_version ASC
 LIMIT %s
 """
+ZULIP_STREAM_NOTIFICATION_MODE_SUBSCRIPTION_CHANGES = {
+    models.WorkspaceStreamNotificationMode.MUTED.value: (
+        {
+            "property": "is_muted",
+            "value": True,
+        },
+    ),
+    models.WorkspaceStreamNotificationMode.ALL_MESSAGES.value: (
+        {
+            "property": "is_muted",
+            "value": False,
+        },
+    ),
+    models.WorkspaceStreamNotificationMode.MENTIONS_ONLY.value: (
+        {
+            "property": "is_muted",
+            "value": False,
+        },
+        {
+            "property": "desktop_notifications",
+            "value": False,
+        },
+        {
+            "property": "audible_notifications",
+            "value": False,
+        },
+        {
+            "property": "push_notifications",
+            "value": False,
+        },
+        {
+            "property": "email_notifications",
+            "value": False,
+        },
+    ),
+}
 
 
 class RetryCommandLater(Exception):
@@ -553,11 +614,21 @@ class WorkspaceIntegrationBridgeCache:
             update_values[key] = value
         if not update_values:
             return stream
+        last_event_epoch = self._get_last_workspace_event_epoch(
+            external_account.project_id,
+        )
         result = messenger_dm_helpers.update_workspace_user_stream(
             project_id=external_account.project_id,
             user_uuid=stream.user_uuid,
             stream_uuid=stream.uuid,
             values=update_values,
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="stream",
+            action="updated",
+            payload_uuid=stream.uuid,
+            after_epoch=last_event_epoch,
         )
         for key, value in update_values.items():
             if hasattr(stream, key):
@@ -628,6 +699,49 @@ class WorkspaceIntegrationBridgeCache:
             binding_uuid=binding.uuid,
         )
 
+    def update_stream_subscription(self, external_account, stream_id, values):
+        if not values:
+            return None
+        stream = self._get_required_workspace_stream_by_zulip_id(
+            external_account=external_account,
+            stream_id=stream_id,
+        )
+        user_uuid = external_account.user_uuid
+        binding = self._get_workspace_stream_binding(
+            external_account=external_account,
+            stream=stream,
+            user_uuid=user_uuid,
+        )
+        notification_mode = values["notification_mode"]
+        if (
+            binding is not None and
+            binding.notification_mode == notification_mode
+        ):
+            return stream
+        if binding is None:
+            self._bind_stream_user(
+                external_account=external_account,
+                stream=stream,
+                user_uuid=user_uuid,
+            )
+        last_event_epoch = self._get_last_workspace_event_epoch(
+            external_account.project_id,
+        )
+        result = messenger_dm_helpers.update_workspace_user_stream_notifications(
+            project_id=external_account.project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream.uuid,
+            notification_mode=notification_mode,
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="stream",
+            action="updated",
+            payload_uuid=stream.uuid,
+            after_epoch=last_event_epoch,
+        )
+        return result
+
     def pop_file_import_errors(self):
         errors = self._file_import_errors
         self._file_import_errors = []
@@ -662,11 +776,21 @@ class WorkspaceIntegrationBridgeCache:
             values["is_archived"] = stream_info["is_archived"]
         if not values:
             return
+        last_event_epoch = self._get_last_workspace_event_epoch(
+            external_account.project_id,
+        )
         messenger_dm_helpers.update_workspace_user_stream(
             project_id=external_account.project_id,
             user_uuid=stream.user_uuid,
             stream_uuid=stream.uuid,
             values=values,
+        )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="stream",
+            action="updated",
+            payload_uuid=stream.uuid,
+            after_epoch=last_event_epoch,
         )
 
     def _should_sync_stream_info(self, stream_info):
@@ -2743,9 +2867,17 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             if "user_uuid" not in payload:
                 return False
             return str(event.user_uuid) == str(payload["user_uuid"])
+        if event.object_type == "stream":
+            if event.action != "updated":
+                return False
+            if "user_uuid" not in payload:
+                return False
+            return str(event.user_uuid) == str(payload["user_uuid"])
         return False
 
     def _get_zulip_outbound_user_uuid(self, event):
+        if event.object_type == "stream":
+            return event.payload["user_uuid"]
         if event.object_type == "message_reaction":
             return event.payload["user_uuid"]
         return event.payload["author_uuid"]
@@ -2903,6 +3035,41 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             self._message_payload_content(event.payload)
         )
 
+    def _get_previous_stream_event_payload(self, event):
+        result = contexts.Context().get_session().execute(
+            """
+            SELECT payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND object_type = 'stream'
+              AND action IN ('created', 'updated')
+              AND epoch_version < %s
+              AND payload->>'uuid' = %s
+              AND user_uuid = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (
+                event.project_id,
+                event.epoch_version,
+                event.payload["uuid"],
+                event.user_uuid,
+            ),
+        )
+        row = result.fetchone()
+        if row is None:
+            return None
+        return row["payload"]
+
+    def _stream_notification_mode_changed(self, event):
+        previous_payload = self._get_previous_stream_event_payload(event)
+        if previous_payload is None:
+            return False
+        return (
+            previous_payload["notification_mode"] !=
+            event.payload["notification_mode"]
+        )
+
     def _get_zulip_private_recipient_id(self, event, message, stream):
         if stream.direct_user_uuid is None:
             return None
@@ -3044,7 +3211,41 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             return self._build_remove_zulip_reaction_command(event)
         return None
 
+    def _get_stream_subscription_data(self, event):
+        source = event.payload["source"]
+        stream_id = self._source_value(source, "stream_id")
+        if stream_id is None:
+            raise RetryCommandLater(
+                "Postpone Zulip stream subscription update because stream_id "
+                "is missing",
+            )
+        notification_mode = event.payload["notification_mode"]
+        changes = ZULIP_STREAM_NOTIFICATION_MODE_SUBSCRIPTION_CHANGES[
+            notification_mode
+        ]
+        return [
+            {
+                "stream_id": stream_id,
+                "property": change["property"],
+                "value": change["value"],
+            }
+            for change in changes
+        ]
+
+    def _build_update_zulip_stream_subscription_command(self, event):
+        if event.action != "updated":
+            return None
+        if not self._stream_notification_mode_changed(event):
+            return None
+        return workers.UpdateZulipStreamSubscription(
+            epoch_version=event.epoch_version,
+            stream_uuid=event.payload["uuid"],
+            subscription_data=self._get_stream_subscription_data(event),
+        )
+
     def _build_zulip_outbound_command(self, event):
+        if event.object_type == "stream":
+            return self._build_update_zulip_stream_subscription_command(event)
         if event.object_type == "message_reaction":
             return self._build_zulip_reaction_outbound_command(event)
         if event.action == "created":
@@ -3076,6 +3277,10 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         if not self._is_zulip_outbound_event(event):
             self._set_outbound_done(state, status=OUTBOUND_SKIPPED_STATUS)
             return
+        command = self._build_zulip_outbound_command(event)
+        if command is None:
+            self._set_outbound_done(state, status=OUTBOUND_SKIPPED_STATUS)
+            return
         external_account = self._get_zulip_outbound_account(state)
         if external_account is None:
             self._set_outbound_retry(
@@ -3096,10 +3301,6 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 state,
                 "Zulip bridge worker is not running",
             )
-            return
-        command = self._build_zulip_outbound_command(event)
-        if command is None:
-            self._set_outbound_done(state, status=OUTBOUND_SKIPPED_STATUS)
             return
         try:
             self._set_outbound_processing(state)
@@ -3239,6 +3440,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 workers.ZulipReactionAdded,
                 workers.ZulipReactionRemoved,
                 workers.ZulipReactionUpdated,
+                workers.ZulipSubscriptionUpdated,
             ),
         ):
             try:

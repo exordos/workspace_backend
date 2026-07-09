@@ -20,6 +20,7 @@ The first version must implement:
 - outbound message operations: send, edit, and delete;
 - outbound reactions;
 - outbound read/unread through the existing Workspace flags mechanism;
+- outbound per-user stream notification mode changes;
 - diagnostics through logs and database tables;
 - backend unit/integration tests.
 
@@ -45,9 +46,9 @@ synchronizes data between Zulip and Workspace Messenger in both directions:
   `m_workspace_events` for the UI.
 - **Outbound (Workspace -> Zulip):** user actions in Workspace for objects with
   `source_name = zulip` are delivered back to Zulip on behalf of that user:
-  message send, edit, delete, reactions, and read/unread. Stream, topic,
-  subscription, participant, and role management remains outside the first
-  outbound version.
+  message send, edit, delete, reactions, read/unread, and per-user stream
+  notification mode changes. Stream/topic management, subscribe/unsubscribe,
+  participant, and role management remain outside the first outbound version.
 
 Run command:
 
@@ -70,9 +71,10 @@ The service inherits from `BasicService` and runs one iteration roughly every
   sent back to Zulip, but the next resynchronization gives priority to the Zulip
   state.
 - First-version bidirectional synchronization includes messages, edits, deletes,
-  reactions, and read/unread. Stream/topic renames, subscriptions,
-  unsubscriptions, participants, and roles are synchronized inbound, but
-  outbound changes for those objects are not part of the first version.
+  reactions, read/unread, and per-user stream notification mode changes.
+  Stream/topic renames, subscriptions, unsubscriptions, participants, and roles
+  are synchronized inbound, but outbound changes for those objects are not part
+  of the first version.
 - Zulip group private chats are not synchronized in the first version. Public
   stream/topic and private 1:1 are supported.
 - If history contains a Zulip user that does not exist in Workspace yet, a
@@ -142,10 +144,6 @@ The bridge currently focuses on events that directly affect Workspace messages,
 streams, and stream membership. The following Zulip event work is still
 outstanding:
 
-- `subscription` with `op = update`: apply per-user subscription settings where
-  Workspace has an equivalent model, for example mute/home-view/notification
-  state. The event is routed by the worker today, but the command is still a
-  no-op.
 - `stream` with `op = update`: extend the property mapping when Workspace gains
   fields for Zulip-only stream settings such as `topics_policy`,
   `history_public_to_subscribers`, `is_web_public`, message retention, and
@@ -567,6 +565,15 @@ bindings current: `peer_add` adds newly visible subscribers as members, and
 `peer_remove`, `remove`, or a stream visibility delete removes the affected
 Workspace stream binding.
 
+Subscription `update` events synchronize per-user notification state where
+Workspace has an equivalent stream binding setting. Zulip `is_muted` and the
+legacy `in_home_view` property map to Workspace `muted` or `all_messages`;
+Zulip stream notification toggles such as `desktop_notifications`,
+`email_notifications`, `push_notifications`, and `audible_notifications` map to
+`mentions_only` when disabled and `all_messages` when enabled or reset to the
+server default. Zulip-only subscription fields such as color, pinning, and
+wildcard mention policy stay no-op until Workspace has matching fields.
+
 ### Outbound Synchronization
 
 For objects with `source_name = zulip`, Workspace must send user actions back to
@@ -577,13 +584,23 @@ The first-version outbound scope includes:
 - sending new messages to stream/topic and private 1:1;
 - editing and deleting messages;
 - adding and removing reactions;
-- read/unread actions through existing Workspace flags.
+- read/unread actions through existing Workspace flags;
+- per-user stream notification mode changes through Zulip subscription
+  properties.
 
 The first-version outbound scope does not include:
 
 - stream/topic rename;
 - subscribe and unsubscribe operations;
 - participant and role changes where supported by the Zulip API.
+
+When a Workspace user changes notification mode for a Zulip-backed stream, the
+bridge sends `/users/me/subscriptions/properties` from that user's Zulip
+account. Workspace `muted` maps to Zulip `is_muted = true`; `all_messages` maps
+to `is_muted = false`; `mentions_only` unmutes the stream and disables explicit
+desktop, audible, push, and email notification toggles for that user. Inbound
+Zulip subscription updates are marked as already applied so they do not echo
+back to Zulip as outbound commands.
 
 An outbound action is executed on behalf of the Workspace user who performed the
 action, through that user's connected Zulip account. For example, deleting a

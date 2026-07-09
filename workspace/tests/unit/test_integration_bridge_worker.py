@@ -964,6 +964,28 @@ def test_outbound_event_filter_uses_author_event_only():
             "source": types.SimpleNamespace(message_id=12345),
         },
     )
+    stream_event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        user_uuid="stream-user",
+        payload={
+            "user_uuid": "stream-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "all_messages",
+        },
+    )
+    recipient_stream_event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        user_uuid="recipient-user",
+        payload={
+            "user_uuid": "stream-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "all_messages",
+        },
+    )
 
     assert worker._is_zulip_outbound_event(author_event)
     assert not worker._is_zulip_outbound_event(recipient_event)
@@ -971,6 +993,8 @@ def test_outbound_event_filter_uses_author_event_only():
     assert not worker._is_zulip_outbound_event(inbound_event)
     assert worker._is_zulip_outbound_event(reaction_event)
     assert not worker._is_zulip_outbound_event(recipient_reaction_event)
+    assert worker._is_zulip_outbound_event(stream_event)
+    assert not worker._is_zulip_outbound_event(recipient_stream_event)
 
 
 class FakeQueryResult:
@@ -1020,6 +1044,11 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
     assert "e.user_uuid::text = e.payload->>'author_uuid'" in statement
     assert "e.object_type = 'message_reaction'" in statement
     assert "e.user_uuid::text = e.payload->>'user_uuid'" in statement
+    assert "e.object_type = 'stream'" in statement
+    assert "e.payload ? 'notification_mode'" in statement
+    assert "e.payload #>> '{source,stream_id}' IS NOT NULL" in statement
+    assert "previous.payload->>'notification_mode'" in statement
+    assert "IS DISTINCT FROM e.payload->>'notification_mode'" in statement
     assert "e.payload #>> '{source,message_id}' IS NULL" in statement
     assert "m_zulip_outbound_event_states" in statement
     assert values == (55, agents.DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT)
@@ -1136,6 +1165,61 @@ def test_dispatch_zulip_reaction_outbound_state_uses_reactor_worker_queue():
     assert state.status == "processing"
 
 
+def test_dispatch_zulip_stream_outbound_state_uses_stream_user_worker_queue():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    command = object()
+    state = FakeOutboundState()
+    event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        user_uuid="stream-user",
+        payload={
+            "user_uuid": "stream-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "all_messages",
+        },
+    )
+    external_account = types.SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        server_url="https://zulip.example.com",
+        user_uuid="stream-user",
+        account_settings=types.SimpleNamespace(credentials=object()),
+    )
+    stream_user_queue = queue.Queue()
+    other_queue = queue.Queue()
+    worker._worker_input_queues = {
+        ("project", "https://zulip.example.com", "stream-user"): (
+            stream_user_queue
+        ),
+        ("project", "https://zulip.example.com", "other-user"): other_queue,
+    }
+
+    with mock.patch.object(
+        worker,
+        "_get_zulip_outbound_event",
+        mock.Mock(return_value=event),
+    ), mock.patch.object(
+        worker,
+        "_build_zulip_outbound_command",
+        mock.Mock(return_value=object()),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_outbound_account",
+        mock.Mock(return_value=external_account),
+    ), mock.patch.object(
+        worker,
+        "_build_zulip_outbound_command",
+        mock.Mock(return_value=command),
+    ):
+        worker._dispatch_zulip_outbound_state(state)
+
+    assert stream_user_queue.get_nowait() is command
+    assert other_queue.empty()
+    assert state.status == "processing"
+
+
 def test_dispatch_zulip_outbound_state_retries_without_credentials():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     state = FakeOutboundState()
@@ -1163,6 +1247,10 @@ def test_dispatch_zulip_outbound_state_retries_without_credentials():
         mock.Mock(return_value=event),
     ), mock.patch.object(
         worker,
+        "_build_zulip_outbound_command",
+        mock.Mock(return_value=object()),
+    ), mock.patch.object(
+        worker,
         "_get_zulip_outbound_account",
         mock.Mock(return_value=external_account),
     ):
@@ -1172,6 +1260,42 @@ def test_dispatch_zulip_outbound_state_retries_without_credentials():
     assert state.attempts == 1
     assert state.next_retry_at is not None
     assert state.last_error == "Zulip external account credentials are missing"
+
+
+def test_dispatch_zulip_outbound_state_skips_noop_before_credentials():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    state = FakeOutboundState()
+    event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        user_uuid="stream-user",
+        payload={
+            "user_uuid": "stream-user",
+            "source_name": "zulip",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "all_messages",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_zulip_outbound_event",
+        mock.Mock(return_value=event),
+    ), mock.patch.object(
+        worker,
+        "_build_zulip_outbound_command",
+        mock.Mock(return_value=None),
+    ), mock.patch.object(
+        worker,
+        "_get_zulip_outbound_account",
+        mock.Mock(),
+    ) as get_account:
+        worker._dispatch_zulip_outbound_state(state)
+
+    get_account.assert_not_called()
+    assert state.status == "skipped"
+    assert state.next_retry_at is None
+    assert state.last_error is None
 
 
 def test_dispatch_zulip_outbound_state_skips_inbound_created_event():
@@ -1372,6 +1496,113 @@ def test_build_zulip_reaction_outbound_commands():
     assert updated_command.old_emoji_name == "heart"
     assert updated_command.message_id == 12345
     assert updated_command.emoji_name == "thumbs_up"
+
+
+def test_build_zulip_stream_subscription_outbound_command_unmutes_stream():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        epoch_version=64,
+        payload={
+            "uuid": "stream-uuid",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "all_messages",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_stream_notification_mode_changed",
+        mock.Mock(return_value=True),
+    ):
+        command = worker._build_zulip_outbound_command(event)
+
+    assert isinstance(
+        command,
+        agents.workers.UpdateZulipStreamSubscription,
+    )
+    assert command.epoch_version == 64
+    assert command.stream_uuid == "stream-uuid"
+    assert command.subscription_data == [
+        {
+            "stream_id": 3,
+            "property": "is_muted",
+            "value": False,
+        },
+    ]
+
+
+def test_build_zulip_stream_subscription_outbound_command_skips_unchanged():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        epoch_version=64,
+        payload={
+            "uuid": "stream-uuid",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "all_messages",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_stream_notification_mode_changed",
+        mock.Mock(return_value=False),
+    ):
+        command = worker._build_zulip_outbound_command(event)
+
+    assert command is None
+
+
+def test_build_zulip_stream_subscription_outbound_command_maps_mentions():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        object_type="stream",
+        action="updated",
+        epoch_version=65,
+        payload={
+            "uuid": "stream-uuid",
+            "source": types.SimpleNamespace(stream_id=3),
+            "notification_mode": "mentions_only",
+        },
+    )
+
+    with mock.patch.object(
+        worker,
+        "_stream_notification_mode_changed",
+        mock.Mock(return_value=True),
+    ):
+        command = worker._build_zulip_outbound_command(event)
+
+    assert command.subscription_data == [
+        {
+            "stream_id": 3,
+            "property": "is_muted",
+            "value": False,
+        },
+        {
+            "stream_id": 3,
+            "property": "desktop_notifications",
+            "value": False,
+        },
+        {
+            "stream_id": 3,
+            "property": "audible_notifications",
+            "value": False,
+        },
+        {
+            "stream_id": 3,
+            "property": "push_notifications",
+            "value": False,
+        },
+        {
+            "stream_id": 3,
+            "property": "email_notifications",
+            "value": False,
+        },
+    ]
 
 
 def test_build_send_zulip_message_command_uses_direct_private_recipient():
@@ -1737,6 +1968,7 @@ def test_bridge_cache_skips_seen_stream_until_subscription_reset():
         source=types.SimpleNamespace(stream_id=3),
     )
     external_account = types.SimpleNamespace(
+        uuid="account-uuid",
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -1766,7 +1998,15 @@ def test_bridge_cache_skips_seen_stream_until_subscription_reset():
             agents.models,
             "WorkspaceStream",
             FakeWorkspaceStream,
-        ):
+        ), mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(return_value=42),
+        ), mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ) as mark_skipped:
             with mock.patch.object(
                 agents.messenger_dm_helpers,
                 "update_workspace_user_stream",
@@ -1787,6 +2027,7 @@ def test_bridge_cache_skips_seen_stream_until_subscription_reset():
                 )
 
     assert update_stream.call_count == 2
+    assert mark_skipped.call_count == 2
 
 
 def test_bridge_cache_binds_existing_stream_users_once():
@@ -2099,6 +2340,7 @@ def test_bridge_cache_updates_existing_zulip_stream_from_event():
         ),
     )
     external_account = types.SimpleNamespace(
+        uuid="account-uuid",
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -2120,7 +2362,15 @@ def test_bridge_cache_updates_existing_zulip_stream_from_event():
                 agents.messenger_dm_helpers,
                 "update_workspace_user_stream",
                 mock.Mock(return_value=existing_stream),
-            ) as update_stream:
+            ) as update_stream, mock.patch.object(
+                cache,
+                "_get_last_workspace_event_epoch",
+                mock.Mock(return_value=90),
+            ), mock.patch.object(
+                cache,
+                "_mark_inbound_zulip_events_skipped",
+                mock.Mock(),
+            ) as mark_skipped:
                 result = cache.update_stream(
                     external_account=external_account,
                     stream_id=3,
@@ -2136,6 +2386,13 @@ def test_bridge_cache_updates_existing_zulip_stream_from_event():
         user_uuid="creator-user",
         stream_uuid="stream-uuid",
         values={"name": "announcements"},
+    )
+    mark_skipped.assert_called_once_with(
+        external_account=external_account,
+        object_type="stream",
+        action="updated",
+        payload_uuid="stream-uuid",
+        after_epoch=90,
     )
     assert existing_stream.name == "announcements"
 
@@ -2286,6 +2543,7 @@ def test_bridge_cache_removes_stream_binding_from_subscription_event():
     )
     existing_binding = types.SimpleNamespace(uuid="binding-uuid")
     external_account = types.SimpleNamespace(
+        uuid="account-uuid",
         project_id="project",
         user_uuid="bridge-user",
         server_url="https://zulip.example.com",
@@ -2331,6 +2589,146 @@ def test_bridge_cache_removes_stream_binding_from_subscription_event():
         "filters"
     ]
     assert filters["user_uuid"].value == "bridge-user"
+
+
+def test_bridge_cache_updates_stream_subscription_notification_mode():
+    existing_stream = types.SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+        private=False,
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+        ),
+    )
+    existing_binding = types.SimpleNamespace(
+        uuid="binding-uuid",
+        notification_mode="all_messages",
+    )
+    updated_stream = types.SimpleNamespace(uuid="stream-uuid")
+    external_account = types.SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+
+    class FakeWorkspaceStream:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[existing_stream]),
+        )
+
+    class FakeWorkspaceStreamBinding:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=existing_binding),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with _patch_zulip_processed_entities():
+        with mock.patch.object(
+            agents.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with mock.patch.object(
+                agents.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ):
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "update_workspace_user_stream_notifications",
+                    mock.Mock(return_value=updated_stream),
+                ) as update_notifications, mock.patch.object(
+                    cache,
+                    "_get_last_workspace_event_epoch",
+                    mock.Mock(return_value=90),
+                ), mock.patch.object(
+                    cache,
+                    "_mark_inbound_zulip_events_skipped",
+                    mock.Mock(),
+                ) as mark_skipped:
+                    result = cache.update_stream_subscription(
+                        external_account=external_account,
+                        stream_id=3,
+                        values={"notification_mode": "muted"},
+                    )
+
+    assert result is updated_stream
+    update_notifications.assert_called_once_with(
+        project_id="project",
+        user_uuid="bridge-user",
+        stream_uuid="stream-uuid",
+        notification_mode="muted",
+    )
+    mark_skipped.assert_called_once_with(
+        external_account=external_account,
+        object_type="stream",
+        action="updated",
+        payload_uuid="stream-uuid",
+        after_epoch=90,
+    )
+    filters = FakeWorkspaceStreamBinding.objects.get_one_or_none.call_args.kwargs[
+        "filters"
+    ]
+    assert filters["user_uuid"].value == "bridge-user"
+
+
+def test_bridge_cache_skips_unchanged_stream_subscription():
+    existing_stream = types.SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+        private=False,
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+        ),
+    )
+    existing_binding = types.SimpleNamespace(
+        uuid="binding-uuid",
+        notification_mode="muted",
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+
+    class FakeWorkspaceStream:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[existing_stream]),
+        )
+
+    class FakeWorkspaceStreamBinding:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=existing_binding),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with _patch_zulip_processed_entities():
+        with mock.patch.object(
+            agents.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with mock.patch.object(
+                agents.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ):
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "update_workspace_user_stream_notifications",
+                    mock.Mock(),
+                ) as update_notifications:
+                    result = cache.update_stream_subscription(
+                        external_account=external_account,
+                        stream_id=3,
+                        values={"notification_mode": "muted"},
+                    )
+
+    assert result is existing_stream
+    update_notifications.assert_not_called()
 
 
 def test_bridge_cache_creates_missing_stream_once():

@@ -644,6 +644,44 @@ def test_zulip_client_removes_reaction_with_official_sdk():
     ]
 
 
+def test_zulip_client_updates_subscription_settings_with_api_key():
+    response = mock.Mock()
+    response.json.return_value = {"result": "success"}
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeZulipSdkClient,
+    )
+
+    with mock.patch.object(
+        zulip.requests,
+        "post",
+        return_value=response,
+    ) as request:
+        result = client.update_subscription_settings_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            subscription_data=[
+                {
+                    "stream_id": 3,
+                    "property": "is_muted",
+                    "value": False,
+                },
+            ],
+        )
+
+    assert result == {"result": "success"}
+    request.assert_called_once_with(
+        "https://zulip.example.com/api/v1/users/me/subscriptions/properties",
+        auth=("user@example.com", "zulip-token"),
+        data={
+            "subscription_data": (
+                '[{"stream_id": 3, "property": "is_muted", "value": false}]'
+            ),
+        },
+        timeout=zulip.SUBSCRIPTION_UPDATE_TIMEOUT,
+    )
+
+
 def test_zulip_client_updates_message_with_official_sdk():
     client = zulip.ZulipClient(
         endpoint="https://zulip.example.com",
