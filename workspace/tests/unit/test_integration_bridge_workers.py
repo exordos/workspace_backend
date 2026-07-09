@@ -193,6 +193,14 @@ class FakeZulipClient:
         return {"uri": f"/user_uploads/1/{file_name}"}
 
 
+def test_should_process_message_accepts_system_private_sender():
+    assert workers.should_process_message({
+        "id": 85,
+        "type": "private",
+        "sender_id": 7,
+    })
+
+
 def _external_account():
     return types.SimpleNamespace(
         project_id="project",
@@ -347,6 +355,24 @@ def test_zulip_bridge_worker_fetches_events():
             "last_event_id": 42,
         },
     ]
+
+
+def test_sync_messages_command_passes_message_anchor():
+    worker = mock.Mock()
+    command = workers.SyncMessages(
+        queue_id="queue-1",
+        last_event_id=42,
+        last_message_id=103,
+        is_synced=False,
+    )
+
+    command.execute(worker)
+
+    worker.sync_messages.assert_called_once_with(
+        queue_id="queue-1",
+        last_event_id=42,
+        last_message_id=103,
+    )
 
 
 def test_zulip_bridge_worker_treats_event_read_timeout_as_empty_batch():
@@ -577,6 +603,11 @@ def test_zulip_bridge_worker_commands_sync_streams_and_messages():
     ]
     assert processed_messages == [
         {
+            "id": 100,
+            "sender_id": 7,
+            "content": "ignored",
+        },
+        {
             "id": 101,
             "sender_id": 8,
             "content": "oldest",
@@ -586,9 +617,16 @@ def test_zulip_bridge_worker_commands_sync_streams_and_messages():
             "sender_id": 9,
             "content": "middle",
         },
+        {
+            "id": 103,
+            "sender_id": 6,
+            "content": "ignored-new",
+        },
     ]
     assert events == [
         "stream",
+        "message",
+        "message",
         "message",
         "message",
     ]
@@ -1840,7 +1878,64 @@ def test_add_message_skips_group_private_message():
     assert cache.calls == []
 
 
-def test_add_message_skips_system_user_message():
+def test_add_message_processes_system_stream_message():
+    class FakeCache:
+        def __init__(self):
+            self.calls = []
+
+        def get_or_create_stream(self, external_account, stream_info):
+            self.calls.append("get_or_create_stream")
+            return object()
+
+        def get_or_create_topic(
+            self,
+            external_account,
+            stream,
+            stream_info,
+            topic_name,
+        ):
+            self.calls.append("get_or_create_topic")
+            return object()
+
+        def get_or_create_message(
+            self,
+            external_account,
+            stream,
+            topic,
+            stream_info,
+            topic_name,
+            message_info,
+        ):
+            self.calls.append("get_or_create_message")
+            return object()
+
+    cache = FakeCache()
+    command = workers.AddMessage(
+        external_account=_external_account(),
+        message={
+            "id": 84,
+            "type": "stream",
+            "stream_id": 3,
+            "display_recipient": "general",
+            "subject": "deploys",
+            "sender_id": 7,
+            "content": "system message",
+            "flags": [],
+            "timestamp": 1770998098,
+        },
+    )
+
+    result = command.execute(cache=cache)
+
+    assert result is not None
+    assert cache.calls == [
+        "get_or_create_stream",
+        "get_or_create_topic",
+        "get_or_create_message",
+    ]
+
+
+def test_add_message_skips_system_private_recipient_message():
     class FakeCache:
         def __init__(self):
             self.calls = []
@@ -1872,13 +1967,15 @@ def test_add_message_skips_system_user_message():
     command = workers.AddMessage(
         external_account=_external_account(),
         message={
-            "id": 84,
-            "type": "stream",
-            "stream_id": 3,
-            "display_recipient": "general",
-            "subject": "deploys",
-            "sender_id": 7,
-            "content": "system message",
+            "id": 85,
+            "type": "private",
+            "recipient_id": 74,
+            "display_recipient": [
+                {"id": 7, "full_name": "Welcome Bot"},
+                {"id": 9, "full_name": "Eugene"},
+            ],
+            "sender_id": 9,
+            "content": "system private message",
             "flags": [],
             "timestamp": 1770998098,
         },

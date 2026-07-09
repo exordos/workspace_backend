@@ -109,14 +109,7 @@ class BadZulipEventQueue(Exception):
 
 
 def should_process_message(message):
-    if message["sender_id"] >= MIN_ZULIP_USER_ID:
-        return True
-    LOG.debug(
-        "Skip Zulip system message %s from user %s",
-        message["id"],
-        message["sender_id"],
-    )
-    return False
+    return True
 
 
 class SyncStreams:
@@ -163,6 +156,7 @@ class SyncMessages:
             worker.sync_messages(
                 queue_id=self.queue_id,
                 last_event_id=self.last_event_id,
+                last_message_id=self.last_message_id,
             )
         finally:
             if self.on_finished is not None:
@@ -270,9 +264,12 @@ class AddMessage:
         }
 
     def _should_skip_stream_info(self, stream_info):
+        if stream_info["type"] != "private":
+            return False
+        subscriber_ids = set(stream_info["subscriber_ids"])
         return (
-            stream_info["type"] == "private" and
-            len(set(stream_info["subscriber_ids"])) != 2
+            len(subscriber_ids) != 2 or
+            min(subscriber_ids) < MIN_ZULIP_USER_ID
         )
 
     def _get_topic_name(self):
@@ -287,7 +284,7 @@ class AddMessage:
 
     def _get_message_info(self):
         timestamp = self._get_timestamp()
-        return {
+        message_info = {
             "message_id": self.message["id"],
             "sender_id": self.message["sender_id"],
             "content": self.message["content"],
@@ -295,6 +292,11 @@ class AddMessage:
             "created_at": timestamp,
             "updated_at": timestamp,
         }
+        if "sender_email" in self.message:
+            message_info["sender_email"] = self.message["sender_email"]
+        if "sender_full_name" in self.message:
+            message_info["sender_full_name"] = self.message["sender_full_name"]
+        return message_info
 
     def execute(self, cache):
         if not should_process_message(self.message):
@@ -1383,8 +1385,8 @@ class ZulipBridgeWorker(threading.Thread):
         self,
         queue_id,
         last_event_id=-1,
+        last_message_id=0,
     ):
-        last_message_id = 0
         while not self._stopped:
             self._process_pending_commands()
             if self._stopped:

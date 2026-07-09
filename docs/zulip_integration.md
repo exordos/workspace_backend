@@ -96,9 +96,11 @@ The service inherits from `BasicService` and runs one iteration roughly every
 - Deleted Zulip messages are physically deleted from Workspace. If a delete is
   initiated in Workspace for a Zulip message, the outbound delete is sent to
   Zulip from the account of the user who performed the delete.
-- Zulip messages from users with `sender_id < 8` are considered system messages
-  and are not imported into Workspace. Such messages must not block history tasks
-  while waiting for a missing Workspace user.
+- Zulip messages are considered for import regardless of the numeric
+  `sender_id`. If a message sender is not yet linked to a Workspace user, the
+  bridge creates or reuses a fallback imported Workspace user from the sender
+  metadata carried in the Zulip payload, then binds that user to the target
+  stream before creating the message.
 
 ### General Architecture
 
@@ -446,6 +448,12 @@ By participant count:
   first version);
 - **fewer than two**: skip the message.
 
+Private message recipients that include Zulip system users are also skipped at
+the stream-mapping layer until the bridge has a supported Workspace
+representation for those system conversations. This is not a message-level
+sender filter: public stream messages and other supported messages from system
+senders are still imported.
+
 #### Creating A Stream In Workspace
 
 The Zulip stream creator, the message author, and any other participant required
@@ -458,6 +466,13 @@ Matching order:
 2. if there is no link, find the Workspace/IAM user by email;
 3. if no user is found, automatically create an imported Workspace user from the
    Zulip profile.
+
+For message authors, the bridge may also use the sender metadata present in the
+message payload itself (`sender_email` and `sender_full_name`) to create a
+fallback imported Workspace user. This covers Zulip system senders such as
+notification bots, which can appear in stream history without a normal synced
+Zulip user account. The same fallback sender is used when importing attachments
+from that message.
 
 Zulip `user_id`, email, name, and avatar/source data are saved so that later
 messages from the same user link to the same Workspace row.

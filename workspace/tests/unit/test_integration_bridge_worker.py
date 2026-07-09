@@ -209,7 +209,9 @@ def test_bridge_cache_preprocesses_zulip_file_links():
             }
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
+    cache._get_or_create_zulip_message_sender_uuid = mock.Mock(
+        return_value=user_uuid,
+    )
 
     with mock.patch.object(
         agents.zulip_client,
@@ -243,9 +245,9 @@ def test_bridge_cache_preprocesses_zulip_file_links():
         "see ![photo.png](/user_uploads/1/photo.png) "
         "and [site](https://example.com)"
     )
-    cache._get_required_zulip_user_uuid.assert_called_once_with(
+    cache._get_or_create_zulip_message_sender_uuid.assert_called_once_with(
         external_account=external_account,
-        user_id=24,
+        message_info=message_info,
     )
     save_file.assert_called_once_with(file_uuid=mock.ANY, data=png_data)
     create_file.assert_called_once_with(
@@ -2224,7 +2226,7 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
         user_uuid="second-user",
         server_url="https://zulip.example.com",
     )
-    stream = types.SimpleNamespace(uuid="stream-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid", user_uuid="owner-user")
     topic = types.SimpleNamespace(uuid="topic-uuid")
     message = types.SimpleNamespace(uuid="message-uuid")
     stream_info = {
@@ -2264,6 +2266,10 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
         mock.Mock(return_value=message),
     ) as get_or_create_message, mock.patch.object(
         agents.messenger_dm_helpers,
+        "get_or_create_workspace_stream_binding",
+        mock.Mock(),
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
         "read_workspace_user_message",
         mock.Mock(),
     ) as read_message:
@@ -2302,13 +2308,117 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
     ]
 
 
+def test_bridge_cache_creates_missing_message_sender_from_zulip_payload():
+    class FakeWorkspaceUser:
+        inserted = []
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=None),
+        )
+
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def insert(self):
+            type(self).inserted.append(self)
+
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="reader-user",
+        server_url="https://zulip.example.com",
+    )
+    stream = types.SimpleNamespace(uuid="stream-uuid", user_uuid="owner-user")
+    topic = types.SimpleNamespace(uuid="topic-uuid")
+    message = types.SimpleNamespace(uuid="message-uuid")
+    stream_info = {
+        "stream_id": 3,
+    }
+    message_info = {
+        "message_id": 100,
+        "sender_id": 6,
+        "sender_email": "notification-bot@zulip.com",
+        "sender_full_name": "Notification Bot",
+        "content": "hello",
+        "read": True,
+        "created_at": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+        "updated_at": datetime.datetime.fromtimestamp(
+            1770998098,
+            tz=datetime.timezone.utc,
+        ),
+    }
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_zulip_user_uuid",
+        mock.Mock(return_value=None),
+    ), mock.patch.object(
+        cache,
+        "_get_processed_workspace_uuid",
+        mock.Mock(return_value=None),
+    ), mock.patch.object(
+        cache,
+        "_save_processed_entity",
+        mock.Mock(),
+    ), mock.patch.object(
+        agents.models,
+        "WorkspaceUser",
+        FakeWorkspaceUser,
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_or_create_workspace_user_message",
+        mock.Mock(return_value=message),
+    ) as get_or_create_message, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_or_create_workspace_stream_binding",
+        mock.Mock(),
+    ) as get_or_create_binding, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "read_workspace_user_message",
+        mock.Mock(),
+    ):
+        result = cache.get_or_create_message(
+            external_account=external_account,
+            stream=stream,
+            topic=topic,
+            stream_info=stream_info,
+            topic_name="deploys",
+            message_info=message_info,
+        )
+
+    assert result is message
+    assert len(FakeWorkspaceUser.inserted) == 1
+    sender = FakeWorkspaceUser.inserted[0]
+    assert sender.username == "Notification Bot"
+    assert sender.source == "zulip"
+    assert sender.email == "notification-bot@zulip.com"
+    get_or_create_binding.assert_called_once_with(
+        project_id="project",
+        stream_uuid="stream-uuid",
+        user_uuid=sender.uuid,
+        who_uuid="owner-user",
+        role="member",
+    )
+    get_or_create_message.assert_called_once()
+    assert get_or_create_message.call_args.kwargs["user_uuid"] == sender.uuid
+    assert cache._user_uuids[
+        (
+            "project",
+            "https://zulip.example.com",
+            6,
+        )
+    ] == sender.uuid
+
+
 def test_bridge_cache_preprocesses_existing_processed_message():
     external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="reader-user",
         server_url="https://zulip.example.com",
     )
-    stream = types.SimpleNamespace(uuid="stream-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid", user_uuid="owner-user")
     topic = types.SimpleNamespace(uuid="topic-uuid")
     message = types.SimpleNamespace(uuid="message-uuid")
     stream_info = {
@@ -2376,7 +2486,7 @@ def test_bridge_cache_rebinds_stale_processed_message():
         user_uuid="reader-user",
         server_url="https://zulip.example.com",
     )
-    stream = types.SimpleNamespace(uuid="stream-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid", user_uuid="owner-user")
     topic = types.SimpleNamespace(uuid="topic-uuid")
     message = types.SimpleNamespace(uuid="new-message-uuid")
     stream_info = {
@@ -2415,7 +2525,11 @@ def test_bridge_cache_rebinds_stale_processed_message():
         agents.messenger_dm_helpers,
         "get_or_create_workspace_user_message",
         mock.Mock(return_value=message),
-    ) as get_or_create_message:
+    ) as get_or_create_message, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_or_create_workspace_stream_binding",
+        mock.Mock(),
+    ):
         with _patch_zulip_processed_entities(processed):
             result = cache.get_or_create_message(
                 external_account=external_account,
@@ -2438,7 +2552,7 @@ def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
         user_uuid="reader-user",
         server_url="https://zulip.example.com",
     )
-    stream = types.SimpleNamespace(uuid="stream-uuid")
+    stream = types.SimpleNamespace(uuid="stream-uuid", user_uuid="owner-user")
     topic = types.SimpleNamespace(uuid="topic-uuid")
     message = types.SimpleNamespace(uuid="message-uuid")
     stream_info = {
@@ -2476,6 +2590,10 @@ def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
         agents.messenger_dm_helpers,
         "get_or_create_workspace_user_message",
         mock.Mock(return_value=message),
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "get_or_create_workspace_stream_binding",
+        mock.Mock(),
     ), mock.patch.object(
         agents.messenger_dm_helpers,
         "read_workspace_user_message",

@@ -602,6 +602,51 @@ class WorkspaceIntegrationBridgeCache:
             )
         return user_uuid
 
+    def _get_or_create_zulip_message_sender_uuid(
+        self,
+        external_account,
+        message_info,
+    ):
+        user_id = message_info["sender_id"]
+        try:
+            return self._get_required_zulip_user_uuid(
+                external_account=external_account,
+                user_id=user_id,
+            )
+        except RetryCommandLater:
+            pass
+
+        if (
+            "sender_email" not in message_info or
+            "sender_full_name" not in message_info
+        ):
+            raise RetryCommandLater(
+                "Postpone Zulip item because user %s was not resolved" %
+                user_id,
+            )
+
+        workspace_user = models.WorkspaceUser.objects.get_one_or_none(
+            filters={
+                "email": dm_filters.EQ(message_info["sender_email"]),
+            },
+        )
+        if workspace_user is None:
+            workspace_user = models.WorkspaceUser(
+                uuid=sys_uuid.uuid4(),
+                username=message_info["sender_full_name"],
+                source=models.WorkspaceUserSource.ZULIP.value,
+                email=message_info["sender_email"],
+            )
+            workspace_user.insert()
+
+        cache_key = (
+            external_account.project_id,
+            external_account.server_url,
+            user_id,
+        )
+        self._user_uuids[cache_key] = workspace_user.uuid
+        return workspace_user.uuid
+
     def _load_zulip_user_uuid(self, external_account, user_id):
         cache_key = (
             external_account.project_id,
@@ -659,8 +704,27 @@ class WorkspaceIntegrationBridgeCache:
                     stream_info["stream_id"],
                     stream_info["subscriber_ids"],
                 ),
-            )
+        )
         return direct_user_uuids[0]
+
+    def _bind_stream_user(self, external_account, stream, user_uuid):
+        if user_uuid == stream.user_uuid:
+            return
+        cache_key = (
+            external_account.project_id,
+            stream.uuid,
+            user_uuid,
+        )
+        if cache_key in self._stream_bindings:
+            return
+        self._stream_bindings.add(cache_key)
+        messenger_dm_helpers.get_or_create_workspace_stream_binding(
+            project_id=external_account.project_id,
+            stream_uuid=stream.uuid,
+            user_uuid=user_uuid,
+            who_uuid=stream.user_uuid,
+            role=models.WorkspaceStreamRole.MEMBER.value,
+        )
 
     def _bind_stream_users(
         self,
@@ -1091,9 +1155,9 @@ class WorkspaceIntegrationBridgeCache:
             file_uuid=file_uuid,
             data=data,
         )
-        user_uuid = self._get_required_zulip_user_uuid(
+        user_uuid = self._get_or_create_zulip_message_sender_uuid(
             external_account=external_account,
-            user_id=message_info["sender_id"],
+            message_info=message_info,
         )
         try:
             return messenger_dm_helpers.create_workspace_file(
@@ -1182,9 +1246,9 @@ class WorkspaceIntegrationBridgeCache:
         message_info,
     ):
         entity_id = message_info["message_id"]
-        user_uuid = self._get_required_zulip_user_uuid(
+        user_uuid = self._get_or_create_zulip_message_sender_uuid(
             external_account=external_account,
-            user_id=message_info["sender_id"],
+            message_info=message_info,
         )
         processed_uuid = self._get_processed_workspace_uuid(
             external_account=external_account,
@@ -1227,6 +1291,11 @@ class WorkspaceIntegrationBridgeCache:
                 stream_info=stream_info,
                 topic_name=topic_name,
                 message_info=message_info,
+            )
+            self._bind_stream_user(
+                external_account=external_account,
+                stream=stream,
+                user_uuid=user_uuid,
             )
             message = (
                 messenger_dm_helpers.get_or_create_workspace_user_message(
