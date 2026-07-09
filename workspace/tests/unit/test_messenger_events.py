@@ -923,12 +923,16 @@ class MessengerEventsTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     stream_uuid=stream_uuid,
+                    source_name="native",
+                    source=models.NativeSource(),
                 ),
                 events.create_topic_deleted_event(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
                     stream_uuid=stream_uuid,
+                    source_name="native",
+                    source=models.NativeSource(),
                 ),
                 events.create_message_deleted_event(
                     project_id=project_id,
@@ -962,7 +966,12 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_events[0], "stream", "deleted", "stream.deleted"
         )
         self.assertEqual(
-            {"kind": "stream.deleted", "uuid": str(stream_uuid)},
+            {
+                "kind": "stream.deleted",
+                "uuid": str(stream_uuid),
+                "source_name": "native",
+                "source": {"kind": "native"},
+            },
             created_events[0]["payload"],
         )
         self._assert_created_event_contract(
@@ -970,6 +979,8 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual(str(topic_uuid), created_events[1]["payload"]["uuid"])
         self.assertEqual(str(stream_uuid), created_events[1]["payload"]["stream_uuid"])
+        self.assertEqual("native", created_events[1]["payload"]["source_name"])
+        self.assertEqual({"kind": "native"}, created_events[1]["payload"]["source"])
         self._assert_created_event_contract(
             created_events[2], "message", "deleted", "message.deleted"
         )

@@ -735,7 +735,10 @@ def test_external_account_creates_workspace_user_without_empty_email():
 
 
 def test_external_account_user_sync_updates_schedule_after_sync():
-    account = types.SimpleNamespace(user_sync=mock.Mock(return_value=["user"]))
+    account = types.SimpleNamespace(
+        access_status=models.ExternalAccountAccessStatus.CONFIRMED.value,
+        user_sync=mock.Mock(return_value=["user"]),
+    )
     user_sync = models.ExternalAccountUserSync(
         project_id=sys_uuid.uuid4(),
         server_url="https://zulip.example.com",
@@ -755,6 +758,40 @@ def test_external_account_user_sync_updates_schedule_after_sync():
 
     assert users == ["user"]
     account.user_sync.assert_called_once_with()
+    assert before <= user_sync.last_synced_at <= after
+    assert user_sync.next_sync_at == (
+        user_sync.last_synced_at
+        + datetime.timedelta(
+            minutes=models.ExternalAccountUserSync.SYNC_INTERVAL_MINUTES,
+        )
+    )
+    save.assert_called_once_with()
+
+
+def test_external_account_user_sync_skips_unconfirmed_account():
+    account = types.SimpleNamespace(
+        access_status=models.ExternalAccountAccessStatus.INVALID_CREDENTIALS.value,
+        user_sync=mock.Mock(return_value=["user"]),
+    )
+    user_sync = models.ExternalAccountUserSync(
+        project_id=sys_uuid.uuid4(),
+        server_url="https://zulip.example.com",
+        external_account_uuid=sys_uuid.uuid4(),
+    )
+    save = mock.Mock()
+    user_sync.save = save
+
+    before = datetime.datetime.now(datetime.timezone.utc)
+    with mock.patch.object(
+        user_sync,
+        "get_external_account",
+        mock.Mock(return_value=account),
+    ):
+        users = user_sync.sync()
+    after = datetime.datetime.now(datetime.timezone.utc)
+
+    assert users is None
+    account.user_sync.assert_not_called()
     assert before <= user_sync.last_synced_at <= after
     assert user_sync.next_sync_at == (
         user_sync.last_synced_at
@@ -868,7 +905,14 @@ def test_external_account_controller_create_fetches_zulip_profile():
     assert account.project_id == project_id
     assert account.user_uuid == user_uuid
     assert account.server_url == "https://zulip.example.com"
+    assert account.source_scope == "https://zulip.example.com"
     assert account.status == "new"
+    assert account.access_status == (
+        models.ExternalAccountAccessStatus.CONFIRMED.value
+    )
+    assert account.access_checked_at is not None
+    assert account.access_confirmed_at is not None
+    assert account.access_last_error is None
     assert account.account_settings is account_settings
     assert account.account_settings.user_info.email == (
         "user32@zulip.genesis-core.tech"

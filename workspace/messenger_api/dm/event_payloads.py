@@ -299,6 +299,17 @@ class TopicDeletedEventPayload(
         types.UUID(),
         required=True,
     )
+    source_name = properties.property(
+        types.AllowNone(types.Enum([source.value for source in base.SourceName])),
+        default=None,
+    )
+    source = properties.property(
+        types.AllowNone(types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(base.ZulipSource),
+            types_dynamic.KindModelType(base.NativeSource),
+        )),
+        default=None,
+    )
 
 
 class StreamDeletedEventPayload(
@@ -306,6 +317,18 @@ class StreamDeletedEventPayload(
     models.ModelWithUUID,
 ):
     KIND = "stream.deleted"
+
+    source_name = properties.property(
+        types.AllowNone(types.Enum([source.value for source in base.SourceName])),
+        default=None,
+    )
+    source = properties.property(
+        types.AllowNone(types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(base.ZulipSource),
+            types_dynamic.KindModelType(base.NativeSource),
+        )),
+        default=None,
+    )
 
 
 class StreamBindingsCreatedEventPayload(

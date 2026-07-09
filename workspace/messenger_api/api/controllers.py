@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import hashlib
 import urllib.parse
 import uuid as sys_uuid
@@ -395,6 +396,14 @@ WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
 class ExternalAccountController(
     WorkspaceBaseResourceControllerPaginated,
 ):
+    ACCESS_FIELDS = (
+        "access_status",
+        "access_checked_at",
+        "access_confirmed_at",
+        "access_next_check_at",
+        "access_last_error",
+    )
+
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.ExternalAccount,
         convert_underscore=False,
@@ -449,11 +458,59 @@ class ExternalAccountController(
         if account_settings.KIND == models.ExternalAccountType.IAM.value:
             raise ra_exc.ValidationErrorException()
 
+    @classmethod
+    def _reject_access_fields_from_api(cls, values):
+        for name in cls.ACCESS_FIELDS:
+            values.pop(name, None)
+
+    @staticmethod
+    def _set_source_scope(values):
+        values.pop("source_scope", None)
+        if "server_url" in values:
+            values["source_scope"] = values["server_url"]
+
+    @staticmethod
+    def _set_confirmed_access(values):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        values.update({
+            "access_status": (
+                models.ExternalAccountAccessStatus.CONFIRMED.value
+            ),
+            "access_checked_at": now,
+            "access_confirmed_at": now,
+            "access_last_error": None,
+        })
+
+    @staticmethod
+    def _set_missing_credentials_access(values):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        values.update({
+            "access_status": (
+                models.ExternalAccountAccessStatus.MISSING_CREDENTIALS.value
+            ),
+            "access_checked_at": now,
+            "access_confirmed_at": None,
+            "access_last_error": "External account credentials are missing",
+        })
+
+    def _set_access_values(self, values, account=None):
+        if "account_settings" not in values and "server_url" not in values:
+            return
+        account_settings = values.get("account_settings")
+        if account_settings is None and account is not None:
+            account_settings = account.account_settings
+        if account_settings is None:
+            return
+        if account_settings.credentials is None:
+            self._set_missing_credentials_access(values)
+            return
+        self._set_confirmed_access(values)
+
     def _validate_zulip_credentials_update(self, account, values):
-        if "account_settings" not in values:
+        if "account_settings" not in values and "server_url" not in values:
             return
 
-        account_settings = values["account_settings"]
+        account_settings = values.get("account_settings", account.account_settings)
         self._reject_iam_account_from_api(account_settings)
         self._reject_user_info_from_api(account_settings)
         if account_settings.KIND != models.ExternalAccountType.ZULIP.value:
@@ -481,6 +538,8 @@ class ExternalAccountController(
 
     def create(self, **kwargs):
         values = kwargs.copy()
+        self._reject_access_fields_from_api(values)
+        self._set_source_scope(values)
         account_settings = values["account_settings"]
         self._reject_iam_account_from_api(account_settings)
         self._reject_user_info_from_api(account_settings)
@@ -491,6 +550,7 @@ class ExternalAccountController(
                 server_url=values["server_url"],
                 account_settings=account_settings,
             )
+        self._set_access_values(values)
         account = super().create(**values)
         self._ensure_user_sync(account)
         return account
@@ -498,7 +558,10 @@ class ExternalAccountController(
     def update(self, uuid, **kwargs):
         account = self.get(uuid=uuid)
         values = self._apply_autovalues(kwargs)
+        self._reject_access_fields_from_api(values)
+        self._set_source_scope(values)
         self._validate_zulip_credentials_update(account, values)
+        self._set_access_values(values, account=account)
         account.update_dm(values=values)
         account.update()
         return account
@@ -628,6 +691,7 @@ class WorkspaceMessageController(
             project_id=values.pop("project_id", self._get_project_id()),
             user_uuid=values.pop("user_uuid"),
             uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
+            enforce_visibility=True,
             **values,
         )
 

@@ -17,6 +17,7 @@
 import datetime
 import uuid as sys_uuid
 
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
 from workspace.messenger_api import exceptions as messenger_exc
@@ -240,6 +241,25 @@ def get_workspace_user_stream(project_id, user_uuid, stream_uuid):
             "user_uuid": dm_filters.EQ(user_uuid),
         },
     )
+
+
+def _ensure_workspace_user_message_target_visible(project_id, user_uuid,
+                                                  values):
+    get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=values["stream_uuid"],
+    )
+    if "topic_uuid" not in values or values["topic_uuid"] is None:
+        return
+
+    topic = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=values["topic_uuid"],
+    )
+    if topic.stream_uuid != values["stream_uuid"]:
+        raise ra_exc.ValidationErrorException()
 
 
 def get_workspace_file(project_id, file_uuid):
@@ -525,21 +545,28 @@ def _create_message_unread_updated_events(project_id, user_uuid, stream_uuid,
 
 def _create_unread_updated_events(project_id, user_uuid, stream_uuid,
                                   topic_uuids, session=None):
-    for topic_uuid in topic_uuids:
-        user_topic = get_workspace_user_stream_topic(
+    try:
+        user_stream = get_workspace_user_stream(
             project_id=project_id,
             user_uuid=user_uuid,
-            topic_uuid=topic_uuid,
+            stream_uuid=stream_uuid,
         )
+    except storage_exc.RecordNotFound:
+        return
+
+    for topic_uuid in topic_uuids:
+        try:
+            user_topic = get_workspace_user_stream_topic(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                topic_uuid=topic_uuid,
+            )
+        except storage_exc.RecordNotFound:
+            continue
         messenger_events.create_topic_updated_event(
             topic=user_topic,
             session=session,
         )
-    user_stream = get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-    )
     messenger_events.create_stream_updated_event(
         stream=user_stream,
         session=session,
@@ -662,6 +689,8 @@ def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
         project_id=project_id,
         user_uuid=binding.user_uuid,
         stream_uuid=binding.stream_uuid,
+        source_name=user_stream.source_name,
+        source=user_stream.source,
         session=session,
     )
     _delete_workspace_stream_binding_file_accesses(
@@ -961,32 +990,25 @@ def _create_workspace_stream_topic_events(project_id, topic_uuid, session=None):
 
 
 def _get_workspace_stream_topic_for_user(project_id, user_uuid, topic_uuid):
-    topic = models.WorkspaceStreamTopic.objects.get_one(
+    user_topic = get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+    )
+    return models.WorkspaceStreamTopic.objects.get_one(
         filters={
-            "uuid": dm_filters.EQ(topic_uuid),
+            "uuid": dm_filters.EQ(user_topic.uuid),
             "project_id": dm_filters.EQ(project_id),
         },
     )
-    models.WorkspaceStreamBinding.objects.get_one(
-        filters={
-            "stream_uuid": dm_filters.EQ(topic.stream_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-        },
-    )
-    return topic
 
 
 def create_workspace_user_stream_topic(project_id, user_uuid, values,
                                        session=None):
-    stream_uuid = values["stream_uuid"]
-    models.WorkspaceStreamBinding.objects.get_one(
-        filters={
-            "stream_uuid": dm_filters.EQ(stream_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-        },
-        session=session,
+    get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=values["stream_uuid"],
     )
     topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
@@ -1042,6 +1064,8 @@ def delete_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
             user_uuid=user_topic.user_uuid,
             topic_uuid=topic_uuid,
             stream_uuid=topic.stream_uuid,
+            source_name=topic.source_name,
+            source=topic.source,
             session=session,
         )
     topic.delete(session=session)
@@ -1440,6 +1464,11 @@ def update_workspace_user_stream_notifications(project_id, user_uuid,
                                                stream_uuid,
                                                notification_mode,
                                                session=None):
+    stream = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+    )
     binding = models.WorkspaceStreamBinding.objects.get_one(
         filters={
             "project_id": dm_filters.EQ(project_id),
@@ -1450,11 +1479,7 @@ def update_workspace_user_stream_notifications(project_id, user_uuid,
     )
     binding.update_dm(values={"notification_mode": notification_mode})
     binding.update(session=session)
-    stream = get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-    )
+    stream.notification_mode = notification_mode
     messenger_events.create_stream_updated_event(
         stream=stream,
         session=session,
@@ -1494,6 +1519,8 @@ def delete_workspace_user_stream(project_id, user_uuid, stream_uuid,
             project_id=project_id,
             user_uuid=user_stream.user_uuid,
             stream_uuid=stream_uuid,
+            source_name=user_stream.source_name,
+            source=user_stream.source,
             session=session,
         )
 
@@ -1529,6 +1556,11 @@ def create_workspace_user_folder(project_id, user_uuid, session=None,
 
 def create_workspace_user_folder_item(project_id, user_uuid, session=None,
                                       **kwargs):
+    get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=kwargs["stream_uuid"],
+    )
     item = models.FolderItem(
         uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
         project_id=project_id,
@@ -1720,6 +1752,16 @@ def get_workspace_user_message(project_id, user_uuid, message_uuid):
     )
 
 
+def _get_workspace_message(project_id, message_uuid, session=None):
+    return models.WorkspaceMessage.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+        session=session,
+    )
+
+
 def get_workspace_user_message_uuids(project_id, user_uuid):
     messages = models.WorkspaceUserMessage.objects.get_all(
         filters={
@@ -1754,13 +1796,20 @@ def _create_workspace_message_reaction_updated_events(project_id,
 
 
 def create_workspace_message_reaction(project_id, user_uuid, session=None,
-                                      **kwargs):
+                                      enforce_visibility=True, **kwargs):
     message_uuid = kwargs["message_uuid"]
-    message = get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
+    if enforce_visibility:
+        message = get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+        )
+    else:
+        message = _get_workspace_message(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            session=session,
+        )
     reaction = models.WorkspaceMessageReactions(
         uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
         project_id=project_id,
@@ -1830,18 +1879,25 @@ def update_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
 
 
 def delete_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
-                                      session=None):
+                                      session=None, enforce_visibility=True):
     reaction = get_workspace_message_reaction(
         project_id=project_id,
         user_uuid=user_uuid,
         reaction_uuid=reaction_uuid,
     )
     message_uuid = reaction.message_uuid
-    message = get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
+    if enforce_visibility:
+        message = get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+        )
+    else:
+        message = _get_workspace_message(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            session=session,
+        )
     reaction.delete(session=session)
     messenger_events.create_message_reaction_deleted_event(
         reaction=reaction,
@@ -1940,13 +1996,26 @@ def _read_workspace_user_messages(project_id, user_uuid, messages,
 
 
 def create_workspace_user_message(project_id, user_uuid, session=None,
+                                  enforce_visibility=False, return_visible=True,
                                   **kwargs):
+    if enforce_visibility:
+        get_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=kwargs["stream_uuid"],
+        )
     if "topic_uuid" not in kwargs or kwargs["topic_uuid"] is None:
         topic = _get_workspace_stream_default_topic(
             project_id=project_id,
             stream_uuid=kwargs["stream_uuid"],
         )
         kwargs["topic_uuid"] = topic.uuid
+    if enforce_visibility:
+        _ensure_workspace_user_message_target_visible(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            values=kwargs,
+        )
     if "source_name" not in kwargs or "source" not in kwargs:
         kwargs.update(
             _get_message_topic_source_fields(
@@ -1988,6 +2057,8 @@ def create_workspace_user_message(project_id, user_uuid, session=None,
         topic_uuid=message.topic_uuid,
         session=session,
     )
+    if not return_visible:
+        return message
     return get_workspace_user_message(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -1995,7 +2066,8 @@ def create_workspace_user_message(project_id, user_uuid, session=None,
     )
 
 
-def get_or_create_workspace_user_message(project_id, user_uuid, **kwargs):
+def get_or_create_workspace_user_message(project_id, user_uuid,
+                                         return_visible=True, **kwargs):
     if "source_name" in kwargs and "source" in kwargs:
         source_name = _normalize_source_name(kwargs["source_name"])
         existing = models.WorkspaceMessage.objects.get_one_or_none(
@@ -2006,6 +2078,8 @@ def get_or_create_workspace_user_message(project_id, user_uuid, **kwargs):
             },
         )
         if existing is not None:
+            if not return_visible:
+                return existing
             return get_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2016,17 +2090,19 @@ def get_or_create_workspace_user_message(project_id, user_uuid, **kwargs):
     return create_workspace_user_message(
         project_id=project_id,
         user_uuid=user_uuid,
+        return_visible=return_visible,
         **kwargs,
     )
 
 
 def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
-                                  session=None):
-    get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
+                                  session=None, enforce_visibility=True):
+    if enforce_visibility:
+        get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+        )
     message = _get_workspace_message_for_author(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -2046,6 +2122,8 @@ def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
             message=user_message,
             session=session,
         )
+    if not enforce_visibility:
+        return message
     return result
 
 

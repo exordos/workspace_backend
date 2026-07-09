@@ -440,6 +440,7 @@ def test_bridge_cache_updates_zulip_message_and_skips_outbound_event():
     assert update_kwargs["project_id"] == project_id
     assert update_kwargs["user_uuid"] == message.user_uuid
     assert update_kwargs["message_uuid"] == message_uuid
+    assert update_kwargs["enforce_visibility"] is False
     assert update_kwargs["values"]["payload"].content == "edited workspace"
     cache_key = (
         project_id,
@@ -637,6 +638,7 @@ def test_bridge_cache_adds_zulip_reaction_and_skips_outbound_events():
         user_uuid=user_uuid,
         message_uuid=message_uuid,
         emoji_name="thumbs_up",
+        enforce_visibility=False,
     )
     assert [
         state.epoch_version
@@ -733,6 +735,7 @@ def test_bridge_cache_removes_zulip_reaction_and_skips_outbound_events():
         project_id=project_id,
         user_uuid=user_uuid,
         reaction_uuid=reaction_uuid,
+        enforce_visibility=False,
     )
     assert [
         state.epoch_version
@@ -807,11 +810,13 @@ def test_bridge_cache_syncs_zulip_message_reactions_from_payload():
         user_uuid=user_uuid,
         message_uuid=message_uuid,
         emoji_name="thumbs_up",
+        enforce_visibility=False,
     )
     delete_reaction.assert_called_once_with(
         project_id=project_id,
         user_uuid=stale_user_uuid,
         reaction_uuid=stale_reaction_uuid,
+        enforce_visibility=False,
     )
     mark_skipped.assert_has_calls([
         mock.call(
@@ -1935,23 +1940,43 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="first-user",
+        access_status=(
+            agents.models.ExternalAccountAccessStatus.CONFIRMED.value
+        ),
         account_settings=types.SimpleNamespace(credentials=credentials),
     )
     second_user = types.SimpleNamespace(
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="second-user",
+        access_status=(
+            agents.models.ExternalAccountAccessStatus.CONFIRMED.value
+        ),
         account_settings=types.SimpleNamespace(credentials=credentials),
     )
     skipped_user = types.SimpleNamespace(
         user_uuid="skipped-user",
         account_settings=types.SimpleNamespace(credentials=None),
     )
+    unconfirmed_user = types.SimpleNamespace(
+        project_id="project",
+        server_url="https://zulip.example.com",
+        user_uuid="unconfirmed-user",
+        access_status=(
+            agents.models.ExternalAccountAccessStatus.INVALID_CREDENTIALS.value
+        ),
+        account_settings=types.SimpleNamespace(credentials=credentials),
+    )
 
     class FakeExternalAccount:
         objects = types.SimpleNamespace(
             get_all=mock.Mock(
-                return_value=[first_user, second_user, skipped_user],
+                return_value=[
+                    first_user,
+                    second_user,
+                    skipped_user,
+                    unconfirmed_user,
+                ],
             ),
         )
 
@@ -2021,6 +2046,11 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
         "project",
         "https://zulip.example.com",
         "skipped-user",
+    ) not in worker._workers
+    assert (
+        "project",
+        "https://zulip.example.com",
+        "unconfirmed-user",
     ) not in worker._workers
     assert FakeZulipBridgeWorker.instances[0].external_account is second_user
     assert FakeZulipBridgeWorker.instances[0].output_queue is (
@@ -3483,6 +3513,7 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
     assert result is message
     assert cached_result is message
     get_or_create_message.assert_called_once()
+    assert get_or_create_message.call_args.kwargs["return_visible"] is False
     save_processed.assert_called_once()
     assert sync_flags.call_args_list == [
         mock.call(
@@ -3646,12 +3677,12 @@ def test_bridge_cache_preprocesses_existing_processed_message():
         "get_or_create_workspace_user_message",
         mock.Mock(),
     ) as get_or_create_message, mock.patch.object(
-        agents.models.WorkspaceUserMessage,
+        agents.models.WorkspaceMessage,
         "objects",
         types.SimpleNamespace(
             get_one_or_none=mock.Mock(return_value=message),
         ),
-    ) as user_messages, mock.patch.object(
+    ) as messages, mock.patch.object(
         agents.messenger_dm_helpers,
         "sync_workspace_user_message_flags",
         mock.Mock(),
@@ -3681,7 +3712,7 @@ def test_bridge_cache_preprocesses_existing_processed_message():
         message_info=message_info,
     )
     get_or_create_message.assert_not_called()
-    user_messages.get_one_or_none.assert_called_once()
+    messages.get_one_or_none.assert_called_once()
 
 
 def test_bridge_cache_rebinds_stale_processed_message():
@@ -3720,7 +3751,7 @@ def test_bridge_cache_rebinds_stale_processed_message():
         "_get_required_zulip_user_uuid",
         mock.Mock(return_value="author-user"),
     ), mock.patch.object(
-        agents.models.WorkspaceUserMessage,
+        agents.models.WorkspaceMessage,
         "objects",
         types.SimpleNamespace(
             get_one_or_none=mock.Mock(return_value=None),
@@ -3758,6 +3789,7 @@ def test_bridge_cache_rebinds_stale_processed_message():
 
     assert result is message
     get_or_create_message.assert_called_once()
+    assert get_or_create_message.call_args.kwargs["return_visible"] is False
     assert processed.workspace_uuid == "new-message-uuid"
     processed.update.assert_called_once_with()
 
@@ -4762,6 +4794,9 @@ def test_bridge_worker_iteration_syncs_users():
 
     with mock.patch.object(
         worker,
+        "_sync_zulip_external_account_accesses",
+    ) as sync_zulip_accesses, mock.patch.object(
+        worker,
         "_sync_iam_users",
     ) as sync_iam_users, mock.patch.object(
         worker,
@@ -4781,6 +4816,7 @@ def test_bridge_worker_iteration_syncs_users():
     ) as process_sync_queue:
         worker._run_iteration()
 
+    sync_zulip_accesses.assert_called_once_with()
     sync_iam_users.assert_called_once_with()
     sync_zulip_users.assert_called_once_with()
     start_bridges.assert_called_once_with()

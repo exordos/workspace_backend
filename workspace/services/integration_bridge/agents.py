@@ -43,6 +43,7 @@ from workspace.services.integration_bridge import workers
 LOG = logging.getLogger(__name__)
 SYNC_QUEUE_TIMEOUT = 0.01
 RETRY_COMMAND_DELAY = datetime.timedelta(seconds=30)
+EXTERNAL_ACCOUNT_ACCESS_CHECK_INTERVAL = datetime.timedelta(minutes=5)
 DEFAULT_SYNC_QUEUE_BATCH_LIMIT = 100
 DEFAULT_HISTORY_SYNC_TASK_BATCH_LIMIT = 1
 DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT = 100
@@ -1602,11 +1603,10 @@ class WorkspaceIntegrationBridgeCache:
         raw_message_info = message_info
         message_info = None
         if processed_uuid is not None and cache_key not in self._messages:
-            message = models.WorkspaceUserMessage.objects.get_one_or_none(
+            message = models.WorkspaceMessage.objects.get_one_or_none(
                 filters={
                     "uuid": dm_filters.EQ(processed_uuid),
                     "project_id": dm_filters.EQ(external_account.project_id),
-                    "user_uuid": dm_filters.EQ(user_uuid),
                 },
             )
             if message is None:
@@ -1649,6 +1649,7 @@ class WorkspaceIntegrationBridgeCache:
                     source=source,
                     created_at=message_info["created_at"],
                     updated_at=message_info["updated_at"],
+                    return_visible=False,
                 )
             )
             self._messages[cache_key] = message
@@ -1728,6 +1729,7 @@ class WorkspaceIntegrationBridgeCache:
                     content=message_info["content"],
                 ),
             },
+            enforce_visibility=False,
         )
         self._mark_inbound_zulip_events_skipped(
             external_account=external_account,
@@ -1851,6 +1853,7 @@ class WorkspaceIntegrationBridgeCache:
                     content=message_info["content"],
                 ),
             },
+            enforce_visibility=False,
         )
         cache_key = (
             external_account.project_id,
@@ -2099,6 +2102,7 @@ class WorkspaceIntegrationBridgeCache:
                 user_uuid=reaction_info["user_uuid"],
                 message_uuid=message.uuid,
                 emoji_name=reaction_info["emoji_name"],
+                enforce_visibility=False,
             )
             created_reaction_uuids.append(reaction.uuid)
 
@@ -2113,6 +2117,7 @@ class WorkspaceIntegrationBridgeCache:
                 project_id=external_account.project_id,
                 user_uuid=reaction.user_uuid,
                 reaction_uuid=reaction.uuid,
+                enforce_visibility=False,
             )
             deleted_reaction_uuids.append(reaction.uuid)
 
@@ -2143,6 +2148,7 @@ class WorkspaceIntegrationBridgeCache:
             user_uuid=user_uuid,
             message_uuid=message.uuid,
             emoji_name=reaction_info["emoji_name"],
+            enforce_visibility=False,
         )
         self._mark_inbound_zulip_events_skipped(
             external_account=external_account,
@@ -2174,6 +2180,7 @@ class WorkspaceIntegrationBridgeCache:
             project_id=external_account.project_id,
             user_uuid=user_uuid,
             reaction_uuid=reaction.uuid,
+            enforce_visibility=False,
         )
         self._mark_inbound_zulip_events_skipped(
             external_account=external_account,
@@ -2236,6 +2243,125 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         for provider in user_providers:
             provider.sync()
 
+    def _get_due_external_account_accesses(self, account_type):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return models.ExternalAccount.objects.get_all(
+            filters={
+                "account_type": dm_filters.EQ(account_type),
+                "access_next_check_at": dm_filters.LE(now),
+            },
+        )
+
+    def _update_external_account_access(
+        self,
+        external_account,
+        access_status,
+        last_error=None,
+        values=None,
+    ):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        access_values = {
+            "access_status": access_status,
+            "access_checked_at": now,
+            "access_next_check_at": (
+                now + EXTERNAL_ACCOUNT_ACCESS_CHECK_INTERVAL
+            ),
+            "access_last_error": last_error,
+        }
+        if values is not None:
+            access_values.update(values)
+        if access_status == models.ExternalAccountAccessStatus.CONFIRMED.value:
+            access_values["access_confirmed_at"] = now
+            access_values["access_last_error"] = None
+        elif access_status in (
+            models.ExternalAccountAccessStatus.MISSING_CREDENTIALS.value,
+            models.ExternalAccountAccessStatus.INVALID_CREDENTIALS.value,
+        ):
+            access_values["access_confirmed_at"] = None
+
+        external_account.update_dm(values=access_values)
+        external_account.save()
+
+    def _check_zulip_external_account_access(self, external_account):
+        if external_account.account_settings.credentials is None:
+            self._update_external_account_access(
+                external_account=external_account,
+                access_status=(
+                    models.ExternalAccountAccessStatus.MISSING_CREDENTIALS.value
+                ),
+                last_error="External account credentials are missing",
+            )
+            return
+
+        credentials = external_account.account_settings.credentials
+        client = self._get_zulip_client(external_account)
+        try:
+            user = client.get_current_user_with_api_key(
+                login=credentials.login,
+                token=credentials.token,
+            )
+        except requests.exceptions.RequestException as exc:
+            self._update_external_account_access(
+                external_account=external_account,
+                access_status=(
+                    models.ExternalAccountAccessStatus.UNAVAILABLE.value
+                ),
+                last_error=str(exc),
+            )
+            return
+
+        if user.get("result") == "error":
+            self._update_external_account_access(
+                external_account=external_account,
+                access_status=(
+                    models.ExternalAccountAccessStatus.INVALID_CREDENTIALS.value
+                ),
+                last_error=user.get("msg"),
+            )
+            return
+
+        try:
+            user_info = external_account.account_settings._get_zulip_user_info(
+                user=user,
+            )
+        except (KeyError, TypeError) as exc:
+            self._update_external_account_access(
+                external_account=external_account,
+                access_status=(
+                    models.ExternalAccountAccessStatus.INVALID_CREDENTIALS.value
+                ),
+                last_error=str(exc),
+            )
+            return
+
+        current_user_info = external_account.account_settings.user_info
+        if (
+            current_user_info is not None
+            and current_user_info.user_id != user_info.user_id
+        ):
+            self._update_external_account_access(
+                external_account=external_account,
+                access_status=(
+                    models.ExternalAccountAccessStatus.INVALID_CREDENTIALS.value
+                ),
+                last_error="External account credentials changed user identity",
+            )
+            return
+
+        external_account.account_settings.user_info = user_info
+        self._update_external_account_access(
+            external_account=external_account,
+            access_status=models.ExternalAccountAccessStatus.CONFIRMED.value,
+            values={"account_settings": external_account.account_settings},
+        )
+
+    def _sync_zulip_external_account_accesses(self):
+        external_accounts = self._get_due_external_account_accesses(
+            account_type=models.ExternalAccountType.ZULIP.value,
+        )
+        for external_account in external_accounts:
+            self._check_zulip_external_account_access(external_account)
+
     def _sync_iam_users(self):
         self._sync_user_providers(
             account_type=models.ExternalAccountType.IAM.value,
@@ -2273,6 +2399,11 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         )
         for user in all_users:
             if user.account_settings.credentials is None:
+                continue
+            if (
+                user.access_status !=
+                models.ExternalAccountAccessStatus.CONFIRMED.value
+            ):
                 continue
             worker_key = self._get_zulip_worker_key(user)
             self._worker_accounts[worker_key] = user
@@ -3892,6 +4023,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         if self._stopping:
             self._shutdown_iteration()
             return
+        self._sync_zulip_external_account_accesses()
         self._sync_iam_users()
         self._sync_zulip_users()
         self._start_bridges()

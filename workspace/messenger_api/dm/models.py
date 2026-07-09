@@ -421,6 +421,13 @@ class ExternalAccountStatus(str, enum.Enum):
     ACTIVE = "active"
 
 
+class ExternalAccountAccessStatus(str, enum.Enum):
+    MISSING_CREDENTIALS = "missing_credentials"
+    CONFIRMED = "confirmed"
+    INVALID_CREDENTIALS = "invalid_credentials"
+    UNAVAILABLE = "unavailable"
+
+
 DEFAULT_ZULIP_TIMEZONE = "Europe/Moscow"
 
 
@@ -788,6 +795,10 @@ class ExternalAccount(
         types.Url(),
         required=True,
     )
+    source_scope = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=2048)),
+        default=None,
+    )
     account_type = properties.property(
         types.Enum([account_type.value for account_type in ExternalAccountType]),
         default=ExternalAccountType.ZULIP.value,
@@ -796,6 +807,28 @@ class ExternalAccount(
         types.Enum([status.value for status in ExternalAccountStatus]),
         default=ExternalAccountStatus.NEW.value,
     )
+    access_status = properties.property(
+        types.Enum([
+            status.value for status in ExternalAccountAccessStatus
+        ]),
+        default=ExternalAccountAccessStatus.MISSING_CREDENTIALS.value,
+    )
+    access_checked_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
+    access_confirmed_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
+    access_next_check_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=lambda: datetime.datetime.now(datetime.timezone.utc),
+    )
+    access_last_error = properties.property(
+        types.AllowNone(types.String(max_length=4096)),
+        default=None,
+    )
     account_settings = properties.property(
         EXTERNAL_ACCOUNT_SETTINGS_TYPE,
         required=True,
@@ -803,6 +836,14 @@ class ExternalAccount(
 
     def user_sync(self):
         return self.account_settings.sync_users(external_account=self)
+
+    def get_source_scope(self):
+        if self.source_scope is not None:
+            return self.source_scope
+        return self.server_url
+
+    def has_credentials(self):
+        return self.account_settings.credentials is not None
 
 
 class ExternalAccountUserSync(
@@ -880,6 +921,12 @@ class ExternalAccountUserSync(
     def sync(self):
         external_account = self.get_external_account()
         if external_account is None:
+            self._update_next_sync_at()
+            return
+        if (
+            external_account.access_status !=
+            ExternalAccountAccessStatus.CONFIRMED.value
+        ):
             self._update_next_sync_at()
             return
         users = external_account.user_sync()
@@ -1123,6 +1170,10 @@ class WorkspaceEvent(
             self.epoch_version = row.fetchone()["epoch_version"]
             self._saved = True
         return self.epoch_version
+
+
+class WorkspaceVisibleEvent(WorkspaceEvent):
+    __tablename__ = "m_workspace_visible_events"
 
 
 class WorkspaceProject(

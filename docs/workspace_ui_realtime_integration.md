@@ -1,7 +1,8 @@
 # Workspace UI Realtime Integration
 
 This document describes the public realtime contract consumed by the UI.
-REST catch-up and websocket delivery use the same flat event object.
+REST catch-up and websocket delivery use the same flat event object and the same
+visible event surface.
 
 ## Endpoints
 
@@ -44,6 +45,9 @@ handshakes close with `4400`.
 
 Every event returned by REST `/events/` and every websocket message has this
 schema. There is no outer `{ "type": "event", "event": ... }` wrapper.
+External-source events are delivered only while the current user has matching
+confirmed external account access; the backend filters REST catch-up,
+`/epoch/`, and websocket delivery consistently.
 
 ```json
 {

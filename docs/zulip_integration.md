@@ -113,16 +113,21 @@ agent may start a separate subscription worker. Workers are responsible for
 reading the Zulip event queue and passing events to the agent. Synchronization,
 task ordering, and state writes are managed by the agent.
 
-On every iteration, the main agent runs `_start_bridges()`:
+On every iteration, the main agent refreshes Zulip external-account access and
+then runs `_start_bridges()`:
 
-1. It loads from the database all `ExternalAccount` rows with
-   `account_type = zulip` and populated `account_settings.credentials`. Accounts
-   without credentials are skipped.
-2. For each such account, it computes the worker key
+1. Due Zulip accounts are checked with the lightweight `users/me` request.
+   Missing credentials set `access_status = missing_credentials`, Zulip
+   authentication failures set `invalid_credentials`, temporary transport or
+   server failures set `unavailable`, and successful checks set `confirmed`.
+2. It loads from the database all `ExternalAccount` rows with
+   `account_type = zulip`, populated `account_settings.credentials`, and
+   `access_status = confirmed`. Accounts without confirmed access are skipped.
+3. For each such account, it computes the worker key
    `(project_id, server_url, user_uuid)` and checks whether a `ZulipBridgeWorker`
    with that key is already running. If not, it creates a thread, passes the
    shared `_sync_queue` to it (worker -> agent), and calls `worker.start()`.
-3. The worker subscribes to the Zulip event queue: it reads the saved `queue_id`
+4. The worker subscribes to the Zulip event queue: it reads the saved `queue_id`
    from `ZulipEventQueueState` and tries to continue with the same queue. If the
    queue is available, the worker keeps reading events from the saved
    `last_event_id` without a full resync. If there was no subscription yet
@@ -137,6 +142,25 @@ message flag, stream, and subscription events. It declares the Zulip
 `archived_channels` client capability so channel archiving is delivered as a
 stream state update instead of a stream deletion event when the server supports
 that behavior.
+
+### External Account Access And Visibility
+
+Zulip data may be stored in Workspace even when a particular Workspace user has
+not confirmed their own Zulip credentials. Storage and visibility are separate:
+
+- the bridge may import streams, topics, messages, reactions, files, and
+  membership state from any connected confirmed account;
+- user-facing streams, topics, messages, unread counters, folder items, REST
+  events, and websocket events expose Zulip rows only when the recipient has a
+  matching confirmed external account;
+- the shared visibility gate is `m_confirmed_external_account_access`, keyed by
+  `(project_id, user_uuid, account_type, source_scope)`;
+- for Zulip, `source_scope` is the external account `server_url` and matches the
+  source payload's `server_url`.
+
+This is the generic external-source visibility model. Future providers should
+write source payloads with a stable provider scope and external account rows
+with the same `account_type` and `source_scope`.
 
 #### Implementation backlog: Zulip event coverage
 

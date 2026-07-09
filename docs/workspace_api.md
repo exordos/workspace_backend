@@ -530,6 +530,16 @@ topics and messages inherit source data from their parent stream/topic, then
 the bridge fills `topic_name` and `message_id` when the external Zulip state is
 known.
 
+External source visibility is gated by the current user's confirmed external
+account access. `m_workspace_user_streams`, `m_workspace_user_topics_view`,
+`m_workspace_user_messages_view`, unread counters, folder item views, and event
+delivery only expose non-native source rows when there is a matching
+`m_external_accounts` row with `access_status = confirmed`, populated
+`account_settings.credentials`, the same `project_id`, `user_uuid`,
+`account_type = source_name`, and matching source scope. For Zulip the source
+scope is the normalized `server_url`; future providers can map their own source
+scope into the same gate.
+
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | Stream identifier. |
@@ -750,6 +760,10 @@ Realtime side effects:
 rows in `m_workspace_user_message_flags`, and writes one durable workspace event
 per recipient to `m_workspace_events`. Reads use
 `m_workspace_user_messages_view` and are scoped to the current IAM user.
+Message creation first checks the selected stream/topic through the same
+user-facing visibility views. A client cannot create a message in a stream or
+topic that is hidden because the corresponding external account access is not
+confirmed.
 
 The only supported message payload in v1 is markdown:
 
@@ -996,14 +1010,31 @@ profile for those credentials and rejects the update if the returned `user_id`
 does not match the account's stored `user_info.user_id`. IAM external accounts
 are internal-only and cannot be created through the public API.
 
+External account access is tracked separately from the lifecycle `status`.
+`access_status = confirmed` means the backend has validated the account
+credentials and user identity. Rows with `missing_credentials`,
+`invalid_credentials`, or `unavailable` do not unlock external-source streams,
+topics, messages, unread counters, folder items, or events for that user.
+Access fields are server-managed: API payloads cannot force an account into the
+confirmed state. For Zulip, the bridge periodically rechecks access with
+`users/me`; successful checks keep the account confirmed, missing credentials
+move it to `missing_credentials`, Zulip authentication errors move it to
+`invalid_credentials`, and transport/server failures move it to `unavailable`.
+
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | External account binding identifier. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `user_uuid` | UUID | no | yes | Workspace user owner. |
 | `server_url` | URL | yes | no | External provider server URL. |
+| `source_scope` | string or `null` | no | yes | Provider source scope used by the visibility gate. Defaults to `server_url` for Zulip. |
 | `account_type` | `zulip`, `iam` | no | no | External account provider type. |
 | `status` | `new`, `active` | no | yes | Integration lifecycle status. |
+| `access_status` | `missing_credentials`, `confirmed`, `invalid_credentials`, `unavailable` | no | yes | Server-managed credential/access status used for external-source visibility. |
+| `access_checked_at` | datetime or `null` | no | yes | Last time the backend checked provider access. |
+| `access_confirmed_at` | datetime or `null` | no | yes | Last successful provider access check. |
+| `access_next_check_at` | datetime | no | yes | Next scheduled provider access check. |
+| `access_last_error` | string or `null` | no | yes | Last access check error. |
 | `account_settings` | object | yes | no | Provider-specific settings with a `kind` discriminator. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
@@ -1043,6 +1074,9 @@ must remove local state. `epoch_version` is a monotonically increasing cursor.
 
 `GET /v1/events/` returns events sorted by `epoch_version` ascending by default.
 REST `/events/` and websocket delivery use the same flat schema:
+both read from the visible event surface, so external-source events are hidden
+whenever the current user's matching external account access is not confirmed.
+`GET /v1/epoch/` uses that same visible event surface.
 
 ```json
 {

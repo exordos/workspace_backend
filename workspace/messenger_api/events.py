@@ -106,7 +106,7 @@ EVENT_METADATA = {
     FOLDER_ITEM_DELETED_EVENT: (FOLDER_ITEM_OBJECT_TYPE, DELETED_ACTION),
 }
 WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
-    model_class=models.WorkspaceEvent,
+    model_class=models.WorkspaceVisibleEvent,
     convert_underscore=False,
     process_filters=True,
 )
@@ -348,8 +348,6 @@ def create_message_events(project_id, message, recipients, session=None):
         order_by={"user_uuid": "asc"},
         session=session,
     )
-    if len(user_messages) != len(recipients):
-        raise ra_exc.ValidationErrorException()
 
     result = []
     for user_message in user_messages:
@@ -566,7 +564,7 @@ def create_topic_read_event(topic, session=None):
 
 
 def create_topic_deleted_event(project_id, user_uuid, topic_uuid, stream_uuid,
-                               session=None):
+                               source_name, source, session=None):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -574,18 +572,24 @@ def create_topic_deleted_event(project_id, user_uuid, topic_uuid, stream_uuid,
         payload={
             "uuid": _event_payload_value("uuid", topic_uuid),
             "stream_uuid": _event_payload_value("stream_uuid", stream_uuid),
+            "source_name": _event_payload_value("source_name", source_name),
+            "source": _event_payload_value("source", source),
         },
         session=session,
     )
 
 
 def create_stream_deleted_event(project_id, user_uuid, stream_uuid,
-                                session=None):
+                                source_name, source, session=None):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
         kind=STREAM_DELETED_EVENT,
-        payload={"uuid": _event_payload_value("uuid", stream_uuid)},
+        payload={
+            "uuid": _event_payload_value("uuid", stream_uuid),
+            "source_name": _event_payload_value("source_name", source_name),
+            "source": _event_payload_value("source", source),
+        },
         session=session,
     )
 
@@ -658,7 +662,7 @@ def create_folder_item_deleted_event(project_id, user_uuid, item_uuid,
 
 def get_events_after(project_id, user_uuid, after_epoch_version=0,
                      limit=DEFAULT_EVENTS_LIMIT, session=None):
-    events = models.WorkspaceEvent.objects.get_all(
+    events = models.WorkspaceVisibleEvent.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
@@ -672,7 +676,7 @@ def get_events_after(project_id, user_uuid, after_epoch_version=0,
 
 
 def get_event_for_user(project_id, user_uuid, epoch_version, session=None):
-    events = models.WorkspaceEvent.objects.get_all(
+    events = models.WorkspaceVisibleEvent.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
@@ -691,7 +695,7 @@ def get_current_epoch_version(project_id, user_uuid, session=None):
             s,
             """
             SELECT COALESCE(MAX(epoch_version), 0) AS epoch_version
-            FROM m_workspace_events
+            FROM m_workspace_visible_events
             WHERE project_id = %s
               AND user_uuid = %s
             """,
