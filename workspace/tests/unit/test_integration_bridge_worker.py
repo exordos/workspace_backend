@@ -456,6 +456,83 @@ def test_bridge_cache_updates_zulip_message_and_skips_outbound_event():
     assert state.status == agents.OUTBOUND_SKIPPED_STATUS
 
 
+def test_bridge_cache_skips_matching_zulip_message_update():
+    project_id = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        uuid=account_uuid,
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+    message = types.SimpleNamespace(
+        uuid=message_uuid,
+        user_uuid=sys_uuid.uuid4(),
+        stream_uuid=stream_uuid,
+        payload=types.SimpleNamespace(content="same workspace"),
+    )
+
+    class FakeWorkspaceMessage:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=message),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_processed_workspace_uuid",
+        mock.Mock(return_value=message_uuid),
+    ), mock.patch.object(
+        cache,
+        "preprocess_zulip_message",
+        mock.Mock(return_value={
+            "message_id": 104,
+            "sender_id": 8,
+            "content": "same workspace",
+        }),
+    ) as preprocess, mock.patch.object(
+        agents.models,
+        "WorkspaceMessage",
+        FakeWorkspaceMessage,
+    ), mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(),
+    ) as get_last_epoch, mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ) as mark_skipped, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "update_workspace_user_message",
+        mock.Mock(),
+    ) as update_workspace_message:
+        result = cache.update_message(
+            external_account=external_account,
+            message_info={
+                "message_id": 104,
+                "sender_id": 8,
+                "content": "same zulip",
+            },
+        )
+
+    assert result is message
+    preprocess.assert_called_once_with(
+        external_account=external_account,
+        stream=types.SimpleNamespace(uuid=stream_uuid),
+        message_info={
+            "message_id": 104,
+            "sender_id": 8,
+            "content": "same zulip",
+        },
+    )
+    get_last_epoch.assert_not_called()
+    mark_skipped.assert_not_called()
+    update_workspace_message.assert_not_called()
+    assert cache._messages == {}
+
+
 def test_bridge_cache_deletes_zulip_message_and_skips_outbound_event():
     project_id = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()

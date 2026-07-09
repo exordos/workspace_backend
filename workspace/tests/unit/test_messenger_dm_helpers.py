@@ -2423,6 +2423,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         other_message = types.SimpleNamespace(user_uuid=other_user_uuid)
 
         class ExistingMessage:
+            payload = {"kind": "markdown", "content": "old"}
+
             def update_dm(self, values):
                 updated_message["values"] = values
 
@@ -2480,6 +2482,59 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 mock.call(message=returned_message, session=session),
             ]
         )
+
+    def test_update_workspace_user_message_skips_matching_payload(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+
+        class ExistingMessage:
+            payload = {"kind": "markdown", "content": "edited"}
+
+            def update_dm(self, values):
+                raise AssertionError("message must not be changed")
+
+            def update(self, session=None):
+                raise AssertionError("message must not be saved")
+
+        existing_message = ExistingMessage()
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_message",
+            mock.Mock(),
+        ) as get_user_message, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_message_for_author",
+            return_value=existing_message,
+        ) as get_author_message, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_messages",
+            mock.Mock(),
+        ) as get_user_messages, mock.patch.object(
+            dm_helpers.messenger_events, "create_message_updated_event"
+        ) as create_event:
+            result = dm_helpers.update_workspace_user_message(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+                values={
+                    "payload": {"kind": "markdown", "content": "edited"},
+                },
+                session=session,
+                enforce_visibility=False,
+            )
+
+        self.assertIs(existing_message, result)
+        get_user_message.assert_not_called()
+        get_author_message.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+        )
+        get_user_messages.assert_not_called()
+        create_event.assert_not_called()
 
     def test_get_workspace_user_message_uuids_scopes_visible_messages(self):
         project_id = sys_uuid.uuid4()

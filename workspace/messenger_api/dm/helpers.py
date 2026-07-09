@@ -1772,6 +1772,12 @@ def get_workspace_user_message_uuids(project_id, user_uuid):
     return [message.uuid for message in messages]
 
 
+def _message_payload_plain_dict(payload):
+    if hasattr(payload, "as_plain_dict"):
+        return payload.as_plain_dict()
+    return payload
+
+
 def get_workspace_message_reaction(project_id, user_uuid, reaction_uuid):
     return models.WorkspaceMessageReactions.objects.get_one(
         filters={
@@ -2097,8 +2103,9 @@ def get_or_create_workspace_user_message(project_id, user_uuid,
 
 def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
                                   session=None, enforce_visibility=True):
+    result = None
     if enforce_visibility:
-        get_workspace_user_message(
+        result = get_workspace_user_message(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
@@ -2108,10 +2115,17 @@ def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
         user_uuid=user_uuid,
         message_uuid=message_uuid,
     )
+    if (
+        _message_payload_plain_dict(message.payload) ==
+        _message_payload_plain_dict(values["payload"])
+    ):
+        if not enforce_visibility:
+            return message
+        return result
+
     message.update_dm(values={"payload": values["payload"]})
     message.update(session=session)
 
-    result = None
     for user_message in _get_workspace_user_messages(
         project_id=project_id,
         message_uuid=message_uuid,
