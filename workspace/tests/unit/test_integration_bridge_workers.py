@@ -1774,6 +1774,47 @@ def test_add_message_treats_missing_flags_as_unread():
     assert message_info["read"] is False
 
 
+def test_add_message_includes_reactions_in_message_info():
+    command = workers.AddMessage(
+        external_account=_external_account(),
+        message={
+            "id": 100,
+            "sender_id": 24,
+            "content": "hello",
+            "timestamp": 1770998098,
+            "reactions": [
+                {
+                    "user_id": 10,
+                    "emoji_name": "thumbs_up",
+                    "emoji_code": "1f44d",
+                    "reaction_type": "unicode_emoji",
+                },
+                {
+                    "user_id": 11,
+                    "emoji_name": "heart",
+                    "emoji_code": "2764",
+                    "reaction_type": "unicode_emoji",
+                },
+            ],
+        },
+    )
+
+    message_info = command._get_message_info()
+
+    assert message_info["reactions"] == [
+        {
+            "message_id": 100,
+            "user_id": 10,
+            "emoji_name": "thumbs_up",
+        },
+        {
+            "message_id": 100,
+            "user_id": 11,
+            "emoji_name": "heart",
+        },
+    ]
+
+
 def test_add_message_skips_single_subscriber_private_message():
     class FakeCache:
         def __init__(self):

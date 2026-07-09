@@ -1353,6 +1353,11 @@ class WorkspaceIntegrationBridgeCache:
             message=message,
             message_info=message_info,
         )
+        self._sync_message_reactions(
+            external_account=external_account,
+            message=message,
+            message_info=raw_message_info,
+        )
         self._mark_seen_subscription_entity(
             external_account=external_account,
             entity_type="message",
@@ -1576,6 +1581,133 @@ class WorkspaceIntegrationBridgeCache:
             },
         )
         return message, user_uuid, reaction
+
+    def _get_workspace_message_reactions(self, external_account, message):
+        return models.WorkspaceMessageReactions.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(external_account.project_id),
+                "message_uuid": dm_filters.EQ(message.uuid),
+            },
+        )
+
+    def _get_reaction_key(self, user_uuid, emoji_name):
+        return (
+            user_uuid,
+            emoji_name,
+        )
+
+    def _get_workspace_reaction_key(self, reaction):
+        return self._get_reaction_key(
+            user_uuid=reaction.user_uuid,
+            emoji_name=reaction.emoji_name,
+        )
+
+    def _get_zulip_reaction_key(self, external_account, reaction_info):
+        user_uuid = self._get_required_zulip_user_uuid(
+            external_account=external_account,
+            user_id=reaction_info["user_id"],
+        )
+        return self._get_reaction_key(
+            user_uuid=user_uuid,
+            emoji_name=reaction_info["emoji_name"],
+        )
+
+    def _mark_synced_message_reactions_skipped(
+        self,
+        external_account,
+        message,
+        created_reaction_uuids,
+        deleted_reaction_uuids,
+        after_epoch,
+    ):
+        for reaction_uuid in created_reaction_uuids:
+            self._mark_inbound_zulip_events_skipped(
+                external_account=external_account,
+                object_type="message_reaction",
+                action="created",
+                payload_uuid=reaction_uuid,
+                after_epoch=after_epoch,
+            )
+        for reaction_uuid in deleted_reaction_uuids:
+            self._mark_inbound_zulip_events_skipped(
+                external_account=external_account,
+                object_type="message_reaction",
+                action="deleted",
+                payload_uuid=reaction_uuid,
+                after_epoch=after_epoch,
+            )
+        self._mark_inbound_zulip_events_skipped(
+            external_account=external_account,
+            object_type="message",
+            action="updated",
+            payload_uuid=message.uuid,
+            after_epoch=after_epoch,
+        )
+
+    def _sync_message_reactions(self, external_account, message, message_info):
+        if "reactions" not in message_info:
+            return
+
+        desired_reactions = {}
+        for reaction_info in message_info["reactions"]:
+            reaction_key = self._get_zulip_reaction_key(
+                external_account=external_account,
+                reaction_info=reaction_info,
+            )
+            desired_reactions[reaction_key] = {
+                "user_uuid": reaction_key[0],
+                "emoji_name": reaction_key[1],
+            }
+
+        existing_reactions = {
+            self._get_workspace_reaction_key(reaction): reaction
+            for reaction in self._get_workspace_message_reactions(
+                external_account=external_account,
+                message=message,
+            )
+        }
+        created_reaction_uuids = []
+        deleted_reaction_uuids = []
+        before_epoch = None
+
+        for reaction_key, reaction_info in desired_reactions.items():
+            if reaction_key in existing_reactions:
+                continue
+            if before_epoch is None:
+                before_epoch = self._get_last_workspace_event_epoch(
+                    external_account.project_id,
+                )
+            reaction = messenger_dm_helpers.create_workspace_message_reaction(
+                project_id=external_account.project_id,
+                user_uuid=reaction_info["user_uuid"],
+                message_uuid=message.uuid,
+                emoji_name=reaction_info["emoji_name"],
+            )
+            created_reaction_uuids.append(reaction.uuid)
+
+        for reaction_key, reaction in existing_reactions.items():
+            if reaction_key in desired_reactions:
+                continue
+            if before_epoch is None:
+                before_epoch = self._get_last_workspace_event_epoch(
+                    external_account.project_id,
+                )
+            messenger_dm_helpers.delete_workspace_message_reaction(
+                project_id=external_account.project_id,
+                user_uuid=reaction.user_uuid,
+                reaction_uuid=reaction.uuid,
+            )
+            deleted_reaction_uuids.append(reaction.uuid)
+
+        if before_epoch is None:
+            return
+        self._mark_synced_message_reactions_skipped(
+            external_account=external_account,
+            message=message,
+            created_reaction_uuids=created_reaction_uuids,
+            deleted_reaction_uuids=deleted_reaction_uuids,
+            after_epoch=before_epoch,
+        )
 
     def add_message_reaction(self, external_account, reaction_info):
         message, user_uuid, reaction = self._get_message_reaction(

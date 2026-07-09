@@ -296,6 +296,15 @@ class AddMessage:
             message_info["sender_email"] = self.message["sender_email"]
         if "sender_full_name" in self.message:
             message_info["sender_full_name"] = self.message["sender_full_name"]
+        if "reactions" in self.message:
+            message_info["reactions"] = [
+                {
+                    "message_id": self.message["id"],
+                    "user_id": reaction["user_id"],
+                    "emoji_name": reaction["emoji_name"],
+                }
+                for reaction in self.message["reactions"]
+            ]
         return message_info
 
     def execute(self, cache):

@@ -740,6 +740,168 @@ def test_bridge_cache_removes_zulip_reaction_and_skips_outbound_events():
     ] == [101, 102]
 
 
+def test_bridge_cache_syncs_zulip_message_reactions_from_payload():
+    project_id = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    created_reaction_uuid = sys_uuid.uuid4()
+    stale_reaction_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stale_user_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+    message = types.SimpleNamespace(uuid=message_uuid)
+    stale_reaction = types.SimpleNamespace(
+        uuid=stale_reaction_uuid,
+        user_uuid=stale_user_uuid,
+        emoji_name="eyes",
+    )
+    created_reaction = types.SimpleNamespace(uuid=created_reaction_uuid)
+
+    class FakeWorkspaceMessageReactions:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[stale_reaction]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceMessageReactions",
+        FakeWorkspaceMessageReactions,
+    ), mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(return_value=90),
+    ), mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ) as mark_skipped, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "create_workspace_message_reaction",
+        mock.Mock(return_value=created_reaction),
+    ) as create_reaction, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "delete_workspace_message_reaction",
+        mock.Mock(),
+    ) as delete_reaction:
+        cache._sync_message_reactions(
+            external_account=external_account,
+            message=message,
+            message_info={
+                "message_id": 104,
+                "reactions": [
+                    {
+                        "message_id": 104,
+                        "user_id": 24,
+                        "emoji_name": "thumbs_up",
+                    },
+                ],
+            },
+        )
+
+    create_reaction.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+        emoji_name="thumbs_up",
+    )
+    delete_reaction.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=stale_user_uuid,
+        reaction_uuid=stale_reaction_uuid,
+    )
+    mark_skipped.assert_has_calls([
+        mock.call(
+            external_account=external_account,
+            object_type="message_reaction",
+            action="created",
+            payload_uuid=created_reaction_uuid,
+            after_epoch=90,
+        ),
+        mock.call(
+            external_account=external_account,
+            object_type="message_reaction",
+            action="deleted",
+            payload_uuid=stale_reaction_uuid,
+            after_epoch=90,
+        ),
+        mock.call(
+            external_account=external_account,
+            object_type="message",
+            action="updated",
+            payload_uuid=message_uuid,
+            after_epoch=90,
+        ),
+    ])
+
+
+def test_bridge_cache_keeps_matching_zulip_message_reactions():
+    project_id = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+    message = types.SimpleNamespace(uuid=message_uuid)
+    reaction = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        user_uuid=user_uuid,
+        emoji_name="thumbs_up",
+    )
+
+    class FakeWorkspaceMessageReactions:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[reaction]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceMessageReactions",
+        FakeWorkspaceMessageReactions,
+    ), mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(),
+    ) as get_last_epoch, mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ) as mark_skipped, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "create_workspace_message_reaction",
+        mock.Mock(),
+    ) as create_reaction, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "delete_workspace_message_reaction",
+        mock.Mock(),
+    ) as delete_reaction:
+        cache._sync_message_reactions(
+            external_account=external_account,
+            message=message,
+            message_info={
+                "message_id": 104,
+                "reactions": [
+                    {
+                        "message_id": 104,
+                        "user_id": 24,
+                        "emoji_name": "thumbs_up",
+                    },
+                ],
+            },
+        )
+
+    get_last_epoch.assert_not_called()
+    mark_skipped.assert_not_called()
+    create_reaction.assert_not_called()
+    delete_reaction.assert_not_called()
+
+
 def test_outbound_event_filter_uses_author_event_only():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     author_event = types.SimpleNamespace(
