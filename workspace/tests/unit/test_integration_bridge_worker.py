@@ -1116,6 +1116,11 @@ class FakeQueryResult:
     def fetchall(self):
         return self._rows
 
+    def fetchone(self):
+        if not self._rows:
+            return None
+        return self._rows[0]
+
 
 def test_get_new_outbound_events_uses_candidate_json_filter():
     event_uuid = sys_uuid.uuid4()
@@ -1149,9 +1154,10 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
     worker._last_outbound_event_epoch = 55
 
     with mock.patch.object(agents.contexts, "Context", return_value=context):
-        events = worker._get_new_outbound_events()
+        events = worker._get_new_outbound_events(high_water_epoch=80)
 
     statement, values = session.execute.call_args.args
+    assert "e.epoch_version <= %s" in statement
     assert "e.payload->>'source_name' = 'zulip'" in statement
     assert "e.user_uuid::text = e.payload->>'author_uuid'" in statement
     assert "e.object_type = 'message_reaction'" in statement
@@ -1165,10 +1171,172 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
     assert "IS DISTINCT FROM e.payload->>'notification_mode'" in statement
     assert "e.payload #>> '{source,message_id}' IS NULL" in statement
     assert "m_zulip_outbound_event_states" in statement
-    assert values == (55, agents.DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT)
+    assert values == (55, 80, agents.DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT)
     assert len(events) == 1
     assert events[0].epoch_version == 56
     assert events[0].uuid == event_uuid
+
+
+def test_outbound_discovery_loads_persisted_cursor():
+    session = types.SimpleNamespace(
+        execute=mock.Mock(
+            return_value=FakeQueryResult([{"epoch_version": 77}]),
+        ),
+    )
+    context = types.SimpleNamespace(get_session=mock.Mock(return_value=session))
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(agents.contexts, "Context", return_value=context):
+        epoch_version = worker._get_outbound_discovery_cursor_epoch()
+
+    statement, values = session.execute.call_args.args
+    assert "m_integration_bridge_event_cursors" in statement
+    assert values == (agents.ZULIP_OUTBOUND_DISCOVERY_CURSOR,)
+    assert epoch_version == 77
+    assert worker._last_outbound_event_epoch == 77
+
+
+def test_outbound_discovery_reads_current_workspace_event_epoch():
+    session = types.SimpleNamespace(
+        execute=mock.Mock(
+            return_value=FakeQueryResult([{"epoch_version": 101}]),
+        ),
+    )
+    context = types.SimpleNamespace(get_session=mock.Mock(return_value=session))
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(agents.contexts, "Context", return_value=context):
+        epoch_version = worker._get_current_workspace_event_epoch()
+
+    statement, values = session.execute.call_args.args
+    assert "MAX(epoch_version)" in statement
+    assert values == ()
+    assert epoch_version == 101
+
+
+def test_outbound_discovery_saves_cursor_with_monotonic_upsert():
+    session = types.SimpleNamespace(
+        execute=mock.Mock(
+            return_value=FakeQueryResult([{"epoch_version": 90}]),
+        ),
+    )
+    context = types.SimpleNamespace(get_session=mock.Mock(return_value=session))
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+
+    with mock.patch.object(agents.contexts, "Context", return_value=context):
+        epoch_version = worker._save_outbound_discovery_cursor_epoch(90)
+
+    statement, values = session.execute.call_args.args
+    assert "ON CONFLICT (name) DO UPDATE" in statement
+    assert "GREATEST" in statement
+    assert values[1:] == (agents.ZULIP_OUTBOUND_DISCOVERY_CURSOR, 90)
+    assert epoch_version == 90
+    assert worker._last_outbound_event_epoch == 90
+
+
+def test_discover_zulip_outbound_events_skips_query_when_cursor_is_current():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._last_outbound_event_epoch = 80
+
+    with (
+        mock.patch.object(
+            worker,
+            "_get_current_workspace_event_epoch",
+            return_value=80,
+        ) as get_current_epoch,
+        mock.patch.object(worker, "_get_new_outbound_events") as get_events,
+        mock.patch.object(
+            worker,
+            "_save_outbound_discovery_cursor_epoch",
+        ) as save_cursor,
+    ):
+        worker._discover_zulip_outbound_events()
+
+    get_current_epoch.assert_called_once_with()
+    get_events.assert_not_called()
+    save_cursor.assert_not_called()
+
+
+def test_discover_zulip_outbound_events_advances_empty_batch_to_high_water():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._last_outbound_event_epoch = 55
+
+    with (
+        mock.patch.object(
+            worker,
+            "_get_current_workspace_event_epoch",
+            return_value=80,
+        ),
+        mock.patch.object(
+            worker,
+            "_get_new_outbound_events",
+            return_value=[],
+        ) as get_events,
+        mock.patch.object(
+            worker,
+            "_save_outbound_discovery_cursor_epoch",
+        ) as save_cursor,
+    ):
+        worker._discover_zulip_outbound_events()
+
+    get_events.assert_called_once_with(80)
+    save_cursor.assert_called_once_with(80)
+
+
+def test_discover_zulip_outbound_events_advances_partial_batch_to_high_water():
+    event = types.SimpleNamespace(
+        epoch_version=60,
+        object_type="user",
+        action="updated",
+        user_uuid="user",
+        payload={},
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._last_outbound_event_epoch = 55
+
+    with (
+        mock.patch.object(
+            worker,
+            "_get_current_workspace_event_epoch",
+            return_value=80,
+        ),
+        mock.patch.object(
+            worker,
+            "_get_new_outbound_events",
+            return_value=[event],
+        ),
+        mock.patch.object(
+            worker,
+            "_save_outbound_discovery_cursor_epoch",
+        ) as save_cursor,
+    ):
+        worker._discover_zulip_outbound_events()
+
+    save_cursor.assert_called_once_with(80)
+
+
+def test_next_outbound_discovery_cursor_epoch_stops_at_full_batch_tail():
+    events = [
+        types.SimpleNamespace(epoch_version=56),
+        types.SimpleNamespace(epoch_version=57),
+    ]
+
+    assert (
+        agents.WorkspaceIntegrationBridgeWorker
+        ._next_outbound_discovery_cursor_epoch(
+            events=events,
+            high_water_epoch=80,
+            batch_limit=2,
+        )
+    ) == 57
+    assert (
+        agents.WorkspaceIntegrationBridgeWorker
+        ._next_outbound_discovery_cursor_epoch(
+            events=events[:1],
+            high_water_epoch=80,
+            batch_limit=2,
+        )
+    ) == 80
 
 
 def test_dispatch_zulip_outbound_state_uses_author_worker_queue():

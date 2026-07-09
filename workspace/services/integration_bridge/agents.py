@@ -47,6 +47,7 @@ EXTERNAL_ACCOUNT_ACCESS_CHECK_INTERVAL = datetime.timedelta(minutes=5)
 DEFAULT_SYNC_QUEUE_BATCH_LIMIT = 100
 DEFAULT_HISTORY_SYNC_TASK_BATCH_LIMIT = 1
 DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT = 100
+ZULIP_OUTBOUND_DISCOVERY_CURSOR = "zulip_outbound_discovery"
 ZULIP_HISTORY_SYNC_TASK_CHUNK_SIZE = 100
 ZULIP_HISTORY_SYNC_RETRY_CHUNK_SIZE = 10
 NO_VALUE = object()
@@ -91,6 +92,7 @@ SELECT
     e.action
 FROM m_workspace_events AS e
 WHERE e.epoch_version > %s
+  AND e.epoch_version <= %s
   AND (
       (
           e.object_type = 'message'
@@ -171,6 +173,33 @@ WHERE e.epoch_version > %s
   )
 ORDER BY e.epoch_version ASC
 LIMIT %s
+"""
+OUTBOUND_HIGH_WATER_QUERY = """
+SELECT COALESCE(MAX(epoch_version), 0) AS epoch_version
+FROM m_workspace_events
+"""
+OUTBOUND_CURSOR_QUERY = """
+SELECT epoch_version
+FROM m_integration_bridge_event_cursors
+WHERE name = %s
+"""
+OUTBOUND_CURSOR_UPSERT_QUERY = """
+INSERT INTO m_integration_bridge_event_cursors (
+    uuid,
+    name,
+    epoch_version,
+    created_at,
+    updated_at
+)
+VALUES (%s, %s, %s, NOW(), NOW())
+ON CONFLICT (name) DO UPDATE
+SET
+    epoch_version = GREATEST(
+        m_integration_bridge_event_cursors.epoch_version,
+        EXCLUDED.epoch_version
+    ),
+    updated_at = NOW()
+RETURNING epoch_version
 """
 ZULIP_STREAM_NOTIFICATION_MODE_SUBSCRIPTION_CHANGES = {
     models.WorkspaceStreamNotificationMode.MUTED.value: (
@@ -2220,7 +2249,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         self._queue_recreate_worker_keys = set()
         self._stream_sync_event_owners = set()
         self._cache = WorkspaceIntegrationBridgeCache()
-        self._last_outbound_event_epoch = 0
+        self._last_outbound_event_epoch = None
         self._stopping = False
 
     def stop(self):
@@ -3100,11 +3129,56 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             for column in OUTBOUND_EVENT_COLUMNS
         })
 
-    def _get_new_outbound_events(self):
+    def _get_current_workspace_event_epoch(self):
+        result = contexts.Context().get_session().execute(
+            OUTBOUND_HIGH_WATER_QUERY,
+            (),
+        )
+        row = result.fetchone()
+        return row["epoch_version"] if row is not None else 0
+
+    def _get_outbound_discovery_cursor_epoch(self):
+        if self._last_outbound_event_epoch is not None:
+            return self._last_outbound_event_epoch
+        result = contexts.Context().get_session().execute(
+            OUTBOUND_CURSOR_QUERY,
+            (ZULIP_OUTBOUND_DISCOVERY_CURSOR,),
+        )
+        row = result.fetchone()
+        self._last_outbound_event_epoch = (
+            row["epoch_version"] if row is not None else 0
+        )
+        return self._last_outbound_event_epoch
+
+    def _save_outbound_discovery_cursor_epoch(self, epoch_version):
+        result = contexts.Context().get_session().execute(
+            OUTBOUND_CURSOR_UPSERT_QUERY,
+            (
+                sys_uuid.uuid4(),
+                ZULIP_OUTBOUND_DISCOVERY_CURSOR,
+                epoch_version,
+            ),
+        )
+        row = result.fetchone()
+        self._last_outbound_event_epoch = row["epoch_version"]
+        return self._last_outbound_event_epoch
+
+    @staticmethod
+    def _next_outbound_discovery_cursor_epoch(
+        events,
+        high_water_epoch,
+        batch_limit,
+    ):
+        if len(events) < batch_limit:
+            return high_water_epoch
+        return events[-1].epoch_version
+
+    def _get_new_outbound_events(self, high_water_epoch):
         result = contexts.Context().get_session().execute(
             OUTBOUND_EVENTS_QUERY,
             (
-                self._last_outbound_event_epoch,
+                self._get_outbound_discovery_cursor_epoch(),
+                high_water_epoch,
                 DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT,
             ),
         )
@@ -3114,10 +3188,13 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         ]
 
     def _discover_zulip_outbound_events(self):
-        events = self._get_new_outbound_events()
+        current_epoch = self._get_outbound_discovery_cursor_epoch()
+        high_water_epoch = self._get_current_workspace_event_epoch()
+        if high_water_epoch <= current_epoch:
+            return
+
+        events = self._get_new_outbound_events(high_water_epoch)
         for event in events:
-            if event.epoch_version > self._last_outbound_event_epoch:
-                self._last_outbound_event_epoch = event.epoch_version
             if not self._is_zulip_outbound_event(event):
                 continue
             if self._get_outbound_event_state(event.epoch_version) is not None:
@@ -3134,6 +3211,12 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                 event=event,
                 external_account=external_account,
             )
+        next_epoch = self._next_outbound_discovery_cursor_epoch(
+            events=events,
+            high_water_epoch=high_water_epoch,
+            batch_limit=DEFAULT_OUTBOUND_EVENTS_BATCH_LIMIT,
+        )
+        self._save_outbound_discovery_cursor_epoch(next_epoch)
 
     def _get_workspace_message(self, event):
         return models.WorkspaceMessage.objects.get_one_or_none(
