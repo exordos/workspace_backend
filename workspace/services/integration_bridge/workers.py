@@ -56,6 +56,10 @@ WORKSPACE_FILE_URN_TYPES = {
     "image",
     "video",
 }
+ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS = {
+    "read": "read",
+    "starred": "starred",
+}
 
 
 class PrioritizedSyncResponse:
@@ -283,16 +287,25 @@ class AddMessage:
             return []
         return self.message["flags"]
 
+    def _get_message_flags_info(self):
+        flags = self._get_flags()
+        return {
+            field_name: flag_name in flags
+            for flag_name, field_name in (
+                ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS.items()
+            )
+        }
+
     def _get_message_info(self):
         timestamp = self._get_timestamp()
         message_info = {
             "message_id": self.message["id"],
             "sender_id": self.message["sender_id"],
             "content": self.message["content"],
-            "read": "read" in self._get_flags(),
             "created_at": timestamp,
             "updated_at": timestamp,
         }
+        message_info.update(self._get_message_flags_info())
         if "sender_email" in self.message:
             message_info["sender_email"] = self.message["sender_email"]
         if "sender_full_name" in self.message:
@@ -400,6 +413,40 @@ class DeleteMessage:
         return cache.delete_messages(
             external_account=self.external_account,
             message_ids=self.message_ids,
+        )
+
+
+class UpdateMessageFlags:
+    priority = SYNC_RESPONSE_PRIORITY_MESSAGE
+
+    def __init__(self, external_account, event):
+        self.external_account = external_account
+        self.event_owner = get_event_owner(external_account)
+        self.event = event
+        self.event_id = event["id"]
+        self.message_ids = event["messages"]
+
+    @property
+    def last_message_id(self):
+        if not self.message_ids:
+            return 0
+        return max(self.message_ids)
+
+    def _get_values(self):
+        field_name = ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS.get(
+            self.event["flag"],
+        )
+        if field_name is None:
+            return {}
+        return {
+            field_name: self.event["op"] == "add",
+        }
+
+    def execute(self, cache):
+        return cache.update_message_flags(
+            external_account=self.external_account,
+            message_ids=self.message_ids,
+            values=self._get_values(),
         )
 
 
@@ -1489,6 +1536,18 @@ class ZulipBridgeWorker(threading.Thread):
         )
         return True
 
+    def _process_message_flags_update(self, event):
+        if event["op"] not in ("add", "remove"):
+            return False
+        put_sync_response(
+            self._output_queue,
+            UpdateMessageFlags(
+                external_account=self._external_account,
+                event=event,
+            ),
+        )
+        return True
+
     def _process_reaction(self, event):
         command_cls = {
             "add": AddMessageReaction,
@@ -1588,6 +1647,8 @@ class ZulipBridgeWorker(threading.Thread):
     def _get_event_message_ids(self, event):
         if event["type"] == "message":
             return [event["message"]["id"]]
+        if "messages" in event:
+            return event["messages"]
         if "message_ids" in event:
             return event["message_ids"]
         if "message_id" in event:
@@ -1603,6 +1664,8 @@ class ZulipBridgeWorker(threading.Thread):
             return self._process_message_update(event)
         if event_type == "delete_message":
             return self._process_message_delete(event)
+        if event_type == "update_message_flags":
+            return self._process_message_flags_update(event)
         if event_type == "reaction":
             return self._process_reaction(event)
         if event_type == "stream":

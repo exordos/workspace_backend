@@ -2208,6 +2208,62 @@ def read_workspace_user_message(project_id, user_uuid, message_uuid,
     return result
 
 
+def sync_workspace_user_message_flags(project_id, user_uuid, message_uuid,
+                                      values, session=None):
+    current_message = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+    )
+    flags = models.WorkspaceUserMessageFlags.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    changed_values = {}
+    for field_name, value in values.items():
+        if getattr(flags, field_name) != value:
+            changed_values[field_name] = value
+    if not changed_values:
+        return current_message
+
+    flags.update_dm(values=changed_values)
+    flags.update(session=session)
+
+    result = get_workspace_user_message(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        message_uuid=message_uuid,
+    )
+    create_updated_event = False
+    if "read" in changed_values:
+        if changed_values["read"]:
+            messenger_events.create_message_read_event(
+                message=result,
+                session=session,
+            )
+        else:
+            create_updated_event = True
+        _create_message_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=current_message.stream_uuid,
+            topic_uuid=current_message.topic_uuid,
+            session=session,
+        )
+    if any(field_name != "read" for field_name in changed_values):
+        create_updated_event = True
+    if create_updated_event:
+        messenger_events.create_message_updated_event(
+            message=result,
+            session=session,
+        )
+    return result
+
+
 def delete_workspace_user_message(project_id, user_uuid, message_uuid,
                                   session=None):
     get_workspace_user_message(

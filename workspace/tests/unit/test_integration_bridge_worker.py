@@ -2893,9 +2893,9 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
         mock.Mock(),
     ), mock.patch.object(
         agents.messenger_dm_helpers,
-        "read_workspace_user_message",
+        "sync_workspace_user_message_flags",
         mock.Mock(),
-    ) as read_message:
+    ) as sync_flags:
         result = cache.get_or_create_message(
             external_account=first_account,
             stream=stream,
@@ -2917,16 +2917,18 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
     assert cached_result is message
     get_or_create_message.assert_called_once()
     save_processed.assert_called_once()
-    assert read_message.call_args_list == [
+    assert sync_flags.call_args_list == [
         mock.call(
             project_id="project",
             user_uuid="first-user",
             message_uuid="message-uuid",
+            values={"read": True},
         ),
         mock.call(
             project_id="project",
             user_uuid="second-user",
             message_uuid="message-uuid",
+            values={"read": True},
         ),
     ]
 
@@ -2999,7 +3001,7 @@ def test_bridge_cache_creates_missing_message_sender_from_zulip_payload():
         mock.Mock(),
     ) as get_or_create_binding, mock.patch.object(
         agents.messenger_dm_helpers,
-        "read_workspace_user_message",
+        "sync_workspace_user_message_flags",
         mock.Mock(),
     ):
         result = cache.get_or_create_message(
@@ -3082,7 +3084,19 @@ def test_bridge_cache_preprocesses_existing_processed_message():
         types.SimpleNamespace(
             get_one_or_none=mock.Mock(return_value=message),
         ),
-    ) as user_messages:
+    ) as user_messages, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "sync_workspace_user_message_flags",
+        mock.Mock(),
+    ), mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(return_value=55),
+    ), mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ):
         with _patch_zulip_processed_entities(processed):
             result = cache.get_or_create_message(
                 external_account=external_account,
@@ -3152,6 +3166,18 @@ def test_bridge_cache_rebinds_stale_processed_message():
         agents.messenger_dm_helpers,
         "get_or_create_workspace_stream_binding",
         mock.Mock(),
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "sync_workspace_user_message_flags",
+        mock.Mock(),
+    ), mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(return_value=55),
+    ), mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
     ):
         with _patch_zulip_processed_entities(processed):
             result = cache.get_or_create_message(
@@ -3169,7 +3195,7 @@ def test_bridge_cache_rebinds_stale_processed_message():
     processed.update.assert_called_once_with()
 
 
-def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
+def test_bridge_cache_syncs_unread_zulip_message_flag():
     external_account = types.SimpleNamespace(
         project_id="project",
         user_uuid="reader-user",
@@ -3219,9 +3245,17 @@ def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
         mock.Mock(),
     ), mock.patch.object(
         agents.messenger_dm_helpers,
-        "read_workspace_user_message",
+        "sync_workspace_user_message_flags",
         mock.Mock(),
-    ) as read_message:
+    ) as sync_flags, mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(return_value=55),
+    ), mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ):
         cache.get_or_create_message(
             external_account=external_account,
             stream=stream,
@@ -3231,7 +3265,132 @@ def test_bridge_cache_does_not_sync_unread_zulip_message_as_unread():
             message_info=message_info,
         )
 
-    read_message.assert_not_called()
+    sync_flags.assert_called_once_with(
+        project_id="project",
+        user_uuid="reader-user",
+        message_uuid="message-uuid",
+        values={"read": False},
+    )
+
+
+def test_bridge_cache_updates_zulip_read_flag_from_realtime_event():
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="reader-user",
+        server_url="https://zulip.example.com",
+    )
+    message = types.SimpleNamespace(uuid="message-uuid")
+    updated_message = types.SimpleNamespace(uuid="message-uuid", read=True)
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_zulip_workspace_message",
+        mock.Mock(return_value=message),
+    ) as get_message, mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(),
+    ) as get_last_epoch, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "sync_workspace_user_message_flags",
+        mock.Mock(return_value=updated_message),
+    ) as sync_flags, mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ) as mark_skipped:
+        result = cache.update_message_flags(
+            external_account=external_account,
+            message_ids=[104],
+            values={"read": True},
+        )
+
+    assert result == [updated_message]
+    get_message.assert_called_once_with(
+        external_account=external_account,
+        message_id=104,
+    )
+    sync_flags.assert_called_once_with(
+        project_id="project",
+        user_uuid="reader-user",
+        message_uuid="message-uuid",
+        values={"read": True},
+    )
+    get_last_epoch.assert_not_called()
+    mark_skipped.assert_not_called()
+
+
+def test_bridge_cache_marks_unread_and_starred_realtime_flags_as_inbound():
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="reader-user",
+        server_url="https://zulip.example.com",
+    )
+    first_message = types.SimpleNamespace(uuid="first-message-uuid")
+    second_message = types.SimpleNamespace(uuid="second-message-uuid")
+    first_result = types.SimpleNamespace(uuid="first-message-uuid")
+    second_result = types.SimpleNamespace(uuid="second-message-uuid")
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with mock.patch.object(
+        cache,
+        "_get_zulip_workspace_message",
+        mock.Mock(side_effect=[first_message, second_message]),
+    ), mock.patch.object(
+        cache,
+        "_get_last_workspace_event_epoch",
+        mock.Mock(side_effect=[55, 57]),
+    ) as get_last_epoch, mock.patch.object(
+        agents.messenger_dm_helpers,
+        "sync_workspace_user_message_flags",
+        mock.Mock(side_effect=[first_result, second_result]),
+    ) as sync_flags, mock.patch.object(
+        cache,
+        "_mark_inbound_zulip_events_skipped",
+        mock.Mock(),
+    ) as mark_skipped:
+        result = cache.update_message_flags(
+            external_account=external_account,
+            message_ids=[104, 105],
+            values={"read": False, "starred": True},
+        )
+
+    assert result == [first_result, second_result]
+    assert get_last_epoch.call_args_list == [
+        mock.call("project"),
+        mock.call("project"),
+    ]
+    assert sync_flags.call_args_list == [
+        mock.call(
+            project_id="project",
+            user_uuid="reader-user",
+            message_uuid="first-message-uuid",
+            values={"read": False, "starred": True},
+        ),
+        mock.call(
+            project_id="project",
+            user_uuid="reader-user",
+            message_uuid="second-message-uuid",
+            values={"read": False, "starred": True},
+        ),
+    ]
+    assert mark_skipped.call_args_list == [
+        mock.call(
+            external_account=external_account,
+            object_type="message",
+            action="updated",
+            payload_uuid="first-message-uuid",
+            after_epoch=55,
+        ),
+        mock.call(
+            external_account=external_account,
+            object_type="message",
+            action="updated",
+            payload_uuid="second-message-uuid",
+            after_epoch=57,
+        ),
+    ]
 
 
 def test_bridge_worker_requeues_retryable_commands():

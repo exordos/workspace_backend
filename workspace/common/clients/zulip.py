@@ -33,10 +33,11 @@ MESSAGE_EVENT_TYPES = [
     "reaction",
     "update_message",
     "delete_message",
+    "update_message_flags",
     "stream",
     "subscription",
 ]
-MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 4
+MESSAGE_EVENT_QUEUE_SUBSCRIPTION_VERSION = 5
 MESSAGE_EVENT_REGISTER_TIMEOUT = 30
 MESSAGE_EVENT_LONGPOLL_TIMEOUT = 10
 MESSAGE_FETCH_TIMEOUT = 30

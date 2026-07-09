@@ -409,7 +409,8 @@ def test_zulip_client_registers_message_event_queue_with_update_and_delete():
         data={
             "event_types": (
                 '["message", "reaction", "update_message", '
-                '"delete_message", "stream", "subscription"]'
+                '"delete_message", "update_message_flags", '
+                '"stream", "subscription"]'
             ),
             "apply_markdown": "false",
             "client_capabilities": (
@@ -463,7 +464,8 @@ def test_zulip_client_registers_all_events_when_filtered_queue_fails():
             data={
                 "event_types": (
                     '["message", "reaction", "update_message", '
-                    '"delete_message", "stream", "subscription"]'
+                    '"delete_message", "update_message_flags", '
+                    '"stream", "subscription"]'
                 ),
                 "apply_markdown": "false",
                 "client_capabilities": (

@@ -1531,7 +1531,7 @@ class WorkspaceIntegrationBridgeCache:
             )
         else:
             message_info = raw_message_info
-        self._sync_message_read_flag(
+        self._sync_message_flags(
             external_account=external_account,
             message=message,
             message_info=message_info,
@@ -1710,6 +1710,84 @@ class WorkspaceIntegrationBridgeCache:
             after_epoch=before_epoch,
         )
         return result
+
+    def _get_message_flag_values(self, message_info):
+        values = {}
+        for field_name in workers.ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS.values():
+            if field_name in message_info:
+                values[field_name] = message_info[field_name]
+        return values
+
+    def _should_mark_message_flags_updated(self, values):
+        return (
+            values.get("read") is False or
+            any(field_name != "read" for field_name in values)
+        )
+
+    def _sync_message_flags(
+        self,
+        external_account,
+        message,
+        message_info,
+    ):
+        values = self._get_message_flag_values(message_info)
+        if not values:
+            return None
+        mark_updated = self._should_mark_message_flags_updated(values)
+        before_epoch = 0
+        if mark_updated:
+            before_epoch = self._get_last_workspace_event_epoch(
+                external_account.project_id,
+            )
+        result = messenger_dm_helpers.sync_workspace_user_message_flags(
+            project_id=external_account.project_id,
+            user_uuid=external_account.user_uuid,
+            message_uuid=message.uuid,
+            values=values,
+        )
+        if mark_updated:
+            self._mark_inbound_zulip_events_skipped(
+                external_account=external_account,
+                object_type="message",
+                action="updated",
+                payload_uuid=message.uuid,
+                after_epoch=before_epoch,
+            )
+        return result
+
+    def update_message_flags(self, external_account, message_ids, values):
+        if not values:
+            return []
+        mark_updated = self._should_mark_message_flags_updated(values)
+        results = []
+        for message_id in message_ids:
+            message = self._get_zulip_workspace_message(
+                external_account=external_account,
+                message_id=message_id,
+            )
+            if message is None:
+                continue
+            before_epoch = 0
+            if mark_updated:
+                before_epoch = self._get_last_workspace_event_epoch(
+                    external_account.project_id,
+                )
+            result = messenger_dm_helpers.sync_workspace_user_message_flags(
+                project_id=external_account.project_id,
+                user_uuid=external_account.user_uuid,
+                message_uuid=message.uuid,
+                values=values,
+            )
+            if mark_updated:
+                self._mark_inbound_zulip_events_skipped(
+                    external_account=external_account,
+                    object_type="message",
+                    action="updated",
+                    payload_uuid=message.uuid,
+                    after_epoch=before_epoch,
+                )
+            results.append(result)
+        return results
 
     def delete_messages(self, external_account, message_ids):
         results = []
@@ -1956,21 +2034,6 @@ class WorkspaceIntegrationBridgeCache:
             after_epoch=before_epoch,
         )
         return reaction
-
-    def _sync_message_read_flag(
-        self,
-        external_account,
-        message,
-        message_info,
-    ):
-        if not message_info["read"]:
-            return
-        messenger_dm_helpers.read_workspace_user_message(
-            project_id=external_account.project_id,
-            user_uuid=external_account.user_uuid,
-            message_uuid=message.uuid,
-        )
-
 
 class WorkspaceIntegrationBridgeWorker(basic.BasicService):
     def __init__(
@@ -3191,6 +3254,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
             workers.AddMessage,
             workers.UpdateMessage,
             workers.DeleteMessage,
+            workers.UpdateMessageFlags,
             workers.AddMessageReaction,
             workers.RemoveMessageReaction,
         )

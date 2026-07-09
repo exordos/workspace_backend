@@ -922,6 +922,103 @@ def test_zulip_bridge_worker_syncs_single_message_delete_event():
     assert command.message_ids == [104]
 
 
+def test_zulip_bridge_worker_syncs_message_flags_update_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 46,
+                    "type": "update_message_flags",
+                    "op": "remove",
+                    "operation": "remove",
+                    "flag": "read",
+                    "messages": [104, 106],
+                    "all": False,
+                    "message_details": {
+                        "104": {
+                            "type": "stream",
+                            "stream_id": 3,
+                            "topic": "deploys",
+                        },
+                    },
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=45,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 46
+    assert last_message_id == 106
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.UpdateMessageFlags)
+    assert command.event_id == 46
+    assert command.last_message_id == 106
+    assert command.message_ids == [104, 106]
+    cache = types.SimpleNamespace(update_message_flags=mock.Mock())
+    command.execute(cache)
+    cache.update_message_flags.assert_called_once_with(
+        external_account=worker.external_account,
+        message_ids=[104, 106],
+        values={"read": False},
+    )
+
+
+def test_zulip_bridge_worker_syncs_starred_message_flag_update_event():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 46,
+                    "type": "update_message_flags",
+                    "op": "add",
+                    "operation": "add",
+                    "flag": "starred",
+                    "messages": [104],
+                    "all": False,
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=45,
+        last_message_id=103,
+    )
+
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    cache = types.SimpleNamespace(update_message_flags=mock.Mock())
+    command.execute(cache)
+    cache.update_message_flags.assert_called_once_with(
+        external_account=worker.external_account,
+        message_ids=[104],
+        values={"starred": True},
+    )
+
+
 def test_zulip_bridge_worker_syncs_reaction_add_event():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.event_calls = []
@@ -2109,6 +2206,7 @@ def test_add_message_executes_with_cache():
                 "sender_id": 24,
                 "content": "hello",
                 "read": True,
+                "starred": False,
                 "created_at": datetime.datetime.fromtimestamp(
                     1770998098,
                     tz=datetime.timezone.utc,
@@ -2515,6 +2613,7 @@ def test_add_private_message_executes_with_cache():
                 "sender_id": 8,
                 "content": "hello private",
                 "read": False,
+                "starred": False,
                 "created_at": datetime.datetime.fromtimestamp(
                     1772202531,
                     tz=datetime.timezone.utc,

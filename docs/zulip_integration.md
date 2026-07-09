@@ -131,9 +131,10 @@ On every iteration, the main agent runs `_start_bridges()`:
    in the database).
 
 The queue subscription requests message, reaction, message update/delete,
-stream, and subscription events. It declares the Zulip `archived_channels`
-client capability so channel archiving is delivered as a stream state update
-instead of a stream deletion event when the server supports that behavior.
+message flag, stream, and subscription events. It declares the Zulip
+`archived_channels` client capability so channel archiving is delivered as a
+stream state update instead of a stream deletion event when the server supports
+that behavior.
 
 #### Implementation backlog: Zulip event coverage
 
@@ -141,10 +142,6 @@ The bridge currently focuses on events that directly affect Workspace messages,
 streams, and stream membership. The following Zulip event work is still
 outstanding:
 
-- `update_message_flags`: synchronize realtime read/unread and other message
-  flag changes after a message has already been imported. History import reads
-  flags from message payloads, but queue-based read/unread changes must be
-  handled from this event type.
 - `subscription` with `op = update`: apply per-user subscription settings where
   Workspace has an equivalent model, for example mute/home-view/notification
   state. The event is routed by the worker today, but the command is still a
@@ -430,9 +427,10 @@ Zulip, not just text:
 - **files**: attachments are downloaded from Zulip, saved to Workspace storage,
   and links in content are replaced with Workspace URNs (`urn:images:<uuid>` and
   equivalents);
-- **flags**: including `read` and other flags from the event/message payload.
-  The existing Workspace flags mechanism is used for read/unread, with flags
-  created separately for each user;
+- **flags**: including `read` and supported per-user flags such as `starred`
+  from the event/message payload. The existing Workspace flags mechanism is used
+  for read/unread and other mapped flags, with flags created separately for each
+  user;
 - **reactions**: add and remove;
 - **deletion**: if a message is marked deleted in Zulip, the corresponding
   Workspace message is physically deleted.
