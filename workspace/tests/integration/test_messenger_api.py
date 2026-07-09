@@ -2347,6 +2347,242 @@ def test_epoch_is_zero_without_visible_events(api):
     assert resp.json() == {"epoch_version": 0}
 
 
+def test_external_folder_and_binding_events_follow_stream_visibility(api, db):
+    conftest.seed_workspace_user(
+        db,
+        api.user_uuid,
+        f"user-{api.user_uuid}",
+    )
+    stream_uuid = sys_uuid.uuid4()
+    server_url = "https://zulip-hidden.example.test"
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+            """,
+            (api.project_id, api.user_uuid),
+        )
+        before_epoch = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            INSERT INTO m_workspace_streams
+                (uuid, name, description, source_name, source,
+                 user_uuid, project_id, created_at, updated_at)
+            VALUES (
+                %s,
+                'hidden-zulip',
+                'hidden',
+                'zulip',
+                jsonb_build_object(
+                    'kind', 'zulip',
+                    'server_url', %s::text,
+                    'stream_id', 42
+                ),
+                %s,
+                %s,
+                NOW(),
+                NOW()
+            )
+            """,
+            (
+                str(stream_uuid),
+                server_url,
+                api.user_uuid,
+                api.project_id,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings
+                (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                 created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, 'member', NOW(), NOW())
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                str(stream_uuid),
+                api.user_uuid,
+                api.user_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_events
+                (uuid, project_id, user_uuid, schema_version, object_type,
+                 action, payload, created_at, updated_at)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                1,
+                'folder',
+                'updated',
+                jsonb_build_object(
+                    'kind', 'folder.updated',
+                    'uuid', '00000000-0000-0000-0000-000000000000',
+                    'title', 'All chats',
+                    'system_type', 'all',
+                    'unread_count', 7,
+                    'folder_items', jsonb_build_array(jsonb_build_object(
+                        'uuid', %s::text,
+                        'folder', '00000000-0000-0000-0000-000000000000',
+                        'project_id', %s::text,
+                        'user_uuid', %s::text,
+                        'stream_uuid', %s::text,
+                        'chat_type', 'stream',
+                        'unread_count', 7
+                    )),
+                    'created_at', '2026-07-10T00:00:00.000000Z',
+                    'updated_at', '2026-07-10T00:00:00.000000Z'
+                ),
+                NOW(),
+                NOW()
+            )
+            RETURNING epoch_version
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                api.user_uuid,
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                api.user_uuid,
+                str(stream_uuid),
+            ),
+        )
+        folder_epoch = cur.fetchone()[0]
+        cur.execute(
+            """
+            INSERT INTO m_workspace_events
+                (uuid, project_id, user_uuid, schema_version, object_type,
+                 action, payload, created_at, updated_at)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                1,
+                'stream_binding',
+                'created',
+                jsonb_build_object(
+                    'kind', 'stream_bindings.created',
+                    'uuid', %s::text,
+                    'items', jsonb_build_array(jsonb_build_object(
+                        'uuid', %s::text,
+                        'project_id', %s::text,
+                        'user_uuid', %s::text,
+                        'stream_uuid', %s::text,
+                        'who_uuid', %s::text,
+                        'role', 'member',
+                        'notification_mode', 'all_messages'
+                    ))
+                ),
+                NOW(),
+                NOW()
+            )
+            RETURNING epoch_version
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                api.user_uuid,
+                str(stream_uuid),
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                api.user_uuid,
+                str(stream_uuid),
+                api.user_uuid,
+            ),
+        )
+        binding_epoch = cur.fetchone()[0]
+
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_visible_events
+            WHERE epoch_version IN (%s, %s)
+            """,
+            (folder_epoch, binding_epoch),
+        )
+        assert cur.fetchone()[0] == 0
+
+    resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version>", before_epoch),
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == []
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts
+                (uuid, project_id, user_uuid, server_url, account_type,
+                 status, account_settings, source_scope, access_status,
+                 access_checked_at, access_confirmed_at, created_at,
+                 updated_at)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                'zulip',
+                'active',
+                jsonb_build_object(
+                    'kind', 'zulip',
+                    'credentials', jsonb_build_object(
+                        'kind', 'zulip',
+                        'email', 'agent@example.test',
+                        'api_key', 'token'
+                    )
+                ),
+                %s,
+                'confirmed',
+                NOW(),
+                NOW(),
+                NOW(),
+                NOW()
+            )
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                api.user_uuid,
+                server_url,
+                server_url,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_visible_events
+            WHERE epoch_version IN (%s, %s)
+            """,
+            (folder_epoch, binding_epoch),
+        )
+        assert cur.fetchone()[0] == 2
+
+    resp = api.get(
+        EVENTS,
+        params=[
+            ("page_limit", 100),
+            ("epoch_version>", before_epoch),
+        ],
+    )
+    assert resp.status_code == 200, resp.text
+    assert [
+        event["epoch_version"]
+        for event in resp.json()
+    ] == [folder_epoch, binding_epoch]
+
+
 def test_message_create_writes_flags_and_visible_events(api, db):
     other_user = sys_uuid.uuid4()
     outsider = sys_uuid.uuid4()

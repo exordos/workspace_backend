@@ -540,6 +540,13 @@ delivery only expose non-native source rows when there is a matching
 scope is the normalized `server_url`; future providers can map their own source
 scope into the same gate.
 
+Folder and stream-binding event replay also follows the same stream visibility
+gate. Historical folder snapshots that contain only hidden external streams are
+not delivered while the account is unconfirmed, so hidden external unread flags
+behave as read from the UI perspective without rewriting stored flags. Once the
+external account is confirmed, the same stream/message state becomes visible and
+the provider sync can refresh read/unread status normally.
+
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | Stream identifier. |

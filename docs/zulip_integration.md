@@ -158,6 +158,13 @@ not confirmed their own Zulip credentials. Storage and visibility are separate:
 - for Zulip, `source_scope` is the external account `server_url` and matches the
   source payload's `server_url`.
 
+Hidden Zulip unread flags are not rewritten. While a user has no confirmed
+Zulip external account, hidden Zulip messages and historical folder or
+stream-binding events do not contribute to the UI, so they behave as read from
+the user's perspective. After the account is confirmed, the imported messages
+and their read/unread status become visible again and the bridge continues
+syncing message state from Zulip.
+
 This is the generic external-source visibility model. Future providers should
 write source payloads with a stable provider scope and external account rows
 with the same `account_type` and `source_scope`.
