@@ -884,9 +884,12 @@ class WorkspaceIntegrationBridgeCache:
         )
         return direct_user_uuids[0]
 
-    def _bind_stream_user(self, external_account, stream, user_uuid):
+    def _get_stream_binding_role(self, stream, user_uuid):
         if user_uuid == stream.user_uuid:
-            return
+            return models.WorkspaceStreamRole.OWNER.value
+        return models.WorkspaceStreamRole.MEMBER.value
+
+    def _bind_stream_user(self, external_account, stream, user_uuid):
         cache_key = (
             external_account.project_id,
             stream.uuid,
@@ -900,7 +903,10 @@ class WorkspaceIntegrationBridgeCache:
             stream_uuid=stream.uuid,
             user_uuid=user_uuid,
             who_uuid=stream.user_uuid,
-            role=models.WorkspaceStreamRole.MEMBER.value,
+            role=self._get_stream_binding_role(
+                stream=stream,
+                user_uuid=user_uuid,
+            ),
         )
 
     def _bind_stream_users(
@@ -913,10 +919,8 @@ class WorkspaceIntegrationBridgeCache:
             external_account=external_account,
             user_ids=subscriber_ids,
         )
-        new_user_uuids = []
+        role_user_uuids = {}
         for user_uuid in user_uuids:
-            if user_uuid == stream.user_uuid:
-                continue
             cache_key = (
                 external_account.project_id,
                 stream.uuid,
@@ -925,16 +929,18 @@ class WorkspaceIntegrationBridgeCache:
             if cache_key in self._stream_bindings:
                 continue
             self._stream_bindings.add(cache_key)
-            new_user_uuids.append(user_uuid)
-        if not new_user_uuids:
+            role = self._get_stream_binding_role(
+                stream=stream,
+                user_uuid=user_uuid,
+            )
+            role_user_uuids.setdefault(role, []).append(user_uuid)
+        if not role_user_uuids:
             return
         messenger_dm_helpers.get_or_create_workspace_stream_bindings(
             project_id=external_account.project_id,
             stream_uuid=stream.uuid,
             who_uuid=stream.user_uuid,
-            role_user_uuids={
-                models.WorkspaceStreamRole.MEMBER.value: new_user_uuids,
-            },
+            role_user_uuids=role_user_uuids,
         )
 
     def _create_stream(self, external_account, stream_info):

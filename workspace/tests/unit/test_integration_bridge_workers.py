@@ -1200,6 +1200,57 @@ def test_zulip_bridge_worker_syncs_subscription_add_event():
     assert stream_info["subscriber_ids"] == [10, 24]
 
 
+def test_zulip_bridge_worker_syncs_subscription_add_event_without_subscribers():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.event_calls = []
+    FakeZulipClient.event_pages = [
+        {
+            "events": [
+                {
+                    "id": 51,
+                    "type": "subscription",
+                    "op": "add",
+                    "subscriptions": [
+                        {
+                            "stream_id": 3,
+                            "name": "general",
+                            "description": "General stream",
+                            "creator_id": 24,
+                            "date_created": 1776940760,
+                            "invite_only": False,
+                            "is_archived": False,
+                            "is_announcement_only": False,
+                        },
+                    ],
+                },
+            ],
+        },
+    ]
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    last_event_id, last_message_id = worker._sync_message_events(
+        queue_id="queue-1",
+        last_event_id=50,
+        last_message_id=103,
+    )
+
+    assert last_event_id == 51
+    assert last_message_id == 103
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.AddSubscription)
+    cache = types.SimpleNamespace(get_or_create_stream=mock.Mock())
+    command.execute(cache)
+    stream_info = cache.get_or_create_stream.call_args.kwargs["stream_info"]
+    assert stream_info["stream_id"] == 3
+    assert stream_info["subscriber_ids"] == [10]
+
+
 def test_zulip_bridge_worker_syncs_subscription_peer_events():
     output_queue = queue.PriorityQueue()
     FakeZulipClient.event_calls = []

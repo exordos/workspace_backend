@@ -603,6 +603,17 @@ class AddSubscription:
         self.event = event
         self.event_id = event["id"]
 
+    def _get_subscriber_ids(self, subscription):
+        subscriber_ids = [
+            self.external_account.account_settings.user_info.user_id,
+        ]
+        if "subscribers" not in subscription:
+            return subscriber_ids
+        for user_id in subscription["subscribers"]:
+            if user_id not in subscriber_ids:
+                subscriber_ids.append(user_id)
+        return subscriber_ids
+
     def execute(self, cache):
         streams = []
         for subscription in self.event["subscriptions"]:
@@ -612,6 +623,9 @@ class AddSubscription:
                     stream_info=AddStream(
                         external_account=self.external_account,
                         stream=subscription,
+                        subscriber_ids=self._get_subscriber_ids(
+                            subscription,
+                        ),
                     )._get_stream_info(),
                 ),
             )

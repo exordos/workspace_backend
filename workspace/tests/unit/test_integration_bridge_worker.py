@@ -1874,6 +1874,9 @@ def test_bridge_cache_binds_existing_stream_users_once():
         stream_uuid="stream-uuid",
         who_uuid="creator-user",
         role_user_uuids={
+            "owner": [
+                "creator-user",
+            ],
             "member": [
                 "member-user",
             ],
@@ -1966,6 +1969,9 @@ def test_bridge_cache_binds_seen_stream_when_later_payload_has_subscribers():
         stream_uuid="stream-uuid",
         who_uuid="creator-user",
         role_user_uuids={
+            "owner": [
+                "creator-user",
+            ],
             "member": [
                 "member-user",
             ],
@@ -2067,6 +2073,9 @@ def test_bridge_cache_does_not_update_stream_metadata_from_message_payload():
         stream_uuid="stream-uuid",
         who_uuid="creator-user",
         role_user_uuids={
+            "owner": [
+                "creator-user",
+            ],
             "member": [
                 "member-user",
             ],
@@ -2195,6 +2204,73 @@ def test_bridge_cache_adds_stream_binding_from_peer_subscription():
         user_uuid="member-user",
         who_uuid="creator-user",
         role="member",
+    )
+
+
+def test_bridge_cache_restores_owner_stream_binding_from_subscription():
+    existing_stream = types.SimpleNamespace(
+        uuid="stream-uuid",
+        user_uuid="creator-user",
+        private=False,
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+        ),
+    )
+    external_account = types.SimpleNamespace(
+        uuid="account-uuid",
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    creator_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="creator-user",
+        server_url="https://zulip.example.com",
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(user_id=24),
+        ),
+    )
+
+    class FakeWorkspaceStream:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[existing_stream]),
+        )
+
+    class FakeExternalAccount:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(return_value=[creator_account]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with _patch_zulip_processed_entities():
+        with mock.patch.object(
+            agents.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with mock.patch.object(
+                agents.models,
+                "ExternalAccount",
+                FakeExternalAccount,
+            ):
+                with mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "get_or_create_workspace_stream_binding",
+                    mock.Mock(),
+                ) as get_or_create_binding:
+                    cache.add_stream_binding(
+                        external_account=external_account,
+                        stream_id=3,
+                        user_id=24,
+                    )
+
+    get_or_create_binding.assert_called_once_with(
+        project_id="project",
+        stream_uuid="stream-uuid",
+        user_uuid="creator-user",
+        who_uuid="creator-user",
+        role="owner",
     )
 
 
@@ -2378,6 +2454,9 @@ def test_bridge_cache_creates_missing_stream_once():
         stream_uuid="stream-uuid",
         who_uuid="creator-user",
         role_user_uuids={
+            "owner": [
+                "creator-user",
+            ],
             "member": [
                 "bridge-user",
                 "member-user",
@@ -2495,6 +2574,9 @@ def test_bridge_cache_creates_missing_private_stream_with_zulip_topic():
         stream_uuid="private-stream-uuid",
         who_uuid="gmelikov-user",
         role_user_uuids={
+            "owner": [
+                "gmelikov-user",
+            ],
             "member": [
                 "admin-user",
             ],
@@ -2629,6 +2711,9 @@ def test_bridge_cache_creates_missing_private_group_stream():
         stream_uuid="private-group-stream-uuid",
         who_uuid="admin-user",
         role_user_uuids={
+            "owner": [
+                "admin-user",
+            ],
             "member": [
                 "eugene-user",
                 "gmelikov-user",
