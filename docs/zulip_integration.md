@@ -135,6 +135,47 @@ stream, and subscription events. It declares the Zulip `archived_channels`
 client capability so channel archiving is delivered as a stream state update
 instead of a stream deletion event when the server supports that behavior.
 
+#### Implementation backlog: Zulip event coverage
+
+The bridge currently focuses on events that directly affect Workspace messages,
+streams, and stream membership. The following Zulip event work is still
+outstanding:
+
+- `update_message_flags`: synchronize realtime read/unread and other message
+  flag changes after a message has already been imported. History import reads
+  flags from message payloads, but queue-based read/unread changes must be
+  handled from this event type.
+- `subscription` with `op = update`: apply per-user subscription settings where
+  Workspace has an equivalent model, for example mute/home-view/notification
+  state. The event is routed by the worker today, but the command is still a
+  no-op.
+- `stream` with `op = update`: extend the property mapping when Workspace gains
+  fields for Zulip-only stream settings such as `topics_policy`,
+  `history_public_to_subscribers`, `is_web_public`, message retention, and
+  permission group related properties. The current mapping only covers stream
+  name, description, invite-only state, archive state, and announcement-only
+  policy.
+- `realm_user` and `realm_bot`: consume realtime user and bot
+  create/update/deactivate events instead of relying only on periodic user sync.
+- `presence`, `typing`, `typing_edit_message`, and `user_status`: map realtime
+  status and typing information if Workspace needs Zulip-originated presence or
+  typing indicators.
+- `realm_emoji`: synchronize custom emoji metadata so imported Zulip reactions
+  can display custom emoji consistently.
+- `attachment` and `submessage`: handle attachment lifecycle changes and Zulip
+  interactive submessages separately from message content import if Workspace
+  starts exposing those concepts.
+- `user_topic`, `muted_topics`, `muted_users`, and `alert_words`: map personal
+  mute, topic, and alert preferences where Workspace has matching settings.
+- `channel_folder`: map Zulip channel folders if Workspace adds a corresponding
+  channel grouping feature.
+- Organization/admin configuration events such as `realm`, `realm_domains`,
+  `realm_linkifiers`, `custom_profile_fields`, `default_streams`,
+  `default_stream_groups`, `user_group`, `saved_snippets`, `scheduled_messages`,
+  `reminders`, `navigation_view`, and device/push events are not required for
+  the first bridge version unless a concrete Workspace feature starts depending
+  on them.
+
 The agent must be able to stop any `ZulipBridgeWorker` at any time through
 `worker.stop()`. The worker sets `_stopped` and exits synchronization loops.
 After `worker.stop()` is called, the worker must finish within **10 seconds**.
