@@ -1982,6 +1982,55 @@ def test_save_zulip_processed_message_casts_message_uuid():
     assert processed.entity_id == "12345"
 
 
+def test_update_sent_zulip_message_source_uses_event_helper():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    project_id = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    message = types.SimpleNamespace(
+        source=types.SimpleNamespace(
+            stream_id=10,
+            server_url=None,
+            topic_name="general",
+        ),
+    )
+    command = types.SimpleNamespace(
+        external_account=types.SimpleNamespace(
+            project_id=project_id,
+            server_url="https://zulip.example.com",
+        ),
+        message_uuid=str(message_uuid),
+        zulip_message_id=12345,
+    )
+
+    class FakeWorkspaceMessage:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=message),
+        )
+
+    with mock.patch.object(
+        agents.models,
+        "WorkspaceMessage",
+        FakeWorkspaceMessage,
+    ), mock.patch.object(
+        agents.messenger_dm_helpers,
+        "update_workspace_message_source",
+    ) as update_source:
+        worker._update_sent_zulip_message_source(command)
+
+    filters = FakeWorkspaceMessage.objects.get_one_or_none.call_args.kwargs[
+        "filters"
+    ]
+    assert filters["uuid"].value == message_uuid
+    assert filters["project_id"].value == project_id
+    update_source.assert_called_once()
+    call_kwargs = update_source.call_args.kwargs
+    assert call_kwargs["message"] is message
+    assert call_kwargs["source"].stream_id == 10
+    assert call_kwargs["source"].server_url == "https://zulip.example.com"
+    assert call_kwargs["source"].topic_name == "general"
+    assert call_kwargs["source"].message_id == 12345
+
+
 def test_zulip_sent_result_error_marks_outbound_failed_without_retry():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     state = FakeOutboundState(status="processing", attempts=1)

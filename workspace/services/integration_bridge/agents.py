@@ -4014,20 +4014,18 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
         if message is None:
             return
         source = message.source
-        message.update_dm(
-            values={
-                "source": models.ZulipSource(
-                    stream_id=self._source_value(source, "stream_id"),
-                    server_url=(
-                        self._source_value(source, "server_url")
-                        or command.external_account.server_url
-                    ),
-                    topic_name=self._source_value(source, "topic_name"),
-                    message_id=command.zulip_message_id,
+        messenger_dm_helpers.update_workspace_message_source(
+            message=message,
+            source=models.ZulipSource(
+                stream_id=self._source_value(source, "stream_id"),
+                server_url=(
+                    self._source_value(source, "server_url")
+                    or command.external_account.server_url
                 ),
-            },
+                topic_name=self._source_value(source, "topic_name"),
+                message_id=command.zulip_message_id,
+            ),
         )
-        message.update()
 
     def _save_zulip_processed_message(self, command):
         message_uuid = self._uuid_value(command.message_uuid)

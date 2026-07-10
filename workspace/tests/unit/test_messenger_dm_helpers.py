@@ -2625,6 +2625,93 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_user_messages.assert_not_called()
         create_event.assert_not_called()
 
+    def test_update_workspace_message_source_sends_events(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+        old_source = dm_helpers.models.ZulipSource(
+            stream_id=10,
+            server_url="https://zulip.example.com",
+            topic_name="general",
+            message_id=None,
+        )
+        new_source = dm_helpers.models.ZulipSource(
+            stream_id=10,
+            server_url="https://zulip.example.com",
+            topic_name="general",
+            message_id=12345,
+        )
+        user_messages = [types.SimpleNamespace(), types.SimpleNamespace()]
+        updated_message = {}
+
+        class ExistingMessage:
+            def update_dm(self, values):
+                updated_message["values"] = values
+
+            def update(self, session=None):
+                updated_message["session"] = session
+
+        message = ExistingMessage()
+        message.uuid = message_uuid
+        message.project_id = project_id
+        message.source = old_source
+        with mock.patch.object(
+            dm_helpers,
+            "_get_workspace_user_messages",
+            return_value=user_messages,
+        ) as get_user_messages, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_message_updated_event",
+        ) as create_event:
+            result = dm_helpers.update_workspace_message_source(
+                message=message,
+                source=new_source,
+                session=session,
+            )
+
+        self.assertIs(message, result)
+        self.assertEqual({"source": new_source}, updated_message["values"])
+        self.assertIs(session, updated_message["session"])
+        get_user_messages.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+        )
+        create_event.assert_has_calls(
+            [
+                mock.call(message=user_messages[0], session=session),
+                mock.call(message=user_messages[1], session=session),
+            ]
+        )
+
+    def test_update_workspace_message_source_skips_matching_source(self):
+        source = dm_helpers.models.ZulipSource(
+            stream_id=10,
+            server_url="https://zulip.example.com",
+            topic_name="general",
+            message_id=12345,
+        )
+
+        class ExistingMessage:
+            def update_dm(self, values):
+                raise AssertionError("message must not be changed")
+
+            def update(self, session=None):
+                raise AssertionError("message must not be saved")
+
+        message = ExistingMessage()
+        message.source = source
+        with mock.patch.object(
+            dm_helpers,
+            "_create_workspace_message_updated_events",
+        ) as create_events:
+            result = dm_helpers.update_workspace_message_source(
+                message=message,
+                source=source,
+            )
+
+        self.assertIs(message, result)
+        create_events.assert_not_called()
+
     def test_get_workspace_user_message_uuids_scopes_visible_messages(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -2662,7 +2749,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs,
         )
 
-    def test_create_workspace_message_reaction_updated_events_sends_snapshots(self):
+    def test_create_workspace_message_updated_events_sends_snapshots(self):
         project_id = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
         session = object()
@@ -2677,7 +2764,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             dm_helpers.messenger_events,
             "create_message_updated_event",
         ) as create_event:
-            dm_helpers._create_workspace_message_reaction_updated_events(
+            dm_helpers._create_workspace_message_updated_events(
                 project_id=project_id,
                 message_uuid=message_uuid,
                 session=session,
@@ -2719,7 +2806,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             FakeWorkspaceMessageReactions,
         ), mock.patch.object(
             dm_helpers,
-            "_create_workspace_message_reaction_updated_events",
+            "_create_workspace_message_updated_events",
         ) as create_events:
             with mock.patch.object(
                 dm_helpers.messenger_events,
@@ -2797,7 +2884,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             side_effect=[old_message, new_message],
         ) as get_user_message, mock.patch.object(
             dm_helpers,
-            "_create_workspace_message_reaction_updated_events",
+            "_create_workspace_message_updated_events",
         ) as create_events, mock.patch.object(
             dm_helpers.messenger_events,
             "create_message_reaction_updated_event",
@@ -2897,7 +2984,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             return_value=object(),
         ) as get_user_message, mock.patch.object(
             dm_helpers,
-            "_create_workspace_message_reaction_updated_events",
+            "_create_workspace_message_updated_events",
         ) as create_events, mock.patch.object(
             dm_helpers.messenger_events,
             "create_message_reaction_deleted_event",

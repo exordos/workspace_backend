@@ -1784,10 +1784,10 @@ def get_workspace_user_message_uuids(project_id, user_uuid):
     return [message.uuid for message in messages]
 
 
-def _message_payload_plain_dict(payload):
-    if hasattr(payload, "as_plain_dict"):
-        return payload.as_plain_dict()
-    return payload
+def _message_field_plain_dict(value):
+    if hasattr(value, "as_plain_dict"):
+        return value.as_plain_dict()
+    return value
 
 
 def get_workspace_message_reaction(project_id, user_uuid, reaction_uuid):
@@ -1800,17 +1800,18 @@ def get_workspace_message_reaction(project_id, user_uuid, reaction_uuid):
     )
 
 
-def _create_workspace_message_reaction_updated_events(project_id,
-                                                      message_uuid,
-                                                      session=None):
-    for user_message in _get_workspace_user_messages(
+def _create_workspace_message_updated_events(project_id, message_uuid,
+                                             session=None):
+    user_messages = _get_workspace_user_messages(
         project_id=project_id,
         message_uuid=message_uuid,
-    ):
+    )
+    for user_message in user_messages:
         messenger_events.create_message_updated_event(
             message=user_message,
             session=session,
         )
+    return user_messages
 
 
 def create_workspace_message_reaction(project_id, user_uuid, session=None,
@@ -1840,7 +1841,7 @@ def create_workspace_message_reaction(project_id, user_uuid, session=None,
         message=message,
         session=session,
     )
-    _create_workspace_message_reaction_updated_events(
+    _create_workspace_message_updated_events(
         project_id=project_id,
         message_uuid=message_uuid,
         session=session,
@@ -1882,13 +1883,13 @@ def update_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
         old_emoji_name=old_emoji_name,
         session=session,
     )
-    _create_workspace_message_reaction_updated_events(
+    _create_workspace_message_updated_events(
         project_id=project_id,
         message_uuid=old_message_uuid,
         session=session,
     )
     if new_message_uuid != old_message_uuid:
-        _create_workspace_message_reaction_updated_events(
+        _create_workspace_message_updated_events(
             project_id=project_id,
             message_uuid=new_message_uuid,
             session=session,
@@ -1922,7 +1923,7 @@ def delete_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
         message=message,
         session=session,
     )
-    _create_workspace_message_reaction_updated_events(
+    _create_workspace_message_updated_events(
         project_id=project_id,
         message_uuid=message_uuid,
         session=session,
@@ -1966,6 +1967,23 @@ def _get_workspace_user_messages(project_id, message_uuid):
             "project_id": dm_filters.EQ(project_id),
         },
     )
+
+
+def update_workspace_message_source(message, source, session=None):
+    if (
+        _message_field_plain_dict(message.source) ==
+        _message_field_plain_dict(source)
+    ):
+        return message
+
+    message.update_dm(values={"source": source})
+    message.update(session=session)
+    _create_workspace_message_updated_events(
+        project_id=message.project_id,
+        message_uuid=message.uuid,
+        session=session,
+    )
+    return message
 
 
 def _get_workspace_message_for_author(project_id, user_uuid, message_uuid):
@@ -2128,8 +2146,8 @@ def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
         message_uuid=message_uuid,
     )
     if (
-        _message_payload_plain_dict(message.payload) ==
-        _message_payload_plain_dict(values["payload"])
+        _message_field_plain_dict(message.payload) ==
+        _message_field_plain_dict(values["payload"])
     ):
         if not enforce_visibility:
             return message
@@ -2138,16 +2156,13 @@ def update_workspace_user_message(project_id, user_uuid, message_uuid, values,
     message.update_dm(values={"payload": values["payload"]})
     message.update(session=session)
 
-    for user_message in _get_workspace_user_messages(
+    for user_message in _create_workspace_message_updated_events(
         project_id=project_id,
         message_uuid=message_uuid,
+        session=session,
     ):
         if user_message.user_uuid == user_uuid:
             result = user_message
-        messenger_events.create_message_updated_event(
-            message=user_message,
-            session=session,
-        )
     if not enforce_visibility:
         return message
     return result
