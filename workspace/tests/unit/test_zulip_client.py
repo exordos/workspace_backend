@@ -557,6 +557,7 @@ def test_zulip_client_sends_message_with_official_sdk():
         "to": "general",
         "topic": "deploys",
         "content": "hello",
+        "read_by_sender": True,
     }
 
 
@@ -581,6 +582,7 @@ def test_zulip_client_sends_private_message_with_official_sdk():
         "type": "direct",
         "to": [42],
         "content": "hello",
+        "read_by_sender": True,
     }
 
 

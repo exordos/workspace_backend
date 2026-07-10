@@ -234,6 +234,7 @@ class ZulipClient(common.RESTClientMixIn):
             "to": stream_name,
             "topic": topic_name,
             "content": content,
+            "read_by_sender": True,
         })
 
     def send_private_message_with_api_key(
@@ -248,6 +249,7 @@ class ZulipClient(common.RESTClientMixIn):
             "type": "direct",
             "to": recipient_ids,
             "content": content,
+            "read_by_sender": True,
         })
 
     def update_message_with_api_key(

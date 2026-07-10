@@ -74,6 +74,67 @@ def test_user_get_by_uuid_uses_global_user_table(api, db):
     assert [user["uuid"] for user in resp.json()] == [str(user_uuid)]
 
 
+def test_own_message_read_backfill_migration(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "own-message-backfill"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    message_uuid = sys_uuid.uuid4()
+    messenger_dm_helpers.create_workspace_user_message(
+        uuid=message_uuid,
+        project_id=sys_uuid.UUID(api.project_id),
+        user_uuid=sys_uuid.UUID(api.user_uuid),
+        stream_uuid=sys_uuid.UUID(stream_uuid),
+        topic_uuid=sys_uuid.UUID(topic_uuid),
+        payload=message_payloads.MarkdownPayload(content="backfill me"),
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = FALSE
+            WHERE uuid = %s
+                AND user_uuid = %s
+            """,
+            (message_uuid, api.user_uuid),
+        )
+
+    migration_path = (
+        conftest.MIGRATIONS_DIR / "0094-mark-own-messages-read-8413a3.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "mark_own_messages_read_migration",
+        migration_path,
+    )
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    migration.migration_step.upgrade(db)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, read
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s
+            ORDER BY user_uuid
+            """,
+            (message_uuid,),
+        )
+        flags = {str(row[0]): row[1] for row in cur.fetchall()}
+
+    assert flags == {
+        str(api.user_uuid): True,
+        str(other_user): False,
+    }
+
+
 def test_user_presence_action_updates_current_user_presence(api, db):
     username = f"user-{api.user_uuid}"
     event_recipient_uuid = sys_uuid.uuid4()
@@ -3528,6 +3589,110 @@ def test_message_helper_writes_visible_event(api, db):
     assert events[0]["payload"]["kind"] == "message.created"
     assert events[0]["payload"]["user_uuid"] == str(message.user_uuid)
     assert events[0]["payload"]["read"] is True
+
+
+def test_zulip_message_flag_sync_keeps_author_read(api, db):
+    other_user = sys_uuid.uuid4()
+    server_url = "https://zulip.example.test"
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "zulip-own-message"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    with db.cursor() as cur:
+        for user_uuid in (api.user_uuid, other_user):
+            cur.execute(
+                """
+                INSERT INTO m_external_accounts
+                    (uuid, project_id, user_uuid, server_url, account_type,
+                     status, account_settings, source_scope, access_status,
+                     access_checked_at, access_confirmed_at, created_at,
+                     updated_at)
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    'zulip',
+                    'active',
+                    jsonb_build_object(
+                        'kind', 'zulip',
+                        'credentials', jsonb_build_object(
+                            'kind', 'zulip',
+                            'login', 'agent@example.test',
+                            'token', 'token'
+                        )
+                    ),
+                    %s,
+                    'confirmed',
+                    NOW(),
+                    NOW(),
+                    NOW(),
+                    NOW()
+                )
+                """,
+                (
+                    str(sys_uuid.uuid4()),
+                    api.project_id,
+                    str(user_uuid),
+                    server_url,
+                    server_url,
+                ),
+            )
+    message_uuid = sys_uuid.uuid4()
+    message = messenger_dm_helpers.create_workspace_user_message(
+        uuid=message_uuid,
+        project_id=sys_uuid.UUID(api.project_id),
+        user_uuid=sys_uuid.UUID(api.user_uuid),
+        stream_uuid=sys_uuid.UUID(stream_uuid),
+        topic_uuid=sys_uuid.UUID(topic_uuid),
+        payload=message_payloads.MarkdownPayload(content="sent through Zulip"),
+        source_name=messenger_models.SourceName.ZULIP.value,
+        source=messenger_models.ZulipSource(
+            stream_id=42,
+            server_url=server_url,
+            topic_name="general",
+            message_id=123,
+        ),
+    )
+
+    assert message.read is True
+    message = messenger_dm_helpers.sync_workspace_user_message_flags(
+        project_id=sys_uuid.UUID(api.project_id),
+        user_uuid=sys_uuid.UUID(api.user_uuid),
+        message_uuid=message_uuid,
+        values={"read": False},
+    )
+    assert message.read is True
+
+    other_message = messenger_dm_helpers.get_workspace_user_message(
+        project_id=sys_uuid.UUID(api.project_id),
+        user_uuid=other_user,
+        message_uuid=message_uuid,
+    )
+    assert other_message.read is False
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, read
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s
+            ORDER BY user_uuid
+            """,
+            (message_uuid,),
+        )
+        flags = {str(row[0]): row[1] for row in cur.fetchall()}
+
+    assert flags == {
+        str(api.user_uuid): True,
+        str(other_user): False,
+    }
 
 
 def test_events_filter_by_epoch_range(api, db):

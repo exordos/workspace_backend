@@ -2319,6 +2319,10 @@ def sync_workspace_user_message_flags(project_id, user_uuid, message_uuid,
         user_uuid=user_uuid,
         message_uuid=message_uuid,
     )
+    if (values.get("read") is False
+            and current_message.author_uuid == user_uuid):
+        values = dict(values)
+        values["read"] = True
     flags = models.WorkspaceUserMessageFlags.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(message_uuid),
