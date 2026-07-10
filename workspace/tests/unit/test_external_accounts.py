@@ -930,7 +930,7 @@ def test_external_account_controller_create_fetches_zulip_profile():
         client.get_current_user_with_api_key.return_value = _zulip_profile()
 
         account = controller.create(
-            server_url="https://zulip.example.com",
+            server_url="https://zulip.example.com/",
             account_settings=account_settings,
         )
 
@@ -1259,6 +1259,7 @@ def test_external_account_controller_update_accepts_same_zulip_user():
 
             updated_account = controller.update(
                 uuid=account.uuid,
+                server_url="https://zulip.example.com/",
                 account_settings=new_settings,
             )
 
@@ -1269,6 +1270,8 @@ def test_external_account_controller_update_accepts_same_zulip_user():
         token="zulip-token",
     )
     assert account.account_settings is new_settings
+    assert account.server_url == "https://zulip.example.com"
+    assert account.source_scope == "https://zulip.example.com"
     assert account.account_settings.user_info.user_id == 32
     assert account.account_settings.user_info.full_name == "Phoenix Updated"
     account.update.assert_called_once_with()

@@ -464,6 +464,16 @@ class ExternalAccountController(
             values.pop(name, None)
 
     @staticmethod
+    def _normalize_server_url(server_url):
+        return server_url.rstrip("/")
+
+    def _normalize_server_url_value(self, values):
+        if "server_url" in values:
+            values["server_url"] = self._normalize_server_url(
+                values["server_url"],
+            )
+
+    @staticmethod
     def _set_source_scope(values):
         values.pop("source_scope", None)
         if "server_url" in values:
@@ -539,6 +549,7 @@ class ExternalAccountController(
     def create(self, **kwargs):
         values = kwargs.copy()
         self._reject_access_fields_from_api(values)
+        self._normalize_server_url_value(values)
         self._set_source_scope(values)
         account_settings = values["account_settings"]
         self._reject_iam_account_from_api(account_settings)
@@ -559,6 +570,7 @@ class ExternalAccountController(
         account = self.get(uuid=uuid)
         values = self._apply_autovalues(kwargs)
         self._reject_access_fields_from_api(values)
+        self._normalize_server_url_value(values)
         self._set_source_scope(values)
         self._validate_zulip_credentials_update(account, values)
         self._set_access_values(values, account=account)
