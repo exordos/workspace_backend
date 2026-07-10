@@ -104,7 +104,7 @@ class MessengerEventsWebsocketServer:
             port,
             subprotocols=[websocket_protocol.WORKSPACE_EVENTS_PROTOCOL],
             select_subprotocol=websocket_protocol.select_subprotocol,
-            ping_interval=None,
+            ping_interval=self._heartbeat_interval,
             max_queue=self._send_queue_limit,
         ):
             LOG.info("Workspace events websocket listening on %s:%s", host, port)

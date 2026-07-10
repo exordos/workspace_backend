@@ -1063,6 +1063,40 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertNotIn("event", json.loads(sent_messages[0]))
         self.assertNotIn("type", json.loads(sent_messages[0]))
 
+    def test_websocket_server_uses_configured_heartbeat_interval(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        serve_kwargs = {}
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=25,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+
+        class ServeContext:
+            async def __aenter__(self):
+                server.stop()
+
+            async def __aexit__(self, exc_type, exc_value, traceback):
+                pass
+
+        def serve(*args, **kwargs):
+            serve_kwargs.update(kwargs)
+            return ServeContext()
+
+        with mock.patch.object(websocket_service.websockets, "serve", side_effect=serve):
+            asyncio.run(server.serve("127.0.0.1", 21082))
+
+        self.assertEqual(25, serve_kwargs["ping_interval"])
+
     def test_websocket_consumer_ignores_client_frames(self):
         websockets_stub = types.ModuleType("websockets")
         websockets_stub.serve = None

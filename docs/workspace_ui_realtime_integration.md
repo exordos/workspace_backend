@@ -194,9 +194,10 @@ After the websocket is accepted, the server sends missed events newer than
 `last_epoch_version`, then live events. Each websocket message is the same flat
 event object returned by REST `/events/`.
 
-The websocket service does not send public `hello` or `ping` frames and does not
-process client `pong` or `ack` frames. Reconnect and catch-up are driven by the
-persisted `last_epoch_version` cursor.
+The websocket service sends protocol-level WebSocket ping control frames at the
+configured heartbeat interval. It does not send application-level JSON `hello`
+or `ping` messages and does not process client JSON `pong` or `ack` messages.
+Reconnect and catch-up are driven by the persisted `last_epoch_version` cursor.
 
 Recommended client flow:
 

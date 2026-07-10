@@ -1264,9 +1264,10 @@ const ws = new WebSocket(
 After the connection is accepted, the server sends missed events newer than
 `last_epoch_version`, then live events. Each websocket message is the same flat
 event object returned by REST `/v1/events/`. The websocket service does not send
-public `hello` or `ping` frames and does not process client `pong` or `ack`
-frames. Reconnect and catch-up are driven by the persisted `last_epoch_version`
-cursor.
+application-level JSON `hello` or `ping` messages and does not process client
+JSON `pong` or `ack` messages. It sends protocol-level WebSocket ping control
+frames at the configured heartbeat interval. Reconnect and catch-up are driven
+by the persisted `last_epoch_version` cursor.
 
 Detailed UI integration rules are documented in
 `docs/workspace_ui_realtime_integration.md`.
