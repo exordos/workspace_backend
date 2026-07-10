@@ -19,16 +19,18 @@ import datetime
 import itertools
 import logging
 import queue
-import re
 import threading
 import urllib.parse
 import uuid as sys_uuid
 
 import requests
+from restalchemy.dm import filters as dm_filters
 
 from workspace.common.clients import zulip as zulip_client
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
+from workspace.messenger_api.dm import models
+from workspace.services.integration_bridge import markdown_links
 
 
 LOG = logging.getLogger(__name__)
@@ -48,13 +50,20 @@ MAX_SYNC_QUEUE_SIZE = 1000
 SYNC_QUEUE_PUT_TIMEOUT = 1
 _SYNC_RESPONSE_SEQUENCE = itertools.count()
 NO_VALUE = object()
-WORKSPACE_FILE_LINK_RE = re.compile(
-    r"(?P<bang>!?)\[(?P<name>[^\]]*)\]\((?P<url>[^)\s]+)\)"
-)
 WORKSPACE_FILE_URN_TYPES = {
     "file",
     "image",
     "video",
+}
+WORKSPACE_MEDIA_URN_TYPES = {
+    "image",
+    "video",
+}
+WORKSPACE_ENTITY_URN_TYPES = {
+    "message",
+    "stream",
+    "topic",
+    "user",
 }
 ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS = {
     "read": "read",
@@ -224,15 +233,11 @@ class AddMessage:
 
     def _get_private_display_recipient(self):
         return ", ".join(
-            recipient["full_name"]
-            for recipient in self.message["display_recipient"]
+            recipient["full_name"] for recipient in self.message["display_recipient"]
         )
 
     def _get_private_subscriber_ids(self):
-        return [
-            recipient["id"]
-            for recipient in self.message["display_recipient"]
-        ]
+        return [recipient["id"] for recipient in self.message["display_recipient"]]
 
     def _get_stream_subscriber_ids(self):
         subscriber_ids = [self.message["sender_id"]]
@@ -247,9 +252,7 @@ class AddMessage:
             "stream_id": self.message["recipient_id"],
             "display_recipient": self._get_private_display_recipient(),
             "description": "",
-            "creator_id": (
-                self.external_account.account_settings.user_info.user_id
-            ),
+            "creator_id": (self.external_account.account_settings.user_info.user_id),
             "timestamp": self._get_timestamp(),
             "invite_only": True,
             "announce": False,
@@ -281,10 +284,7 @@ class AddMessage:
         if stream_info["type"] != "private":
             return False
         subscriber_ids = set(stream_info["subscriber_ids"])
-        return (
-            len(subscriber_ids) != 2 or
-            min(subscriber_ids) < MIN_ZULIP_USER_ID
-        )
+        return len(subscriber_ids) != 2 or min(subscriber_ids) < MIN_ZULIP_USER_ID
 
     def _get_topic_name(self):
         if self.message["type"] == "private":
@@ -300,9 +300,7 @@ class AddMessage:
         flags = self._get_flags()
         return {
             field_name: flag_name in flags
-            for flag_name, field_name in (
-                ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS.items()
-            )
+            for flag_name, field_name in (ZULIP_WORKSPACE_MESSAGE_FLAG_FIELDS.items())
         }
 
     def _get_message_info(self):
@@ -537,10 +535,7 @@ class AddStream:
         if "is_announcement_only" in self.stream:
             return self.stream["is_announcement_only"]
         if "stream_post_policy" in self.stream:
-            return (
-                self.stream["stream_post_policy"] ==
-                ZULIP_STREAM_POST_POLICY_ADMINS
-            )
+            return self.stream["stream_post_policy"] == ZULIP_STREAM_POST_POLICY_ADMINS
         return False
 
     def _get_subscriber_ids(self):
@@ -600,9 +595,7 @@ class UpdateStream:
             return {"announce": self.event["value"]}
         if property_name == "stream_post_policy":
             return {
-                "announce": (
-                    self.event["value"] == ZULIP_STREAM_POST_POLICY_ADMINS
-                ),
+                "announce": (self.event["value"] == ZULIP_STREAM_POST_POLICY_ADMINS),
             }
         return {}
 
@@ -628,10 +621,7 @@ class DeleteStream:
     def _get_stream_ids(self):
         if "stream_ids" in self.event:
             return self.event["stream_ids"]
-        return [
-            stream["stream_id"]
-            for stream in self.event["streams"]
-        ]
+        return [stream["stream_id"] for stream in self.event["streams"]]
 
     def execute(self, cache):
         for stream_id in self._get_stream_ids():
@@ -1171,10 +1161,7 @@ class UpdateZulipReaction(ZulipOutboundCommand):
 
     def execute(self, worker):
         try:
-            if (
-                self.old_message_id is not None
-                and self.old_emoji_name is not None
-            ):
+            if self.old_message_id is not None and self.old_emoji_name is not None:
                 worker.remove_reaction(
                     message_id=self.old_message_id,
                     emoji_name=self.old_emoji_name,
@@ -1366,9 +1353,7 @@ class ZulipBridgeWorker(threading.Thread):
             if "BAD_EVENT_QUEUE_ID" in str(exc):
                 raise BadZulipEventQueue() from exc
             raise
-        if data.get("result") == "error" and (
-            data.get("code") == "BAD_EVENT_QUEUE_ID"
-        ):
+        if data.get("result") == "error" and (data.get("code") == "BAD_EVENT_QUEUE_ID"):
             raise BadZulipEventQueue()
         if "events" not in data:
             LOG.warning(
@@ -1399,13 +1384,194 @@ class ZulipBridgeWorker(threading.Thread):
 
     def _convert_workspace_file_links(self, content):
         uploaded_files = {}
-        return WORKSPACE_FILE_LINK_RE.sub(
-            lambda match: self._convert_workspace_file_link(
+        return markdown_links.MARKDOWN_LINK_RE.sub(
+            lambda match: self._convert_workspace_link(
                 match=match,
                 uploaded_files=uploaded_files,
             ),
             content,
         )
+
+    def _convert_workspace_link(self, match, uploaded_files):
+        converted = self._convert_workspace_entity_link(match=match)
+        if converted is not None:
+            return converted
+        return self._convert_workspace_file_link(
+            match=match,
+            uploaded_files=uploaded_files,
+        )
+
+    def _convert_workspace_entity_link(self, match):
+        parsed_urn = markdown_links.parse_urn(match.group("url"))
+        if parsed_urn is None:
+            return None
+        if parsed_urn["type"] == "url":
+            return self._convert_workspace_url_link(
+                match=match,
+                parsed_urn=parsed_urn,
+            )
+        if parsed_urn["type"] == "gavatar":
+            return self._convert_workspace_generated_avatar_link(
+                match=match,
+                parsed_urn=parsed_urn,
+            )
+        if parsed_urn["type"] not in WORKSPACE_ENTITY_URN_TYPES:
+            return None
+        try:
+            entity_uuid = sys_uuid.UUID(parsed_urn["value"])
+        except ValueError:
+            return None
+        if parsed_urn["type"] == "user":
+            return self._convert_workspace_user_link(entity_uuid)
+        if parsed_urn["type"] == "message":
+            return self._convert_workspace_message_link(
+                match=match,
+                message_uuid=entity_uuid,
+            )
+        if parsed_urn["type"] == "stream":
+            return self._convert_workspace_stream_link(stream_uuid=entity_uuid)
+        if parsed_urn["type"] == "topic":
+            return self._convert_workspace_topic_link(topic_uuid=entity_uuid)
+        return None
+
+    def _convert_workspace_url_link(self, match, parsed_urn):
+        url = parsed_urn["value"]
+        if parsed_urn["query_string"]:
+            url = "%s?%s" % (url, parsed_urn["query_string"])
+        if parsed_urn["fragment"]:
+            url = "%s#%s" % (url, parsed_urn["fragment"])
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.scheme not in ("http", "https"):
+            return match.group(0)
+        return markdown_links.build_markdown_link(
+            bang=match.group("bang"),
+            name=match.group("name"),
+            url=url,
+        )
+
+    def _convert_workspace_generated_avatar_link(self, match, parsed_urn):
+        try:
+            user_uuid = sys_uuid.UUID(parsed_urn["value"])
+        except ValueError:
+            return None
+        avatar_hash = str(user_uuid).replace("-", "")
+        return markdown_links.build_markdown_link(
+            bang=match.group("bang"),
+            name=match.group("name"),
+            url=(
+                "https://secure.gravatar.com/avatar/"
+                "%s?d=identicon&s=500"
+            ) % avatar_hash,
+        )
+
+    def _convert_workspace_user_link(self, user_uuid):
+        account = models.ExternalAccount.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(
+                    self._external_account.project_id,
+                ),
+                "account_type": dm_filters.EQ(
+                    models.ExternalAccountType.ZULIP.value,
+                ),
+                "server_url": dm_filters.EQ(
+                    self._external_account.server_url,
+                ),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+        )
+        if account is None or account.account_settings.user_info is None:
+            return None
+        user_info = account.account_settings.user_info
+        return "@**%s|%s**" % (user_info.full_name, user_info.user_id)
+
+    @staticmethod
+    def _source_value(source, name):
+        if hasattr(source, name):
+            return getattr(source, name)
+        return source.get(name)
+
+    def _is_same_zulip_source(self, source):
+        server_url = self._source_value(source, "server_url")
+        return server_url is None or server_url == self._external_account.server_url
+
+    def _get_workspace_stream(self, stream_uuid):
+        return models.WorkspaceStream.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(self._external_account.project_id),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+        )
+
+    def _get_workspace_topic(self, topic_uuid):
+        return models.WorkspaceStreamTopic.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(self._external_account.project_id),
+                "uuid": dm_filters.EQ(topic_uuid),
+            },
+        )
+
+    def _convert_workspace_message_link(self, match, message_uuid):
+        message = models.WorkspaceMessage.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(self._external_account.project_id),
+                "uuid": dm_filters.EQ(message_uuid),
+                "source_name": dm_filters.EQ(models.SourceName.ZULIP.value),
+            },
+        )
+        if message is None or not self._is_same_zulip_source(message.source):
+            return None
+        message_id = self._source_value(message.source, "message_id")
+        stream_id = self._source_value(message.source, "stream_id")
+        topic_name = self._source_value(message.source, "topic_name")
+        if message_id is None or stream_id is None:
+            return None
+        stream = self._get_workspace_stream(message.stream_uuid)
+        if stream is None or getattr(stream, "private", False):
+            return None
+        if topic_name is None:
+            topic = self._get_workspace_topic(message.topic_uuid)
+            if topic is None:
+                return None
+            topic_name = topic.name
+        url = markdown_links.build_zulip_message_narrow_url(
+            server_url=self._external_account.server_url,
+            stream_id=stream_id,
+            stream_name=stream.name,
+            topic_name=topic_name,
+            message_id=message_id,
+        )
+        return markdown_links.build_markdown_link(
+            bang=match.group("bang"),
+            name=match.group("name") or url,
+            url=url,
+        )
+
+    def _convert_workspace_stream_link(self, stream_uuid):
+        stream = self._get_workspace_stream(stream_uuid)
+        if (
+            stream is None
+            or stream.source_name != models.SourceName.ZULIP.value
+            or not self._is_same_zulip_source(stream.source)
+            or getattr(stream, "private", False)
+        ):
+            return None
+        return "#**%s**" % stream.name
+
+    def _convert_workspace_topic_link(self, topic_uuid):
+        topic = self._get_workspace_topic(topic_uuid)
+        if (
+            topic is None
+            or topic.source_name != models.SourceName.ZULIP.value
+            or not self._is_same_zulip_source(topic.source)
+        ):
+            return None
+        stream = self._get_workspace_stream(topic.stream_uuid)
+        if stream is None or getattr(stream, "private", False):
+            return None
+        topic_name = self._source_value(topic.source, "topic_name")
+        if topic_name is None:
+            topic_name = topic.name
+        return "#**%s>%s**" % (stream.name, topic_name)
 
     def _convert_workspace_file_link(self, match, uploaded_files):
         parsed_urn = self._parse_workspace_file_urn(match.group("url"))
@@ -1431,21 +1597,14 @@ class ZulipBridgeWorker(threading.Thread):
             match=match,
             params=params,
         )
-        prefix = "!" if file_type == "image" else ""
+        prefix = "!" if file_type in WORKSPACE_MEDIA_URN_TYPES else ""
         return f"{prefix}[{file_name}]({uploaded_files[file_uuid]['uri']})"
 
     def _parse_workspace_file_urn(self, url):
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "urn":
+        parsed = markdown_links.parse_uuid_urn(url, WORKSPACE_FILE_URN_TYPES)
+        if parsed is None:
             return None
-        urn_parts = parsed.path.split(":", 1)
-        if len(urn_parts) != 2 or urn_parts[0] not in WORKSPACE_FILE_URN_TYPES:
-            return None
-        return (
-            urn_parts[0],
-            sys_uuid.UUID(urn_parts[1]),
-            urllib.parse.parse_qs(parsed.query),
-        )
+        return parsed["type"], parsed["uuid"], parsed["query"]
 
     def _get_workspace_file_name(self, file, match, params):
         names = params.get("name")
@@ -1582,10 +1741,10 @@ class ZulipBridgeWorker(threading.Thread):
         priority=None,
     ):
         if (
-            queue_id is NO_VALUE and
-            last_event_id is None and
-            last_message_id is None and
-            is_synced is None
+            queue_id is NO_VALUE
+            and last_event_id is None
+            and last_message_id is None
+            and is_synced is None
         ):
             return
         put_sync_response(

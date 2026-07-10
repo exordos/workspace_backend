@@ -81,7 +81,7 @@ The service inherits from `BasicService` and runs one iteration roughly every
   Workspace user is created automatically from the Zulip profile.
 - Files and attachments are imported into Workspace storage. Message content
   must be processed so that Zulip upload links are replaced with native
-  Workspace URNs, for example `urn:images:<uuid>` for images and equivalent URNs
+  Workspace URNs, for example `urn:image:<uuid>` for images and equivalent URNs
   for other file types.
 - First-version integration state and errors are visible through logs and
   database tables. A separate user-facing or admin status UI is not required for
@@ -456,8 +456,16 @@ Zulip, not just text:
 
 - **content**: message body;
 - **files**: attachments are downloaded from Zulip, saved to Workspace storage,
-  and links in content are replaced with Workspace URNs (`urn:images:<uuid>` and
+  and links in content are replaced with Workspace URNs (`urn:image:<uuid>` and
   equivalents);
+- **entity links**: Zulip user mentions, stream/topic references, and message
+  permalinks are normalized to regular markdown links whose URL is a Workspace
+  URN. User mentions become `[Full Name](urn:user:<user-uuid>)`; message,
+  stream, and topic links become `urn:message:<message-uuid>`,
+  `urn:stream:<stream-uuid>`, and `urn:topic:<topic-uuid>` when the referenced
+  Workspace entity is already known. Other `http` / `https` links are wrapped
+  as `urn:url:http(s)://...`. Wildcard Zulip mentions such as `@all` remain
+  unchanged;
 - **flags**: including `read` and supported per-user flags such as `starred`
   from the event/message payload. The existing Workspace flags mechanism is used
   for read/unread and other mapped flags, with flags created separately for each
@@ -468,6 +476,24 @@ Zulip, not just text:
 
 No individual parts may be skipped: on repeated processing, everything must be
 compared with the current Workspace state.
+
+Outbound Workspace messages keep the same markdown-link contract. Before sending
+content to Zulip, the bridge translates resolvable Workspace URNs back to Zulip
+syntax:
+
+- `urn:user:<user-uuid>` becomes a Zulip mention using the synced Zulip
+  `full_name` and `user_id`;
+- `urn:stream:<stream-uuid>` and `urn:topic:<topic-uuid>` become Zulip
+  stream/topic references;
+- `urn:message:<message-uuid>` becomes a Zulip message permalink when the target
+  message has a Zulip `message_id` and belongs to a public Zulip stream;
+- `urn:file`, `urn:image`, and `urn:video` are uploaded to Zulip and replaced
+  with the returned Zulip upload link;
+- `urn:gavatar:<user-uuid>` becomes a generated avatar image URL;
+- `urn:url:http(s)://...` is unwrapped to a regular markdown URL.
+
+If a URN cannot be resolved safely, the bridge leaves the original markdown link
+unchanged instead of dropping content or failing the message.
 
 If a Zulip attachment cannot be downloaded or saved, the message is still
 created or updated. The content receives a link to a prepared placeholder
@@ -552,7 +578,10 @@ from that message.
 Zulip `user_id`, email, name, and source data are saved so that later messages
 from the same user link to the same Workspace row. Zulip `avatar_url` stays in
 external-account user metadata; Workspace user `avatar` defaults to
-`urn:gavatar:<user-uuid>` and is not replaced with a Zulip URL automatically.
+`urn:gavatar:<user-uuid>`. This profile default is independent from message
+content conversion; markdown links or images that explicitly reference
+`urn:gavatar:<user-uuid>` are converted to generated avatar image URLs when sent
+to Zulip.
 
 IAM remains the external source for corporate users, but the absence of an IAM
 row does not block Zulip history import. If a canonical IAM row for the same

@@ -781,6 +781,20 @@ The only supported message payload in v1 is markdown:
 }
 ```
 
+Workspace entity references inside markdown content use regular markdown link
+syntax. The URL part is a Workspace URN:
+
+| Entity | Markdown form | Notes |
+| --- | --- | --- |
+| user mention | `[Jane Doe](urn:user:<user-uuid>)` | Treated as a user tag/mention. |
+| message link | `[See message](urn:message:<message-uuid>)` | Points to a Workspace message. |
+| stream link | `[general](urn:stream:<stream-uuid>)` | Points to a Workspace stream. |
+| topic link | `[deploys](urn:topic:<topic-uuid>)` | Points to a Workspace topic. |
+| file link | `[report.pdf](urn:file:<file-uuid>?name=report.pdf)` | File/media URNs may include metadata query parameters. |
+| image/video link | `![photo.png](urn:image:<file-uuid>?name=photo.png)` | Images and videos use `urn:image` / `urn:video`. |
+| avatar/default image | `[avatar](urn:gavatar:<user-uuid>)` | Same avatar URN format as Workspace users. |
+| external URL | `[site](urn:url:https://example.com)` | External `http` / `https` links are stored through `urn:url`. |
+
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | Message identifier. |
@@ -1120,6 +1134,10 @@ whenever the current user's matching external account access is not confirmed.
 
 Top-level fields describe the event row only. `payload.kind` is the only `kind`.
 Do not expect top-level `type`, `kind`, `stream_uuid`, or `topic_uuid`.
+
+Message create/update events carry the same markdown payload stored on the
+message. Entity links remain regular markdown links with `urn:user`,
+`urn:message`, `urn:stream`, `urn:topic`, file/media, avatar, or URL URNs.
 
 Create, update, read, and action events carry the same full object snapshot that
 the current user receives from the corresponding REST endpoint/action response,

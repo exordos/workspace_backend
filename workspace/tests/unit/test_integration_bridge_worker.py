@@ -213,22 +213,27 @@ def test_bridge_cache_preprocesses_zulip_file_links():
         return_value=user_uuid,
     )
 
-    with mock.patch.object(
-        agents.zulip_client,
-        "ZulipClient",
-        FakeZulipClient,
-    ), mock.patch.object(
-        agents.file_storage,
-        "save_workspace_file",
-        return_value=storage_info,
-    ) as save_file, mock.patch.object(
-        agents.file_storage,
-        "delete_workspace_file",
-    ) as delete_file, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "create_workspace_file",
-        return_value=created_file,
-    ) as create_file:
+    with (
+        mock.patch.object(
+            agents.zulip_client,
+            "ZulipClient",
+            FakeZulipClient,
+        ),
+        mock.patch.object(
+            agents.file_storage,
+            "save_workspace_file",
+            return_value=storage_info,
+        ) as save_file,
+        mock.patch.object(
+            agents.file_storage,
+            "delete_workspace_file",
+        ) as delete_file,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "create_workspace_file",
+            return_value=created_file,
+        ) as create_file,
+    ):
         result = cache.preprocess_zulip_message(
             external_account=external_account,
             stream=stream,
@@ -239,11 +244,10 @@ def test_bridge_cache_preprocesses_zulip_file_links():
         f"see ![photo.png](urn:image:{file_uuid}?"
         f"name=photo.png&content_type=image%2Fpng&"
         f"w=1280&h=720&size={len(png_data)}) "
-        "and [site](https://example.com)"
+        "and [site](urn:url:https://example.com)"
     )
     assert message_info["content"] == (
-        "see ![photo.png](/user_uploads/1/photo.png) "
-        "and [site](https://example.com)"
+        "see ![photo.png](/user_uploads/1/photo.png) and [site](https://example.com)"
     )
     cache._get_or_create_zulip_message_sender_uuid.assert_called_once_with(
         external_account=external_account,
@@ -264,8 +268,106 @@ def test_bridge_cache_preprocesses_zulip_file_links():
         storage_id="",
         storage_object_id="aa/file",
     )
-    assert create_file.call_args.kwargs["uuid"] == (
-        save_file.call_args.kwargs["file_uuid"]
+    assert (
+        create_file.call_args.kwargs["uuid"]
+        == (save_file.call_args.kwargs["file_uuid"])
+    )
+    delete_file.assert_not_called()
+
+
+def test_bridge_cache_preprocesses_zulip_video_links_as_media_urns():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    mp4_data = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+    external_account = types.SimpleNamespace(
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+        account_settings=types.SimpleNamespace(
+            credentials=types.SimpleNamespace(
+                login="user@example.com",
+                token="zulip-token",
+            ),
+        ),
+    )
+    stream = types.SimpleNamespace(uuid=stream_uuid)
+    message_info = {
+        "message_id": 42,
+        "sender_id": 24,
+        "content": "see ![clip.mp4](/user_uploads/1/clip.mp4?w=1920&h=1080)",
+    }
+    storage_info = agents.file_storage.WorkspaceFileStorageInfo(
+        storage_type="file",
+        storage_id="",
+        storage_object_id="aa/file",
+    )
+    created_file = types.SimpleNamespace(uuid=file_uuid)
+
+    class FakeZulipClient:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+
+        def download_file_with_api_key(self, login, token, url):
+            assert self.endpoint == "https://zulip.example.com"
+            assert login == "user@example.com"
+            assert token == "zulip-token"
+            assert url == "/user_uploads/1/clip.mp4?w=1920&h=1080"
+            return {
+                "content": mp4_data,
+                "content_type": "application/octet-stream",
+            }
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._get_or_create_zulip_message_sender_uuid = mock.Mock(
+        return_value=user_uuid,
+    )
+
+    with (
+        mock.patch.object(
+            agents.zulip_client,
+            "ZulipClient",
+            FakeZulipClient,
+        ),
+        mock.patch.object(
+            agents.file_storage,
+            "save_workspace_file",
+            return_value=storage_info,
+        ),
+        mock.patch.object(
+            agents.file_storage,
+            "delete_workspace_file",
+        ) as delete_file,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "create_workspace_file",
+            return_value=created_file,
+        ) as create_file,
+    ):
+        result = cache.preprocess_zulip_message(
+            external_account=external_account,
+            stream=stream,
+            message_info=message_info,
+        )
+
+    assert result["content"] == (
+        f"see ![clip.mp4](urn:video:{file_uuid}?"
+        f"name=clip.mp4&content_type=video%2Fmp4&"
+        f"w=1920&h=1080&size={len(mp4_data)})"
+    )
+    create_file.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        uuid=mock.ANY,
+        stream_uuid=stream_uuid,
+        name="clip.mp4",
+        description="",
+        content_type="video/mp4",
+        size_bytes=len(mp4_data),
+        hash=agents.hashlib.sha256(mp4_data).hexdigest(),
+        storage_type="file",
+        storage_id="",
+        storage_object_id="aa/file",
     )
     delete_file.assert_not_called()
 
@@ -320,6 +422,123 @@ def test_bridge_cache_uses_placeholder_when_zulip_file_import_fails():
             "for message 42: download boom"
         ),
     ]
+
+
+def test_bridge_cache_preprocesses_zulip_entity_links():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        project_id=project_id,
+        server_url="https://zulip.example.com",
+    )
+    stream = types.SimpleNamespace(uuid=stream_uuid)
+    message_info = {
+        "message_id": 42,
+        "sender_id": 24,
+        "content": (
+            "hi @**Jane Doe|25** see "
+            "[that message](https://zulip.example.com/#narrow/stream/"
+            "3-general/topic/deploys/near/100) "
+            "#**general>deploys** #**general** "
+            "[site](https://example.com/a?x=1#section)"
+        ),
+    }
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._get_zulip_user_uuid = mock.Mock(return_value=user_uuid)
+    cache._get_zulip_workspace_message = mock.Mock(
+        return_value=types.SimpleNamespace(uuid=message_uuid),
+    )
+    cache._get_zulip_workspace_topic_by_name = mock.Mock(
+        return_value=types.SimpleNamespace(uuid=topic_uuid),
+    )
+    cache._get_zulip_workspace_stream_by_name = mock.Mock(
+        return_value=types.SimpleNamespace(uuid=stream_uuid),
+    )
+
+    result = cache.preprocess_zulip_message(
+        external_account=external_account,
+        stream=stream,
+        message_info=message_info,
+    )
+
+    assert result["content"] == (
+        f"hi [Jane Doe](urn:user:{user_uuid}) see "
+        f"[that message](urn:message:{message_uuid}) "
+        f"[general > deploys](urn:topic:{topic_uuid}) "
+        f"[general](urn:stream:{stream_uuid}) "
+        "[site](urn:url:https://example.com/a?x=1#section)"
+    )
+    cache._get_zulip_user_uuid.assert_called_once_with(
+        external_account=external_account,
+        user_id=25,
+    )
+
+
+def test_bridge_cache_wraps_unresolved_zulip_links_as_url_urn():
+    external_account = types.SimpleNamespace(
+        project_id=sys_uuid.uuid4(),
+        server_url="https://zulip.example.com",
+    )
+    message_info = {
+        "message_id": 42,
+        "sender_id": 24,
+        "content": (
+            "[old message](https://zulip.example.com/#narrow/stream/"
+            "3-general/topic/deploys/near/100)"
+        ),
+    }
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._resolve_zulip_narrow_workspace_uuid = mock.Mock(return_value=None)
+
+    result = cache.preprocess_zulip_message(
+        external_account=external_account,
+        stream=types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+        message_info=message_info,
+    )
+
+    assert result["content"] == (
+        "[old message](urn:url:https://zulip.example.com/"
+        "#narrow/stream/3-general/topic/deploys/near/100)"
+    )
+
+
+def test_bridge_cache_preprocesses_zulip_user_mention_by_full_name():
+    user_uuid = sys_uuid.uuid4()
+    external_account = types.SimpleNamespace(
+        project_id=sys_uuid.uuid4(),
+        server_url="https://zulip.example.com",
+    )
+    message_info = {
+        "message_id": 42,
+        "sender_id": 24,
+        "content": "hi @**Jane Doe** and @**all**",
+    }
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    cache._get_zulip_user_uuid_by_full_name = mock.Mock(return_value=user_uuid)
+
+    result = cache.preprocess_zulip_message(
+        external_account=external_account,
+        stream=types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+        message_info=message_info,
+    )
+
+    assert result["content"] == (f"hi [Jane Doe](urn:user:{user_uuid}) and @**all**")
+    cache._get_zulip_user_uuid_by_full_name.assert_called_once_with(
+        external_account=external_account,
+        full_name="Jane Doe",
+    )
+
+
+def test_markdown_payload_detects_user_urn_mention():
+    user_uuid = sys_uuid.uuid4()
+    payload = agents.message_payloads.MarkdownPayload(
+        content=f"hi [Jane](urn:user:{user_uuid})",
+    )
+
+    assert payload.is_user_mentioned(user_uuid)
 
 
 def test_bridge_cache_uses_filetype_for_video_metadata():
@@ -387,35 +606,44 @@ def test_bridge_cache_updates_zulip_message_and_skips_outbound_event():
         get_one_or_none=mock.Mock(return_value=None),
     )
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=message_uuid),
-    ), mock.patch.object(
-        cache,
-        "preprocess_zulip_message",
-        mock.Mock(return_value={
-            "message_id": 104,
-            "sender_id": 8,
-            "content": "edited workspace",
-        }),
-    ) as preprocess, mock.patch.object(
-        agents.models,
-        "WorkspaceMessage",
-        FakeWorkspaceMessage,
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceEvent",
-        FakeWorkspaceEvent,
-    ), mock.patch.object(
-        agents.models,
-        "ZulipOutboundEventState",
-        FakeZulipOutboundEventState,
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "update_workspace_user_message",
-        mock.Mock(return_value=updated_message),
-    ) as update_workspace_message:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=message_uuid),
+        ),
+        mock.patch.object(
+            cache,
+            "preprocess_zulip_message",
+            mock.Mock(
+                return_value={
+                    "message_id": 104,
+                    "sender_id": 8,
+                    "content": "edited workspace",
+                }
+            ),
+        ) as preprocess,
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessage",
+            FakeWorkspaceMessage,
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceEvent",
+            FakeWorkspaceEvent,
+        ),
+        mock.patch.object(
+            agents.models,
+            "ZulipOutboundEventState",
+            FakeZulipOutboundEventState,
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "update_workspace_user_message",
+            mock.Mock(return_value=updated_message),
+        ) as update_workspace_message,
+    ):
         result = cache.update_message(
             external_account=external_account,
             message_info={
@@ -479,35 +707,44 @@ def test_bridge_cache_skips_matching_zulip_message_update():
         )
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=message_uuid),
-    ), mock.patch.object(
-        cache,
-        "preprocess_zulip_message",
-        mock.Mock(return_value={
-            "message_id": 104,
-            "sender_id": 8,
-            "content": "same workspace",
-        }),
-    ) as preprocess, mock.patch.object(
-        agents.models,
-        "WorkspaceMessage",
-        FakeWorkspaceMessage,
-    ), mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(),
-    ) as get_last_epoch, mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
-    ) as mark_skipped, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "update_workspace_user_message",
-        mock.Mock(),
-    ) as update_workspace_message:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=message_uuid),
+        ),
+        mock.patch.object(
+            cache,
+            "preprocess_zulip_message",
+            mock.Mock(
+                return_value={
+                    "message_id": 104,
+                    "sender_id": 8,
+                    "content": "same workspace",
+                }
+            ),
+        ) as preprocess,
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessage",
+            FakeWorkspaceMessage,
+        ),
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(),
+        ) as get_last_epoch,
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ) as mark_skipped,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "update_workspace_user_message",
+            mock.Mock(),
+        ) as update_workspace_message,
+    ):
         result = cache.update_message(
             external_account=external_account,
             message_info={
@@ -579,27 +816,33 @@ def test_bridge_cache_deletes_zulip_message_and_skips_outbound_event():
             104,
         )
     ] = message
-    with mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=message_uuid),
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceMessage",
-        FakeWorkspaceMessage,
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceEvent",
-        FakeWorkspaceEvent,
-    ), mock.patch.object(
-        agents.models,
-        "ZulipOutboundEventState",
-        FakeZulipOutboundEventState,
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "delete_workspace_user_message",
-        mock.Mock(),
-    ) as delete_workspace_message:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=message_uuid),
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessage",
+            FakeWorkspaceMessage,
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceEvent",
+            FakeWorkspaceEvent,
+        ),
+        mock.patch.object(
+            agents.models,
+            "ZulipOutboundEventState",
+            FakeZulipOutboundEventState,
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "delete_workspace_user_message",
+            mock.Mock(),
+        ) as delete_workspace_message,
+    ):
         results = cache.delete_messages(
             external_account=external_account,
             message_ids=[104],
@@ -675,31 +918,38 @@ def test_bridge_cache_adds_zulip_reaction_and_skips_outbound_events():
     )
     cache = agents.WorkspaceIntegrationBridgeCache()
     cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
-    with mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=message_uuid),
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceMessage",
-        FakeWorkspaceMessage,
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceMessageReactions",
-        FakeWorkspaceMessageReactions,
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceEvent",
-        FakeWorkspaceEvent,
-    ), mock.patch.object(
-        agents.models,
-        "ZulipOutboundEventState",
-        FakeZulipOutboundEventState,
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "create_workspace_message_reaction",
-        mock.Mock(return_value=reaction),
-    ) as create_reaction:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=message_uuid),
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessage",
+            FakeWorkspaceMessage,
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceEvent",
+            FakeWorkspaceEvent,
+        ),
+        mock.patch.object(
+            agents.models,
+            "ZulipOutboundEventState",
+            FakeZulipOutboundEventState,
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "create_workspace_message_reaction",
+            mock.Mock(return_value=reaction),
+        ) as create_reaction,
+    ):
         result = cache.add_message_reaction(
             external_account=external_account,
             reaction_info={
@@ -717,10 +967,10 @@ def test_bridge_cache_adds_zulip_reaction_and_skips_outbound_events():
         emoji_name="thumbs_up",
         enforce_visibility=False,
     )
-    assert [
-        state.epoch_version
-        for state in FakeZulipOutboundEventState.inserted
-    ] == [91, 92]
+    assert [state.epoch_version for state in FakeZulipOutboundEventState.inserted] == [
+        91,
+        92,
+    ]
 
 
 def test_bridge_cache_removes_zulip_reaction_and_skips_outbound_events():
@@ -773,31 +1023,38 @@ def test_bridge_cache_removes_zulip_reaction_and_skips_outbound_events():
     )
     cache = agents.WorkspaceIntegrationBridgeCache()
     cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
-    with mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=message_uuid),
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceMessage",
-        FakeWorkspaceMessage,
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceMessageReactions",
-        FakeWorkspaceMessageReactions,
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceEvent",
-        FakeWorkspaceEvent,
-    ), mock.patch.object(
-        agents.models,
-        "ZulipOutboundEventState",
-        FakeZulipOutboundEventState,
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "delete_workspace_message_reaction",
-        mock.Mock(),
-    ) as delete_reaction:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=message_uuid),
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessage",
+            FakeWorkspaceMessage,
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceEvent",
+            FakeWorkspaceEvent,
+        ),
+        mock.patch.object(
+            agents.models,
+            "ZulipOutboundEventState",
+            FakeZulipOutboundEventState,
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "delete_workspace_message_reaction",
+            mock.Mock(),
+        ) as delete_reaction,
+    ):
         result = cache.remove_message_reaction(
             external_account=external_account,
             reaction_info={
@@ -814,10 +1071,10 @@ def test_bridge_cache_removes_zulip_reaction_and_skips_outbound_events():
         reaction_uuid=reaction_uuid,
         enforce_visibility=False,
     )
-    assert [
-        state.epoch_version
-        for state in FakeZulipOutboundEventState.inserted
-    ] == [101, 102]
+    assert [state.epoch_version for state in FakeZulipOutboundEventState.inserted] == [
+        101,
+        102,
+    ]
 
 
 def test_bridge_cache_syncs_zulip_message_reactions_from_payload():
@@ -846,27 +1103,33 @@ def test_bridge_cache_syncs_zulip_message_reactions_from_payload():
 
     cache = agents.WorkspaceIntegrationBridgeCache()
     cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
-    with mock.patch.object(
-        agents.models,
-        "WorkspaceMessageReactions",
-        FakeWorkspaceMessageReactions,
-    ), mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(return_value=90),
-    ), mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
-    ) as mark_skipped, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "create_workspace_message_reaction",
-        mock.Mock(return_value=created_reaction),
-    ) as create_reaction, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "delete_workspace_message_reaction",
-        mock.Mock(),
-    ) as delete_reaction:
+    with (
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ),
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(return_value=90),
+        ),
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ) as mark_skipped,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "create_workspace_message_reaction",
+            mock.Mock(return_value=created_reaction),
+        ) as create_reaction,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "delete_workspace_message_reaction",
+            mock.Mock(),
+        ) as delete_reaction,
+    ):
         cache._sync_message_reactions(
             external_account=external_account,
             message=message,
@@ -895,29 +1158,31 @@ def test_bridge_cache_syncs_zulip_message_reactions_from_payload():
         reaction_uuid=stale_reaction_uuid,
         enforce_visibility=False,
     )
-    mark_skipped.assert_has_calls([
-        mock.call(
-            external_account=external_account,
-            object_type="message_reaction",
-            action="created",
-            payload_uuid=created_reaction_uuid,
-            after_epoch=90,
-        ),
-        mock.call(
-            external_account=external_account,
-            object_type="message_reaction",
-            action="deleted",
-            payload_uuid=stale_reaction_uuid,
-            after_epoch=90,
-        ),
-        mock.call(
-            external_account=external_account,
-            object_type="message",
-            action="updated",
-            payload_uuid=message_uuid,
-            after_epoch=90,
-        ),
-    ])
+    mark_skipped.assert_has_calls(
+        [
+            mock.call(
+                external_account=external_account,
+                object_type="message_reaction",
+                action="created",
+                payload_uuid=created_reaction_uuid,
+                after_epoch=90,
+            ),
+            mock.call(
+                external_account=external_account,
+                object_type="message_reaction",
+                action="deleted",
+                payload_uuid=stale_reaction_uuid,
+                after_epoch=90,
+            ),
+            mock.call(
+                external_account=external_account,
+                object_type="message",
+                action="updated",
+                payload_uuid=message_uuid,
+                after_epoch=90,
+            ),
+        ]
+    )
 
 
 def test_bridge_cache_keeps_matching_zulip_message_reactions():
@@ -942,27 +1207,33 @@ def test_bridge_cache_keeps_matching_zulip_message_reactions():
 
     cache = agents.WorkspaceIntegrationBridgeCache()
     cache._get_required_zulip_user_uuid = mock.Mock(return_value=user_uuid)
-    with mock.patch.object(
-        agents.models,
-        "WorkspaceMessageReactions",
-        FakeWorkspaceMessageReactions,
-    ), mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(),
-    ) as get_last_epoch, mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
-    ) as mark_skipped, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "create_workspace_message_reaction",
-        mock.Mock(),
-    ) as create_reaction, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "delete_workspace_message_reaction",
-        mock.Mock(),
-    ) as delete_reaction:
+    with (
+        mock.patch.object(
+            agents.models,
+            "WorkspaceMessageReactions",
+            FakeWorkspaceMessageReactions,
+        ),
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(),
+        ) as get_last_epoch,
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ) as mark_skipped,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "create_workspace_message_reaction",
+            mock.Mock(),
+        ) as create_reaction,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "delete_workspace_message_reaction",
+            mock.Mock(),
+        ) as delete_reaction,
+    ):
         cache._sync_message_reactions(
             external_account=external_account,
             message=message,
@@ -1129,24 +1400,26 @@ def test_get_new_outbound_events_uses_candidate_json_filter():
     now = datetime.datetime.now(datetime.timezone.utc)
     session = types.SimpleNamespace(
         execute=mock.Mock(
-            return_value=FakeQueryResult([
-                {
-                    "epoch_version": 56,
-                    "uuid": event_uuid,
-                    "project_id": project_id,
-                    "user_uuid": user_uuid,
-                    "payload": {
-                        "author_uuid": str(user_uuid),
-                        "source_name": "zulip",
-                        "source": {"message_id": None},
+            return_value=FakeQueryResult(
+                [
+                    {
+                        "epoch_version": 56,
+                        "uuid": event_uuid,
+                        "project_id": project_id,
+                        "user_uuid": user_uuid,
+                        "payload": {
+                            "author_uuid": str(user_uuid),
+                            "source_name": "zulip",
+                            "source": {"message_id": None},
+                        },
+                        "created_at": now,
+                        "updated_at": now,
+                        "schema_version": 1,
+                        "object_type": "message",
+                        "action": "created",
                     },
-                    "created_at": now,
-                    "updated_at": now,
-                    "schema_version": 1,
-                    "object_type": "message",
-                    "action": "created",
-                },
-            ]),
+                ]
+            ),
         ),
     )
     context = types.SimpleNamespace(get_session=mock.Mock(return_value=session))
@@ -1322,16 +1595,14 @@ def test_next_outbound_discovery_cursor_epoch_stops_at_full_batch_tail():
     ]
 
     assert (
-        agents.WorkspaceIntegrationBridgeWorker
-        ._next_outbound_discovery_cursor_epoch(
+        agents.WorkspaceIntegrationBridgeWorker._next_outbound_discovery_cursor_epoch(
             events=events,
             high_water_epoch=80,
             batch_limit=2,
         )
     ) == 57
     assert (
-        agents.WorkspaceIntegrationBridgeWorker
-        ._next_outbound_discovery_cursor_epoch(
+        agents.WorkspaceIntegrationBridgeWorker._next_outbound_discovery_cursor_epoch(
             events=events[:1],
             high_water_epoch=80,
             batch_limit=2,
@@ -1377,18 +1648,22 @@ def test_dispatch_zulip_outbound_state_uses_author_worker_queue():
         other_key: other_queue,
     }
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=command),
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=command),
+        ),
     ):
         worker._dispatch_zulip_outbound_state(state)
 
@@ -1427,18 +1702,22 @@ def test_dispatch_zulip_reaction_outbound_state_uses_reactor_worker_queue():
         ("project", "https://zulip.example.com", "author-user"): author_queue,
     }
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=command),
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=command),
+        ),
     ):
         worker._dispatch_zulip_outbound_state(state)
 
@@ -1472,28 +1751,31 @@ def test_dispatch_zulip_stream_outbound_state_uses_stream_user_worker_queue():
     stream_user_queue = queue.Queue()
     other_queue = queue.Queue()
     worker._worker_input_queues = {
-        ("project", "https://zulip.example.com", "stream-user"): (
-            stream_user_queue
-        ),
+        ("project", "https://zulip.example.com", "stream-user"): (stream_user_queue),
         ("project", "https://zulip.example.com", "other-user"): other_queue,
     }
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=object()),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=command),
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=object()),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=command),
+        ),
     ):
         worker._dispatch_zulip_outbound_state(state)
 
@@ -1530,24 +1812,26 @@ def test_dispatch_zulip_topic_outbound_state_uses_topic_user_worker_queue():
     topic_user_queue = queue.Queue()
     other_queue = queue.Queue()
     worker._worker_input_queues = {
-        ("project", "https://zulip.example.com", "topic-user"): (
-            topic_user_queue
-        ),
+        ("project", "https://zulip.example.com", "topic-user"): (topic_user_queue),
         ("project", "https://zulip.example.com", "other-user"): other_queue,
     }
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=command),
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=command),
+        ),
     ):
         worker._dispatch_zulip_outbound_state(state)
 
@@ -1577,18 +1861,22 @@ def test_dispatch_zulip_outbound_state_retries_without_credentials():
         account_settings=types.SimpleNamespace(credentials=None),
     )
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=object()),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(return_value=external_account),
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=object()),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(return_value=external_account),
+        ),
     ):
         worker._dispatch_zulip_outbound_state(state)
 
@@ -1613,19 +1901,23 @@ def test_dispatch_zulip_outbound_state_skips_noop_before_credentials():
         },
     )
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_build_zulip_outbound_command",
-        mock.Mock(return_value=None),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(),
-    ) as get_account:
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_build_zulip_outbound_command",
+            mock.Mock(return_value=None),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(),
+        ) as get_account,
+    ):
         worker._dispatch_zulip_outbound_state(state)
 
     get_account.assert_not_called()
@@ -1648,15 +1940,18 @@ def test_dispatch_zulip_outbound_state_skips_inbound_created_event():
         },
     )
 
-    with mock.patch.object(
-        worker,
-        "_get_zulip_outbound_event",
-        mock.Mock(return_value=event),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_outbound_account",
-        mock.Mock(),
-    ) as get_account:
+    with (
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_event",
+            mock.Mock(return_value=event),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_outbound_account",
+            mock.Mock(),
+        ) as get_account,
+    ):
         worker._dispatch_zulip_outbound_state(state)
 
     get_account.assert_not_called()
@@ -1701,14 +1996,17 @@ def test_zulip_sent_result_error_marks_outbound_failed_without_retry():
         zulip_message_id=12345,
     )
 
-    with mock.patch.object(
-        worker,
-        "_handle_zulip_message_sent",
-        mock.Mock(side_effect=RuntimeError("local boom")),
-    ), mock.patch.object(
-        worker,
-        "_get_outbound_state_for_command",
-        mock.Mock(return_value=state),
+    with (
+        mock.patch.object(
+            worker,
+            "_handle_zulip_message_sent",
+            mock.Mock(side_effect=RuntimeError("local boom")),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_outbound_state_for_command",
+            mock.Mock(return_value=state),
+        ),
     ):
         worker._execute_sync_command(command)
 
@@ -1753,9 +2051,7 @@ def test_expired_processing_outbound_state_is_failed_not_redispatched():
 
     assert expired_state.status == "failed"
     assert expired_state.next_retry_at is None
-    assert expired_state.last_error == (
-        "Zulip outbound command processing expired"
-    )
+    assert expired_state.last_error == ("Zulip outbound command processing expired")
     assert ready_states == [pending_state]
 
 
@@ -1766,15 +2062,18 @@ def test_build_update_zulip_message_command_skips_reaction_only_update():
         payload={"uuid": "message-uuid"},
     )
 
-    with mock.patch.object(
-        worker,
-        "_message_content_changed",
-        mock.Mock(return_value=False),
-    ), mock.patch.object(
-        worker,
-        "_get_workspace_message",
-        mock.Mock(),
-    ) as get_message:
+    with (
+        mock.patch.object(
+            worker,
+            "_message_content_changed",
+            mock.Mock(return_value=False),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_workspace_message",
+            mock.Mock(),
+        ) as get_message,
+    ):
         command = worker._build_update_zulip_message_command(event)
 
     assert command is None
@@ -2058,22 +2357,27 @@ def test_build_send_zulip_message_command_uses_direct_private_recipient():
             get_one_or_none=mock.Mock(return_value=recipient_account),
         )
 
-    with mock.patch.object(
-        worker,
-        "_get_workspace_message",
-        mock.Mock(return_value=message),
-    ), mock.patch.object(
-        worker,
-        "_get_workspace_stream",
-        mock.Mock(return_value=stream),
-    ), mock.patch.object(
-        worker,
-        "_get_workspace_topic",
-        mock.Mock(),
-    ) as get_topic, mock.patch.object(
-        agents.models,
-        "ExternalAccount",
-        FakeExternalAccount,
+    with (
+        mock.patch.object(
+            worker,
+            "_get_workspace_message",
+            mock.Mock(return_value=message),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_workspace_stream",
+            mock.Mock(return_value=stream),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_workspace_topic",
+            mock.Mock(),
+        ) as get_topic,
+        mock.patch.object(
+            agents.models,
+            "ExternalAccount",
+            FakeExternalAccount,
+        ),
     ):
         command = worker._build_send_zulip_message_command(event)
 
@@ -2083,9 +2387,7 @@ def test_build_send_zulip_message_command_uses_direct_private_recipient():
     assert command.recipient_ids == [42]
     assert command.content == "hello"
     get_topic.assert_not_called()
-    filters = FakeExternalAccount.objects.get_one_or_none.call_args.kwargs[
-        "filters"
-    ]
+    filters = FakeExternalAccount.objects.get_one_or_none.call_args.kwargs["filters"]
     assert filters["project_id"].value == "project"
     assert filters["account_type"].value == "zulip"
     assert filters["server_url"].value == "https://zulip.example.com"
@@ -2151,9 +2453,7 @@ def test_bridge_worker_syncs_due_user_providers():
         agents.WorkspaceIntegrationBridgeWorker()._sync_zulip_users()
 
     FakeExternalAccountUserSync.objects.get_all.assert_called_once()
-    filters = FakeExternalAccountUserSync.objects.get_all.call_args.kwargs[
-        "filters"
-    ]
+    filters = FakeExternalAccountUserSync.objects.get_all.call_args.kwargs["filters"]
     assert filters["account_type"].value == "zulip"
     provider.sync.assert_called_once_with()
 
@@ -2172,9 +2472,7 @@ def test_bridge_worker_syncs_due_iam_user_providers():
         agents.WorkspaceIntegrationBridgeWorker()._sync_iam_users()
 
     FakeExternalAccountUserSync.objects.get_all.assert_called_once()
-    filters = FakeExternalAccountUserSync.objects.get_all.call_args.kwargs[
-        "filters"
-    ]
+    filters = FakeExternalAccountUserSync.objects.get_all.call_args.kwargs["filters"]
     assert filters["account_type"].value == "iam"
     provider.sync.assert_called_once_with()
 
@@ -2185,18 +2483,14 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="first-user",
-        access_status=(
-            agents.models.ExternalAccountAccessStatus.CONFIRMED.value
-        ),
+        access_status=(agents.models.ExternalAccountAccessStatus.CONFIRMED.value),
         account_settings=types.SimpleNamespace(credentials=credentials),
     )
     second_user = types.SimpleNamespace(
         project_id="project",
         server_url="https://zulip.example.com",
         user_uuid="second-user",
-        access_status=(
-            agents.models.ExternalAccountAccessStatus.CONFIRMED.value
-        ),
+        access_status=(agents.models.ExternalAccountAccessStatus.CONFIRMED.value),
         account_settings=types.SimpleNamespace(credentials=credentials),
     )
     skipped_user = types.SimpleNamespace(
@@ -2284,9 +2578,7 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
     filters = FakeExternalAccount.objects.get_all.call_args.kwargs["filters"]
     assert filters["account_type"].value == "zulip"
     assert worker._workers[first_worker_key] is existing_worker
-    assert worker._workers[second_worker_key] is (
-        FakeZulipBridgeWorker.instances[0]
-    )
+    assert worker._workers[second_worker_key] is (FakeZulipBridgeWorker.instances[0])
     assert (
         "project",
         "https://zulip.example.com",
@@ -2298,9 +2590,7 @@ def test_bridge_worker_starts_zulip_bridge_workers_by_user_uuid():
         "unconfirmed-user",
     ) not in worker._workers
     assert FakeZulipBridgeWorker.instances[0].external_account is second_user
-    assert FakeZulipBridgeWorker.instances[0].output_queue is (
-        worker._sync_queue
-    )
+    assert FakeZulipBridgeWorker.instances[0].output_queue is (worker._sync_queue)
     assert worker._message_sync_worker_keys == {
         first_worker_key,
         second_worker_key,
@@ -2438,19 +2728,23 @@ def test_bridge_cache_skips_seen_stream_until_subscription_reset():
 
     cache = agents.WorkspaceIntegrationBridgeCache()
     with _patch_zulip_processed_entities():
-        with mock.patch.object(
-            agents.models,
-            "WorkspaceStream",
-            FakeWorkspaceStream,
-        ), mock.patch.object(
-            cache,
-            "_get_last_workspace_event_epoch",
-            mock.Mock(return_value=42),
-        ), mock.patch.object(
-            cache,
-            "_mark_inbound_zulip_events_skipped",
-            mock.Mock(),
-        ) as mark_skipped:
+        with (
+            mock.patch.object(
+                agents.models,
+                "WorkspaceStream",
+                FakeWorkspaceStream,
+            ),
+            mock.patch.object(
+                cache,
+                "_get_last_workspace_event_epoch",
+                mock.Mock(return_value=42),
+            ),
+            mock.patch.object(
+                cache,
+                "_mark_inbound_zulip_events_skipped",
+                mock.Mock(),
+            ) as mark_skipped,
+        ):
             with mock.patch.object(
                 agents.messenger_dm_helpers,
                 "update_workspace_user_stream",
@@ -2802,19 +3096,23 @@ def test_bridge_cache_updates_existing_zulip_stream_from_event():
             "WorkspaceStream",
             FakeWorkspaceStream,
         ):
-            with mock.patch.object(
-                agents.messenger_dm_helpers,
-                "update_workspace_user_stream",
-                mock.Mock(return_value=existing_stream),
-            ) as update_stream, mock.patch.object(
-                cache,
-                "_get_last_workspace_event_epoch",
-                mock.Mock(return_value=90),
-            ), mock.patch.object(
-                cache,
-                "_mark_inbound_zulip_events_skipped",
-                mock.Mock(),
-            ) as mark_skipped:
+            with (
+                mock.patch.object(
+                    agents.messenger_dm_helpers,
+                    "update_workspace_user_stream",
+                    mock.Mock(return_value=existing_stream),
+                ) as update_stream,
+                mock.patch.object(
+                    cache,
+                    "_get_last_workspace_event_epoch",
+                    mock.Mock(return_value=90),
+                ),
+                mock.patch.object(
+                    cache,
+                    "_mark_inbound_zulip_events_skipped",
+                    mock.Mock(),
+                ) as mark_skipped,
+            ):
                 result = cache.update_stream(
                     external_account=external_account,
                     stream_id=3,
@@ -3079,19 +3377,23 @@ def test_bridge_cache_updates_stream_subscription_notification_mode():
                 "WorkspaceStreamBinding",
                 FakeWorkspaceStreamBinding,
             ):
-                with mock.patch.object(
-                    agents.messenger_dm_helpers,
-                    "update_workspace_user_stream_notifications",
-                    mock.Mock(return_value=updated_stream),
-                ) as update_notifications, mock.patch.object(
-                    cache,
-                    "_get_last_workspace_event_epoch",
-                    mock.Mock(return_value=90),
-                ), mock.patch.object(
-                    cache,
-                    "_mark_inbound_zulip_events_skipped",
-                    mock.Mock(),
-                ) as mark_skipped:
+                with (
+                    mock.patch.object(
+                        agents.messenger_dm_helpers,
+                        "update_workspace_user_stream_notifications",
+                        mock.Mock(return_value=updated_stream),
+                    ) as update_notifications,
+                    mock.patch.object(
+                        cache,
+                        "_get_last_workspace_event_epoch",
+                        mock.Mock(return_value=90),
+                    ),
+                    mock.patch.object(
+                        cache,
+                        "_mark_inbound_zulip_events_skipped",
+                        mock.Mock(),
+                    ) as mark_skipped,
+                ):
                     result = cache.update_stream_subscription(
                         external_account=external_account,
                         stream_id=3,
@@ -3713,31 +4015,38 @@ def test_bridge_cache_syncs_zulip_read_flag_for_each_external_account():
     }
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_required_zulip_user_uuid",
-        mock.Mock(return_value="author-user"),
-    ), mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=None),
-    ), mock.patch.object(
-        cache,
-        "_save_processed_entity",
-        mock.Mock(),
-    ) as save_processed, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_user_message",
-        mock.Mock(return_value=message),
-    ) as get_or_create_message, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_stream_binding",
-        mock.Mock(),
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(),
-    ) as sync_flags:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_required_zulip_user_uuid",
+            mock.Mock(return_value="author-user"),
+        ),
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=None),
+        ),
+        mock.patch.object(
+            cache,
+            "_save_processed_entity",
+            mock.Mock(),
+        ) as save_processed,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_user_message",
+            mock.Mock(return_value=message),
+        ) as get_or_create_message,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_stream_binding",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(),
+        ) as sync_flags,
+    ):
         result = cache.get_or_create_message(
             external_account=first_account,
             stream=stream,
@@ -3818,34 +4127,42 @@ def test_bridge_cache_creates_missing_message_sender_from_zulip_payload():
     }
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_zulip_user_uuid",
-        mock.Mock(return_value=None),
-    ), mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=None),
-    ), mock.patch.object(
-        cache,
-        "_save_processed_entity",
-        mock.Mock(),
-    ), mock.patch.object(
-        agents.models,
-        "WorkspaceUser",
-        FakeWorkspaceUser,
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_user_message",
-        mock.Mock(return_value=message),
-    ) as get_or_create_message, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_stream_binding",
-        mock.Mock(),
-    ) as get_or_create_binding, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(),
+    with (
+        mock.patch.object(
+            cache,
+            "_get_zulip_user_uuid",
+            mock.Mock(return_value=None),
+        ),
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=None),
+        ),
+        mock.patch.object(
+            cache,
+            "_save_processed_entity",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceUser",
+            FakeWorkspaceUser,
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_user_message",
+            mock.Mock(return_value=message),
+        ) as get_or_create_message,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_stream_binding",
+            mock.Mock(),
+        ) as get_or_create_binding,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(),
+        ),
     ):
         result = cache.get_or_create_message(
             external_account=external_account,
@@ -3871,13 +4188,16 @@ def test_bridge_cache_creates_missing_message_sender_from_zulip_payload():
     )
     get_or_create_message.assert_called_once()
     assert get_or_create_message.call_args.kwargs["user_uuid"] == sender.uuid
-    assert cache._user_uuids[
-        (
-            "project",
-            "https://zulip.example.com",
-            6,
-        )
-    ] == sender.uuid
+    assert (
+        cache._user_uuids[
+            (
+                "project",
+                "https://zulip.example.com",
+                6,
+            )
+        ]
+        == sender.uuid
+    )
 
 
 def test_bridge_cache_preprocesses_existing_processed_message():
@@ -3909,36 +4229,44 @@ def test_bridge_cache_preprocesses_existing_processed_message():
     processed = types.SimpleNamespace(workspace_uuid="message-uuid")
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_required_zulip_user_uuid",
-        mock.Mock(return_value="author-user"),
-    ), mock.patch.object(
-        cache,
-        "preprocess_zulip_message",
-        mock.Mock(return_value=message_info),
-    ) as preprocess_message, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_user_message",
-        mock.Mock(),
-    ) as get_or_create_message, mock.patch.object(
-        agents.models.WorkspaceMessage,
-        "objects",
-        types.SimpleNamespace(
-            get_one_or_none=mock.Mock(return_value=message),
+    with (
+        mock.patch.object(
+            cache,
+            "_get_required_zulip_user_uuid",
+            mock.Mock(return_value="author-user"),
         ),
-    ) as messages, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(),
-    ), mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(return_value=55),
-    ), mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
+        mock.patch.object(
+            cache,
+            "preprocess_zulip_message",
+            mock.Mock(return_value=message_info),
+        ) as preprocess_message,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_user_message",
+            mock.Mock(),
+        ) as get_or_create_message,
+        mock.patch.object(
+            agents.models.WorkspaceMessage,
+            "objects",
+            types.SimpleNamespace(
+                get_one_or_none=mock.Mock(return_value=message),
+            ),
+        ) as messages,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(return_value=55),
+        ),
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ),
     ):
         with _patch_zulip_processed_entities(processed):
             result = cache.get_or_create_message(
@@ -3991,36 +4319,44 @@ def test_bridge_cache_rebinds_stale_processed_message():
     )
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_required_zulip_user_uuid",
-        mock.Mock(return_value="author-user"),
-    ), mock.patch.object(
-        agents.models.WorkspaceMessage,
-        "objects",
-        types.SimpleNamespace(
-            get_one_or_none=mock.Mock(return_value=None),
+    with (
+        mock.patch.object(
+            cache,
+            "_get_required_zulip_user_uuid",
+            mock.Mock(return_value="author-user"),
         ),
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_user_message",
-        mock.Mock(return_value=message),
-    ) as get_or_create_message, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_stream_binding",
-        mock.Mock(),
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(),
-    ), mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(return_value=55),
-    ), mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
+        mock.patch.object(
+            agents.models.WorkspaceMessage,
+            "objects",
+            types.SimpleNamespace(
+                get_one_or_none=mock.Mock(return_value=None),
+            ),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_user_message",
+            mock.Mock(return_value=message),
+        ) as get_or_create_message,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_stream_binding",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(return_value=55),
+        ),
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ),
     ):
         with _patch_zulip_processed_entities(processed):
             result = cache.get_or_create_message(
@@ -4067,38 +4403,47 @@ def test_bridge_cache_syncs_unread_zulip_message_flag():
     }
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_required_zulip_user_uuid",
-        mock.Mock(return_value="author-user"),
-    ), mock.patch.object(
-        cache,
-        "_get_processed_workspace_uuid",
-        mock.Mock(return_value=None),
-    ), mock.patch.object(
-        cache,
-        "_save_processed_entity",
-        mock.Mock(),
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_user_message",
-        mock.Mock(return_value=message),
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "get_or_create_workspace_stream_binding",
-        mock.Mock(),
-    ), mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(),
-    ) as sync_flags, mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(return_value=55),
-    ), mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
+    with (
+        mock.patch.object(
+            cache,
+            "_get_required_zulip_user_uuid",
+            mock.Mock(return_value="author-user"),
+        ),
+        mock.patch.object(
+            cache,
+            "_get_processed_workspace_uuid",
+            mock.Mock(return_value=None),
+        ),
+        mock.patch.object(
+            cache,
+            "_save_processed_entity",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_user_message",
+            mock.Mock(return_value=message),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_stream_binding",
+            mock.Mock(),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(),
+        ) as sync_flags,
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(return_value=55),
+        ),
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ),
     ):
         cache.get_or_create_message(
             external_account=external_account,
@@ -4127,23 +4472,28 @@ def test_bridge_cache_updates_zulip_read_flag_from_realtime_event():
     updated_message = types.SimpleNamespace(uuid="message-uuid", read=True)
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_zulip_workspace_message",
-        mock.Mock(return_value=message),
-    ) as get_message, mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(),
-    ) as get_last_epoch, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(return_value=updated_message),
-    ) as sync_flags, mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
-    ) as mark_skipped:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_zulip_workspace_message",
+            mock.Mock(return_value=message),
+        ) as get_message,
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(),
+        ) as get_last_epoch,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(return_value=updated_message),
+        ) as sync_flags,
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ) as mark_skipped,
+    ):
         result = cache.update_message_flags(
             external_account=external_account,
             message_ids=[104],
@@ -4177,23 +4527,28 @@ def test_bridge_cache_marks_unread_and_starred_realtime_flags_as_inbound():
     second_result = types.SimpleNamespace(uuid="second-message-uuid")
 
     cache = agents.WorkspaceIntegrationBridgeCache()
-    with mock.patch.object(
-        cache,
-        "_get_zulip_workspace_message",
-        mock.Mock(side_effect=[first_message, second_message]),
-    ), mock.patch.object(
-        cache,
-        "_get_last_workspace_event_epoch",
-        mock.Mock(side_effect=[55, 57]),
-    ) as get_last_epoch, mock.patch.object(
-        agents.messenger_dm_helpers,
-        "sync_workspace_user_message_flags",
-        mock.Mock(side_effect=[first_result, second_result]),
-    ) as sync_flags, mock.patch.object(
-        cache,
-        "_mark_inbound_zulip_events_skipped",
-        mock.Mock(),
-    ) as mark_skipped:
+    with (
+        mock.patch.object(
+            cache,
+            "_get_zulip_workspace_message",
+            mock.Mock(side_effect=[first_message, second_message]),
+        ),
+        mock.patch.object(
+            cache,
+            "_get_last_workspace_event_epoch",
+            mock.Mock(side_effect=[55, 57]),
+        ) as get_last_epoch,
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "sync_workspace_user_message_flags",
+            mock.Mock(side_effect=[first_result, second_result]),
+        ) as sync_flags,
+        mock.patch.object(
+            cache,
+            "_mark_inbound_zulip_events_skipped",
+            mock.Mock(),
+        ) as mark_skipped,
+    ):
         result = cache.update_message_flags(
             external_account=external_account,
             message_ids=[104, 105],
@@ -4253,8 +4608,7 @@ def test_bridge_worker_requeues_retryable_commands():
     assert worker._postponed_commands[0][1] is command
 
     worker._postponed_commands[0] = (
-        datetime.datetime.now(datetime.timezone.utc) -
-        datetime.timedelta(seconds=1),
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1),
         command,
     )
     worker._release_postponed_commands()
@@ -4275,12 +4629,9 @@ def test_bridge_worker_resets_stale_zulip_queue_subscription_version():
         subscription_version=1,
     )
 
-    result = (
-        agents.WorkspaceIntegrationBridgeWorker()
-        ._ensure_zulip_queue_subscription_version(
-            external_account=external_account,
-            queue_state=queue_state,
-        )
+    result = agents.WorkspaceIntegrationBridgeWorker()._ensure_zulip_queue_subscription_version(
+        external_account=external_account,
+        queue_state=queue_state,
     )
 
     assert result is queue_state
@@ -4356,22 +4707,27 @@ def test_bridge_worker_rebuilds_history_tasks_from_latest_message():
     done_task = types.SimpleNamespace(delete=mock.Mock())
     FakeZulipHistorySyncTask.inserted = []
     FakeZulipHistorySyncTask.objects = types.SimpleNamespace(
-        get_all=mock.Mock(side_effect=[
-            [pending_task],
-            [failed_task],
-            [done_task],
-        ]),
+        get_all=mock.Mock(
+            side_effect=[
+                [pending_task],
+                [failed_task],
+                [done_task],
+            ]
+        ),
     )
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with mock.patch.object(
-        agents.models,
-        "ZulipHistorySyncTask",
-        FakeZulipHistorySyncTask,
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_latest_message_id",
-        mock.Mock(return_value=250),
+    with (
+        mock.patch.object(
+            agents.models,
+            "ZulipHistorySyncTask",
+            FakeZulipHistorySyncTask,
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_latest_message_id",
+            mock.Mock(return_value=250),
+        ),
     ):
         created = worker._rebuild_zulip_history_sync_tasks(external_account)
 
@@ -4422,14 +4778,17 @@ def test_bridge_worker_processes_new_queue_by_rebuilding_history_tasks():
         external_account=external_account,
     )
 
-    with mock.patch.object(
-        worker,
-        "_rebuild_zulip_history_sync_tasks",
-        mock.Mock(return_value=3),
-    ) as rebuild_tasks, mock.patch.object(
-        worker,
-        "_get_or_create_zulip_queue_state",
-        mock.Mock(return_value=queue_state),
+    with (
+        mock.patch.object(
+            worker,
+            "_rebuild_zulip_history_sync_tasks",
+            mock.Mock(return_value=3),
+        ) as rebuild_tasks,
+        mock.patch.object(
+            worker,
+            "_get_or_create_zulip_queue_state",
+            mock.Mock(return_value=queue_state),
+        ),
     ):
         worker._execute_sync_command(command)
 
@@ -4458,41 +4817,51 @@ def test_bridge_worker_processes_one_history_task_newest_messages_first():
     )
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with mock.patch.object(
-        worker,
-        "_get_next_zulip_history_sync_task",
-        mock.Mock(return_value=task),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_history_task_external_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_fetch_zulip_history_task_messages",
-        mock.Mock(return_value=[
-            {"id": 101},
-            {"id": 199},
-            {"id": 150},
-        ]),
-    ), mock.patch.object(
-        worker,
-        "_sync_zulip_history_task_message",
-        mock.Mock(return_value=[]),
-    ) as sync_message, mock.patch.object(
-        worker,
-        "_has_pending_zulip_history_sync_tasks",
-        mock.Mock(return_value=False),
-    ), mock.patch.object(
-        worker,
-        "_update_external_account_zulip_queue_state",
-        mock.Mock(),
-    ) as update_queue_state:
+    with (
+        mock.patch.object(
+            worker,
+            "_get_next_zulip_history_sync_task",
+            mock.Mock(return_value=task),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_history_task_external_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_history_task_messages",
+            mock.Mock(
+                return_value=[
+                    {"id": 101},
+                    {"id": 199},
+                    {"id": 150},
+                ]
+            ),
+        ),
+        mock.patch.object(
+            worker,
+            "_sync_zulip_history_task_message",
+            mock.Mock(return_value=[]),
+        ) as sync_message,
+        mock.patch.object(
+            worker,
+            "_has_pending_zulip_history_sync_tasks",
+            mock.Mock(return_value=False),
+        ),
+        mock.patch.object(
+            worker,
+            "_update_external_account_zulip_queue_state",
+            mock.Mock(),
+        ) as update_queue_state,
+    ):
         worker._process_zulip_history_sync_task()
 
-    assert [
-        call.kwargs["message"]["id"]
-        for call in sync_message.call_args_list
-    ] == [199, 150, 101]
+    assert [call.kwargs["message"]["id"] for call in sync_message.call_args_list] == [
+        199,
+        150,
+        101,
+    ]
     assert task.status == "done"
     assert task.last_error is None
     task.update.assert_called_once_with()
@@ -4550,15 +4919,18 @@ def test_bridge_worker_fetches_single_history_task_message_directly():
     )
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with mock.patch.object(
-        worker,
-        "_fetch_zulip_message",
-        mock.Mock(return_value={"id": 5749}),
-    ) as fetch_message, mock.patch.object(
-        worker,
-        "_fetch_zulip_messages",
-        mock.Mock(return_value=[]),
-    ) as fetch_messages:
+    with (
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_message",
+            mock.Mock(return_value={"id": 5749}),
+        ) as fetch_message,
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_messages",
+            mock.Mock(return_value=[]),
+        ) as fetch_messages,
+    ):
         messages = worker._fetch_zulip_history_task_messages(
             external_account=external_account,
             task=task,
@@ -4586,15 +4958,18 @@ def test_bridge_worker_treats_invalid_single_history_message_as_empty_range():
     )
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with mock.patch.object(
-        worker,
-        "_fetch_zulip_message",
-        mock.Mock(return_value=None),
-    ) as fetch_message, mock.patch.object(
-        worker,
-        "_fetch_zulip_messages",
-        mock.Mock(return_value=[]),
-    ) as fetch_messages:
+    with (
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_message",
+            mock.Mock(return_value=None),
+        ) as fetch_message,
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_messages",
+            mock.Mock(return_value=[]),
+        ) as fetch_messages,
+    ):
         messages = worker._fetch_zulip_history_task_messages(
             external_account=external_account,
             task=task,
@@ -4631,10 +5006,9 @@ def test_bridge_worker_prefers_pending_history_tasks_without_error():
         result = worker._get_next_zulip_history_sync_task()
 
     assert result is errored_task
-    first_filters = (
-        FakeZulipHistorySyncTask.objects
-        .get_all.call_args_list[0].kwargs["filters"]
-    )
+    first_filters = FakeZulipHistorySyncTask.objects.get_all.call_args_list[0].kwargs[
+        "filters"
+    ]
     assert first_filters["status"].value == "pending"
     assert first_filters["last_error"].value is None
 
@@ -4658,27 +5032,33 @@ def test_bridge_worker_keeps_retryable_history_task_pending():
         stream_id=3,
     )
 
-    with mock.patch.object(
-        worker,
-        "_get_next_zulip_history_sync_task",
-        mock.Mock(return_value=task),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_history_task_external_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_fetch_zulip_history_task_messages",
-        mock.Mock(return_value=[{"id": 199}]),
-    ), mock.patch.object(
-        worker,
-        "_sync_zulip_history_task_message",
-        mock.Mock(side_effect=error),
-    ), mock.patch.object(
-        worker,
-        "_request_zulip_stream_sync",
-        mock.Mock(),
-    ) as request_stream_sync:
+    with (
+        mock.patch.object(
+            worker,
+            "_get_next_zulip_history_sync_task",
+            mock.Mock(return_value=task),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_history_task_external_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_history_task_messages",
+            mock.Mock(return_value=[{"id": 199}]),
+        ),
+        mock.patch.object(
+            worker,
+            "_sync_zulip_history_task_message",
+            mock.Mock(side_effect=error),
+        ),
+        mock.patch.object(
+            worker,
+            "_request_zulip_stream_sync",
+            mock.Mock(),
+        ) as request_stream_sync,
+    ):
         worker._process_zulip_history_sync_task()
 
     request_stream_sync.assert_called_once_with(error)
@@ -4704,22 +5084,27 @@ def test_bridge_worker_splits_network_error_history_task():
     worker = agents.WorkspaceIntegrationBridgeWorker()
     error = agents.requests.exceptions.ReadTimeout("slow Zulip response")
 
-    with mock.patch.object(
-        worker,
-        "_get_next_zulip_history_sync_task",
-        mock.Mock(return_value=task),
-    ), mock.patch.object(
-        worker,
-        "_get_zulip_history_task_external_account",
-        mock.Mock(return_value=external_account),
-    ), mock.patch.object(
-        worker,
-        "_fetch_zulip_history_task_messages",
-        mock.Mock(side_effect=error),
-    ), mock.patch.object(
-        agents.models,
-        "ZulipHistorySyncTask",
-        FakeZulipHistorySyncTask,
+    with (
+        mock.patch.object(
+            worker,
+            "_get_next_zulip_history_sync_task",
+            mock.Mock(return_value=task),
+        ),
+        mock.patch.object(
+            worker,
+            "_get_zulip_history_task_external_account",
+            mock.Mock(return_value=external_account),
+        ),
+        mock.patch.object(
+            worker,
+            "_fetch_zulip_history_task_messages",
+            mock.Mock(side_effect=error),
+        ),
+        mock.patch.object(
+            agents.models,
+            "ZulipHistorySyncTask",
+            FakeZulipHistorySyncTask,
+        ),
     ):
         FakeZulipHistorySyncTask.inserted = []
         FakeZulipHistorySyncTask.deleted = []
@@ -4974,9 +5359,7 @@ def test_bridge_worker_processes_stream_commands_during_stream_sync():
     stream_command.execute.assert_called_once_with(cache=worker._cache)
     message_command.execute.assert_not_called()
     response = worker._sync_queue.get_nowait()
-    assert agents.workers.get_sync_response_command(response) is (
-        message_command
-    )
+    assert agents.workers.get_sync_response_command(response) is (message_command)
 
 
 def test_bridge_worker_releases_stream_sync_barrier_on_finished_response():
@@ -5037,28 +5420,36 @@ def test_bridge_worker_uses_short_sync_queue_empty_wait():
 def test_bridge_worker_iteration_syncs_users():
     worker = agents.WorkspaceIntegrationBridgeWorker()
 
-    with mock.patch.object(
-        worker,
-        "_sync_zulip_external_account_accesses",
-    ) as sync_zulip_accesses, mock.patch.object(
-        worker,
-        "_sync_iam_users",
-    ) as sync_iam_users, mock.patch.object(
-        worker,
-        "_sync_zulip_users",
-    ) as sync_zulip_users, mock.patch.object(
-        worker,
-        "_start_bridges",
-    ) as start_bridges, mock.patch.object(
-        worker,
-        "_dispatch_zulip_outbound_events",
-    ) as dispatch_zulip_outbound_events, mock.patch.object(
-        worker,
-        "_process_zulip_history_sync_tasks",
-    ) as process_history_tasks, mock.patch.object(
-        worker,
-        "_process_sync_queue",
-    ) as process_sync_queue:
+    with (
+        mock.patch.object(
+            worker,
+            "_sync_zulip_external_account_accesses",
+        ) as sync_zulip_accesses,
+        mock.patch.object(
+            worker,
+            "_sync_iam_users",
+        ) as sync_iam_users,
+        mock.patch.object(
+            worker,
+            "_sync_zulip_users",
+        ) as sync_zulip_users,
+        mock.patch.object(
+            worker,
+            "_start_bridges",
+        ) as start_bridges,
+        mock.patch.object(
+            worker,
+            "_dispatch_zulip_outbound_events",
+        ) as dispatch_zulip_outbound_events,
+        mock.patch.object(
+            worker,
+            "_process_zulip_history_sync_tasks",
+        ) as process_history_tasks,
+        mock.patch.object(
+            worker,
+            "_process_sync_queue",
+        ) as process_sync_queue,
+    ):
         worker._run_iteration()
 
     sync_zulip_accesses.assert_called_once_with()

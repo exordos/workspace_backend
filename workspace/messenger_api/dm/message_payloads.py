@@ -32,6 +32,7 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
         return (
             ("@" + needle) in self.content
             or ("<@" + needle + ">") in self.content
+            or ("urn:user:" + needle) in self.content
         )
 
 

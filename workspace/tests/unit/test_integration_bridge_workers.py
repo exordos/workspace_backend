@@ -52,18 +52,22 @@ class FakeZulipClient:
         type(self).init_endpoint = endpoint
 
     def get_messages_with_api_key(self, login, token, message_filters):
-        type(self).calls.append({
-            "login": login,
-            "token": token,
-            "message_filters": dict(message_filters),
-        })
+        type(self).calls.append(
+            {
+                "login": login,
+                "token": token,
+                "message_filters": dict(message_filters),
+            }
+        )
         return type(self).pages.pop(0)
 
     def get_streams_with_api_key(self, login, token):
-        type(self).stream_calls.append({
-            "login": login,
-            "token": token,
-        })
+        type(self).stream_calls.append(
+            {
+                "login": login,
+                "token": token,
+            }
+        )
         return type(self).streams
 
     def get_stream_subscribers_with_api_key(
@@ -72,27 +76,33 @@ class FakeZulipClient:
         token,
         stream_id,
     ):
-        type(self).subscriber_calls.append({
-            "login": login,
-            "token": token,
-            "stream_id": stream_id,
-        })
+        type(self).subscriber_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "stream_id": stream_id,
+            }
+        )
         return type(self).subscribers[stream_id]
 
     def register_message_event_queue_with_api_key(self, login, token):
-        type(self).register_calls.append({
-            "login": login,
-            "token": token,
-        })
+        type(self).register_calls.append(
+            {
+                "login": login,
+                "token": token,
+            }
+        )
         return type(self).registered_queue
 
     def get_events_with_api_key(self, login, token, queue_id, last_event_id):
-        type(self).event_calls.append({
-            "login": login,
-            "token": token,
-            "queue_id": queue_id,
-            "last_event_id": last_event_id,
-        })
+        type(self).event_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "queue_id": queue_id,
+                "last_event_id": last_event_id,
+            }
+        )
         event_page = type(self).event_pages.pop(0)
         if isinstance(event_page, Exception):
             raise event_page
@@ -106,13 +116,15 @@ class FakeZulipClient:
         topic_name,
         content,
     ):
-        type(self).send_calls.append({
-            "login": login,
-            "token": token,
-            "stream_name": stream_name,
-            "topic_name": topic_name,
-            "content": content,
-        })
+        type(self).send_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "stream_name": stream_name,
+                "topic_name": topic_name,
+                "content": content,
+            }
+        )
         return {"id": 12345}
 
     def send_private_message_with_api_key(
@@ -122,29 +134,35 @@ class FakeZulipClient:
         recipient_ids,
         content,
     ):
-        type(self).send_private_calls.append({
-            "login": login,
-            "token": token,
-            "recipient_ids": recipient_ids,
-            "content": content,
-        })
+        type(self).send_private_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "recipient_ids": recipient_ids,
+                "content": content,
+            }
+        )
         return {"id": 12345}
 
     def update_message_with_api_key(self, login, token, message_id, content):
-        type(self).update_calls.append({
-            "login": login,
-            "token": token,
-            "message_id": message_id,
-            "content": content,
-        })
+        type(self).update_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
         return {"result": "success"}
 
     def delete_message_with_api_key(self, login, token, message_id):
-        type(self).delete_calls.append({
-            "login": login,
-            "token": token,
-            "message_id": message_id,
-        })
+        type(self).delete_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "message_id": message_id,
+            }
+        )
         return {"result": "success"}
 
     def add_reaction_with_api_key(
@@ -156,14 +174,16 @@ class FakeZulipClient:
         emoji_code=None,
         reaction_type=None,
     ):
-        type(self).add_reaction_calls.append({
-            "login": login,
-            "token": token,
-            "message_id": message_id,
-            "emoji_name": emoji_name,
-            "emoji_code": emoji_code,
-            "reaction_type": reaction_type,
-        })
+        type(self).add_reaction_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "message_id": message_id,
+                "emoji_name": emoji_name,
+                "emoji_code": emoji_code,
+                "reaction_type": reaction_type,
+            }
+        )
         return {"result": "success"}
 
     def remove_reaction_with_api_key(
@@ -175,14 +195,16 @@ class FakeZulipClient:
         emoji_code=None,
         reaction_type=None,
     ):
-        type(self).remove_reaction_calls.append({
-            "login": login,
-            "token": token,
-            "message_id": message_id,
-            "emoji_name": emoji_name,
-            "emoji_code": emoji_code,
-            "reaction_type": reaction_type,
-        })
+        type(self).remove_reaction_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "message_id": message_id,
+                "emoji_name": emoji_name,
+                "emoji_code": emoji_code,
+                "reaction_type": reaction_type,
+            }
+        )
         return {"result": "success"}
 
     def update_subscription_settings_with_api_key(
@@ -191,11 +213,13 @@ class FakeZulipClient:
         token,
         subscription_data,
     ):
-        type(self).update_subscription_calls.append({
-            "login": login,
-            "token": token,
-            "subscription_data": subscription_data,
-        })
+        type(self).update_subscription_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "subscription_data": subscription_data,
+            }
+        )
         return {"result": "success"}
 
     def update_user_topic_with_api_key(
@@ -206,31 +230,37 @@ class FakeZulipClient:
         topic,
         visibility_policy,
     ):
-        type(self).update_user_topic_calls.append({
-            "login": login,
-            "token": token,
-            "stream_id": stream_id,
-            "topic": topic,
-            "visibility_policy": visibility_policy,
-        })
+        type(self).update_user_topic_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "stream_id": stream_id,
+                "topic": topic,
+                "visibility_policy": visibility_policy,
+            }
+        )
         return {"result": "success"}
 
     def upload_file_with_api_key(self, login, token, file_name, data):
-        type(self).upload_calls.append({
-            "login": login,
-            "token": token,
-            "file_name": file_name,
-            "data": data,
-        })
+        type(self).upload_calls.append(
+            {
+                "login": login,
+                "token": token,
+                "file_name": file_name,
+                "data": data,
+            }
+        )
         return {"uri": f"/user_uploads/1/{file_name}"}
 
 
 def test_should_process_message_accepts_system_private_sender():
-    assert workers.should_process_message({
-        "id": 85,
-        "type": "private",
-        "sender_id": 7,
-    })
+    assert workers.should_process_message(
+        {
+            "id": 85,
+            "type": "private",
+            "sender_id": 7,
+        }
+    )
 
 
 def _external_account():
@@ -592,10 +622,12 @@ def test_zulip_bridge_worker_commands_sync_streams_and_messages():
     )
 
     def process_stream(stream, subscriber_ids=None):
-        processed_streams.append({
-            "stream": stream,
-            "subscriber_ids": subscriber_ids,
-        })
+        processed_streams.append(
+            {
+                "stream": stream,
+                "subscriber_ids": subscriber_ids,
+            }
+        )
         events.append("stream")
 
     def process_message(message, event_id=None):
@@ -1783,15 +1815,18 @@ def test_send_zulip_message_command_uploads_workspace_file_links():
         client_cls=FakeZulipClient,
     )
 
-    with mock.patch.object(
-        workers.messenger_dm_helpers,
-        "get_workspace_user_file",
-        return_value=file,
-    ) as get_file, mock.patch.object(
-        workers.file_storage,
-        "read_workspace_file",
-        return_value=b"image-data",
-    ) as read_file:
+    with (
+        mock.patch.object(
+            workers.messenger_dm_helpers,
+            "get_workspace_user_file",
+            return_value=file,
+        ) as get_file,
+        mock.patch.object(
+            workers.file_storage,
+            "read_workspace_file",
+            return_value=b"image-data",
+        ) as read_file,
+    ):
         workers.SendZulipMessage(
             epoch_version=55,
             message_uuid="message-uuid",
@@ -1823,6 +1858,216 @@ def test_send_zulip_message_command_uploads_workspace_file_links():
     ]
     assert FakeZulipClient.send_calls[0]["content"] == (
         "see ![photo.png](/user_uploads/1/photo.png)"
+    )
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+
+
+def test_send_zulip_message_command_uploads_workspace_video_links():
+    output_queue = queue.PriorityQueue()
+    file_uuid = sys_uuid.UUID("5f73361e-32bc-4373-8e39-bfffdcfb365b")
+    file = types.SimpleNamespace(
+        uuid=file_uuid,
+        name="clip.mp4",
+        storage_type="file",
+        storage_object_id="5f/file",
+    )
+    FakeZulipClient.send_calls = []
+    FakeZulipClient.upload_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    with (
+        mock.patch.object(
+            workers.messenger_dm_helpers,
+            "get_workspace_user_file",
+            return_value=file,
+        ),
+        mock.patch.object(
+            workers.file_storage,
+            "read_workspace_file",
+            return_value=b"video-data",
+        ),
+    ):
+        workers.SendZulipMessage(
+            epoch_version=55,
+            message_uuid="message-uuid",
+            stream_name="general",
+            topic_name="deploys",
+            content=f"see ![clip.mp4](urn:video:{file_uuid}?name=clip.mp4)",
+        ).execute(worker)
+
+    assert FakeZulipClient.upload_calls == [
+        {
+            "login": "user@example.com",
+            "token": "zulip-token",
+            "file_name": "clip.mp4",
+            "data": b"video-data",
+        },
+    ]
+    assert FakeZulipClient.send_calls[0]["content"] == (
+        "see ![clip.mp4](/user_uploads/1/clip.mp4)"
+    )
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+
+
+def test_send_zulip_message_command_leaves_unsafe_workspace_urns_unchanged():
+    output_queue = queue.PriorityQueue()
+    FakeZulipClient.send_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    content = (
+        "[bad file](urn:file:not-a-uuid) "
+        "[bad url](urn:url:javascript:alert) "
+        "[bad avatar](urn:gavatar:not-a-uuid)"
+    )
+    workers.SendZulipMessage(
+        epoch_version=55,
+        message_uuid="message-uuid",
+        stream_name="general",
+        topic_name="deploys",
+        content=content,
+    ).execute(worker)
+
+    assert FakeZulipClient.send_calls[0]["content"] == content
+    response = output_queue.get_nowait()
+    command = workers.get_sync_response_command(response)
+    assert isinstance(command, workers.ZulipMessageSent)
+
+
+def test_send_zulip_message_command_converts_workspace_entity_links():
+    output_queue = queue.PriorityQueue()
+    user_uuid = sys_uuid.UUID("0ded9f62-6c57-4305-8f5c-4e42d4f32fe5")
+    message_uuid = sys_uuid.UUID("6f063901-7b96-4f5a-b79b-58d6080c1c53")
+    stream_uuid = sys_uuid.UUID("38cab094-94b6-4d75-acf9-a2e8920fb40f")
+    topic_uuid = sys_uuid.UUID("eafcfdbb-ad1f-4095-a412-57e33425ab8b")
+    avatar_uuid = sys_uuid.UUID("f0f5b652-fd61-4932-9517-e67149cf4188")
+    account = types.SimpleNamespace(
+        account_settings=types.SimpleNamespace(
+            user_info=types.SimpleNamespace(
+                full_name="Jane Doe",
+                user_id=25,
+            ),
+        ),
+    )
+    stream = types.SimpleNamespace(
+        uuid=stream_uuid,
+        name="general",
+        private=False,
+        source_name="zulip",
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+        ),
+    )
+    topic = types.SimpleNamespace(
+        uuid=topic_uuid,
+        name="deploys",
+        stream_uuid=stream_uuid,
+        source_name="zulip",
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+            topic_name="deploys",
+        ),
+    )
+    message = types.SimpleNamespace(
+        uuid=message_uuid,
+        stream_uuid=stream_uuid,
+        topic_uuid=topic_uuid,
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+            topic_name="deploys",
+            message_id=100,
+        ),
+    )
+
+    class FakeExternalAccount:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=account),
+        )
+
+    class FakeWorkspaceMessage:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=message),
+        )
+
+    class FakeWorkspaceStream:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=stream),
+        )
+
+    class FakeWorkspaceStreamTopic:
+        objects = types.SimpleNamespace(
+            get_one_or_none=mock.Mock(return_value=topic),
+        )
+
+    FakeZulipClient.send_calls = []
+    worker = workers.ZulipBridgeWorker(
+        external_account=_external_account(),
+        input_queue=queue.Queue(),
+        output_queue=output_queue,
+        client_cls=FakeZulipClient,
+    )
+
+    with (
+        mock.patch.object(
+            workers.models,
+            "ExternalAccount",
+            FakeExternalAccount,
+        ),
+        mock.patch.object(
+            workers.models,
+            "WorkspaceMessage",
+            FakeWorkspaceMessage,
+        ),
+        mock.patch.object(
+            workers.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ),
+        mock.patch.object(
+            workers.models,
+            "WorkspaceStreamTopic",
+            FakeWorkspaceStreamTopic,
+        ),
+    ):
+        workers.SendZulipMessage(
+            epoch_version=55,
+            message_uuid="message-uuid",
+            stream_name="general",
+            topic_name="deploys",
+            content=(
+                f"hi [Jane](urn:user:{user_uuid}) "
+                f"[msg](urn:message:{message_uuid}) "
+                f"[stream](urn:stream:{stream_uuid}) "
+                f"[topic](urn:topic:{topic_uuid}) "
+                "[site](urn:url:https://example.com/a?x=1#section) "
+                f"![avatar](urn:gavatar:{avatar_uuid})"
+            ),
+        ).execute(worker)
+
+    assert FakeZulipClient.send_calls[0]["content"] == (
+        "hi @**Jane Doe|25** "
+        "[msg](https://zulip.example.com/#narrow/stream/3-general/"
+        "topic/deploys/near/100) "
+        "#**general** #**general>deploys** "
+        "[site](https://example.com/a?x=1#section) "
+        "![avatar](https://secure.gravatar.com/avatar/"
+        "f0f5b652fd6149329517e67149cf4188?d=identicon&s=500)"
     )
     response = output_queue.get_nowait()
     command = workers.get_sync_response_command(response)
@@ -1936,14 +2181,17 @@ def test_update_zulip_message_command_uploads_workspace_file_links():
         client_cls=FakeZulipClient,
     )
 
-    with mock.patch.object(
-        workers.messenger_dm_helpers,
-        "get_workspace_user_file",
-        return_value=file,
-    ), mock.patch.object(
-        workers.file_storage,
-        "read_workspace_file",
-        return_value=b"pdf-data",
+    with (
+        mock.patch.object(
+            workers.messenger_dm_helpers,
+            "get_workspace_user_file",
+            return_value=file,
+        ),
+        mock.patch.object(
+            workers.file_storage,
+            "read_workspace_file",
+            return_value=b"pdf-data",
+        ),
     ):
         workers.UpdateZulipMessage(
             epoch_version=56,
@@ -2261,11 +2509,13 @@ def test_add_message_executes_with_cache():
             self.calls = []
 
         def get_or_create_stream(self, external_account, stream_info):
-            self.calls.append({
-                "method": "get_or_create_stream",
-                "external_account": external_account,
-                "stream_info": stream_info,
-            })
+            self.calls.append(
+                {
+                    "method": "get_or_create_stream",
+                    "external_account": external_account,
+                    "stream_info": stream_info,
+                }
+            )
             return stream
 
         def get_or_create_topic(
@@ -2275,13 +2525,15 @@ def test_add_message_executes_with_cache():
             stream_info,
             topic_name,
         ):
-            self.calls.append({
-                "method": "get_or_create_topic",
-                "external_account": external_account,
-                "stream": stream,
-                "stream_info": stream_info,
-                "topic_name": topic_name,
-            })
+            self.calls.append(
+                {
+                    "method": "get_or_create_topic",
+                    "external_account": external_account,
+                    "stream": stream,
+                    "stream_info": stream_info,
+                    "topic_name": topic_name,
+                }
+            )
             return topic
 
         def get_or_create_message(
@@ -2293,15 +2545,17 @@ def test_add_message_executes_with_cache():
             topic_name,
             message_info,
         ):
-            self.calls.append({
-                "method": "get_or_create_message",
-                "external_account": external_account,
-                "stream": stream,
-                "topic": topic,
-                "stream_info": stream_info,
-                "topic_name": topic_name,
-                "message_info": message_info,
-            })
+            self.calls.append(
+                {
+                    "method": "get_or_create_message",
+                    "external_account": external_account,
+                    "stream": stream,
+                    "topic": topic,
+                    "stream_info": stream_info,
+                    "topic_name": topic_name,
+                    "message_info": message_info,
+                }
+            )
             return message
 
     cache = FakeCache()
@@ -2659,11 +2913,13 @@ def test_add_private_message_executes_with_cache():
             self.calls = []
 
         def get_or_create_stream(self, external_account, stream_info):
-            self.calls.append({
-                "method": "get_or_create_stream",
-                "external_account": external_account,
-                "stream_info": stream_info,
-            })
+            self.calls.append(
+                {
+                    "method": "get_or_create_stream",
+                    "external_account": external_account,
+                    "stream_info": stream_info,
+                }
+            )
             return stream
 
         def get_or_create_topic(
@@ -2673,13 +2929,15 @@ def test_add_private_message_executes_with_cache():
             stream_info,
             topic_name,
         ):
-            self.calls.append({
-                "method": "get_or_create_topic",
-                "external_account": external_account,
-                "stream": stream,
-                "stream_info": stream_info,
-                "topic_name": topic_name,
-            })
+            self.calls.append(
+                {
+                    "method": "get_or_create_topic",
+                    "external_account": external_account,
+                    "stream": stream,
+                    "stream_info": stream_info,
+                    "topic_name": topic_name,
+                }
+            )
             return topic
 
         def get_or_create_message(
@@ -2691,15 +2949,17 @@ def test_add_private_message_executes_with_cache():
             topic_name,
             message_info,
         ):
-            self.calls.append({
-                "method": "get_or_create_message",
-                "external_account": external_account,
-                "stream": stream,
-                "topic": topic,
-                "stream_info": stream_info,
-                "topic_name": topic_name,
-                "message_info": message_info,
-            })
+            self.calls.append(
+                {
+                    "method": "get_or_create_message",
+                    "external_account": external_account,
+                    "stream": stream,
+                    "topic": topic,
+                    "stream_info": stream_info,
+                    "topic_name": topic_name,
+                    "message_info": message_info,
+                }
+            )
             return message
 
     cache = FakeCache()
@@ -2794,10 +3054,12 @@ def test_update_message_executes_with_cache():
             self.calls = []
 
         def update_message(self, external_account, message_info):
-            self.calls.append({
-                "external_account": external_account,
-                "message_info": message_info,
-            })
+            self.calls.append(
+                {
+                    "external_account": external_account,
+                    "message_info": message_info,
+                }
+            )
             return message
 
     cache = FakeCache()
@@ -2845,10 +3107,12 @@ def test_delete_message_executes_with_cache():
             self.calls = []
 
         def delete_messages(self, external_account, message_ids):
-            self.calls.append({
-                "external_account": external_account,
-                "message_ids": message_ids,
-            })
+            self.calls.append(
+                {
+                    "external_account": external_account,
+                    "message_ids": message_ids,
+                }
+            )
             return messages
 
     cache = FakeCache()
@@ -2884,10 +3148,12 @@ def test_add_message_reaction_executes_with_cache():
             self.calls = []
 
         def add_message_reaction(self, external_account, reaction_info):
-            self.calls.append({
-                "external_account": external_account,
-                "reaction_info": reaction_info,
-            })
+            self.calls.append(
+                {
+                    "external_account": external_account,
+                    "reaction_info": reaction_info,
+                }
+            )
             return reaction
 
     cache = FakeCache()
@@ -2929,10 +3195,12 @@ def test_remove_message_reaction_executes_with_cache():
             self.calls = []
 
         def remove_message_reaction(self, external_account, reaction_info):
-            self.calls.append({
-                "external_account": external_account,
-                "reaction_info": reaction_info,
-            })
+            self.calls.append(
+                {
+                    "external_account": external_account,
+                    "reaction_info": reaction_info,
+                }
+            )
             return reaction
 
     cache = FakeCache()
@@ -2974,10 +3242,12 @@ def test_add_stream_executes_with_cache():
             self.calls = []
 
         def get_or_create_stream(self, external_account, stream_info):
-            self.calls.append({
-                "external_account": external_account,
-                "stream_info": stream_info,
-            })
+            self.calls.append(
+                {
+                    "external_account": external_account,
+                    "stream_info": stream_info,
+                }
+            )
             return stream
 
     cache = FakeCache()
@@ -3031,10 +3301,12 @@ def test_add_stream_uses_current_user_id_without_creator_id():
             self.calls = []
 
         def get_or_create_stream(self, external_account, stream_info):
-            self.calls.append({
-                "external_account": external_account,
-                "stream_info": stream_info,
-            })
+            self.calls.append(
+                {
+                    "external_account": external_account,
+                    "stream_info": stream_info,
+                }
+            )
             return stream
 
     cache = FakeCache()
