@@ -627,11 +627,23 @@ def fetch_existing_private_workspace_user_stream(project_id, user_uuid, stream,
 
 
 def create_workspace_stream_binding_events(binding, session=None):
-    user_stream = get_workspace_user_stream(
-        project_id=binding.project_id,
-        user_uuid=binding.user_uuid,
-        stream_uuid=binding.stream_uuid,
-    )
+    try:
+        user_stream = get_workspace_user_stream(
+            project_id=binding.project_id,
+            user_uuid=binding.user_uuid,
+            stream_uuid=binding.stream_uuid,
+        )
+    except storage_exc.RecordNotFound:
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(binding.stream_uuid),
+                "project_id": dm_filters.EQ(binding.project_id),
+            },
+            session=session,
+        )
+        if stream.source_name == models.SourceName.NATIVE.value:
+            raise
+        return
     messenger_events.create_stream_event(
         stream=user_stream,
         session=session,

@@ -266,6 +266,9 @@ class SyncStreamsNeeded(RetryCommandLater):
 
 class WorkspaceIntegrationBridgeCache:
     def __init__(self):
+        self.reset()
+
+    def reset(self):
         self._streams = {}
         self._topics = {}
         self._messages = {}
@@ -900,7 +903,7 @@ class WorkspaceIntegrationBridgeCache:
             return getattr(stream, "direct_user_uuid", None) is None
         return matches
 
-    def _load_or_create_stream(self, external_account, stream_info):
+    def _get_matching_workspace_stream(self, external_account, stream_info):
         for stream in models.WorkspaceStream.objects.get_all(
             filters={
                 "project_id": dm_filters.EQ(external_account.project_id),
@@ -913,6 +916,15 @@ class WorkspaceIntegrationBridgeCache:
                 stream_info=stream_info,
             ):
                 return stream
+        return None
+
+    def _load_or_create_stream(self, external_account, stream_info):
+        stream = self._get_matching_workspace_stream(
+            external_account=external_account,
+            stream_info=stream_info,
+        )
+        if stream is not None:
+            return stream
         if self._should_request_stream_sync(stream_info):
             raise SyncStreamsNeeded(
                 external_account=external_account,
@@ -1160,6 +1172,7 @@ class WorkspaceIntegrationBridgeCache:
             user_id=stream_info["creator_id"],
         )
         values = {
+            "uuid": sys_uuid.uuid4(),
             "project_id": external_account.project_id,
             "user_uuid": user_uuid,
             "name": stream_info["display_recipient"],
@@ -1176,8 +1189,14 @@ class WorkspaceIntegrationBridgeCache:
         }
         if self._is_private_stream_info(stream_info):
             if self._is_private_group_stream_info(stream_info):
-                return messenger_dm_helpers.create_workspace_private_group_stream(
+                stream = messenger_dm_helpers.create_workspace_private_group_stream(
                     **values
+                )
+                if stream is not None:
+                    return stream
+                return self._get_created_stream(
+                    external_account=external_account,
+                    stream_info=stream_info,
                 )
             if self._is_private_direct_stream_info(stream_info):
                 direct_user_uuid = self._get_private_direct_user_uuid(
@@ -1197,7 +1216,30 @@ class WorkspaceIntegrationBridgeCache:
                         stream_info["subscriber_ids"],
                     ),
                 )
-        return messenger_dm_helpers.get_or_create_workspace_user_stream(**values)
+        stream = messenger_dm_helpers.get_or_create_workspace_user_stream(
+            **values
+        )
+        if stream is not None:
+            return stream
+        return self._get_created_stream(
+            external_account=external_account,
+            stream_info=stream_info,
+        )
+
+    def _get_created_stream(self, external_account, stream_info):
+        stream = self._get_matching_workspace_stream(
+            external_account=external_account,
+            stream_info=stream_info,
+        )
+        if stream is None:
+            raise RetryCommandLater(
+                (
+                    "Postpone Zulip stream %s because workspace stream was "
+                    "not resolved after creation"
+                )
+                % stream_info["stream_id"],
+            )
+        return stream
 
     def _build_zulip_topic_source(
         self,
@@ -2711,8 +2753,12 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
 
     def _iteration(self):
         ctx = contexts.Context()
-        with ctx.session_manager():
-            self._run_iteration()
+        try:
+            with ctx.session_manager():
+                self._run_iteration()
+        except Exception:
+            self._cache.reset()
+            raise
 
     def _clear_finished_workers(self):
         for worker_key, worker in list(self._workers.items()):

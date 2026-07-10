@@ -902,6 +902,95 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             folder_uuids,
         )
 
+    def test_create_workspace_stream_binding_events_skips_hidden_zulip_stream(
+        self,
+    ):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+        binding = types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+        )
+        stream = types.SimpleNamespace(
+            source_name=dm_helpers.models.SourceName.ZULIP.value,
+        )
+
+        class FakeWorkspaceStream:
+            objects = mock.Mock()
+
+        FakeWorkspaceStream.objects.get_one.return_value = stream
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            side_effect=dm_helpers.storage_exc.RecordNotFound(
+                model=dm_helpers.models.WorkspaceUserStream,
+                filters={},
+            ),
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_stream_event",
+        ) as create_stream_event, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_folder_updated_event",
+        ) as create_folder_event:
+            dm_helpers.create_workspace_stream_binding_events(
+                binding=binding,
+                session=session,
+            )
+
+        get_stream = FakeWorkspaceStream.objects.get_one
+        filters = get_stream.call_args.kwargs["filters"]
+        self.assertEqual(stream_uuid, filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(session, get_stream.call_args.kwargs["session"])
+        create_stream_event.assert_not_called()
+        create_folder_event.assert_not_called()
+
+    def test_create_workspace_stream_binding_events_raises_for_hidden_native(
+        self,
+    ):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        binding = types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+        )
+        stream = types.SimpleNamespace(
+            source_name=dm_helpers.models.SourceName.NATIVE.value,
+        )
+
+        class FakeWorkspaceStream:
+            objects = mock.Mock()
+
+        FakeWorkspaceStream.objects.get_one.return_value = stream
+
+        with mock.patch.object(
+            dm_helpers,
+            "get_workspace_user_stream",
+            side_effect=dm_helpers.storage_exc.RecordNotFound(
+                model=dm_helpers.models.WorkspaceUserStream,
+                filters={},
+            ),
+        ), mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with self.assertRaises(dm_helpers.storage_exc.RecordNotFound):
+                dm_helpers.create_workspace_stream_binding_events(
+                    binding=binding,
+                )
+
     def test_create_workspace_stream_bindings_created_events_batches_bindings(self):
         project_id = sys_uuid.uuid4()
         owner_uuid = sys_uuid.uuid4()

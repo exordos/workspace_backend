@@ -2690,6 +2690,76 @@ def test_bridge_cache_gets_existing_stream_once():
     assert filters["source_name"].value == "zulip"
 
 
+def test_bridge_cache_uses_created_root_stream_when_user_stream_is_hidden():
+    created_stream = types.SimpleNamespace(
+        uuid="created-stream-uuid",
+        user_uuid="creator-user",
+        name="general",
+        description="General stream",
+        invite_only=False,
+        announce=False,
+        is_archived=False,
+        private=False,
+        source=types.SimpleNamespace(
+            stream_id=3,
+            server_url="https://zulip.example.com",
+        ),
+    )
+    external_account = types.SimpleNamespace(
+        project_id="project",
+        user_uuid="bridge-user",
+        server_url="https://zulip.example.com",
+    )
+    stream_info = {
+        "type": "stream",
+        "stream_id": 3,
+        "display_recipient": "general",
+        "description": "General stream",
+        "creator_id": 24,
+        "timestamp": 1770998098,
+        "invite_only": False,
+        "announce": False,
+        "is_archived": False,
+        "subscriber_ids": [],
+    }
+
+    class FakeWorkspaceStream:
+        objects = types.SimpleNamespace(
+            get_all=mock.Mock(side_effect=[[], [created_stream]]),
+        )
+
+    cache = agents.WorkspaceIntegrationBridgeCache()
+    with (
+        _patch_zulip_processed_entities(),
+        mock.patch.object(
+            agents.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ),
+        mock.patch.object(
+            cache,
+            "_get_required_zulip_user_uuid",
+            mock.Mock(return_value="creator-user"),
+        ),
+        mock.patch.object(
+            agents.messenger_dm_helpers,
+            "get_or_create_workspace_user_stream",
+            mock.Mock(return_value=None),
+        ) as get_or_create_stream,
+    ):
+        stream = cache.get_or_create_stream(
+            external_account=external_account,
+            stream_info=stream_info,
+        )
+
+    assert stream is created_stream
+    assert FakeWorkspaceStream.objects.get_all.call_count == 2
+    create_kwargs = get_or_create_stream.call_args.kwargs
+    assert create_kwargs["uuid"] is not None
+    assert create_kwargs["project_id"] == "project"
+    assert create_kwargs["user_uuid"] == "creator-user"
+
+
 def test_bridge_cache_skips_seen_stream_until_subscription_reset():
     existing_stream = types.SimpleNamespace(
         uuid="stream-uuid",
@@ -5459,3 +5529,47 @@ def test_bridge_worker_iteration_syncs_users():
     dispatch_zulip_outbound_events.assert_called_once_with()
     process_history_tasks.assert_called_once_with()
     process_sync_queue.assert_called_once_with()
+
+
+def test_bridge_worker_resets_cache_after_iteration_error():
+    class SessionManager:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    context = types.SimpleNamespace(
+        session_manager=mock.Mock(return_value=SessionManager()),
+    )
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    worker._cache._streams["stream"] = object()
+    worker._cache._topics["topic"] = object()
+    worker._cache._messages["message"] = object()
+    worker._cache._stream_bindings.add(("project", "stream", "user"))
+    worker._cache._file_import_errors.append("download failed")
+
+    with (
+        mock.patch.object(
+            agents.contexts,
+            "Context",
+            mock.Mock(return_value=context),
+        ),
+        mock.patch.object(
+            worker,
+            "_run_iteration",
+            mock.Mock(side_effect=RuntimeError("broken")),
+        ),
+    ):
+        try:
+            worker._iteration()
+        except RuntimeError as exc:
+            assert str(exc) == "broken"
+        else:
+            raise AssertionError("iteration error should be re-raised")
+
+    assert worker._cache._streams == {}
+    assert worker._cache._topics == {}
+    assert worker._cache._messages == {}
+    assert worker._cache._stream_bindings == set()
+    assert worker._cache._file_import_errors == []
