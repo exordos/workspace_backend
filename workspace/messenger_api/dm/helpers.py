@@ -1001,6 +1001,28 @@ def _create_workspace_stream_topic_events(project_id, topic_uuid, session=None):
     return user_topics
 
 
+def _create_workspace_stream_updated_events(project_id, stream_uuid):
+    user_streams = models.WorkspaceUserStream.objects.get_all(
+        filters={
+            "uuid": dm_filters.EQ(stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+    )
+    for user_stream in user_streams:
+        messenger_events.create_stream_updated_event(stream=user_stream)
+    return user_streams
+
+
+def _create_workspace_stream_topic_updated_events(project_id, topic_uuid):
+    if topic_uuid is None:
+        return
+    for user_topic in _get_workspace_user_stream_topics(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+    ):
+        messenger_events.create_topic_updated_event(topic=user_topic)
+
+
 def _get_workspace_stream_topic_for_user(project_id, user_uuid, topic_uuid):
     user_topic = get_workspace_user_stream_topic(
         project_id=project_id,
@@ -1067,10 +1089,24 @@ def delete_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
         user_uuid=user_uuid,
         topic_uuid=topic_uuid,
     )
-    for user_topic in _get_workspace_user_stream_topics(
+    user_topics = _get_workspace_user_stream_topics(
         project_id=project_id,
         topic_uuid=topic_uuid,
-    ):
+    )
+    stream = models.WorkspaceStream.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(topic.stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+    )
+    if stream.default_topic_uuid == topic.uuid:
+        stream.update_dm(values={"default_topic_uuid": None})
+        stream.update()
+        _create_workspace_stream_updated_events(
+            project_id=project_id,
+            stream_uuid=topic.stream_uuid,
+        )
+    for user_topic in user_topics:
         messenger_events.create_topic_deleted_event(
             project_id=project_id,
             user_uuid=user_topic.user_uuid,
@@ -1081,6 +1117,48 @@ def delete_workspace_user_stream_topic(project_id, user_uuid, topic_uuid,
             session=session,
         )
     topic.delete(session=session)
+
+
+def set_workspace_user_stream_topic_default(project_id, user_uuid,
+                                            topic_uuid):
+    topic = _get_workspace_stream_topic_for_user(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+    )
+    stream = models.WorkspaceStream.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(topic.stream_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
+    )
+    previous_topic_uuid = stream.default_topic_uuid
+    if previous_topic_uuid == topic.uuid:
+        return get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+        )
+
+    stream.update_dm(values={"default_topic_uuid": topic.uuid})
+    stream.update()
+    _create_workspace_stream_updated_events(
+        project_id=project_id,
+        stream_uuid=topic.stream_uuid,
+    )
+    _create_workspace_stream_topic_updated_events(
+        project_id=project_id,
+        topic_uuid=previous_topic_uuid,
+    )
+    _create_workspace_stream_topic_updated_events(
+        project_id=project_id,
+        topic_uuid=topic.uuid,
+    )
+    return get_workspace_user_stream_topic(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+    )
 
 
 def _set_workspace_user_topic_done(project_id, user_uuid, topic_uuid,
@@ -1246,6 +1324,7 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
         )
 
     _ensure_color(kwargs)
+    default_topic_uuid = sys_uuid.uuid4()
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
@@ -1253,6 +1332,7 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
         private=True,
         direct_user_uuid=direct_user_uuid,
         private_index=private_index,
+        default_topic_uuid=default_topic_uuid,
         **kwargs,
     )
     stream.insert(session=session)
@@ -1269,12 +1349,11 @@ def _get_or_create_private_workspace_user_stream(project_id, user_uuid,
 
     default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
+        uuid=default_topic_uuid,
         stream_uuid=stream.uuid,
         name=default_topic_name,
-        default_for_stream_uuid=stream.uuid,
         **_get_default_topic_source_fields(kwargs, default_topic_name),
     )
-
     result = None
     for user_stream in models.WorkspaceUserStream.objects.get_all(
         filters={
@@ -1313,11 +1392,13 @@ def create_workspace_private_group_stream(project_id, user_uuid, session=None,
         raise messenger_exc.PrivateIndexIsTechnicalFieldError()
 
     _ensure_color(kwargs)
+    default_topic_uuid = sys_uuid.uuid4()
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
         user_uuid=user_uuid,
         private=True,
+        default_topic_uuid=default_topic_uuid,
         **kwargs,
     )
     stream.insert(session=session)
@@ -1332,12 +1413,11 @@ def create_workspace_private_group_stream(project_id, user_uuid, session=None,
 
     default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
+        uuid=default_topic_uuid,
         stream_uuid=stream.uuid,
         name=default_topic_name,
-        default_for_stream_uuid=stream.uuid,
         **_get_default_topic_source_fields(kwargs, default_topic_name),
     )
-
     result = None
     for user_stream in models.WorkspaceUserStream.objects.get_all(
         filters={
@@ -1386,10 +1466,12 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
         )
 
     _ensure_color(kwargs)
+    default_topic_uuid = sys_uuid.uuid4()
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
         user_uuid=user_uuid,
+        default_topic_uuid=default_topic_uuid,
         **kwargs,
     )
     stream.insert(session=session)
@@ -1404,12 +1486,11 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None,
 
     default_topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
+        uuid=default_topic_uuid,
         stream_uuid=stream.uuid,
         name=default_topic_name,
-        default_for_stream_uuid=stream.uuid,
         **_get_default_topic_source_fields(kwargs, default_topic_name),
     )
-
     result = None
     for user_stream in models.WorkspaceUserStream.objects.get_all(
         filters={
@@ -1931,11 +2012,19 @@ def delete_workspace_message_reaction(project_id, user_uuid, reaction_uuid,
 
 
 def _get_workspace_stream_default_topic(project_id, stream_uuid):
+    stream = models.WorkspaceStream.objects.get_one(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "uuid": dm_filters.EQ(stream_uuid),
+        },
+    )
+    if stream.default_topic_uuid is None:
+        raise messenger_exc.StreamDefaultTopicNotConfiguredError()
     return models.WorkspaceStreamTopic.objects.get_one(
         filters={
             "project_id": dm_filters.EQ(project_id),
             "stream_uuid": dm_filters.EQ(stream_uuid),
-            "default_for_stream_uuid": dm_filters.EQ(stream_uuid),
+            "uuid": dm_filters.EQ(stream.default_topic_uuid),
         },
     )
 

@@ -251,6 +251,10 @@ class WorkspaceStreamBase(
         types.Integer(min_value=0, max_value=COLOR_MAX_VALUE),
         default=random_color,
     )
+    default_topic_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
 
 
 class WorkspaceUserStreamBase(
@@ -317,4 +321,9 @@ class WorkspaceUserStreamBase(
     last_message_uuid = properties.property(
         types.AllowNone(types.UUID()),
         default=None,
+    )
+    default_topic_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+        read_only=True,
     )

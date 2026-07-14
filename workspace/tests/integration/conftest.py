@@ -390,19 +390,25 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name,
                       is_default=False):
     """Insert a topic and the binding needed for the user topics view."""
     topic_uuid = sys_uuid.uuid4()
-    default_for = str(stream_uuid) if is_default else None
     seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid)
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO m_workspace_stream_topics
-                (uuid, project_id, name, stream_uuid, default_for_stream_uuid,
-                 created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                (uuid, project_id, name, stream_uuid, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, NOW(), NOW())
             """,
-            (str(topic_uuid), str(project_id), name, str(stream_uuid),
-             default_for),
+            (str(topic_uuid), str(project_id), name, str(stream_uuid)),
         )
+        if is_default:
+            cur.execute(
+                """
+                UPDATE m_workspace_streams
+                SET default_topic_uuid = %s
+                WHERE uuid = %s AND project_id = %s
+                """,
+                (str(topic_uuid), str(stream_uuid), str(project_id)),
+            )
     return str(topic_uuid)
 
 

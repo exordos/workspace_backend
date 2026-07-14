@@ -48,3 +48,8 @@ class InvalidTopicNotificationModeError(ra_exc.ValidationErrorException):
         "notification mode"
     )
     code = 400001006
+
+
+class StreamDefaultTopicNotConfiguredError(ra_exc.ValidationErrorException):
+    message = "Stream default topic is not configured"
+    code = 400001007

@@ -202,6 +202,7 @@ GET /v1/events/?epoch_version%3E=123&page_limit=500
 | `DELETE` | `/v1/stream_topics/{topic_uuid}` | Delete a topic. |
 | `POST` | `/v1/stream_topics/{topic_uuid}/toggle_done/` | Toggle the shared `is_done` flag for all topic users. |
 | `POST` | `/v1/stream_topics/{topic_uuid}/actions/notifications/invoke` | Set current user's topic notification mode. |
+| `POST` | `/v1/stream_topics/{topic_uuid}/actions/set_default/invoke` | Make the topic its stream's default topic. |
 | `POST` | `/v1/stream_topics/{topic_uuid}/actions/read/invoke` | Mark all unread topic messages as read for the current user. |
 | `GET` | `/v1/messages/` | List messages visible to the current IAM user. |
 | `POST` | `/v1/messages/` | Create a message. |
@@ -488,8 +489,13 @@ Realtime side effects:
 ## Streams
 
 `POST /v1/streams/` writes to `m_workspace_streams`, creates owner bindings,
-and creates a default topic named `General Topic`. Reads use
-`m_workspace_user_streams`.
+creates a default topic named `General Topic`, and stores its UUID in
+`m_workspace_streams.default_topic_uuid`. Reads use `m_workspace_user_streams`.
+The reference is nullable and becomes `null` when the current default topic is
+deleted. REST resource responses follow the standard RestAlchemy JSON packer
+and omit nullable fields whose value is `null`, so clients must also treat a
+missing `default_topic_uuid` as `null`. Durable `stream.updated` events are full
+snapshots and keep `default_topic_uuid: null` explicitly.
 
 If `direct_user_uuid` is provided, the backend creates a two-user private
 stream, sets `private: true`, stores `private_index` as
@@ -567,6 +573,7 @@ the provider sync can refresh read/unread status normally.
 | `is_archived` | boolean | no | action-managed | Archived flag. |
 | `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
 | `last_message_uuid` | UUID or `null` | no | yes | Latest message in the stream, or `null` when empty. |
+| `default_topic_uuid` | UUID or `null` | no | yes | Current default topic UUID, or `null` when no default is configured. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -703,7 +710,7 @@ custom folders. Other stream users do not receive a binding-delete event.
 | `color` | integer `0..0xFFFFFF` | no | no | Topic color; generated randomly when omitted or `null`. |
 | `last_message_uuid` | UUID or `null` | no | yes | Latest message in the topic, or `null` when empty. |
 | `unread_count` | integer | no | yes | Current user's unread count for the topic. |
-| `is_default` | boolean | no | yes | Whether this is the stream default topic. |
+| `is_default` | boolean | no | yes | Whether this topic UUID equals the stream's `default_topic_uuid`. |
 | `is_done` | boolean | no | action-managed | Current user's done flag. |
 | `notification_mode` | `mute`, `default`, `unmute`, `follow` | no | user-scoped action-managed | Current user's topic notification mode; defaults to `default`. |
 | `source_name` | `native`, `zulip` | no | no | Topic source name; defaults to `native` when omitted. |
@@ -726,6 +733,12 @@ renaming the topic.
 
 `POST /v1/stream_topics/{topic_uuid}/toggle_done/` flips `is_done` for all
 topic users and returns the current user's updated topic view.
+
+`POST /v1/stream_topics/{topic_uuid}/actions/set_default/invoke` sets the
+topic as its stream's default and returns the current user's updated topic
+view. The operation is idempotent. A changed default emits `stream.updated`
+for every stream user and `topic.updated` for the previous and new default
+topics.
 
 `POST /v1/stream_topics/{topic_uuid}/actions/notifications/invoke` sets the
 current user's topic notification mode:
@@ -756,10 +769,11 @@ Realtime side effects:
 | create topic | `topic.created` | `topic` | Full user topic snapshot for every stream user. |
 | rename topic | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | toggle done | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| set default topic | `stream.updated`, `topic.updated` | `stream`, `topic` | Updated stream snapshot and previous/new default topic snapshots for every stream user. |
 | change topic notification mode | `topic.updated` | `topic` | Full user topic snapshot for the current user only. |
 | read topic messages | `topic.read` | `topic` | Full user topic snapshot returned by the action. |
 | read topic messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
-| delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. |
+| delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. Deleting the default topic also emits `stream.updated` with `default_topic_uuid: null`. |
 
 ## Messages
 
@@ -800,7 +814,7 @@ syntax. The URL part is a Workspace URN:
 | `uuid` | UUID | no | yes | Message identifier. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
-| `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. |
+| `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. The request fails with code `400001007` when the stream has no default. |
 | `author_uuid` | UUID | no | yes | Message author. |
 | `payload` | object | yes | no | Message payload. |
 | `user_uuid` | UUID | no | yes | Current user in the user message view. |

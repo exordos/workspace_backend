@@ -867,6 +867,14 @@ class WorkspaceStreamTopicController(
         )
 
     @ra_actions.post
+    def set_default(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.set_workspace_user_stream_topic_default(
+            project_id=self._get_project_id(),
+            user_uuid=self._get_user_uuid(),
+            topic_uuid=resource.uuid,
+        )
+
+    @ra_actions.post
     def read(self, resource, *args, **kwargs):
         return messenger_dm_helpers.read_workspace_user_stream_topic_messages(
             project_id=self._get_project_id(),

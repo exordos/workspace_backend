@@ -1345,6 +1345,8 @@ def test_stream_create_writes_realtime_event(api, db):
     assert payload["unread_count"] == 0
     assert stream.get("last_message_uuid") is None
     assert payload.get("last_message_uuid") is None
+    assert stream["default_topic_uuid"] is not None
+    assert payload["default_topic_uuid"] == stream["default_topic_uuid"]
     assert 0 <= stream["color"] <= 0xFFFFFF
     assert payload["color"] == stream["color"]
     assert payload["source_name"] == "native"
@@ -1365,12 +1367,14 @@ def test_stream_create_writes_realtime_event(api, db):
     assert event["payload"]["notification_mode"] == "all_messages"
     assert event["payload"]["color"] == stream["color"]
     assert event["payload"].get("last_message_uuid") is None
+    assert event["payload"]["default_topic_uuid"] == stream["default_topic_uuid"]
 
     topic_epoch_version, topic_user_uuid, topic_payload = rows[3]
     assert str(topic_user_uuid) == str(api.user_uuid)
     assert topic_payload["kind"] == "topic.created"
     assert topic_payload["name"] == "General Topic"
     assert topic_payload["stream_uuid"] == stream["uuid"]
+    assert topic_payload["uuid"] == stream["default_topic_uuid"]
     assert topic_payload["user_uuid"] == str(api.user_uuid)
     assert topic_payload["project_id"] == str(api.project_id)
     assert topic_payload["is_default"] is True
@@ -2352,6 +2356,125 @@ def test_stream_topic_delete_cascades_topic_messages(api, db):
     }
     for _, payload in event_rows:
         assert payload["stream_uuid"] == stream_uuid
+
+
+def test_stream_topic_set_default_updates_stream_and_topics(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-default-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    previous_topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "planning"
+    )
+
+    resp = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_default/invoke"
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["uuid"] == topic_uuid
+    assert resp.json()["is_default"] is True
+
+    resp = api.get(f"{STREAMS}{stream_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["default_topic_uuid"] == topic_uuid
+
+    resp = api.get(f"{STREAM_TOPICS}{previous_topic_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_default"] is False
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND payload->>'kind' = 'stream.updated'
+              AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, stream_uuid),
+        )
+        stream_events = cur.fetchall()
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND payload->>'kind' = 'topic.updated'
+              AND payload->>'uuid' IN (%s, %s)
+            ORDER BY payload->>'uuid', user_uuid
+            """,
+            (api.project_id, previous_topic_uuid, topic_uuid),
+        )
+        topic_events = cur.fetchall()
+
+    assert {str(row[0]) for row in stream_events} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    assert all(
+        payload["default_topic_uuid"] == topic_uuid
+        for _, payload in stream_events
+    )
+    assert len(topic_events) == 4
+    assert {
+        (payload["uuid"], payload["is_default"])
+        for _, payload in topic_events
+    } == {
+        (previous_topic_uuid, False),
+        (topic_uuid, True),
+    }
+
+
+def test_stream_default_topic_delete_sends_stream_update(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-default-delete-team"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, stream_uuid, other_user
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        is_default=True,
+    )
+
+    resp = api.delete(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code in (200, 204), resp.text
+
+    resp = api.get(f"{STREAMS}{stream_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("default_topic_uuid") is None
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND payload->>'kind' = 'stream.updated'
+              AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, stream_uuid),
+        )
+        stream_events = cur.fetchall()
+
+    assert {str(row[0]) for row in stream_events} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    assert all(
+        payload["default_topic_uuid"] is None
+        for _, payload in stream_events
+    )
 
 
 def test_stream_topic_is_done_flag(api, db):
@@ -3562,6 +3685,26 @@ def test_message_create_uses_stream_default_topic(api, db):
 
     assert str(stored_topic_uuid) == topic_uuid
     assert event_payload["topic_uuid"] == topic_uuid
+
+
+def test_message_create_without_topic_rejects_stream_without_default(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "no-default-topic-team"
+    )
+
+    resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "missing default topic",
+            },
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["code"] == 400001007
 
 
 def test_message_helper_writes_visible_event(api, db):

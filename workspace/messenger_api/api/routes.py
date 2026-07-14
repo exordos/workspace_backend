@@ -194,6 +194,10 @@ class WorkspaceStreamTopicNotificationsAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
 
+class WorkspaceStreamTopicSetDefaultAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamTopicController
+
+
 class WorkspaceStreamTopicReadAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
@@ -218,6 +222,10 @@ class WorkspaceStreamTopicRoute(routes.Route):
     )
     notifications = routes.action(
         WorkspaceStreamTopicNotificationsAction,
+        invoke=True,
+    )
+    set_default = routes.action(
+        WorkspaceStreamTopicSetDefaultAction,
         invoke=True,
     )
     read = routes.action(WorkspaceStreamTopicReadAction, invoke=True)

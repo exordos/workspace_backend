@@ -198,6 +198,38 @@ def test_topic_controller_toggle_done_uses_context_scope():
     )
 
 
+def test_topic_controller_set_default_uses_context_scope():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            project_id=project_id,
+            user_uuid=user_uuid,
+        )
+    )
+    controller = controllers.WorkspaceStreamTopicController(request)
+    resource = types.SimpleNamespace(uuid=topic_uuid)
+    returned_topic = object()
+
+    with mock.patch.object(
+        controllers.messenger_dm_helpers,
+        "set_workspace_user_stream_topic_default",
+        return_value=returned_topic,
+    ) as set_default:
+        result = controllers.WorkspaceStreamTopicController.set_default._post(
+            self=controller,
+            resource=resource,
+        )
+
+    assert result is returned_topic
+    set_default.assert_called_once_with(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        topic_uuid=topic_uuid,
+    )
+
+
 def test_topic_controller_notifications_uses_context_scope():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()

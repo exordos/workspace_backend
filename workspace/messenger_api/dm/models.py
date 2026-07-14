@@ -1178,9 +1178,13 @@ class WorkspaceUserStream(base.WorkspaceUserStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_user_streams"
 
     def get_default_topic(self):
+        if self.default_topic_uuid is None:
+            return None
         return WorkspaceStreamTopic.objects.get_one(
             filters={
-                "default_for_stream_uuid": dm_filters.EQ(self.uuid),
+                "uuid": dm_filters.EQ(self.default_topic_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.uuid),
             }
         )
 
@@ -1314,9 +1318,6 @@ class WorkspaceStreamTopic(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_stream_topics"
-    __custom_properties__ = {
-        "is_default": types.Boolean(),
-    }
 
     name = properties.property(
         types.String(max_length=128),
@@ -1330,15 +1331,6 @@ class WorkspaceStreamTopic(
         types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
         default=base.random_color,
     )
-    default_for_stream_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        required=False,
-    )
-
-    @property
-    def is_default(self):
-        return self.default_for_stream_uuid is not None
-
     def get_recipients(self, session=None):
         return get_stream_recipients(
             project_id=self.project_id,
