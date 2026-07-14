@@ -1413,7 +1413,7 @@ class ZulipBridgeWorker(threading.Thread):
                 match=match,
                 parsed_urn=parsed_urn,
             )
-        if parsed_urn["type"] == "gavatar":
+        if parsed_urn["type"] == "gravatar":
             return self._convert_workspace_generated_avatar_link(
                 match=match,
                 parsed_urn=parsed_urn,
@@ -1453,11 +1453,11 @@ class ZulipBridgeWorker(threading.Thread):
         )
 
     def _convert_workspace_generated_avatar_link(self, match, parsed_urn):
-        try:
-            user_uuid = sys_uuid.UUID(parsed_urn["value"])
-        except ValueError:
+        avatar_hash = parsed_urn["value"]
+        if models.WORKSPACE_USER_GRAVATAR_HASH_RE.fullmatch(
+            avatar_hash,
+        ) is None:
             return None
-        avatar_hash = str(user_uuid).replace("-", "")
         return markdown_links.build_markdown_link(
             bang=match.group("bang"),
             name=match.group("name"),

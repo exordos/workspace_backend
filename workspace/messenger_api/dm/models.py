@@ -16,6 +16,8 @@
 
 import datetime
 import enum
+import hashlib
+import re
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
@@ -367,13 +369,26 @@ class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
 
 
 WORKSPACE_USER_AVATAR_MAX_LENGTH = 2048
-WORKSPACE_USER_DEFAULT_AVATAR_PREFIX = "urn:gavatar:"
+WORKSPACE_USER_GRAVATAR_PREFIX = "urn:gravatar:"
 WORKSPACE_USER_IMAGE_AVATAR_PREFIX = "urn:image:"
 WORKSPACE_USER_URL_AVATAR_PREFIX = "urn:url:"
+WORKSPACE_USER_GRAVATAR_HASH_RE = re.compile(
+    r"(?:[0-9a-f]{32}|[0-9a-f]{64})",
+    re.IGNORECASE,
+)
+
+
+def build_workspace_user_gravatar_avatar(email):
+    normalized_email = email.strip().lower().encode()
+    email_hash = hashlib.md5(
+        normalized_email,
+        usedforsecurity=False,
+    ).hexdigest()
+    return "%s%s" % (WORKSPACE_USER_GRAVATAR_PREFIX, email_hash)
 
 
 def build_workspace_user_default_avatar(user_uuid):
-    return "%s%s" % (WORKSPACE_USER_DEFAULT_AVATAR_PREFIX, user_uuid)
+    return build_workspace_user_gravatar_avatar(str(user_uuid))
 
 
 class WorkspaceUserAvatarType(types.String):
@@ -392,8 +407,15 @@ class WorkspaceUserAvatarType(types.String):
         return (
             self._is_uuid_urn(value, WORKSPACE_USER_IMAGE_AVATAR_PREFIX)
             or self._is_url_urn(value)
-            or self._is_uuid_urn(value, WORKSPACE_USER_DEFAULT_AVATAR_PREFIX)
+            or self._is_gravatar_urn(value)
         )
+
+    @staticmethod
+    def _is_gravatar_urn(value):
+        if not value.startswith(WORKSPACE_USER_GRAVATAR_PREFIX):
+            return False
+        avatar_hash = value[len(WORKSPACE_USER_GRAVATAR_PREFIX):]
+        return WORKSPACE_USER_GRAVATAR_HASH_RE.fullmatch(avatar_hash) is not None
 
     @staticmethod
     def _is_uuid_urn(value, prefix):
@@ -424,9 +446,13 @@ class WorkspaceUser(
         if "uuid" not in kwargs:
             kwargs["uuid"] = sys_uuid.uuid4()
         if "avatar" not in kwargs or kwargs["avatar"] is None:
-            kwargs["avatar"] = build_workspace_user_default_avatar(
-                kwargs["uuid"],
-            )
+            email = kwargs.get("email")
+            if email:
+                kwargs["avatar"] = build_workspace_user_gravatar_avatar(email)
+            else:
+                kwargs["avatar"] = build_workspace_user_default_avatar(
+                    kwargs["uuid"],
+                )
         super(WorkspaceUser, self).pour(**kwargs)
 
     username = properties.property(
@@ -610,6 +636,7 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
             else:
                 self._update_zulip_external_account(
                     external_account=synced_account,
+                    user=user,
                     user_info=user_info,
                 )
             synced_accounts.append(synced_account)
@@ -656,7 +683,9 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
         user,
         user_info,
     ):
-        workspace_user = self._get_or_create_workspace_user(user=user)
+        workspace_user = self._get_or_create_workspace_user(
+            user=user,
+        )
         synced_account = type(external_account)(
             project_id=external_account.project_id,
             user_uuid=workspace_user.uuid,
@@ -671,7 +700,19 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
         synced_account.insert()
         return synced_account
 
-    def _update_zulip_external_account(self, external_account, user_info):
+    def _update_zulip_external_account(
+        self,
+        external_account,
+        user,
+        user_info,
+    ):
+        workspace_user = WorkspaceUser.objects.get_one(
+            filters={"uuid": dm_filters.EQ(external_account.user_uuid)},
+        )
+        self._update_workspace_user_avatar_if_changed(
+            workspace_user=workspace_user,
+            avatar=self._build_zulip_user_avatar(user=user),
+        )
         external_account.account_settings.user_info = user_info
         external_account.update_dm(
             values={"status": ExternalAccountStatus.ACTIVE.value},
@@ -681,11 +722,16 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
 
     def _get_or_create_workspace_user(self, user):
         email = self._empty_to_none(user["delivery_email"])
+        avatar = self._build_zulip_user_avatar(user=user)
         if email is not None:
             workspace_users = WorkspaceUser.objects.get_all(
                 filters={"email": dm_filters.EQ(email)},
             )
             for workspace_user in workspace_users:
+                self._update_workspace_user_avatar_if_changed(
+                    workspace_user=workspace_user,
+                    avatar=avatar,
+                )
                 return workspace_user
 
         workspace_user = WorkspaceUser(
@@ -693,9 +739,21 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
             username=user["full_name"],
             source=WorkspaceUserSource.ZULIP.value,
             email=email,
+            avatar=avatar,
         )
         workspace_user.insert()
         return workspace_user
+
+    @staticmethod
+    def _update_workspace_user_avatar_if_changed(workspace_user, avatar):
+        if workspace_user.avatar == avatar:
+            return
+        workspace_user.update_dm(values={"avatar": avatar})
+        workspace_user.save()
+
+    def _build_zulip_user_avatar(self, user):
+        email = self._empty_to_none(user["delivery_email"]) or user["email"]
+        return build_workspace_user_gravatar_avatar(email)
 
     @staticmethod
     def _empty_to_none(value):

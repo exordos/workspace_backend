@@ -1953,7 +1953,6 @@ def test_send_zulip_message_command_converts_workspace_entity_links():
     message_uuid = sys_uuid.UUID("6f063901-7b96-4f5a-b79b-58d6080c1c53")
     stream_uuid = sys_uuid.UUID("38cab094-94b6-4d75-acf9-a2e8920fb40f")
     topic_uuid = sys_uuid.UUID("eafcfdbb-ad1f-4095-a412-57e33425ab8b")
-    avatar_uuid = sys_uuid.UUID("f0f5b652-fd61-4932-9517-e67149cf4188")
     account = types.SimpleNamespace(
         account_settings=types.SimpleNamespace(
             user_info=types.SimpleNamespace(
@@ -2056,7 +2055,8 @@ def test_send_zulip_message_command_converts_workspace_entity_links():
                 f"[stream](urn:stream:{stream_uuid}) "
                 f"[topic](urn:topic:{topic_uuid}) "
                 "[site](urn:url:https://example.com/a?x=1#section) "
-                f"![avatar](urn:gavatar:{avatar_uuid})"
+                "![avatar](urn:gravatar:"
+                "539ee7d79023d65612ec4801a588a6bc)"
             ),
         ).execute(worker)
 
@@ -2067,7 +2067,7 @@ def test_send_zulip_message_command_converts_workspace_entity_links():
         "#**general** #**general>deploys** "
         "[site](https://example.com/a?x=1#section) "
         "![avatar](https://secure.gravatar.com/avatar/"
-        "f0f5b652fd6149329517e67149cf4188?d=identicon&s=500)"
+        "539ee7d79023d65612ec4801a588a6bc?d=identicon&s=500)"
     )
     response = output_queue.get_nowait()
     command = workers.get_sync_response_command(response)

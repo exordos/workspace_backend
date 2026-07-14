@@ -475,7 +475,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
                     'username', 'clean-user',
                     'source', 'iam',
                     'status', 'active',
-                    'avatar', 'urn:gavatar:' || %s::text,
+                    'avatar', 'urn:gravatar:' || md5(%s::text),
                     'last_ping_at', '2026-07-02 12:00:00.000000'
                 ),
                 NOW(),
@@ -514,7 +514,7 @@ def test_workspace_event_payload_identity_backfill_migration(_database, db):
                     'username', 'damaged-user',
                     'source', 'iam',
                     'status', 'active',
-                    'avatar', 'urn:gavatar:' || %s::text,
+                    'avatar', 'urn:gravatar:' || md5(%s::text),
                     'last_ping_at', '2026-07-02 12:00:00.000000'
                 ),
                 NOW(),

@@ -285,7 +285,9 @@ class MessengerEventsTestCase(unittest.TestCase):
             "first_name": "John",
             "last_name": "Smith",
             "email": "john@example.com",
-            "avatar": f"urn:gavatar:{user_uuid}",
+            "avatar": models.build_workspace_user_gravatar_avatar(
+                "john@example.com",
+            ),
             "last_ping_at": "2026-06-24T10:00:00.000000Z",
             "created_at": "2026-06-24T10:00:00.000000Z",
             "updated_at": "2026-06-24T10:05:00.000000Z",
@@ -507,7 +509,9 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "first_name": "John",
                 "last_name": "Smith",
                 "email": "john@example.com",
-                "avatar": f"urn:gavatar:{user_uuid}",
+                "avatar": models.build_workspace_user_gravatar_avatar(
+                    "john@example.com",
+                ),
                 "last_ping_at": "2026-06-24T22:28:40.166369",
                 "created_at": "2026-06-24T22:28:34.166369",
                 "updated_at": "2026-06-24T22:28:40.166369",

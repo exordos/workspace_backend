@@ -489,7 +489,7 @@ syntax:
   message has a Zulip `message_id` and belongs to a public Zulip stream;
 - `urn:file`, `urn:image`, and `urn:video` are uploaded to Zulip and replaced
   with the returned Zulip upload link;
-- `urn:gavatar:<user-uuid>` becomes a generated avatar image URL;
+- `urn:gravatar:<email-hash>` becomes a generated Gravatar image URL;
 - `urn:url:http(s)://...` is unwrapped to a regular markdown URL.
 
 If a URN cannot be resolved safely, the bridge leaves the original markdown link
@@ -577,11 +577,19 @@ from that message.
 
 Zulip `user_id`, email, name, and source data are saved so that later messages
 from the same user link to the same Workspace row. Zulip `avatar_url` stays in
-external-account user metadata; Workspace user `avatar` defaults to
-`urn:gavatar:<user-uuid>`. This profile default is independent from message
-content conversion; markdown links or images that explicitly reference
-`urn:gavatar:<user-uuid>` are converted to generated avatar image URLs when sent
-to Zulip.
+external-account user metadata. The Workspace profile avatar is always derived
+from the Zulip user's real `delivery_email`, falling back to the profile
+`email`: trim whitespace, lowercase it, calculate the MD5 digest used by Zulip
+12.1 for Gravatar identifiers, and store
+`urn:gravatar:<32-hex-email-hash>`. The same value is written when an existing
+Workspace user is matched by email or refreshed during a later user sync.
+
+The misspelled legacy form `urn:gavatar:<user-uuid>` is not a supported runtime
+format. Migration `0095-fix-workspace-gravatar-avatar-urn-f75679.py` replaces
+legacy user avatars and their copies in user events and markdown content before
+the new validation constraint is enabled. Markdown links or images that use the
+canonical `urn:gravatar:<email-hash>` form are converted to generated Gravatar
+image URLs when sent to Zulip.
 
 IAM remains the external source for corporate users, but the absence of an IAM
 row does not block Zulip history import. If a canonical IAM row for the same

@@ -416,6 +416,7 @@ def test_external_account_sync_updates_external_account_by_server_url_and_user_i
     update_external_account.assert_called_once()
     call_kwargs = update_external_account.call_args.kwargs
     assert call_kwargs["external_account"] is existing_account
+    assert call_kwargs["user"] == _zulip_profile()
     assert call_kwargs["user_info"].user_id == 32
     provider.save.assert_called_once_with()
 
@@ -524,18 +525,35 @@ def test_external_account_updates_zulip_external_account():
         ),
     )
     external_account.save = mock.Mock()
+    workspace_user = models.WorkspaceUser(
+        uuid=workspace_user_uuid,
+        username="Phoenix",
+    )
+    workspace_user.save = mock.Mock()
     user_info = provider.account_settings._get_zulip_user_info(
         user=_zulip_profile(),
     )
 
-    updated_account = provider.account_settings._update_zulip_external_account(
-        external_account=external_account,
-        user_info=user_info,
-    )
+    with mock.patch.object(
+        orm.ObjectCollection,
+        "get_one",
+        return_value=workspace_user,
+    ) as get_one:
+        updated_account = (
+            provider.account_settings._update_zulip_external_account(
+                external_account=external_account,
+                user=_zulip_profile(),
+                user_info=user_info,
+            )
+        )
 
     assert updated_account is external_account
     assert external_account.account_settings.user_info is user_info
     assert external_account.status == "active"
+    assert workspace_user.avatar == "urn:gravatar:539ee7d79023d65612ec4801a588a6bc"
+    filters = get_one.call_args.kwargs["filters"]
+    assert filters["uuid"].value == workspace_user_uuid
+    workspace_user.save.assert_called_once_with()
     external_account.save.assert_called_once_with()
 
 
@@ -597,7 +615,9 @@ def test_iam_external_account_kind_creates_workspace_user():
     assert workspace_user.last_name == "Admin"
     assert workspace_user.email == "admin@genesis-core.tech"
     assert workspace_user.avatar == (
-        models.build_workspace_user_default_avatar(workspace_user.uuid)
+        models.build_workspace_user_gravatar_avatar(
+            "admin@genesis-core.tech",
+        )
     )
     uuid_filters = get_one_or_none.call_args_list[0].kwargs["filters"]
     username_filters = get_one_or_none.call_args_list[1].kwargs["filters"]
@@ -611,10 +631,16 @@ def test_iam_external_account_kind_creates_workspace_user():
 def test_workspace_user_avatar_accepts_supported_urns():
     user_uuid = sys_uuid.uuid4()
     image_uuid = sys_uuid.uuid4()
+    gravatar_hash = "539ee7d79023d65612ec4801a588a6bc"
 
     default_user = models.WorkspaceUser(
         uuid=user_uuid,
         username="admin",
+    )
+    email_user = models.WorkspaceUser(
+        uuid=user_uuid,
+        username="admin",
+        email="cassi+phoenix@genesis-corporation.ru",
     )
     image_user = models.WorkspaceUser(
         uuid=user_uuid,
@@ -627,7 +653,11 @@ def test_workspace_user_avatar_accepts_supported_urns():
         avatar="urn:url:https://example.com/avatar.png",
     )
 
-    assert default_user.avatar == f"urn:gavatar:{user_uuid}"
+    assert default_user.avatar == (
+        models.build_workspace_user_default_avatar(user_uuid)
+    )
+    assert default_user.avatar.startswith("urn:gravatar:")
+    assert email_user.avatar == f"urn:gravatar:{gravatar_hash}"
     assert image_user.avatar == f"urn:image:{image_uuid}"
     assert url_user.avatar == "urn:url:https://example.com/avatar.png"
     with pytest.raises(ra_exc.TypeError):
@@ -636,6 +666,24 @@ def test_workspace_user_avatar_accepts_supported_urns():
             username="admin",
             avatar="https://example.com/avatar.png",
         )
+    with pytest.raises(ra_exc.TypeError):
+        models.WorkspaceUser(
+            uuid=user_uuid,
+            username="admin",
+            avatar="urn:gravatar:not-a-hash",
+        )
+    with pytest.raises(ra_exc.TypeError):
+        models.WorkspaceUser(
+            uuid=user_uuid,
+            username="admin",
+            avatar=f"urn:gavatar:{user_uuid}",
+        )
+
+
+def test_workspace_gravatar_avatar_normalizes_email():
+    assert models.build_workspace_user_gravatar_avatar(
+        " CASSI+Phoenix@Genesis-Corporation.RU ",
+    ) == "urn:gravatar:539ee7d79023d65612ec4801a588a6bc"
 
 
 def test_iam_external_account_kind_updates_workspace_user_by_username():
@@ -713,7 +761,9 @@ def test_external_account_uses_workspace_user_by_email_for_new_zulip_account():
         uuid=sys_uuid.uuid4(),
         username="cassi+phoenix@genesis-corporation.ru",
         email="cassi+phoenix@genesis-corporation.ru",
+        avatar="urn:gravatar:00000000000000000000000000000000",
     )
+    workspace_user.save = mock.Mock()
 
     with mock.patch.object(
         orm.ObjectCollection,
@@ -725,6 +775,8 @@ def test_external_account_uses_workspace_user_by_email_for_new_zulip_account():
         )
 
     assert found_user is workspace_user
+    assert workspace_user.avatar == "urn:gravatar:539ee7d79023d65612ec4801a588a6bc"
+    workspace_user.save.assert_called_once_with()
     filters = get_all.call_args.kwargs["filters"]
     assert filters["email"].value == "cassi+phoenix@genesis-corporation.ru"
 
@@ -747,10 +799,7 @@ def test_external_account_creates_workspace_user_by_email_for_new_zulip_account(
     assert workspace_user.username == "Phoenix"
     assert workspace_user.email == "cassi+phoenix@genesis-corporation.ru"
     assert workspace_user.source == "zulip"
-    assert workspace_user.avatar == (
-        models.build_workspace_user_default_avatar(workspace_user.uuid)
-    )
-    assert not workspace_user.avatar.startswith("urn:url:")
+    assert workspace_user.avatar == "urn:gravatar:539ee7d79023d65612ec4801a588a6bc"
     filters = get_all.call_args.kwargs["filters"]
     assert filters["email"].value == "cassi+phoenix@genesis-corporation.ru"
     insert.assert_called_once_with()
@@ -768,6 +817,25 @@ def test_external_account_creates_workspace_user_without_empty_email():
 
     assert workspace_user.username == "Phoenix"
     assert workspace_user.email is None
+    insert.assert_called_once_with()
+
+
+def test_external_account_creates_gravatar_avatar_from_delivery_email():
+    account_settings = _zulip_account_settings()
+    user = _zulip_profile()
+    user["avatar_url"] = None
+
+    with (
+        mock.patch.object(orm.ObjectCollection, "get_all", return_value=[]),
+        mock.patch.object(models.WorkspaceUser, "insert") as insert,
+    ):
+        workspace_user = account_settings._get_or_create_workspace_user(
+            user=user,
+        )
+
+    assert workspace_user.avatar == (
+        "urn:gravatar:539ee7d79023d65612ec4801a588a6bc"
+    )
     insert.assert_called_once_with()
 
 
