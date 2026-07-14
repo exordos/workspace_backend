@@ -50,6 +50,16 @@ INVALID_MESSAGE_CODE = "BAD_REQUEST"
 INVALID_MESSAGE_MSG = "Invalid message(s)"
 
 
+class ZulipAPIError(RuntimeError):
+    pass
+
+
+def _require_success(data):
+    if data["result"] != "success":
+        raise ZulipAPIError(data["msg"])
+    return data
+
+
 class ZulipClient(common.RESTClientMixIn):
     """Client for interacting with Zulip API.
 
@@ -229,13 +239,13 @@ class ZulipClient(common.RESTClientMixIn):
         content: str,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.send_message({
+        return _require_success(client.send_message({
             "type": "stream",
             "to": stream_name,
             "topic": topic_name,
             "content": content,
             "read_by_sender": True,
-        })
+        }))
 
     def send_private_message_with_api_key(
         self,
@@ -245,12 +255,12 @@ class ZulipClient(common.RESTClientMixIn):
         content: str,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.send_message({
+        return _require_success(client.send_message({
             "type": "direct",
             "to": recipient_ids,
             "content": content,
             "read_by_sender": True,
-        })
+        }))
 
     def update_message_with_api_key(
         self,
@@ -260,10 +270,10 @@ class ZulipClient(common.RESTClientMixIn):
         content: str,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.update_message({
+        return _require_success(client.update_message({
             "message_id": message_id,
             "content": content,
-        })
+        }))
 
     def delete_message_with_api_key(
         self,
@@ -272,7 +282,7 @@ class ZulipClient(common.RESTClientMixIn):
         message_id: int,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.delete_message(message_id)
+        return _require_success(client.delete_message(message_id))
 
     def add_reaction_with_api_key(
         self,
@@ -284,7 +294,7 @@ class ZulipClient(common.RESTClientMixIn):
         reaction_type: typing.Optional[str] = None,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.call_endpoint(
+        return _require_success(client.call_endpoint(
             url=f"messages/{message_id}/reactions",
             method="POST",
             request={
@@ -292,7 +302,7 @@ class ZulipClient(common.RESTClientMixIn):
                 "emoji_code": emoji_code,
                 "reaction_type": reaction_type,
             },
-        )
+        ))
 
     def remove_reaction_with_api_key(
         self,
@@ -304,7 +314,7 @@ class ZulipClient(common.RESTClientMixIn):
         reaction_type: typing.Optional[str] = None,
     ):
         client = self._get_sdk_client(login=login, token=token)
-        return client.call_endpoint(
+        return _require_success(client.call_endpoint(
             url=f"messages/{message_id}/reactions",
             method="DELETE",
             request={
@@ -312,7 +322,7 @@ class ZulipClient(common.RESTClientMixIn):
                 "emoji_code": emoji_code,
                 "reaction_type": reaction_type,
             },
-        )
+        ))
 
     def update_subscription_settings_with_api_key(
         self,
@@ -320,7 +330,7 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         subscription_data: list[typing.Dict[str, typing.Any]],
     ):
-        return self._post_api_json_with_api_key(
+        return _require_success(self._post_api_json_with_api_key(
             login=login,
             token=token,
             path="users/me/subscriptions/properties",
@@ -328,7 +338,7 @@ class ZulipClient(common.RESTClientMixIn):
                 "subscription_data": subscription_data,
             },
             timeout=SUBSCRIPTION_UPDATE_TIMEOUT,
-        )
+        ))
 
     def update_user_topic_with_api_key(
         self,
@@ -338,7 +348,7 @@ class ZulipClient(common.RESTClientMixIn):
         topic: str,
         visibility_policy: int,
     ):
-        return self._post_api_json_with_api_key(
+        return _require_success(self._post_api_json_with_api_key(
             login=login,
             token=token,
             path="user_topics",
@@ -348,7 +358,7 @@ class ZulipClient(common.RESTClientMixIn):
                 "visibility_policy": visibility_policy,
             },
             timeout=USER_TOPIC_UPDATE_TIMEOUT,
-        )
+        ))
 
     def upload_file_with_api_key(
         self,
@@ -360,7 +370,7 @@ class ZulipClient(common.RESTClientMixIn):
         client = self._get_sdk_client(login=login, token=token)
         file = io.BytesIO(data)
         file.name = file_name
-        return client.upload_file(file)
+        return _require_success(client.upload_file(file))
 
     def download_file_with_api_key(
         self,

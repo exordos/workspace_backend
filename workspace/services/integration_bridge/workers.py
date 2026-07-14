@@ -909,6 +909,7 @@ class ZulipMessageFailed(ZulipOutboundResponse):
         epoch_version,
         message_uuid,
         error,
+        retryable=True,
     ):
         super().__init__(
             external_account=external_account,
@@ -916,6 +917,7 @@ class ZulipMessageFailed(ZulipOutboundResponse):
             message_uuid=message_uuid,
         )
         self.error = error
+        self.retryable = retryable
 
 
 class ZulipOutboundCommand:
@@ -931,6 +933,7 @@ class ZulipOutboundCommand:
                 epoch_version=self.epoch_version,
                 message_uuid=self.message_uuid,
                 error=str(exc),
+                retryable=not isinstance(exc, zulip_client.ZulipAPIError),
             ),
         )
 

@@ -16,6 +16,8 @@
 
 import unittest.mock as mock
 
+import pytest
+
 from workspace.common.clients import zulip
 
 
@@ -736,6 +738,32 @@ def test_zulip_client_updates_message_with_official_sdk():
         "message_id": 12345,
         "content": "edited",
     }
+
+
+def test_zulip_client_raises_on_update_error_response():
+    class FakeErrorZulipSdkClient(FakeZulipSdkClient):
+        def update_message(self, request):
+            return {
+                "result": "error",
+                "msg": "The time limit for editing this message has passed",
+                "code": "BAD_REQUEST",
+            }
+
+    client = zulip.ZulipClient(
+        endpoint="https://zulip.example.com",
+        client_cls=FakeErrorZulipSdkClient,
+    )
+
+    with pytest.raises(
+        zulip.ZulipAPIError,
+        match="The time limit for editing this message has passed",
+    ):
+        client.update_message_with_api_key(
+            login="user@example.com",
+            token="zulip-token",
+            message_id=12345,
+            content="edited",
+        )
 
 
 def test_zulip_client_deletes_message_with_official_sdk():

@@ -3609,6 +3609,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
               AND action IN ('created', 'updated')
               AND epoch_version < %s
               AND payload->>'uuid' = %s
+              AND user_uuid = %s
             ORDER BY epoch_version DESC
             LIMIT 1
             """,
@@ -3616,6 +3617,7 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
                     event.project_id,
                     event.epoch_version,
                     event.payload["uuid"],
+                    event.user_uuid,
                 ),
             )
         )
@@ -4066,7 +4068,10 @@ class WorkspaceIntegrationBridgeWorker(basic.BasicService):
     def _handle_zulip_message_failed(self, command):
         state = self._get_outbound_state_for_command(command)
         if state is not None:
-            self._set_outbound_retry(state, command.error)
+            if command.retryable:
+                self._set_outbound_retry(state, command.error)
+            else:
+                self._set_outbound_failed(state, command.error)
 
     def _handle_zulip_outbound_result_error(self, command, exc):
         LOG.exception(

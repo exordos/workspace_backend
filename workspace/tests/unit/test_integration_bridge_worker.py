@@ -2065,6 +2065,34 @@ def test_zulip_sent_result_error_marks_outbound_failed_without_retry():
     assert state.last_error == "local boom"
 
 
+def test_zulip_api_error_marks_outbound_failed_without_retry():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    state = FakeOutboundState(status="processing", attempts=1)
+    command = agents.workers.ZulipMessageFailed(
+        external_account=types.SimpleNamespace(
+            project_id="project",
+            server_url="https://zulip.example.com",
+            user_uuid="author-user",
+        ),
+        epoch_version=55,
+        message_uuid=str(sys_uuid.uuid4()),
+        error="Invalid message",
+        retryable=False,
+    )
+
+    with mock.patch.object(
+        worker,
+        "_get_outbound_state_for_command",
+        mock.Mock(return_value=state),
+    ):
+        worker._execute_sync_command(command)
+
+    assert state.status == "failed"
+    assert state.attempts == 1
+    assert state.next_retry_at is None
+    assert state.last_error == "Invalid message"
+
+
 def test_expired_processing_outbound_state_is_failed_not_redispatched():
     now = datetime.datetime.now(datetime.timezone.utc)
     expired_state = FakeOutboundState(
@@ -2127,6 +2155,41 @@ def test_build_update_zulip_message_command_skips_reaction_only_update():
 
     assert command is None
     get_message.assert_not_called()
+
+
+def test_previous_message_event_payload_is_scoped_to_event_user():
+    worker = agents.WorkspaceIntegrationBridgeWorker()
+    event = types.SimpleNamespace(
+        project_id="project-uuid",
+        epoch_version=56,
+        user_uuid="author-uuid",
+        payload={"uuid": "message-uuid"},
+    )
+    session = types.SimpleNamespace(
+        execute=mock.Mock(
+            return_value=FakeQueryResult(
+                [{"payload": {"payload": {"content": "old"}}}],
+            ),
+        ),
+    )
+    context = types.SimpleNamespace(get_session=mock.Mock(return_value=session))
+
+    with mock.patch.object(
+        agents.contexts,
+        "Context",
+        mock.Mock(return_value=context),
+    ):
+        payload = worker._get_previous_message_event_payload(event)
+
+    assert payload == {"payload": {"content": "old"}}
+    statement, values = session.execute.call_args.args
+    assert "AND user_uuid = %s" in statement
+    assert values == (
+        "project-uuid",
+        56,
+        "message-uuid",
+        "author-uuid",
+    )
 
 
 def test_build_zulip_reaction_outbound_commands():
