@@ -496,10 +496,54 @@ class WorkspaceUser(
         default=lambda: datetime.datetime.now(datetime.timezone.utc),
     )
 
+    @classmethod
+    def sync_iam_identity(
+        cls,
+        user_uuid,
+        username,
+        first_name,
+        last_name,
+        email,
+        status=WorkspaceUserStatus.ACTIVE.value,
+    ):
+        values = {
+            "username": username,
+            "source": WorkspaceUserSource.IAM.value,
+            "first_name": first_name or None,
+            "last_name": last_name or None,
+            "email": email or None,
+        }
+        workspace_user = cls.objects.get_one_or_none(
+            filters={"uuid": dm_filters.EQ(user_uuid)},
+        )
+        if workspace_user is None:
+            workspace_user = cls.objects.get_one_or_none(
+                filters={"username": dm_filters.EQ(username)},
+            )
+        if workspace_user is None:
+            workspace_user = cls(
+                uuid=user_uuid,
+                status=status,
+                **values,
+            )
+            workspace_user.insert()
+            return workspace_user
+
+        changed_values = {
+            name: value for name, value in values.items()
+            if getattr(workspace_user, name) != value
+        }
+        if changed_values:
+            workspace_user.update_dm(values=changed_values)
+            workspace_user.save()
+        return workspace_user
+
 
 class ExternalAccountType(str, enum.Enum):
     ZULIP = "zulip"
     IAM = "iam"
+    MAIL = "mail"
+    CALENDAR = "calendar"
 
 
 class ExternalAccountStatus(str, enum.Enum):
@@ -508,6 +552,7 @@ class ExternalAccountStatus(str, enum.Enum):
 
 
 class ExternalAccountAccessStatus(str, enum.Enum):
+    PENDING = "pending"
     MISSING_CREDENTIALS = "missing_credentials"
     CONFIRMED = "confirmed"
     INVALID_CREDENTIALS = "invalid_credentials"
@@ -836,64 +881,108 @@ class IamExternalAccountKind(types_dynamic.AbstractKindModel):
         status = WorkspaceUserStatus.ACTIVE.value
         if user["status"] != "ACTIVE":
             status = WorkspaceUserStatus.OFFLINE.value
-
-        values = {
-            "username": user["username"],
-            "source": WorkspaceUserSource.IAM.value,
-            "status": status,
-            "first_name": self._empty_to_none(user.get("first_name")),
-            "last_name": self._empty_to_none(user.get("last_name")),
-            "email": self._empty_to_none(user["email"]),
-        }
-        workspace_user = self._get_workspace_user_for_iam_sync(
+        return WorkspaceUser.sync_iam_identity(
             user_uuid=user_uuid,
             username=user["username"],
-        )
-        if workspace_user is not None:
-            values.pop("status")
-            self._update_workspace_user_if_changed(
-                workspace_user=workspace_user,
-                values=values,
-            )
-            return workspace_user
-
-        workspace_user = WorkspaceUser(
-            uuid=user_uuid,
-            **values,
-        )
-        workspace_user.insert()
-        return workspace_user
-
-    def _update_workspace_user_if_changed(self, workspace_user, values):
-        changed_values = {
-            name: value for name, value in values.items()
-            if getattr(workspace_user, name) != value
-        }
-        if not changed_values:
-            return
-        workspace_user.update_dm(values=changed_values)
-        workspace_user.save()
-
-    def _get_workspace_user_for_iam_sync(self, user_uuid, username):
-        workspace_user = WorkspaceUser.objects.get_one_or_none(
-            filters={"uuid": dm_filters.EQ(user_uuid)},
-        )
-        if workspace_user is not None:
-            return workspace_user
-        return WorkspaceUser.objects.get_one_or_none(
-            filters={"username": dm_filters.EQ(username)},
+            first_name=user.get("first_name"),
+            last_name=user.get("last_name"),
+            email=user["email"],
+            status=status,
         )
 
-    @staticmethod
-    def _empty_to_none(value):
-        if value == "":
-            return None
-        return value
+
+class MailExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.MAIL.value
+
+    username = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    password = properties.property(
+        types.String(min_length=1, max_length=4096),
+        required=True,
+    )
+
+
+MAIL_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(MailExternalAccountCredentialsKind),
+)
+
+
+class MailExternalAccountKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.MAIL.value
+
+    credentials = properties.property(
+        types.AllowNone(MAIL_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
+        default=None,
+    )
+    email = properties.property(types.Email(), required=True)
+    imap_host = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    imap_port = properties.property(
+        types.Integer(min_value=1, max_value=65535),
+        default=993,
+    )
+    imap_security = properties.property(
+        types.Enum(["tls", "starttls", "plain"]),
+        default="tls",
+    )
+    smtp_host = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    smtp_port = properties.property(
+        types.Integer(min_value=1, max_value=65535),
+        default=465,
+    )
+    smtp_security = properties.property(
+        types.Enum(["tls", "starttls", "plain"]),
+        default="tls",
+    )
+
+    def sync_users(self, external_account):
+        return []
+
+
+class CalendarExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.CALENDAR.value
+
+    username = properties.property(
+        types.String(min_length=1, max_length=256),
+        required=True,
+    )
+    password = properties.property(
+        types.String(min_length=1, max_length=4096),
+        required=True,
+    )
+
+
+CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = (
+    types_dynamic.KindModelSelectorType(
+        types_dynamic.KindModelType(CalendarExternalAccountCredentialsKind),
+    )
+)
+
+
+class CalendarExternalAccountKind(types_dynamic.AbstractKindModel):
+    KIND = ExternalAccountType.CALENDAR.value
+
+    credentials = properties.property(
+        types.AllowNone(CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
+        default=None,
+    )
+
+    def sync_users(self, external_account):
+        return []
 
 
 EXTERNAL_ACCOUNT_SETTINGS_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(ZulipExternalAccountKind),
     types_dynamic.KindModelType(IamExternalAccountKind),
+    types_dynamic.KindModelType(MailExternalAccountKind),
+    types_dynamic.KindModelType(CalendarExternalAccountKind),
 )
 
 
@@ -1228,6 +1317,10 @@ WORKSPACE_EVENT_OBJECT_TYPES = (
     "user",
     "folder",
     "folder_item",
+    "mail_folder",
+    "mail_message",
+    "calendar",
+    "calendar_event",
 )
 WORKSPACE_EVENT_ACTIONS = (
     "created",

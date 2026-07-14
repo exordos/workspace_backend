@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import uuid as sys_uuid
 
 import webob
@@ -37,6 +38,10 @@ TOPIC_OBJECT_TYPE = "topic"
 USER_OBJECT_TYPE = "user"
 FOLDER_OBJECT_TYPE = "folder"
 FOLDER_ITEM_OBJECT_TYPE = "folder_item"
+MAIL_FOLDER_OBJECT_TYPE = "mail_folder"
+MAIL_MESSAGE_OBJECT_TYPE = "mail_message"
+CALENDAR_OBJECT_TYPE = "calendar"
+CALENDAR_EVENT_OBJECT_TYPE = "calendar_event"
 CREATED_ACTION = "created"
 UPDATED_ACTION = "updated"
 DELETED_ACTION = "deleted"
@@ -73,6 +78,18 @@ FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
 FOLDER_ITEM_DELETED_EVENT = (
     event_payloads.FolderItemDeletedEventPayload.KIND
 )
+MAIL_FOLDER_CREATED_EVENT = "mail.folder.created"
+MAIL_FOLDER_UPDATED_EVENT = "mail.folder.updated"
+MAIL_FOLDER_DELETED_EVENT = "mail.folder.deleted"
+MAIL_MESSAGE_CREATED_EVENT = "mail.message.created"
+MAIL_MESSAGE_UPDATED_EVENT = "mail.message.updated"
+MAIL_MESSAGE_DELETED_EVENT = "mail.message.deleted"
+CALENDAR_CREATED_EVENT = "calendar.calendar.created"
+CALENDAR_UPDATED_EVENT = "calendar.calendar.updated"
+CALENDAR_DELETED_EVENT = "calendar.calendar.deleted"
+CALENDAR_EVENT_CREATED_EVENT = "calendar.event.created"
+CALENDAR_EVENT_UPDATED_EVENT = "calendar.event.updated"
+CALENDAR_EVENT_DELETED_EVENT = "calendar.event.deleted"
 EVENT_METADATA = {
     MESSAGE_CREATED_EVENT: (MESSAGE_OBJECT_TYPE, CREATED_ACTION),
     MESSAGE_UPDATED_EVENT: (MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
@@ -104,6 +121,18 @@ EVENT_METADATA = {
     FOLDER_UPDATED_EVENT: (FOLDER_OBJECT_TYPE, UPDATED_ACTION),
     FOLDER_DELETED_EVENT: (FOLDER_OBJECT_TYPE, DELETED_ACTION),
     FOLDER_ITEM_DELETED_EVENT: (FOLDER_ITEM_OBJECT_TYPE, DELETED_ACTION),
+    MAIL_FOLDER_CREATED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, CREATED_ACTION),
+    MAIL_FOLDER_UPDATED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, UPDATED_ACTION),
+    MAIL_FOLDER_DELETED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, DELETED_ACTION),
+    MAIL_MESSAGE_CREATED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, CREATED_ACTION),
+    MAIL_MESSAGE_UPDATED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
+    MAIL_MESSAGE_DELETED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, DELETED_ACTION),
+    CALENDAR_CREATED_EVENT: (CALENDAR_OBJECT_TYPE, CREATED_ACTION),
+    CALENDAR_UPDATED_EVENT: (CALENDAR_OBJECT_TYPE, UPDATED_ACTION),
+    CALENDAR_DELETED_EVENT: (CALENDAR_OBJECT_TYPE, DELETED_ACTION),
+    CALENDAR_EVENT_CREATED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, CREATED_ACTION),
+    CALENDAR_EVENT_UPDATED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, UPDATED_ACTION),
+    CALENDAR_EVENT_DELETED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, DELETED_ACTION),
 }
 WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
     model_class=models.WorkspaceVisibleEvent,
@@ -152,6 +181,15 @@ def _event_payload_value(name, value):
             value
         )
         return event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+    if isinstance(value, datetime.date):
+        return value.isoformat()
     if isinstance(value, sys_uuid.UUID):
         return _to_uuid_string(value)
     if name == "uuid" or name.endswith("uuid") or name == "project_id":
@@ -656,6 +694,27 @@ def create_folder_item_deleted_event(project_id, user_uuid, item_uuid,
         user_uuid=user_uuid,
         kind=FOLDER_ITEM_DELETED_EVENT,
         payload={"uuid": _event_payload_value("uuid", item_uuid)},
+        session=session,
+    )
+
+
+def create_groupware_event(resource, kind, session=None):
+    return _create_workspace_event(
+        project_id=resource.project_id,
+        user_uuid=resource.user_uuid,
+        kind=kind,
+        payload=_model_to_event_payload_value(resource),
+        session=session,
+    )
+
+
+def create_groupware_deleted_event(project_id, user_uuid, resource_uuid,
+                                   kind, session=None):
+    return _create_workspace_event(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        kind=kind,
+        payload={"uuid": _event_payload_value("uuid", resource_uuid)},
         session=session,
     )
 

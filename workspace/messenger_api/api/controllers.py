@@ -22,6 +22,7 @@ import uuid as sys_uuid
 import webob
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import controllers as ra_controllers
+from restalchemy.api import packers as ra_packers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
@@ -371,19 +372,27 @@ WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
     summary="Upload file",
     parameters=(),
     responses=oa_c.build_openapi_create_response("WorkspaceFile_Create"),
-    request_body=oa_c.build_openapi_req_body_multipart(
-        description="Upload workspace file",
-        properties={
-            "file": {"format": "binary", "type": "string"},
-            "stream_uuid": {"format": "uuid", "type": "string"},
-            "name": {"type": "string"},
-            "description": {"type": "string"},
-            "storage_type": {
-                "enum": ["file", "s3"],
-                "type": "string",
+    request_body={
+        "description": "Upload workspace file",
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"format": "binary", "type": "string"},
+                        "stream_uuid": {"format": "uuid", "type": "string"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "storage_type": {
+                            "enum": ["file", "s3"],
+                            "type": "string",
+                        },
+                    },
+                },
             },
         },
-    ),
+    },
 )
 
 WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
@@ -403,6 +412,16 @@ class ExternalAccountController(
         "access_next_check_at",
         "access_last_error",
     )
+
+    class Packer(ra_packers.JSONPacker):
+        def pack_resource(self, obj):
+            result = super().pack_resource(obj)
+            settings = result.get("account_settings")
+            if isinstance(settings, dict) and "credentials" in settings:
+                settings["credentials"] = None
+            return result
+
+    __packer__ = Packer
 
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.ExternalAccount,
@@ -503,6 +522,18 @@ class ExternalAccountController(
             "access_last_error": "External account credentials are missing",
         })
 
+    @staticmethod
+    def _set_pending_access(values):
+        values.update({
+            "access_status": models.ExternalAccountAccessStatus.PENDING.value,
+            "access_checked_at": None,
+            "access_confirmed_at": None,
+            "access_next_check_at": datetime.datetime.now(
+                datetime.timezone.utc,
+            ),
+            "access_last_error": None,
+        })
+
     def _set_access_values(self, values, account=None):
         if "account_settings" not in values and "server_url" not in values:
             return
@@ -513,6 +544,12 @@ class ExternalAccountController(
             return
         if account_settings.credentials is None:
             self._set_missing_credentials_access(values)
+            return
+        if account_settings.KIND in (
+            models.ExternalAccountType.MAIL.value,
+            models.ExternalAccountType.CALENDAR.value,
+        ):
+            self._set_pending_access(values)
             return
         self._set_confirmed_access(values)
 
@@ -563,7 +600,8 @@ class ExternalAccountController(
             )
         self._set_access_values(values)
         account = super().create(**values)
-        self._ensure_user_sync(account)
+        if account.account_type == models.ExternalAccountType.ZULIP.value:
+            self._ensure_user_sync(account)
         return account
 
     def update(self, uuid, **kwargs):
@@ -615,6 +653,15 @@ class WorkspaceStreamController(
             project_id=self._get_project_id(),
             user_uuid=self._get_user_uuid(),
             stream_uuid=uuid,
+        )
+
+    @ra_actions.post
+    def add_users(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
+            project_id=resource.project_id,
+            stream_uuid=resource.uuid,
+            who_uuid=self._get_user_uuid(),
+            role_user_uuids=kwargs,
         )
 
     @ra_actions.post
@@ -672,20 +719,15 @@ class WorkspaceStreamBindingController(
             "project_id": self._get_project_id(),
         }
 
-    @ra_actions.post
-    def add_users(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
-            project_id=resource.project_id,
-            stream_uuid=resource.uuid,
-            who_uuid=self._get_user_uuid(),
-            role_user_uuids=kwargs,
-        )
-
     def delete(self, uuid):
         return messenger_dm_helpers.delete_workspace_stream_binding(
             project_id=self._get_project_id(),
             binding_uuid=uuid,
         )
+
+
+class WorkspaceStreamBindingsActionController(WorkspaceStreamController):
+    __resource__ = WorkspaceStreamBindingController.__resource__
 
 
 class WorkspaceMessageController(
@@ -897,6 +939,20 @@ class WorkspaceUserController(
 
     def _get_project_id(self):
         return self.get_context().project_id
+
+    def get(self, uuid, **kwargs):
+        if uuid == self._get_user_uuid():
+            iam_user = (
+                self.get_context().iam_context.get_introspection_info().user_info
+            )
+            models.WorkspaceUser.sync_iam_identity(
+                user_uuid=uuid,
+                username=iam_user.name,
+                first_name=iam_user.first_name,
+                last_name=iam_user.last_name,
+                email=iam_user.email,
+            )
+        return super().get(uuid, **kwargs)
 
     @ra_actions.post
     def presence(self, resource, *args, **kwargs):

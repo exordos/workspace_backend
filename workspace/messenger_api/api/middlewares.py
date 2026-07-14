@@ -23,7 +23,9 @@ from restalchemy.api import middlewares
 from workspace.messenger_api.api import versions
 
 
-SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/server_settings"
+SERVER_SETTINGS_PATH = (
+    f"/{versions.API_VERSION_1_0}/messenger/server_settings"
+)
 
 
 def _normalize_path(path):

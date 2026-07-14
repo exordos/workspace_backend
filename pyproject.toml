@@ -30,6 +30,8 @@ dependencies = [
     "zulip>=0.9.0,<0.9.1",  # Apache-2.0
     "filetype>=1.2.0,<2.0.0",  # MIT License (MIT)
     "pillow>=10.0.0,<13.0.0",  # HPND License
+    "icalendar>=6.1.0,<7.0.0",  # BSD License (BSD-2-Clause)
+    "requests>=2.32.0,<3.0.0",  # Apache-2.0
 ]
 [project.urls]
 homepage = "https://github.com/infraguys/workspace/"
@@ -125,9 +127,10 @@ where = ["."]
 
 [project.scripts]
 workspace-user-api = "workspace.cmd.user_api:main"
-workspace-messenger-api = "workspace.cmd.messenger_api:main"
+workspace-api = "workspace.cmd.workspace_api:main"
 workspace-messenger-worker = "workspace.cmd.messenger_worker:main"
 workspace-integration-bridge-worker = "workspace.cmd.workspace_integration_bridge_worker:main"
+workspace-groupware-bridge-worker = "workspace.cmd.workspace_groupware_bridge_worker:main"
 workspace-messenger-events = "workspace.cmd.messenger_events:main"
 
 [tool.uv]

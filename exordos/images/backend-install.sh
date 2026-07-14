@@ -26,9 +26,10 @@ VENV_PATH="$GC_PATH/.venv"
 
 WORKSPACE_BINARIES=(
     workspace-user-api
-    workspace-messenger-api
+    workspace-api
     workspace-messenger-worker
     workspace-integration-bridge-worker
+    workspace-groupware-bridge-worker
     workspace-messenger-events
 )
 WORKSPACE_HELPERS=(

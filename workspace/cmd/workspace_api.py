@@ -1,18 +1,7 @@
-#    Copyright 2026 Genesis Corporation.
+# Copyright 2026 Genesis Corporation.
 #
-#    All Rights Reserved.
-#
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
-#
-#         http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
 
 import logging
 import sys
@@ -28,28 +17,16 @@ from restalchemy.storage.sql import engines
 from workspace.common import config
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
-from workspace.messenger_api.api import app
+from workspace.workspace_api.api import app
+
+
+DOMAIN = "workspace_api"
 
 api_cli_opts = [
-    cfg.StrOpt(
-        "bind-host",
-        default="127.0.0.1",
-        help="The host IP to bind to",
-    ),
-    cfg.IntOpt(
-        "bind-port",
-        default=21081,
-        help="The port to bind to",
-    ),
-    cfg.IntOpt(
-        "workers",
-        default=1,
-        help="How many http servers should be started",
-    ),
+    cfg.StrOpt("bind-host", default="127.0.0.1"),
+    cfg.IntOpt("bind-port", default=21081),
+    cfg.IntOpt("workers", default=1),
 ]
-
-
-DOMAIN = "messenger_api"
 
 CONF = cfg.CONF
 CONF.register_cli_opts(api_cli_opts, DOMAIN)
@@ -60,39 +37,31 @@ file_storage_opts.register_opts(CONF)
 
 def main():
     config.parse(sys.argv[1:])
-
     infra_log.configure()
     log = logging.getLogger(__name__)
-
     log.info(
         "Start service on %s:%s",
         CONF[DOMAIN].bind_host,
         CONF[DOMAIN].bind_port,
     )
-
     service_hub = hub.ProcessHubService()
     iam_driver = drivers.HttpDriver(
         CONF.iam.iam_endpoint,
         CONF.iam.audience,
         CONF.iam.hs256_jwks_decryption_key,
     )
-
     for _ in range(CONF[DOMAIN].workers):
         service = bjoern_service.BjoernService(
             wsgi_app=app.build_wsgi_application(iam_driver),
             host=CONF[DOMAIN].bind_host,
             port=CONF[DOMAIN].bind_port,
-            bjoern_kwargs=dict(reuse_port=True),
+            bjoern_kwargs={"reuse_port": True},
         )
-
         service.add_setup(
             lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
         )
-
         service_hub.add_service(service)
-
     service_hub.start()
-
     log.info("Bye!!!")
 
 

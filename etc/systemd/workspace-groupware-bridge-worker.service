@@ -1,0 +1,12 @@
+[Unit]
+Description=Workspace mail and calendar bridge worker
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=workspace
+ExecStart=workspace-groupware-bridge-worker --config-file /etc/workspace/workspace.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

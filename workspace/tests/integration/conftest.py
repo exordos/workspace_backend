@@ -47,10 +47,10 @@ from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.common import file_storage_opts
-from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.workspace_api.api import app as workspace_app
 
 
 # --------------------------------------------------------------------------- #
@@ -93,7 +93,7 @@ class _FakeToken:
 class FakeIamEngine:
     """Drop-in replacement for ``gcl_iam.engines.IamEngine``.
 
-    Exposes exactly the surface used by ``WorkspaceMessengerAuthContext``.
+    Exposes exactly the surface used by ``WorkspaceAuthContext``.
     The enforcer is intentionally hostile: workspace must not call policies.
     """
 
@@ -104,7 +104,13 @@ class FakeIamEngine:
             "otp_verified": True,
             "otp_enabled": False,
             "permissions": [],
-            "user_info": {"uuid": str(user_uuid)},
+            "user_info": {
+                "uuid": str(user_uuid),
+                "name": f"user-{user_uuid}",
+                "first_name": "",
+                "last_name": "",
+                "email": "",
+            },
         }
 
     @property
@@ -136,7 +142,7 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
         super().__init__(
             application=application,
             iam_engine_driver=None,
-            context_class=auth_context.WorkspaceMessengerAuthContext,
+            context_class=auth_context.WorkspaceAuthContext,
         )
 
     def _get_response(self, ctx, req):
@@ -154,8 +160,8 @@ def build_test_wsgi_application():
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
     application = applications.OpenApiApplication(
-        route_class=messenger_app.get_api_application(),
-        openapi_engine=messenger_app.get_openapi_engine(),
+        route_class=workspace_app.get_api_application(),
+        openapi_engine=workspace_app.get_openapi_engine(),
     )
     return middlewares.attach_middlewares(
         application,

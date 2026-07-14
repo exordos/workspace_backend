@@ -35,6 +35,52 @@ def test_workspace_controller_does_not_use_policy_based_controller():
     )
 
 
+def test_workspace_user_get_syncs_current_iam_identity():
+    user_uuid = sys_uuid.uuid4()
+    iam_user = types.SimpleNamespace(
+        name="cassi",
+        first_name="Cassandra",
+        last_name="Volkova",
+        email="cassi@exordos.com",
+    )
+    iam_context = types.SimpleNamespace(
+        get_introspection_info=mock.Mock(
+            return_value=types.SimpleNamespace(user_info=iam_user),
+        ),
+    )
+    request = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            user_uuid=user_uuid,
+            iam_context=iam_context,
+        ),
+    )
+    controller = controllers.WorkspaceUserController(request)
+    returned_user = object()
+
+    with (
+        mock.patch.object(
+            models.WorkspaceUser,
+            "sync_iam_identity",
+        ) as sync_identity,
+        mock.patch.object(
+            controllers.ra_controllers.BaseResourceControllerPaginated,
+            "get",
+            return_value=returned_user,
+        ) as parent_get,
+    ):
+        result = controller.get(user_uuid)
+
+    assert result is returned_user
+    sync_identity.assert_called_once_with(
+        user_uuid=user_uuid,
+        username="cassi",
+        first_name="Cassandra",
+        last_name="Volkova",
+        email="cassi@exordos.com",
+    )
+    parent_get.assert_called_once_with(user_uuid)
+
+
 def test_workspace_controller_applies_local_project_and_user_scope():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
@@ -806,7 +852,7 @@ def test_stream_controller_read_uses_context_scope():
     )
 
 
-def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
+def test_stream_controller_add_users_uses_context_and_stream_resource():
     project_id = sys_uuid.uuid4()
     actor_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -816,7 +862,7 @@ def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
             user_uuid=actor_uuid,
         )
     )
-    controller = controllers.WorkspaceStreamBindingController(request)
+    controller = controllers.WorkspaceStreamController(request)
     resource = types.SimpleNamespace(
         project_id=project_id,
         uuid=stream_uuid,
@@ -832,7 +878,7 @@ def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
         "get_or_create_workspace_stream_bindings",
         return_value=returned_bindings,
     ) as get_or_create:
-        result = controllers.WorkspaceStreamBindingController.add_users._post(
+        result = controllers.WorkspaceStreamController.add_users._post(
             self=controller,
             resource=resource,
             **payload,
@@ -873,10 +919,10 @@ def test_stream_binding_controller_delete_uses_context_scope():
     )
 
 
-def test_stream_bindings_action_uses_binding_controller_resource():
+def test_stream_bindings_action_uses_stream_controller_resource():
     assert (
         routes.WorkspaceStreamBindingsAction.__controller__
-        is controllers.WorkspaceStreamBindingController
+        is controllers.WorkspaceStreamBindingsActionController
     )
 
 

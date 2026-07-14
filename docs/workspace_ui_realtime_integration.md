@@ -6,17 +6,17 @@ visible event surface.
 
 ## Endpoints
 
-REST messenger endpoints are exposed through nginx:
+Common realtime endpoints are exposed through nginx:
 
-- `GET /api/messenger/v1/events/`
-- `GET /api/messenger/v1/epoch/`
+- `GET /api/workspace/v1/events/`
+- `GET /api/workspace/v1/epoch/`
 
 The browser websocket endpoint is:
 
-- `WS /api/messenger/ws?last_epoch_version=<number>`
+- `WS /api/workspace/v1/events/ws?last_epoch_version=<number>`
 
 The internal websocket service path is `/v1/events/ws` on `127.0.0.1:21082`.
-Browser code should use only `/api/messenger/ws`.
+Browser code should use only `/api/workspace/v1/events/ws`.
 
 ## Authentication
 
@@ -48,6 +48,17 @@ schema. There is no outer `{ "type": "event", "event": ... }` wrapper.
 External-source events are delivered only while the current user has matching
 confirmed external account access; the backend filters REST catch-up,
 `/epoch/`, and websocket delivery consistently.
+
+The same stream carries all three services. Supported groupware kinds are:
+
+- `mail.folder.created|updated|deleted`
+- `mail.message.created|updated|deleted`
+- `calendar.calendar.created|updated|deleted`
+- `calendar.event.created|updated|deleted`
+
+Groupware events use `object_type` values `mail_folder`, `mail_message`,
+`calendar`, and `calendar_event`. Their payload contains the affected local
+resource snapshot; delete payloads contain its `uuid`.
 
 ```json
 {
@@ -175,14 +186,14 @@ For REST catch-up, request events strictly newer than the latest successfully
 processed epoch:
 
 ```http
-GET /api/messenger/v1/events/?epoch_version%3E=<last_epoch_version>&page_limit=500
+GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&page_limit=500
 ```
 
 `epoch_version>` is strict. If the HTTP client does not encode `>`, encode it as
 `%3E`. Process events in ascending `epoch_version` order and persist the latest
 processed epoch after applying each event.
 
-`GET /api/messenger/v1/epoch/` returns the current user's latest visible epoch:
+`GET /api/workspace/v1/epoch/` returns the current user's latest visible epoch:
 
 ```json
 {"epoch_version": 124}
@@ -204,7 +215,7 @@ Recommended client flow:
 1. Load the persisted cursor.
 2. Run REST catch-up with `epoch_version>` until no more events are returned.
 3. Persist the latest processed epoch.
-4. Open `/api/messenger/ws?last_epoch_version=<latest>`.
+4. Open `/api/workspace/v1/events/ws?last_epoch_version=<latest>`.
 5. Process websocket events through the same idempotent dispatcher as REST.
 6. Deduplicate by `epoch_version` across REST catch-up, websocket catch-up, and
    live delivery.

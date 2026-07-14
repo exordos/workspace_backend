@@ -19,8 +19,8 @@ import uuid as sys_uuid
 from gcl_iam import contexts as iam_contexts
 
 
-class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
-    """IAM-only context for workspace messenger models."""
+class WorkspaceAuthContext(iam_contexts.GenesisCoreAuthContext):
+    """IAM context shared by all Workspace API domains."""
 
     @property
     def user_uuid(self):

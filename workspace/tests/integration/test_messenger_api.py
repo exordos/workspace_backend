@@ -31,7 +31,7 @@ from workspace.messenger_api.dm import models as messenger_models
 from workspace.tests.integration import conftest
 
 
-V1 = "/v1"
+V1 = "/v1/messenger"
 STREAMS = f"{V1}/streams/"
 STREAM_BINDINGS = f"{V1}/stream_bindings/"
 FOLDERS = f"{V1}/folders/"
@@ -40,9 +40,9 @@ FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
 MESSAGE_REACTIONS = f"{V1}/message_reactions/"
-EVENTS = f"{V1}/events/"
-EPOCH = f"{V1}/epoch/"
-USERS = f"{V1}/users/"
+EVENTS = "/v1/events/"
+EPOCH = "/v1/epoch/"
+USERS = "/v1/users/"
 
 
 # --------------------------------------------------------------------------- #
@@ -3621,7 +3621,7 @@ def test_unbound_user_cannot_send_message(api, db):
             },
         },
     )
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 404, resp.text
 
     with db.cursor() as cur:
         cur.execute(
