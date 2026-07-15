@@ -8,7 +8,8 @@ import uuid as sys_uuid
 from workspace.tests.integration import conftest
 
 
-def test_only_workspace_v1_contract_is_exposed(api):
+def test_only_workspace_v1_contract_is_exposed(workspace_api):
+    api = workspace_api
     assert api.get("/v1/").status_code == 200
     assert api.get("/v1/messenger/").status_code == 200
     assert api.get("/v1/mail/").status_code == 200
@@ -20,15 +21,32 @@ def test_only_workspace_v1_contract_is_exposed(api):
     assert api.get("/v1/messenger/events/").status_code >= 400
 
 
-def test_mail_external_user_and_local_message_roundtrip(api, db):
+def test_mail_external_user_and_local_message_roundtrip(
+    api, workspace_api, provider_api, db
+):
+    messenger_api = api
+    api = workspace_api
     conftest.seed_workspace_user(
         db,
         api.user_uuid,
         f"user-{api.user_uuid}",
     )
-    external_user = api.post(
-        "/v1/external_users/",
+    provider_uuid = sys_uuid.uuid4()
+    registered = provider_api.put(
+        f"/v1/providers/{provider_uuid}",
         json={
+            "name": "Mail provider",
+            "supported_kinds": ["mail"],
+            "version": "1.0.0",
+        },
+    )
+    assert registered.status_code == 200, registered.text
+    external_user = messenger_api.post(
+        "/v1/external_accounts/",
+        user=api.user_uuid,
+        project=api.project_id,
+        json={
+            "provider_uuid": str(provider_uuid),
             "server_url": "https://mail.example.com",
             "account_settings": {
                 "kind": "mail",
@@ -75,8 +93,23 @@ def test_mail_external_user_and_local_message_roundtrip(api, db):
         },
     )
     assert message.status_code in (200, 201), message.text
+    assert message.json()["from_address"] == "cassi@example.com"
     assert message.json()["to_addresses"] == ["recipient@example.com"]
-    assert message.json()["sync_status"] == "pending"
+    assert message.json()["provider"]["uuid"] == str(provider_uuid)
+    assert message.json()["delivery"]["status"] == "pending"
+    assert "sync_status" not in message.json()
+
+    commands = provider_api.get(
+        f"/v1/providers/{provider_uuid}/mail/commands/",
+        params={"status": "pending"},
+    )
+    message_command = next(
+        item for item in commands.json() if item["operation"] == "message.create"
+    )
+    assert message_command["payload"]["folder_urn"] == (
+        f"urn:mail-folder:{folder.json()['uuid']}"
+    )
+    assert "folder_uuid" not in message_command["payload"]
 
     sent = api.post(
         f"/v1/mail/messages/{message.json()['uuid']}/actions/send/invoke",
@@ -84,7 +117,7 @@ def test_mail_external_user_and_local_message_roundtrip(api, db):
     )
     assert sent.status_code == 200, sent.text
     assert sent.json()["draft"] is False
-    assert sent.json()["sync_status"] == "pending"
+    assert sent.json()["delivery"]["status"] == "pending"
 
     events = api.get("/v1/events/")
     assert events.status_code == 200, events.text
@@ -96,7 +129,8 @@ def test_mail_external_user_and_local_message_roundtrip(api, db):
     ]
 
 
-def test_calendar_local_event_roundtrip(api, db):
+def test_calendar_local_event_roundtrip(workspace_api, db):
+    api = workspace_api
     conftest.seed_workspace_user(
         db,
         api.user_uuid,
@@ -123,7 +157,9 @@ def test_calendar_local_event_roundtrip(api, db):
     assert event.json()["summary"] == "Workspace API review"
     assert event.json()["attendees"] == [{"email": "reviewer@example.com"}]
     assert event.json()["alarms"] == []
-    assert event.json()["sync_status"] == "synced"
+    assert "sync_status" not in event.json()
+    assert "ics" not in event.json()
+    assert "etag" not in event.json()
 
     listed = api.get(
         "/v1/calendar/events/",

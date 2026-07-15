@@ -38,3 +38,27 @@ build:
           script: images/backend-install.sh
           override:
             disk_size: "8G"
+    - manifest: manifests/workspace-zulip-provider.yaml.j2
+      images:
+        - name: workspace-zulip-provider
+          format: zst
+          profile: exordos_base
+          script: images/provider-install.sh
+          override:
+            disk_size: "8G"
+    - manifest: manifests/workspace-mail-provider.yaml.j2
+      images:
+        - name: workspace-mail-provider
+          format: zst
+          profile: exordos_base
+          script: images/provider-install.sh
+          override:
+            disk_size: "8G"
+    - manifest: manifests/workspace-calendar-provider.yaml.j2
+      images:
+        - name: workspace-calendar-provider
+          format: zst
+          profile: exordos_base
+          script: images/provider-install.sh
+          override:
+            disk_size: "8G"

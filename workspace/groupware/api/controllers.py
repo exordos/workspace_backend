@@ -17,10 +17,12 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 
 from workspace.groupware.dm import models
-from workspace.messenger_api import events as workspace_events
+from workspace.workspace_api import events as workspace_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import controllers as workspace_controllers
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.provider_api import commands as provider_commands
 
 
 class GroupwareJSONPacker(ra_packers.JSONPacker):
@@ -32,7 +34,7 @@ class GroupwareJSONPacker(ra_packers.JSONPacker):
             value = result.get(name)
             if isinstance(value, str):
                 result[name] = orjson.loads(value)
-        return result
+        return workspace_events.add_provider_delivery_payload(result, obj)
 
 
 class MailMessageJSONPacker(GroupwareJSONPacker):
@@ -63,13 +65,22 @@ class MailFolderController(
     ExternalAccountOwnershipMixin,
     workspace_controllers.WorkspaceBaseResourceControllerPaginated,
 ):
+    __packer__ = GroupwareJSONPacker
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.MailFolder,
         hidden_fields=[
             "project_id",
             "user_uuid",
+            "provider_uuid",
+            "provider_external_id",
+            "delivery_status",
+            "delivery_error",
+            "delivery_updated_at",
             "sync_cursor",
+            "sync_status",
             "sync_error",
+            "source_name",
+            "source",
         ],
         convert_underscore=False,
         process_filters=True,
@@ -83,7 +94,7 @@ class MailFolderController(
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
         account_uuid = values.get("external_user_uuid")
-        self._get_owned_external_account(
+        account = self._get_owned_external_account(
             account_uuid,
             messenger_models.ExternalAccountType.MAIL.value,
         )
@@ -98,8 +109,10 @@ class MailFolderController(
         )
         values["sync_error"] = None
         values["deleted"] = False
+        values["provider_uuid"] = None if account is None else account.provider_uuid
         folder = models.MailFolder(**values)
         folder.insert()
+        provider_commands.create_mail_command(folder, "folder.create")
         workspace_events.create_groupware_event(
             folder,
             workspace_events.MAIL_FOLDER_CREATED_EVENT,
@@ -109,18 +122,29 @@ class MailFolderController(
     def update(self, uuid, **kwargs):
         folder = self.get(uuid=uuid)
         values = kwargs.copy()
-        for name in ("source_name", "source", "sync_cursor", "sync_status", "sync_error", "deleted"):
+        for name in (
+            "source_name",
+            "source",
+            "sync_cursor",
+            "sync_status",
+            "sync_error",
+            "deleted",
+        ):
             values.pop(name, None)
         if "external_user_uuid" in values:
             self._get_owned_external_account(
                 values["external_user_uuid"],
                 messenger_models.ExternalAccountType.MAIL.value,
             )
-        if folder.external_user_uuid is not None or values.get("external_user_uuid") is not None:
+        if (
+            folder.external_user_uuid is not None
+            or values.get("external_user_uuid") is not None
+        ):
             values["sync_status"] = models.SyncStatus.PENDING.value
             values["sync_error"] = None
         folder.update_dm(values=values)
         folder.update()
+        provider_commands.create_mail_command(folder, "folder.update")
         workspace_events.create_groupware_event(
             folder,
             workspace_events.MAIL_FOLDER_UPDATED_EVENT,
@@ -143,6 +167,7 @@ class MailFolderController(
                 },
             )
             folder.update()
+        provider_commands.create_mail_command(folder, "folder.delete")
         workspace_events.create_groupware_deleted_event(
             project_id,
             user_uuid,
@@ -157,7 +182,19 @@ class MailMessageController(
     __packer__ = MailMessageJSONPacker
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.MailMessage,
-        hidden_fields=["project_id", "user_uuid", "sync_error"],
+        hidden_fields=[
+            "project_id",
+            "user_uuid",
+            "provider_uuid",
+            "provider_external_id",
+            "delivery_status",
+            "delivery_error",
+            "delivery_updated_at",
+            "sync_status",
+            "sync_error",
+            "source_name",
+            "source",
+        ],
         convert_underscore=False,
         process_filters=True,
     )
@@ -177,6 +214,23 @@ class MailMessageController(
             },
         )
 
+    def _account_sender(self, account_uuid):
+        if account_uuid is None:
+            return None
+        account = messenger_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(account_uuid),
+                "project_id": dm_filters.EQ(self._get_project_id()),
+                "user_uuid": dm_filters.EQ(self._get_user_uuid()),
+                "account_type": dm_filters.EQ(
+                    messenger_models.ExternalAccountType.MAIL.value,
+                ),
+            },
+        )
+        settings = account.account_settings
+        credentials = settings.get("credentials") or {}
+        return settings.get("email") or credentials.get("username")
+
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
         folder = self._get_owned_folder(values["folder_uuid"])
@@ -185,6 +239,9 @@ class MailMessageController(
         values["source"] = {}
         values["external_uid"] = None
         values["external_user_uuid"] = folder.external_user_uuid
+        sender = self._account_sender(folder.external_user_uuid)
+        if sender is not None:
+            values["from_address"] = sender
         values["sync_status"] = (
             models.SyncStatus.PENDING.value
             if folder.external_user_uuid is not None
@@ -193,6 +250,7 @@ class MailMessageController(
         values["sync_error"] = None
         message = models.MailMessage(**values)
         message.insert()
+        provider_commands.create_mail_command(message, "message.create")
         workspace_events.create_groupware_event(
             message,
             workspace_events.MAIL_MESSAGE_CREATED_EVENT,
@@ -216,6 +274,7 @@ class MailMessageController(
             values["sync_error"] = None
         message.update_dm(values=values)
         message.update()
+        provider_commands.create_mail_command(message, "message.update")
         workspace_events.create_groupware_event(
             message,
             workspace_events.MAIL_MESSAGE_UPDATED_EVENT,
@@ -235,6 +294,7 @@ class MailMessageController(
                 },
             )
             message.update()
+        provider_commands.create_mail_command(message, "message.delete")
         workspace_events.create_groupware_deleted_event(
             message.project_id,
             message.user_uuid,
@@ -253,6 +313,7 @@ class MailMessageController(
             },
         )
         resource.update()
+        provider_commands.create_mail_command(resource, "message.send")
         workspace_events.create_groupware_event(
             resource,
             workspace_events.MAIL_MESSAGE_UPDATED_EVENT,
@@ -275,6 +336,7 @@ class MailMessageController(
             },
         )
         resource.update()
+        provider_commands.create_mail_command(resource, "message.move")
         workspace_events.create_groupware_event(
             resource,
             workspace_events.MAIL_MESSAGE_UPDATED_EVENT,
@@ -313,13 +375,41 @@ class MailAttachmentController(
     def create(self, **kwargs):
         parts = kwargs["parts"]
         file_part = parts["file"]
-        message_uuid = sys_uuid.UUID(parts["message_uuid"].value)
-        self._get_owned_message(message_uuid)
+        message_uuid_part = parts["message_uuid"]
+        message_uuid = sys_uuid.UUID(
+            getattr(message_uuid_part, "value", message_uuid_part),
+        )
+        message = self._get_owned_message(message_uuid)
         file_part.file.seek(0)
         data = file_part.file.read()
         attachment_uuid = sys_uuid.uuid4()
         storage = file_storage.save_workspace_file(attachment_uuid, data)
+        workspace_blob = None
         try:
+            digest = hashlib.sha256(data).hexdigest()
+            if getattr(message, "provider_uuid", None) is not None:
+                workspace_blob = messenger_models.WorkspaceFile(
+                    uuid=attachment_uuid,
+                    project_id=self._get_project_id(),
+                    user_uuid=self._get_user_uuid(),
+                    stream_uuid=None,
+                    provider_uuid=message.provider_uuid,
+                    external_account_uuid=message.external_user_uuid,
+                    name=file_part.filename,
+                    description="",
+                    content_type=file_part.type or "application/octet-stream",
+                    size_bytes=len(data),
+                    hash=digest,
+                    storage_type=storage.storage_type,
+                    storage_id=storage.storage_id,
+                    storage_object_id=storage.storage_object_id,
+                )
+                workspace_blob.insert()
+                messenger_dm_helpers.get_or_create_workspace_file_access(
+                    project_id=self._get_project_id(),
+                    file_uuid=workspace_blob.uuid,
+                    user_uuid=self._get_user_uuid(),
+                )
             attachment = models.MailAttachment(
                 uuid=attachment_uuid,
                 project_id=self._get_project_id(),
@@ -328,19 +418,22 @@ class MailAttachmentController(
                 name=file_part.filename,
                 content_type=file_part.type or "application/octet-stream",
                 size_bytes=len(data),
-                hash=hashlib.sha256(data).hexdigest(),
+                hash=digest,
                 storage_type=storage.storage_type,
                 storage_id=storage.storage_id,
                 storage_object_id=storage.storage_object_id,
             )
             attachment.insert()
             message = self._get_owned_message(message_uuid)
+            provider_commands.create_mail_command(message, "message.update")
             workspace_events.create_groupware_event(
                 message,
                 workspace_events.MAIL_MESSAGE_UPDATED_EVENT,
             )
             return attachment
         except Exception:
+            if workspace_blob is not None:
+                workspace_blob.delete()
             file_storage.delete_workspace_file(
                 attachment_uuid,
                 storage_type=storage.storage_type,
@@ -361,6 +454,12 @@ class MailAttachmentController(
         attachment = self.get(uuid=uuid)
         message = self._get_owned_message(attachment.message_uuid)
         attachment.delete()
+        workspace_blob = messenger_models.WorkspaceFile.objects.get_one_or_none(
+            filters={"uuid": dm_filters.EQ(attachment.uuid)},
+        )
+        if workspace_blob is not None:
+            workspace_blob.delete()
+        provider_commands.create_mail_command(message, "message.update")
         file_storage.delete_workspace_file(
             attachment.uuid,
             storage_type=attachment.storage_type,
@@ -416,13 +515,23 @@ class CalendarController(
     ExternalAccountOwnershipMixin,
     workspace_controllers.WorkspaceBaseResourceControllerPaginated,
 ):
+    __packer__ = GroupwareJSONPacker
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.Calendar,
         hidden_fields=[
             "project_id",
             "user_uuid",
+            "provider_uuid",
+            "provider_external_id",
+            "delivery_status",
+            "delivery_error",
+            "delivery_updated_at",
+            "ctag",
             "sync_token",
+            "sync_status",
             "sync_error",
+            "source_name",
+            "source",
         ],
         convert_underscore=False,
         process_filters=True,
@@ -436,7 +545,7 @@ class CalendarController(
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
         account_uuid = values.get("external_user_uuid")
-        self._get_owned_external_account(
+        account = self._get_owned_external_account(
             account_uuid,
             messenger_models.ExternalAccountType.CALENDAR.value,
         )
@@ -451,8 +560,10 @@ class CalendarController(
         )
         values["sync_error"] = None
         values["deleted"] = False
+        values["provider_uuid"] = None if account is None else account.provider_uuid
         calendar = models.Calendar(**values)
         calendar.insert()
+        provider_commands.create_calendar_command(calendar, "calendar.create")
         workspace_events.create_groupware_event(
             calendar,
             workspace_events.CALENDAR_CREATED_EVENT,
@@ -462,18 +573,30 @@ class CalendarController(
     def update(self, uuid, **kwargs):
         calendar = self.get(uuid=uuid)
         values = kwargs.copy()
-        for name in ("source_name", "source", "sync_token", "sync_status", "sync_error", "deleted"):
+        for name in (
+            "ctag",
+            "source_name",
+            "source",
+            "sync_token",
+            "sync_status",
+            "sync_error",
+            "deleted",
+        ):
             values.pop(name, None)
         if "external_user_uuid" in values:
             self._get_owned_external_account(
                 values["external_user_uuid"],
                 messenger_models.ExternalAccountType.CALENDAR.value,
             )
-        if calendar.external_user_uuid is not None or values.get("external_user_uuid") is not None:
+        if (
+            calendar.external_user_uuid is not None
+            or values.get("external_user_uuid") is not None
+        ):
             values["sync_status"] = models.SyncStatus.PENDING.value
             values["sync_error"] = None
         calendar.update_dm(values=values)
         calendar.update()
+        provider_commands.create_calendar_command(calendar, "calendar.update")
         workspace_events.create_groupware_event(
             calendar,
             workspace_events.CALENDAR_UPDATED_EVENT,
@@ -496,12 +619,19 @@ class CalendarController(
                 },
             )
             calendar.update()
-        workspace_events.create_groupware_deleted_event(
-            project_id,
-            user_uuid,
-            calendar_uuid,
-            workspace_events.CALENDAR_DELETED_EVENT,
-        )
+        provider_commands.create_calendar_command(calendar, "calendar.delete")
+        if calendar.external_user_uuid is None:
+            workspace_events.create_groupware_deleted_event(
+                project_id,
+                user_uuid,
+                calendar_uuid,
+                workspace_events.CALENDAR_DELETED_EVENT,
+            )
+        else:
+            workspace_events.create_groupware_event(
+                calendar,
+                workspace_events.CALENDAR_DELETED_EVENT,
+            )
 
 
 class CalendarEventController(
@@ -510,7 +640,21 @@ class CalendarEventController(
     __packer__ = CalendarEventJSONPacker
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.CalendarEvent,
-        hidden_fields=["project_id", "user_uuid", "sync_error"],
+        hidden_fields=[
+            "project_id",
+            "user_uuid",
+            "provider_uuid",
+            "provider_external_id",
+            "delivery_status",
+            "delivery_error",
+            "delivery_updated_at",
+            "ics",
+            "etag",
+            "sync_status",
+            "sync_error",
+            "source_name",
+            "source",
+        ],
         convert_underscore=False,
         process_filters=True,
     )
@@ -546,6 +690,7 @@ class CalendarEventController(
         values["sync_error"] = None
         event = models.CalendarEvent(**values)
         event.insert()
+        provider_commands.create_calendar_command(event, "event.create")
         workspace_events.create_groupware_event(
             event,
             workspace_events.CALENDAR_EVENT_CREATED_EVENT,
@@ -556,6 +701,7 @@ class CalendarEventController(
         event = self.get(uuid=uuid)
         values = kwargs.copy()
         for name in (
+            "ics",
             "source_name",
             "source",
             "sync_status",
@@ -572,6 +718,7 @@ class CalendarEventController(
             values["sync_error"] = None
         event.update_dm(values=values)
         event.update()
+        provider_commands.create_calendar_command(event, "event.update")
         workspace_events.create_groupware_event(
             event,
             workspace_events.CALENDAR_EVENT_UPDATED_EVENT,
@@ -591,12 +738,19 @@ class CalendarEventController(
                 },
             )
             event.update()
-        workspace_events.create_groupware_deleted_event(
-            event.project_id,
-            event.user_uuid,
-            event.uuid,
-            workspace_events.CALENDAR_EVENT_DELETED_EVENT,
-        )
+        provider_commands.create_calendar_command(event, "event.delete")
+        if event.external_user_uuid is None:
+            workspace_events.create_groupware_deleted_event(
+                event.project_id,
+                event.user_uuid,
+                event.uuid,
+                workspace_events.CALENDAR_EVENT_DELETED_EVENT,
+            )
+        else:
+            workspace_events.create_groupware_event(
+                event,
+                workspace_events.CALENDAR_EVENT_DELETED_EVENT,
+            )
         return None
 
     @ra_actions.post
@@ -615,6 +769,7 @@ class CalendarEventController(
             },
         )
         resource.update()
+        provider_commands.create_calendar_command(resource, "event.move")
         workspace_events.create_groupware_event(
             resource,
             workspace_events.CALENDAR_EVENT_UPDATED_EVENT,

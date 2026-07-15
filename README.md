@@ -2,24 +2,31 @@
 
 Backend services for **Genesis Workspace**. The current branch provides one
 IAM-authenticated REST API for messenger, mail, and calendar data; durable
-cross-service realtime events; external protocol bridge workers; and the
-messenger background workers.
+cross-service realtime events; a separate trusted provider Service API;
+independent full-state provider daemons; and the messenger background workers.
 
 Current contracts are documented in:
 
+- [`docs/architecture.md`](docs/architecture.md)
 - [`docs/workspace_api.md`](docs/workspace_api.md)
 - [`docs/workspace_ui_realtime_integration.md`](docs/workspace_ui_realtime_integration.md)
+- [`docs/provider_service_api.md`](docs/provider_service_api.md)
+- [`docs/provider_integration_guide.md`](docs/provider_integration_guide.md)
 
 ## Runtime Entry Points
 
 Direct local services:
 
-- REST API: `http://127.0.0.1:21081/v1`
+- Messenger REST API: `http://127.0.0.1:21081/v1`
 - WebSocket API: `ws://127.0.0.1:21082/v1/events/ws`
+- Provider Service API: `http://127.0.0.1:21083/v1`
+- Workspace REST API: `http://127.0.0.1:21084/v1`
 - Messenger worker: `workspace-messenger-worker`
-- Integration bridge worker: `workspace-integration-bridge-worker`
-- Mail/calendar bridge worker: `workspace-groupware-bridge-worker`
-- OpenAPI spec: `http://127.0.0.1:21081/specifications/3.0.3`
+- Independent providers: `workspace-zulip-provider`, `workspace-mail-provider`,
+  and `workspace-calendar-provider`
+- Messenger OpenAPI spec: `http://127.0.0.1:21081/specifications/3.0.3`
+- Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
+- Provider OpenAPI spec: `http://127.0.0.1:21083/specifications/3.0.3`
 
 Nginx exposes the services as:
 
@@ -30,6 +37,16 @@ Nginx exposes the services as:
 - WebSocket API: `/api/workspace/v1/events/ws?last_epoch_version=<number>`
 - OpenAPI spec: `/api/workspace/specifications/3.0.3`
 - Upload request limit: `50m`
+
+The provider process is not published by the browser-facing nginx. Providers
+on the same host use `http://127.0.0.1:21083/v1`. Provider elements use the
+platform-internal nginx listener on port `21085` under
+`/api/workspace-service/v1`; that listener must not be exposed publicly.
+The UI never calls either Provider Service URL.
+
+Zulip, Mail, and Calendar providers are separate Exordos elements with separate
+manifests, compute images, daemons, PostgreSQL instances, users, and databases.
+They share no tables with each other or with the Workspace backend.
 
 Deployment stores uploaded files through the configured messenger file
 storage backend. For durable deployments prefer S3; local storage uses the node
@@ -51,6 +68,7 @@ The main resources are:
 - `messages` and `message_reactions`
 - `files`
 - common `users`, `external_users`, `services`, `me`, `events`, and `epoch`
+- the IAM-authenticated provider catalog used by External Account setup
 - mail `folders`, `messages`, and `attachments`
 - calendar `calendars` and `events`
 

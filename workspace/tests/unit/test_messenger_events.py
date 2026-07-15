@@ -82,7 +82,9 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
 
     def test_conditional_filter_suffixes(self):
-        split = controllers.WorkspaceBaseResourceControllerPaginated._split_filter_operator
+        split = (
+            controllers.WorkspaceBaseResourceControllerPaginated._split_filter_operator
+        )
         self.assertEqual(
             ("created_at", dm_filters.GE),
             split("created_at=>"),
@@ -336,9 +338,7 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
-            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
-                payload.created_at
-            ),
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.created_at),
         )
         self.assertEqual({}, payload.reactions)
 
@@ -392,9 +392,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("Inbox", payload.title)
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
-            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
-                payload.created_at
-            ),
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.created_at),
         )
 
     def test_folder_updated_event_payload_accepts_postgres_json_timestamp(self):
@@ -421,9 +419,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("Archive", payload.title)
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
-            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
-                payload.updated_at
-            ),
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.updated_at),
         )
 
     def test_stream_created_event_payload_accepts_postgres_json_timestamp(self):
@@ -451,17 +447,19 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "invite_only": False,
                 "announce": False,
                 "private": False,
+                "provider": None,
+                "delivery": None,
                 "created_at": "2026-06-24T22:28:34.166369",
                 "updated_at": "2026-06-24T22:28:34.166369",
             }
         )
 
         self.assertEqual("Engineering", payload.name)
+        self.assertIsNone(payload.provider)
+        self.assertIsNone(payload.delivery)
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
-            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
-                payload.created_at
-            ),
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.created_at),
         )
 
     def test_stream_bindings_created_event_payload_accepts_binding_list(self):
@@ -529,9 +527,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual(
             "2026-06-24T22:28:40.166369Z",
-            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
-                payload.updated_at
-            ),
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.updated_at),
         )
 
     def test_topic_created_event_payload_accepts_postgres_json_timestamp(self):
@@ -556,16 +552,26 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "is_default": False,
                 "is_done": False,
                 "notification_mode": "default",
+                "provider": {
+                    "uuid": str(sys_uuid.uuid4()),
+                    "name": "Zulip Main",
+                    "kind": "zulip",
+                },
+                "delivery": {
+                    "status": "delivered",
+                    "safe_error": None,
+                    "updated_at": "2026-06-24T22:28:34.166369Z",
+                },
             }
         )
 
         self.assertEqual("Planning", payload.name)
         self.assertEqual("default", payload.notification_mode)
+        self.assertEqual("Zulip Main", payload.provider["name"])
+        self.assertEqual("delivered", payload.delivery["status"])
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
-            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(
-                payload.created_at
-            ),
+            event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.created_at),
         )
 
     def test_topic_deleted_event_payload_accepts_topic_id(self):
@@ -653,9 +659,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             payload=payload,
         )
         session = mock.MagicMock()
-        session.execute.return_value.fetchone.return_value = {
-            "epoch_version": 42
-        }
+        session.execute.return_value.fetchone.return_value = {"epoch_version": 42}
         engine = mock.MagicMock()
         engine.escape.side_effect = lambda value: f'"{value}"'
         engine.session_manager.return_value.__enter__.return_value = session
@@ -702,12 +706,21 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         session = object()
 
-        result, created_events = self._capture_workspace_events(
-            lambda: events.create_message_updated_event(
-                message=user_message,
-                session=session,
+        with mock.patch.object(
+            events.models.WorkspaceMessage,
+            "objects",
+            types.SimpleNamespace(
+                get_one=mock.Mock(
+                    return_value=types.SimpleNamespace(provider_uuid=None),
+                ),
+            ),
+        ):
+            result, created_events = self._capture_workspace_events(
+                lambda: events.create_message_updated_event(
+                    message=user_message,
+                    session=session,
+                )
             )
-        )
 
         created_event = created_events[0]
         self.assertEqual(1, result)
@@ -816,15 +829,28 @@ class MessengerEventsTestCase(unittest.TestCase):
             notification_mode="default",
         )
 
-        _result, created_events = self._capture_workspace_events(
-            lambda: [
-                events.create_folder_event(folder=folder),
-                events.create_stream_event(stream=stream),
-                events.create_stream_read_event(stream=stream),
-                events.create_topic_event(topic=topic),
-                events.create_topic_read_event(topic=topic),
-            ]
-        )
+        native_resource = types.SimpleNamespace(provider_uuid=None)
+        with (
+            mock.patch.object(
+                events.models.WorkspaceStream,
+                "objects",
+                types.SimpleNamespace(get_one=mock.Mock(return_value=native_resource)),
+            ),
+            mock.patch.object(
+                events.models.WorkspaceStreamTopic,
+                "objects",
+                types.SimpleNamespace(get_one=mock.Mock(return_value=native_resource)),
+            ),
+        ):
+            _result, created_events = self._capture_workspace_events(
+                lambda: [
+                    events.create_folder_event(folder=folder),
+                    events.create_stream_event(stream=stream),
+                    events.create_stream_read_event(stream=stream),
+                    events.create_topic_event(topic=topic),
+                    events.create_topic_read_event(topic=topic),
+                ]
+            )
 
         self._assert_created_event_contract(
             created_events[0], "folder", "created", "folder.created"
@@ -835,6 +861,8 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Engineering", created_events[1]["payload"]["name"])
         self.assertEqual({"kind": "native"}, created_events[1]["payload"]["source"])
+        self.assertIsNone(created_events[1]["payload"]["provider"])
+        self.assertIsNone(created_events[1]["payload"]["delivery"])
         self._assert_created_event_contract(
             created_events[2], "stream", "read", "stream.read"
         )
@@ -842,9 +870,127 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_events[3], "topic", "created", "topic.created"
         )
         self.assertEqual("Planning", created_events[3]["payload"]["name"])
+        self.assertIsNone(created_events[3]["payload"]["provider"])
+        self.assertIsNone(created_events[3]["payload"]["delivery"])
         self._assert_created_event_contract(
             created_events[4], "topic", "read", "topic.read"
         )
+
+    def test_provider_stream_topic_and_reaction_events_match_rest_metadata(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        provider_uuid = sys_uuid.uuid4()
+        account_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        updated_at = datetime.datetime(
+            2026, 6, 24, 10, 5, 0, tzinfo=datetime.timezone.utc
+        )
+        provider = types.SimpleNamespace(
+            uuid=provider_uuid,
+            name="Zulip Main",
+        )
+        account = types.SimpleNamespace(account_type="zulip")
+        provider_resource = types.SimpleNamespace(
+            provider_uuid=provider_uuid,
+            external_account_uuid=account_uuid,
+            delivery_status="delivered",
+            delivery_error=None,
+            delivery_updated_at=updated_at,
+        )
+        stream = models.WorkspaceUserStream(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            name="Engineering",
+            description="Engineering workspace",
+            project_id=project_id,
+            owner=user_uuid,
+            role="member",
+            notification_mode="all_messages",
+            source_name="zulip",
+            source=models.ZulipSource(
+                stream_id=17,
+                server_url="https://zulip.example.test",
+            ),
+        )
+        topic = models.WorkspaceUserTopic(
+            uuid=topic_uuid,
+            user_uuid=user_uuid,
+            project_id=project_id,
+            name="Planning",
+            stream_uuid=stream_uuid,
+        )
+        reaction = types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            project_id=project_id,
+            message_uuid=message_uuid,
+            user_uuid=user_uuid,
+            emoji_name="thumbs_up",
+            **vars(provider_resource),
+        )
+        message = types.SimpleNamespace(
+            source_name="zulip",
+            source=models.ZulipSource(
+                stream_id=17,
+                server_url="https://zulip.example.test",
+                topic_name="Planning",
+                message_id=42,
+            ),
+        )
+        session = object()
+
+        with (
+            mock.patch.object(
+                events.models.WorkspaceStream,
+                "objects",
+                types.SimpleNamespace(
+                    get_one=mock.Mock(return_value=provider_resource),
+                ),
+            ),
+            mock.patch.object(
+                events.models.WorkspaceStreamTopic,
+                "objects",
+                types.SimpleNamespace(
+                    get_one=mock.Mock(return_value=provider_resource),
+                ),
+            ),
+            mock.patch.object(
+                events.provider_payloads.provider_models.WorkspaceProvider,
+                "objects",
+                types.SimpleNamespace(get_one=mock.Mock(return_value=provider)),
+            ),
+            mock.patch.object(
+                events.provider_payloads.messenger_models.ExternalAccount,
+                "objects",
+                types.SimpleNamespace(get_one=mock.Mock(return_value=account)),
+            ),
+        ):
+            _result, created_events = self._capture_workspace_events(
+                lambda: [
+                    events.create_stream_event(stream, session=session),
+                    events.create_topic_event(topic, session=session),
+                    events.create_message_reaction_created_event(
+                        reaction,
+                        message,
+                        session=session,
+                    ),
+                ]
+            )
+
+        expected_provider = {
+            "uuid": str(provider_uuid),
+            "name": "Zulip Main",
+            "kind": "zulip",
+        }
+        expected_delivery = {
+            "status": "delivered",
+            "safe_error": None,
+            "updated_at": "2026-06-24T10:05:00Z",
+        }
+        for created_event in created_events:
+            self.assertEqual(expected_provider, created_event["payload"]["provider"])
+            self.assertEqual(expected_delivery, created_event["payload"]["delivery"])
 
     def test_create_stream_bindings_created_event_uses_items_payload(self):
         project_id = sys_uuid.uuid4()
@@ -1096,7 +1242,9 @@ class MessengerEventsTestCase(unittest.TestCase):
             serve_kwargs.update(kwargs)
             return ServeContext()
 
-        with mock.patch.object(websocket_service.websockets, "serve", side_effect=serve):
+        with mock.patch.object(
+            websocket_service.websockets, "serve", side_effect=serve
+        ):
             asyncio.run(server.serve("127.0.0.1", 21082))
 
         self.assertEqual(25, serve_kwargs["ping_interval"])

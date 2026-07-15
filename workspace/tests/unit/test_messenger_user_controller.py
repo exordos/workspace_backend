@@ -33,18 +33,11 @@ class WorkspaceUserControllerTestCase(unittest.TestCase):
         user_uuid = sys_uuid.uuid4()
         expected_user = object()
 
-        with (
-            mock.patch.object(
-                controller,
-                "_get_user_uuid",
-                return_value=sys_uuid.uuid4(),
-            ),
-            mock.patch.object(
-                orm.ObjectCollection,
-                "get_one",
-                return_value=expected_user,
-            ) as get_one,
-        ):
+        with mock.patch.object(
+            orm.ObjectCollection,
+            "get_one",
+            return_value=expected_user,
+        ) as get_one:
             result = controller.get(uuid=user_uuid)
 
         self.assertIs(result, expected_user)

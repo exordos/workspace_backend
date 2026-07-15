@@ -14,7 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
 import uuid as sys_uuid
 
 import webob
@@ -27,6 +26,7 @@ from restalchemy.storage.sql import engines
 
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import models
+from workspace.provider_api import payloads as provider_payloads
 
 
 EVENTS_CHANNEL = "workspace_events"
@@ -38,10 +38,6 @@ TOPIC_OBJECT_TYPE = "topic"
 USER_OBJECT_TYPE = "user"
 FOLDER_OBJECT_TYPE = "folder"
 FOLDER_ITEM_OBJECT_TYPE = "folder_item"
-MAIL_FOLDER_OBJECT_TYPE = "mail_folder"
-MAIL_MESSAGE_OBJECT_TYPE = "mail_message"
-CALENDAR_OBJECT_TYPE = "calendar"
-CALENDAR_EVENT_OBJECT_TYPE = "calendar_event"
 CREATED_ACTION = "created"
 UPDATED_ACTION = "updated"
 DELETED_ACTION = "deleted"
@@ -51,22 +47,14 @@ MESSAGE_UPDATED_EVENT = event_payloads.MessageUpdatedEventPayload.KIND
 MESSAGE_READ_EVENT = event_payloads.MessageReadEventPayload.KIND
 MESSAGES_READ_EVENT = event_payloads.MessagesReadEventPayload.KIND
 MESSAGE_DELETED_EVENT = event_payloads.MessageDeletedEventPayload.KIND
-MESSAGE_REACTION_CREATED_EVENT = (
-    event_payloads.MessageReactionCreatedEventPayload.KIND
-)
-MESSAGE_REACTION_UPDATED_EVENT = (
-    event_payloads.MessageReactionUpdatedEventPayload.KIND
-)
-MESSAGE_REACTION_DELETED_EVENT = (
-    event_payloads.MessageReactionDeletedEventPayload.KIND
-)
+MESSAGE_REACTION_CREATED_EVENT = event_payloads.MessageReactionCreatedEventPayload.KIND
+MESSAGE_REACTION_UPDATED_EVENT = event_payloads.MessageReactionUpdatedEventPayload.KIND
+MESSAGE_REACTION_DELETED_EVENT = event_payloads.MessageReactionDeletedEventPayload.KIND
 STREAM_CREATED_EVENT = event_payloads.StreamCreatedEventPayload.KIND
 STREAM_UPDATED_EVENT = event_payloads.StreamUpdatedEventPayload.KIND
 STREAM_READ_EVENT = event_payloads.StreamReadEventPayload.KIND
 STREAM_DELETED_EVENT = event_payloads.StreamDeletedEventPayload.KIND
-STREAM_BINDINGS_CREATED_EVENT = (
-    event_payloads.StreamBindingsCreatedEventPayload.KIND
-)
+STREAM_BINDINGS_CREATED_EVENT = event_payloads.StreamBindingsCreatedEventPayload.KIND
 USER_UPDATED_EVENT = event_payloads.UserUpdatedEventPayload.KIND
 TOPIC_CREATED_EVENT = event_payloads.TopicCreatedEventPayload.KIND
 TOPIC_UPDATED_EVENT = event_payloads.TopicUpdatedEventPayload.KIND
@@ -75,21 +63,7 @@ TOPIC_DELETED_EVENT = event_payloads.TopicDeletedEventPayload.KIND
 FOLDER_CREATED_EVENT = event_payloads.FolderCreatedEventPayload.KIND
 FOLDER_UPDATED_EVENT = event_payloads.FolderUpdatedEventPayload.KIND
 FOLDER_DELETED_EVENT = event_payloads.FolderDeletedEventPayload.KIND
-FOLDER_ITEM_DELETED_EVENT = (
-    event_payloads.FolderItemDeletedEventPayload.KIND
-)
-MAIL_FOLDER_CREATED_EVENT = "mail.folder.created"
-MAIL_FOLDER_UPDATED_EVENT = "mail.folder.updated"
-MAIL_FOLDER_DELETED_EVENT = "mail.folder.deleted"
-MAIL_MESSAGE_CREATED_EVENT = "mail.message.created"
-MAIL_MESSAGE_UPDATED_EVENT = "mail.message.updated"
-MAIL_MESSAGE_DELETED_EVENT = "mail.message.deleted"
-CALENDAR_CREATED_EVENT = "calendar.calendar.created"
-CALENDAR_UPDATED_EVENT = "calendar.calendar.updated"
-CALENDAR_DELETED_EVENT = "calendar.calendar.deleted"
-CALENDAR_EVENT_CREATED_EVENT = "calendar.event.created"
-CALENDAR_EVENT_UPDATED_EVENT = "calendar.event.updated"
-CALENDAR_EVENT_DELETED_EVENT = "calendar.event.deleted"
+FOLDER_ITEM_DELETED_EVENT = event_payloads.FolderItemDeletedEventPayload.KIND
 EVENT_METADATA = {
     MESSAGE_CREATED_EVENT: (MESSAGE_OBJECT_TYPE, CREATED_ACTION),
     MESSAGE_UPDATED_EVENT: (MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
@@ -97,20 +71,24 @@ EVENT_METADATA = {
     MESSAGES_READ_EVENT: (MESSAGE_OBJECT_TYPE, READ_ACTION),
     MESSAGE_DELETED_EVENT: (MESSAGE_OBJECT_TYPE, DELETED_ACTION),
     MESSAGE_REACTION_CREATED_EVENT: (
-        MESSAGE_REACTION_OBJECT_TYPE, CREATED_ACTION,
+        MESSAGE_REACTION_OBJECT_TYPE,
+        CREATED_ACTION,
     ),
     MESSAGE_REACTION_UPDATED_EVENT: (
-        MESSAGE_REACTION_OBJECT_TYPE, UPDATED_ACTION,
+        MESSAGE_REACTION_OBJECT_TYPE,
+        UPDATED_ACTION,
     ),
     MESSAGE_REACTION_DELETED_EVENT: (
-        MESSAGE_REACTION_OBJECT_TYPE, DELETED_ACTION,
+        MESSAGE_REACTION_OBJECT_TYPE,
+        DELETED_ACTION,
     ),
     STREAM_CREATED_EVENT: (STREAM_OBJECT_TYPE, CREATED_ACTION),
     STREAM_UPDATED_EVENT: (STREAM_OBJECT_TYPE, UPDATED_ACTION),
     STREAM_READ_EVENT: (STREAM_OBJECT_TYPE, READ_ACTION),
     STREAM_DELETED_EVENT: (STREAM_OBJECT_TYPE, DELETED_ACTION),
     STREAM_BINDINGS_CREATED_EVENT: (
-        STREAM_BINDING_OBJECT_TYPE, CREATED_ACTION,
+        STREAM_BINDING_OBJECT_TYPE,
+        CREATED_ACTION,
     ),
     USER_UPDATED_EVENT: (USER_OBJECT_TYPE, UPDATED_ACTION),
     TOPIC_CREATED_EVENT: (TOPIC_OBJECT_TYPE, CREATED_ACTION),
@@ -121,18 +99,6 @@ EVENT_METADATA = {
     FOLDER_UPDATED_EVENT: (FOLDER_OBJECT_TYPE, UPDATED_ACTION),
     FOLDER_DELETED_EVENT: (FOLDER_OBJECT_TYPE, DELETED_ACTION),
     FOLDER_ITEM_DELETED_EVENT: (FOLDER_ITEM_OBJECT_TYPE, DELETED_ACTION),
-    MAIL_FOLDER_CREATED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, CREATED_ACTION),
-    MAIL_FOLDER_UPDATED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, UPDATED_ACTION),
-    MAIL_FOLDER_DELETED_EVENT: (MAIL_FOLDER_OBJECT_TYPE, DELETED_ACTION),
-    MAIL_MESSAGE_CREATED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, CREATED_ACTION),
-    MAIL_MESSAGE_UPDATED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
-    MAIL_MESSAGE_DELETED_EVENT: (MAIL_MESSAGE_OBJECT_TYPE, DELETED_ACTION),
-    CALENDAR_CREATED_EVENT: (CALENDAR_OBJECT_TYPE, CREATED_ACTION),
-    CALENDAR_UPDATED_EVENT: (CALENDAR_OBJECT_TYPE, UPDATED_ACTION),
-    CALENDAR_DELETED_EVENT: (CALENDAR_OBJECT_TYPE, DELETED_ACTION),
-    CALENDAR_EVENT_CREATED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, CREATED_ACTION),
-    CALENDAR_EVENT_UPDATED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, UPDATED_ACTION),
-    CALENDAR_EVENT_DELETED_EVENT: (CALENDAR_EVENT_OBJECT_TYPE, DELETED_ACTION),
 }
 WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
     model_class=models.WorkspaceVisibleEvent,
@@ -141,25 +107,18 @@ WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
 )
 DEFAULT_EVENTS_LIMIT = 100
 MAX_EVENTS_LIMIT = 500
-WORKSPACE_USER_MESSAGE_FIELDS = tuple(
-    models.WorkspaceUserMessage.properties.properties
-)
+WORKSPACE_USER_MESSAGE_FIELDS = tuple(models.WorkspaceUserMessage.properties.properties)
 WORKSPACE_USER_STREAM_FIELDS = tuple(
-    name for name in models.WorkspaceUserStream.properties.properties
+    name
+    for name in models.WorkspaceUserStream.properties.properties
     if name != "private_index"
 )
 WORKSPACE_STREAM_BINDING_FIELDS = tuple(
     models.WorkspaceStreamBinding.properties.properties
 )
-WORKSPACE_USER_TOPIC_FIELDS = tuple(
-    models.WorkspaceUserTopic.properties.properties
-)
-WORKSPACE_USER_FOLDER_FIELDS = tuple(
-    models.UserFolder.properties.properties
-)
-WORKSPACE_USER_FIELDS = tuple(
-    models.WorkspaceUser.properties.properties
-)
+WORKSPACE_USER_TOPIC_FIELDS = tuple(models.WorkspaceUserTopic.properties.properties)
+WORKSPACE_USER_FOLDER_FIELDS = tuple(models.UserFolder.properties.properties)
+WORKSPACE_USER_FIELDS = tuple(models.WorkspaceUser.properties.properties)
 
 
 def _to_uuid_string(value):
@@ -177,19 +136,8 @@ def _event_payload_value(name, value):
     if value is None:
         return None
     if name in ("created_at", "updated_at", "last_ping_at"):
-        value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(
-            value
-        )
+        value = event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.from_simple_type(value)
         return event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(value)
-    if isinstance(value, datetime.datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=datetime.timezone.utc)
-        return value.astimezone(datetime.timezone.utc).isoformat().replace(
-            "+00:00",
-            "Z",
-        )
-    if isinstance(value, datetime.date):
-        return value.isoformat()
     if isinstance(value, sys_uuid.UUID):
         return _to_uuid_string(value)
     if name == "uuid" or name.endswith("uuid") or name == "project_id":
@@ -215,7 +163,7 @@ def _event_payload_get(event_payload, name):
         return None
 
 
-def _message_from_event_payload(event_payload):
+def _message_from_event_payload(event_payload, session=None):
     result = {}
     for name in WORKSPACE_USER_MESSAGE_FIELDS:
         value = _event_payload_get(event_payload, name)
@@ -224,7 +172,20 @@ def _message_from_event_payload(event_payload):
         if value is None:
             continue
         result[name] = _event_payload_value(name, value)
-    return result
+    message = models.WorkspaceMessage.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(_event_payload_get(event_payload, "uuid")),
+            "project_id": dm_filters.EQ(
+                _event_payload_get(event_payload, "project_id"),
+            ),
+        },
+        session=session,
+    )
+    return provider_payloads.add_provider_delivery_payload(
+        result,
+        message,
+        session=session,
+    )
 
 
 def _folder_from_event_payload(event_payload):
@@ -234,21 +195,48 @@ def _folder_from_event_payload(event_payload):
     }
 
 
-def _stream_from_event_payload(event_payload):
-    return {
+def _stream_from_event_payload(event_payload, session=None):
+    result = {
         name: _event_payload_value(name, _event_payload_get(event_payload, name))
         for name in WORKSPACE_USER_STREAM_FIELDS
     }
+    stream = models.WorkspaceStream.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(_event_payload_get(event_payload, "uuid")),
+            "project_id": dm_filters.EQ(
+                _event_payload_get(event_payload, "project_id"),
+            ),
+        },
+        session=session,
+    )
+    return provider_payloads.add_provider_delivery_payload(
+        result,
+        stream,
+        session=session,
+    )
 
 
-def _topic_from_event_payload(event_payload):
+def _topic_from_event_payload(event_payload, session=None):
     result = {}
     for name in WORKSPACE_USER_TOPIC_FIELDS:
         value = _event_payload_get(event_payload, name)
         if name == "notification_mode" and value is None:
             value = models.WorkspaceTopicNotificationMode.DEFAULT.value
         result[name] = _event_payload_value(name, value)
-    return result
+    topic = models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(_event_payload_get(event_payload, "uuid")),
+            "project_id": dm_filters.EQ(
+                _event_payload_get(event_payload, "project_id"),
+            ),
+        },
+        session=session,
+    )
+    return provider_payloads.add_provider_delivery_payload(
+        result,
+        topic,
+        session=session,
+    )
 
 
 def _stream_binding_snapshot_from_mapping(value):
@@ -304,9 +292,7 @@ def _workspace_event_from_row(row):
     row_object_type = _event_row_get(row, "object_type")
     row_action = _event_row_get(row, "action")
     values = {
-        "schema_version": (
-            schema_version or models.WORKSPACE_EVENT_SCHEMA_VERSION
-        ),
+        "schema_version": (schema_version or models.WORKSPACE_EVENT_SCHEMA_VERSION),
         "uuid": _event_row_uuid(_event_row_get(row, "uuid"), sys_uuid.uuid4()),
         "epoch_version": _event_row_get(row, "epoch_version"),
         "project_id": _event_row_uuid(
@@ -393,7 +379,7 @@ def create_message_events(project_id, message, recipients, session=None):
             project_id=user_message.project_id,
             user_uuid=user_message.user_uuid,
             kind=MESSAGE_CREATED_EVENT,
-            payload=_message_from_event_payload(user_message),
+            payload=_message_from_event_payload(user_message, session=session),
             session=session,
         )
         result.append(epoch_version)
@@ -405,7 +391,7 @@ def create_message_updated_event(message, session=None):
         project_id=message.project_id,
         user_uuid=message.user_uuid,
         kind=MESSAGE_UPDATED_EVENT,
-        payload=_message_from_event_payload(message),
+        payload=_message_from_event_payload(message, session=session),
         session=session,
     )
 
@@ -415,13 +401,12 @@ def create_message_read_event(message, session=None):
         project_id=message.project_id,
         user_uuid=message.user_uuid,
         kind=MESSAGE_READ_EVENT,
-        payload=_message_from_event_payload(message),
+        payload=_message_from_event_payload(message, session=session),
         session=session,
     )
 
 
-def create_messages_read_event(project_id, user_uuid, message_uuids,
-                               session=None):
+def create_messages_read_event(project_id, user_uuid, message_uuids, session=None):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -437,9 +422,17 @@ def create_messages_read_event(project_id, user_uuid, message_uuids,
     )
 
 
-def create_message_deleted_event(project_id, user_uuid, message_uuid,
-                                 stream_uuid, topic_uuid, author_uuid,
-                                 source_name, source, session=None):
+def create_message_deleted_event(
+    project_id,
+    user_uuid,
+    message_uuid,
+    stream_uuid,
+    topic_uuid,
+    author_uuid,
+    source_name,
+    source,
+    session=None,
+):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -456,7 +449,12 @@ def create_message_deleted_event(project_id, user_uuid, message_uuid,
     )
 
 
-def _message_reaction_event_payload(reaction, message, **values):
+def _message_reaction_event_payload(
+    reaction,
+    message,
+    session=None,
+    **values,
+):
     payload = {
         "uuid": _event_payload_value("uuid", reaction.uuid),
         "project_id": _event_payload_value("project_id", reaction.project_id),
@@ -476,7 +474,11 @@ def _message_reaction_event_payload(reaction, message, **values):
         "source": _event_payload_value("source", message.source),
     }
     payload.update(values)
-    return payload
+    return provider_payloads.add_provider_delivery_payload(
+        payload,
+        reaction,
+        session=session,
+    )
 
 
 def create_message_reaction_created_event(reaction, message, session=None):
@@ -484,7 +486,11 @@ def create_message_reaction_created_event(reaction, message, session=None):
         project_id=reaction.project_id,
         user_uuid=reaction.user_uuid,
         kind=MESSAGE_REACTION_CREATED_EVENT,
-        payload=_message_reaction_event_payload(reaction, message),
+        payload=_message_reaction_event_payload(
+            reaction,
+            message,
+            session=session,
+        ),
         session=session,
     )
 
@@ -503,6 +509,7 @@ def create_message_reaction_updated_event(
         payload=_message_reaction_event_payload(
             reaction,
             message,
+            session=session,
             old_message_uuid=_event_payload_value(
                 "message_uuid",
                 old_message.uuid,
@@ -526,7 +533,11 @@ def create_message_reaction_deleted_event(reaction, message, session=None):
         project_id=reaction.project_id,
         user_uuid=reaction.user_uuid,
         kind=MESSAGE_REACTION_DELETED_EVENT,
-        payload=_message_reaction_event_payload(reaction, message),
+        payload=_message_reaction_event_payload(
+            reaction,
+            message,
+            session=session,
+        ),
         session=session,
     )
 
@@ -546,7 +557,7 @@ def create_stream_event(stream, session=None):
         project_id=stream.project_id,
         user_uuid=stream.user_uuid,
         kind=STREAM_CREATED_EVENT,
-        payload=_stream_from_event_payload(stream),
+        payload=_stream_from_event_payload(stream, session=session),
         session=session,
     )
 
@@ -556,7 +567,7 @@ def create_stream_updated_event(stream, session=None):
         project_id=stream.project_id,
         user_uuid=stream.user_uuid,
         kind=STREAM_UPDATED_EVENT,
-        payload=_stream_from_event_payload(stream),
+        payload=_stream_from_event_payload(stream, session=session),
         session=session,
     )
 
@@ -566,7 +577,7 @@ def create_stream_read_event(stream, session=None):
         project_id=stream.project_id,
         user_uuid=stream.user_uuid,
         kind=STREAM_READ_EVENT,
-        payload=_stream_from_event_payload(stream),
+        payload=_stream_from_event_payload(stream, session=session),
         session=session,
     )
 
@@ -576,7 +587,7 @@ def create_topic_event(topic, session=None):
         project_id=topic.project_id,
         user_uuid=topic.user_uuid,
         kind=TOPIC_CREATED_EVENT,
-        payload=_topic_from_event_payload(topic),
+        payload=_topic_from_event_payload(topic, session=session),
         session=session,
     )
 
@@ -586,7 +597,7 @@ def create_topic_updated_event(topic, session=None):
         project_id=topic.project_id,
         user_uuid=topic.user_uuid,
         kind=TOPIC_UPDATED_EVENT,
-        payload=_topic_from_event_payload(topic),
+        payload=_topic_from_event_payload(topic, session=session),
         session=session,
     )
 
@@ -596,13 +607,14 @@ def create_topic_read_event(topic, session=None):
         project_id=topic.project_id,
         user_uuid=topic.user_uuid,
         kind=TOPIC_READ_EVENT,
-        payload=_topic_from_event_payload(topic),
+        payload=_topic_from_event_payload(topic, session=session),
         session=session,
     )
 
 
-def create_topic_deleted_event(project_id, user_uuid, topic_uuid, stream_uuid,
-                               source_name, source, session=None):
+def create_topic_deleted_event(
+    project_id, user_uuid, topic_uuid, stream_uuid, source_name, source, session=None
+):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -617,8 +629,9 @@ def create_topic_deleted_event(project_id, user_uuid, topic_uuid, stream_uuid,
     )
 
 
-def create_stream_deleted_event(project_id, user_uuid, stream_uuid,
-                                source_name, source, session=None):
+def create_stream_deleted_event(
+    project_id, user_uuid, stream_uuid, source_name, source, session=None
+):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -649,8 +662,7 @@ def create_stream_bindings_created_event(bindings, user_uuid, session=None):
     )
 
 
-def create_user_updated_events(user, project_id, recipient_user_uuids,
-                               session=None):
+def create_user_updated_events(user, project_id, recipient_user_uuids, session=None):
     result = []
     payload = _user_from_event_payload(user)
     for recipient_user_uuid in recipient_user_uuids:
@@ -676,8 +688,7 @@ def create_folder_updated_event(folder, session=None):
     )
 
 
-def create_folder_deleted_event(project_id, user_uuid, folder_uuid,
-                                session=None):
+def create_folder_deleted_event(project_id, user_uuid, folder_uuid, session=None):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -687,8 +698,7 @@ def create_folder_deleted_event(project_id, user_uuid, folder_uuid,
     )
 
 
-def create_folder_item_deleted_event(project_id, user_uuid, item_uuid,
-                                     session=None):
+def create_folder_item_deleted_event(project_id, user_uuid, item_uuid, session=None):
     return _create_workspace_event(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -698,29 +708,13 @@ def create_folder_item_deleted_event(project_id, user_uuid, item_uuid,
     )
 
 
-def create_groupware_event(resource, kind, session=None):
-    return _create_workspace_event(
-        project_id=resource.project_id,
-        user_uuid=resource.user_uuid,
-        kind=kind,
-        payload=_model_to_event_payload_value(resource),
-        session=session,
-    )
-
-
-def create_groupware_deleted_event(project_id, user_uuid, resource_uuid,
-                                   kind, session=None):
-    return _create_workspace_event(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        kind=kind,
-        payload={"uuid": _event_payload_value("uuid", resource_uuid)},
-        session=session,
-    )
-
-
-def get_events_after(project_id, user_uuid, after_epoch_version=0,
-                     limit=DEFAULT_EVENTS_LIMIT, session=None):
+def get_events_after(
+    project_id,
+    user_uuid,
+    after_epoch_version=0,
+    limit=DEFAULT_EVENTS_LIMIT,
+    session=None,
+):
     events = models.WorkspaceVisibleEvent.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),

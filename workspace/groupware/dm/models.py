@@ -21,6 +21,13 @@ class JsonList(types.List):
 
 
 class IsoUtcDateTime(types.UTCDateTimeZ):
+    def to_simple_type(self, value):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        else:
+            value = value.astimezone(datetime.timezone.utc)
+        return value.isoformat()
+
     def from_simple_type(self, value):
         try:
             return super().from_simple_type(value)
@@ -35,6 +42,12 @@ class SyncStatus(str, enum.Enum):
     PENDING = "pending"
     PROCESSING = "processing"
     SYNCED = "synced"
+    FAILED = "failed"
+
+
+class DeliveryStatus(str, enum.Enum):
+    PENDING = "pending"
+    DELIVERED = "delivered"
     FAILED = "failed"
 
 
@@ -55,6 +68,27 @@ class MailFolder(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_mail_folders"
+
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum([status.value for status in DeliveryStatus])),
+        default=None,
+    )
+    delivery_error = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
+    )
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
 
     user_uuid = properties.property(types.UUID(), required=True)
     external_user_uuid = properties.property(
@@ -103,6 +137,27 @@ class MailMessage(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_mail_messages"
+
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum([status.value for status in DeliveryStatus])),
+        default=None,
+    )
+    delivery_error = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
+    )
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
 
     user_uuid = properties.property(types.UUID(), required=True)
     folder_uuid = properties.property(types.UUID(), required=True)
@@ -212,6 +267,27 @@ class Calendar(
 ):
     __tablename__ = "m_calendars"
 
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum([status.value for status in DeliveryStatus])),
+        default=None,
+    )
+    delivery_error = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
+    )
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
+
     name = properties.property(
         types.String(min_length=1, max_length=256),
         required=True,
@@ -253,6 +329,27 @@ class CalendarEvent(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_calendar_events"
+
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum([status.value for status in DeliveryStatus])),
+        default=None,
+    )
+    delivery_error = properties.property(
+        types.AllowNone(types.String()),
+        default=None,
+    )
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
 
     user_uuid = properties.property(types.UUID(), required=True)
     calendar_uuid = properties.property(types.UUID(), required=True)

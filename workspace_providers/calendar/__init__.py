@@ -1,0 +1,1 @@
+"""CalDAV Workspace calendar provider."""

@@ -30,12 +30,15 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
-from workspace.common.clients import zulip as zulip_client
+from workspace.common import urns
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import models
+from workspace.provider_api import commands as provider_commands
+from workspace.provider_api import payloads as provider_payloads
+from workspace.provider_api.dm import models as provider_models
 
 
 class ApiEndpointController(ra_controllers.RoutesListController):
@@ -80,9 +83,7 @@ class WorkspaceBaseResourceControllerPaginated(
                 cleaned_params.append((name, value))
                 continue
             field_name, field_value = self._prepare_filter(field_name, value)
-            self._conditional_filters.append(
-                {field_name: operator(field_value)}
-            )
+            self._conditional_filters.append({field_name: operator(field_value)})
         return super()._prepare_filters(multidict.MultiDict(cleaned_params))
 
     def _apply_autofilters(self, filters):
@@ -216,8 +217,7 @@ class WorkspaceFileController(
         quoted_name = file.name.replace("\\", "\\\\").replace('"', '\\"')
         encoded_name = urllib.parse.quote(file.name)
         return (
-            f'attachment; filename="{quoted_name}"; '
-            f"filename*=UTF-8''{encoded_name}"
+            f"attachment; filename=\"{quoted_name}\"; filename*=UTF-8''{encoded_name}"
         )
 
     def process_result(self, result, *args, **kwargs):
@@ -372,27 +372,19 @@ WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
     summary="Upload file",
     parameters=(),
     responses=oa_c.build_openapi_create_response("WorkspaceFile_Create"),
-    request_body={
-        "description": "Upload workspace file",
-        "required": True,
-        "content": {
-            "multipart/form-data": {
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "file": {"format": "binary", "type": "string"},
-                        "stream_uuid": {"format": "uuid", "type": "string"},
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "storage_type": {
-                            "enum": ["file", "s3"],
-                            "type": "string",
-                        },
-                    },
-                },
+    request_body=oa_c.build_openapi_req_body_multipart(
+        description="Upload workspace file",
+        properties={
+            "file": {"format": "binary", "type": "string"},
+            "stream_uuid": {"format": "uuid", "type": "string"},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "storage_type": {
+                "enum": ["file", "s3"],
+                "type": "string",
             },
         },
-    },
+    ),
 )
 
 WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
@@ -422,47 +414,11 @@ class ExternalAccountController(
             return result
 
     __packer__ = Packer
-
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.ExternalAccount,
         convert_underscore=False,
         process_filters=True,
     )
-
-    @staticmethod
-    def _ensure_user_sync(account):
-        user_sync = models.ExternalAccountUserSync.objects.get_one_or_none(
-            filters={
-                "account_type": dm_filters.EQ(account.account_type),
-                "server_url": dm_filters.EQ(account.server_url),
-            },
-        )
-        if user_sync is not None:
-            if user_sync.external_account_uuid is None:
-                user_sync.update_dm(
-                    values={"external_account_uuid": account.uuid},
-                )
-                user_sync.update()
-            return user_sync
-
-        user_sync = models.ExternalAccountUserSync(
-            project_id=account.project_id,
-            account_type=account.account_type,
-            server_url=account.server_url,
-            external_account_uuid=account.uuid,
-        )
-        user_sync.insert()
-        return user_sync
-
-    @staticmethod
-    def _get_zulip_user_info(server_url, account_settings):
-        credentials = account_settings.credentials
-        client = zulip_client.ZulipClient(endpoint=server_url)
-        user_info = client.get_current_user_with_api_key(
-            login=credentials.login,
-            token=credentials.token,
-        )
-        return account_settings._get_zulip_user_info(user=user_info)
 
     @staticmethod
     def _reject_user_info_from_api(account_settings):
@@ -475,6 +431,19 @@ class ExternalAccountController(
     @staticmethod
     def _reject_iam_account_from_api(account_settings):
         if account_settings.KIND == models.ExternalAccountType.IAM.value:
+            raise ra_exc.ValidationErrorException()
+
+    @staticmethod
+    def _validate_provider(provider_uuid, account_settings):
+        if provider_uuid is None:
+            raise ra_exc.ValidationErrorException()
+        provider = provider_models.WorkspaceProvider.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(provider_uuid),
+                "enabled": dm_filters.EQ(True),
+            },
+        )
+        if account_settings.KIND not in provider.supported_kinds:
             raise ra_exc.ValidationErrorException()
 
     @classmethod
@@ -499,40 +468,29 @@ class ExternalAccountController(
             values["source_scope"] = values["server_url"]
 
     @staticmethod
-    def _set_confirmed_access(values):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        values.update({
-            "access_status": (
-                models.ExternalAccountAccessStatus.CONFIRMED.value
-            ),
-            "access_checked_at": now,
-            "access_confirmed_at": now,
-            "access_last_error": None,
-        })
+    def _set_pending_access(values):
+        values.update(
+            {
+                "access_status": models.ExternalAccountAccessStatus.PENDING.value,
+                "access_checked_at": None,
+                "access_confirmed_at": None,
+                "access_last_error": None,
+            }
+        )
 
     @staticmethod
     def _set_missing_credentials_access(values):
         now = datetime.datetime.now(datetime.timezone.utc)
-        values.update({
-            "access_status": (
-                models.ExternalAccountAccessStatus.MISSING_CREDENTIALS.value
-            ),
-            "access_checked_at": now,
-            "access_confirmed_at": None,
-            "access_last_error": "External account credentials are missing",
-        })
-
-    @staticmethod
-    def _set_pending_access(values):
-        values.update({
-            "access_status": models.ExternalAccountAccessStatus.PENDING.value,
-            "access_checked_at": None,
-            "access_confirmed_at": None,
-            "access_next_check_at": datetime.datetime.now(
-                datetime.timezone.utc,
-            ),
-            "access_last_error": None,
-        })
+        values.update(
+            {
+                "access_status": (
+                    models.ExternalAccountAccessStatus.MISSING_CREDENTIALS.value
+                ),
+                "access_checked_at": now,
+                "access_confirmed_at": None,
+                "access_last_error": "External account credentials are missing",
+            }
+        )
 
     def _set_access_values(self, values, account=None):
         if "account_settings" not in values and "server_url" not in values:
@@ -545,43 +503,7 @@ class ExternalAccountController(
         if account_settings.credentials is None:
             self._set_missing_credentials_access(values)
             return
-        if account_settings.KIND in (
-            models.ExternalAccountType.MAIL.value,
-            models.ExternalAccountType.CALENDAR.value,
-        ):
-            self._set_pending_access(values)
-            return
-        self._set_confirmed_access(values)
-
-    def _validate_zulip_credentials_update(self, account, values):
-        if "account_settings" not in values and "server_url" not in values:
-            return
-
-        account_settings = values.get("account_settings", account.account_settings)
-        self._reject_iam_account_from_api(account_settings)
-        self._reject_user_info_from_api(account_settings)
-        if account_settings.KIND != models.ExternalAccountType.ZULIP.value:
-            return
-
-        if account_settings.credentials is None:
-            return
-
-        server_url = account.server_url
-        if "server_url" in values:
-            server_url = values["server_url"]
-        user_info = self._get_zulip_user_info(
-            server_url=server_url,
-            account_settings=account_settings,
-        )
-        current_user_info = None
-        if account.account_settings.KIND == models.ExternalAccountType.ZULIP.value:
-            current_user_info = account.account_settings.user_info
-        if (
-            current_user_info is not None
-            and user_info.user_id != current_user_info.user_id
-        ):
-            raise ra_exc.ValidationErrorException()
-        account_settings.user_info = user_info
+        self._set_pending_access(values)
 
     def create(self, **kwargs):
         values = kwargs.copy()
@@ -589,20 +511,13 @@ class ExternalAccountController(
         self._normalize_server_url_value(values)
         self._set_source_scope(values)
         account_settings = values["account_settings"]
+        self._validate_provider(values.get("provider_uuid"), account_settings)
         self._reject_iam_account_from_api(account_settings)
         self._reject_user_info_from_api(account_settings)
         values["account_type"] = account_settings.KIND
         values["status"] = models.ExternalAccountStatus.NEW.value
-        if account_settings.KIND == models.ExternalAccountType.ZULIP.value:
-            account_settings.user_info = self._get_zulip_user_info(
-                server_url=values["server_url"],
-                account_settings=account_settings,
-            )
         self._set_access_values(values)
-        account = super().create(**values)
-        if account.account_type == models.ExternalAccountType.ZULIP.value:
-            self._ensure_user_sync(account)
-        return account
+        return super().create(**values)
 
     def update(self, uuid, **kwargs):
         account = self.get(uuid=uuid)
@@ -610,7 +525,16 @@ class ExternalAccountController(
         self._reject_access_fields_from_api(values)
         self._normalize_server_url_value(values)
         self._set_source_scope(values)
-        self._validate_zulip_credentials_update(account, values)
+        account_settings = values.get(
+            "account_settings",
+            account.account_settings,
+        )
+        self._validate_provider(
+            values.get("provider_uuid", account.provider_uuid),
+            account_settings,
+        )
+        self._reject_iam_account_from_api(account_settings)
+        self._reject_user_info_from_api(account_settings)
         self._set_access_values(values, account=account)
         account.update_dm(values=values)
         account.update()
@@ -620,6 +544,21 @@ class ExternalAccountController(
 class WorkspaceStreamController(
     WorkspaceBaseResourceControllerPaginated,
 ):
+    class Packer(ra_packers.JSONPacker):
+        def pack_resource(self, obj):
+            result = super().pack_resource(obj)
+            stream = models.WorkspaceStream.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(obj.uuid),
+                    "project_id": dm_filters.EQ(obj.project_id),
+                },
+            )
+            return provider_payloads.add_provider_delivery_payload(
+                result,
+                stream,
+            )
+
+    __packer__ = Packer
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=["private_index"],
@@ -641,27 +580,39 @@ class WorkspaceStreamController(
         )
 
     def update(self, uuid, **kwargs):
-        return messenger_dm_helpers.update_workspace_user_stream(
-            project_id=self._get_project_id(),
+        project_id = self._get_project_id()
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.mark_messenger_delivery_pending(stream)
+        result = messenger_dm_helpers.update_workspace_user_stream(
+            project_id=project_id,
             user_uuid=self._get_user_uuid(),
             stream_uuid=uuid,
             values=kwargs,
         )
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            stream,
+            "stream.update",
+            urns.MESSENGER_STREAM,
+            update_projection=False,
+        )
+        return result
 
     def delete(self, uuid):
         return messenger_dm_helpers.delete_workspace_user_stream(
             project_id=self._get_project_id(),
             user_uuid=self._get_user_uuid(),
             stream_uuid=uuid,
-        )
-
-    @ra_actions.post
-    def add_users(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
-            project_id=resource.project_id,
-            stream_uuid=resource.uuid,
-            who_uuid=self._get_user_uuid(),
-            role_user_uuids=kwargs,
         )
 
     @ra_actions.post
@@ -719,6 +670,15 @@ class WorkspaceStreamBindingController(
             "project_id": self._get_project_id(),
         }
 
+    @ra_actions.post
+    def add_users(self, resource, *args, **kwargs):
+        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
+            project_id=resource.project_id,
+            stream_uuid=resource.uuid,
+            who_uuid=self._get_user_uuid(),
+            role_user_uuids=kwargs,
+        )
+
     def delete(self, uuid):
         return messenger_dm_helpers.delete_workspace_stream_binding(
             project_id=self._get_project_id(),
@@ -726,13 +686,24 @@ class WorkspaceStreamBindingController(
         )
 
 
-class WorkspaceStreamBindingsActionController(WorkspaceStreamController):
-    __resource__ = WorkspaceStreamBindingController.__resource__
-
-
 class WorkspaceMessageController(
     WorkspaceBaseResourceControllerPaginated,
 ):
+    class Packer(ra_packers.JSONPacker):
+        def pack_resource(self, obj):
+            result = super().pack_resource(obj)
+            message = models.WorkspaceMessage.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(obj.uuid),
+                    "project_id": dm_filters.EQ(obj.project_id),
+                },
+            )
+            return provider_payloads.add_provider_delivery_payload(
+                result,
+                message,
+            )
+
+    __packer__ = Packer
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserMessage,
         convert_underscore=False,
@@ -741,25 +712,93 @@ class WorkspaceMessageController(
 
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.create_workspace_user_message(
-            project_id=values.pop("project_id", self._get_project_id()),
-            user_uuid=values.pop("user_uuid"),
+        project_id = values.pop("project_id", self._get_project_id())
+        user_uuid = values.pop("user_uuid")
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(values["stream_uuid"]),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        if stream.provider_uuid is not None:
+            values.update(
+                {
+                    "provider_uuid": stream.provider_uuid,
+                    "external_account_uuid": stream.external_account_uuid,
+                    "delivery_status": (
+                        provider_models.ProviderCommandStatus.PENDING.value
+                    ),
+                    "delivery_error": None,
+                    "delivery_updated_at": datetime.datetime.now(
+                        datetime.timezone.utc,
+                    ),
+                },
+            )
+        visible_message = messenger_dm_helpers.create_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
             uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
             enforce_visibility=True,
             **values,
         )
+        message = models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(visible_message.uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            message,
+            "message.create",
+            urns.MESSENGER_MESSAGE,
+            update_projection=False,
+        )
+        return visible_message
 
     def update(self, uuid, **kwargs):
-        return messenger_dm_helpers.update_workspace_user_message(
-            project_id=self._get_project_id(),
+        project_id = self._get_project_id()
+        message = models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.mark_messenger_delivery_pending(message)
+        result = messenger_dm_helpers.update_workspace_user_message(
+            project_id=project_id,
             user_uuid=self._get_user_uuid(),
             message_uuid=uuid,
             values=kwargs,
         )
+        message = models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            message,
+            "message.update",
+            urns.MESSENGER_MESSAGE,
+            update_projection=False,
+        )
+        return result
 
     def delete(self, uuid):
+        project_id = self._get_project_id()
+        message = models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            message,
+            "message.delete",
+            urns.MESSENGER_MESSAGE,
+        )
         return messenger_dm_helpers.delete_workspace_user_message(
-            project_id=self._get_project_id(),
+            project_id=project_id,
             user_uuid=self._get_user_uuid(),
             message_uuid=uuid,
         )
@@ -784,6 +823,15 @@ class WorkspaceMessageController(
 class WorkspaceMessageReactionController(
     WorkspaceBaseResourceControllerPaginated,
 ):
+    class Packer(ra_packers.JSONPacker):
+        def pack_resource(self, obj):
+            result = super().pack_resource(obj)
+            return provider_payloads.add_provider_delivery_payload(
+                result,
+                obj,
+            )
+
+    __packer__ = Packer
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceMessageReactions,
         convert_underscore=False,
@@ -809,24 +857,85 @@ class WorkspaceMessageReactionController(
 
     def create(self, **kwargs):
         values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.create_workspace_message_reaction(
-            project_id=values.pop("project_id", self._get_project_id()),
+        project_id = values.pop("project_id", self._get_project_id())
+        message = models.WorkspaceMessage.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(values["message_uuid"]),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        if message.provider_uuid is not None:
+            values.update(
+                {
+                    "provider_uuid": message.provider_uuid,
+                    "external_account_uuid": message.external_account_uuid,
+                    "delivery_status": (
+                        provider_models.ProviderCommandStatus.PENDING.value
+                    ),
+                    "delivery_error": None,
+                    "delivery_updated_at": datetime.datetime.now(
+                        datetime.timezone.utc,
+                    ),
+                },
+            )
+        reaction = messenger_dm_helpers.create_workspace_message_reaction(
+            project_id=project_id,
             user_uuid=values.pop("user_uuid", self._get_user_uuid()),
             uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
             **values,
         )
+        provider_commands.create_messenger_command(
+            reaction,
+            "reaction.create",
+            urns.MESSENGER_REACTION,
+            update_projection=False,
+        )
+        return reaction
 
     def update(self, uuid, **kwargs):
-        return messenger_dm_helpers.update_workspace_message_reaction(
-            project_id=self._get_project_id(),
+        project_id = self._get_project_id()
+        reaction = models.WorkspaceMessageReactions.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.mark_messenger_delivery_pending(reaction)
+        result = messenger_dm_helpers.update_workspace_message_reaction(
+            project_id=project_id,
             user_uuid=self._get_user_uuid(),
             reaction_uuid=uuid,
             values=kwargs,
         )
+        reaction = models.WorkspaceMessageReactions.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            reaction,
+            "reaction.update",
+            urns.MESSENGER_REACTION,
+            update_projection=False,
+        )
+        return result
 
     def delete(self, uuid):
+        project_id = self._get_project_id()
+        reaction = models.WorkspaceMessageReactions.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            reaction,
+            "reaction.delete",
+            urns.MESSENGER_REACTION,
+        )
         return messenger_dm_helpers.delete_workspace_message_reaction(
-            project_id=self._get_project_id(),
+            project_id=project_id,
             user_uuid=self._get_user_uuid(),
             reaction_uuid=uuid,
         )
@@ -854,6 +963,21 @@ class WorkspaceEpochController(
 class WorkspaceStreamTopicController(
     WorkspaceBaseResourceControllerPaginated,
 ):
+    class Packer(ra_packers.JSONPacker):
+        def pack_resource(self, obj):
+            result = super().pack_resource(obj)
+            topic = models.WorkspaceStreamTopic.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(obj.uuid),
+                    "project_id": dm_filters.EQ(obj.project_id),
+                },
+            )
+            return provider_payloads.add_provider_delivery_payload(
+                result,
+                topic,
+            )
+
+    __packer__ = Packer
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserTopic,
         convert_underscore=False,
@@ -874,12 +998,33 @@ class WorkspaceStreamTopicController(
         )
 
     def update(self, uuid, **kwargs):
-        return messenger_dm_helpers.update_workspace_user_stream_topic(
-            project_id=self._get_project_id(),
+        project_id = self._get_project_id()
+        topic = models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.mark_messenger_delivery_pending(topic)
+        result = messenger_dm_helpers.update_workspace_user_stream_topic(
+            project_id=project_id,
             user_uuid=self._get_user_uuid(),
             topic_uuid=uuid,
             values=kwargs,
         )
+        topic = models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+        )
+        provider_commands.create_messenger_command(
+            topic,
+            "topic.update",
+            urns.MESSENGER_TOPIC,
+            update_projection=False,
+        )
+        return result
 
     def delete(self, uuid):
         return messenger_dm_helpers.delete_workspace_user_stream_topic(
@@ -939,20 +1084,6 @@ class WorkspaceUserController(
 
     def _get_project_id(self):
         return self.get_context().project_id
-
-    def get(self, uuid, **kwargs):
-        if uuid == self._get_user_uuid():
-            iam_user = (
-                self.get_context().iam_context.get_introspection_info().user_info
-            )
-            models.WorkspaceUser.sync_iam_identity(
-                user_uuid=uuid,
-                username=iam_user.name,
-                first_name=iam_user.first_name,
-                last_name=iam_user.last_name,
-                email=iam_user.email,
-            )
-        return super().get(uuid, **kwargs)
 
     @ra_actions.post
     def presence(self, resource, *args, **kwargs):

@@ -28,7 +28,7 @@ class FolderItemUnpinAction(routes.Action):
 
 
 class WorkspaceStreamBindingsAction(routes.Action):
-    __controller__ = controllers.WorkspaceStreamBindingsActionController
+    __controller__ = controllers.WorkspaceStreamBindingController
 
 
 class WorkspaceMessageReadAction(routes.Action):
@@ -125,6 +125,12 @@ class WorkspaceStreamRoute(routes.Route):
         invoke=True,
     )
     read = routes.action(WorkspaceStreamReadAction, invoke=True)
+
+    @classmethod
+    def get_actions_by_names(cls, names):
+        return [
+            getattr(cls.get_action(name).get_controller_class(), name) for name in names
+        ]
 
 
 class WorkspaceStreamBindingRoute(routes.Route):
@@ -263,7 +269,5 @@ class ApiEndpointRoute(routes.Route):
     message_reactions = routes.route(WorkspaceMessageReactionRoute)
     files = routes.route(WorkspaceFileRoute)
     external_accounts = routes.route(ExternalAccountRoute)
-    events = routes.route(WorkspaceEventRoute)
-    epoch = routes.route(WorkspaceEpochRoute)
     users = routes.route(WorkspaceUserRoute)
     me = routes.route(MeRoute)

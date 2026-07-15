@@ -29,8 +29,6 @@ from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
-from workspace.common.clients import iam as iam_client
-from workspace.common.clients import zulip as zulip_client
 from workspace.messenger_api.dm import base
 
 
@@ -51,178 +49,6 @@ SourceName = base.SourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
-
-ZULIP_PROCESSED_ENTITY_TYPES = (
-    "stream",
-    "private_stream",
-    "topic",
-    "message",
-)
-ZULIP_OUTBOUND_EVENT_STATUSES = (
-    "pending",
-    "processing",
-    "sent",
-    "skipped",
-    "failed",
-)
-ZULIP_HISTORY_SYNC_TASK_STATUSES = (
-    "pending",
-    "done",
-    "failed",
-)
-
-
-class ZulipProcessedEntity(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_zulip_processed_entities"
-
-    server_url = properties.property(
-        types.String(min_length=1, max_length=2048),
-        required=True,
-    )
-    entity_type = properties.property(
-        types.Enum(ZULIP_PROCESSED_ENTITY_TYPES),
-        required=True,
-    )
-    entity_id = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    workspace_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-
-
-class ZulipEventQueueState(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_zulip_event_queue_states"
-
-    external_account_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    server_url = properties.property(
-        types.Url(),
-        required=True,
-    )
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    queue_id = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=256)),
-        default=None,
-    )
-    last_event_id = properties.property(
-        types.Integer(),
-        default=-1,
-    )
-    last_message_id = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-    is_synced = properties.property(
-        types.Boolean(),
-        default=False,
-    )
-    subscription_version = properties.property(
-        types.Integer(min_value=1),
-        default=1,
-    )
-
-
-class ZulipHistorySyncTask(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_zulip_history_sync_tasks"
-
-    external_account_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    server_url = properties.property(
-        types.Url(),
-        required=True,
-    )
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    from_message_id = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    to_message_id = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    status = properties.property(
-        types.Enum(ZULIP_HISTORY_SYNC_TASK_STATUSES),
-        default="pending",
-    )
-    last_error = properties.property(
-        types.AllowNone(types.String()),
-        default=None,
-    )
-
-
-class ZulipOutboundRetryAtType(types.UTCDateTimeZ):
-    def from_simple_type(self, value):
-        try:
-            return super().from_simple_type(value)
-        except ValueError:
-            if not isinstance(value, str):
-                raise
-            parsed = datetime.datetime.fromisoformat(value)
-            if parsed.tzinfo is None:
-                return parsed.replace(tzinfo=datetime.timezone.utc)
-            return parsed.astimezone(datetime.timezone.utc)
-
-
-class ZulipOutboundEventState(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_zulip_outbound_event_states"
-
-    epoch_version = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    external_account_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    status = properties.property(
-        types.Enum(ZULIP_OUTBOUND_EVENT_STATUSES),
-        default="pending",
-    )
-    attempts = properties.property(
-        types.Integer(min_value=0),
-        default=0,
-    )
-    next_retry_at = properties.property(
-        types.AllowNone(ZulipOutboundRetryAtType()),
-        default=None,
-    )
-    last_error = properties.property(
-        types.AllowNone(types.String()),
-        default=None,
-    )
 
 
 class Folder(
@@ -414,7 +240,7 @@ class WorkspaceUserAvatarType(types.String):
     def _is_gravatar_urn(value):
         if not value.startswith(WORKSPACE_USER_GRAVATAR_PREFIX):
             return False
-        avatar_hash = value[len(WORKSPACE_USER_GRAVATAR_PREFIX):]
+        avatar_hash = value[len(WORKSPACE_USER_GRAVATAR_PREFIX) :]
         return WORKSPACE_USER_GRAVATAR_HASH_RE.fullmatch(avatar_hash) is not None
 
     @staticmethod
@@ -422,7 +248,7 @@ class WorkspaceUserAvatarType(types.String):
         if not value.startswith(prefix):
             return False
         try:
-            sys_uuid.UUID(value[len(prefix):])
+            sys_uuid.UUID(value[len(prefix) :])
         except ValueError:
             return False
         return True
@@ -431,7 +257,7 @@ class WorkspaceUserAvatarType(types.String):
     def _is_url_urn(value):
         if not value.startswith(WORKSPACE_USER_URL_AVATAR_PREFIX):
             return False
-        url = value[len(WORKSPACE_USER_URL_AVATAR_PREFIX):]
+        url = value[len(WORKSPACE_USER_URL_AVATAR_PREFIX) :]
         return url.startswith("http://") or url.startswith("https://")
 
 
@@ -441,6 +267,19 @@ class WorkspaceUser(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_users"
+
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
 
     def pour(self, **kwargs):
         if "uuid" not in kwargs:
@@ -530,7 +369,8 @@ class WorkspaceUser(
             return workspace_user
 
         changed_values = {
-            name: value for name, value in values.items()
+            name: value
+            for name, value in values.items()
             if getattr(workspace_user, name) != value
         }
         if changed_values:
@@ -657,182 +497,6 @@ class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
         default=None,
     )
 
-    def sync_users(self, external_account):
-        users = self._get_zulip_users(external_account=external_account)
-        external_accounts_by_user = (
-            self._get_external_accounts_by_server_url_and_user_id(
-                external_account=external_account,
-            )
-        )
-        synced_accounts = []
-        for user in users:
-            user_info = self._get_zulip_user_info(user=user)
-            user_key = (external_account.server_url, user_info.user_id)
-            synced_account = external_accounts_by_user.get(
-                user_key,
-            )
-            if synced_account is None:
-                synced_account = self._create_zulip_external_account(
-                    external_account=external_account,
-                    user=user,
-                    user_info=user_info,
-                )
-                external_accounts_by_user[user_key] = synced_account
-            else:
-                self._update_zulip_external_account(
-                    external_account=synced_account,
-                    user=user,
-                    user_info=user_info,
-                )
-            synced_accounts.append(synced_account)
-
-        external_account.update_dm(
-            values={"status": ExternalAccountStatus.ACTIVE.value},
-        )
-        external_account.save()
-        return synced_accounts
-
-    def _get_zulip_users(self, external_account):
-        credentials = self.credentials
-        client = zulip_client.ZulipClient(endpoint=external_account.server_url)
-        users = client.get_users_with_api_key(
-            login=credentials.login,
-            token=credentials.token,
-        )
-        return users
-
-    def _get_external_accounts_by_server_url_and_user_id(self, external_account):
-        accounts = type(external_account).objects.get_all(
-            filters={
-                "project_id": dm_filters.EQ(external_account.project_id),
-                "account_type": dm_filters.EQ(external_account.account_type),
-                "server_url": dm_filters.EQ(external_account.server_url),
-            },
-            order_by={"created_at": "asc", "uuid": "asc"},
-        )
-        return {
-            (
-                account.server_url,
-                account.account_settings.user_info.user_id,
-            ): account
-            for account in accounts
-            if (
-                account.server_url == external_account.server_url
-                and account.account_settings.user_info is not None
-            )
-        }
-
-    def _create_zulip_external_account(
-        self,
-        external_account,
-        user,
-        user_info,
-    ):
-        workspace_user = self._get_or_create_workspace_user(
-            user=user,
-        )
-        synced_account = type(external_account)(
-            project_id=external_account.project_id,
-            user_uuid=workspace_user.uuid,
-            server_url=external_account.server_url,
-            account_type=external_account.account_type,
-            status=ExternalAccountStatus.ACTIVE.value,
-            account_settings=ZulipExternalAccountKind(
-                credentials=None,
-                user_info=user_info,
-            ),
-        )
-        synced_account.insert()
-        return synced_account
-
-    def _update_zulip_external_account(
-        self,
-        external_account,
-        user,
-        user_info,
-    ):
-        workspace_user = WorkspaceUser.objects.get_one(
-            filters={"uuid": dm_filters.EQ(external_account.user_uuid)},
-        )
-        self._update_workspace_user_avatar_if_changed(
-            workspace_user=workspace_user,
-            avatar=self._build_zulip_user_avatar(user=user),
-        )
-        external_account.account_settings.user_info = user_info
-        external_account.update_dm(
-            values={"status": ExternalAccountStatus.ACTIVE.value},
-        )
-        external_account.save()
-        return external_account
-
-    def _get_or_create_workspace_user(self, user):
-        email = self._empty_to_none(user["delivery_email"])
-        avatar = self._build_zulip_user_avatar(user=user)
-        if email is not None:
-            workspace_users = WorkspaceUser.objects.get_all(
-                filters={"email": dm_filters.EQ(email)},
-            )
-            for workspace_user in workspace_users:
-                self._update_workspace_user_avatar_if_changed(
-                    workspace_user=workspace_user,
-                    avatar=avatar,
-                )
-                return workspace_user
-
-        workspace_user = WorkspaceUser(
-            uuid=sys_uuid.uuid4(),
-            username=user["full_name"],
-            source=WorkspaceUserSource.ZULIP.value,
-            email=email,
-            avatar=avatar,
-        )
-        workspace_user.insert()
-        return workspace_user
-
-    @staticmethod
-    def _update_workspace_user_avatar_if_changed(workspace_user, avatar):
-        if workspace_user.avatar == avatar:
-            return
-        workspace_user.update_dm(values={"avatar": avatar})
-        workspace_user.save()
-
-    def _build_zulip_user_avatar(self, user):
-        email = self._empty_to_none(user["delivery_email"]) or user["email"]
-        return build_workspace_user_gravatar_avatar(email)
-
-    @staticmethod
-    def _empty_to_none(value):
-        if value == "":
-            return None
-        return value
-
-    @staticmethod
-    def _empty_to_default(value, default):
-        if value == "":
-            return default
-        return value
-
-    def _get_zulip_user_info(self, user):
-        return ZulipExternalAccountUserInfoKind(
-            email=user["email"],
-            user_id=user["user_id"],
-            avatar_version=user["avatar_version"],
-            is_admin=user["is_admin"],
-            is_owner=user["is_owner"],
-            is_guest=user["is_guest"],
-            role=user["role"],
-            is_bot=user["is_bot"],
-            full_name=user["full_name"],
-            timezone=self._empty_to_default(
-                user["timezone"],
-                DEFAULT_ZULIP_TIMEZONE,
-            ),
-            is_active=user["is_active"],
-            date_joined=user["date_joined"],
-            delivery_email=self._empty_to_none(user["delivery_email"]),
-            avatar_url=self._empty_to_none(user["avatar_url"]),
-        )
-
 
 class IamExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
     KIND = ExternalAccountType.IAM.value
@@ -859,36 +523,6 @@ class IamExternalAccountKind(types_dynamic.AbstractKindModel):
         IAM_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE,
         required=True,
     )
-
-    def sync_users(self, external_account):
-        users = self._get_iam_users(external_account=external_account)
-        synced_users = []
-        for user in users:
-            synced_users.append(self._sync_iam_user(user=user))
-
-        external_account.update_dm(
-            values={"status": ExternalAccountStatus.ACTIVE.value},
-        )
-        external_account.save()
-        return synced_users
-
-    def _get_iam_users(self, external_account):
-        client = iam_client.IamClient(endpoint=external_account.server_url)
-        return client.get_users(token=self.credentials.access_token)
-
-    def _sync_iam_user(self, user):
-        user_uuid = sys_uuid.UUID(user["uuid"])
-        status = WorkspaceUserStatus.ACTIVE.value
-        if user["status"] != "ACTIVE":
-            status = WorkspaceUserStatus.OFFLINE.value
-        return WorkspaceUser.sync_iam_identity(
-            user_uuid=user_uuid,
-            username=user["username"],
-            first_name=user.get("first_name"),
-            last_name=user.get("last_name"),
-            email=user["email"],
-            status=status,
-        )
 
 
 class MailExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
@@ -942,9 +576,6 @@ class MailExternalAccountKind(types_dynamic.AbstractKindModel):
         default="tls",
     )
 
-    def sync_users(self, external_account):
-        return []
-
 
 class CalendarExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
     KIND = ExternalAccountType.CALENDAR.value
@@ -959,10 +590,8 @@ class CalendarExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
     )
 
 
-CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = (
-    types_dynamic.KindModelSelectorType(
-        types_dynamic.KindModelType(CalendarExternalAccountCredentialsKind),
-    )
+CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
+    types_dynamic.KindModelType(CalendarExternalAccountCredentialsKind),
 )
 
 
@@ -973,9 +602,6 @@ class CalendarExternalAccountKind(types_dynamic.AbstractKindModel):
         types.AllowNone(CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
         default=None,
     )
-
-    def sync_users(self, external_account):
-        return []
 
 
 EXTERNAL_ACCOUNT_SETTINGS_TYPE = types_dynamic.KindModelSelectorType(
@@ -993,6 +619,11 @@ class ExternalAccount(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_external_accounts"
+
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
 
     user_uuid = properties.property(
         types.UUID(),
@@ -1015,9 +646,7 @@ class ExternalAccount(
         default=ExternalAccountStatus.NEW.value,
     )
     access_status = properties.property(
-        types.Enum([
-            status.value for status in ExternalAccountAccessStatus
-        ]),
+        types.Enum([status.value for status in ExternalAccountAccessStatus]),
         default=ExternalAccountAccessStatus.MISSING_CREDENTIALS.value,
     )
     access_checked_at = properties.property(
@@ -1028,10 +657,6 @@ class ExternalAccount(
         types.AllowNone(types.UTCDateTimeZ()),
         default=None,
     )
-    access_next_check_at = properties.property(
-        types.UTCDateTimeZ(),
-        default=lambda: datetime.datetime.now(datetime.timezone.utc),
-    )
     access_last_error = properties.property(
         types.AllowNone(types.String(max_length=4096)),
         default=None,
@@ -1041,9 +666,6 @@ class ExternalAccount(
         required=True,
     )
 
-    def user_sync(self):
-        return self.account_settings.sync_users(external_account=self)
-
     def get_source_scope(self):
         if self.source_scope is not None:
             return self.source_scope
@@ -1051,94 +673,6 @@ class ExternalAccount(
 
     def has_credentials(self):
         return self.account_settings.credentials is not None
-
-
-class ExternalAccountUserSync(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_external_account_user_syncs"
-    SYNC_INTERVAL_MINUTES = 5
-
-    account_type = properties.property(
-        types.Enum([account_type.value for account_type in ExternalAccountType]),
-        default=ExternalAccountType.ZULIP.value,
-    )
-    server_url = properties.property(
-        types.Url(),
-        required=True,
-    )
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
-    last_synced_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
-    )
-    next_sync_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=lambda: datetime.datetime.now(datetime.timezone.utc),
-    )
-
-    def get_external_account(self):
-        if self.external_account_uuid is None:
-            return self._select_external_account()
-        return ExternalAccount.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(self.external_account_uuid),
-                "project_id": dm_filters.EQ(self.project_id),
-            },
-        )
-
-    def _select_external_account(self):
-        accounts = ExternalAccount.objects.get_all(
-            filters={
-                "project_id": dm_filters.EQ(self.project_id),
-                "account_type": dm_filters.EQ(self.account_type),
-                "server_url": dm_filters.EQ(self.server_url),
-            },
-            order_by={"created_at": "asc", "uuid": "asc"},
-        )
-        for account in accounts:
-            self.update_dm(
-                values={"external_account_uuid": account.uuid},
-            )
-            self.save()
-            return account
-        return None
-
-    def _update_next_sync_at(self):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        self.update_dm(
-            values={
-                "last_synced_at": now,
-                "next_sync_at": (
-                    now
-                    + datetime.timedelta(
-                        minutes=self.SYNC_INTERVAL_MINUTES,
-                    )
-                ),
-            },
-        )
-        self.save()
-
-    def sync(self):
-        external_account = self.get_external_account()
-        if external_account is None:
-            self._update_next_sync_at()
-            return
-        if (
-            external_account.access_status !=
-            ExternalAccountAccessStatus.CONFIRMED.value
-        ):
-            self._update_next_sync_at()
-            return
-        users = external_account.user_sync()
-        self._update_next_sync_at()
-        return users
 
 
 class WorkspaceFile(
@@ -1155,8 +689,16 @@ class WorkspaceFile(
         required=True,
     )
     stream_uuid = properties.property(
-        types.UUID(),
-        required=True,
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    provider_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
     )
     content_type = properties.property(
         types.String(min_length=1, max_length=255),
@@ -1204,6 +746,22 @@ class WorkspaceFileAccess(
 
 class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_streams"
+
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)), default=None
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
+        default=None,
+    )
+    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
 
     def get_recipients(self, session=None):
         return get_stream_recipients(
@@ -1293,6 +851,22 @@ class WorkspaceMessageReactions(
 ):
     __tablename__ = "m_workspace_message_reactions"
 
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)), default=None
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
+        default=None,
+    )
+    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+
     message_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -1321,6 +895,7 @@ WORKSPACE_EVENT_OBJECT_TYPES = (
     "mail_message",
     "calendar",
     "calendar_event",
+    "external_account",
 )
 WORKSPACE_EVENT_ACTIONS = (
     "created",
@@ -1412,6 +987,22 @@ class WorkspaceStreamTopic(
 ):
     __tablename__ = "m_workspace_stream_topics"
 
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)), default=None
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
+        default=None,
+    )
+    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
+
     name = properties.property(
         types.String(max_length=128),
         required=True,
@@ -1424,6 +1015,7 @@ class WorkspaceStreamTopic(
         types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
         default=base.random_color,
     )
+
     def get_recipients(self, session=None):
         return get_stream_recipients(
             project_id=self.project_id,
@@ -1497,6 +1089,22 @@ class WorkspaceMessage(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_messages"
+
+    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+    external_account_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
+    provider_external_id = properties.property(
+        types.AllowNone(types.String(max_length=2048)), default=None
+    )
+    delivery_status = properties.property(
+        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
+        default=None,
+    )
+    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
+    delivery_updated_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()), default=None
+    )
 
     user_uuid = properties.property(
         types.UUID(),

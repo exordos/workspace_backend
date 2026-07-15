@@ -28,57 +28,19 @@ from workspace.messenger_api.api import routes
 from workspace.messenger_api.dm import models
 
 
+def _native_object_collection():
+    return types.SimpleNamespace(
+        get_one=mock.Mock(
+            return_value=types.SimpleNamespace(provider_uuid=None),
+        ),
+    )
+
+
 def test_workspace_controller_does_not_use_policy_based_controller():
     assert (
         iam_controllers.PolicyBasedController
         not in controllers.WorkspaceBaseResourceControllerPaginated.mro()
     )
-
-
-def test_workspace_user_get_syncs_current_iam_identity():
-    user_uuid = sys_uuid.uuid4()
-    iam_user = types.SimpleNamespace(
-        name="cassi",
-        first_name="Cassandra",
-        last_name="Volkova",
-        email="cassi@exordos.com",
-    )
-    iam_context = types.SimpleNamespace(
-        get_introspection_info=mock.Mock(
-            return_value=types.SimpleNamespace(user_info=iam_user),
-        ),
-    )
-    request = types.SimpleNamespace(
-        context=types.SimpleNamespace(
-            user_uuid=user_uuid,
-            iam_context=iam_context,
-        ),
-    )
-    controller = controllers.WorkspaceUserController(request)
-    returned_user = object()
-
-    with (
-        mock.patch.object(
-            models.WorkspaceUser,
-            "sync_iam_identity",
-        ) as sync_identity,
-        mock.patch.object(
-            controllers.ra_controllers.BaseResourceControllerPaginated,
-            "get",
-            return_value=returned_user,
-        ) as parent_get,
-    ):
-        result = controller.get(user_uuid)
-
-    assert result is returned_user
-    sync_identity.assert_called_once_with(
-        user_uuid=user_uuid,
-        username="cassi",
-        first_name="Cassandra",
-        last_name="Volkova",
-        email="cassi@exordos.com",
-    )
-    parent_get.assert_called_once_with(user_uuid)
 
 
 def test_workspace_controller_applies_local_project_and_user_scope():
@@ -169,11 +131,18 @@ def test_topic_controller_update_uses_context_scope():
     controller = controllers.WorkspaceStreamTopicController(request)
     returned_topic = object()
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "update_workspace_user_stream_topic",
-        return_value=returned_topic,
-    ) as update_topic:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "update_workspace_user_stream_topic",
+            return_value=returned_topic,
+        ) as update_topic,
+        mock.patch.object(
+            controllers.models.WorkspaceStreamTopic,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.update(topic_uuid, name="retros")
 
     assert result is returned_topic
@@ -356,11 +325,18 @@ def test_message_controller_update_uses_context_scope():
     returned_message = object()
     payload = {"kind": "markdown", "content": "edited"}
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "update_workspace_user_message",
-        return_value=returned_message,
-    ) as update_message:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "update_workspace_user_message",
+            return_value=returned_message,
+        ) as update_message,
+        mock.patch.object(
+            controllers.models.WorkspaceMessage,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.update(message_uuid, payload=payload)
 
     assert result is returned_message
@@ -384,11 +360,18 @@ def test_message_controller_delete_uses_context_scope():
     )
     controller = controllers.WorkspaceMessageController(request)
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "delete_workspace_user_message",
-        return_value=None,
-    ) as delete_message:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "delete_workspace_user_message",
+            return_value=None,
+        ) as delete_message,
+        mock.patch.object(
+            controllers.models.WorkspaceMessage,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.delete(message_uuid)
 
     assert result is None
@@ -463,7 +446,6 @@ def test_message_controller_read_up_to_uses_context_scope():
     )
 
 
-
 def test_message_reaction_controller_reads_all_visible_message_reactions():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
@@ -510,11 +492,18 @@ def test_message_reaction_controller_create_uses_context_scope():
     controller = controllers.WorkspaceMessageReactionController(request)
     returned_reaction = object()
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "create_workspace_message_reaction",
-        return_value=returned_reaction,
-    ) as create_reaction:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "create_workspace_message_reaction",
+            return_value=returned_reaction,
+        ) as create_reaction,
+        mock.patch.object(
+            controllers.models.WorkspaceMessage,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.create(
             uuid=reaction_uuid,
             project_id=sys_uuid.uuid4(),
@@ -546,11 +535,18 @@ def test_message_reaction_controller_update_uses_context_scope():
     controller = controllers.WorkspaceMessageReactionController(request)
     returned_reaction = object()
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "update_workspace_message_reaction",
-        return_value=returned_reaction,
-    ) as update_reaction:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "update_workspace_message_reaction",
+            return_value=returned_reaction,
+        ) as update_reaction,
+        mock.patch.object(
+            controllers.models.WorkspaceMessageReactions,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.update(
             reaction_uuid,
             emoji_name="heart",
@@ -577,11 +573,18 @@ def test_message_reaction_controller_delete_uses_context_scope():
     )
     controller = controllers.WorkspaceMessageReactionController(request)
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "delete_workspace_message_reaction",
-        return_value=None,
-    ) as delete_reaction:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "delete_workspace_message_reaction",
+            return_value=None,
+        ) as delete_reaction,
+        mock.patch.object(
+            controllers.models.WorkspaceMessageReactions,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.delete(reaction_uuid)
 
     assert result is None
@@ -644,11 +647,18 @@ def test_stream_controller_update_uses_context_scope():
     controller = controllers.WorkspaceStreamController(request)
     returned_stream = object()
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "update_workspace_user_stream",
-        return_value=returned_stream,
-    ) as update_stream:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "update_workspace_user_stream",
+            return_value=returned_stream,
+        ) as update_stream,
+        mock.patch.object(
+            controllers.models.WorkspaceStream,
+            "objects",
+            _native_object_collection(),
+        ),
+    ):
         result = controller.update(
             uuid=stream_uuid,
             name="Core Team",
@@ -852,7 +862,7 @@ def test_stream_controller_read_uses_context_scope():
     )
 
 
-def test_stream_controller_add_users_uses_context_and_stream_resource():
+def test_stream_binding_controller_add_users_uses_context_and_stream_resource():
     project_id = sys_uuid.uuid4()
     actor_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -862,7 +872,7 @@ def test_stream_controller_add_users_uses_context_and_stream_resource():
             user_uuid=actor_uuid,
         )
     )
-    controller = controllers.WorkspaceStreamController(request)
+    controller = controllers.WorkspaceStreamBindingController(request)
     resource = types.SimpleNamespace(
         project_id=project_id,
         uuid=stream_uuid,
@@ -878,7 +888,7 @@ def test_stream_controller_add_users_uses_context_and_stream_resource():
         "get_or_create_workspace_stream_bindings",
         return_value=returned_bindings,
     ) as get_or_create:
-        result = controllers.WorkspaceStreamController.add_users._post(
+        result = controllers.WorkspaceStreamBindingController.add_users._post(
             self=controller,
             resource=resource,
             **payload,
@@ -919,10 +929,10 @@ def test_stream_binding_controller_delete_uses_context_scope():
     )
 
 
-def test_stream_bindings_action_uses_stream_controller_resource():
+def test_stream_bindings_action_uses_binding_controller_resource():
     assert (
         routes.WorkspaceStreamBindingsAction.__controller__
-        is controllers.WorkspaceStreamBindingsActionController
+        is controllers.WorkspaceStreamBindingController
     )
 
 
@@ -978,7 +988,10 @@ def test_file_route_registered_and_allows_crud():
     assert ra_routes.GET in routes.WorkspaceFileRoute.__allow_methods__
     assert ra_routes.UPDATE in routes.WorkspaceFileRoute.__allow_methods__
     assert ra_routes.DELETE in routes.WorkspaceFileRoute.__allow_methods__
-    assert routes.WorkspaceFileDownloadAction.__controller__ is controllers.WorkspaceFileController
+    assert (
+        routes.WorkspaceFileDownloadAction.__controller__
+        is controllers.WorkspaceFileController
+    )
     assert not routes.WorkspaceFileDownloadAction.is_invoke()
 
 
@@ -1001,15 +1014,18 @@ def test_file_controller_create_uses_context_scope():
         storage_object_id="aa/file",
     )
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "create_workspace_file",
-        return_value=returned_file,
-    ) as create_file, mock.patch.object(
-        controllers.file_storage,
-        "get_workspace_file_storage_info",
-        return_value=storage_info,
-    ) as get_storage_info:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "create_workspace_file",
+            return_value=returned_file,
+        ) as create_file,
+        mock.patch.object(
+            controllers.file_storage,
+            "get_workspace_file_storage_info",
+            return_value=storage_info,
+        ) as get_storage_info,
+    ):
         result = controller.create(
             project_id=sys_uuid.uuid4(),
             user_uuid=sys_uuid.uuid4(),
@@ -1093,15 +1109,18 @@ def test_file_controller_create_from_multipart_builds_file_metadata():
         storage_object_id="key",
     )
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "create_workspace_file",
-        return_value=returned_file,
-    ) as create_file, mock.patch.object(
-        controllers.file_storage,
-        "save_workspace_file",
-        return_value=storage_info,
-    ) as save_file:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "create_workspace_file",
+            return_value=returned_file,
+        ) as create_file,
+        mock.patch.object(
+            controllers.file_storage,
+            "save_workspace_file",
+            return_value=storage_info,
+        ) as save_file,
+    ):
         result = controller.create(multipart=True, parts=parts)
 
     assert result is returned_file
@@ -1162,7 +1181,6 @@ def test_file_controller_download_returns_file_response():
     assert 'filename="example \\"file\\".txt"' in content_disposition
 
 
-
 def test_file_controller_delete_removes_backend_object():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
@@ -1179,17 +1197,21 @@ def test_file_controller_delete_removes_backend_object():
         storage_object_id="key",
     )
 
-    with mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "get_workspace_owned_file",
-        return_value=file,
-    ) as get_file, mock.patch.object(
-        controllers.messenger_dm_helpers,
-        "delete_workspace_file",
-    ) as delete_file, mock.patch.object(
-        controllers.file_storage,
-        "delete_workspace_file",
-    ) as delete_stored_file:
+    with (
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "get_workspace_owned_file",
+            return_value=file,
+        ) as get_file,
+        mock.patch.object(
+            controllers.messenger_dm_helpers,
+            "delete_workspace_file",
+        ) as delete_file,
+        mock.patch.object(
+            controllers.file_storage,
+            "delete_workspace_file",
+        ) as delete_stored_file,
+    ):
         result = controller.delete(file_uuid)
 
     assert result is delete_file.return_value

@@ -41,9 +41,21 @@ class MessageEventTimestampType(types.UTCDateTimeZ):
 MESSAGE_EVENT_TIMESTAMP_TYPE = MessageEventTimestampType()
 
 
+class ProviderDeliveryEventPayloadBase(models.Model):
+    provider = properties.property(
+        types.AllowNone(types.Dict()),
+        default=None,
+    )
+    delivery = properties.property(
+        types.AllowNone(types.Dict()),
+        default=None,
+    )
+
+
 class MessageEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserMessageBase,
+    ProviderDeliveryEventPayloadBase,
 ):
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
@@ -110,10 +122,13 @@ class MessageDeletedEventPayload(
         ),
         required=True,
     )
+
+
 class MessageReactionEventPayloadBase(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
     models.ModelWithProject,
+    ProviderDeliveryEventPayloadBase,
 ):
     message_uuid = properties.property(
         types.UUID(),
@@ -202,6 +217,7 @@ class FolderUpdatedEventPayload(FolderEventPayloadBase):
 class StreamEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.WorkspaceUserStreamBase,
+    ProviderDeliveryEventPayloadBase,
 ):
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
@@ -231,6 +247,7 @@ class TopicEventPayloadBase(
     types_dynamic.AbstractKindModel,
     base.UserScopedModelWithUUID,
     models.ModelWithProject,
+    ProviderDeliveryEventPayloadBase,
 ):
     name = properties.property(
         types.String(max_length=128),
@@ -261,9 +278,7 @@ class TopicEventPayloadBase(
         default=False,
     )
     notification_mode = properties.property(
-        types.Enum([
-            mode.value for mode in base.WorkspaceTopicNotificationMode
-        ]),
+        types.Enum([mode.value for mode in base.WorkspaceTopicNotificationMode]),
         default=base.WorkspaceTopicNotificationMode.DEFAULT.value,
     )
     created_at = properties.property(
@@ -305,10 +320,12 @@ class TopicDeletedEventPayload(
         default=None,
     )
     source = properties.property(
-        types.AllowNone(types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(base.ZulipSource),
-            types_dynamic.KindModelType(base.NativeSource),
-        )),
+        types.AllowNone(
+            types_dynamic.KindModelSelectorType(
+                types_dynamic.KindModelType(base.ZulipSource),
+                types_dynamic.KindModelType(base.NativeSource),
+            )
+        ),
         default=None,
     )
 
@@ -324,10 +341,12 @@ class StreamDeletedEventPayload(
         default=None,
     )
     source = properties.property(
-        types.AllowNone(types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(base.ZulipSource),
-            types_dynamic.KindModelType(base.NativeSource),
-        )),
+        types.AllowNone(
+            types_dynamic.KindModelSelectorType(
+                types_dynamic.KindModelType(base.ZulipSource),
+                types_dynamic.KindModelType(base.NativeSource),
+            )
+        ),
         default=None,
     )
 
@@ -366,10 +385,12 @@ class UserUpdatedEventPayload(
         required=True,
     )
     source = properties.property(
-        types.Enum([
-            messenger_models.WorkspaceUserSource.IAM.value,
-            messenger_models.WorkspaceUserSource.ZULIP.value,
-        ]),
+        types.Enum(
+            [
+                messenger_models.WorkspaceUserSource.IAM.value,
+                messenger_models.WorkspaceUserSource.ZULIP.value,
+            ]
+        ),
         required=True,
     )
     status = properties.property(

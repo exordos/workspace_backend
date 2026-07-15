@@ -31,7 +31,7 @@ from workspace.messenger_api.dm import models as messenger_models
 from workspace.tests.integration import conftest
 
 
-V1 = "/v1/messenger"
+V1 = "/v1"
 STREAMS = f"{V1}/streams/"
 STREAM_BINDINGS = f"{V1}/stream_bindings/"
 FOLDERS = f"{V1}/folders/"
@@ -40,9 +40,9 @@ FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
 MESSAGE_REACTIONS = f"{V1}/message_reactions/"
-EVENTS = "/v1/events/"
-EPOCH = "/v1/epoch/"
-USERS = "/v1/users/"
+EVENTS = f"{V1}/events/"
+EPOCH = f"{V1}/epoch/"
+USERS = f"{V1}/users/"
 
 
 # --------------------------------------------------------------------------- #
@@ -80,12 +80,14 @@ def test_own_message_read_backfill_migration(api, db):
         db, api.project_id, api.user_uuid, "own-message-backfill"
     )
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     message_uuid = sys_uuid.uuid4()
     messenger_dm_helpers.create_workspace_user_message(
         uuid=message_uuid,
@@ -106,9 +108,7 @@ def test_own_message_read_backfill_migration(api, db):
             (message_uuid, api.user_uuid),
         )
 
-    migration_path = (
-        conftest.MIGRATIONS_DIR / "0094-mark-own-messages-read-8413a3.py"
-    )
+    migration_path = conftest.MIGRATIONS_DIR / "0094-mark-own-messages-read-8413a3.py"
     spec = importlib.util.spec_from_file_location(
         "mark_own_messages_read_migration",
         migration_path,
@@ -614,9 +614,7 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
     )
     stream_user = sys_uuid.uuid4()
     outsider_user = sys_uuid.uuid4()
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, stream_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, stream_user)
 
     resp = api.post(
         FILES,
@@ -667,9 +665,7 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
 
     resp = api.get(f"{FILES}{file_uuid}", user=outsider_user)
     assert resp.status_code == 404, resp.text
-    resp = api.get(
-        f"{FILES}{file_uuid}/actions/download", user=outsider_user
-    )
+    resp = api.get(f"{FILES}{file_uuid}/actions/download", user=outsider_user)
     assert resp.status_code == 404, resp.text
 
     with db.cursor() as cur:
@@ -681,7 +677,9 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
             ON CONFLICT (project_id, file_uuid, user_uuid) DO NOTHING
             """,
             (
-                str(sys_uuid.uuid4()), api.project_id, file_uuid,
+                str(sys_uuid.uuid4()),
+                api.project_id,
+                file_uuid,
                 str(outsider_user),
             ),
         )
@@ -725,17 +723,13 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
     assert access_count == 0
 
 
-def test_file_multipart_upload_writes_local_file(
-    api, db, tmp_path, monkeypatch
-):
+def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch):
     monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "file-upload-team"
     )
     stream_user = sys_uuid.uuid4()
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, stream_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, stream_user)
     data = b"uploaded file data"
 
     resp = api.post(
@@ -761,9 +755,7 @@ def test_file_multipart_upload_writes_local_file(
     assert resp.headers["Content-Type"].startswith("text/plain")
     assert 'filename="upload.txt"' in resp.headers["Content-Disposition"]
 
-    resp = api.get(
-        f"{FILES}{file['uuid']}/actions/download", user=stream_user
-    )
+    resp = api.get(f"{FILES}{file['uuid']}/actions/download", user=stream_user)
     assert resp.status_code == 200, resp.text
     assert resp.content == data
 
@@ -839,23 +831,16 @@ def test_system_folders_exist_for_user_without_streams(api, db):
 
     resp = api.get(FOLDERS)
     assert resp.status_code == 200, resp.text
-    folders_by_uuid = {
-        folder["uuid"]: folder
-        for folder in resp.json()
-    }
+    folders_by_uuid = {folder["uuid"]: folder for folder in resp.json()}
     expected_folders = {
         str(messenger_dm_helpers.ALL_CHATS_FOLDER_UUID): "All chats",
         str(messenger_dm_helpers.PERSONAL_FOLDER_UUID): "Personal",
         str(messenger_dm_helpers.CHANNELS_FOLDER_UUID): "Channels",
     }
     assert {
-        uuid: folders_by_uuid[uuid]["title"]
-        for uuid in expected_folders
+        uuid: folders_by_uuid[uuid]["title"] for uuid in expected_folders
     } == expected_folders
-    assert all(
-        folders_by_uuid[uuid]["folder_items"] == []
-        for uuid in expected_folders
-    )
+    assert all(folders_by_uuid[uuid]["folder_items"] == [] for uuid in expected_folders)
     assert all(
         folders_by_uuid[uuid]["background_color_value"] == 11184810
         for uuid in expected_folders
@@ -1196,16 +1181,13 @@ def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
     pinned_item = resp.json()
     assert pinned_item["uuid"] == item_uuid
     assert pinned_item["stream_uuid"] == stream_uuid
-    assert pinned_item["folder_uuid"] == str(
-        messenger_dm_helpers.ALL_CHATS_FOLDER_UUID
-    )
+    assert pinned_item["folder_uuid"] == str(messenger_dm_helpers.ALL_CHATS_FOLDER_UUID)
     assert pinned_item["pinned_at"] is not None
 
     resp = api.get(f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}")
     assert resp.status_code == 200, resp.text
     folder_item = [
-        item for item in resp.json()["folder_items"]
-        if item["uuid"] == item_uuid
+        item for item in resp.json()["folder_items"] if item["uuid"] == item_uuid
     ][0]
     assert folder_item["pinned_at"] is not None
 
@@ -1218,8 +1200,7 @@ def test_system_folder_item_pin_unpin_actions_materialize_user_item(api, db):
     resp = api.get(f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}")
     assert resp.status_code == 200, resp.text
     folder_item = [
-        item for item in resp.json()["folder_items"]
-        if item["uuid"] == item_uuid
+        item for item in resp.json()["folder_items"] if item["uuid"] == item_uuid
     ][0]
     assert folder_item.get("pinned_at") is None
 
@@ -1410,10 +1391,7 @@ def test_stream_create_writes_realtime_event(api, db):
         "All chats",
         "Channels",
     ]
-    assert all(
-        payload["user_uuid"] == str(api.user_uuid)
-        for payload in folder_events
-    )
+    assert all(payload["user_uuid"] == str(api.user_uuid) for payload in folder_events)
 
 
 def test_stream_notifications_are_user_scoped_and_write_event(api, db):
@@ -1421,9 +1399,7 @@ def test_stream_notifications_are_user_scoped_and_write_event(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "notifications-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
 
     resp = api.get(f"{STREAMS}{stream_uuid}")
     assert resp.status_code == 200, resp.text
@@ -1510,15 +1486,11 @@ def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
     )
     conftest.seed_user_stream(db, api.project_id, api.user_uuid, "keep-owner")
     conftest.seed_user_stream(db, api.project_id, other_user, "keep-other")
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
-    conftest.seed_stream_topic_flags(
-        db, topic_uuid, api.user_uuid, api.project_id
-    )
+    conftest.seed_stream_topic_flags(db, topic_uuid, api.user_uuid, api.project_id)
 
     folder_resp = api.post(FOLDERS, json={"title": "Pinned"})
     assert folder_resp.status_code in (200, 201), folder_resp.text
@@ -1646,10 +1618,7 @@ def test_stream_delete_cascades_data_and_writes_realtime_events(api, db):
         "00000000-0000-0000-0000-000000000002",
     ]
     for event in owner_folder_events + other_folder_events:
-        assert all(
-            item["stream_uuid"] != stream_uuid
-            for item in event["folder_items"]
-        )
+        assert all(item["stream_uuid"] != stream_uuid for item in event["folder_items"])
 
 
 def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
@@ -1659,9 +1628,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         direct_user_uuid,
         f"user-{direct_user_uuid}",
     )
-    expected_index = ":".join(
-        sorted([str(api.user_uuid), str(direct_user_uuid)])
-    )
+    expected_index = ":".join(sorted([str(api.user_uuid), str(direct_user_uuid)]))
     payload = {
         "name": "Direct",
         "description": "Private workspace",
@@ -1858,25 +1825,17 @@ def test_stream_binding_create_notifies_added_user(api, db):
         "stream_bindings.created",
     ]
     assert owner_events[0]["uuid"] == stream_uuid
-    assert [
-        binding["user_uuid"]
-        for binding in owner_events[0]["items"]
-    ] == [
+    assert [binding["user_uuid"] for binding in owner_events[0]["items"]] == [
         str(target_user_uuid),
         str(second_target_user_uuid),
     ]
-    assert {
-        binding["who_uuid"]
-        for binding in owner_events[0]["items"]
-    } == {str(api.user_uuid)}
-    assert {
-        binding["role"]
-        for binding in owner_events[0]["items"]
-    } == {"member"}
-    assert {
-        binding["notification_mode"]
-        for binding in owner_events[0]["items"]
-    } == {"all_messages"}
+    assert {binding["who_uuid"] for binding in owner_events[0]["items"]} == {
+        str(api.user_uuid)
+    }
+    assert {binding["role"] for binding in owner_events[0]["items"]} == {"member"}
+    assert {binding["notification_mode"] for binding in owner_events[0]["items"]} == {
+        "all_messages"
+    }
 
 
 def test_stream_binding_delete_notifies_removed_user(api, db):
@@ -2015,10 +1974,7 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
         (folder["uuid"], "Watched"),
     ]
     for event in events[1:]:
-        assert all(
-            item["stream_uuid"] != stream_uuid
-            for item in event["folder_items"]
-        )
+        assert all(item["stream_uuid"] != stream_uuid for item in event["folder_items"])
 
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):
@@ -2069,9 +2025,7 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "topic-create-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
 
     resp = api.post(
         STREAM_TOPICS,
@@ -2157,9 +2111,7 @@ def test_stream_topic_rename(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "team-chat"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
     )
@@ -2206,9 +2158,7 @@ def test_stream_topic_notifications_follow_stream_mute_rules(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "topic-notifications-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
     )
@@ -2292,9 +2242,7 @@ def test_stream_topic_delete_cascades_topic_messages(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "topic-delete-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
     )
@@ -2363,20 +2311,20 @@ def test_stream_topic_set_default_updates_stream_and_topics(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "topic-default-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     previous_topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "planning"
     )
 
-    resp = api.post(
-        f"{STREAM_TOPICS}{topic_uuid}/actions/set_default/invoke"
-    )
+    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/actions/set_default/invoke")
     assert resp.status_code == 200, resp.text
     assert resp.json()["uuid"] == topic_uuid
     assert resp.json()["is_default"] is True
@@ -2420,13 +2368,11 @@ def test_stream_topic_set_default_updates_stream_and_topics(api, db):
         str(other_user),
     }
     assert all(
-        payload["default_topic_uuid"] == topic_uuid
-        for _, payload in stream_events
+        payload["default_topic_uuid"] == topic_uuid for _, payload in stream_events
     )
     assert len(topic_events) == 4
     assert {
-        (payload["uuid"], payload["is_default"])
-        for _, payload in topic_events
+        (payload["uuid"], payload["is_default"]) for _, payload in topic_events
     } == {
         (previous_topic_uuid, False),
         (topic_uuid, True),
@@ -2438,11 +2384,13 @@ def test_stream_default_topic_delete_sends_stream_update(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "topic-default-delete-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
 
@@ -2471,10 +2419,7 @@ def test_stream_default_topic_delete_sends_stream_update(api, db):
         str(api.user_uuid),
         str(other_user),
     }
-    assert all(
-        payload["default_topic_uuid"] is None
-        for _, payload in stream_events
-    )
+    assert all(payload["default_topic_uuid"] is None for _, payload in stream_events)
 
 
 def test_stream_topic_is_done_flag(api, db):
@@ -2485,9 +2430,7 @@ def test_stream_topic_is_done_flag(api, db):
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "standups"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
 
     resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
     assert resp.status_code == 200, resp.text
@@ -2538,13 +2481,21 @@ def test_stream_topic_is_done_flag(api, db):
 # --------------------------------------------------------------------------- #
 
 
-def test_epoch_is_zero_without_visible_events(api):
-    resp = api.get(EPOCH)
+def test_epoch_is_zero_without_visible_events(api, workspace_api):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    resp = workspace_api.get(EPOCH)
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"epoch_version": 0}
 
 
-def test_external_folder_and_binding_events_follow_stream_visibility(api, db):
+def test_external_folder_and_binding_events_follow_stream_visibility(
+    api,
+    workspace_api,
+    db,
+):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
     conftest.seed_workspace_user(
         db,
         api.user_uuid,
@@ -2707,7 +2658,7 @@ def test_external_folder_and_binding_events_follow_stream_visibility(api, db):
         )
         assert cur.fetchone()[0] == 0
 
-    resp = api.get(
+    resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
@@ -2766,7 +2717,7 @@ def test_external_folder_and_binding_events_follow_stream_visibility(api, db):
         )
         assert cur.fetchone()[0] == 2
 
-    resp = api.get(
+    resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
@@ -2774,13 +2725,15 @@ def test_external_folder_and_binding_events_follow_stream_visibility(api, db):
         ],
     )
     assert resp.status_code == 200, resp.text
-    assert [
-        event["epoch_version"]
-        for event in resp.json()
-    ] == [folder_epoch, binding_epoch]
+    assert [event["epoch_version"] for event in resp.json()] == [
+        folder_epoch,
+        binding_epoch,
+    ]
 
 
-def test_message_create_writes_flags_and_visible_events(api, db):
+def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
     other_user = sys_uuid.uuid4()
     outsider = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
@@ -2789,9 +2742,7 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
 
     resp = api.post(
         MESSAGES,
@@ -2927,15 +2878,13 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert packed_author_payload["kind"] == "message.created"
     assert packed_other_payload["kind"] == "message.created"
     assert {
-        key: value for key, value in packed_author_payload.items()
-        if key != "kind"
+        key: value for key, value in packed_author_payload.items() if key != "kind"
     } == message
     assert {
-        key: value for key, value in packed_other_payload.items()
-        if key != "kind"
+        key: value for key, value in packed_other_payload.items() if key != "kind"
     } == other_message
 
-    author_resp = api.get(EVENTS, params={"page_limit": 100})
+    author_resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert author_resp.status_code == 200, author_resp.text
     author_events = author_resp.json()
     assert len(author_events) == 1
@@ -2954,7 +2903,7 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert event["payload"]["is_own"] is True
     assert event["payload"]["reactions"] == {}
 
-    other_events = api.get(
+    other_events = workspace_api.get(
         EVENTS,
         user=other_user,
         params={"page_limit": 100},
@@ -2977,14 +2926,14 @@ def test_message_create_writes_flags_and_visible_events(api, db):
     assert other_events[1]["payload"]["last_message_uuid"] == message_uuid
     assert other_events[2]["payload"]["last_message_uuid"] == message_uuid
 
-    outsider_events = api.get(
+    outsider_events = workspace_api.get(
         EVENTS,
         user=outsider,
         params={"page_limit": 100},
     ).json()
     assert outsider_events == []
 
-    next_page = api.get(
+    next_page = workspace_api.get(
         EVENTS,
         params={
             "page_limit": 100,
@@ -2999,11 +2948,13 @@ def test_message_update_read_delete_write_realtime_events(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "message-crud-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
 
@@ -3125,10 +3076,7 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         "message.updated",
         "message.updated",
     ]
-    assert all(
-        row[1]["payload"]["content"] == "edited version"
-        for row in update_rows
-    )
+    assert all(row[1]["payload"]["content"] == "edited version" for row in update_rows)
 
     with db.cursor() as cur:
         cur.execute(
@@ -3206,11 +3154,13 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "reaction-crud-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
 
@@ -3317,8 +3267,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         ("thumbs_up", str(other_user)),
     }
     assert {
-        (item["emoji_name"], item["user_uuid"])
-        for item in resp.json()
+        (item["emoji_name"], item["user_uuid"]) for item in resp.json()
     } == expected_reactions
 
     other_filter_resp = api.get(
@@ -3328,8 +3277,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     )
     assert other_filter_resp.status_code == 200, other_filter_resp.text
     assert {
-        (item["emoji_name"], item["user_uuid"])
-        for item in other_filter_resp.json()
+        (item["emoji_name"], item["user_uuid"]) for item in other_filter_resp.json()
     } == expected_reactions
 
     user_filter_resp = api.get(
@@ -3392,8 +3340,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
             (api.project_id, message_uuid),
         )
         stored_reactions = [
-            (emoji_name, str(user_uuid))
-            for emoji_name, user_uuid in cur.fetchall()
+            (emoji_name, str(user_uuid)) for emoji_name, user_uuid in cur.fetchall()
         ]
         cur.execute(
             """
@@ -3422,13 +3369,9 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         {"eyes": 1, "heart": 1, "thumbs_up": 1},
         {"heart": 1, "thumbs_up": 1},
     ]
-    message_event_rows = [
-        row for row in reaction_event_rows
-        if row[0] == "message"
-    ]
+    message_event_rows = [row for row in reaction_event_rows if row[0] == "message"]
     reaction_state_event_rows = [
-        row for row in reaction_event_rows
-        if row[0] == "message_reaction"
+        row for row in reaction_event_rows if row[0] == "message_reaction"
     ]
     assert len(message_event_rows) == len(expected_reaction_snapshots) * 2
     assert all(
@@ -3436,19 +3379,16 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         for _, action, _, payload in message_event_rows
     )
     assert all(
-        payload["kind"] == "message.updated"
-        for _, _, _, payload in message_event_rows
+        payload["kind"] == "message.updated" for _, _, _, payload in message_event_rows
     )
     assert all(
-        payload["uuid"] == message_uuid
-        for _, _, _, payload in message_event_rows
+        payload["uuid"] == message_uuid for _, _, _, payload in message_event_rows
     )
     for index, expected_reactions in enumerate(expected_reaction_snapshots):
-        group = message_event_rows[index * 2:index * 2 + 2]
+        group = message_event_rows[index * 2 : index * 2 + 2]
         assert {user_uuid for _, _, user_uuid, _ in group} == expected_event_users
         assert all(
-            payload["reactions"] == expected_reactions
-            for _, _, _, payload in group
+            payload["reactions"] == expected_reactions for _, _, _, payload in group
         )
 
     expected_reaction_events = [
@@ -3464,9 +3404,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         expected_reaction_events,
     ):
         _, action, event_user_uuid, payload = event_row
-        expected_action, expected_user_uuid, expected_uuid, expected_emoji = (
-            expected
-        )
+        expected_action, expected_user_uuid, expected_uuid, expected_emoji = expected
         assert action == expected_action
         assert event_user_uuid == expected_user_uuid
         assert payload["kind"] == f"message_reaction.{expected_action}"
@@ -3491,11 +3429,13 @@ def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "read-actions-team"
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
     other_topic_uuid = conftest.seed_stream_topic(
@@ -3621,7 +3561,7 @@ def test_unbound_user_cannot_send_message(api, db):
             },
         },
     )
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code == 400, resp.text
 
     with db.cursor() as cur:
         cur.execute(
@@ -3642,7 +3582,11 @@ def test_message_create_uses_stream_default_topic(api, db):
         db, api.project_id, api.user_uuid, "default-topic-team"
     )
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
     message_uuid = str(sys_uuid.uuid4())
@@ -3707,7 +3651,9 @@ def test_message_create_without_topic_rejects_stream_without_default(api, db):
     assert resp.json()["code"] == 400001007
 
 
-def test_message_helper_writes_visible_event(api, db):
+def test_message_helper_writes_visible_event(api, workspace_api, db):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "helper-events-team"
     )
@@ -3724,7 +3670,7 @@ def test_message_helper_writes_visible_event(api, db):
         payload=message_payloads.MarkdownPayload(content="created through model"),
     )
 
-    resp = api.get(EVENTS, params={"page_limit": 100})
+    resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text
     events = resp.json()
     assert len(events) == 1
@@ -3741,12 +3687,14 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
         db, api.project_id, api.user_uuid, "zulip-own-message"
     )
     topic_uuid = conftest.seed_stream_topic(
-        db, api.project_id, stream_uuid, api.user_uuid, "general",
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
         is_default=True,
     )
-    conftest.seed_user_stream_binding(
-        db, api.project_id, stream_uuid, other_user
-    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     with db.cursor() as cur:
         for user_uuid in (api.user_uuid, other_user):
             cur.execute(
@@ -3838,7 +3786,9 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
     }
 
 
-def test_events_filter_by_epoch_range(api, db):
+def test_events_filter_by_epoch_range(api, workspace_api, db):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "range-events-team"
     )
@@ -3858,17 +3808,14 @@ def test_events_filter_by_epoch_range(api, db):
             payload=message_payloads.MarkdownPayload(content=content),
         )
 
-    resp = api.get(EVENTS, params={"page_limit": 100})
+    resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text
     events = resp.json()
-    assert [
-        event["payload"]["uuid"]
-        for event in events
-    ] == message_uuids
+    assert [event["payload"]["uuid"] for event in events] == message_uuids
     first_epoch = events[0]["epoch_version"]
     second_epoch = events[1]["epoch_version"]
 
-    after_resp = api.get(
+    after_resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
@@ -3876,12 +3823,12 @@ def test_events_filter_by_epoch_range(api, db):
         ],
     )
     assert after_resp.status_code == 200, after_resp.text
-    assert [
-        event["epoch_version"]
-        for event in after_resp.json()
-    ] == [first_epoch, second_epoch]
+    assert [event["epoch_version"] for event in after_resp.json()] == [
+        first_epoch,
+        second_epoch,
+    ]
 
-    strict_after_resp = api.get(
+    strict_after_resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
@@ -3889,12 +3836,11 @@ def test_events_filter_by_epoch_range(api, db):
         ],
     )
     assert strict_after_resp.status_code == 200, strict_after_resp.text
-    assert [
-        event["epoch_version"]
-        for event in strict_after_resp.json()
-    ] == [second_epoch]
+    assert [event["epoch_version"] for event in strict_after_resp.json()] == [
+        second_epoch
+    ]
 
-    before_resp = api.get(
+    before_resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
@@ -3904,7 +3850,7 @@ def test_events_filter_by_epoch_range(api, db):
     assert before_resp.status_code == 200, before_resp.text
     assert [event["epoch_version"] for event in before_resp.json()] == [first_epoch]
 
-    strict_before_resp = api.get(
+    strict_before_resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
@@ -3912,12 +3858,11 @@ def test_events_filter_by_epoch_range(api, db):
         ],
     )
     assert strict_before_resp.status_code == 200, strict_before_resp.text
-    assert [
-        event["epoch_version"]
-        for event in strict_before_resp.json()
-    ] == [first_epoch]
+    assert [event["epoch_version"] for event in strict_before_resp.json()] == [
+        first_epoch
+    ]
 
-    exact_resp = api.get(
+    exact_resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),

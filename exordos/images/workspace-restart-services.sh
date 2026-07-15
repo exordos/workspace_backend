@@ -20,11 +20,10 @@ set -eu
 set -o pipefail
 
 SERVICE_NAMES=(
-    workspace-user-api
     workspace-api
+    workspace-provider-api
+    workspace-messenger-api
     workspace-messenger-worker
-    workspace-integration-bridge-worker
-    workspace-groupware-bridge-worker
     workspace-messenger-events
 )
 

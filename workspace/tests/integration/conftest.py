@@ -47,9 +47,11 @@ from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.common import file_storage_opts
+from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.provider_api.api import app as provider_app
 from workspace.workspace_api.api import app as workspace_app
 
 
@@ -142,7 +144,7 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
         super().__init__(
             application=application,
             iam_engine_driver=None,
-            context_class=auth_context.WorkspaceAuthContext,
+            context_class=auth_context.WorkspaceMessengerAuthContext,
         )
 
     def _get_response(self, ctx, req):
@@ -156,12 +158,12 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
                 return contexts_mw.ContextMiddleware._get_response(self, ctx, req)
 
 
-def build_test_wsgi_application():
+def build_test_wsgi_application(app_module=messenger_app):
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
     application = applications.OpenApiApplication(
-        route_class=workspace_app.get_api_application(),
-        openapi_engine=workspace_app.get_openapi_engine(),
+        route_class=app_module.get_api_application(),
+        openapi_engine=app_module.get_openapi_engine(),
     )
     return middlewares.attach_middlewares(
         application,
@@ -172,6 +174,10 @@ def build_test_wsgi_application():
             logging_mw.LoggingMiddleware,
         ],
     )
+
+
+def build_provider_test_wsgi_application():
+    return provider_app.build_wsgi_application()
 
 
 # --------------------------------------------------------------------------- #
@@ -246,8 +252,8 @@ def _database():
 
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute("DROP SCHEMA IF EXISTS \"public\" CASCADE;")
-            cur.execute("CREATE SCHEMA \"public\";")
+            cur.execute('DROP SCHEMA IF EXISTS "public" CASCADE;')
+            cur.execute('CREATE SCHEMA "public";')
 
     engines.engine_factory.configure_factory(db_url=TEST_DB_URL)
 
@@ -279,6 +285,44 @@ def http_server(_database):
         server.server_close()
 
 
+@pytest.fixture(scope="session")
+def workspace_http_server(_database):
+    server = wsgiref.simple_server.make_server(
+        "127.0.0.1",
+        0,
+        build_test_wsgi_application(workspace_app),
+        handler_class=_QuietHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+@pytest.fixture(scope="session")
+def provider_http_server(_database):
+    server = wsgiref.simple_server.make_server(
+        "127.0.0.1",
+        0,
+        build_provider_test_wsgi_application(),
+        handler_class=_QuietHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
 @pytest.fixture
 def api(http_server, db):
     """API client scoped to a fresh, unique (user, project) pair per test."""
@@ -292,6 +336,30 @@ def api(http_server, db):
             value,
             f"user-{value}",
         ),
+    )
+
+
+@pytest.fixture
+def workspace_api(workspace_http_server, db):
+    user_uuid = sys_uuid.uuid4()
+    return ApiClient(
+        base_url=workspace_http_server,
+        user_uuid=user_uuid,
+        project_id=sys_uuid.uuid4(),
+        user_seeder=lambda value: seed_workspace_user(
+            db,
+            value,
+            f"user-{value}",
+        ),
+    )
+
+
+@pytest.fixture
+def provider_api(provider_http_server):
+    return ApiClient(
+        base_url=provider_http_server,
+        user_uuid=sys_uuid.uuid4(),
+        project_id=sys_uuid.uuid4(),
     )
 
 
@@ -325,8 +393,7 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
                  user_uuid, project_id)
             VALUES (%s, %s, %s, 'native', '{"kind": "native"}'::jsonb, %s, %s)
             """,
-            (str(stream_uuid), name, description, str(user_uuid),
-             str(project_id)),
+            (str(stream_uuid), name, description, str(user_uuid), str(project_id)),
         )
         cur.execute(
             """
@@ -336,14 +403,18 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
             VALUES (%s, %s, %s, %s, %s, 'owner', NOW(), NOW())
             ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
             """,
-            (str(sys_uuid.uuid4()), str(project_id), str(stream_uuid),
-             str(user_uuid), str(user_uuid)),
+            (
+                str(sys_uuid.uuid4()),
+                str(project_id),
+                str(stream_uuid),
+                str(user_uuid),
+                str(user_uuid),
+            ),
         )
     return str(stream_uuid)
 
 
-def seed_workspace_user(conn, user_uuid, username, status="active",
-                        last_ping_at=None):
+def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at=None):
     avatar = messenger_models.build_workspace_user_default_avatar(user_uuid)
     with conn.cursor() as cur:
         cur.execute(
@@ -375,8 +446,7 @@ def seed_workspace_user(conn, user_uuid, username, status="active",
         )
 
 
-def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid,
-                             role="member"):
+def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="member"):
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     with conn.cursor() as cur:
         cur.execute(
@@ -387,13 +457,18 @@ def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid,
             VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
             ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
             """,
-            (str(sys_uuid.uuid4()), str(project_id), str(stream_uuid),
-             str(user_uuid), str(user_uuid), role),
+            (
+                str(sys_uuid.uuid4()),
+                str(project_id),
+                str(stream_uuid),
+                str(user_uuid),
+                str(user_uuid),
+                role,
+            ),
         )
 
 
-def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name,
-                      is_default=False):
+def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default=False):
     """Insert a topic and the binding needed for the user topics view."""
     topic_uuid = sys_uuid.uuid4()
     seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid)
@@ -418,8 +493,7 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name,
     return str(topic_uuid)
 
 
-def seed_stream_topic_flags(conn, topic_uuid, user_uuid, project_id,
-                            is_done=False):
+def seed_stream_topic_flags(conn, topic_uuid, user_uuid, project_id, is_done=False):
     with conn.cursor() as cur:
         cur.execute(
             """

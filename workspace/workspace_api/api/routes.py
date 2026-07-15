@@ -41,13 +41,18 @@ class ServiceRoute(user_routes.ServiceRoute):
     __allow_methods__ = [routes.FILTER, routes.GET]
 
 
+class ProviderCatalogRoute(routes.Route):
+    __controller__ = controllers.WorkspaceProviderCatalogController
+    __allow_methods__ = [routes.FILTER, routes.GET]
+
+
 class WorkspaceApiEndpointRoute(routes.Route):
     __controller__ = controllers.WorkspaceApiEndpointController
     __allow_methods__ = [routes.FILTER]
 
     users = routes.route(messenger_routes.WorkspaceUserRoute)
-    external_users = routes.route(messenger_routes.ExternalAccountRoute)
     services = routes.route(ServiceRoute)
+    providers = routes.route(ProviderCatalogRoute)
     me = routes.route(messenger_routes.MeRoute)
     events = routes.route(messenger_routes.WorkspaceEventRoute)
     epoch = routes.route(messenger_routes.WorkspaceEpochRoute)

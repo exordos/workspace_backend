@@ -23,9 +23,7 @@ from restalchemy.api import middlewares
 from workspace.messenger_api.api import versions
 
 
-SERVER_SETTINGS_PATH = (
-    f"/{versions.API_VERSION_1_0}/messenger/server_settings"
-)
+SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/server_settings"
 
 
 def _normalize_path(path):
@@ -54,7 +52,7 @@ def build_server_settings(req):
             "google": False,
             "apple": False,
             "saml": False,
-            "openid connect": False
+            "openid connect": False,
         },
         "push_notifications_enabled": True,
         "email_auth_enabled": True,
@@ -66,7 +64,7 @@ def build_server_settings(req):
         "realm_web_public_access_enabled": False,
         "meet_url": "https://meet.genesis-core.tech",
         "external_authentication_methods": [],
-        "realm_uri": realm_url
+        "realm_uri": realm_url,
     }
     if req.GET:
         result["ignored_parameters_unsupported"] = sorted(req.GET)
@@ -75,10 +73,7 @@ def build_server_settings(req):
 
 class ServerSettingsMiddleware(middlewares.Middleware):
     def process_request(self, req):
-        if (
-            req.method == "GET"
-            and _normalize_path(req.path) == SERVER_SETTINGS_PATH
-        ):
+        if req.method == "GET" and _normalize_path(req.path) == SERVER_SETTINGS_PATH:
             body = json.dumps(build_server_settings(req)).encode("utf-8")
             return webob.Response(
                 body=body,

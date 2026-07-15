@@ -25,11 +25,10 @@ GC_CFG_DIR=/etc/workspace
 VENV_PATH="$GC_PATH/.venv"
 
 WORKSPACE_BINARIES=(
-    workspace-user-api
     workspace-api
+    workspace-provider-api
+    workspace-messenger-api
     workspace-messenger-worker
-    workspace-integration-bridge-worker
-    workspace-groupware-bridge-worker
     workspace-messenger-events
 )
 WORKSPACE_HELPERS=(

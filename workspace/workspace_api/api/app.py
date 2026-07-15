@@ -73,7 +73,7 @@ def build_wsgi_application(iam_engine_driver):
             middlewares.configure_middleware(
                 iam_mw.GenesisCoreAuthMiddleware,
                 iam_engine_driver=iam_engine_driver,
-                context_class=auth_context.WorkspaceAuthContext,
+                context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
             iam_mw.ErrorsHandlerMiddleware,
