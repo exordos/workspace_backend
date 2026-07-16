@@ -37,6 +37,7 @@ class ImapSettings:
     port: int
     credentials: Credentials
     security: str = "plain"
+    ca_file: str | None = None
     timeout: float = 10.0
 
     def __post_init__(self) -> None:
@@ -52,6 +53,7 @@ class SmtpSettings:
     port: int
     security: str = "plain"
     credentials: Credentials | None = None
+    ca_file: str | None = None
     timeout: float = 10.0
 
     def __post_init__(self) -> None:
@@ -132,12 +134,13 @@ class ImapClient:
         self.connection: typing.Any = None
 
     def __enter__(self) -> "ImapClient":
+        ssl_context = ssl.create_default_context(cafile=self.settings.ca_file)
         if self.settings.security == "tls":
             self.connection = imaplib.IMAP4_SSL(
                 self.settings.host,
                 self.settings.port,
                 timeout=self.settings.timeout,
-                ssl_context=ssl.create_default_context(),
+                ssl_context=ssl_context,
             )
         else:
             self.connection = imaplib.IMAP4(
@@ -146,7 +149,7 @@ class ImapClient:
                 timeout=self.settings.timeout,
             )
             if self.settings.security == "starttls":
-                self.connection.starttls(ssl_context=ssl.create_default_context())
+                self.connection.starttls(ssl_context=ssl_context)
         self.connection.login(
             self.settings.credentials.username,
             self.settings.credentials.password,
@@ -298,12 +301,13 @@ class SmtpClient:
         self.connection: typing.Any = None
 
     def __enter__(self) -> "SmtpClient":
+        ssl_context = ssl.create_default_context(cafile=self.settings.ca_file)
         if self.settings.security == "tls":
             self.connection = smtplib.SMTP_SSL(
                 self.settings.host,
                 self.settings.port,
                 timeout=self.settings.timeout,
-                context=ssl.create_default_context(),
+                context=ssl_context,
             )
         else:
             self.connection = smtplib.SMTP(
@@ -312,7 +316,7 @@ class SmtpClient:
                 timeout=self.settings.timeout,
             )
             if self.settings.security == "starttls":
-                self.connection.starttls(context=ssl.create_default_context())
+                self.connection.starttls(context=ssl_context)
         if self.settings.credentials is not None:
             self.connection.login(
                 self.settings.credentials.username,

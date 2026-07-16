@@ -79,6 +79,8 @@ def test_mail_options_mark_credentials_secret_and_have_internal_defaults():
     assert options["smtp-password"].secret is True
     assert conf[runtime.DOMAIN].smtp_host == "127.0.0.1"
     assert conf[runtime.DOMAIN].imap_host == "127.0.0.1"
+    assert conf[runtime.DOMAIN].smtp_ca_file is None
+    assert conf[runtime.DOMAIN].imap_ca_file is None
     assert conf[runtime.DOMAIN].technical_domain == (service.DEFAULT_TECHNICAL_DOMAIN)
 
 
@@ -111,6 +113,33 @@ def test_user_and_project_master_logins_are_deterministic_and_context_managed(
     assert "master-secret" not in repr(user_settings)
     assert "master-secret" not in repr(project_settings.credentials)
     assert "master-secret" not in service.technical_address(USER_UUID)
+
+
+def test_runtime_factory_passes_internal_ca_to_verified_mail_clients(monkeypatch):
+    FakeImapClient.instances = []
+    FakeSmtpClient.instances = []
+    monkeypatch.setattr(runtime.protocol, "ImapClient", FakeImapClient)
+    monkeypatch.setattr(runtime.protocol, "SmtpClient", FakeSmtpClient)
+    conf = _conf()
+    conf.set_override("imap_security", "starttls", group=runtime.DOMAIN)
+    conf.set_override("imap_ca_file", "/etc/workspace/mail-ca.crt", group=runtime.DOMAIN)
+    conf.set_override("smtp_security", "starttls", group=runtime.DOMAIN)
+    conf.set_override("smtp_ca_file", "/etc/workspace/mail-ca.crt", group=runtime.DOMAIN)
+    factory = runtime.RuntimeFactory(conf)
+
+    with factory.user_imap_client(USER_UUID):
+        pass
+    with factory.smtp_client():
+        pass
+
+    assert FakeImapClient.instances[0].settings.security == "starttls"
+    assert FakeImapClient.instances[0].settings.ca_file == (
+        "/etc/workspace/mail-ca.crt"
+    )
+    assert FakeSmtpClient.instances[0].settings.security == "starttls"
+    assert FakeSmtpClient.instances[0].settings.ca_file == (
+        "/etc/workspace/mail-ca.crt"
+    )
 
 
 def test_smtp_factory_supports_internal_optional_auth_and_hides_password(

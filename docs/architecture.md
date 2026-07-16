@@ -132,7 +132,10 @@ Dovecot index and transaction-log files are rebuildable caches and live under
 `/run/workspace/dovecot-indexes`, outside the persistent Maildir volume. Maildir
 messages and control files remain persistent, preserving message state,
 UIDVALIDITY, and UIDs while preventing an interrupted node replacement from
-reusing a partially written index log.
+reusing a partially written index log. Mail bootstrap explicitly creates the
+root-owned `/run/workspace` parent with mode `0755` before creating the
+`workspace:workspace` index directory with mode `0750`; this remains traversable
+when the universal agent itself runs with a restrictive `UMask=0077`.
 
 Because IMAP is the message source of truth, recovery may discard and rebuild
 the PostgreSQL projection by replaying the IMAP journal. No message or shared

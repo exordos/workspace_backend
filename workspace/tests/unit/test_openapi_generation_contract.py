@@ -117,7 +117,7 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         "schema"
     ] == {"$ref": "#/components/schemas/WorkspaceUser_Get"}
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
-    _assert_multipart_object(paths["/v1/files/"]["post"], ["file", "stream_uuid"])
+    _assert_multipart_object(paths["/v1/files/"]["post"], ["file"])
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
@@ -153,7 +153,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     _assert_message_pagination_contract(paths["/v1/messenger/messages/"]["get"])
     _assert_multipart_object(
         paths["/v1/messenger/files/"]["post"],
-        ["file", "stream_uuid"],
+        ["file"],
     )
     avatar_upload_path = (
         "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"

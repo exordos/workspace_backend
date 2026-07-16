@@ -4,11 +4,18 @@
 # you may not use this file except in compliance with the License.
 
 import configparser
+import imaplib
 import json
+import os
 import pathlib
 import re
+import runpy
+import socket
+import smtplib
+import ssl
 import subprocess
 import sys
+import time
 
 import yaml
 
@@ -78,7 +85,11 @@ def _render_workspace_manifest(*, stage1, cutover=False):
                 match.group("enabled")
                 if stage1
                 else (
-                    (match.group("cutover") or "")
+                    (
+                        match.group("cutover")
+                        if match.group("cutover") is not None
+                        else (match.group("disabled") or "")
+                    )
                     if cutover
                     else (match.group("disabled") or "")
                 )
@@ -101,20 +112,40 @@ def _render_workspace_manifest(*, stage1, cutover=False):
             if stage1
             else "workspace-mail.{$workspace.imports.$core_local_domain:name}"
         ),
-        (
-            "{{ '' if mail_migration_stage1_enabled else "
-            "'\\n          smtp_username = workspace-service"
-            "\\n          smtp_password = "
-            "{$core.secret.passwords.$workspace_mail_master_password:value}' }}"
-        ): (
-            ""
-            if stage1
-            else (
-                "\n          smtp_username = workspace-service"
-                "\n          smtp_password = "
-                "{$core.secret.passwords.$workspace_mail_master_password:value}"
-            )
-        ),
+            (
+                "{{ 'plain' if mail_migration_stage1_enabled else "
+                "'starttls' }}"
+            ): "plain" if stage1 else "starttls",
+            (
+                "{{ '' if mail_migration_stage1_enabled else "
+                "'\\n          smtp_ca_file = "
+                "/etc/workspace/tls/workspace-mail-ca.crt"
+                "\\n          smtp_username = workspace-service"
+                "\\n          smtp_password = "
+                "{$core.secret.passwords.$workspace_mail_master_password:value}' }}"
+            ): (
+                ""
+                if stage1
+                else (
+                    "\n          smtp_ca_file = "
+                    "/etc/workspace/tls/workspace-mail-ca.crt"
+                    "\n          smtp_username = workspace-service"
+                    "\n          smtp_password = "
+                    "{$core.secret.passwords.$workspace_mail_master_password:value}"
+                )
+            ),
+            (
+                "{{ '' if mail_migration_stage1_enabled else "
+                "'\\n          imap_ca_file = "
+                "/etc/workspace/tls/workspace-mail-ca.crt' }}"
+            ): (
+                ""
+                if stage1
+                else (
+                    "\n          imap_ca_file = "
+                    "/etc/workspace/tls/workspace-mail-ca.crt"
+                )
+            ),
         (
             "{{ '' if mail_migration_stage1_enabled else "
             "'_remote_mail_v1' }}"
@@ -276,6 +307,7 @@ def test_element_password_resources_include_the_required_project_scope():
     assert set(passwords) == {
         "workspace_projection_db_password",
         "workspace_mail_master_password",
+        "workspace_mail_ca_bootstrap_secret",
         "workspace_s3_access_key",
         "workspace_s3_secret_key",
     }
@@ -362,11 +394,128 @@ def test_backend_bootstrap_defers_mail_readiness_to_config_on_change():
     assert "workspace-mail-healthcheck" in reload_config
 
     clear_ready = reload_config.index('rm -f "$READY_FILE"')
-    check_mail = reload_config.index("workspace-mail-healthcheck")
-    bootstrap_config = reload_config.index("workspace-bootstrap")
-    restart_services = reload_config.index("workspace-restart-services")
+    check_mail = reload_config.index('until "$MAIL_HEALTHCHECK"')
+    bootstrap_config = reload_config.index('"$WORKSPACE_BOOTSTRAP"')
+    restart_services = reload_config.index('"$RESTART_SERVICES"')
 
     assert clear_ready < check_mail < bootstrap_config < restart_services
+
+
+def test_backend_config_reload_defers_until_remote_mail_ca_is_delivered():
+    reload_config = _read("exordos/images/workspace-reload-config.sh")
+
+    require_workspace = reload_config.index(
+        'if [ ! -s "$WORKSPACE_CONFIG" ]'
+    )
+    check_starttls = reload_config.index(
+        "smtp|imap)_security"
+    )
+    check_pki = reload_config.index(
+        '[ "$STARTTLS_REQUIRED" -eq 1 ] && [ ! -s "$PKI_CONFIG" ]'
+    )
+    deferred_exit = reload_config.index("exit 0", check_pki)
+    optional_pki = reload_config.index('if [ -s "$PKI_CONFIG" ]')
+    sync_ca = reload_config.index('"$CA_SYNC" "$PKI_CONFIG"')
+    check_ca = reload_config.index('[ ! -s "$TLS_CA" ]')
+    clear_ready = reload_config.index('rm -f "$READY_FILE"')
+
+    assert (
+        require_workspace
+        < check_starttls
+        < check_pki
+        < deferred_exit
+        < optional_pki
+        < sync_ca
+        < check_ca
+        < clear_ready
+    )
+
+
+def test_backend_config_reload_fetches_ca_after_deferred_config_delivery(
+    tmp_path,
+):
+    reload_config = (
+        PROJECT_ROOT / "exordos/images/workspace-reload-config.sh"
+    )
+    workspace_config = tmp_path / "workspace.conf"
+    pki_config = tmp_path / "mail-pki.conf"
+    ca_file = tmp_path / "workspace-mail-ca.crt"
+    ready_file = tmp_path / "bootstrap.ready"
+    action_log = tmp_path / "actions.log"
+    workspace_config.write_text(
+        "[messenger_mail]\n"
+        "smtp_security = starttls\n"
+        "imap_security = starttls\n",
+        encoding="utf-8",
+    )
+    ready_file.write_text("ready\n", encoding="utf-8")
+
+    def write_mock(name, body):
+        path = tmp_path / name
+        path.write_text("#!/usr/bin/env bash\nset -eu\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    ca_sync = write_mock(
+        "ca-sync",
+        'printf "sync\\n" >> "$MOCK_ACTION_LOG"\n'
+        'printf "ca\\n" > "$MOCK_CA_FILE"\n',
+    )
+    healthcheck = write_mock(
+        "healthcheck",
+        'printf "healthcheck\\n" >> "$MOCK_ACTION_LOG"\n',
+    )
+    bootstrap = write_mock(
+        "bootstrap",
+        'printf "bootstrap\\n" >> "$MOCK_ACTION_LOG"\n',
+    )
+    restart = write_mock(
+        "restart",
+        'printf "restart\\n" >> "$MOCK_ACTION_LOG"\n',
+    )
+    environment = {
+        **os.environ,
+        "WORKSPACE_CONFIG": str(workspace_config),
+        "PKI_CONFIG": str(pki_config),
+        "READY_FILE": str(ready_file),
+        "WORKSPACE_MAIL_CA_FILE": str(ca_file),
+        "WORKSPACE_MAIL_CA_SYNC": str(ca_sync),
+        "WORKSPACE_MAIL_HEALTHCHECK": str(healthcheck),
+        "WORKSPACE_BOOTSTRAP": str(bootstrap),
+        "WORKSPACE_RESTART_SERVICES": str(restart),
+        "MOCK_ACTION_LOG": str(action_log),
+        "MOCK_CA_FILE": str(ca_file),
+    }
+
+    deferred = subprocess.run(
+        ["bash", reload_config],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert deferred.returncode == 0, deferred.stderr
+    assert ready_file.is_file()
+    assert not action_log.exists()
+    assert not ca_file.exists()
+
+    pki_config.write_text("[mail_pki]\nhostname = workspace-mail.local\n")
+    completed = subprocess.run(
+        ["bash", reload_config],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not ready_file.exists()
+    assert ca_file.read_text(encoding="utf-8") == "ca\n"
+    assert action_log.read_text(encoding="utf-8").splitlines() == [
+        "sync",
+        "healthcheck",
+        "bootstrap",
+        "restart",
+    ]
 
 
 def test_backend_bootstrap_defers_successfully_until_config_delivery():
@@ -439,9 +588,11 @@ def test_workspace_uses_dedicated_mail_node_and_a_secondary_projection_database(
     assert "script: images/mail-install.sh" in build_config
     assert "label: data" in manifest
     assert "[messenger_mail]" in manifest
-    assert "smtp_host = 127.0.0.1" in manifest
+    assert "'127.0.0.1' if mail_migration_stage1_enabled" in manifest
     assert "workspace-mail.{$workspace.imports.$core_local_domain:name}" in manifest
-    assert "imap_host = 127.0.0.1" in manifest
+    assert "imap_host = {{ '127.0.0.1' if mail_migration_stage1_enabled" in (
+        manifest
+    )
     assert "imap_port = 1143" in manifest
     assert "dovecot-imapd" in mail_install
     assert "exim4-daemon-light" in mail_install
@@ -532,6 +683,10 @@ def test_actual_jinja_render_supports_mail_modes_and_rejects_invalid_flags():
     stage1_config = stage1["resources"]["$core.config.configs"][
         "workspace_backend_config"
     ]["body"]["content"]
+    assert (
+        "workspace_backend_mail_pki_config"
+        not in stage1["resources"]["$core.config.configs"]
+    )
     assert _messenger_mail_section(stage1_config) == (
         STAGE1_LIVE_MESSENGER_MAIL_SECTION
     )
@@ -554,6 +709,7 @@ def test_actual_jinja_render_supports_mail_modes_and_rejects_invalid_flags():
         {"size": 20, "label": "data"},
     ]
     cutover_configs = cutover_resources["$core.config.configs"]
+    assert "workspace_backend_mail_pki_config" in cutover_configs
     assert "workspace_backend_config" not in cutover_configs
     cutover_config = cutover_configs[
         "workspace_backend_config_remote_mail_v1"
@@ -611,6 +767,7 @@ def test_stage1_mail_migration_preserves_backend_data_and_local_mail():
     assert "workspace_backend_mail_config" not in configs
     assert "workspace_backend_mail_bootstrap" not in services
     assert "workspace_backend_config_remote_mail_v1" not in configs
+    assert "workspace_backend_mail_pki_config" not in configs
     assert services["workspace_bootstrap"]["path"] == (
         "/usr/local/bin/workspace-bootstrap"
     )
@@ -659,6 +816,7 @@ def test_cutover_uses_new_backend_root_and_keeps_legacy_data_disk():
     assert "workspace_backend_mail_config" not in configs
     assert "workspace_backend_mail_bootstrap" not in services
     assert "workspace_backend_config" not in configs
+    assert "workspace_backend_mail_pki_config" in configs
     backend_config = configs["workspace_backend_config_remote_mail_v1"]["body"][
         "content"
     ]
@@ -671,6 +829,14 @@ def test_cutover_uses_new_backend_root_and_keeps_legacy_data_disk():
         in backend_config
     )
     assert "smtp_username = workspace-service" in backend_config
+    assert "smtp_security = starttls" in backend_config
+    assert "smtp_ca_file = /etc/workspace/tls/workspace-mail-ca.crt" in (
+        backend_config
+    )
+    assert "imap_security = starttls" in backend_config
+    assert "imap_ca_file = /etc/workspace/tls/workspace-mail-ca.crt" in (
+        backend_config
+    )
     assert "smtp_host = 127.0.0.1" not in backend_config
 
 
@@ -689,6 +855,7 @@ def test_final_mail_migration_uses_root_only_backend_and_remote_mail():
     assert "workspace_backend_mail_config" not in configs
     assert "workspace_backend_mail_bootstrap" not in services
     assert "workspace_backend_config" not in configs
+    assert "workspace_backend_mail_pki_config" in configs
 
     backend_config = configs["workspace_backend_config_remote_mail_v1"]["body"][
         "content"
@@ -704,6 +871,14 @@ def test_final_mail_migration_uses_root_only_backend_and_remote_mail():
     assert "smtp_host = 127.0.0.1" not in backend_config
     assert "imap_host = 127.0.0.1" not in backend_config
     assert "smtp_username = workspace-service" in backend_config
+    assert "smtp_security = starttls" in backend_config
+    assert "smtp_ca_file = /etc/workspace/tls/workspace-mail-ca.crt" in (
+        backend_config
+    )
+    assert "imap_security = starttls" in backend_config
+    assert "imap_ca_file = /etc/workspace/tls/workspace-mail-ca.crt" in (
+        backend_config
+    )
     assert (
         "smtp_password = "
         "{$core.secret.passwords.$workspace_mail_master_password:value}"
@@ -733,10 +908,18 @@ def test_mail_services_use_authenticated_internal_network_and_disable_os_logins(
     exim_transport = _read("etc/exim4/workspace-messenger-transport.conf")
     exim_local_parts = _read("etc/exim4/workspace-messenger-local-parts")
     exim_auth = _read("etc/exim4/workspace-messenger-auth.conf")
+    exim_tls = _read("etc/exim4/workspace-messenger-tls.conf")
     install_script = _read("exordos/images/mail-install.sh")
 
     assert "listen = 0.0.0.0" in dovecot
-    assert "auth_allow_cleartext = yes" in dovecot
+    assert "ssl = required" in dovecot
+    assert (
+        "ssl_server_cert_file = /etc/workspace/tls/workspace-mail.pem" in dovecot
+    )
+    assert (
+        "ssl_server_key_file = /etc/workspace/tls/workspace-mail.pem" in dovecot
+    )
+    assert "auth_allow_cleartext = no" in dovecot
     assert "auth_mechanisms = plain login" in dovecot
     assert "disable_plaintext_auth" not in dovecot
     assert "mail_driver = maildir" in dovecot
@@ -764,6 +947,18 @@ def test_mail_services_use_authenticated_internal_network_and_disable_os_logins(
     assert "disables OS-user IMAP authentication" in install_script
     assert "dc_local_interfaces='0.0.0.0'" in install_script
     assert "public_name = PLAIN" in exim_auth
+    assert 'server_advertise_condition = ${if eq{$tls_in_cipher}{}{}{*}}' in (
+        exim_auth
+    )
+    assert "MAIN_TLS_ENABLE = true" in exim_tls
+    assert (
+        "MAIN_TLS_CERTIFICATE = /etc/workspace/tls/workspace-mail.pem" in exim_tls
+    )
+    assert (
+        "MAIN_TLS_PRIVATEKEY = /etc/workspace/tls/workspace-mail.pem" in exim_tls
+    )
+    assert "workspace-messenger-tls.conf" in install_script
+    assert "/etc/exim4/conf.d/main/01_workspace_messenger" in install_script
     assert "/etc/exim4/workspace-smtp.passwd" in exim_auth
     assert "$authenticated_id" in exim_router
     assert "domains = messenger.workspace.invalid" in exim_router
@@ -778,11 +973,53 @@ def test_mail_services_use_authenticated_internal_network_and_disable_os_logins(
     assert "workspace-messenger-local-parts" in install_script
 
 
+def test_mail_bootstrap_creates_tls_on_the_persistent_disk():
+    bootstrap = _read("exordos/images/mail-bootstrap.sh")
+    reload_script = _read("exordos/images/workspace-mail-reload.sh")
+
+    assert "/etc/workspace/mail.conf" in bootstrap
+    assert "/etc/workspace/mail.conf" in reload_script
+    assert 'if [[ -z "$PERSISTENT_DISK" ]]' in bootstrap
+    assert "workspace-mail-pki" in bootstrap
+    assert "TLS_STORE_RELATIVE=workspace-mail-pki" in bootstrap
+    assert "$PERSISTENT_MOUNT/$TLS_STORE_RELATIVE" in bootstrap
+    deferred_exit = bootstrap.index("exit 0")
+    mount_disk = bootstrap.index('mountpoint -q "$PERSISTENT_MOUNT"')
+    create_tls = bootstrap.index("/usr/local/bin/workspace-mail-pki")
+    configure = bootstrap.index("workspace-mail-configure")
+    healthcheck = bootstrap.index("workspace-mail-healthcheck")
+    assert deferred_exit < mount_disk < create_tls < configure < healthcheck
+    assert "sleep 1" not in bootstrap
+
+
+def test_image_installs_universal_agent_secret_umask_before_config_delivery():
+    backend_install = _read("exordos/images/backend-install.sh")
+    mail_install = _read("exordos/images/mail-install.sh")
+    umask_install = _read("exordos/images/install-universal-agent-umask.sh")
+
+    for install in (backend_install, mail_install):
+        source_umask = install.index("install-universal-agent-umask.sh")
+        install_packages = install.index("sudo apt update")
+        assert source_umask < install_packages
+
+    assert "UNIT=exordos-universal-agent.service" in umask_install
+    assert "UMask=0077" in umask_install
+    assert "systemd-analyze verify" in umask_install
+    assert "systemctl daemon-reload" in umask_install
+
+
 def test_dovecot_rebuildable_indexes_are_created_on_the_runtime_filesystem():
     configure_script = _read("exordos/images/workspace-mail-configure.sh")
     dovecot = _read("etc/dovecot/99-workspace-messenger.conf")
     install_script = _read("exordos/images/mail-install.sh")
 
+    runtime_parent = configure_script.index(
+        "install -d -m 0755 -o root -g root /run/workspace"
+    )
+    runtime_indexes = configure_script.index(
+        "/run/workspace/dovecot-indexes"
+    )
+    assert runtime_parent < runtime_indexes
     assert "/run/workspace/dovecot-indexes" in configure_script
     assert "-m 0750 -o workspace -g workspace" in configure_script
     assert "mail_index_path = /run/workspace/dovecot-indexes/" in dovecot
@@ -793,6 +1030,97 @@ def test_dovecot_rebuildable_indexes_are_created_on_the_runtime_filesystem():
     assert (
         "workspace-dovecot-validate.py" in install_script
     )
+
+
+def test_mail_healthcheck_accepts_an_empty_authenticated_mailbox(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout):
+            calls.append(("smtp-connect", host, port, timeout))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def starttls(self, context):
+            calls.append(("smtp-starttls", context))
+
+        def login(self, username, password):
+            calls.append(("smtp-login", username, password))
+
+        def noop(self):
+            calls.append(("smtp-noop",))
+            return 250, b"OK"
+
+    class FakeIMAP:
+        def __init__(self, host, port, timeout):
+            calls.append(("imap-connect", host, port, timeout))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def starttls(self, ssl_context):
+            calls.append(("imap-starttls", ssl_context))
+
+        def login(self, username, password):
+            calls.append(("imap-login", username, password))
+            return "OK", [b"authenticated"]
+
+        def noop(self):
+            calls.append(("imap-noop",))
+            return "OK", [b"still here"]
+
+        def select(self, *_args, **_kwargs):
+            raise AssertionError(
+                "readiness must not require an existing mailbox"
+            )
+
+    config_file = tmp_path / "workspace.conf"
+    config_file.write_text(
+        "[messenger_mail]\n"
+        "smtp_host = mail.internal\n"
+        "smtp_port = 25\n"
+        "smtp_username = workspace-service\n"
+        "smtp_password = smtp-secret\n"
+        f"smtp_ca_file = {tmp_path / 'ca.crt'}\n"
+        "imap_host = mail.internal\n"
+        "imap_port = 1143\n"
+        "imap_master_username = workspace-service\n"
+        "imap_master_password = imap-secret\n"
+        f"imap_ca_file = {tmp_path / 'ca.crt'}\n"
+        "technical_domain = messenger.invalid\n",
+        encoding="utf-8",
+    )
+    tls_context = object()
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(imaplib, "IMAP4", FakeIMAP)
+    monkeypatch.setattr(
+        ssl,
+        "create_default_context",
+        lambda **_kwargs: tls_context,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["workspace-mail-healthcheck", str(config_file)],
+    )
+
+    runpy.run_path(
+        str(PROJECT_ROOT / "exordos/images/workspace-mail-healthcheck.py"),
+        run_name="__main__",
+    )
+
+    assert ("smtp-noop",) in calls
+    assert ("imap-noop",) in calls
 
 
 def test_effective_dovecot_config_rejects_index_path_overrides():
@@ -875,11 +1203,347 @@ def test_deployment_mail_option_names_match_runtime_factory():
     assert "mail['imap_master_username']" in healthcheck
     assert 'mail["imap_master_password"]' in healthcheck
     assert 'smtp.login(mail["smtp_username"], mail["smtp_password"])' in healthcheck
+    assert "smtp.starttls(context=smtp_context)" in healthcheck
+    assert "imap.starttls(ssl_context=imap_context)" in healthcheck
+    assert "status, _ = imap.noop()" in healthcheck
+    assert 'imap.select("INBOX")' not in healthcheck
+    assert 'ssl.create_default_context(cafile=mail["smtp_ca_file"])' in healthcheck
+    assert 'ssl.create_default_context(cafile=mail["imap_ca_file"])' in healthcheck
+
+    assert 'cfg.StrOpt("smtp-ca-file", default=None)' in runtime
+    assert 'cfg.StrOpt("imap-ca-file", default=None)' in runtime
 
     for stale_option in ("master_username", "master_password", "events_mailbox"):
         pattern = rf"(?m)^\s*{re.escape(stale_option)}\s*="
         assert re.search(pattern, local_config) is None
         assert re.search(pattern, manifest) is None
+
+
+def test_internal_mail_certificate_is_persistent_and_not_manifest_managed():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    mail_install = _read("exordos/images/mail-install.sh")
+    backend_install = _read("exordos/images/backend-install.sh")
+    pki = _read("exordos/images/workspace-mail-pki.sh")
+    ca_server = _read("exordos/images/workspace-mail-ca-server.py")
+    ca_sync = _read("exordos/images/workspace-mail-ca-sync.py")
+    reload_config = _read("exordos/images/workspace-reload-config.sh")
+
+    assert "$core.secret.certificates:" not in manifest
+    assert "kind: internal_ca" not in manifest
+    assert "workspace-mail-pki.sh" in mail_install
+    assert "workspace-mail-ca-server.py" in mail_install
+    assert "workspace-mail-ca-sync.py" in backend_install
+    assert "TLS_STORE/v1" in pki
+    assert "os.lstat(parent)" in pki
+    assert "Persistent TLS store parent must be a real directory" in pki
+    assert 'install -d -m 0700 "$TLS_STORE"' not in pki
+    assert "ca.key" in pki
+    assert "leaf.key" in pki
+    assert "workspace-mail.pem" in pki
+    assert "workspace-mail-ca-v1" in ca_server
+    assert "workspace-mail-ca-v1" in ca_sync
+    assert "secrets.token_hex(32)" in ca_sync
+    assert "nonce.encode()" in ca_server
+    assert "requested_hostname.encode()" in ca_server
+    assert "hmac.compare_digest" in ca_sync
+    assert '"realm_id": pki["realm_id"]' in pki
+    assert "bootstrap_secret" not in pki.split("write_realm_metadata", 1)[1].split(
+        "validate_realm_metadata",
+        1,
+    )[0]
+    assert "checkend" in pki
+    assert "-no_check_time" in pki
+    assert "mv -Tf" in pki
+    assert "validate_permissions" in pki
+    assert "Certificate Sign, CRL Sign" in pki
+    assert "request_queue_size = 8" in ca_server
+    assert "request.settimeout(5)" in ca_server
+    assert "workspace-mail-ca-sync" in reload_config
+    assert "name: workspace-mail-ca" in manifest
+    assert "path: /usr/local/bin/workspace-mail-ca-server" in manifest
+    assert "user: workspace-pki" in manifest
+    assert "workspace_mail_ca_bootstrap_secret" in manifest
+    assert "[mail_pki]" in manifest
+
+
+def test_persistent_mail_pki_and_authenticated_public_ca_sync(tmp_path):
+    pki = PROJECT_ROOT / "exordos/images/workspace-mail-pki.sh"
+    ca_server = PROJECT_ROOT / "exordos/images/workspace-mail-ca-server.py"
+    ca_sync = PROJECT_ROOT / "exordos/images/workspace-mail-ca-sync.py"
+    store = tmp_path / "store"
+    live = tmp_path / "live"
+    mail_config = tmp_path / "mail-pki.conf"
+    mail_config.write_text(
+        "[mail_pki]\n"
+        "hostname = workspace-mail.localhost\n"
+        "realm_id = test-realm-id\n"
+        "bootstrap_secret = stable-random-secret\n"
+        f"ca_file = {tmp_path / 'backend-ca.crt'}\n"
+        f"realm_file = {tmp_path / 'backend-realm.json'}\n",
+        encoding="utf-8",
+    )
+    environment = {
+        **os.environ,
+        "WORKSPACE_MAIL_TLS_SKIP_CHOWN": "1",
+    }
+    first = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    first_ca = (store / "v1/ca.crt").read_bytes()
+    first_leaf = (store / "v1/current/leaf.crt").read_bytes()
+
+    second = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert second.returncode == 0, second.stderr
+    assert (store / "v1/ca.crt").read_bytes() == first_ca
+    assert (store / "v1/current/leaf.crt").read_bytes() == first_leaf
+    assert (store / "v1/ca.key").stat().st_mode & 0o777 == 0o600
+    assert (store / "v1/current/leaf.key").stat().st_mode & 0o777 == 0o600
+    assert (
+        (store / "v1/current/workspace-mail.pem").stat().st_mode & 0o777
+        == 0o640
+    )
+
+    renewal_environment = {
+        **environment,
+        "WORKSPACE_MAIL_LEAF_RENEW_SECONDS": "999999999",
+    }
+    renewed = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=renewal_environment,
+        text=True,
+    )
+    assert renewed.returncode == 0, renewed.stderr
+    assert (store / "v1/ca.crt").read_bytes() == first_ca
+    assert (store / "v1/current/leaf.crt").read_bytes() != first_leaf
+    assert (live / "workspace-mail.pem").is_symlink()
+    assert not (live / "workspace-mail-ca.crt").is_symlink()
+    assert not (live / "workspace-mail-realm.json").is_symlink()
+
+    old_leaf = store / "v1/leaves/leaf-initial"
+    old_timestamp = time.time() - 120
+    os.utime(old_leaf, (old_timestamp, old_timestamp))
+    pruning_environment = {
+        **environment,
+        "WORKSPACE_MAIL_LEAF_RETENTION_MINUTES": "0",
+    }
+    pruned = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=pruning_environment,
+        text=True,
+    )
+    assert pruned.returncode == 0, pruned.stderr
+    assert not old_leaf.exists()
+    assert (store / "v1/current/leaf.key").is_file()
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            ca_server,
+            "--config-file",
+            mail_config,
+            "--ca-file",
+            live / "workspace-mail-ca.crt",
+            "--realm-file",
+            live / "workspace-mail-realm.json",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+    )
+    try:
+        for _ in range(50):
+            with socket.socket() as connection:
+                if connection.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("Workspace mail CA server did not start")
+
+        backend_ca = tmp_path / "backend-ca.crt"
+        backend_config = tmp_path / "backend.conf"
+        backend_config.write_text(
+            "[mail_pki]\n"
+            "hostname = workspace-mail.localhost\n"
+            "realm_id = test-realm-id\n"
+            "bootstrap_secret = stable-random-secret\n"
+            f"ca_file = {backend_ca}\n"
+            f"realm_file = {tmp_path / 'backend-realm.json'}\n",
+            encoding="utf-8",
+        )
+        synced = subprocess.run(
+            [
+                sys.executable,
+                ca_sync,
+                backend_config,
+                "--port",
+                str(port),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert synced.returncode == 0, synced.stderr
+        assert backend_ca.read_bytes() == first_ca
+
+        backend_config.write_text(
+            backend_config.read_text(encoding="utf-8").replace(
+                "stable-random-secret",
+                "wrong-secret",
+            ),
+            encoding="utf-8",
+        )
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                ca_sync,
+                backend_config,
+                "--port",
+                str(port),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert rejected.returncode != 0
+        assert backend_ca.read_bytes() == first_ca
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+    mismatched_config = tmp_path / "mismatched.conf"
+    mismatched_config.write_text(
+        mail_config.read_text(encoding="utf-8").replace(
+            "test-realm-id",
+            "another-realm-id",
+        ),
+        encoding="utf-8",
+    )
+    mismatched = subprocess.run(
+        ["bash", pki, mismatched_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert mismatched.returncode != 0
+    assert (store / "v1/ca.crt").read_bytes() == first_ca
+
+    rotated_secret_config = tmp_path / "rotated-secret.conf"
+    rotated_secret_config.write_text(
+        mail_config.read_text(encoding="utf-8").replace(
+            "stable-random-secret",
+            "replacement-random-secret",
+        ),
+        encoding="utf-8",
+    )
+    rotated_secret = subprocess.run(
+        ["bash", pki, rotated_secret_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert rotated_secret.returncode == 0, rotated_secret.stderr
+    assert (store / "v1/ca.crt").read_bytes() == first_ca
+
+    partial_store = tmp_path / "partial-store"
+    (partial_store / "v1").mkdir(parents=True)
+    partial = subprocess.run(
+        ["bash", pki, mail_config, partial_store, tmp_path / "partial-live"],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert partial.returncode != 0
+    assert not (partial_store / "v1/ca.key").exists()
+
+    symlink_target = tmp_path / "symlink-target"
+    symlink_target.mkdir()
+    symlink_store = tmp_path / "symlink-store"
+    symlink_store.symlink_to(symlink_target, target_is_directory=True)
+    symlinked = subprocess.run(
+        ["bash", pki, mail_config, symlink_store, tmp_path / "symlink-live"],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert symlinked.returncode != 0
+    assert list(symlink_target.iterdir()) == []
+
+    (store / "v1/ca.key").chmod(0o644)
+    normalized_permissions = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert normalized_permissions.returncode == 0, normalized_permissions.stderr
+    assert (store / "v1/ca.key").stat().st_mode & 0o777 == 0o600
+
+    ca_key = store / "v1/ca.key"
+    ca_key_backup = store / "v1/ca.key.backup"
+    ca_key.rename(ca_key_backup)
+    ca_key.symlink_to(ca_key_backup)
+    unsafe_type = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert unsafe_type.returncode != 0
+    ca_key.unlink()
+    ca_key_backup.rename(ca_key)
+
+    (store / "v1/current/leaf.crt").write_text(
+        "corrupt\n",
+        encoding="utf-8",
+    )
+    corrupted = subprocess.run(
+        ["bash", pki, mail_config, store, live],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert corrupted.returncode != 0
+    assert (store / "v1/ca.crt").read_bytes() == first_ca
+
+
+def test_tracked_development_config_does_not_publish_the_iam_secret():
+    local_config = configparser.ConfigParser()
+    local_config.read_string(_read("etc/workspace/workspace.conf"))
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    gitignore = _read(".gitignore")
+
+    assert local_config["iam"]["hs256_jwks_decryption_key"] == ""
+    assert (
+        "hs256_jwks_decryption_key = "
+        "{$workspace.imports.$var_hs256_jwks_encryption_key:value}"
+    ) in manifest
+    assert "etc/*/*local.conf" in gitignore
 
 
 def test_element_builds_and_serves_the_existing_workspace_ui():

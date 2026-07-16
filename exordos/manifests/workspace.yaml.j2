@@ -116,6 +116,14 @@ resources:
       constructor:
         kind: plain
       method: AUTO_HEX
+    workspace_mail_ca_bootstrap_secret:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_mail_ca_bootstrap_secret
+      description: "Workspace mail public CA bootstrap authentication secret"
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
     workspace_s3_access_key:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace_s3_access_key
@@ -218,6 +226,54 @@ resources:
       instance: $s3aas.types.s3.instances.$workspace_s3:uuid
 
   $core.config.configs:
+    workspace_mail_pki_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mail-pki.conf
+      mode: "0640"
+      owner: root
+      group: workspace-pki
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-mail-reload
+      body:
+        kind: text
+        content: |
+          f"
+          [mail_pki]
+          hostname = workspace-mail.{$workspace.imports.$core_local_domain:name}
+          realm_id = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:uuid}
+          bootstrap_secret = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:value}
+          ca_file = /etc/workspace/tls/workspace-mail-ca.crt
+          realm_file = /etc/workspace/tls/workspace-mail-realm.json
+          "
+# {% if mail_migration_stage1_enabled %}
+# {% else %}
+    workspace_backend_mail_pki_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mail-pki.conf
+      mode: "0600"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-reload-config
+      body:
+        kind: text
+        content: |
+          f"
+          [mail_pki]
+          hostname = workspace-mail.{$workspace.imports.$core_local_domain:name}
+          realm_id = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:uuid}
+          bootstrap_secret = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:value}
+          ca_file = /etc/workspace/tls/workspace-mail-ca.crt
+          realm_file = /etc/workspace/tls/workspace-mail-realm.json
+          "
+# {% endif %}
     workspace_mail_config:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/mail.conf
@@ -233,14 +289,16 @@ resources:
         content: |
           f"
           [messenger_mail]
-          smtp_host = 127.0.0.1
+          smtp_host = workspace-mail.{$workspace.imports.$core_local_domain:name}
           smtp_port = 25
-          smtp_security = plain
+          smtp_security = starttls
+          smtp_ca_file = /etc/workspace/tls/workspace-mail-ca.crt
           smtp_username = workspace-service
           smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}
-          imap_host = 127.0.0.1
+          imap_host = workspace-mail.{$workspace.imports.$core_local_domain:name}
           imap_port = 1143
-          imap_security = plain
+          imap_security = starttls
+          imap_ca_file = /etc/workspace/tls/workspace-mail-ca.crt
           imap_master_username = workspace-service
           imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
           technical_domain = messenger.workspace.invalid
@@ -302,10 +360,10 @@ resources:
           [messenger_mail]
           smtp_host = {{ '127.0.0.1' if mail_migration_stage1_enabled else 'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}
           smtp_port = 25
-          smtp_security = plain{{ '' if mail_migration_stage1_enabled else '\n          smtp_username = workspace-service\n          smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}' }}
+          smtp_security = {{ 'plain' if mail_migration_stage1_enabled else 'starttls' }}{{ '' if mail_migration_stage1_enabled else '\n          smtp_ca_file = /etc/workspace/tls/workspace-mail-ca.crt\n          smtp_username = workspace-service\n          smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}' }}
           imap_host = {{ '127.0.0.1' if mail_migration_stage1_enabled else 'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}
           imap_port = 1143
-          imap_security = plain
+          imap_security = {{ 'plain' if mail_migration_stage1_enabled else 'starttls' }}{{ '' if mail_migration_stage1_enabled else '\n          imap_ca_file = /etc/workspace/tls/workspace-mail-ca.crt' }}
           imap_master_username = workspace-service
           imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
           technical_domain = messenger.workspace.invalid
@@ -425,6 +483,18 @@ resources:
         node: $core.compute.nodes.$workspace_mail:uuid
       service_type:
         kind: oneshot
+      target_status: enabled
+    workspace_mail_ca:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-mail-ca
+      path: /usr/local/bin/workspace-mail-ca-server
+      user: workspace-pki
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      service_type:
+        kind: simple
+        count: 1
       target_status: enabled
     workspace_bootstrap:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"

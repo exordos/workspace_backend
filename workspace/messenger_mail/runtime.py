@@ -26,6 +26,7 @@ mail_opts = [
     ),
     cfg.StrOpt("smtp-username", default=None),
     cfg.StrOpt("smtp-password", default=None, secret=True),
+    cfg.StrOpt("smtp-ca-file", default=None),
     cfg.FloatOpt("smtp-timeout", default=10.0, min=0.1),
     cfg.StrOpt("imap-host", default="127.0.0.1"),
     cfg.IntOpt("imap-port", default=143, min=1, max=65535),
@@ -36,6 +37,7 @@ mail_opts = [
     ),
     cfg.StrOpt("imap-master-username", default="workspace-master"),
     cfg.StrOpt("imap-master-password", default=None, secret=True),
+    cfg.StrOpt("imap-ca-file", default=None),
     cfg.FloatOpt("imap-timeout", default=10.0, min=0.1),
     cfg.StrOpt(
         "technical-domain",
@@ -82,6 +84,7 @@ class RuntimeFactory:
             port=group.imap_port,
             credentials=self._master_credentials(target),
             security=group.imap_security,
+            ca_file=group.imap_ca_file,
             timeout=group.imap_timeout,
         )
 
@@ -102,6 +105,7 @@ class RuntimeFactory:
             port=group.smtp_port,
             security=group.smtp_security,
             credentials=credentials,
+            ca_file=group.smtp_ca_file,
             timeout=group.smtp_timeout,
         )
 

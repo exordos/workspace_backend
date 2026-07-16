@@ -410,21 +410,22 @@ def create_workspace_file(project_id, user_uuid, uuid, session=None, **values):
         **values,
     )
     file.insert(session=session)
-    stream_user_uuids = models.get_stream_recipients(
-        project_id=project_id,
-        stream_uuid=values["stream_uuid"],
+    recipient_user_uuids = _get_workspace_file_event_recipients(
+        project_id,
+        file,
         session=session,
     )
-    for stream_user_uuid in stream_user_uuids:
-        get_or_create_workspace_file_access(
-            project_id=project_id,
-            file_uuid=file.uuid,
-            user_uuid=stream_user_uuid,
-            session=session,
-        )
+    if file.stream_uuid is not None:
+        for recipient_user_uuid in recipient_user_uuids:
+            get_or_create_workspace_file_access(
+                project_id=project_id,
+                file_uuid=file.uuid,
+                user_uuid=recipient_user_uuid,
+                session=session,
+            )
     messenger_events.create_file_created_events(
         file,
-        stream_user_uuids,
+        recipient_user_uuids,
         session=session,
     )
     return file
@@ -480,7 +481,9 @@ def delete_workspace_avatar_file(user_uuid, file_uuid, session=None):
             session=session,
         )
         messenger_events.create_file_deleted_events(
-            file,
+            file.project_id,
+            file.stream_uuid,
+            file.uuid,
             recipient_user_uuids,
             session=session,
         )

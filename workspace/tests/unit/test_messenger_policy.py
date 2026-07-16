@@ -536,6 +536,18 @@ def test_file_create_uses_current_scope_and_storage_metadata(store_factory):
     assert values["storage_object_id"] == "aa/file"
 
 
+def test_file_json_create_still_requires_stream_uuid(store_factory):
+    controller = _controller(controllers.WorkspaceFileController)
+
+    with pytest.raises(Exception):
+        controller.create(
+            name="example.txt",
+            content_type="text/plain",
+            size_bytes=12,
+            hash="abc",
+        )
+
+
 def test_multipart_upload_builds_metadata_before_store_write(store_factory):
     store, _opened_scopes = store_factory
     controller = _controller(controllers.WorkspaceFileController)
@@ -587,6 +599,68 @@ def test_multipart_upload_builds_metadata_before_store_write(store_factory):
     assert metadata.sha256 == values["hash"]
     assert metadata.acl_mode == "stream_members"
     save_metadata.assert_called_once_with(metadata, storage_type="s3")
+
+
+def test_multipart_public_upload_uses_public_acl_without_stream(store_factory):
+    store, _opened_scopes = store_factory
+    controller = _controller(controllers.WorkspaceFileController)
+    data = b"public example data"
+    parts = {
+        "file": types.SimpleNamespace(
+            file=io.BytesIO(data),
+            filename="public-example.txt",
+            type="text/plain",
+        ),
+        "acl": types.SimpleNamespace(value='{"mode":"public"}'),
+    }
+    storage_info = controllers.file_storage.WorkspaceFileStorageInfo(
+        storage_type="s3",
+        storage_id="workspace-files",
+        storage_object_id="public-key",
+    )
+
+    with (
+        mock.patch.object(
+            controllers.file_storage,
+            "save_workspace_file",
+            return_value=storage_info,
+        ),
+        mock.patch.object(
+            controllers.file_storage,
+            "save_workspace_file_metadata",
+        ) as save_metadata,
+    ):
+        controller.create(multipart=True, parts=parts)
+
+    values = store.calls[0][2]
+    assert values["stream_uuid"] is None
+    metadata = save_metadata.call_args.args[0]
+    assert metadata.stream_uuid is None
+    assert metadata.acl_mode == "public"
+    save_metadata.assert_called_once_with(metadata, storage_type="s3")
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        {},
+        {"acl": types.SimpleNamespace(value='{"mode":"stream_members"}')},
+        {
+            "acl": types.SimpleNamespace(value='{"mode":"public"}'),
+            "stream_uuid": types.SimpleNamespace(value=str(sys_uuid.uuid4())),
+        },
+    ],
+)
+def test_multipart_upload_rejects_invalid_acl_scope(store_factory, parts):
+    controller = _controller(controllers.WorkspaceFileController)
+    parts["file"] = types.SimpleNamespace(
+        file=io.BytesIO(b"example"),
+        filename="example.txt",
+        type="text/plain",
+    )
+
+    with pytest.raises(Exception):
+        controller.create(multipart=True, parts=parts)
 
 
 def test_file_download_and_delete_use_store_authorization(store_factory):

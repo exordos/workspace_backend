@@ -11,12 +11,15 @@ set -o pipefail
 
 GC_PATH=/opt/workspace
 
+source "$GC_PATH/exordos/images/install-universal-agent-umask.sh"
+
 sudo apt update
 sudo DEBIAN_FRONTEND=noninteractive apt install -y \
     dovecot-core \
     dovecot-imapd \
     exim4-daemon-light \
     openssh-server \
+    openssl \
     python3
 
 sudo systemctl enable ssh.service
@@ -32,10 +35,21 @@ if ! getent passwd workspace >/dev/null; then
         --shell /usr/sbin/nologin \
         workspace
 fi
+if ! getent group workspace-pki >/dev/null; then
+    sudo groupadd --system workspace-pki
+fi
+if ! getent passwd workspace-pki >/dev/null; then
+    sudo useradd \
+        --system \
+        --gid workspace-pki \
+        --home-dir /nonexistent \
+        --shell /usr/sbin/nologin \
+        workspace-pki
+fi
 
 sudo install -d -m 0750 -o workspace -g workspace \
     /var/lib/workspace/messenger/mail
-sudo install -d -m 0755 /etc/workspace /usr/local/bin
+sudo install -d -m 0755 /etc/workspace /etc/workspace/tls /usr/local/bin
 sudo install -m 0644 \
     "$GC_PATH/etc/dovecot/99-workspace-messenger.conf" \
     /etc/dovecot/conf.d/99-workspace-messenger.conf
@@ -45,6 +59,9 @@ sudo sed -i \
 sudo install -m 0644 \
     "$GC_PATH/etc/exim4/workspace-messenger-auth.conf" \
     /etc/exim4/conf.d/auth/30_workspace_messenger
+sudo install -m 0644 \
+    "$GC_PATH/etc/exim4/workspace-messenger-tls.conf" \
+    /etc/exim4/conf.d/main/01_workspace_messenger
 sudo install -m 0644 \
     "$GC_PATH/etc/exim4/workspace-messenger-router.conf" \
     /etc/exim4/conf.d/router/250_workspace_messenger
@@ -66,6 +83,12 @@ sudo sed -i "s/^dc_use_split_config=.*/dc_use_split_config='true'/" \
 sudo install -m 0755 \
     "$GC_PATH/exordos/images/mail-bootstrap.sh" \
     /usr/local/bin/workspace-mail-bootstrap
+sudo install -m 0755 \
+    "$GC_PATH/exordos/images/workspace-mail-pki.sh" \
+    /usr/local/bin/workspace-mail-pki
+sudo install -m 0755 \
+    "$GC_PATH/exordos/images/workspace-mail-ca-server.py" \
+    /usr/local/bin/workspace-mail-ca-server
 sudo install -m 0755 \
     "$GC_PATH/exordos/images/workspace-dovecot-validate.py" \
     /usr/local/bin/workspace-dovecot-validate

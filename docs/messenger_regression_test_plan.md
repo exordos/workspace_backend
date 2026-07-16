@@ -70,6 +70,7 @@ storage.
 | MSG-FILE-002 | Attach a file to a message and restart all backend services. | The message keeps its authorized file reference and the object remains downloadable. |
 | MSG-FILE-003 | Request a file as an unrelated user or project. | Access is denied without disclosing object keys or metadata. |
 | MSG-FILE-004 | Delete the last authorized file reference through the supported flow. | Metadata, access records, and object cleanup follow the established contract. |
+| MSG-FILE-005 | Upload multipart data with `acl={"mode":"public"}` and no `stream_uuid`, then request its metadata and bytes with another valid Workspace bearer token. | The sidecar contains `acl.mode=public` without a stream UUID, the second authenticated user succeeds without membership, anonymous access remains rejected, and the canonical file URN remains unchanged. |
 
 ## Events and reconnect behavior
 
@@ -87,11 +88,18 @@ storage.
 
 | ID | Scenario | Expected result |
 | --- | --- | --- |
-| MSG-DEPLOY-001 | Inspect listening sockets and routing after deployment. | SMTP and IMAP are reachable from the backend only with service credentials over the internal network; only documented HTTP/websocket routes are public. |
+| MSG-DEPLOY-001 | Inspect listening sockets and routing after deployment. | SMTP and IMAP are reachable from the backend only with service credentials over CA-verified STARTTLS on the internal network; plaintext authentication is not advertised before TLS, and only documented HTTP/websocket routes are public. |
 | MSG-DEPLOY-002 | Reboot the backend and mail nodes after creating messages and files. | Maildir and S3 data survive and the public API returns the same resources. |
 | MSG-DEPLOY-003 | Replace the mail root image while preserving its data disk. | Exim4/Dovecot configuration is recreated and existing Maildir data is readable. |
 | MSG-DEPLOY-004 | Search the database and deployment for message cache tables or provider runtime artifacts. | Neither SQL message cache nor provider services, routes, images, manifests, or processes exist. |
 | MSG-DEPLOY-005 | On a disposable environment, terminate the mail VM during active journal reads, then boot it again with the same Maildir volume. | Message files, UIDVALIDITY, UIDs, and API state remain unchanged; Dovecot creates fresh indexes below `/run/workspace/dovecot-indexes` and does not reuse a persistent `dovecot.index.log`. |
+| MSG-DEPLOY-006 | Replace the backend and mail root images independently while preserving the mail data disk. | The persistent CA fingerprint remains unchanged; the current leaf remains unchanged during ordinary root replacement unless it has reached the renewal threshold, in which case a new leaf is signed by the same CA. Realm metadata validates, the backend retrieves only the public CA through the nonce-bound HMAC endpoint, and verified SMTP/IMAP connectivity recovers. |
+| MSG-DEPLOY-007 | Replay or modify the CA response, nonce, hostname, signature, redirect, or shared HMAC credential during backend bootstrap. | The backend rejects the response, does not replace its current CA file, and remains unready without attempting plaintext mail authentication. |
+| MSG-DEPLOY-008 | Bootstrap with a leaf inside or beyond the renewal window, then with corrupt, partial, cloned, hostname/realm-mismatched, unsafe-permission, unexpected-type, and wrong-key persistent TLS stores. | Expiry creates a complete new leaf generation under the same CA and atomically changes `current`; safe owner/mode drift is normalized, while every invalid type or mismatched store fails closed without regenerating the CA; old leaf keys are pruned only after the rollback window. |
+| MSG-DEPLOY-009 | Restore the mail data disk and rotate the CA through the documented overlap procedure. | Encrypted backup restores CA/leaf/realm state with exact safe ownership and modes; backend trusts both CAs during cutover and removes the old CA only after verified convergence and the rollback window. |
+| MSG-DEPLOY-010 | Deliver the final STARTTLS workspace config before the backend PKI config, and inspect newly rendered secret configs on both images. | The first on-change handler defers successfully without clearing readiness or entering a healthcheck retry loop; PKI delivery later performs authenticated CA sync and the full readiness sequence. The actual universal-agent unit runs with `UMask=0077`, so a newly created secret config is never group/world-readable even before its final resource mode is applied. |
+| MSG-DEPLOY-011 | Replace the persistent PKI store or its parent with a symlink to a controlled directory, then run mail bootstrap. | Bootstrap rejects the path before any install, ownership, or mode mutation; the symlink target remains byte-for-byte and metadata unchanged. A root-owned direct child of the persistent mount continues to bootstrap normally. |
+| MSG-DEPLOY-012 | Bootstrap a fresh mail root while the universal agent runs with `UMask=0077`, then authenticate an empty healthcheck user and select the project `Workspace/State` and `Workspace/Events` mailboxes. | `/run/workspace` is `root:root 0755`, its `dovecot-indexes` child is `workspace:workspace 0750`, healthcheck succeeds through authenticated SMTP/IMAP `NOOP` without requiring an INBOX, both canonical mailbox selections succeed without `NOPERM`, and config delivery does not enter a Dovecot/Exim restart loop. |
 
 ## Execution order
 

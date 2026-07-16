@@ -11,9 +11,15 @@ set -o pipefail
 WORKSPACE_CONFIG=${WORKSPACE_CONFIG:-/etc/workspace/workspace.conf}
 MASTER_PASSWD=/etc/dovecot/workspace-master.passwd
 SMTP_PASSWD=/etc/exim4/workspace-smtp.passwd
+TLS_BUNDLE=/etc/workspace/tls/workspace-mail.pem
+TLS_CA=/etc/workspace/tls/workspace-mail-ca.crt
 
 if [[ ! -s "$WORKSPACE_CONFIG" ]]; then
     echo "Workspace configuration is not available" >&2
+    exit 1
+fi
+if [[ ! -s "$TLS_BUNDLE" || ! -s "$TLS_CA" ]]; then
+    echo "Workspace mail TLS material is not available" >&2
     exit 1
 fi
 
@@ -42,6 +48,7 @@ if [[ -z "${MAIL_CREDENTIALS[0]}" || -z "${MAIL_CREDENTIALS[1]}" || \
     exit 1
 fi
 
+install -d -m 0755 -o root -g root /run/workspace
 install -d -m 0750 -o workspace -g workspace \
     /var/lib/workspace/messenger/mail \
     /run/workspace/dovecot-indexes

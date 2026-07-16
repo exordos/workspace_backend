@@ -4842,6 +4842,67 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_delete_workspace_avatar_file_emits_public_file_event(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        file_uuid = sys_uuid.uuid4()
+        session = object()
+        deleted_file = {}
+
+        class ExistingFile:
+            def delete(self, session=None):
+                deleted_file["delete_session"] = session
+
+        existing_file = ExistingFile()
+        existing_file.uuid = file_uuid
+        existing_file.project_id = project_id
+        existing_file.stream_uuid = None
+        recipients = [user_uuid, sys_uuid.uuid4()]
+
+        class FakeWorkspaceFile:
+            class objects:
+                @staticmethod
+                def get_one_or_none(**kwargs):
+                    get_file(**kwargs)
+                    return existing_file
+
+        get_file = mock.Mock()
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceFile",
+            FakeWorkspaceFile,
+        ), mock.patch.object(
+            dm_helpers,
+            "_get_workspace_file_event_recipients",
+            return_value=recipients,
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_file_deleted_events",
+        ) as create_events:
+            result = dm_helpers.delete_workspace_avatar_file(
+                user_uuid=user_uuid,
+                file_uuid=file_uuid,
+                session=session,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            {
+                "uuid": mock.ANY,
+                "user_uuid": mock.ANY,
+            },
+            get_file.call_args.kwargs["filters"],
+        )
+        self.assertIs(session, get_file.call_args.kwargs["session"])
+        self.assertIs(session, deleted_file["delete_session"])
+        create_events.assert_called_once_with(
+            project_id,
+            None,
+            file_uuid,
+            recipients,
+            session=session,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

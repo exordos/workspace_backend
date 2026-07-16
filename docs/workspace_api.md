@@ -1075,7 +1075,7 @@ metadata. Nginx rejects multipart requests larger than `50m` before they reach
 | `uuid` | UUID | no | yes | File identifier. |
 | `project_id` | UUID | no | yes | IAM project scope; hidden in API responses. |
 | `user_uuid` | UUID | no | yes | Owner/uploader. |
-| `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. `null` is reserved for files created by server actions with `acl.mode=public`. |
+| `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. Required for JSON create and `stream_members` multipart uploads; omitted for multipart uploads with `acl.mode=public`. |
 | `name` | string | yes | no | File display name. |
 | `description` | string | yes | no | File description. |
 | `content_type` | string | yes | no | MIME content type. |
@@ -1110,10 +1110,29 @@ name=example.txt
 description=Example
 ```
 
-For multipart uploads, `file` and `stream_uuid` are required. `name` defaults to
-the uploaded filename and `description` defaults to an empty string. The backend
-stores the bytes, sets `content_type` from the uploaded part, calculates
-`size_bytes`, and writes a SHA-256 `hash`.
+An ordinary authenticated client uploads a Workspace-wide public file through
+the same endpoint by sending the existing ACL object as JSON and omitting
+`stream_uuid`:
+
+```http
+POST /api/workspace/v1/messenger/files/
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data
+
+file=<binary file part>
+acl={"mode":"public"}
+name=public-example.txt
+description=Authenticated Workspace-wide file
+```
+
+For multipart uploads, `file` is required and exactly one scope must be
+provided: either `stream_uuid`, or the JSON form field
+`acl={"mode":"public"}`. Public uploads reject `stream_uuid`; stream uploads
+retain the `stream_members` ACL. `name` defaults to the uploaded filename and
+`description` defaults to an empty string. The backend stores the bytes, sets
+`content_type` from the uploaded part, calculates `size_bytes`, and writes a
+SHA-256 `hash`. Both modes preserve the same binary plus JSON sidecar layout and
+the same `urn:file`, `urn:image`, or `urn:video` client contract.
 
 `GET /api/workspace/v1/messenger/files/`, `GET /api/workspace/v1/messenger/files/{file_uuid}`, and
 `GET /api/workspace/v1/messenger/files/{file_uuid}/actions/download` require file access. `PUT` and

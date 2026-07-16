@@ -33,6 +33,7 @@ WORKSPACE_BINARIES=(
 )
 WORKSPACE_HELPERS=(
     backend-bootstrap.sh:workspace-bootstrap
+    workspace-mail-ca-sync.py:workspace-mail-ca-sync
     workspace-mail-healthcheck.py:workspace-mail-healthcheck
     workspace-nginx-reload.sh:workspace-nginx-reload
     workspace-reload-config.sh:workspace-reload-config
@@ -48,6 +49,8 @@ disable_packaged_nginx_service() {
 
     sudo rm -f /etc/systemd/system/multi-user.target.wants/nginx.service
 }
+
+source "$GC_PATH/exordos/images/install-universal-agent-umask.sh"
 
 sudo apt update
 sudo DEBIAN_FRONTEND=noninteractive apt install -y \
@@ -84,6 +87,7 @@ fi
 
 sudo mkdir -p \
     "$GC_CFG_DIR" \
+    "$GC_CFG_DIR/tls" \
     /etc/nginx/conf.d \
     /etc/nginx/sites-available \
     /etc/nginx/sites-enabled \

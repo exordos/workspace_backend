@@ -411,6 +411,7 @@ def test_imap_context_uses_timeout_starttls_and_login(monkeypatch):
         1143,
         protocol.Credentials("service", "secret"),
         security="starttls",
+        ca_file="/etc/workspace/tls/mail-ca.crt",
         timeout=2.5,
     )
 
@@ -418,6 +419,9 @@ def test_imap_context_uses_timeout_starttls_and_login(monkeypatch):
         pass
 
     constructor.assert_called_once_with("imap.internal", 1143, timeout=2.5)
+    protocol.ssl.create_default_context.assert_called_once_with(
+        cafile="/etc/workspace/tls/mail-ca.crt"
+    )
     connection.starttls.assert_called_once_with(ssl_context=ssl_context)
     connection.login.assert_called_once_with("service", "secret")
     connection.logout.assert_called_once_with()
@@ -454,6 +458,7 @@ def test_smtp_security_timeout_optional_auth_and_context_cleanup(
         2525,
         security=security,
         credentials=credentials,
+        ca_file="/etc/workspace/tls/mail-ca.crt",
         timeout=3.5,
     )
     message = codec.build_message(_envelope())
@@ -470,6 +475,9 @@ def test_smtp_security_timeout_optional_auth_and_context_cleanup(
             context=ssl_context,
         )
     assert constructor.call_args == expected
+    protocol.ssl.create_default_context.assert_called_once_with(
+        cafile="/etc/workspace/tls/mail-ca.crt"
+    )
     assert connection.starttls.called is uses_starttls
     if uses_starttls:
         connection.starttls.assert_called_once_with(context=ssl_context)

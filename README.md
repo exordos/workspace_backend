@@ -5,7 +5,8 @@ is IAM-authenticated and preserves the existing REST and realtime contracts.
 Message persistence is implemented by the local mail stack described in
 [`docs/mail_backed_messenger_architecture.md`](docs/mail_backed_messenger_architecture.md):
 Exim4, Dovecot, and Maildir run on a dedicated mail node in the same element.
-Their authenticated protocol listeners remain on the platform-internal network.
+Their authenticated protocol listeners remain on the platform-internal network
+and require CA-verified STARTTLS.
 
 The backend does not expose provider, mail, calendar, or external-integration
 APIs. Messenger attachments continue to use the configured S3-compatible file
@@ -51,8 +52,12 @@ sends a `ready` control frame before it can deliver live events.
 
 Maildir is the source of truth for message content and state. The Maildir tree
 must be placed on the mail node's persistent data disk. The backend accesses
-Exim4 and Dovecot only through authenticated internal SMTP and IMAP; these protocols are not public API
-surfaces.
+Exim4 and Dovecot only through authenticated internal SMTP and IMAP with
+hostname verification against the Workspace mail CA. The CA, leaf certificate,
+and private keys are created on the mail node during first persistent-disk
+initialization and survive root-image replacement. The backend obtains only the
+public CA through an HMAC-authenticated internal endpoint. These protocols and
+the CA endpoint are not public API surfaces.
 
 Files and their metadata and access-control records use the configured
 S3-compatible storage backend. PostgreSQL stores a rebuildable projection for
@@ -62,6 +67,19 @@ copy of a message or shared Messenger state.
 ## Local development
 
 The project virtual environment is expected at `.tox/develop`.
+
+The tracked `etc/workspace/workspace.conf` intentionally contains no IAM JWKS
+decryption key. For local development, copy it to the ignored local config and
+set the key there:
+
+```bash
+cp etc/workspace/workspace.conf etc/workspace/workspace.local.conf
+```
+
+Pass `--config-file etc/workspace/workspace.local.conf` to local services and
+utilities that need IAM authentication. Never commit that file. Deployed
+elements receive the key from the Exordos Core secret import and do not use the
+local config.
 
 Useful RESTAlchemy utilities are available there, including:
 
@@ -73,7 +91,7 @@ Useful RESTAlchemy utilities are available there, including:
 Apply migrations with:
 
 ```bash
-.tox/develop/bin/ra-apply-migration --config-file etc/workspace/workspace.conf --path migrations
+.tox/develop/bin/ra-apply-migration --config-file etc/workspace/workspace.local.conf --path migrations
 ```
 
 Use the `admin/admin` account for local manual checks when the environment

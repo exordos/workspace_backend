@@ -267,11 +267,15 @@ def test_file_upload_openapi_keeps_required_multipart_contract():
     assert set(request_body["content"]) == {"multipart/form-data"}
     schema = request_body["content"]["multipart/form-data"]["schema"]
     assert schema["type"] == "object"
-    assert schema["required"] == ["file", "stream_uuid"]
+    assert schema["required"] == ["file"]
     properties = schema["properties"]
     assert properties == {
         "file": {"format": "binary", "type": "string"},
         "stream_uuid": {"format": "uuid", "type": "string"},
+        "acl": {
+            "description": 'JSON ACL object. Use {"mode":"public"} for authenticated Workspace-wide access.',
+            "type": "string",
+        },
         "name": {"type": "string"},
         "description": {"type": "string"},
         "storage_type": {"enum": ["file", "s3"], "type": "string"},

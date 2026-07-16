@@ -284,6 +284,10 @@ def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
     assert metadata.acl_mode == "public"
     assert metadata.stream_uuid is None
     assert metadata.owner_uuid == sys_uuid.UUID(api.user_uuid)
+    metadata_path = tmp_path / file_storage.get_workspace_file_metadata_object_id(
+        file_uuid
+    )
+    assert metadata_path.exists()
 
     resp = api.get(
         f"{FILES}{file_uuid}",
@@ -311,12 +315,37 @@ def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
         file_uuid,
         storage_path=tmp_path,
     ).exists()
+    assert not metadata_path.exists()
     with db.cursor() as cur:
         cur.execute(
             "SELECT COUNT(*) FROM m_workspace_files WHERE uuid = %s",
             (file_uuid,),
         )
         assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE payload->>'kind' = 'file.deleted'
+                AND payload->>'uuid' = %s
+            ORDER BY user_uuid
+            """,
+            (file_uuid,),
+        )
+        event_rows = cur.fetchall()
+    assert {
+        str(api.user_uuid),
+        str(other_user_uuid),
+    }.issubset({str(row[0]) for row in event_rows})
+    assert all(
+        row[1]
+        == {
+            "kind": "file.deleted",
+            "uuid": file_uuid,
+            "stream_uuid": None,
+        }
+        for row in event_rows
+    )
 
 
 def test_avatar_actions_reject_another_user_uuid(api, db, tmp_path, monkeypatch):
@@ -877,6 +906,54 @@ def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch)
     assert not path.exists()
 
 
+def test_public_file_multipart_upload_is_visible_to_authenticated_user(
+    api, db, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    other_user_uuid = sys_uuid.uuid4()
+    other_project_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        other_user_uuid,
+        f"user-{other_user_uuid}",
+    )
+    data = b"public file data"
+
+    resp = api.post(
+        FILES,
+        data={"acl": '{"mode":"public"}'},
+        files={"file": ("public.txt", io.BytesIO(data), "text/plain")},
+    )
+    assert resp.status_code in (200, 201), resp.text
+    file = resp.json()
+    assert file.get("stream_uuid") is None
+
+    metadata = file_storage.read_workspace_file_metadata(file["uuid"])
+    assert metadata.acl_mode == "public"
+    assert metadata.stream_uuid is None
+
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM m_workspace_file_accesses WHERE file_uuid = %s",
+            (file["uuid"],),
+        )
+        assert cur.fetchone()[0] == 0
+
+    resp = api.get(
+        f"{FILES}{file['uuid']}",
+        user=other_user_uuid,
+        project=other_project_uuid,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = api.get(
+        f"{FILES}{file['uuid']}/actions/download",
+        user=other_user_uuid,
+        project=other_project_uuid,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == data
+
+
 # --------------------------------------------------------------------------- #
 # Folders: full write path through the real ORM
 # --------------------------------------------------------------------------- #
@@ -1217,7 +1294,7 @@ def test_folder_item_delete_writes_deleted_event(api, db):
         )
         rows = cur.fetchall()
 
-    assert len(rows) == 3
+    assert len(rows) == 4
     epoch_version, user_uuid, payload = rows[2]
     assert str(user_uuid) == str(api.user_uuid)
     assert payload == {
@@ -1235,6 +1312,12 @@ def test_folder_item_delete_writes_deleted_event(api, db):
     assert event["object_type"] == "folder_item"
     assert event["payload"]["kind"] == "folder_item.deleted"
     assert event["payload"] == payload
+
+    _, folder_user_uuid, folder_payload = rows[3]
+    assert str(folder_user_uuid) == str(api.user_uuid)
+    assert folder_payload["kind"] == "folder.updated"
+    assert folder_payload["uuid"] == folder["uuid"]
+    assert folder_payload["folder_items"] == []
 
 
 def test_folder_item_pin_unpin_actions_write_folder_updated_events(api, db):
@@ -1998,18 +2081,20 @@ def test_stream_binding_create_notifies_added_user(api, db):
         owner_events = [row[0] for row in cur.fetchall()]
 
     assert [event["kind"] for event in owner_events] == [
+        "file.created",
         "stream_bindings.created",
     ]
-    assert owner_events[0]["uuid"] == stream_uuid
-    assert [binding["user_uuid"] for binding in owner_events[0]["items"]] == [
+    binding_event = owner_events[1]
+    assert binding_event["uuid"] == stream_uuid
+    assert [binding["user_uuid"] for binding in binding_event["items"]] == [
         str(target_user_uuid),
         str(second_target_user_uuid),
     ]
-    assert {binding["who_uuid"] for binding in owner_events[0]["items"]} == {
+    assert {binding["who_uuid"] for binding in binding_event["items"]} == {
         str(api.user_uuid)
     }
-    assert {binding["role"] for binding in owner_events[0]["items"]} == {"member"}
-    assert {binding["notification_mode"] for binding in owner_events[0]["items"]} == {
+    assert {binding["role"] for binding in binding_event["items"]} == {"member"}
+    assert {binding["notification_mode"] for binding in binding_event["items"]} == {
         "all_messages"
     }
 
@@ -2132,6 +2217,7 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
 
     assert [str(row[0]) for row in event_rows] == [
         str(target_user_uuid),
+        str(api.user_uuid),
         str(target_user_uuid),
         str(target_user_uuid),
         str(target_user_uuid),
@@ -2139,17 +2225,24 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
     events = [row[1] for row in event_rows]
     assert [event["kind"] for event in events] == [
         "stream.deleted",
+        "stream_binding.deleted",
         "folder.updated",
         "folder.updated",
         "folder.updated",
     ]
     assert events[0]["uuid"] == stream_uuid
-    assert [(event["uuid"], event["title"]) for event in events[1:]] == [
+    assert events[1] == {
+        "kind": "stream_binding.deleted",
+        "uuid": str(binding_uuid),
+        "stream_uuid": stream_uuid,
+        "user_uuid": str(target_user_uuid),
+    }
+    assert [(event["uuid"], event["title"]) for event in events[2:]] == [
         ("00000000-0000-0000-0000-000000000000", "All chats"),
         ("00000000-0000-0000-0000-000000000002", "Channels"),
         (folder["uuid"], "Watched"),
     ]
-    for event in events[1:]:
+    for event in events[2:]:
         assert all(item["stream_uuid"] != stream_uuid for item in event["folder_items"])
 
 
@@ -2802,7 +2895,11 @@ def test_epoch_is_zero_without_visible_events(api, workspace_api):
     workspace_api.project_id = api.project_id
     resp = workspace_api.get(EPOCH)
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"epoch_version": 0}
+    cursor = resp.json()
+    assert cursor["epoch_version"] == 0
+    assert cursor["current_epoch_version"] == 0
+    assert cursor["minimum_epoch_version"] == 1
+    assert cursor["epoch_generation"]
 
 
 def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
@@ -3007,11 +3104,13 @@ def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
     ).json()
     assert outsider_events == []
 
+    epoch_generation = workspace_api.get(EPOCH).json()["epoch_generation"]
     next_page = workspace_api.get(
         EVENTS,
         params={
             "page_limit": 100,
             "page_marker": event["epoch_version"],
+            "epoch_generation": epoch_generation,
         },
     ).json()
     assert next_page == []
@@ -3888,12 +3987,14 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
     assert [event["payload"]["uuid"] for event in events] == message_uuids
     first_epoch = events[0]["epoch_version"]
     second_epoch = events[1]["epoch_version"]
+    epoch_generation = workspace_api.get(EPOCH).json()["epoch_generation"]
 
     after_resp = workspace_api.get(
         EVENTS,
         params=[
             ("page_limit", 100),
             ("epoch_version=>", first_epoch),
+            ("epoch_generation", epoch_generation),
         ],
     )
     assert after_resp.status_code == 200, after_resp.text
@@ -3907,6 +4008,7 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
         params=[
             ("page_limit", 100),
             ("epoch_version>", first_epoch),
+            ("epoch_generation", epoch_generation),
         ],
     )
     assert strict_after_resp.status_code == 200, strict_after_resp.text
@@ -3919,6 +4021,7 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
         params=[
             ("page_limit", 100),
             ("epoch_version=<", first_epoch),
+            ("epoch_generation", epoch_generation),
         ],
     )
     assert before_resp.status_code == 200, before_resp.text
@@ -3929,6 +4032,7 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
         params=[
             ("page_limit", 100),
             ("epoch_version<", second_epoch),
+            ("epoch_generation", epoch_generation),
         ],
     )
     assert strict_before_resp.status_code == 200, strict_before_resp.text
@@ -3942,6 +4046,7 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
             ("page_limit", 100),
             ("epoch_version=>", second_epoch),
             ("epoch_version=<", second_epoch),
+            ("epoch_generation", epoch_generation),
         ],
     )
     assert exact_resp.status_code == 200, exact_resp.text

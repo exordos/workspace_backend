@@ -21,8 +21,8 @@ unchanged.
   for messages and messenger metadata.
 - Deploy Exim4, Dovecot, and Maildir on a dedicated VM inside the Workspace
   element. Keep backend and UI services on their existing VM. IMAP and SMTP
-  use service credentials over the platform-internal network and are not
-  exposed to browsers or end users.
+  use service credentials over CA-verified STARTTLS on the platform-internal
+  network and are not exposed to browsers or end users.
 - Obtain users and authentication from Exordos Core IAM. Create technical
   mailboxes automatically for IAM users; users do not manage separate mail
   credentials.
@@ -61,11 +61,90 @@ image. Exim4 and Dovecot must be ready before the Messenger API and realtime
 services report readiness. DBaaS is secondary: an empty replacement database
 must be reconstructible by replaying the IMAP journal.
 
+The first mail bootstrap mounts the persistent data disk before creating a
+Workspace-owned CA and a leaf certificate whose only DNS SAN is
+`workspace-mail.<core_local_domain>`. The persistent TLS store is
+`<persistent-mount>/workspace-mail-pki/v1`. It contains the stable
+CA key and certificate, immutable versioned leaf directories, an atomic
+`current` symlink, and realm metadata. The metadata binds the store to the
+configured hostname and stable UUID of the dedicated Core password resource. A
+cloned disk, changed hostname or realm UUID, missing file, unsafe type,
+key/certificate mismatch, invalid CA constraints or chain, or partial generation
+fails closed instead of silently creating a new CA. For legitimate regular
+files and directories, bootstrap reasserts the required owner and mode before
+cryptographic validation, which supports safe backup restoration without
+accepting path/type substitution. Before creating or changing the store,
+bootstrap uses no-follow `lstat` checks on the root-owned persistent mount and
+its direct `workspace-mail-pki` child. A symlinked or non-directory parent or
+store, a group/world-writable parent, or a store on another filesystem is
+rejected without changing the referenced target. Only after those confinement
+checks may bootstrap create or normalize the store. The CA and private keys
+never enter the element manifest, Core config resources, image artifacts,
+backend node, or logs. Subsequent mail root-image replacements attach the same
+data disk, validate the complete store, and atomically recreate the
+`/etc/workspace/tls` runtime files.
+
+The backend cannot read guest files through the current element or config API.
+The mail node therefore serves only the public CA on its internal port 21085.
+It authenticates the exact response bytes with HMAC-SHA256 using the existing
+random `workspace_mail_ca_bootstrap_secret` and a protocol-specific
+`workspace-mail-ca-v1` context. This secret is independent from rotatable
+SMTP/IMAP credentials and is delivered in a separate config. Every request
+includes a fresh 256-bit nonce and the expected mail hostname; both values are
+covered by the HMAC together with the CA bytes, so a captured response cannot
+be replayed for a new request or another realm. The dedicated non-login
+`workspace-pki` user receives only that config, the public CA, and public realm
+metadata; it cannot traverse the persistent private-key directories. The
+credential is never sent to the CA endpoint. An unauthenticated, replayed,
+redirected, truncated, oversized, or modified response is rejected and backend
+readiness remains blocked. The single-request server has a bounded listen queue
+and per-connection timeout. The current element schema exposes no per-service
+source-address ACL, so the endpoint binds to the internal node network; it
+contains public material only, and response authenticity does not rely on
+network secrecy.
+
+The current universal-agent config renderer creates its destination before
+applying the resource mode and does not publish through an atomic temporary
+file. Both Workspace images therefore install a systemd drop-in for the actual
+`exordos-universal-agent.service` with `UMask=0077` before first config
+delivery, and validate the unit with `systemd-analyze verify`. Final resource
+modes remain explicit and restrictive. This image-level protection should be
+retained until Core provides an atomic, mode-safe config renderer.
+
+Dovecot and Exim require TLS before accepting PLAIN authentication. Backend
+SMTP and IMAP clients use the Core local DNS name and verify both the stable CA
+and hostname. Backend and mail root images can be updated independently after
+the first coordinated deployment because the mail trust root belongs to the
+persistent mail disk. Within 30 days of leaf expiry, bootstrap writes a complete
+new versioned leaf generation signed by the same CA and atomically changes the
+`current` symlink. Corrupt state is never treated as an expiry renewal.
+Superseded leaf directories are retained for seven days for rollback and then
+their private keys are pruned. The persistent TLS store is part of the mail
+data-disk backup scope and must be encrypted and access-controlled as CA key
+material; restoring Maildir without the matching TLS store is incomplete.
+Deliberate CA rotation is a separate maintenance operation and requires an
+overlapping trust rollout: distribute old and new public CAs to the backend,
+switch the mail leaf, verify all clients, then remove the old CA and key after
+the rollback window. Deleting the persistent TLS store is not a supported
+renewal procedure.
+
+The liveness healthcheck verifies SMTP and IMAP STARTTLS, service
+authentication, and protocol `NOOP`; it does not require an already-created
+technical mailbox. Mailbox usability is tested separately with the canonical
+`Workspace/State` and `Workspace/Events` paths. Bootstrap explicitly creates
+`/run/workspace` as `root:root` mode `0755` before the
+`workspace:workspace` mode `0750` Dovecot index directory. This avoids a
+restrictive agent umask creating an untraversable intermediate parent, which
+would make every mailbox selection fail with `NOPERM` and trigger repeated
+bootstrap service restarts.
+
 The mail root image has an independent manifest input. Backend-only releases
 pin `workspace_mail_image` to the currently deployed immutable mail image;
 releases that intentionally change the mail runtime omit that override and use
 the newly built `workspace-mail` image. The persistent data disk is unchanged
-in either case.
+in either case. The first release that introduces persistent PKI and the
+authenticated CA endpoint must update backend and mail together. Later releases
+may pin either compatible image independently.
 
 ### Staged migration from backend-local mail
 
@@ -79,6 +158,19 @@ exordos build . --force --output-dir build/mail-migration-stage1 \
   --manifest-var mail_migration_stage1=true \
   --manifest-var workspace_backend_image=urn:images:<CURRENT_LIVE_BACKEND_IMAGE_UUID>
 ```
+
+Stage 1 does not deliver the backend PKI bootstrap config and therefore does
+not wait for the new remote CA. Its pinned backend continues the existing local
+plain-mail readiness, bootstrap, and restart path while the remote mail node
+initializes independently.
+
+During final STARTTLS cutover, `workspace_backend_config` and the separate
+backend PKI config may be delivered in either order. If the STARTTLS workspace
+config arrives first, its on-change handler exits successfully without clearing
+readiness until both the PKI config and public CA are present. Delivery of the
+PKI config then performs authenticated CA synchronization and the full
+healthcheck/bootstrap/restart sequence. The stage-1 plain-mail config does not
+take this deferred path.
 
 In this mode the backend remains a `root` plus 20 GiB `data` multi-disk node,
 uses the pinned live root image, keeps the existing `workspace_backend_config`

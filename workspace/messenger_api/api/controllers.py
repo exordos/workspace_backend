@@ -5,7 +5,9 @@
 
 import datetime
 import hashlib
+import json
 import logging
+import typing
 import urllib.parse
 import uuid as sys_uuid
 
@@ -284,6 +286,30 @@ class WorkspaceFileController(StoreResourceController):
             f"attachment; filename=\"{quoted_name}\"; filename*=UTF-8''{encoded_name}"
         )
 
+    @classmethod
+    def _multipart_scope(
+        cls,
+        parts: typing.Mapping[str, typing.Any],
+    ) -> tuple[sys_uuid.UUID | None, str]:
+        stream_value = cls._optional_part(parts, "stream_uuid")
+        acl_value = cls._optional_part(parts, "acl")
+        if acl_value is None:
+            if stream_value is None:
+                raise ra_exc.ValidationErrorException()
+            try:
+                return sys_uuid.UUID(stream_value), "stream_members"
+            except (TypeError, ValueError) as exc:
+                raise ra_exc.ValidationErrorException() from exc
+        if stream_value is not None:
+            raise ra_exc.ValidationErrorException()
+        try:
+            acl = acl_value if isinstance(acl_value, dict) else json.loads(acl_value)
+        except (TypeError, ValueError) as exc:
+            raise ra_exc.ValidationErrorException() from exc
+        if acl != {"mode": "public"}:
+            raise ra_exc.ValidationErrorException()
+        return None, "public"
+
     def process_result(self, result, *args, **kwargs):
         if isinstance(result, webob.Response):
             return result
@@ -292,7 +318,7 @@ class WorkspaceFileController(StoreResourceController):
     def _create_from_multipart(self, parts):
         file_part = parts["file"]
         file_uuid = sys_uuid.uuid4()
-        stream_uuid = sys_uuid.UUID(self._multipart_value(parts["stream_uuid"]))
+        stream_uuid, acl_mode = self._multipart_scope(parts)
         name = self._optional_part(parts, "name", file_part.filename)
         description = self._optional_part(parts, "description", "")
         file_part.file.seek(0)
@@ -315,6 +341,7 @@ class WorkspaceFileController(StoreResourceController):
             size_bytes=len(data),
             sha256=sha256,
             created_at=datetime.datetime.now(datetime.timezone.utc),
+            acl_mode=acl_mode,
         )
         try:
             file_storage.save_workspace_file_metadata(
@@ -350,6 +377,8 @@ class WorkspaceFileController(StoreResourceController):
     def create(self, **kwargs):
         if kwargs.pop("multipart", False):
             return self._create_from_multipart(kwargs["parts"])
+        if kwargs.get("stream_uuid") is None:
+            raise ra_exc.ValidationErrorException()
         file_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
         storage_info = file_storage.get_workspace_file_storage_info(
             file_uuid=file_uuid,
@@ -409,11 +438,18 @@ WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
         properties={
             "file": {"format": "binary", "type": "string"},
             "stream_uuid": {"format": "uuid", "type": "string"},
+            "acl": {
+                "description": (
+                    'JSON ACL object. Use {"mode":"public"} for authenticated '
+                    "Workspace-wide access."
+                ),
+                "type": "string",
+            },
             "name": {"type": "string"},
             "description": {"type": "string"},
             "storage_type": {"enum": ["file", "s3"], "type": "string"},
         },
-        required=("file", "stream_uuid"),
+        required=("file",),
     ),
 )
 WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
