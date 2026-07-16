@@ -239,6 +239,45 @@ node and releases the legacy backend data disk while continuing to use
 deployment; follow the normal protected Workspace update, acceptance, backup,
 and data-preservation procedure separately.
 
+## Host Backup Contract
+
+An application-consistent host backup must resolve exactly one domain for each
+of these roles: Exordos Core, DBaaS control plane, MetaPaaS control plane,
+Workspace DBaaS data plane, Workspace S3aaS data plane, Workspace backend, and
+Workspace mail. It must fail closed when a role is missing or ambiguous and
+must reject explicitly protected domains.
+
+The coordinated snapshot contains these disk scopes:
+
+- the persistent `vdb` disk for each platform dependency;
+- the replaceable backend `vda` root disk;
+- both the mail VM `vda` root disk and its persistent Maildir `vdb` disk.
+
+The mail `vdb` snapshot includes the Workspace CA private key and current leaf
+private key. Backup transport and retention must therefore provide encryption
+and access controls suitable for signing keys. Restore validation must confirm
+the realm metadata, CA key/certificate match, current leaf chain and hostname,
+and file ownership/modes before mail services start.
+
+Before creating external snapshots, stop the backend universal agent and all
+Workspace API, messenger API, realtime, and worker services so reconciliation
+cannot restart writers. Drain the mail queue and stop Exim4 and Dovecot on the
+mail VM, then stop the DBaaS and S3aaS data services and their control-plane
+dependencies. After snapshot creation, start dependencies first, then mail,
+then the backend services and universal agent. Readiness checks must cover the
+backend APIs, the universal agent, Exim4, Dovecot, PostgreSQL, and S3 storage
+before writers are considered restored.
+
+The backup manifest must contain seven domain XML files, eight qcow disk
+entries, and one JSON manifest. After the repository write, commit every
+external overlay back to its base, remove snapshot metadata and overlays, and
+repeat the platform health checks.
+
+Retention selects snapshots by the stable backup tag and groups them by host
+only before applying `keep-last`. Do not include paths or the unique per-run tag
+in the grouping: root-image replacements change paths, and a unique run tag
+would otherwise put every snapshot into its own retention group.
+
 ## Identity And Mailbox Provisioning
 
 Each IAM project and user pair maps to a deterministic internal mailbox. The
