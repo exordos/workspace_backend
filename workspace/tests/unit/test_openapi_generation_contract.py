@@ -46,6 +46,47 @@ def _assert_multipart_object(operation, required):
     }
 
 
+def _assert_file_upload_contract(operation):
+    content = operation["requestBody"]["content"]
+    assert set(content) == {"application/json", "multipart/form-data"}
+    json_schema = content["application/json"]["schema"]
+    assert json_schema["required"] == [
+        "stream_uuid",
+        "name",
+        "content_type",
+        "size_bytes",
+        "hash",
+    ]
+    assert "storage_type" not in json_schema["properties"]
+    multipart_schema = content["multipart/form-data"]["schema"]
+    assert multipart_schema["required"] == ["file"]
+    assert multipart_schema["oneOf"] == [
+        {
+            "required": ["stream_uuid"],
+            "not": {"required": ["acl"]},
+        },
+        {
+            "required": ["acl"],
+            "not": {"required": ["stream_uuid"]},
+        },
+    ]
+    assert "storage_type" not in multipart_schema["properties"]
+
+
+def _assert_collection_pagination_contract(operation, marker_schema):
+    parameters = {
+        (parameter["in"], parameter["name"]): parameter
+        for parameter in operation["parameters"]
+    }
+    assert parameters[("query", "page_limit")]["schema"] == {
+        "type": "integer",
+        "minimum": 0,
+    }
+    assert parameters[("query", "page_marker")]["schema"] == marker_schema
+    headers = operation["responses"][200]["headers"]
+    assert headers["X-Pagination-Marker"]["schema"] == marker_schema
+
+
 def _build_openapi(app_module):
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
@@ -117,7 +158,11 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         "schema"
     ] == {"$ref": "#/components/schemas/WorkspaceUser_Get"}
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
-    _assert_multipart_object(paths["/v1/files/"]["post"], ["file"])
+    _assert_file_upload_contract(paths["/v1/files/"]["post"])
+    _assert_collection_pagination_contract(
+        paths["/v1/folders/"]["get"],
+        {"type": "string", "format": "uuid"},
+    )
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
@@ -151,11 +196,37 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "schema"
     ] == {"$ref": "#/components/schemas/WorkspaceUser_Get"}
     _assert_message_pagination_contract(paths["/v1/messenger/messages/"]["get"])
-    _assert_multipart_object(
-        paths["/v1/messenger/files/"]["post"],
-        ["file"],
+    _assert_file_upload_contract(paths["/v1/messenger/files/"]["post"])
+    _assert_collection_pagination_contract(
+        event_operation,
+        {"type": "integer", "minimum": 0},
     )
     avatar_upload_path = (
         "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"
     )
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
+
+    schemas = specification["components"]["schemas"]
+    raw_provider_fields = {
+        "provider_uuid",
+        "external_account_uuid",
+        "provider_external_id",
+    }
+    assert raw_provider_fields.isdisjoint(schemas["WorkspaceUser_Get"]["properties"])
+    assert raw_provider_fields.isdisjoint(
+        schemas["WorkspaceFile_Filter"]["properties"],
+    )
+    reaction_properties = schemas["WorkspaceMessageReactions_Filter"]["properties"]
+    assert raw_provider_fields.isdisjoint(reaction_properties)
+    assert {"provider", "delivery"} <= set(reaction_properties)
+    assert schemas["WorkspaceEvent_Filter"]["properties"]["object_type"]["enum"] == [
+        "file",
+        "folder",
+        "folder_item",
+        "message",
+        "message_reaction",
+        "stream",
+        "stream_binding",
+        "topic",
+        "user",
+    ]

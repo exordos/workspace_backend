@@ -133,7 +133,16 @@ WORKSPACE_STREAM_BINDING_FIELDS = tuple(
 )
 WORKSPACE_USER_TOPIC_FIELDS = tuple(models.WorkspaceUserTopic.properties.properties)
 WORKSPACE_USER_FOLDER_FIELDS = tuple(models.UserFolder.properties.properties)
-WORKSPACE_USER_FIELDS = tuple(models.WorkspaceUser.properties.properties)
+WORKSPACE_USER_FIELDS = tuple(
+    name
+    for name in models.WorkspaceUser.properties.properties
+    if name
+    not in {
+        "provider_uuid",
+        "external_account_uuid",
+        "provider_external_id",
+    }
+)
 WORKSPACE_FILE_EVENT_FIELDS = (
     "uuid",
     "project_id",

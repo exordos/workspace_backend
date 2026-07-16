@@ -180,6 +180,37 @@ def test_events_and_epoch_are_read_through_store_boundary(fake_store):
     ]
 
 
+def test_generic_pagination_only_marks_a_proven_next_page():
+    controller = _controller(controllers.FolderController)
+    controller._pagination_limit = 2
+    first = {"uuid": sys_uuid.uuid4()}
+    second = {"uuid": sys_uuid.uuid4()}
+    third = {"uuid": sys_uuid.uuid4()}
+
+    assert controller._paginate_result([first, second]) == [first, second]
+    assert controller._pagination_has_more is False
+    assert controller._paginate_result([first, second, third]) == [first, second]
+    assert controller._pagination_has_more is True
+
+
+def test_reaction_mutations_reject_internal_provider_projection_fields(fake_store):
+    controller = _controller(controllers.WorkspaceMessageReactionController)
+
+    with pytest.raises(Exception):
+        controller.create(
+            message_uuid=MESSAGE_UUID,
+            emoji_name="eyes",
+            provider_uuid=sys_uuid.uuid4(),
+        )
+    with pytest.raises(Exception):
+        controller.update(
+            sys_uuid.uuid4(),
+            delivery_status="pending",
+        )
+
+    assert fake_store.calls == []
+
+
 def test_external_accounts_are_not_part_of_messenger_routes():
     assert not hasattr(routes.ApiEndpointRoute, "external_accounts")
     assert not hasattr(routes, "ExternalAccountRoute")

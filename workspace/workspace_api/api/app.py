@@ -35,6 +35,7 @@ class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
                 "bearerFormat": "JWT",
             },
         }
+        specification = openapi_contract.add_public_projection_contract(specification)
         return openapi_contract.add_avatar_upload_schema(specification)
 
 
@@ -45,6 +46,9 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             for operation in path.values():
                 if isinstance(operation, dict) and "responses" in operation:
                     operation["security"] = [{"bearerAuth": []}]
+        specification = openapi_contract.add_collection_pagination_contract(
+            specification,
+        )
         specification = openapi_contract.add_message_pagination_contract(
             specification,
             "/v1/messenger/messages/",

@@ -83,7 +83,24 @@ def _as_dict(value, resource=None):
     result = _simple(value)
     if not isinstance(result, dict):
         raise TypeError("Messenger projection rows must serialize to dictionaries")
-    if resource in EXTENSION_RESOURCES:
+    if resource == "message_reactions":
+        delivery_status = result.pop("delivery_status", None)
+        delivery_error = result.pop("delivery_error", None)
+        delivery_updated_at = result.pop("delivery_updated_at", None)
+        result.pop("provider_uuid", None)
+        result.pop("external_account_uuid", None)
+        result.pop("provider_external_id", None)
+        result["provider"] = None
+        result["delivery"] = (
+            None
+            if delivery_status is None
+            else {
+                "status": delivery_status,
+                "safe_error": delivery_error,
+                "updated_at": delivery_updated_at,
+            }
+        )
+    elif resource in EXTENSION_RESOURCES:
         result.setdefault("provider", None)
         result.setdefault("delivery", None)
     return result

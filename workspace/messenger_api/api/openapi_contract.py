@@ -6,13 +6,15 @@
 import copy
 
 
+PAGINATION_LIMIT_PARAMETER = {
+    "name": "page_limit",
+    "in": "query",
+    "description": "Maximum resources returned in this page.",
+    "schema": {"type": "integer", "minimum": 0},
+}
+
 MESSAGE_PAGINATION_PARAMETERS = (
-    {
-        "name": "page_limit",
-        "in": "query",
-        "description": "Maximum messages returned in this page.",
-        "schema": {"type": "integer", "minimum": 0},
-    },
+    {**PAGINATION_LIMIT_PARAMETER, "description": "Maximum messages returned."},
     {
         "name": "page_marker",
         "in": "query",
@@ -45,6 +47,37 @@ MESSAGE_PAGINATION_HEADERS = {
             "UUID continuation marker. Present only when another message exists."
         ),
         "schema": {"type": "string", "format": "uuid"},
+    },
+}
+
+PROVIDER_SCHEMA = {
+    "type": "object",
+    "nullable": True,
+    "readOnly": True,
+    "required": ["uuid", "name", "kind"],
+    "properties": {
+        "uuid": {"type": "string", "format": "uuid"},
+        "name": {"type": "string"},
+        "kind": {"type": "string"},
+    },
+}
+
+DELIVERY_SCHEMA = {
+    "type": "object",
+    "nullable": True,
+    "readOnly": True,
+    "required": ["status", "safe_error", "updated_at"],
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["pending", "delivered", "failed"],
+        },
+        "safe_error": {"type": "string", "nullable": True},
+        "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": True,
+        },
     },
 }
 
@@ -103,6 +136,65 @@ def add_avatar_upload_schema(specification):
         "WorkspaceUser_AvatarUpload",
         copy.deepcopy(schemas["WorkspaceUser_Get"]),
     )
+    return specification
+
+
+def add_public_projection_contract(specification):
+    schemas = specification["components"]["schemas"]
+    for name, schema in schemas.items():
+        if not name.startswith("WorkspaceMessageReactions_"):
+            continue
+        properties = schema["properties"]
+        properties["provider"] = copy.deepcopy(PROVIDER_SCHEMA)
+        properties["delivery"] = copy.deepcopy(DELIVERY_SCHEMA)
+    return specification
+
+
+def _pagination_marker_schema(path):
+    if path.endswith("/events/"):
+        return {"type": "integer", "minimum": 0}
+    return {"type": "string", "format": "uuid"}
+
+
+def add_collection_pagination_contract(specification):
+    for path, path_item in specification["paths"].items():
+        operation = path_item.get("get")
+        if operation is None:
+            continue
+        response = operation.get("responses", {}).get(200, {})
+        schema = (
+            response.get("content", {})
+            .get("application/json", {})
+            .get("schema", {})
+        )
+        if schema.get("type") != "array":
+            continue
+        marker_schema = _pagination_marker_schema(path)
+        parameters = operation.setdefault("parameters", [])
+        existing = {(parameter["in"], parameter["name"]) for parameter in parameters}
+        for parameter in (
+            PAGINATION_LIMIT_PARAMETER,
+            {
+                "name": "page_marker",
+                "in": "query",
+                "description": "Last resource identifier from the previous page.",
+                "schema": marker_schema,
+            },
+        ):
+            if (parameter["in"], parameter["name"]) not in existing:
+                parameters.append(copy.deepcopy(parameter))
+        operation["responses"][200]["headers"] = {
+            "X-Pagination-Limit": {
+                "description": "Requested page limit.",
+                "schema": {"type": "integer"},
+            },
+            "X-Pagination-Marker": {
+                "description": (
+                    "Continuation marker. Present only when another resource exists."
+                ),
+                "schema": copy.deepcopy(marker_schema),
+            },
+        }
     return specification
 
 

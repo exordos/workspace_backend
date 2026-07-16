@@ -170,18 +170,24 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
             order_by = {self.model.get_id_property_name(): "asc"}
         return filters, order_by
 
+    def _paginate_result(self, result):
+        if not self._pagination_limit:
+            self._pagination_has_more = False
+            return result
+        probe = result[: self._pagination_limit + 1]
+        self._pagination_has_more = len(probe) > self._pagination_limit
+        return probe[: self._pagination_limit]
+
     def filter(self, filters, order_by=None):
         filters, order_by = self._store_query(filters, order_by)
         with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
             result = db.filter_resources(self.resource_name, filters, order_by)
-        if self._pagination_limit:
-            return result[: self._pagination_limit]
-        return result
+        return self._paginate_result(result)
 
     def _create_response(self, body, status, headers):
         if self._pagination_limit:
             headers[self._header_page_limit] = str(self._pagination_limit)
-            if len(body) == self._pagination_limit:
+            if getattr(self, "_pagination_has_more", False):
                 id_name = self.model.get_id_property_name()
                 marker = (
                     body[-1][id_name]
@@ -263,7 +269,14 @@ class WorkspaceFileController(StoreResourceController):
     resource_name = "files"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceFile,
-        hidden_fields=["project_id", "storage_id", "storage_object_id"],
+        hidden_fields=[
+            "project_id",
+            "provider_uuid",
+            "external_account_uuid",
+            "storage_type",
+            "storage_id",
+            "storage_object_id",
+        ],
         convert_underscore=False,
         process_filters=True,
     )
@@ -328,7 +341,6 @@ class WorkspaceFileController(StoreResourceController):
         storage_info = file_storage.save_workspace_file(
             file_uuid=file_uuid,
             data=data,
-            storage_type=self._optional_part(parts, "storage_type"),
         )
         metadata = file_storage.WorkspaceFileMetadata(
             uuid=file_uuid,
@@ -380,9 +392,11 @@ class WorkspaceFileController(StoreResourceController):
         if kwargs.get("stream_uuid") is None:
             raise ra_exc.ValidationErrorException()
         file_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
+        kwargs.pop("provider_uuid", None)
+        kwargs.pop("external_account_uuid", None)
+        kwargs.pop("storage_type", None)
         storage_info = file_storage.get_workspace_file_storage_info(
             file_uuid=file_uuid,
-            storage_type=kwargs.pop("storage_type", None),
         )
         kwargs.update(
             {
@@ -393,6 +407,12 @@ class WorkspaceFileController(StoreResourceController):
             }
         )
         return super().create(**kwargs)
+
+    def update(self, uuid, **kwargs):
+        kwargs.pop("provider_uuid", None)
+        kwargs.pop("external_account_uuid", None)
+        kwargs.pop("storage_type", None)
+        return super().update(uuid, **kwargs)
 
     def delete(self, uuid):
         with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
@@ -433,24 +453,65 @@ WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
     summary="Upload file",
     parameters=(),
     responses=oa_c.build_openapi_create_response("WorkspaceFile_Create"),
-    request_body=_build_openapi_multipart_request_body(
-        description="Upload workspace file",
-        properties={
-            "file": {"format": "binary", "type": "string"},
-            "stream_uuid": {"format": "uuid", "type": "string"},
-            "acl": {
-                "description": (
-                    'JSON ACL object. Use {"mode":"public"} for authenticated '
-                    "Workspace-wide access."
-                ),
-                "type": "string",
+    request_body={
+        "description": "Create file metadata or upload workspace file bytes",
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": [
+                        "stream_uuid",
+                        "name",
+                        "content_type",
+                        "size_bytes",
+                        "hash",
+                    ],
+                    "properties": {
+                        "stream_uuid": {"format": "uuid", "type": "string"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "content_type": {"type": "string"},
+                        "size_bytes": {"minimum": 0, "type": "integer"},
+                        "hash": {"type": "string"},
+                    },
+                },
             },
-            "name": {"type": "string"},
-            "description": {"type": "string"},
-            "storage_type": {"enum": ["file", "s3"], "type": "string"},
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["file"],
+                    "properties": {
+                        "file": {"format": "binary", "type": "string"},
+                        "stream_uuid": {"format": "uuid", "type": "string"},
+                        "acl": {
+                            "description": (
+                                'JSON ACL object. The only public form is '
+                                '{"mode":"public"}.'
+                            ),
+                            "pattern": (
+                                '^\\s*\\{\\s*"mode"\\s*:\\s*"public"'
+                                "\\s*\\}\\s*$"
+                            ),
+                            "type": "string",
+                        },
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "oneOf": [
+                        {
+                            "required": ["stream_uuid"],
+                            "not": {"required": ["acl"]},
+                        },
+                        {
+                            "required": ["acl"],
+                            "not": {"required": ["stream_uuid"]},
+                        },
+                    ],
+                },
+            },
         },
-        required=("file",),
-    ),
+    },
 )
 WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
     summary="Download file",
@@ -589,11 +650,35 @@ class WorkspaceMessageController(StoreResourceController):
 
 class WorkspaceMessageReactionController(StoreResourceController):
     resource_name = "message_reactions"
+    _internal_fields = {
+        "provider_uuid",
+        "external_account_uuid",
+        "provider_external_id",
+        "delivery_status",
+        "delivery_error",
+        "delivery_updated_at",
+        "provider",
+        "delivery",
+    }
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceMessageReactions,
+        hidden_fields=sorted(_internal_fields),
         convert_underscore=False,
         process_filters=True,
     )
+
+    @classmethod
+    def _reject_internal_fields(cls, values):
+        if cls._internal_fields.intersection(values):
+            raise ra_exc.ValidationErrorException()
+
+    def create(self, **kwargs):
+        self._reject_internal_fields(kwargs)
+        return super().create(**kwargs)
+
+    def update(self, uuid, **kwargs):
+        self._reject_internal_fields(kwargs)
+        return super().update(uuid, **kwargs)
 
 
 class WorkspaceEventController(StoreResourceController):
@@ -629,9 +714,7 @@ class WorkspaceEventController(StoreResourceController):
                     order_by,
                     epoch_generation=epoch_generation,
                 )
-        if self._pagination_limit:
-            return result[: self._pagination_limit]
-        return result
+        return self._paginate_result(result)
 
 
 class WorkspaceEpochController(StoreResourceController):
@@ -680,6 +763,11 @@ class WorkspaceUserController(StoreResourceController):
     resource_name = "users"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUser,
+        hidden_fields=[
+            "provider_uuid",
+            "external_account_uuid",
+            "provider_external_id",
+        ],
         convert_underscore=False,
         process_filters=True,
     )

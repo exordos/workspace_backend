@@ -404,6 +404,32 @@ def test_file_filter_is_delegated_with_current_scope(store_factory):
     assert operation[3] == {"uuid": "asc"}
 
 
+def test_reaction_projection_hides_raw_provider_fields_and_nests_delivery():
+    result = sql_store._as_dict(
+        {
+            "uuid": sys_uuid.uuid4(),
+            "provider_uuid": sys_uuid.uuid4(),
+            "external_account_uuid": sys_uuid.uuid4(),
+            "provider_external_id": "remote-reaction",
+            "delivery_status": "failed",
+            "delivery_error": "Retry later",
+            "delivery_updated_at": "2026-07-16T10:00:00Z",
+        },
+        "message_reactions",
+    )
+
+    assert result["provider"] is None
+    assert result["delivery"] == {
+        "status": "failed",
+        "safe_error": "Retry later",
+        "updated_at": "2026-07-16T10:00:00Z",
+    }
+    assert "provider_uuid" not in result
+    assert "external_account_uuid" not in result
+    assert "provider_external_id" not in result
+    assert "delivery_status" not in result
+
+
 class _FakeMailRepository:
     def __init__(self):
         self.projection = repository.Projection()
@@ -517,7 +543,7 @@ def test_file_create_uses_current_scope_and_storage_metadata(store_factory):
         controllers.file_storage,
         "get_workspace_file_storage_info",
         return_value=storage_info,
-    ):
+    ) as get_storage_info:
         controller.create(
             project_id=sys_uuid.uuid4(),
             user_uuid=sys_uuid.uuid4(),
@@ -526,14 +552,21 @@ def test_file_create_uses_current_scope_and_storage_metadata(store_factory):
             content_type="text/plain",
             size_bytes=12,
             hash="abc",
+            storage_type="s3",
+            provider_uuid=sys_uuid.uuid4(),
+            external_account_uuid=sys_uuid.uuid4(),
         )
 
+    get_storage_info.assert_called_once()
+    assert get_storage_info.call_args.kwargs.keys() == {"file_uuid"}
     assert opened_scopes == [(PROJECT_UUID, USER_UUID)]
     values = store.calls[0][2]
     assert values["project_id"] == PROJECT_UUID
     assert values["user_uuid"] == USER_UUID
     assert values["storage_type"] == "file"
     assert values["storage_object_id"] == "aa/file"
+    assert "provider_uuid" not in values
+    assert "external_account_uuid" not in values
 
 
 def test_file_json_create_still_requires_stream_uuid(store_factory):
@@ -585,7 +618,6 @@ def test_multipart_upload_builds_metadata_before_store_write(store_factory):
     save_file.assert_called_once_with(
         file_uuid=values["uuid"],
         data=data,
-        storage_type="s3",
     )
     assert values["stream_uuid"] == stream_uuid
     assert values["hash"] == hashlib.sha256(data).hexdigest()

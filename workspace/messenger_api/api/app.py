@@ -37,12 +37,16 @@ class MessengerApiApp(routes.RootRoute):
 class MessengerOpenApiComponents(openapi_structures.OpenApiComponents):
     def build(self, request):
         specification = super().build(request)
+        specification = openapi_contract.add_public_projection_contract(specification)
         return openapi_contract.add_avatar_upload_schema(specification)
 
 
 class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
     def build(self, request, components):
         specification = super().build(request, components)
+        specification = openapi_contract.add_collection_pagination_contract(
+            specification,
+        )
         specification = openapi_contract.add_message_pagination_contract(
             specification,
             "/v1/messages/",

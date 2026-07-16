@@ -264,21 +264,45 @@ def test_file_upload_openapi_keeps_required_multipart_contract():
     )
 
     assert request_body["required"] is True
-    assert set(request_body["content"]) == {"multipart/form-data"}
+    assert set(request_body["content"]) == {
+        "application/json",
+        "multipart/form-data",
+    }
+    json_schema = request_body["content"]["application/json"]["schema"]
+    assert json_schema["required"] == [
+        "stream_uuid",
+        "name",
+        "content_type",
+        "size_bytes",
+        "hash",
+    ]
+    assert "storage_type" not in json_schema["properties"]
     schema = request_body["content"]["multipart/form-data"]["schema"]
     assert schema["type"] == "object"
     assert schema["required"] == ["file"]
+    assert schema["oneOf"] == [
+        {
+            "required": ["stream_uuid"],
+            "not": {"required": ["acl"]},
+        },
+        {
+            "required": ["acl"],
+            "not": {"required": ["stream_uuid"]},
+        },
+    ]
     properties = schema["properties"]
     assert properties == {
         "file": {"format": "binary", "type": "string"},
         "stream_uuid": {"format": "uuid", "type": "string"},
         "acl": {
-            "description": 'JSON ACL object. Use {"mode":"public"} for authenticated Workspace-wide access.',
+            "description": (
+                'JSON ACL object. The only public form is {"mode":"public"}.'
+            ),
+            "pattern": '^\\s*\\{\\s*"mode"\\s*:\\s*"public"\\s*\\}\\s*$',
             "type": "string",
         },
         "name": {"type": "string"},
         "description": {"type": "string"},
-        "storage_type": {"enum": ["file", "s3"], "type": "string"},
     }
 
 

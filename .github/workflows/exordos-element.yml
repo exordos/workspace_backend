@@ -19,7 +19,7 @@ env:
   ARTIFACTS_PATH: output
   EXORDOS_CFG: exordos/exordos.yaml
   WORKSPACE_UI_REPOSITORY: https://github.com/exordos/workspace_ui.git
-  WORKSPACE_UI_REF: 183508d5dd90efa8ab3ccf24c9e5aaaf8fe50ef3
+  WORKSPACE_UI_REF: c421c408d1f97dea2852fe15f25927c79cc07ce6
 
 jobs:
   build:

@@ -231,6 +231,7 @@ authoritative snapshots before starting a new cursor.
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/api/workspace/v1/` | List routes below `/api/workspace/v1/`. |
+| `GET` | `/api/workspace/v1/messenger/` | List Messenger routes below `/api/workspace/v1/messenger/`. |
 | `GET` | `/api/workspace/v1/messenger/server_settings` | Return Zulip-like server settings. |
 | `GET` | `/api/workspace/v1/messenger/server_settings/` | Same as above; trailing slash is supported. |
 | `GET` | `/api/workspace/v1/messenger/folders/` | List folders for the current IAM user. |
@@ -286,6 +287,7 @@ authoritative snapshots before starting a new cursor.
 | `DELETE` | `/api/workspace/v1/messenger/files/{file_uuid}` | Delete an owned file and its access rows. |
 | `GET` | `/api/workspace/v1/messenger/files/{file_uuid}/actions/download` | Download visible file bytes. |
 | `GET` | `/api/workspace/v1/services/` | List available Workspace services. |
+| `GET` | `/api/workspace/v1/services/{service_uuid}` | Get one available Workspace service. |
 | `GET` | `/api/workspace/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/api/workspace/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/api/workspace/v1/users/` | List workspace users. |
@@ -1029,7 +1031,8 @@ Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
 
 File bytes and a separate JSON sidecar are stored through the configured
 messenger file storage backend. S3 is the deployed backend; the local backend
-implements the same layout for tests. PostgreSQL rows and
+implements the same layout for tests. The backend is selected by server
+configuration and cannot be chosen by a browser request. PostgreSQL rows and
 `m_workspace_file_accesses` are rebuildable projections only.
 
 The sidecar contains the file UUID, project UUID, owner UUID, display metadata,
@@ -1270,6 +1273,12 @@ alias of `current_epoch_version`:
 }
 ```
 
+For a newly created empty event mailbox, `epoch_version` and
+`current_epoch_version` are `0`, `minimum_epoch_version` is `1`, and
+`epoch_generation` is still a non-empty mailbox generation. A cold
+`GET /api/workspace/v1/events/?epoch_version%3E=0` returns an empty list rather
+than a cursor-gap error.
+
 Clients persist `epoch_generation` together with `epoch_version`. A resume
 cursor above zero without a generation, a changed generation, a future epoch,
 or an epoch older than the retained suffix returns HTTP `410` with
@@ -1290,6 +1299,13 @@ token. The client does not send or derive a user UUID for this request. The
 backend takes `project_id` from IAM introspection, refreshes the IAM-owned
 username, first name, last name, and email projection, and returns the local
 Workspace status, avatar, and presence fields.
+
+IAM identities are projected lazily. Calling `/me/` or requesting the current
+user through `/users/{user_uuid}` creates or refreshes that user's Workspace
+projection; listing `/users/` does not eagerly import every IAM account. A
+`GET /users/{other_user_uuid}` lookup is projection-only: it does not import
+that IAM identity and returns not found until the other user has been
+materialized by their own authenticated Workspace activity.
 
 When the current IAM user requests their own UUID, the API materializes or
 refreshes the IAM identity projection before returning it. The browser cannot

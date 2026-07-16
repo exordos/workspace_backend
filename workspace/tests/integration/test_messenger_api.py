@@ -885,7 +885,7 @@ def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch)
     )
     assert path.read_bytes() == data
     assert file["name"] == "upload.txt"
-    assert file["storage_type"] == "file"
+    assert "storage_type" not in file
     assert "storage_id" not in file
     assert "storage_object_id" not in file
     resp = api.get(f"{FILES}{file['uuid']}/actions/download")

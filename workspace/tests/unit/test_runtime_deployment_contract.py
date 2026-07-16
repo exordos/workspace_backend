@@ -1565,7 +1565,7 @@ def test_element_workflow_checks_out_compatible_ui_and_publishes():
     workflow = _read(".github/workflows/exordos-element.yml")
 
     assert (
-        "WORKSPACE_UI_REF: 183508d5dd90efa8ab3ccf24c9e5aaaf8fe50ef3"
+        "WORKSPACE_UI_REF: c421c408d1f97dea2852fe15f25927c79cc07ce6"
         in workflow
     )
     assert 'ui_dir="${GITHUB_WORKSPACE}/../workspace_ui"' in workflow
