@@ -15,12 +15,44 @@
 #    under the License.
 
 import io
+import datetime
 import types
 import uuid as sys_uuid
 from unittest import mock
 
 from workspace.common import file_storage_opts
 from workspace.messenger_api import file_storage
+
+
+def _metadata(file_uuid):
+    return file_storage.WorkspaceFileMetadata(
+        uuid=file_uuid,
+        project_id=sys_uuid.uuid4(),
+        stream_uuid=sys_uuid.uuid4(),
+        owner_uuid=sys_uuid.uuid4(),
+        name="diagram.png",
+        description="Диаграмма",
+        content_type="image/png",
+        size_bytes=7,
+        sha256="a" * 64,
+        created_at=datetime.datetime(2026, 7, 15, tzinfo=datetime.timezone.utc),
+    )
+
+
+def _public_metadata(file_uuid):
+    return file_storage.WorkspaceFileMetadata(
+        uuid=file_uuid,
+        project_id=sys_uuid.uuid4(),
+        stream_uuid=None,
+        owner_uuid=sys_uuid.uuid4(),
+        name="avatar.png",
+        description="Workspace user avatar",
+        content_type="image/png",
+        size_bytes=8,
+        sha256="b" * 64,
+        created_at=datetime.datetime(2026, 7, 15, tzinfo=datetime.timezone.utc),
+        acl_mode="public",
+    )
 
 
 def _patch_conf(monkeypatch, tmp_path, default_type="file"):
@@ -55,11 +87,14 @@ def test_local_storage_saves_reads_and_deletes_file(tmp_path, monkeypatch):
     assert storage_info.storage_object_id == (
         file_storage.get_workspace_file_object_id(file_uuid)
     )
-    assert file_storage.read_workspace_file(
-        file_uuid=file_uuid,
-        storage_type=storage_info.storage_type,
-        storage_object_id=storage_info.storage_object_id,
-    ) == data
+    assert (
+        file_storage.read_workspace_file(
+            file_uuid=file_uuid,
+            storage_type=storage_info.storage_type,
+            storage_object_id=storage_info.storage_object_id,
+        )
+        == data
+    )
 
     path = file_storage.get_workspace_file_path(file_uuid=file_uuid)
     assert path.read_bytes() == data
@@ -70,6 +105,40 @@ def test_local_storage_saves_reads_and_deletes_file(tmp_path, monkeypatch):
         storage_object_id=storage_info.storage_object_id,
     )
     assert not path.exists()
+
+
+def test_local_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    metadata = _metadata(file_uuid)
+
+    file_storage.save_workspace_file_metadata(metadata)
+
+    assert file_storage.read_workspace_file_metadata(file_uuid) == metadata
+    metadata_path = tmp_path / file_storage.get_workspace_file_metadata_object_id(
+        file_uuid,
+    )
+    assert b'"mode":"stream_members"' in metadata_path.read_bytes()
+
+    file_storage.delete_workspace_file_metadata(file_uuid)
+    assert not metadata_path.exists()
+
+
+def test_public_file_metadata_has_no_stream_uuid(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    metadata = _public_metadata(file_uuid)
+
+    file_storage.save_workspace_file_metadata(metadata)
+
+    assert file_storage.read_workspace_file_metadata(file_uuid) == metadata
+    metadata_path = tmp_path / file_storage.get_workspace_file_metadata_object_id(
+        file_uuid,
+    )
+    payload = metadata_path.read_bytes()
+    assert b'"mode":"public"' in payload
+    assert b'"owner_uuid"' in payload
+    assert b'"stream_uuid"' not in payload
 
 
 def test_default_storage_type_selects_s3(tmp_path, monkeypatch):
@@ -134,4 +203,34 @@ def test_s3_storage_uses_configured_bucket_and_key(tmp_path, monkeypatch):
     client.delete_object.assert_called_once_with(
         Bucket="workspace-files",
         Key=storage_info.storage_object_id,
+    )
+
+
+def test_s3_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    metadata = _metadata(file_uuid)
+    client = mock.Mock()
+    client.get_object.return_value = {"Body": io.BytesIO(metadata.to_json())}
+    storage = file_storage.S3WorkspaceFileStorage()
+    storage._client = client
+
+    storage.save_metadata(file_uuid, metadata)
+    assert storage.read_metadata(file_uuid) == metadata
+    storage.delete_metadata(file_uuid)
+
+    object_id = file_storage.get_workspace_file_metadata_object_id(file_uuid)
+    client.put_object.assert_called_once_with(
+        Body=metadata.to_json(),
+        Bucket="workspace-files",
+        ContentType="application/json",
+        Key=object_id,
+    )
+    client.get_object.assert_called_once_with(
+        Bucket="workspace-files",
+        Key=object_id,
+    )
+    client.delete_object.assert_called_once_with(
+        Bucket="workspace-files",
+        Key=object_id,
     )

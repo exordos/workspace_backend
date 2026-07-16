@@ -14,6 +14,7 @@ from restalchemy.openapi import structures as openapi_structures
 from workspace import version as app_version
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
+from workspace.messenger_api.api import openapi_contract
 from workspace.workspace_api.api import routes as app_routes
 
 
@@ -34,7 +35,7 @@ class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
                 "bearerFormat": "JWT",
             },
         }
-        return specification
+        return openapi_contract.add_avatar_upload_schema(specification)
 
 
 class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
@@ -44,7 +45,19 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             for operation in path.values():
                 if isinstance(operation, dict) and "responses" in operation:
                     operation["security"] = [{"bearerAuth": []}]
-        return specification
+        specification = openapi_contract.add_message_pagination_contract(
+            specification,
+            "/v1/messenger/messages/",
+        )
+        specification = openapi_contract.add_events_cursor_contract(
+            specification,
+            "/v1/events/",
+            "/v1/epoch/",
+        )
+        return openapi_contract.add_current_user_contract(
+            specification,
+            "/v1/me/",
+        )
 
 
 def get_api_application():
@@ -76,7 +89,7 @@ def build_wsgi_application(iam_engine_driver):
                 context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
-            iam_mw.ErrorsHandlerMiddleware,
+            app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],
     )

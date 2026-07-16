@@ -25,7 +25,6 @@ WORKSPACE_CONFIG="$GC_CFG_DIR/workspace.conf"
 RUN_DIR="/run/workspace"
 READY_FILE="$RUN_DIR/bootstrap.ready"
 LOCK_FILE="$RUN_DIR/bootstrap.lock"
-WORKSPACE_DATA_DIR="/var/lib/workspace"
 
 
 mkdir -p "$GC_CFG_DIR" "$RUN_DIR"
@@ -33,12 +32,20 @@ mkdir -p "$GC_CFG_DIR" "$RUN_DIR"
 exec 9>"$LOCK_FILE"
 flock -x 9
 
-while [ ! -s "$WORKSPACE_CONFIG" ]; do
-    echo "Waiting for workspace platform configs..."
-    sleep 1
-done
+if [ ! -s "$WORKSPACE_CONFIG" ]; then
+    echo "Workspace platform config is not available; deferring bootstrap."
+    exit 0
+fi
 
-mkdir -p "$WORKSPACE_DATA_DIR/messenger/files"
+mkdir -p /var/lib/workspace/messenger/files
+
+TRACE_ENABLED=0
+case "$-" in
+    *x*)
+        TRACE_ENABLED=1
+        set +x
+        ;;
+esac
 
 eval "$(
     python3 - "$WORKSPACE_CONFIG" <<'PY'
@@ -50,7 +57,6 @@ import urllib.parse
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
 url = urllib.parse.urlsplit(config["db"]["connection_url"])
-
 values = {
     "WORKSPACE_PG_ENDPOINT": url.hostname or "localhost",
     "WORKSPACE_PG_PORT": str(url.port or 5432),
@@ -63,32 +69,27 @@ for key, value in values.items():
 PY
 )"
 
-wait_for_db() {
-    local attempt=1
-
-    echo "Waiting for workspace database..."
-    while true; do
-        if PGPASSWORD="$WORKSPACE_PG_PASS" psql \
-            -h "$WORKSPACE_PG_ENDPOINT" \
-            -p "$WORKSPACE_PG_PORT" \
-            -U "$WORKSPACE_PG_USER" \
-            -d "$WORKSPACE_PG_DB" \
-            -c "SELECT 1;" >/dev/null 2>&1; then
-            echo "Database is available after $attempt attempts"
-            return 0
-        fi
-
-        echo "Attempt $attempt: database is not ready, waiting 5 seconds..."
-        sleep 5
-        attempt=$((attempt + 1))
-    done
-}
-
-wait_for_db
+attempt=1
+until PGPASSWORD="$WORKSPACE_PG_PASS" psql \
+    -h "$WORKSPACE_PG_ENDPOINT" \
+    -p "$WORKSPACE_PG_PORT" \
+    -U "$WORKSPACE_PG_USER" \
+    -d "$WORKSPACE_PG_DB" \
+    -c "SELECT 1;" >/dev/null 2>&1; do
+    echo "Projection database attempt $attempt is not ready; waiting 5 seconds"
+    sleep 5
+    attempt=$((attempt + 1))
+done
 
 source "$GC_PATH/.venv/bin/activate"
 ra-apply-migration --config-dir "$GC_CFG_DIR" --path "$GC_PATH/migrations"
 deactivate
+unset WORKSPACE_PG_PASS
+
+if [[ "$TRACE_ENABLED" -eq 1 ]]; then
+    set -x
+fi
+unset TRACE_ENABLED
 
 touch "$READY_FILE"
 

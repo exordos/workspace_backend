@@ -23,6 +23,7 @@ from restalchemy.storage.sql import engines
 
 from workspace.common import config
 from workspace.common import log as infra_log
+from workspace.messenger_mail import runtime as messenger_mail_runtime
 from workspace.services.messenger_workers import agents
 
 DOMAIN = "messenger_worker_agent"
@@ -30,6 +31,7 @@ DOMAIN = "messenger_worker_agent"
 
 CONF = cfg.CONF
 ra_config_opts.register_posgresql_db_opts(CONF)
+messenger_mail_runtime.register_opts(CONF)
 
 
 def main():
@@ -40,6 +42,7 @@ def main():
 
     service = agents.MessengerWorkerAgent(
         iter_min_period=3,
+        runtime_factory=messenger_mail_runtime.RuntimeFactory(CONF),
     )
 
     service.add_setup(

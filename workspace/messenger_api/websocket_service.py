@@ -27,6 +27,7 @@ from gcl_iam import engines as iam_engines
 from gcl_iam import tokens as iam_tokens
 
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import websocket_protocol
 
 
@@ -62,11 +63,20 @@ class MessengerEventsAuthenticator:
 
 
 class ClientConnection:
-    def __init__(self, websocket, project_id, user_uuid, last_epoch_version):
+    def __init__(
+        self,
+        websocket,
+        project_id,
+        user_uuid,
+        last_epoch_version,
+        epoch_generation=None,
+    ):
         self.websocket = websocket
         self.project_id = project_id
         self.user_uuid = user_uuid
         self.last_epoch_version = last_epoch_version
+        self.epoch_generation = epoch_generation
+        self.ready = False
         self.send_lock = asyncio.Lock()
 
 
@@ -134,6 +144,7 @@ class MessengerEventsWebsocketServer:
                 token,
             )
             last_epoch_version = websocket_protocol.parse_last_epoch_version(path)
+            epoch_generation = websocket_protocol.parse_epoch_generation(path)
         except WebsocketAuthError:
             await websocket.close(code=4401, reason="Unauthorized")
             return
@@ -147,10 +158,13 @@ class MessengerEventsWebsocketServer:
             project_id=project_id,
             user_uuid=user_uuid,
             last_epoch_version=last_epoch_version,
+            epoch_generation=epoch_generation,
         )
         self._add_connection(connection)
         try:
-            await self._catch_up(connection)
+            if not await self._catch_up_until_current(connection):
+                return
+            await self._send_ready(connection)
             await self._consume_client_frames(connection)
         finally:
             self._remove_connection(connection)
@@ -186,39 +200,83 @@ class MessengerEventsWebsocketServer:
         )
 
     async def _catch_up(self, connection):
-        events = await asyncio.to_thread(
-            messenger_events.get_events_after,
-            project_id=connection.project_id,
-            user_uuid=connection.user_uuid,
-            after_epoch_version=connection.last_epoch_version,
-            limit=self._catchup_limit,
-        )
+        try:
+            events = await asyncio.to_thread(
+                messenger_events.get_events_after,
+                project_id=connection.project_id,
+                user_uuid=connection.user_uuid,
+                after_epoch_version=connection.last_epoch_version,
+                limit=self._catchup_limit,
+                epoch_generation=connection.epoch_generation,
+            )
+        except messenger_exceptions.EventsCursorExpiredError as error:
+            await self._send_json(connection, error.as_dict())
+            await connection.websocket.close(code=4410, reason="epoch_pruned")
+            return False
         for event in events:
             await self._send_event(connection, event)
+        return len(events)
+
+    async def _catch_up_until_current(self, connection):
+        if (
+            connection.last_epoch_version == 0
+            and connection.epoch_generation is None
+        ):
+            cursor = await asyncio.to_thread(
+                messenger_events.get_event_cursor,
+                project_id=connection.project_id,
+                user_uuid=connection.user_uuid,
+            )
+            connection.epoch_generation = cursor["epoch_generation"]
+        while True:
+            count = await self._catch_up(connection)
+            if count is False:
+                return False
+            if count < self._catchup_limit:
+                return True
+
+    async def _send_ready(self, connection):
+        cursor = await asyncio.to_thread(
+            messenger_events.get_event_cursor,
+            project_id=connection.project_id,
+            user_uuid=connection.user_uuid,
+        )
+        if cursor["epoch_generation"] != connection.epoch_generation:
+            error = messenger_exceptions.EventsCursorExpiredError(
+                reason="epoch_generation_changed",
+                epoch_generation=cursor["epoch_generation"],
+                current_epoch_version=cursor["current_epoch_version"],
+                minimum_epoch_version=cursor["minimum_epoch_version"],
+            )
+            await self._send_json(connection, error.as_dict())
+            await connection.websocket.close(code=4410, reason="epoch_pruned")
+            return False
+        payload = {
+            "type": "ready",
+            "epoch_generation": cursor["epoch_generation"],
+            "epoch_version": connection.last_epoch_version,
+        }
+        async with connection.send_lock:
+            await asyncio.wait_for(
+                connection.websocket.send(_json_dumps(payload)),
+                timeout=self._client_timeout,
+            )
+            connection.epoch_generation = cursor["epoch_generation"]
+            connection.ready = True
+        return True
 
     async def _broadcast_epoch(self, epoch_version):
+        del epoch_version
+        # PostgreSQL epochs only wake the service; event cursors are per-user
+        # Maildir UIDs and cannot be addressed by the global outbox sequence.
         tasks = []
         for bucket in list(self._connections.values()):
             for connection in list(bucket):
-                if epoch_version <= connection.last_epoch_version:
+                if not connection.ready:
                     continue
-                tasks.append(self._send_epoch_if_visible(connection, epoch_version))
+                tasks.append(self._catch_up(connection))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _send_epoch_if_visible(self, connection, epoch_version):
-        try:
-            event = await asyncio.to_thread(
-                messenger_events.get_event_for_user,
-                project_id=connection.project_id,
-                user_uuid=connection.user_uuid,
-                epoch_version=epoch_version,
-            )
-            if event is not None:
-                await self._send_event(connection, event)
-        except Exception:
-            LOG.exception("Failed to send workspace event")
-            await connection.websocket.close(code=1011, reason="Event delivery failed")
 
     async def _consume_client_frames(self, connection):
         async for _raw_frame in connection.websocket:
@@ -231,6 +289,7 @@ class MessengerEventsWebsocketServer:
                 self._catch_up(connection)
                 for bucket in list(self._connections.values())
                 for connection in list(bucket)
+                if connection.ready
             ]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)

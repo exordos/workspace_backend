@@ -1,21 +1,11 @@
-#    Copyright 2026 Genesis Corporation.
+# Copyright 2026 Genesis Corporation.
 #
-#    All Rights Reserved.
-#
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
-#
-#         http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
 
 import datetime
 import hashlib
+import logging
 import urllib.parse
 import uuid as sys_uuid
 
@@ -30,26 +20,81 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
-from workspace.common import urns
-from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import versions
-from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import models
-from workspace.provider_api import commands as provider_commands
-from workspace.provider_api import payloads as provider_payloads
-from workspace.provider_api.dm import models as provider_models
+from workspace.messenger_mail import repository as mail_repository
+
+
+LOG = logging.getLogger(__name__)
+MAX_AVATAR_SIZE_BYTES = 25 * 1024 * 1024
+AVATAR_CONTENT_TYPES = {
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+
+def _normalize_avatar_content_type(value):
+    value = value.lower()
+    return "image/jpeg" if value == "image/jpg" else value
+
+
+def _valid_avatar_bytes(content_type, data):
+    signatures = {
+        "image/gif": (b"GIF87a", b"GIF89a"),
+        "image/jpeg": (b"\xff\xd8\xff",),
+        "image/png": (b"\x89PNG\r\n\x1a\n",),
+    }
+    if content_type == "image/webp":
+        return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+    return any(data.startswith(prefix) for prefix in signatures[content_type])
+
+
+def _build_openapi_multipart_request_body(*, description, properties, required):
+    request_body = oa_c.build_openapi_req_body_multipart(
+        description=description,
+        properties=properties,
+    )
+    schema = request_body["content"]["multipart/form-data"]["schema"]
+    schema["type"] = "object"
+    schema["required"] = list(required)
+    return request_body
 
 
 class ApiEndpointController(ra_controllers.RoutesListController):
-    """Controller for /v1/ endpoint."""
-
     __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/"
 
 
-class WorkspaceBaseResourceControllerPaginated(
-    ra_controllers.BaseResourceControllerPaginated,
-):
+class ContractJSONPacker(ra_packers.JSONPacker):
+    """Apply resource visibility to dictionaries returned by the mail store."""
+
+    def pack_resource(self, obj):
+        if not isinstance(obj, dict) or self._rt is None:
+            return super().pack_resource(obj)
+        result = {}
+        for name, field in self._rt.get_fields_by_request(self._req):
+            if (
+                field.is_public()
+                and not self._rt._fields_permissions.is_hidden(name, self._req)
+                and name in obj
+            ):
+                result[field.api_name] = obj[name]
+        for extension_name in ("provider", "delivery"):
+            if extension_name in obj:
+                result[extension_name] = obj[extension_name]
+        return result
+
+
+class ContractMultipartPacker(ra_packers.MultipartPacker):
+    pack_resource = ContractJSONPacker.pack_resource
+
+
+class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
+    __generate_location_for__ = ()
+    resource_name = ""
     _filter_operator_suffixes = (
         ("=>", dm_filters.GE),
         ("=<", dm_filters.LE),
@@ -61,11 +106,30 @@ class WorkspaceBaseResourceControllerPaginated(
         return self.get_context().user_uuid
 
     def _get_project_id(self):
-        ctx = self.get_context()
-        project_id = getattr(ctx, "project_id", None) if ctx is not None else None
+        context = self.get_context()
+        project_id = getattr(context, "project_id", None)
         if project_id is None:
             raise ra_exc.ValidationErrorException()
         return project_id
+
+    def get_packer(self, content_type, resource_type=None):
+        packer = (
+            ContractMultipartPacker
+            if "multipart/form-data" in content_type
+            else ContractJSONPacker
+        )
+        return packer(resource_type or self.get_resource(), request=self.request)
+
+    def _values(self, values):
+        result = values.copy()
+        result["project_id"] = self._get_project_id()
+        result["user_uuid"] = self._get_user_uuid()
+        result.setdefault("uuid", sys_uuid.uuid4())
+        result.setdefault("source_name", "native")
+        result.setdefault("source", {"kind": "native"})
+        result.setdefault("provider", None)
+        result.setdefault("delivery", None)
+        return result
 
     @classmethod
     def _split_filter_operator(cls, name):
@@ -75,40 +139,97 @@ class WorkspaceBaseResourceControllerPaginated(
         return name, None
 
     def _prepare_filters(self, params):
-        self._conditional_filters = []
-        cleaned_params = []
+        regular = []
+        conditional = {}
         for name, value in params.items():
             field_name, operator = self._split_filter_operator(name)
             if operator is None:
-                cleaned_params.append((name, value))
+                regular.append((name, value))
                 continue
             field_name, field_value = self._prepare_filter(field_name, value)
-            self._conditional_filters.append({field_name: operator(field_value)})
-        return super()._prepare_filters(multidict.MultiDict(cleaned_params))
+            clause = operator(field_value)
+            if field_name in conditional:
+                conditional[field_name] = dm_filters.AND(
+                    conditional[field_name],
+                    clause,
+                )
+            else:
+                conditional[field_name] = clause
+        result = super()._prepare_filters(multidict.MultiDict(regular))
+        result.update(conditional)
+        return result
 
-    def _apply_autofilters(self, filters):
-        filters = super()._apply_autofilters(filters)
-        conditional_filters = getattr(self, "_conditional_filters", [])
-        if conditional_filters:
-            return dm_filters.AND(filters, *conditional_filters)
-        return filters
+    def _store_query(self, filters, order_by):
+        filters = filters.copy()
+        marker = getattr(self, "_pagination_marker", None)
+        if marker is not None:
+            filters[self.model.get_id_property_name()] = dm_filters.GT(marker)
+        if order_by is None:
+            order_by = {self.model.get_id_property_name(): "asc"}
+        return filters, order_by
 
-    def get_autofilters(self):
-        return {
-            "project_id": dm_filters.EQ(self._get_project_id()),
-            "user_uuid": dm_filters.EQ(self._get_user_uuid()),
-        }
+    def filter(self, filters, order_by=None):
+        filters, order_by = self._store_query(filters, order_by)
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            result = db.filter_resources(self.resource_name, filters, order_by)
+        if self._pagination_limit:
+            return result[: self._pagination_limit]
+        return result
 
-    def get_autovalues(self):
-        return {
-            "project_id": self._get_project_id(),
-            "user_uuid": self._get_user_uuid(),
-        }
+    def _create_response(self, body, status, headers):
+        if self._pagination_limit:
+            headers[self._header_page_limit] = str(self._pagination_limit)
+            if len(body) == self._pagination_limit:
+                id_name = self.model.get_id_property_name()
+                marker = (
+                    body[-1][id_name]
+                    if isinstance(body[-1], dict)
+                    else getattr(body[-1], id_name)
+                )
+                headers[self._header_page_marker] = str(marker)
+        return ra_controllers.Controller._create_response(
+            self,
+            body,
+            status,
+            headers,
+        )
+
+    def get(self, uuid, **kwargs):
+        del kwargs
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.get_resource(self.resource_name, uuid)
+
+    def create(self, **kwargs):
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.create_resource(self.resource_name, self._values(kwargs))
+
+    def update(self, uuid, **kwargs):
+        values = kwargs.copy()
+        values.pop("project_id", None)
+        values.pop("user_uuid", None)
+        values.pop("uuid", None)
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.update_resource(self.resource_name, uuid, values)
+
+    def delete(self, uuid):
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.delete_resource(self.resource_name, uuid)
+
+    def _action(self, resource, action, values=None):
+        resource_uuid = (
+            resource["uuid"] if isinstance(resource, dict) else resource.uuid
+        )
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.perform_action(
+                self.resource_name,
+                resource_uuid,
+                action,
+                values or {},
+            )
 
 
-class FolderController(
-    WorkspaceBaseResourceControllerPaginated,
-):
+class FolderController(StoreResourceController):
+    resource_name = "folders"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.UserFolder,
         hidden_fields=["project_id", "user_uuid"],
@@ -116,84 +237,28 @@ class FolderController(
         process_filters=True,
     )
 
-    def create(self, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.create_workspace_user_folder(
-            project_id=values.pop("project_id", self._get_project_id()),
-            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
-            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
-            **values,
-        )
 
-    def update(self, uuid, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.update_workspace_user_folder(
-            project_id=values.pop("project_id", self._get_project_id()),
-            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
-            folder_uuid=uuid,
-            **values,
-        )
-
-    def delete(self, uuid):
-        return messenger_dm_helpers.delete_workspace_user_folder(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            folder_uuid=uuid,
-        )
-
-
-class FolderItemController(
-    WorkspaceBaseResourceControllerPaginated,
-):
+class FolderItemController(StoreResourceController):
+    resource_name = "folder_items"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.UserFolderItem,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def create(self, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.create_workspace_user_folder_item(
-            project_id=values.pop("project_id", self._get_project_id()),
-            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
-            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
-            **values,
-        )
-
-    def get(self, uuid):
-        return messenger_dm_helpers.get_workspace_user_folder_item(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            item_uuid=uuid,
-        )
-
-    def delete(self, uuid):
-        return messenger_dm_helpers.delete_workspace_user_folder_item(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            item_uuid=uuid,
-        )
-
     @ra_actions.post
     def pin(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.pin_workspace_user_folder_item(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            item_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "pin")
 
     @ra_actions.post
     def unpin(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.unpin_workspace_user_folder_item(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            item_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "unpin")
 
 
-class WorkspaceFileController(
-    WorkspaceBaseResourceControllerPaginated,
-):
+class WorkspaceFileController(StoreResourceController):
+    resource_name = "files"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceFile,
         hidden_fields=["project_id", "storage_id", "storage_object_id"],
@@ -202,20 +267,19 @@ class WorkspaceFileController(
     )
 
     @staticmethod
-    def _get_multipart_value(part):
+    def _multipart_value(part):
         return getattr(part, "value", part)
 
     @classmethod
-    def _get_optional_multipart_value(cls, parts, name, default=None):
+    def _optional_part(cls, parts, name, default=None):
         part = parts.get(name)
-        if part is None:
-            return default
-        return cls._get_multipart_value(part)
+        return default if part is None else cls._multipart_value(part)
 
     @staticmethod
-    def _get_content_disposition(file):
-        quoted_name = file.name.replace("\\", "\\\\").replace('"', '\\"')
-        encoded_name = urllib.parse.quote(file.name)
+    def _content_disposition(file):
+        name = file["name"]
+        quoted_name = name.replace("\\", "\\\\").replace('"', '\\"')
+        encoded_name = urllib.parse.quote(name)
         return (
             f"attachment; filename=\"{quoted_name}\"; filename*=UTF-8''{encoded_name}"
         )
@@ -225,65 +289,37 @@ class WorkspaceFileController(
             return result
         return super().process_result(result, *args, **kwargs)
 
-    def get_autofilters(self):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        file_uuids = messenger_dm_helpers.get_workspace_user_file_uuids(
-            project_id=project_id,
-            user_uuid=user_uuid,
-        )
-        return {
-            "project_id": dm_filters.EQ(project_id),
-            "uuid": dm_filters.In(file_uuids),
-        }
-
-    def _apply_autofilters(self, filters):
-        filter_parts = [filters, self.get_autofilters()]
-        filter_parts.extend(getattr(self, "_conditional_filters", []))
-        return dm_filters.AND(*filter_parts)
-
     def _create_from_multipart(self, parts):
         file_part = parts["file"]
-        stream_uuid_part = parts["stream_uuid"]
-        stream_uuid = sys_uuid.UUID(
-            self._get_multipart_value(stream_uuid_part),
-        )
-
+        file_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.UUID(self._multipart_value(parts["stream_uuid"]))
+        name = self._optional_part(parts, "name", file_part.filename)
+        description = self._optional_part(parts, "description", "")
         file_part.file.seek(0)
         data = file_part.file.read()
         file_part.file.seek(0)
-
-        file_uuid = sys_uuid.uuid4()
+        sha256 = hashlib.sha256(data).hexdigest()
         storage_info = file_storage.save_workspace_file(
             file_uuid=file_uuid,
             data=data,
-            storage_type=self._get_optional_multipart_value(
-                parts,
-                "storage_type",
-            ),
+            storage_type=self._optional_part(parts, "storage_type"),
+        )
+        metadata = file_storage.WorkspaceFileMetadata(
+            uuid=file_uuid,
+            project_id=sys_uuid.UUID(str(self._get_project_id())),
+            stream_uuid=stream_uuid,
+            owner_uuid=sys_uuid.UUID(str(self._get_user_uuid())),
+            name=name,
+            description=description,
+            content_type=file_part.type,
+            size_bytes=len(data),
+            sha256=sha256,
+            created_at=datetime.datetime.now(datetime.timezone.utc),
         )
         try:
-            return messenger_dm_helpers.create_workspace_file(
-                project_id=self._get_project_id(),
-                user_uuid=self._get_user_uuid(),
-                uuid=file_uuid,
-                stream_uuid=stream_uuid,
-                name=self._get_optional_multipart_value(
-                    parts,
-                    "name",
-                    file_part.filename,
-                ),
-                description=self._get_optional_multipart_value(
-                    parts,
-                    "description",
-                    "",
-                ),
-                content_type=file_part.type,
-                size_bytes=len(data),
-                hash=hashlib.sha256(data).hexdigest(),
+            file_storage.save_workspace_file_metadata(
+                metadata,
                 storage_type=storage_info.storage_type,
-                storage_id=storage_info.storage_id,
-                storage_object_id=storage_info.storage_object_id,
             )
         except Exception:
             file_storage.delete_workspace_file(
@@ -292,101 +328,94 @@ class WorkspaceFileController(
                 storage_object_id=storage_info.storage_object_id,
             )
             raise
+        values = self._values(
+            {
+                "uuid": file_uuid,
+                "stream_uuid": stream_uuid,
+                "name": name,
+                "description": description,
+                "content_type": file_part.type,
+                "size_bytes": len(data),
+                "hash": sha256,
+                "storage_type": storage_info.storage_type,
+                "storage_id": storage_info.storage_id,
+                "storage_object_id": storage_info.storage_object_id,
+            }
+        )
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            # Once the sidecar exists, a failing SQL projection must not erase
+            # canonical storage: IMAP replay can repair the disposable row.
+            return db.create_resource(self.resource_name, values)
 
     def create(self, **kwargs):
         if kwargs.pop("multipart", False):
-            parts = kwargs["parts"]
-            return self._create_from_multipart(parts)
-
-        values = self._apply_autovalues(kwargs)
-        values.pop("storage_id", None)
-        values.pop("storage_object_id", None)
-        file_uuid = values.pop("uuid", None) or sys_uuid.uuid4()
+            return self._create_from_multipart(kwargs["parts"])
+        file_uuid = kwargs.get("uuid") or sys_uuid.uuid4()
         storage_info = file_storage.get_workspace_file_storage_info(
             file_uuid=file_uuid,
-            storage_type=values.pop("storage_type", None),
+            storage_type=kwargs.pop("storage_type", None),
         )
-        return messenger_dm_helpers.create_workspace_file(
-            project_id=values.pop("project_id", self._get_project_id()),
-            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
-            uuid=file_uuid,
-            storage_type=storage_info.storage_type,
-            storage_id=storage_info.storage_id,
-            storage_object_id=storage_info.storage_object_id,
-            **values,
+        kwargs.update(
+            {
+                "uuid": file_uuid,
+                "storage_type": storage_info.storage_type,
+                "storage_id": storage_info.storage_id,
+                "storage_object_id": storage_info.storage_object_id,
+            }
         )
-
-    def update(self, uuid, **kwargs):
-        values = kwargs.copy()
-        values.pop("project_id", None)
-        values.pop("user_uuid", None)
-        values.pop("storage_type", None)
-        values.pop("storage_id", None)
-        values.pop("storage_object_id", None)
-        return messenger_dm_helpers.update_workspace_file(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            file_uuid=uuid,
-            values=values,
-        )
+        return super().create(**kwargs)
 
     def delete(self, uuid):
-        file = messenger_dm_helpers.get_workspace_owned_file(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            file_uuid=uuid,
-        )
-        result = messenger_dm_helpers.delete_workspace_file(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            file_uuid=uuid,
-        )
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            file = db.get_resource(self.resource_name, uuid)
+            result = db.delete_resource(self.resource_name, uuid)
         file_storage.delete_workspace_file(
             file_uuid=uuid,
-            storage_type=file.storage_type,
-            storage_object_id=file.storage_object_id,
+            storage_type=file["storage_type"],
+            storage_object_id=file["storage_object_id"],
+        )
+        file_storage.delete_workspace_file_metadata(
+            file_uuid=uuid,
+            storage_type=file["storage_type"],
         )
         return result
 
-    def _download_file_response(self, resource):
+    @ra_actions.get
+    def download(self, resource, *args, **kwargs):
+        del args, kwargs
         data = file_storage.read_workspace_file(
-            file_uuid=resource.uuid,
-            storage_type=resource.storage_type,
-            storage_object_id=resource.storage_object_id,
+            file_uuid=resource["uuid"],
+            storage_type=resource["storage_type"],
+            storage_object_id=resource["storage_object_id"],
         )
         return webob.Response(
             body=data,
             status=200,
             headers={
-                "Content-Type": resource.content_type,
-                "Content-Disposition": self._get_content_disposition(resource),
+                "Content-Type": resource["content_type"],
+                "Content-Disposition": self._content_disposition(resource),
+                "ETag": f'"{resource["hash"]}"',
+                "Cache-Control": "private, no-cache",
             },
         )
-
-    @ra_actions.get
-    def download(self, resource, *args, **kwargs):
-        return self._download_file_response(resource)
 
 
 WorkspaceFileController.create.openapi_schema = oa_utils.Schema(
     summary="Upload file",
     parameters=(),
     responses=oa_c.build_openapi_create_response("WorkspaceFile_Create"),
-    request_body=oa_c.build_openapi_req_body_multipart(
+    request_body=_build_openapi_multipart_request_body(
         description="Upload workspace file",
         properties={
             "file": {"format": "binary", "type": "string"},
             "stream_uuid": {"format": "uuid", "type": "string"},
             "name": {"type": "string"},
             "description": {"type": "string"},
-            "storage_type": {
-                "enum": ["file", "s3"],
-                "type": "string",
-            },
+            "storage_type": {"enum": ["file", "s3"], "type": "string"},
         },
+        required=("file", "stream_uuid"),
     ),
 )
-
 WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
     summary="Download file",
     parameters=(),
@@ -394,171 +423,8 @@ WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
 )
 
 
-class ExternalAccountController(
-    WorkspaceBaseResourceControllerPaginated,
-):
-    ACCESS_FIELDS = (
-        "access_status",
-        "access_checked_at",
-        "access_confirmed_at",
-        "access_next_check_at",
-        "access_last_error",
-    )
-
-    class Packer(ra_packers.JSONPacker):
-        def pack_resource(self, obj):
-            result = super().pack_resource(obj)
-            settings = result.get("account_settings")
-            if isinstance(settings, dict) and "credentials" in settings:
-                settings["credentials"] = None
-            return result
-
-    __packer__ = Packer
-    __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.ExternalAccount,
-        convert_underscore=False,
-        process_filters=True,
-    )
-
-    @staticmethod
-    def _reject_user_info_from_api(account_settings):
-        if (
-            account_settings.KIND == models.ExternalAccountType.ZULIP.value
-            and account_settings.user_info is not None
-        ):
-            raise ra_exc.ValidationErrorException()
-
-    @staticmethod
-    def _reject_iam_account_from_api(account_settings):
-        if account_settings.KIND == models.ExternalAccountType.IAM.value:
-            raise ra_exc.ValidationErrorException()
-
-    @staticmethod
-    def _validate_provider(provider_uuid, account_settings):
-        if provider_uuid is None:
-            raise ra_exc.ValidationErrorException()
-        provider = provider_models.WorkspaceProvider.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(provider_uuid),
-                "enabled": dm_filters.EQ(True),
-            },
-        )
-        if account_settings.KIND not in provider.supported_kinds:
-            raise ra_exc.ValidationErrorException()
-
-    @classmethod
-    def _reject_access_fields_from_api(cls, values):
-        for name in cls.ACCESS_FIELDS:
-            values.pop(name, None)
-
-    @staticmethod
-    def _normalize_server_url(server_url):
-        return server_url.rstrip("/")
-
-    def _normalize_server_url_value(self, values):
-        if "server_url" in values:
-            values["server_url"] = self._normalize_server_url(
-                values["server_url"],
-            )
-
-    @staticmethod
-    def _set_source_scope(values):
-        values.pop("source_scope", None)
-        if "server_url" in values:
-            values["source_scope"] = values["server_url"]
-
-    @staticmethod
-    def _set_pending_access(values):
-        values.update(
-            {
-                "access_status": models.ExternalAccountAccessStatus.PENDING.value,
-                "access_checked_at": None,
-                "access_confirmed_at": None,
-                "access_last_error": None,
-            }
-        )
-
-    @staticmethod
-    def _set_missing_credentials_access(values):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        values.update(
-            {
-                "access_status": (
-                    models.ExternalAccountAccessStatus.MISSING_CREDENTIALS.value
-                ),
-                "access_checked_at": now,
-                "access_confirmed_at": None,
-                "access_last_error": "External account credentials are missing",
-            }
-        )
-
-    def _set_access_values(self, values, account=None):
-        if "account_settings" not in values and "server_url" not in values:
-            return
-        account_settings = values.get("account_settings")
-        if account_settings is None and account is not None:
-            account_settings = account.account_settings
-        if account_settings is None:
-            return
-        if account_settings.credentials is None:
-            self._set_missing_credentials_access(values)
-            return
-        self._set_pending_access(values)
-
-    def create(self, **kwargs):
-        values = kwargs.copy()
-        self._reject_access_fields_from_api(values)
-        self._normalize_server_url_value(values)
-        self._set_source_scope(values)
-        account_settings = values["account_settings"]
-        self._validate_provider(values.get("provider_uuid"), account_settings)
-        self._reject_iam_account_from_api(account_settings)
-        self._reject_user_info_from_api(account_settings)
-        values["account_type"] = account_settings.KIND
-        values["status"] = models.ExternalAccountStatus.NEW.value
-        self._set_access_values(values)
-        return super().create(**values)
-
-    def update(self, uuid, **kwargs):
-        account = self.get(uuid=uuid)
-        values = self._apply_autovalues(kwargs)
-        self._reject_access_fields_from_api(values)
-        self._normalize_server_url_value(values)
-        self._set_source_scope(values)
-        account_settings = values.get(
-            "account_settings",
-            account.account_settings,
-        )
-        self._validate_provider(
-            values.get("provider_uuid", account.provider_uuid),
-            account_settings,
-        )
-        self._reject_iam_account_from_api(account_settings)
-        self._reject_user_info_from_api(account_settings)
-        self._set_access_values(values, account=account)
-        account.update_dm(values=values)
-        account.update()
-        return account
-
-
-class WorkspaceStreamController(
-    WorkspaceBaseResourceControllerPaginated,
-):
-    class Packer(ra_packers.JSONPacker):
-        def pack_resource(self, obj):
-            result = super().pack_resource(obj)
-            stream = models.WorkspaceStream.objects.get_one(
-                filters={
-                    "uuid": dm_filters.EQ(obj.uuid),
-                    "project_id": dm_filters.EQ(obj.project_id),
-                },
-            )
-            return provider_payloads.add_provider_delivery_payload(
-                result,
-                stream,
-            )
-
-    __packer__ = Packer
+class WorkspaceStreamController(StoreResourceController):
+    resource_name = "streams"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserStream,
         hidden_fields=["private_index"],
@@ -567,538 +433,397 @@ class WorkspaceStreamController(
     )
 
     def create(self, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        values.pop("project_id", None)
-        values.pop("user_uuid", None)
-        return messenger_dm_helpers.get_or_create_workspace_user_stream(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
-            **values,
-        )
-
-    def update(self, uuid, **kwargs):
-        project_id = self._get_project_id()
-        stream = models.WorkspaceStream.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.mark_messenger_delivery_pending(stream)
-        result = messenger_dm_helpers.update_workspace_user_stream(
-            project_id=project_id,
-            user_uuid=self._get_user_uuid(),
-            stream_uuid=uuid,
-            values=kwargs,
-        )
-        stream = models.WorkspaceStream.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            stream,
-            "stream.update",
-            urns.MESSENGER_STREAM,
-            update_projection=False,
-        )
-        return result
-
-    def delete(self, uuid):
-        return messenger_dm_helpers.delete_workspace_user_stream(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            stream_uuid=uuid,
-        )
+        peer_uuid = kwargs.get("direct_user_uuid")
+        if peer_uuid is not None:
+            if peer_uuid == self._get_user_uuid():
+                raise ra_exc.ValidationErrorException()
+            kwargs["uuid"] = mail_repository.deterministic_dm_uuid(
+                self._get_project_id(),
+                self._get_user_uuid(),
+                peer_uuid,
+            )
+            kwargs["private"] = True
+        return super().create(**kwargs)
 
     @ra_actions.post
     def archive(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.update_workspace_user_stream(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            stream_uuid=resource.uuid,
-            values={"is_archived": True},
-        )
+        del args, kwargs
+        return self._action(resource, "archive")
 
     @ra_actions.post
     def unarchive(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.update_workspace_user_stream(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            stream_uuid=resource.uuid,
-            values={"is_archived": False},
-        )
+        del args, kwargs
+        return self._action(resource, "unarchive")
 
     @ra_actions.post
     def notifications(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.update_workspace_user_stream_notifications(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            stream_uuid=resource.uuid,
-            notification_mode=kwargs["notification_mode"],
-        )
+        del args
+        return self._action(resource, "notifications", kwargs)
 
     @ra_actions.post
     def read(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.read_workspace_user_stream_messages(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            stream_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "read")
 
 
-class WorkspaceStreamBindingController(
-    WorkspaceBaseResourceControllerPaginated,
-):
+class WorkspaceStreamBindingController(StoreResourceController):
+    resource_name = "stream_bindings"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceStreamBinding,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def get_autofilters(self):
-        return {
-            "project_id": dm_filters.EQ(self._get_project_id()),
-        }
-
-    def get_autovalues(self):
-        return {
-            "project_id": self._get_project_id(),
-        }
-
     @ra_actions.post
     def add_users(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.get_or_create_workspace_stream_bindings(
-            project_id=resource.project_id,
-            stream_uuid=resource.uuid,
-            who_uuid=self._get_user_uuid(),
-            role_user_uuids=kwargs,
-        )
-
-    def delete(self, uuid):
-        return messenger_dm_helpers.delete_workspace_stream_binding(
-            project_id=self._get_project_id(),
-            binding_uuid=uuid,
-        )
+        del args
+        return self._action(resource, "add_users", kwargs)
 
 
-class WorkspaceMessageController(
-    WorkspaceBaseResourceControllerPaginated,
-):
-    class Packer(ra_packers.JSONPacker):
-        def pack_resource(self, obj):
-            result = super().pack_resource(obj)
-            message = models.WorkspaceMessage.objects.get_one(
-                filters={
-                    "uuid": dm_filters.EQ(obj.uuid),
-                    "project_id": dm_filters.EQ(obj.project_id),
-                },
-            )
-            return provider_payloads.add_provider_delivery_payload(
-                result,
-                message,
-            )
-
-    __packer__ = Packer
+class WorkspaceMessageController(StoreResourceController):
+    resource_name = "messages"
+    __default_sort__ = {"created_at": "asc"}
+    __sortable_fields__ = ("created_at",)
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserMessage,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def create(self, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        project_id = values.pop("project_id", self._get_project_id())
-        user_uuid = values.pop("user_uuid")
-        stream = models.WorkspaceStream.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(values["stream_uuid"]),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        if stream.provider_uuid is not None:
-            values.update(
-                {
-                    "provider_uuid": stream.provider_uuid,
-                    "external_account_uuid": stream.external_account_uuid,
-                    "delivery_status": (
-                        provider_models.ProviderCommandStatus.PENDING.value
-                    ),
-                    "delivery_error": None,
-                    "delivery_updated_at": datetime.datetime.now(
-                        datetime.timezone.utc,
-                    ),
-                },
+    def filter(self, filters, order_by=None):
+        order_by = order_by or self.__default_sort__
+        if tuple(order_by) != ("created_at",):
+            raise ra_exc.ValidationErrorException()
+        sort_direction = order_by["created_at"].lower()
+        if sort_direction not in {"asc", "desc"}:
+            raise ra_exc.ValidationErrorException()
+        limit = self._pagination_limit or None
+        fetch_limit = None if limit is None else limit + 1
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            result = db.filter_message_page(
+                filters=filters,
+                marker_uuid=getattr(self, "_pagination_marker", None),
+                sort_direction=sort_direction,
+                limit=fetch_limit,
             )
-        visible_message = messenger_dm_helpers.create_workspace_user_message(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
-            enforce_visibility=True,
-            **values,
+        self._message_page_has_more = limit is not None and len(result) > limit
+        return result if limit is None else result[:limit]
+
+    def _create_response(self, body, status, headers):
+        if self._pagination_limit:
+            headers[self._header_page_limit] = str(self._pagination_limit)
+            if self._message_page_has_more:
+                marker = (
+                    body[-1]["uuid"] if isinstance(body[-1], dict) else body[-1].uuid
+                )
+                headers[self._header_page_marker] = str(marker)
+        return ra_controllers.Controller._create_response(
+            self,
+            body,
+            status,
+            headers,
         )
-        message = models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(visible_message.uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            message,
-            "message.create",
-            urns.MESSENGER_MESSAGE,
-            update_projection=False,
-        )
-        return visible_message
+
+    def create(self, **kwargs):
+        values = self._values(kwargs)
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.create_message(values)
 
     def update(self, uuid, **kwargs):
-        project_id = self._get_project_id()
-        message = models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.mark_messenger_delivery_pending(message)
-        result = messenger_dm_helpers.update_workspace_user_message(
-            project_id=project_id,
-            user_uuid=self._get_user_uuid(),
-            message_uuid=uuid,
-            values=kwargs,
-        )
-        message = models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            message,
-            "message.update",
-            urns.MESSENGER_MESSAGE,
-            update_projection=False,
-        )
-        return result
+        values = kwargs.copy()
+        for name in ("project_id", "user_uuid", "uuid"):
+            values.pop(name, None)
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.update_message(uuid, values)
 
     def delete(self, uuid):
-        project_id = self._get_project_id()
-        message = models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            message,
-            "message.delete",
-            urns.MESSENGER_MESSAGE,
-        )
-        return messenger_dm_helpers.delete_workspace_user_message(
-            project_id=project_id,
-            user_uuid=self._get_user_uuid(),
-            message_uuid=uuid,
-        )
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            return db.delete_message(uuid)
 
     @ra_actions.post
     def read(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.read_workspace_user_message(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            message_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "read")
 
     @ra_actions.post
     def read_up_to(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.read_workspace_user_topic_messages_to_message(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            message_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "read_up_to")
 
 
-class WorkspaceMessageReactionController(
-    WorkspaceBaseResourceControllerPaginated,
-):
-    class Packer(ra_packers.JSONPacker):
-        def pack_resource(self, obj):
-            result = super().pack_resource(obj)
-            return provider_payloads.add_provider_delivery_payload(
-                result,
-                obj,
-            )
-
-    __packer__ = Packer
+class WorkspaceMessageReactionController(StoreResourceController):
+    resource_name = "message_reactions"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceMessageReactions,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def get_autofilters(self):
-        project_id = self._get_project_id()
-        user_uuid = self._get_user_uuid()
-        message_uuids = messenger_dm_helpers.get_workspace_user_message_uuids(
-            project_id=project_id,
-            user_uuid=user_uuid,
-        )
-        return {
-            "project_id": dm_filters.EQ(project_id),
-            "message_uuid": dm_filters.In(message_uuids),
-        }
 
-    def _apply_autofilters(self, filters):
-        filter_parts = [filters, self.get_autofilters()]
-        filter_parts.extend(getattr(self, "_conditional_filters", []))
-        return dm_filters.AND(*filter_parts)
-
-    def create(self, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        project_id = values.pop("project_id", self._get_project_id())
-        message = models.WorkspaceMessage.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(values["message_uuid"]),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        if message.provider_uuid is not None:
-            values.update(
-                {
-                    "provider_uuid": message.provider_uuid,
-                    "external_account_uuid": message.external_account_uuid,
-                    "delivery_status": (
-                        provider_models.ProviderCommandStatus.PENDING.value
-                    ),
-                    "delivery_error": None,
-                    "delivery_updated_at": datetime.datetime.now(
-                        datetime.timezone.utc,
-                    ),
-                },
-            )
-        reaction = messenger_dm_helpers.create_workspace_message_reaction(
-            project_id=project_id,
-            user_uuid=values.pop("user_uuid", self._get_user_uuid()),
-            uuid=values.pop("uuid", None) or sys_uuid.uuid4(),
-            **values,
-        )
-        provider_commands.create_messenger_command(
-            reaction,
-            "reaction.create",
-            urns.MESSENGER_REACTION,
-            update_projection=False,
-        )
-        return reaction
-
-    def update(self, uuid, **kwargs):
-        project_id = self._get_project_id()
-        reaction = models.WorkspaceMessageReactions.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.mark_messenger_delivery_pending(reaction)
-        result = messenger_dm_helpers.update_workspace_message_reaction(
-            project_id=project_id,
-            user_uuid=self._get_user_uuid(),
-            reaction_uuid=uuid,
-            values=kwargs,
-        )
-        reaction = models.WorkspaceMessageReactions.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            reaction,
-            "reaction.update",
-            urns.MESSENGER_REACTION,
-            update_projection=False,
-        )
-        return result
-
-    def delete(self, uuid):
-        project_id = self._get_project_id()
-        reaction = models.WorkspaceMessageReactions.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            reaction,
-            "reaction.delete",
-            urns.MESSENGER_REACTION,
-        )
-        return messenger_dm_helpers.delete_workspace_message_reaction(
-            project_id=project_id,
-            user_uuid=self._get_user_uuid(),
-            reaction_uuid=uuid,
-        )
-
-
-class WorkspaceEventController(
-    WorkspaceBaseResourceControllerPaginated,
-):
-    __resource__ = messenger_events.WORKSPACE_EVENT_RESOURCE
+class WorkspaceEventController(StoreResourceController):
+    resource_name = "events"
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceEvent,
+        convert_underscore=False,
+        process_filters=True,
+    )
     __default_sort__ = {"epoch_version": "asc"}
 
+    def _prepare_filters(self, params):
+        generations = params.getall("epoch_generation")
+        if len(generations) > 1 or (generations and not generations[0]):
+            raise ra_exc.ParseError(value=generations)
+        self._epoch_generation = generations[0] if generations else None
+        event_params = multidict.MultiDict(
+            (name, value)
+            for name, value in params.items()
+            if name != "epoch_generation"
+        )
+        return super()._prepare_filters(event_params)
 
-class WorkspaceEpochController(
-    WorkspaceBaseResourceControllerPaginated,
-):
     def filter(self, filters, order_by=None):
+        filters, order_by = self._store_query(filters, order_by)
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            epoch_generation = getattr(self, "_epoch_generation", None)
+            if epoch_generation is None:
+                result = db.events_after(filters, order_by)
+            else:
+                result = db.events_after(
+                    filters,
+                    order_by,
+                    epoch_generation=epoch_generation,
+                )
+        if self._pagination_limit:
+            return result[: self._pagination_limit]
+        return result
+
+
+class WorkspaceEpochController(StoreResourceController):
+    resource_name = "epoch"
+
+    def filter(self, filters, order_by=None):
+        del filters, order_by
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            cursor = db.event_cursor()
         return {
-            "epoch_version": messenger_events.get_current_epoch_version(
-                project_id=self._get_project_id(),
-                user_uuid=self._get_user_uuid(),
-            )
+            "epoch_version": cursor["current_epoch_version"],
+            **cursor,
         }
 
 
-class WorkspaceStreamTopicController(
-    WorkspaceBaseResourceControllerPaginated,
-):
-    class Packer(ra_packers.JSONPacker):
-        def pack_resource(self, obj):
-            result = super().pack_resource(obj)
-            topic = models.WorkspaceStreamTopic.objects.get_one(
-                filters={
-                    "uuid": dm_filters.EQ(obj.uuid),
-                    "project_id": dm_filters.EQ(obj.project_id),
-                },
-            )
-            return provider_payloads.add_provider_delivery_payload(
-                result,
-                topic,
-            )
-
-    __packer__ = Packer
+class WorkspaceStreamTopicController(StoreResourceController):
+    resource_name = "stream_topics"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUserTopic,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def get_autovalues(self):
-        return {
-            "project_id": self._get_project_id(),
-        }
-
-    def create(self, **kwargs):
-        values = self._apply_autovalues(kwargs)
-        return messenger_dm_helpers.create_workspace_user_stream_topic(
-            project_id=values.pop("project_id", self._get_project_id()),
-            user_uuid=self._get_user_uuid(),
-            values=values,
-        )
-
-    def update(self, uuid, **kwargs):
-        project_id = self._get_project_id()
-        topic = models.WorkspaceStreamTopic.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.mark_messenger_delivery_pending(topic)
-        result = messenger_dm_helpers.update_workspace_user_stream_topic(
-            project_id=project_id,
-            user_uuid=self._get_user_uuid(),
-            topic_uuid=uuid,
-            values=kwargs,
-        )
-        topic = models.WorkspaceStreamTopic.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-        )
-        provider_commands.create_messenger_command(
-            topic,
-            "topic.update",
-            urns.MESSENGER_TOPIC,
-            update_projection=False,
-        )
-        return result
-
-    def delete(self, uuid):
-        return messenger_dm_helpers.delete_workspace_user_stream_topic(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            topic_uuid=uuid,
-        )
-
     @ra_actions.post
     def toggle_done(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.toggle_workspace_user_stream_topic_done(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            topic_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "toggle_done")
 
     @ra_actions.post
     def notifications(self, resource, *args, **kwargs):
-        update_notifications = (
-            messenger_dm_helpers.update_workspace_user_stream_topic_notifications
-        )
-        return update_notifications(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            topic_uuid=resource.uuid,
-            notification_mode=kwargs["notification_mode"],
-        )
+        del args
+        return self._action(resource, "notifications", kwargs)
 
     @ra_actions.post
     def set_default(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.set_workspace_user_stream_topic_default(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            topic_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "set_default")
 
     @ra_actions.post
     def read(self, resource, *args, **kwargs):
-        return messenger_dm_helpers.read_workspace_user_stream_topic_messages(
-            project_id=self._get_project_id(),
-            user_uuid=self._get_user_uuid(),
-            topic_uuid=resource.uuid,
-        )
+        del args, kwargs
+        return self._action(resource, "read")
 
 
-class WorkspaceUserController(
-    ra_controllers.BaseResourceControllerPaginated,
-):
+class WorkspaceUserController(StoreResourceController):
+    resource_name = "users"
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=models.WorkspaceUser,
         convert_underscore=False,
         process_filters=True,
     )
 
-    def _get_user_uuid(self):
-        return self.get_context().user_uuid
+    def get(self, uuid, **kwargs):
+        del kwargs
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            if uuid == self._get_user_uuid():
+                iam_user = (
+                    self.get_context().iam_context.get_introspection_info().user_info
+                )
+                db.sync_iam_identity(
+                    {
+                        "user_uuid": uuid,
+                        "username": iam_user.name,
+                        "first_name": iam_user.first_name,
+                        "last_name": iam_user.last_name,
+                        "email": iam_user.email,
+                    }
+                )
+            return db.get_resource(self.resource_name, uuid)
 
-    def _get_project_id(self):
-        return self.get_context().project_id
+    @staticmethod
+    def _resource_value(resource, name):
+        return resource[name] if isinstance(resource, dict) else getattr(resource, name)
+
+    def _replaced_avatar_file(self, db, resource):
+        avatar = self._resource_value(resource, "avatar")
+        if not avatar.startswith(models.WORKSPACE_USER_IMAGE_AVATAR_PREFIX):
+            return None
+        file_uuid = sys_uuid.UUID(
+            avatar[len(models.WORKSPACE_USER_IMAGE_AVATAR_PREFIX) :]
+        )
+        return db.get_resource("files", file_uuid)
+
+    @staticmethod
+    def _delete_avatar_storage(file):
+        if file is None:
+            return
+        try:
+            file_storage.delete_workspace_file(
+                file_uuid=file["uuid"],
+                storage_type=file["storage_type"],
+                storage_object_id=file["storage_object_id"],
+            )
+            file_storage.delete_workspace_file_metadata(
+                file_uuid=file["uuid"],
+                storage_type=file["storage_type"],
+            )
+        except Exception:
+            LOG.exception("Failed to remove replaced avatar storage object")
+
+    @staticmethod
+    def _validate_avatar(file_part, data):
+        content_type = _normalize_avatar_content_type(file_part.type)
+        if (
+            not data
+            or len(data) > MAX_AVATAR_SIZE_BYTES
+            or content_type not in AVATAR_CONTENT_TYPES
+            or not _valid_avatar_bytes(content_type, data)
+        ):
+            raise ra_exc.ValidationErrorException()
+        return content_type
+
+    @ra_actions.post
+    def avatar_upload(self, resource, *args, **kwargs):
+        del args
+        resource_uuid = sys_uuid.UUID(str(self._resource_value(resource, "uuid")))
+        if resource_uuid != sys_uuid.UUID(str(self._get_user_uuid())) or not kwargs.pop(
+            "multipart", False
+        ):
+            raise ra_exc.ValidationErrorException()
+        file_part = kwargs["parts"]["file"]
+        file_part.file.seek(0)
+        data = file_part.file.read()
+        file_part.file.seek(0)
+        content_type = self._validate_avatar(file_part, data)
+        file_uuid = sys_uuid.uuid4()
+        sha256 = hashlib.sha256(data).hexdigest()
+        storage_info = file_storage.save_workspace_file(
+            file_uuid=file_uuid,
+            data=data,
+        )
+        metadata = file_storage.WorkspaceFileMetadata(
+            uuid=file_uuid,
+            project_id=sys_uuid.UUID(str(self._get_project_id())),
+            stream_uuid=None,
+            owner_uuid=sys_uuid.UUID(str(self._get_user_uuid())),
+            name=file_part.filename,
+            description="Workspace user avatar",
+            content_type=content_type,
+            size_bytes=len(data),
+            sha256=sha256,
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+            acl_mode="public",
+        )
+        try:
+            file_storage.save_workspace_file_metadata(
+                metadata,
+                storage_type=storage_info.storage_type,
+            )
+            with api_store.open_store(
+                self._get_project_id(), self._get_user_uuid()
+            ) as db:
+                replaced_file = self._replaced_avatar_file(db, resource)
+                result = db.perform_action(
+                    self.resource_name,
+                    resource_uuid,
+                    "avatar_upload",
+                    {
+                        "uuid": file_uuid,
+                        "name": file_part.filename,
+                        "description": "Workspace user avatar",
+                        "content_type": content_type,
+                        "size_bytes": len(data),
+                        "hash": sha256,
+                        "storage_type": storage_info.storage_type,
+                        "storage_id": storage_info.storage_id,
+                        "storage_object_id": storage_info.storage_object_id,
+                    },
+                )
+        except Exception:
+            file_storage.delete_workspace_file(
+                file_uuid=file_uuid,
+                storage_type=storage_info.storage_type,
+                storage_object_id=storage_info.storage_object_id,
+            )
+            file_storage.delete_workspace_file_metadata(
+                file_uuid=file_uuid,
+                storage_type=storage_info.storage_type,
+            )
+            raise
+        self._delete_avatar_storage(replaced_file)
+        return result
+
+    @ra_actions.post
+    def avatar_reset(self, resource, *args, **kwargs):
+        del args, kwargs
+        resource_uuid = sys_uuid.UUID(str(self._resource_value(resource, "uuid")))
+        if resource_uuid != sys_uuid.UUID(str(self._get_user_uuid())):
+            raise ra_exc.ValidationErrorException()
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            replaced_file = self._replaced_avatar_file(db, resource)
+            result = db.perform_action(
+                self.resource_name,
+                resource_uuid,
+                "avatar_reset",
+                {},
+            )
+        self._delete_avatar_storage(replaced_file)
+        return result
 
     @ra_actions.post
     def presence(self, resource, *args, **kwargs):
-        values = {"status": kwargs["status"]}
-        if "emoji" in kwargs:
-            values["status_emoji"] = kwargs["emoji"]
-        if "text" in kwargs:
-            values["status_text"] = kwargs["text"]
-        return messenger_dm_helpers.update_workspace_user_presence(
-            project_id=self._get_project_id(),
-            user_uuid=resource.uuid,
-            current_user_uuid=self._get_user_uuid(),
-            values=values,
-        )
+        del args
+        return self._action(resource, "presence", kwargs)
 
 
-class MeController(ra_controllers.RoutesListController):
-    __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/me/"
+WorkspaceUserController.avatar_upload.openapi_schema = oa_utils.Schema(
+    summary="Upload own avatar",
+    parameters=(),
+    responses=oa_c.build_openapi_create_response("WorkspaceUser_AvatarUpload"),
+    request_body=_build_openapi_multipart_request_body(
+        description="Upload own Workspace avatar",
+        properties={
+            "file": {"format": "binary", "type": "string"},
+        },
+        required=("file",),
+    ),
+)
+
+
+class MeController(WorkspaceUserController):
+    def filter(self, filters, order_by=None):
+        del filters, order_by
+        return self.get(self._get_user_uuid())
+
+
+MeController.filter.openapi_schema = oa_utils.Schema(
+    summary="Get current Workspace user",
+    parameters=(),
+    responses=oa_c.build_openapi_get_update_response("WorkspaceUser_Get"),
+)

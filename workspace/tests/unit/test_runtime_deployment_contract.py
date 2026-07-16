@@ -4,19 +4,156 @@
 # you may not use this file except in compliance with the License.
 
 import configparser
+import json
 import pathlib
 import re
+import subprocess
+import sys
 
-import pytest
 import yaml
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[3]
-PROVIDER_KINDS = ("zulip", "mail", "calendar")
+STAGE1_LIVE_MESSENGER_MAIL_SECTION = """smtp_host = 127.0.0.1
+smtp_port = 25
+smtp_security = plain
+imap_host = 127.0.0.1
+imap_port = 1143
+imap_security = plain
+imap_master_username = workspace-service
+imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+technical_domain = messenger.workspace.invalid
+state_mailbox = Workspace/State
+event_mailbox_prefix = Workspace/Events"""
 
 
 def _read(relative_path):
     return (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _messenger_mail_section(config_body):
+    return config_body.split("[messenger_mail]\n", 1)[1].split(
+        "\n\n\n[messenger_files]",
+        1,
+    )[0]
+
+
+def _render_workspace_manifest(*, stage1, cutover=False):
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    manifest = re.sub(
+        r"^# \{% set mail_migration_(?:stage1|cutover)_enabled = .*? %\}\n",
+        "",
+        manifest,
+        flags=re.MULTILINE,
+    )
+    manifest = re.sub(
+        r"# \{% if mail_migration_stage1_enabled and not .*? %\}"
+        r".*?"
+        r"# \{% endif %\}\n",
+        "",
+        manifest,
+        flags=re.DOTALL,
+    )
+    manifest = re.sub(
+        r"# \{% if mail_migration_stage1_enabled and "
+        r"mail_migration_cutover_enabled %\}"
+        r".*?"
+        r"# \{% endif %\}\n",
+        "",
+        manifest,
+        flags=re.DOTALL,
+    )
+    conditional = re.compile(
+        r"[ \t]*# \{% if mail_migration_stage1_enabled %\}"
+        r"(?P<enabled>.*?)"
+        r"(?:[ \t]*# \{% elif mail_migration_cutover_enabled %\}"
+        r"(?P<cutover>.*?))?"
+        r"(?:[ \t]*# \{% else %\}(?P<disabled>.*?))?"
+        r"[ \t]*# \{% endif %\}",
+        flags=re.DOTALL,
+    )
+    while conditional.search(manifest):
+        manifest = conditional.sub(
+            lambda match: (
+                match.group("enabled")
+                if stage1
+                else (
+                    (match.group("cutover") or "")
+                    if cutover
+                    else (match.group("disabled") or "")
+                )
+            ),
+            manifest,
+        )
+    replacements = {
+        "{{ version }}": "test",
+        "{{ images['workspace_backend'] }}": "urn:images:built-backend",
+        "{{ workspace_backend_image }}": "urn:images:current-live-backend",
+        (
+            "{{ workspace_mail_image | "
+            "default(images['workspace_mail_raw_zst'], true) }}"
+        ): "urn:images:built-mail",
+        (
+            "{{ '127.0.0.1' if mail_migration_stage1_enabled else "
+            "'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}"
+        ): (
+            "127.0.0.1"
+            if stage1
+            else "workspace-mail.{$workspace.imports.$core_local_domain:name}"
+        ),
+        (
+            "{{ '' if mail_migration_stage1_enabled else "
+            "'\\n          smtp_username = workspace-service"
+            "\\n          smtp_password = "
+            "{$core.secret.passwords.$workspace_mail_master_password:value}' }}"
+        ): (
+            ""
+            if stage1
+            else (
+                "\n          smtp_username = workspace-service"
+                "\n          smtp_password = "
+                "{$core.secret.passwords.$workspace_mail_master_password:value}"
+            )
+        ),
+        (
+            "{{ '' if mail_migration_stage1_enabled else "
+            "'_remote_mail_v1' }}"
+        ): "" if stage1 else "_remote_mail_v1",
+        (
+            "{{ '' if mail_migration_stage1_enabled else "
+            "'/usr/local/bin/workspace-wait-ready ' }}"
+        ): "" if stage1 else "/usr/local/bin/workspace-wait-ready ",
+    }
+    for expression, value in replacements.items():
+        manifest = manifest.replace(expression, value)
+    assert "{{" not in manifest
+    assert "{%" not in manifest
+    return yaml.safe_load(manifest)
+
+
+def _render_workspace_manifest_with_jinja(variables):
+    script = """
+import json
+import pathlib
+import sys
+
+import jinja2
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+print(jinja2.Template(source).render(**json.loads(sys.argv[2])))
+"""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(PROJECT_ROOT / "exordos/manifests/workspace.yaml.j2"),
+            json.dumps(variables),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
 
 
 def _configured_port(section):
@@ -33,44 +170,6 @@ def _manifest_port(manifest, section):
     )
     assert match is not None, f"missing [{section}] in deployment config"
     return int(match.group("port"))
-
-
-def _provider_manifest(kind):
-    expected_name = f"workspace-{kind}-provider"
-    path = PROJECT_ROOT / f"exordos/manifests/{expected_name}.yaml.j2"
-    assert path.is_file(), f"missing dedicated manifest for {expected_name}"
-    content = path.read_text(encoding="utf-8")
-    assert re.search(
-        rf'(?m)^name:\s*["\']{re.escape(expected_name)}["\']\s*$',
-        content,
-    )
-    return path, content
-
-
-def _nginx_server_blocks(manifest):
-    lines = manifest.splitlines()
-    blocks = []
-    for index, line in enumerate(lines):
-        if line.strip() != "server {":
-            continue
-        depth = 0
-        block = []
-        for nested_line in lines[index:]:
-            block.append(nested_line)
-            depth += nested_line.count("{") - nested_line.count("}")
-            if depth == 0:
-                blocks.append("\n".join(block))
-                break
-    return blocks
-
-
-def _provider_env_assignments(manifest):
-    return dict(
-        re.findall(
-            r"(?m)^\s{10}(WORKSPACE_[A-Z_]+|DATABASE_URL)=(.+)$",
-            manifest,
-        )
-    )
 
 
 def test_runtime_entry_points_keep_separate_messenger_and_workspace_apis():
@@ -145,212 +244,692 @@ def test_legacy_public_messenger_routes_are_absent():
     assert "/api/workspace/v1/messenger/events/ws" not in manifest
 
 
-def test_backend_exports_node_for_provider_elements():
+def test_backend_manifest_references_the_local_build_artifact():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 
-    assert re.search(
-        r"(?ms)^exports:\s*$.*?^\s{2}backend_node:\s*$"
-        r'.*?^\s{4}link:\s*["\']?\$core\.compute\.nodes\.\$workspace_backend["\']?\s*$',
-        manifest,
-    )
-
-
-def test_backend_manifest_references_build_image_by_name():
-    manifest = _read("exordos/manifests/workspace.yaml.j2")
-
-    assert re.search(
-        r'(?m)^\s+image:\s+["\']workspace-backend["\']\s*$',
-        manifest,
-    )
+    # Exordos CLI normalizes image names by replacing hyphens with underscores
+    # before exposing them to the Jinja manifest context.
+    assert 'image: "{{ images[\'workspace_backend\'] }}"' in manifest
+    assert "images['workspace-backend']" not in manifest
+    assert 'image: "workspace-backend"' not in manifest
     assert "{{ repository" not in manifest
     assert ".raw.zst" not in manifest
 
 
-def test_provider_service_api_uses_a_separate_platform_internal_listener():
+def test_backend_root_disk_fits_the_built_image():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
-
-    server_blocks = _nginx_server_blocks(manifest)
-    browser_servers = [block for block in server_blocks if "listen 80;" in block]
-    provider_servers = [block for block in server_blocks if "listen 21085;" in block]
-
-    assert len(browser_servers) == 1
-    assert "/api/workspace-service/" not in browser_servers[0]
-    assert len(provider_servers) == 1
-    assert "location /api/workspace-service/v1/ {" in provider_servers[0]
-    assert "proxy_pass http://127.0.0.1:21083/v1/;" in provider_servers[0]
-    assert sum("/api/workspace-service/" in block for block in server_blocks) == 1
-
-
-def test_backend_runs_provider_service_api_but_not_provider_daemons():
-    pyproject = _read("pyproject.toml")
-    manifest = _read("exordos/manifests/workspace.yaml.j2")
-    install_script = _read("exordos/images/backend-install.sh")
-    restart_script = _read("exordos/images/workspace-restart-services.sh")
-
-    assert (
-        'workspace-provider-api = "workspace.cmd.workspace_provider_api:main"'
-        in pyproject
-    )
-    assert _configured_port("workspace_provider_api") == 21083
-    assert _manifest_port(manifest, "workspace_provider_api") == 21083
-    assert "workspace-provider-api" in install_script
-    assert "workspace-provider-api" in restart_script
-    assert "name: workspace-provider-api" in manifest
-    assert (
-        "ExecStart=workspace-provider-api --config-file /etc/workspace/workspace.conf"
-        in _read("etc/systemd/workspace-provider-api.service")
-    )
-
-
-def test_workspace_backend_runtime_does_not_start_provider_daemons():
-    manifest = _read("exordos/manifests/workspace.yaml.j2")
-    install_script = _read("exordos/images/backend-install.sh")
-    restart_script = _read("exordos/images/workspace-restart-services.sh")
-
-    for kind in PROVIDER_KINDS:
-        daemon = f"workspace-{kind}-provider"
-        assert daemon not in manifest
-        assert daemon not in install_script
-        assert daemon not in restart_script
-        assert not (PROJECT_ROOT / f"etc/systemd/{daemon}.service").exists()
-
-
-@pytest.mark.parametrize("kind", PROVIDER_KINDS)
-def test_provider_element_has_isolated_node_image_database_and_daemon(kind):
-    path, manifest = _provider_manifest(kind)
-    element_name = f"workspace-{kind}-provider"
-
-    assert "$core.compute.nodes:" in manifest
-    assert re.search(
-        rf'(?m)^\s+image:\s+["\']{re.escape(element_name)}["\']\s*$',
-        manifest,
-    )
-    assert "{{ repository" not in manifest
-    assert ".raw.zst" not in manifest
-
-    assert "$core.secret.passwords:" in manifest
-    assert "$dbaas.types.postgres.instances:" in manifest
-    assert re.search(
-        r"(?m)^\s*\$dbaas\.types\.postgres\.instances\.\$[^.\s:]+\.users:\s*$",
-        manifest,
-    )
-    assert re.search(
-        r"(?m)^\s*\$dbaas\.types\.postgres\.instances\.\$[^.\s:]+\.databases:\s*$",
-        manifest,
-    )
-    assert "postgresql://" in manifest
-    assert "WORKSPACE_BACKEND_URL='http://" in manifest
-    assert ":21085'" in manifest
-
-    assert re.search(r"(?m)^\s{2}workspace:\s*$", manifest)
-    assert 'element: "$workspace"' in manifest
-    assert 'link: "$workspace.backend_node"' in manifest
-    assert "join(ipsv4)" in manifest
-
-    daemon_paths = re.findall(
-        r"(?m)^\s+path:\s+[^\n]*"
-        r"(workspace-(?:zulip|mail|calendar)-provider)[^\n]*$",
-        manifest,
-    )
-    assert daemon_paths == [element_name]
-
-    build_config = _read("exordos/exordos.yaml")
-    relative_manifest = path.relative_to(PROJECT_ROOT / "exordos")
-    assert f"manifest: {relative_manifest}" in build_config
-    assert f"name: {element_name}" in build_config
-
-
-def test_provider_manifests_do_not_reference_another_provider_runtime():
-    manifests = {}
-    provider_uuids = set()
-
-    for kind in PROVIDER_KINDS:
-        path, manifest = _provider_manifest(kind)
-        namespace = f"workspace_{kind}_provider"
-        manifests[kind] = path
-
-        assert path.name == f"workspace-{kind}-provider.yaml.j2"
-        assert f"{namespace}_cluster_pg" in manifest
-        assert f"{namespace}_db_user" in manifest
-        assert f"{namespace}_db" in manifest
-        assert f"WORKSPACE_PROVIDER_BINARY='workspace-{kind}-provider'" in manifest
-
-        for other_kind in set(PROVIDER_KINDS) - {kind}:
-            assert f"workspace_{other_kind}_provider" not in manifest
-            assert f"workspace-{other_kind}-provider" not in manifest
-
-        provider_uuid = re.search(
-            r"WORKSPACE_PROVIDER_UUID=\{\{\s*shell_quote\(provider_uuid\s*"
-            r"\|\s*default\('(?P<uuid>[^']+)'\)\)\s*\}\}",
-            manifest,
-        )
-        assert provider_uuid is not None
-        provider_uuids.add(provider_uuid.group("uuid"))
-
-    assert len(set(manifests.values())) == len(PROVIDER_KINDS)
-    assert len(provider_uuids) == len(PROVIDER_KINDS)
-
-
-def test_provider_builds_are_one_manifest_and_one_image_per_element():
     build_config = _read("exordos/exordos.yaml")
 
-    for kind in PROVIDER_KINDS:
-        manifest = f"manifests/workspace-{kind}-provider.yaml.j2"
-        image = f"workspace-{kind}-provider"
-
-        assert build_config.count(f"manifest: {manifest}") == 1
-        assert build_config.count(f"name: {image}") == 1
-
-
-@pytest.mark.parametrize("kind", PROVIDER_KINDS)
-def test_provider_manifest_is_parseable_before_jinja_render(kind):
-    _, manifest = _provider_manifest(kind)
-
-    assert yaml.safe_load(manifest)["name"] == f"workspace-{kind}-provider"
-
-
-def test_provider_entry_points_are_distinct_daemons():
-    pyproject = _read("pyproject.toml")
-
-    for kind in PROVIDER_KINDS:
-        assert (
-            f'workspace-{kind}-provider = "workspace_providers.{kind}.main:main"'
-        ) in pyproject
-
-
-@pytest.mark.parametrize("kind", PROVIDER_KINDS)
-def test_provider_environment_is_posix_shell_quoted(kind):
-    _, manifest = _provider_manifest(kind)
-    macro = re.search(
-        r"(?s)\{%\s*macro shell_quote\(value\).*?"
-        r"\{%[-]?\s*endmacro\s*%\}",
+    assert 'disk_size: "10G"' in build_config
+    assert re.search(
+        r'(?ms)^\s{8}kind: "root_disk"\n'
+        r'\s{8}size: 10\n'
+        r'\s{8}image: "\{\{ images\[\'workspace_backend\'\] \}\}"',
         manifest,
     )
-    assignments = _provider_env_assignments(manifest)
 
-    assert macro is not None
-    assert r"""| replace("'", "'\"'\"'")""" in macro.group()
 
-    assert set(assignments) == {
-        "WORKSPACE_PROVIDER_BINARY",
-        "WORKSPACE_PROVIDER_UUID",
-        "WORKSPACE_PROVIDER_NAME",
-        "WORKSPACE_BACKEND_URL",
-        "DATABASE_URL",
+def test_element_password_resources_include_the_required_project_scope():
+    manifest = _render_workspace_manifest(stage1=False, cutover=True)
+    passwords = manifest["resources"]["$core.secret.passwords"]
+
+    assert set(passwords) == {
+        "workspace_projection_db_password",
+        "workspace_mail_master_password",
+        "workspace_s3_access_key",
+        "workspace_s3_secret_key",
     }
-    for key, value in assignments.items():
-        if key in ("WORKSPACE_PROVIDER_UUID", "WORKSPACE_PROVIDER_NAME"):
-            assert re.fullmatch(r"\{\{\s*shell_quote\(.+\)\s*\}\}", value)
-        else:
-            assert value.startswith("'") and value.endswith("'")
+    for password in passwords.values():
+        assert password["project_id"] == "12345678-c625-4fee-81d5-f691897b8142"
 
 
-def test_provider_image_explicitly_installs_process_control_tools():
-    install_script = _read("exordos/images/provider-install.sh")
-    install_command = re.search(
-        r"(?ms)^sudo apt install -y (?P<packages>.+?)(?:\n\n|$)",
+def test_mail_bootstrap_does_not_remount_an_active_persistent_disk():
+    bootstrap = _read("exordos/images/mail-bootstrap.sh")
+    wait_ready = _read("exordos/images/workspace-wait-ready.sh")
+
+    assert 'mountpoint -q "$PERSISTENT_MOUNT"' in bootstrap
+    assert bootstrap.index('mountpoint -q "$PERSISTENT_MOUNT"') < bootstrap.index(
+        'prepare_persistent_disk "$PERSISTENT_DISK" "$PERSISTENT_MOUNT"'
+    )
+    assert 'mountpoint -q "$WORKSPACE_MAIL_DIR"' in bootstrap
+    assert bootstrap.index('mountpoint -q "$WORKSPACE_MAIL_DIR"') < bootstrap.index(
+        "migrate_to_persistent"
+    )
+    assert "/usr/local/bin/workspace-bootstrap" not in wait_ready
+
+
+def test_backend_services_wait_inside_the_managed_process_until_ready():
+    manifest = _render_workspace_manifest(stage1=False, cutover=True)
+    services = manifest["resources"]["$core.em.services"]
+    wait_ready = _read("exordos/images/workspace-wait-ready.sh")
+
+    service_commands = {
+        "workspace_api": "/usr/bin/workspace-api",
+        "workspace_messenger_api": "/usr/bin/workspace-messenger-api",
+        "workspace_messenger_worker": "/usr/bin/workspace-messenger-worker",
+        "workspace_messenger_events": "/usr/bin/workspace-messenger-events",
+    }
+    for service_name, command in service_commands.items():
+        assert service_name not in services
+        service = services[f"{service_name}_remote_mail_v1"]
+        assert service["name"] == service_name.replace("_", "-")
+        assert service["path"].startswith(
+            f"/usr/local/bin/workspace-wait-ready {command} "
+        )
+        assert "before" not in service
+
+    assert 'exec "$@"' in wait_ready
+
+
+def test_stage1_keeps_service_commands_compatible_with_the_pinned_image():
+    manifest = _render_workspace_manifest(stage1=True)
+    services = manifest["resources"]["$core.em.services"]
+
+    service_commands = {
+        "workspace_api": "/usr/bin/workspace-api",
+        "workspace_messenger_api": "/usr/bin/workspace-messenger-api",
+        "workspace_messenger_worker": "/usr/bin/workspace-messenger-worker",
+        "workspace_messenger_events": "/usr/bin/workspace-messenger-events",
+    }
+    for service_name, command in service_commands.items():
+        assert f"{service_name}_remote_mail_v1" not in services
+        service = services[service_name]
+        assert service["path"].startswith(f"{command} ")
+        assert service["before"] == [
+            {
+                "kind": "shell",
+                "command": "/usr/local/bin/workspace-wait-ready",
+            }
+        ]
+
+
+def test_backend_bootstrap_disables_shell_trace_while_using_database_password():
+    bootstrap = _read("exordos/images/backend-bootstrap.sh")
+
+    disable_trace = bootstrap.index("TRACE_ENABLED=0")
+    read_password = bootstrap.index('eval "$(')
+    clear_password = bootstrap.index("unset WORKSPACE_PG_PASS")
+    restore_trace = bootstrap.index('if [[ "$TRACE_ENABLED" -eq 1 ]]')
+
+    assert disable_trace < read_password < clear_password < restore_trace
+
+
+def test_backend_bootstrap_defers_mail_readiness_to_config_on_change():
+    bootstrap = _read("exordos/images/backend-bootstrap.sh")
+    reload_config = _read("exordos/images/workspace-reload-config.sh")
+
+    assert "workspace-mail-healthcheck" not in bootstrap
+    assert "workspace-mail-healthcheck" in reload_config
+
+    clear_ready = reload_config.index('rm -f "$READY_FILE"')
+    check_mail = reload_config.index("workspace-mail-healthcheck")
+    bootstrap_config = reload_config.index("workspace-bootstrap")
+    restart_services = reload_config.index("workspace-restart-services")
+
+    assert clear_ready < check_mail < bootstrap_config < restart_services
+
+
+def test_backend_bootstrap_defers_successfully_until_config_delivery():
+    bootstrap = _read("exordos/images/backend-bootstrap.sh")
+
+    missing_config = bootstrap.index('if [ ! -s "$WORKSPACE_CONFIG" ]')
+    deferred_exit = bootstrap.index("exit 0", missing_config)
+    read_config = bootstrap.index('python3 - "$WORKSPACE_CONFIG"')
+    publish_ready = bootstrap.index('touch "$READY_FILE"')
+
+    assert missing_config < deferred_exit < read_config < publish_ready
+
+
+def test_backend_image_supports_platform_managed_ssh_keys():
+    install_script = _read("exordos/images/backend-install.sh")
+
+    assert "    openssh-server \\\n" in install_script
+    assert "sudo systemctl enable ssh.service" in install_script
+
+
+def test_external_provider_runtime_artifacts_are_absent():
+    pyproject = _read("pyproject.toml")
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    build_config = _read("exordos/exordos.yaml")
+    install_script = _read("exordos/images/backend-install.sh")
+    restart_script = _read("exordos/images/workspace-restart-services.sh")
+
+    for content in (
+        pyproject,
+        manifest,
+        build_config,
         install_script,
+        restart_script,
+    ):
+        assert "workspace-provider-api" not in content
+        assert "workspace-mail-provider" not in content
+        assert "workspace-calendar-provider" not in content
+        assert "workspace-zulip-provider" not in content
+
+    assert "/api/workspace-service/" not in manifest
+    assert "listen 21085;" not in manifest
+    assert not list((PROJECT_ROOT / "workspace_providers").rglob("*.py"))
+    assert not list((PROJECT_ROOT / "workspace/provider_api").rglob("*.py"))
+    assert not list((PROJECT_ROOT / "workspace/groupware").rglob("*.py"))
+    assert not list(
+        (PROJECT_ROOT / "exordos/manifests").glob("workspace-*-provider.yaml.j2")
     )
 
-    assert install_command is not None
-    assert re.search(r"(?m)(?:^|\s)procps(?:\s|$)", install_command.group("packages"))
+
+def test_workspace_uses_dedicated_mail_node_and_a_secondary_projection_database():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    backend_install = _read("exordos/images/backend-install.sh")
+    backend_bootstrap = _read("exordos/images/backend-bootstrap.sh")
+    mail_install = _read("exordos/images/mail-install.sh")
+    mail_bootstrap = _read("exordos/images/mail-bootstrap.sh")
+    build_config = _read("exordos/exordos.yaml")
+
+    assert "workspace_projection_cluster" in manifest
+    assert "rebuildable PostgreSQL projection" in manifest
+    assert "postgresql-client" in backend_install
+    assert "ra-apply-migration" in backend_bootstrap
+    assert "workspace_mail:" in manifest
+    assert "name: workspace-mail" in manifest
+    assert (
+        "image: \"{{ workspace_mail_image | "
+        "default(images['workspace_mail_raw_zst'], true) }}\""
+        in manifest
+    )
+    assert "name: workspace-mail" in build_config
+    assert "script: images/mail-install.sh" in build_config
+    assert "label: data" in manifest
+    assert "[messenger_mail]" in manifest
+    assert "smtp_host = 127.0.0.1" in manifest
+    assert "workspace-mail.{$workspace.imports.$core_local_domain:name}" in manifest
+    assert "imap_host = 127.0.0.1" in manifest
+    assert "imap_port = 1143" in manifest
+    assert "dovecot-imapd" in mail_install
+    assert "exim4-daemon-light" in mail_install
+    assert "dovecot-imapd" not in backend_install
+    assert "exim4-daemon-light" not in backend_install
+    assert "prepare_persistent_disk" in mail_bootstrap
+    assert "workspace-mail-configure" in mail_bootstrap
+    assert "prepare_persistent_disk" not in backend_bootstrap
+
+
+def test_mail_root_image_can_be_pinned_for_backend_only_releases():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert (
+        "image: \"{{ workspace_mail_image | "
+        "default(images['workspace_mail_raw_zst'], true) }}\""
+        in manifest
+    )
+
+
+def test_mail_multidisk_root_uses_built_image_and_data_disk_is_image_less():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    mail_node = re.search(
+        r'(?ms)^    workspace_mail:\n'
+        r'.*?^      disk_spec:\n'
+        r'        kind: "disks"\n'
+        r'        disks:\n'
+        r'          - size: 10\n'
+        r'            image: "(?P<root_image>[^\n]+)"\n'
+        r'            label: root\n'
+        r'          - size: 20\n'
+        r'(?P<data_fields>(?:            [^\n]+\n)+?)'
+        r'(?=^\n|^  \$core\.)',
+        manifest,
+    )
+
+    assert mail_node is not None
+    assert mail_node.group("root_image") == (
+        "{{ workspace_mail_image | "
+        "default(images['workspace_mail_raw_zst'], true) }}"
+    )
+    assert "label: data" in mail_node.group("data_fields")
+    assert "image:" not in mail_node.group("data_fields")
+    assert "images['workspace_mail']" not in manifest
+
+
+def test_raw_workspace_manifest_metadata_is_yaml_before_jinja_rendering():
+    manifest = yaml.safe_load(_read("exordos/manifests/workspace.yaml.j2"))
+
+    assert manifest["name"] == "workspace"
+    assert manifest["description"] == "Workspace backend element"
+    assert manifest["schema_version"] == 1
+    assert manifest["version"] == "{{ version }}"
+
+
+def test_actual_jinja_render_supports_mail_modes_and_rejects_invalid_flags():
+    images = {
+        "workspace_backend": "urn:images:built-backend",
+        "workspace_backend_raw_zst": "urn:images:built-backend",
+        "workspace_mail_raw_zst": "urn:images:built-mail",
+    }
+    final_result = _render_workspace_manifest_with_jinja(
+        {"version": "test", "images": images}
+    )
+    assert final_result.returncode == 0, final_result.stderr
+    final = yaml.safe_load(final_result.stdout)
+    assert final["resources"]["$core.compute.nodes"]["workspace_backend"][
+        "disk_spec"
+    ]["kind"] == "root_disk"
+
+    stage1_result = _render_workspace_manifest_with_jinja(
+        {
+            "version": "test",
+            "images": images,
+            "mail_migration_stage1": True,
+            "workspace_backend_image": "urn:images:current-live-backend",
+        }
+    )
+    assert stage1_result.returncode == 0, stage1_result.stderr
+    stage1 = yaml.safe_load(stage1_result.stdout)
+    stage1_backend = stage1["resources"]["$core.compute.nodes"][
+        "workspace_backend"
+    ]
+    assert stage1_backend["disk_spec"]["kind"] == "disks"
+    assert stage1_backend["disk_spec"]["disks"][0]["image"] == (
+        "urn:images:current-live-backend"
+    )
+    stage1_config = stage1["resources"]["$core.config.configs"][
+        "workspace_backend_config"
+    ]["body"]["content"]
+    assert _messenger_mail_section(stage1_config) == (
+        STAGE1_LIVE_MESSENGER_MAIL_SECTION
+    )
+    assert "# " not in _messenger_mail_section(stage1_config)
+
+    cutover_result = _render_workspace_manifest_with_jinja(
+        {
+            "version": "test",
+            "images": images,
+            "mail_migration_cutover_keep_legacy_disk": True,
+        }
+    )
+    assert cutover_result.returncode == 0, cutover_result.stderr
+    cutover = yaml.safe_load(cutover_result.stdout)
+    cutover_resources = cutover["resources"]
+    assert cutover_resources["$core.compute.nodes"]["workspace_backend"][
+        "disk_spec"
+    ]["disks"] == [
+        {"size": 10, "image": "urn:images:built-backend", "label": "root"},
+        {"size": 20, "label": "data"},
+    ]
+    cutover_configs = cutover_resources["$core.config.configs"]
+    assert "workspace_backend_config" not in cutover_configs
+    cutover_config = cutover_configs[
+        "workspace_backend_config_remote_mail_v1"
+    ]["body"]["content"]
+    assert "smtp_host = workspace-mail." in cutover_config
+    assert "smtp_username = workspace-service" in cutover_config
+
+    missing_pin_result = _render_workspace_manifest_with_jinja(
+        {
+            "version": "test",
+            "images": images,
+            "mail_migration_stage1": True,
+        }
+    )
+    assert missing_pin_result.returncode != 0
+    assert "missing_required_manifest_var" in missing_pin_result.stderr
+
+    incompatible_result = _render_workspace_manifest_with_jinja(
+        {
+            "version": "test",
+            "images": images,
+            "mail_migration_stage1": True,
+            "mail_migration_cutover_keep_legacy_disk": True,
+            "workspace_backend_image": "urn:images:current-live-backend",
+        }
+    )
+    assert incompatible_result.returncode != 0
+    assert "incompatible_manifest_vars" in incompatible_result.stderr
+
+
+def test_stage1_mail_migration_preserves_backend_data_and_local_mail():
+    template = _read("exordos/manifests/workspace.yaml.j2")
+    assert "missing_required_manifest_var.workspace_backend_image" in template
+    manifest = _render_workspace_manifest(stage1=True)
+    resources = manifest["resources"]
+    nodes = resources["$core.compute.nodes"]
+    configs = resources["$core.config.configs"]
+    services = resources["$core.em.services"]
+
+    backend = nodes["workspace_backend"]
+    assert backend["name"] == "workspace-backend"
+    assert backend["disk_spec"] == {
+        "kind": "disks",
+        "disks": [
+            {
+                "size": 10,
+                "image": "urn:images:current-live-backend",
+                "label": "root",
+            },
+            {"size": 20, "label": "data"},
+        ],
+    }
+    assert "image" not in backend["disk_spec"]["disks"][1]
+
+    assert "workspace_backend_mail_config" not in configs
+    assert "workspace_backend_mail_bootstrap" not in services
+    assert "workspace_backend_config_remote_mail_v1" not in configs
+    assert services["workspace_bootstrap"]["path"] == (
+        "/usr/local/bin/workspace-bootstrap"
+    )
+    assert services["workspace_bootstrap"]["target"]["node"] == (
+        "$core.compute.nodes.$workspace_backend:uuid"
+    )
+
+    backend_config = configs["workspace_backend_config"]["body"]["content"]
+    assert _messenger_mail_section(backend_config) == (
+        STAGE1_LIVE_MESSENGER_MAIL_SECTION
+    )
+    assert "# " not in _messenger_mail_section(backend_config)
+
+    mail = nodes["workspace_mail"]
+    assert mail["name"] == "workspace-mail"
+    assert mail["disk_spec"]["disks"] == [
+        {"size": 10, "image": "urn:images:built-mail", "label": "root"},
+        {"size": 20, "label": "data"},
+    ]
+    assert configs["workspace_mail_config"]["target"]["node"] == (
+        "$core.compute.nodes.$workspace_mail:uuid"
+    )
+    assert services["workspace_mail_bootstrap"]["target"]["node"] == (
+        "$core.compute.nodes.$workspace_mail:uuid"
+    )
+
+
+def test_cutover_uses_new_backend_root_and_keeps_legacy_data_disk():
+    manifest = _render_workspace_manifest(stage1=False, cutover=True)
+    resources = manifest["resources"]
+    nodes = resources["$core.compute.nodes"]
+    configs = resources["$core.config.configs"]
+    services = resources["$core.em.services"]
+
+    assert nodes["workspace_backend"]["disk_spec"] == {
+        "kind": "disks",
+        "disks": [
+            {
+                "size": 10,
+                "image": "urn:images:built-backend",
+                "label": "root",
+            },
+            {"size": 20, "label": "data"},
+        ],
+    }
+    assert "workspace_backend_mail_config" not in configs
+    assert "workspace_backend_mail_bootstrap" not in services
+    assert "workspace_backend_config" not in configs
+    backend_config = configs["workspace_backend_config_remote_mail_v1"]["body"][
+        "content"
+    ]
+    assert (
+        "smtp_host = workspace-mail.{$workspace.imports.$core_local_domain:name}"
+        in backend_config
+    )
+    assert (
+        "imap_host = workspace-mail.{$workspace.imports.$core_local_domain:name}"
+        in backend_config
+    )
+    assert "smtp_username = workspace-service" in backend_config
+    assert "smtp_host = 127.0.0.1" not in backend_config
+
+
+def test_final_mail_migration_uses_root_only_backend_and_remote_mail():
+    manifest = _render_workspace_manifest(stage1=False)
+    resources = manifest["resources"]
+    nodes = resources["$core.compute.nodes"]
+    configs = resources["$core.config.configs"]
+    services = resources["$core.em.services"]
+
+    assert nodes["workspace_backend"]["disk_spec"] == {
+        "kind": "root_disk",
+        "size": 10,
+        "image": "urn:images:built-backend",
+    }
+    assert "workspace_backend_mail_config" not in configs
+    assert "workspace_backend_mail_bootstrap" not in services
+    assert "workspace_backend_config" not in configs
+
+    backend_config = configs["workspace_backend_config_remote_mail_v1"]["body"][
+        "content"
+    ]
+    assert (
+        "smtp_host = workspace-mail.{$workspace.imports.$core_local_domain:name}"
+        in backend_config
+    )
+    assert (
+        "imap_host = workspace-mail.{$workspace.imports.$core_local_domain:name}"
+        in backend_config
+    )
+    assert "smtp_host = 127.0.0.1" not in backend_config
+    assert "imap_host = 127.0.0.1" not in backend_config
+    assert "smtp_username = workspace-service" in backend_config
+    assert (
+        "smtp_password = "
+        "{$core.secret.passwords.$workspace_mail_master_password:value}"
+        in backend_config
+    )
+    assert nodes["workspace_mail"]["disk_spec"]["disks"][1] == {
+        "size": 20,
+        "label": "data",
+    }
+
+
+def test_mail_node_is_discovered_through_the_core_local_domain():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert "$workspace.imports.$core_local_domain.records:" in manifest
+    assert "name: workspace-mail" in manifest
+    assert (
+        "address: $core.compute.nodes.$workspace_mail:default_network:ipv4"
+        in manifest
+    )
+    assert "workspace-mail.{$workspace.imports.$core_local_domain:name}" in manifest
+
+
+def test_mail_services_use_authenticated_internal_network_and_disable_os_logins():
+    dovecot = _read("etc/dovecot/99-workspace-messenger.conf")
+    exim_router = _read("etc/exim4/workspace-messenger-router.conf")
+    exim_transport = _read("etc/exim4/workspace-messenger-transport.conf")
+    exim_local_parts = _read("etc/exim4/workspace-messenger-local-parts")
+    exim_auth = _read("etc/exim4/workspace-messenger-auth.conf")
+    install_script = _read("exordos/images/mail-install.sh")
+
+    assert "listen = 0.0.0.0" in dovecot
+    assert "auth_allow_cleartext = yes" in dovecot
+    assert "auth_mechanisms = plain login" in dovecot
+    assert "disable_plaintext_auth" not in dovecot
+    assert "mail_driver = maildir" in dovecot
+    assert "mail_path = ~/Maildir" in dovecot
+    assert "mail_inbox_path = ~/Maildir" in dovecot
+    assert (
+        "mail_index_path = /run/workspace/dovecot-indexes/"
+        "%{user | domain}/%{user | username}"
+    ) in dovecot
+    assert "mail_control_path" not in dovecot
+    assert "separator = /" in dovecot
+    assert 'mailbox "Workspace/State"' in dovecot
+    assert 'mailbox "Workspace/Events"' in dovecot
+    assert "Workspace.State" not in dovecot
+    assert "Workspace.Events" not in dovecot
+    assert "mail_location" not in dovecot
+    assert "passdb workspace-master {" in dovecot
+    assert "master = yes" in dovecot
+    assert "result_success = continue" in dovecot
+    assert "passwd_file_path = /etc/dovecot/workspace-master.passwd" in dovecot
+    assert "passdb workspace-authorized {" in dovecot
+    assert "static_password = {CRYPT}*" in dovecot
+    assert "userdb workspace-static {" in dovecot
+    assert "driver = static" in dovecot
+    assert "disables OS-user IMAP authentication" in install_script
+    assert "dc_local_interfaces='0.0.0.0'" in install_script
+    assert "public_name = PLAIN" in exim_auth
+    assert "/etc/exim4/workspace-smtp.passwd" in exim_auth
+    assert "$authenticated_id" in exim_router
+    assert "domains = messenger.workspace.invalid" in exim_router
+    assert (
+        "local_parts = nwildlsearch,ret=key;"
+        "/etc/exim4/workspace-messenger-local-parts"
+    ) in exim_router
+    assert "^(?-i)u-[0-9a-f]{32}$:" in exim_local_parts
+    assert "$local_part_data@$domain_data" in exim_transport
+    assert "$local_part@$domain" not in exim_transport
+    assert "$sender_address" not in exim_transport
+    assert "workspace-messenger-local-parts" in install_script
+
+
+def test_dovecot_rebuildable_indexes_are_created_on_the_runtime_filesystem():
+    configure_script = _read("exordos/images/workspace-mail-configure.sh")
+    dovecot = _read("etc/dovecot/99-workspace-messenger.conf")
+    install_script = _read("exordos/images/mail-install.sh")
+
+    assert "/run/workspace/dovecot-indexes" in configure_script
+    assert "-m 0750 -o workspace -g workspace" in configure_script
+    assert "mail_index_path = /run/workspace/dovecot-indexes/" in dovecot
+    assert "mail_index_path = /var/lib/workspace" not in dovecot
+    assert "doveconf -n | /usr/local/bin/workspace-dovecot-validate" in (
+        configure_script
+    )
+    assert (
+        "workspace-dovecot-validate.py" in install_script
+    )
+
+
+def test_effective_dovecot_config_rejects_index_path_overrides():
+    validator = PROJECT_ROOT / "exordos/images/workspace-dovecot-validate.py"
+    runtime_path = (
+        "/run/workspace/dovecot-indexes/%{user | domain}/%{user | username}"
+    )
+
+    valid = subprocess.run(
+        [sys.executable, validator],
+        input=f"mail_driver = maildir\nmail_index_path = {runtime_path}\n",
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert valid.returncode == 0
+
+    invalid_configs = (
+        "mail_driver = maildir\n",
+        "mail_index_path = /var/lib/workspace/messenger/mail/indexes\n",
+        f"mail_index_path = {runtime_path}\n  mail_index_path = {runtime_path}\n",
+        f"  mail_index_path = {runtime_path}\n",
+        f"mail_index_path = {runtime_path}\nmail_index_path = /tmp/override\n",
+        (
+            f"mail_index_path = {runtime_path}\n"
+            "mail_control_path = /run/workspace/dovecot-control/%{user}\n"
+        ),
+        (
+            f"mail_index_path = {runtime_path}\n"
+            "  mail_control_path = /tmp/namespace-control\n"
+        ),
+        (
+            f"mail_index_path = {runtime_path}\n"
+            "mail_cache_path = /var/lib/workspace/dovecot-cache/%{user}\n"
+        ),
+        (
+            f"mail_index_path = {runtime_path}\n"
+            "mail_index_private_path = /var/lib/workspace/dovecot-private/%{user}\n"
+        ),
+        (
+            f"mail_index_path = {runtime_path}\n"
+            "  mail_cache_path = /tmp/namespace-cache\n"
+        ),
+    )
+    for effective_config in invalid_configs:
+        invalid = subprocess.run(
+            [sys.executable, validator],
+            input=effective_config,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        assert invalid.returncode == 1
+
+
+def test_deployment_mail_option_names_match_runtime_factory():
+    local_config = _read("etc/workspace/workspace.conf")
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    configure_script = _read("exordos/images/workspace-mail-configure.sh")
+    healthcheck = _read("exordos/images/workspace-mail-healthcheck.py")
+    runtime = _read("workspace/messenger_mail/runtime.py")
+
+    for option in (
+        "imap_master_username",
+        "imap_master_password",
+        "event_mailbox_prefix",
+    ):
+        assert option in local_config
+        assert option in manifest
+        assert option in runtime
+
+    for content in (local_config, manifest):
+        assert "state_mailbox = Workspace/State" in content
+        assert "event_mailbox_prefix = Workspace/Events" in content
+        assert "Workspace.State" not in content
+        assert "Workspace.Events" not in content
+
+    assert 'config["messenger_mail"]["imap_master_username"]' in configure_script
+    assert 'config["messenger_mail"]["imap_master_password"]' in configure_script
+    assert "mail['imap_master_username']" in healthcheck
+    assert 'mail["imap_master_password"]' in healthcheck
+    assert 'smtp.login(mail["smtp_username"], mail["smtp_password"])' in healthcheck
+
+    for stale_option in ("master_username", "master_password", "events_mailbox"):
+        pattern = rf"(?m)^\s*{re.escape(stale_option)}\s*="
+        assert re.search(pattern, local_config) is None
+        assert re.search(pattern, manifest) is None
+
+
+def test_element_builds_and_serves_the_existing_workspace_ui():
+    build_config = _read("exordos/exordos.yaml")
+    install_script = _read("exordos/images/backend-install.sh")
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert "../../workspace_ui" in build_config
+    assert "node_modules" in build_config
+    assert "npm ci --include=dev" in install_script
+    assert "VITE_MESSENGER_ONLY=true npm run build --workspace=web" in install_script
+    assert "packages/web/dist/index.html" in install_script
+    assert "root /opt/workspace-ui/packages/web/dist;" in manifest
+    assert "try_files $uri $uri/ /index.html;" in manifest
+    assert "127.0.0.1:5173" not in manifest
+
+
+def test_element_workflow_checks_out_compatible_ui_and_publishes():
+    workflow = _read(".github/workflows/exordos-element.yml")
+
+    assert (
+        "WORKSPACE_UI_REF: 183508d5dd90efa8ab3ccf24c9e5aaaf8fe50ef3"
+        in workflow
+    )
+    assert 'ui_dir="${GITHUB_WORKSPACE}/../workspace_ui"' in workflow
+    assert 'fetch --depth=1 origin "${WORKSPACE_UI_REF}"' in workflow
+    assert (
+        "https://github.com/exordos/exordos/releases/download/"
+        "3.0.2/exordos-linux"
+        in workflow
+    )
+    assert (
+        "469007b01253f69b5fcf540b8f6605a360c2539019a5b148fbabb0353bee6a5b"
+        in workflow
+    )
+    for curl_option in (
+        "--connect-timeout 30",
+        "--max-time 180",
+        "--retry 4",
+        "--retry-all-errors",
+        "--retry-delay 5",
+        "--retry-max-time 600",
+    ):
+        assert curl_option in workflow
+    assert '--output "${exordos_download}"' in workflow
+    assert 'mv "${exordos_download}" "${exordos_bin}"' in workflow
+    assert '"${EXORDOS_BIN}" version' in workflow
+    assert '"${EXORDOS_BIN}" build .' in workflow
+    assert '"${EXORDOS_BIN}" push .' in workflow
+    publish_step = workflow.split("      - name: Publish element", maxsplit=1)[1]
+    assert "\n        if:" not in publish_step.split(
+        "\n      - name:", maxsplit=1
+    )[0]

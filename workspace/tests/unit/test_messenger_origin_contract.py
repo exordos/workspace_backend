@@ -106,17 +106,6 @@ ROUTE_MANIFEST = {
             ra_routes.DELETE,
         },
     ),
-    "external_accounts": (
-        routes.ExternalAccountRoute,
-        controllers.ExternalAccountController,
-        {
-            ra_routes.CREATE,
-            ra_routes.FILTER,
-            ra_routes.GET,
-            ra_routes.UPDATE,
-            ra_routes.DELETE,
-        },
-    ),
     "users": (
         routes.WorkspaceUserRoute,
         controllers.WorkspaceUserController,
@@ -184,6 +173,14 @@ ACTION_MANIFEST = {
         False,
     ),
     (routes.WorkspaceUserRoute, "presence"): (
+        controllers.WorkspaceUserController,
+        True,
+    ),
+    (routes.WorkspaceUserRoute, "avatar_upload"): (
+        controllers.WorkspaceUserController,
+        True,
+    ),
+    (routes.WorkspaceUserRoute, "avatar_reset"): (
         controllers.WorkspaceUserController,
         True,
     ),
@@ -268,7 +265,10 @@ def test_file_upload_openapi_keeps_required_multipart_contract():
 
     assert request_body["required"] is True
     assert set(request_body["content"]) == {"multipart/form-data"}
-    properties = request_body["content"]["multipart/form-data"]["schema"]["properties"]
+    schema = request_body["content"]["multipart/form-data"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["required"] == ["file", "stream_uuid"]
+    properties = schema["properties"]
     assert properties == {
         "file": {"format": "binary", "type": "string"},
         "stream_uuid": {"format": "uuid", "type": "string"},

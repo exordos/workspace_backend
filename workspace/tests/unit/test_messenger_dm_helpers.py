@@ -1078,6 +1078,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
     def test_delete_workspace_stream_binding_sends_removed_user_events(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
+        remaining_user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         binding_uuid = sys_uuid.uuid4()
         custom_folder_uuid = sys_uuid.uuid4()
@@ -1146,6 +1147,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 ("file_accesses.deleted", kwargs)
             ),
         ) as delete_file_accesses, mock.patch.object(
+            dm_helpers.models,
+            "get_stream_recipients",
+            return_value=[user_uuid, remaining_user_uuid],
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_stream_binding_deleted_events",
+            side_effect=lambda *args, **kwargs: order.append(
+                ("stream_binding.deleted", args, kwargs)
+            ),
+        ) as create_binding_deleted, mock.patch.object(
             dm_helpers.messenger_events,
             "create_folder_updated_event",
             side_effect=create_folder_updated_event,
@@ -1188,6 +1199,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             source=user_stream.source,
             session=session,
         )
+        create_binding_deleted.assert_called_once_with(
+            mock.ANY,
+            [remaining_user_uuid],
+            session=session,
+        )
         self.assertEqual(3, get_user_folder.call_count)
         create_folder_updated.assert_has_calls(
             [
@@ -1200,6 +1216,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             [
                 "stream.deleted",
                 "file_accesses.deleted",
+                "stream_binding.deleted",
                 "delete",
                 "folder.updated",
                 "folder.updated",
@@ -3866,11 +3883,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
+            session=session,
         )
         get_stream.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         FakeFolderItem.objects.get_all.assert_called_once()
         filters = FakeFolderItem.objects.get_all.call_args.kwargs["filters"]
@@ -3883,16 +3902,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=custom_folder_uuid,
+                    session=session,
                 ),
             ],
             get_folder.call_args_list,
@@ -4127,6 +4149,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
+            session=session,
         )
         create_event.assert_called_once_with(
             folder=returned_folder,
@@ -4136,16 +4159,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             item_uuid=item_uuid,
+            session=session,
         )
 
     def test_delete_workspace_user_folder_item_deletes_event_with_item_id(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         item_uuid = sys_uuid.uuid4()
+        folder_uuid = sys_uuid.uuid4()
         session = object()
         deleted_item = {}
+        returned_folder = types.SimpleNamespace(uuid=folder_uuid)
 
         class ExistingItem:
+            def __init__(self):
+                self.folder_uuid = folder_uuid
+
             def delete(self, session=None):
                 deleted_item["delete_session"] = session
 
@@ -4160,7 +4189,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             dm_helpers.models, "FolderItem", FakeFolderItem
         ), mock.patch.object(
             dm_helpers.messenger_events, "create_folder_item_deleted_event"
-        ) as create_event:
+        ) as create_event, mock.patch.object(
+            dm_helpers.messenger_events, "create_folder_updated_event"
+        ) as create_folder_event, mock.patch.object(
+            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        ) as get_user_folder:
             result = dm_helpers.delete_workspace_user_folder_item(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4175,6 +4208,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             item_uuid=item_uuid,
+            session=session,
+        )
+        get_user_folder.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            folder_uuid=folder_uuid,
+            session=session,
+        )
+        create_folder_event.assert_called_once_with(
+            folder=returned_folder,
             session=session,
         )
 
@@ -4453,7 +4496,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceFile:
             def __init__(self, **kwargs):
                 created_file.update(kwargs)
-                self.uuid = kwargs["uuid"]
+                for name, value in kwargs.items():
+                    setattr(self, name, value)
 
             def insert(self, session=None):
                 created_file["insert_session"] = session
@@ -4476,7 +4520,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             return_value=[user_uuid, other_user_uuid],
         ) as get_recipients, mock.patch.object(
             dm_helpers, "get_or_create_workspace_file_access"
-        ) as get_access:
+        ) as get_access, mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_file_created_events",
+        ) as create_events:
             result = dm_helpers.create_workspace_file(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4527,6 +4574,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
         self.assertEqual(2, get_access.call_count)
+        create_events.assert_called_once_with(
+            result,
+            [user_uuid, other_user_uuid],
+            session=session,
+        )
 
     def test_create_workspace_stream_binding_file_accesses_grants_stream_files(self):
         project_id = sys_uuid.uuid4()
@@ -4704,12 +4756,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 updated_file["update_session"] = session
 
         existing_file = ExistingFile()
+        recipients = [user_uuid]
 
         with mock.patch.object(
             dm_helpers,
             "get_workspace_owned_file",
             return_value=existing_file,
-        ) as get_file:
+        ) as get_file, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_file_event_recipients",
+            return_value=recipients,
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_file_updated_events",
+        ) as create_events:
             result = dm_helpers.update_workspace_file(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4726,6 +4786,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual({"name": "renamed.txt"}, updated_file["values"])
         self.assertIs(session, updated_file["update_session"])
+        create_events.assert_called_once_with(
+            existing_file,
+            recipients,
+            session=session,
+        )
 
     def test_delete_workspace_file_deletes_owned_file(self):
         project_id = sys_uuid.uuid4()
@@ -4739,12 +4804,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 deleted_file["delete_session"] = session
 
         existing_file = ExistingFile()
+        existing_file.uuid = file_uuid
+        existing_file.stream_uuid = sys_uuid.uuid4()
+        recipients = [user_uuid]
 
         with mock.patch.object(
             dm_helpers,
             "get_workspace_owned_file",
             return_value=existing_file,
-        ) as get_file:
+        ) as get_file, mock.patch.object(
+            dm_helpers,
+            "_get_workspace_file_event_recipients",
+            return_value=recipients,
+        ), mock.patch.object(
+            dm_helpers.messenger_events,
+            "create_file_deleted_events",
+        ) as create_events:
             result = dm_helpers.delete_workspace_file(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4759,6 +4834,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             file_uuid=file_uuid,
         )
         self.assertIs(session, deleted_file["delete_session"])
+        create_events.assert_called_once_with(
+            project_id,
+            existing_file.stream_uuid,
+            file_uuid,
+            recipients,
+            session=session,
+        )
 
 
 if __name__ == "__main__":

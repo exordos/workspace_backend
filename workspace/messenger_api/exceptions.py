@@ -53,3 +53,36 @@ class InvalidTopicNotificationModeError(ra_exc.ValidationErrorException):
 class StreamDefaultTopicNotConfiguredError(ra_exc.ValidationErrorException):
     message = "Stream default topic is not configured"
     code = 400001007
+
+
+class EventsCursorExpiredError(ra_exc.RestAlchemyException):
+    """The saved events cursor can no longer produce a complete delta."""
+
+    message = "The saved events cursor is outside the retained event journal"
+    code = 410
+
+    def __init__(
+        self,
+        *,
+        reason,
+        epoch_generation,
+        current_epoch_version,
+        minimum_epoch_version,
+    ):
+        super().__init__()
+        self.reason = reason
+        self.epoch_generation = epoch_generation
+        self.current_epoch_version = current_epoch_version
+        self.minimum_epoch_version = minimum_epoch_version
+
+    def as_dict(self):
+        return {
+            "type": self.__class__.__name__,
+            "code": self.code,
+            "error": "epoch_pruned",
+            "message": self.msg,
+            "reason": self.reason,
+            "epoch_generation": self.epoch_generation,
+            "current_epoch_version": self.current_epoch_version,
+            "minimum_epoch_version": self.minimum_epoch_version,
+        }

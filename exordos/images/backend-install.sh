@@ -23,16 +23,17 @@ set -o pipefail
 GC_PATH="/opt/workspace"
 GC_CFG_DIR=/etc/workspace
 VENV_PATH="$GC_PATH/.venv"
+UI_PATH="/opt/workspace-ui"
 
 WORKSPACE_BINARIES=(
     workspace-api
-    workspace-provider-api
     workspace-messenger-api
     workspace-messenger-worker
     workspace-messenger-events
 )
 WORKSPACE_HELPERS=(
     backend-bootstrap.sh:workspace-bootstrap
+    workspace-mail-healthcheck.py:workspace-mail-healthcheck
     workspace-nginx-reload.sh:workspace-nginx-reload
     workspace-reload-config.sh:workspace-reload-config
     workspace-restart-services.sh:workspace-restart-services
@@ -49,11 +50,37 @@ disable_packaged_nginx_service() {
 }
 
 sudo apt update
-sudo apt install -y \
+sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+    ca-certificates \
+    curl \
     libev-dev \
     nginx \
+    openssh-server \
     postgresql-client \
     procps
+
+sudo systemctl enable ssh.service
+
+node_major=0
+if command -v node >/dev/null 2>&1; then
+    node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
+fi
+if (( node_major < 22 )); then
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs
+fi
+
+if ! getent group workspace >/dev/null; then
+    sudo groupadd --system workspace
+fi
+if ! getent passwd workspace >/dev/null; then
+    sudo useradd \
+        --system \
+        --gid workspace \
+        --home-dir /var/lib/workspace \
+        --shell /usr/sbin/nologin \
+        workspace
+fi
 
 sudo mkdir -p \
     "$GC_CFG_DIR" \
@@ -67,6 +94,11 @@ sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 
 cd "$GC_PATH"
 uv sync --locked --no-dev
+
+cd "$UI_PATH"
+npm ci --include=dev
+VITE_MESSENGER_ONLY=true npm run build --workspace=web
+test -s "$UI_PATH/packages/web/dist/index.html"
 
 for binary in "${WORKSPACE_BINARIES[@]}"; do
     sudo ln -sf "$VENV_PATH/bin/$binary" "/usr/bin/$binary"

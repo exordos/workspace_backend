@@ -15,8 +15,11 @@
 #    under the License.
 
 import dataclasses
+import datetime
+import json
 import os
 import pathlib
+import uuid as sys_uuid
 
 from oslo_config import cfg
 
@@ -34,6 +37,93 @@ class WorkspaceFileStorageInfo:
     storage_object_id: str
 
 
+@dataclasses.dataclass(frozen=True)
+class WorkspaceFileMetadata:
+    uuid: sys_uuid.UUID
+    project_id: sys_uuid.UUID
+    stream_uuid: sys_uuid.UUID | None
+    owner_uuid: sys_uuid.UUID
+    name: str
+    description: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    created_at: datetime.datetime
+    acl_mode: str = "stream_members"
+
+    def to_json(self):
+        created_at = self.created_at
+        if created_at.tzinfo is None:
+            raise ValueError("File metadata timestamp must be timezone-aware")
+        if self.acl_mode == "stream_members":
+            if self.stream_uuid is None:
+                raise ValueError("Stream file metadata requires a stream UUID")
+            acl = {
+                "mode": self.acl_mode,
+                "stream_uuid": str(self.stream_uuid),
+            }
+        elif self.acl_mode == "public":
+            if self.stream_uuid is not None:
+                raise ValueError("Public file metadata must not have a stream UUID")
+            acl = {"mode": self.acl_mode}
+        else:
+            raise ValueError("Unsupported file metadata ACL mode")
+        payload = {
+            "acl": acl,
+            "content_type": self.content_type,
+            "created_at": created_at.astimezone(
+                datetime.timezone.utc,
+            ).isoformat(),
+            "description": self.description,
+            "name": self.name,
+            "owner_uuid": str(self.owner_uuid),
+            "project_id": str(self.project_id),
+            "schema_version": 1,
+            "sha256": self.sha256,
+            "size_bytes": self.size_bytes,
+            "uuid": str(self.uuid),
+        }
+        if self.stream_uuid is not None:
+            payload["stream_uuid"] = str(self.stream_uuid)
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @classmethod
+    def from_json(cls, value):
+        data = json.loads(value.decode("utf-8"))
+        if data["schema_version"] != 1:
+            raise ValueError("Unsupported file metadata schema version")
+        acl_mode = data["acl"]["mode"]
+        if acl_mode not in ("stream_members", "public"):
+            raise ValueError("Unsupported file metadata ACL mode")
+        stream_uuid = data.get("stream_uuid")
+        if acl_mode == "stream_members" and (
+            stream_uuid is None or data["acl"].get("stream_uuid") != stream_uuid
+        ):
+            raise ValueError("File metadata ACL stream does not match file stream")
+        if acl_mode == "public" and (
+            stream_uuid is not None or "stream_uuid" in data["acl"]
+        ):
+            raise ValueError("Public file metadata must not have a stream UUID")
+        return cls(
+            uuid=sys_uuid.UUID(data["uuid"]),
+            project_id=sys_uuid.UUID(data["project_id"]),
+            stream_uuid=(None if stream_uuid is None else sys_uuid.UUID(stream_uuid)),
+            owner_uuid=sys_uuid.UUID(data["owner_uuid"]),
+            name=data["name"],
+            description=data["description"],
+            content_type=data["content_type"],
+            size_bytes=data["size_bytes"],
+            sha256=data["sha256"],
+            created_at=datetime.datetime.fromisoformat(data["created_at"]),
+            acl_mode=acl_mode,
+        )
+
+
 def get_default_storage_type():
     return CONF[file_storage_opts.DOMAIN].default_type
 
@@ -48,6 +138,11 @@ def get_storage_path():
 def get_workspace_file_object_id(file_uuid):
     file_name = str(file_uuid)
     return f"{file_name[:2]}/{file_name}"
+
+
+def get_workspace_file_metadata_object_id(file_uuid):
+    file_name = str(file_uuid)
+    return f"metadata/{file_name[:2]}/{file_name}.json"
 
 
 def _get_local_file_path(storage_object_id, storage_path=None):
@@ -98,6 +193,24 @@ class LocalWorkspaceFileStorage:
             file_uuid=file_uuid,
             storage_object_id=storage_object_id,
         )
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def save_metadata(self, file_uuid, metadata):
+        path = _get_local_file_path(get_workspace_file_metadata_object_id(file_uuid))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(f"{path.name}.tmp")
+        temporary_path.write_bytes(metadata.to_json())
+        os.replace(temporary_path, path)
+
+    def read_metadata(self, file_uuid):
+        path = _get_local_file_path(get_workspace_file_metadata_object_id(file_uuid))
+        return WorkspaceFileMetadata.from_json(path.read_bytes())
+
+    def delete_metadata(self, file_uuid):
+        path = _get_local_file_path(get_workspace_file_metadata_object_id(file_uuid))
         try:
             path.unlink()
         except FileNotFoundError:
@@ -166,6 +279,27 @@ class S3WorkspaceFileStorage:
             Key=object_id,
         )
 
+    def save_metadata(self, file_uuid, metadata):
+        self.client.put_object(
+            Body=metadata.to_json(),
+            Bucket=self.bucket_name,
+            ContentType="application/json",
+            Key=get_workspace_file_metadata_object_id(file_uuid),
+        )
+
+    def read_metadata(self, file_uuid):
+        response = self.client.get_object(
+            Bucket=self.bucket_name,
+            Key=get_workspace_file_metadata_object_id(file_uuid),
+        )
+        return WorkspaceFileMetadata.from_json(response["Body"].read())
+
+    def delete_metadata(self, file_uuid):
+        self.client.delete_object(
+            Bucket=self.bucket_name,
+            Key=get_workspace_file_metadata_object_id(file_uuid),
+        )
+
 
 def get_workspace_file_storage(storage_type=None):
     storage_type = storage_type or get_default_storage_type()
@@ -176,8 +310,9 @@ def get_workspace_file_storage(storage_type=None):
     raise ValueError(f"Unsupported workspace file storage type: {storage_type}")
 
 
-def get_workspace_file_storage_info(file_uuid, storage_type=None,
-                                    storage_object_id=None):
+def get_workspace_file_storage_info(
+    file_uuid, storage_type=None, storage_object_id=None
+):
     storage = get_workspace_file_storage(storage_type=storage_type)
     return WorkspaceFileStorageInfo(
         storage_type=storage.storage_type,
@@ -188,8 +323,7 @@ def get_workspace_file_storage_info(file_uuid, storage_type=None,
     )
 
 
-def save_workspace_file(file_uuid, data, storage_type=None,
-                        storage_object_id=None):
+def save_workspace_file(file_uuid, data, storage_type=None, storage_object_id=None):
     storage = get_workspace_file_storage(storage_type=storage_type)
     return storage.save(
         file_uuid=file_uuid,
@@ -212,3 +346,18 @@ def delete_workspace_file(file_uuid, storage_type=None, storage_object_id=None):
         file_uuid=file_uuid,
         storage_object_id=storage_object_id,
     )
+
+
+def save_workspace_file_metadata(metadata, storage_type=None):
+    storage = get_workspace_file_storage(storage_type=storage_type)
+    storage.save_metadata(metadata.uuid, metadata)
+
+
+def read_workspace_file_metadata(file_uuid, storage_type=None):
+    storage = get_workspace_file_storage(storage_type=storage_type)
+    return storage.read_metadata(file_uuid)
+
+
+def delete_workspace_file_metadata(file_uuid, storage_type=None):
+    storage = get_workspace_file_storage(storage_type=storage_type)
+    storage.delete_metadata(file_uuid)

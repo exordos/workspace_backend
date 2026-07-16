@@ -27,5 +27,13 @@ if [ ! -s "$WORKSPACE_CONFIG" ]; then
 fi
 
 rm -f "$READY_FILE"
+
+attempt=1
+until /usr/local/bin/workspace-mail-healthcheck "$WORKSPACE_CONFIG"; do
+    echo "Workspace mail service attempt $attempt is not ready; waiting 5 seconds"
+    sleep 5
+    attempt=$((attempt + 1))
+done
+
 /usr/local/bin/workspace-bootstrap
 /usr/local/bin/workspace-restart-services

@@ -5,7 +5,6 @@
 
 from restalchemy.api import routes
 
-from workspace.groupware.api import routes as groupware_routes
 from workspace.messenger_api.api import routes as messenger_routes
 from workspace.user_api.api import routes as user_routes
 from workspace.workspace_api.api import controllers
@@ -27,22 +26,7 @@ class MessengerRoute(routes.Route):
     files = routes.route(messenger_routes.WorkspaceFileRoute)
 
 
-class MailRoute(groupware_routes.MailRoute):
-    __controller__ = controllers.MailApiEndpointController
-    __allow_methods__ = [routes.FILTER]
-
-
-class CalendarRoute(groupware_routes.CalendarApiRoute):
-    __controller__ = controllers.CalendarApiEndpointController
-    __allow_methods__ = [routes.FILTER]
-
-
 class ServiceRoute(user_routes.ServiceRoute):
-    __allow_methods__ = [routes.FILTER, routes.GET]
-
-
-class ProviderCatalogRoute(routes.Route):
-    __controller__ = controllers.WorkspaceProviderCatalogController
     __allow_methods__ = [routes.FILTER, routes.GET]
 
 
@@ -52,10 +36,7 @@ class WorkspaceApiEndpointRoute(routes.Route):
 
     users = routes.route(messenger_routes.WorkspaceUserRoute)
     services = routes.route(ServiceRoute)
-    providers = routes.route(ProviderCatalogRoute)
     me = routes.route(messenger_routes.MeRoute)
     events = routes.route(messenger_routes.WorkspaceEventRoute)
     epoch = routes.route(messenger_routes.WorkspaceEpochRoute)
     messenger = routes.route(MessengerRoute)
-    mail = routes.route(MailRoute)
-    calendar = routes.route(CalendarRoute)

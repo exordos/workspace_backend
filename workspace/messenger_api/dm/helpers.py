@@ -106,21 +106,22 @@ def _should_create_workspace_user_presence_event(user, values):
     return False
 
 
-def update_workspace_user_presence(
-    project_id, user_uuid, current_user_uuid, values, session=None
-):
+def get_workspace_own_user(user_uuid, current_user_uuid, session=None):
     if user_uuid != current_user_uuid:
         raise storage_exc.RecordNotFound(
             model=models.WorkspaceUser.__name__,
             filters={"uuid": user_uuid},
         )
-
-    user = models.WorkspaceUser.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(user_uuid),
-        },
+    return models.WorkspaceUser.objects.get_one(
+        filters={"uuid": dm_filters.EQ(user_uuid)},
         session=session,
     )
+
+
+def update_workspace_user_presence(
+    project_id, user_uuid, current_user_uuid, values, session=None
+):
+    user = get_workspace_own_user(user_uuid, current_user_uuid, session=session)
     values = dict(values)
     should_create_event = _should_create_workspace_user_presence_event(
         user=user,
@@ -130,6 +131,21 @@ def update_workspace_user_presence(
     user.update_dm(values=values)
     user.update(session=session)
     if should_create_event:
+        _create_workspace_user_updated_events(
+            project_id=project_id,
+            user=user,
+            session=session,
+        )
+    return user
+
+
+def update_workspace_user_avatar(user_uuid, current_user_uuid, avatar, session=None):
+    user = get_workspace_own_user(user_uuid, current_user_uuid, session=session)
+    if user.avatar == avatar:
+        return user
+    user.update_dm(values={"avatar": avatar})
+    user.update(session=session)
+    for project_id in _get_workspace_event_project_ids():
         _create_workspace_user_updated_events(
             project_id=project_id,
             user=user,
@@ -160,17 +176,18 @@ def mark_stale_workspace_users_offline(now=None, session=None):
     return users
 
 
-def get_workspace_user_folder(project_id, user_uuid, folder_uuid):
+def get_workspace_user_folder(project_id, user_uuid, folder_uuid, session=None):
     return models.UserFolder.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(folder_uuid),
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
         },
+        session=session,
     )
 
 
-def get_workspace_user_folder_item(project_id, user_uuid, item_uuid):
+def get_workspace_user_folder_item(project_id, user_uuid, item_uuid, session=None):
     filters = {
         "uuid": dm_filters.EQ(item_uuid),
         "project_id": dm_filters.EQ(project_id),
@@ -179,6 +196,7 @@ def get_workspace_user_folder_item(project_id, user_uuid, item_uuid):
     try:
         return models.UserFolderItem.objects.get_one(
             filters=filters,
+            session=session,
         )
     except storage_exc.RecordNotFound:
         system_item_model = SYSTEM_FOLDER_ITEM_MODELS.get(str(item_uuid)[:2])
@@ -186,6 +204,7 @@ def get_workspace_user_folder_item(project_id, user_uuid, item_uuid):
             raise
         return system_item_model.objects.get_one(
             filters=filters,
+            session=session,
         )
 
 
@@ -227,13 +246,14 @@ def _create_workspace_user_folder_item_from_view(
     return folder_item
 
 
-def get_workspace_user_stream(project_id, user_uuid, stream_uuid):
+def get_workspace_user_stream(project_id, user_uuid, stream_uuid, session=None):
     return models.WorkspaceUserStream.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(stream_uuid),
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
         },
+        session=session,
     )
 
 
@@ -285,6 +305,12 @@ def get_workspace_owned_file(project_id, user_uuid, file_uuid):
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
         },
+    )
+
+
+def get_workspace_file_by_uuid(file_uuid):
+    return models.WorkspaceFile.objects.get_one(
+        filters={"uuid": dm_filters.EQ(file_uuid)},
     )
 
 
@@ -396,7 +422,69 @@ def create_workspace_file(project_id, user_uuid, uuid, session=None, **values):
             user_uuid=stream_user_uuid,
             session=session,
         )
+    messenger_events.create_file_created_events(
+        file,
+        stream_user_uuids,
+        session=session,
+    )
     return file
+
+
+def create_workspace_avatar_file(project_id, user_uuid, uuid, session=None, **values):
+    file = models.WorkspaceFile(
+        uuid=uuid,
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=None,
+        **values,
+    )
+    file.insert(session=session)
+    recipient_user_uuids = _get_workspace_file_event_recipients(
+        project_id,
+        file,
+        session=session,
+    )
+    messenger_events.create_file_created_events(
+        file,
+        recipient_user_uuids,
+        session=session,
+    )
+    return file
+
+
+def _get_workspace_file_event_recipients(project_id, file, session=None):
+    if file.stream_uuid is not None:
+        return models.get_stream_recipients(
+            project_id=project_id,
+            stream_uuid=file.stream_uuid,
+            session=session,
+        )
+    return [
+        user.uuid
+        for user in models.WorkspaceUser.objects.get_all(session=session)
+    ]
+
+
+def delete_workspace_avatar_file(user_uuid, file_uuid, session=None):
+    file = models.WorkspaceFile.objects.get_one_or_none(
+        filters={
+            "uuid": dm_filters.EQ(file_uuid),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+    if file is not None and file.stream_uuid is None:
+        recipient_user_uuids = _get_workspace_file_event_recipients(
+            file.project_id,
+            file,
+            session=session,
+        )
+        messenger_events.create_file_deleted_events(
+            file,
+            recipient_user_uuids,
+            session=session,
+        )
+        file.delete(session=session)
 
 
 def update_workspace_file(project_id, user_uuid, file_uuid, values, session=None):
@@ -407,6 +495,16 @@ def update_workspace_file(project_id, user_uuid, file_uuid, values, session=None
     )
     file.update_dm(values=values)
     file.update(session=session)
+    recipient_user_uuids = _get_workspace_file_event_recipients(
+        project_id,
+        file,
+        session=session,
+    )
+    messenger_events.create_file_updated_events(
+        file,
+        recipient_user_uuids,
+        session=session,
+    )
     return file
 
 
@@ -415,6 +513,18 @@ def delete_workspace_file(project_id, user_uuid, file_uuid, session=None):
         project_id=project_id,
         user_uuid=user_uuid,
         file_uuid=file_uuid,
+    )
+    recipient_user_uuids = _get_workspace_file_event_recipients(
+        project_id,
+        file,
+        session=session,
+    )
+    messenger_events.create_file_deleted_events(
+        project_id,
+        file.stream_uuid,
+        file.uuid,
+        recipient_user_uuids,
+        session=session,
     )
     file.delete(session=session)
 
@@ -425,8 +535,16 @@ def build_private_stream_index(user_uuid, direct_user_uuid):
     return ":".join(sorted([str(user_uuid), str(direct_user_uuid)]))
 
 
-def _create_owner_binding(project_id, stream_uuid, user_uuid, who_uuid, session=None):
+def _create_owner_binding(
+    project_id,
+    stream_uuid,
+    user_uuid,
+    who_uuid,
+    session=None,
+    uuid=None,
+):
     binding = models.WorkspaceStreamBinding(
+        uuid=uuid or sys_uuid.uuid4(),
         project_id=project_id,
         stream_uuid=stream_uuid,
         user_uuid=user_uuid,
@@ -541,6 +659,7 @@ def _create_unread_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
     except storage_exc.RecordNotFound:
         return
@@ -551,6 +670,7 @@ def _create_unread_updated_events(
                 project_id=project_id,
                 user_uuid=user_uuid,
                 topic_uuid=topic_uuid,
+                session=session,
             )
         except storage_exc.RecordNotFound:
             continue
@@ -574,6 +694,7 @@ def _create_unread_updated_events(
             project_id=project_id,
             user_uuid=target_user_uuid,
             folder_uuid=folder_uuid,
+            session=session,
         )
         messenger_events.create_folder_updated_event(
             folder=user_folder,
@@ -703,14 +824,38 @@ def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
         user_uuid=binding.user_uuid,
         session=session,
     )
+    remaining_user_uuids = [
+        user_uuid
+        for user_uuid in models.get_stream_recipients(
+            project_id,
+            binding.stream_uuid,
+            session=session,
+        )
+        if user_uuid != binding.user_uuid
+    ]
+    messenger_events.create_stream_binding_deleted_events(
+        binding,
+        remaining_user_uuids,
+        session=session,
+    )
     binding.delete(session=session)
-
     _create_available_folder_updated_events(
         project_id=project_id,
         folder_targets=folder_targets,
         session=session,
     )
 
+
+def create_workspace_stream_binding_updated_events(binding, session=None):
+    messenger_events.create_stream_binding_updated_events(
+        binding,
+        models.get_stream_recipients(
+            binding.project_id,
+            binding.stream_uuid,
+            session=session,
+        ),
+        session=session,
+    )
 
 def _create_workspace_stream_binding_message_flags(
     project_id, stream_uuid, user_uuid, session=None
@@ -744,7 +889,13 @@ def _create_workspace_stream_binding_message_flags(
 
 
 def _get_or_create_workspace_stream_binding(
-    project_id, stream_uuid, user_uuid, who_uuid, role, session=None
+    project_id,
+    stream_uuid,
+    user_uuid,
+    who_uuid,
+    role,
+    session=None,
+    uuid=None,
 ):
     for existing in models.WorkspaceStreamBinding.objects.get_all(
         filters={
@@ -758,6 +909,7 @@ def _get_or_create_workspace_stream_binding(
         return existing, False
 
     binding = models.WorkspaceStreamBinding(
+        uuid=uuid or sys_uuid.uuid4(),
         project_id=project_id,
         stream_uuid=stream_uuid,
         user_uuid=user_uuid,
@@ -805,7 +957,12 @@ def _validate_stream_binding_roles_payload(role_user_uuids):
 
 
 def get_or_create_workspace_stream_bindings(
-    project_id, stream_uuid, who_uuid, role_user_uuids, session=None
+    project_id,
+    stream_uuid,
+    who_uuid,
+    role_user_uuids,
+    session=None,
+    binding_uuids=None,
 ):
     _validate_stream_binding_roles_payload(role_user_uuids)
     result = []
@@ -820,6 +977,7 @@ def get_or_create_workspace_stream_bindings(
                 who_uuid=who_uuid,
                 role=role,
                 session=session,
+                uuid=(binding_uuids or {}).get(str(user_uuid)),
             )
             result.append(binding)
             if created:
@@ -961,13 +1119,14 @@ def get_or_create_workspace_stream_topic_with_flags(
     )
 
 
-def get_workspace_user_stream_topic(project_id, user_uuid, topic_uuid):
+def get_workspace_user_stream_topic(project_id, user_uuid, topic_uuid, session=None):
     return models.WorkspaceUserTopic.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(topic_uuid),
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
         },
+        session=session,
     )
 
 
@@ -1290,7 +1449,14 @@ def update_workspace_user_stream_topic_notifications(
 
 
 def _get_or_create_private_workspace_user_stream(
-    project_id, user_uuid, direct_user_uuid, stream_uuid, session=None, **kwargs
+    project_id,
+    user_uuid,
+    direct_user_uuid,
+    stream_uuid,
+    session=None,
+    default_topic_uuid=None,
+    binding_uuids=None,
+    **kwargs,
 ):
     default_topic_name = kwargs.pop("default_topic_name", "General Topic")
     private_index = build_private_stream_index(user_uuid, direct_user_uuid)
@@ -1311,7 +1477,7 @@ def _get_or_create_private_workspace_user_stream(
         )
 
     _ensure_color(kwargs)
-    default_topic_uuid = sys_uuid.uuid4()
+    default_topic_uuid = default_topic_uuid or sys_uuid.uuid4()
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
@@ -1332,6 +1498,7 @@ def _get_or_create_private_workspace_user_stream(
             user_uuid=participant_uuid,
             who_uuid=user_uuid,
             session=session,
+            uuid=(binding_uuids or {}).get(str(participant_uuid)),
         )
 
     default_topic = create_workspace_stream_topic_with_flags(
@@ -1438,6 +1605,8 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None, **k
     stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
     direct_user_uuid = kwargs.pop("direct_user_uuid", None)
     default_topic_name = kwargs.pop("default_topic_name", "General Topic")
+    default_topic_uuid = kwargs.pop("canonical_default_topic_uuid", None)
+    binding_uuids = kwargs.pop("canonical_binding_uuids", None)
     kwargs.pop("private", None)
     if kwargs.pop("private_index", None) is not None:
         raise messenger_exc.PrivateIndexIsTechnicalFieldError()
@@ -1449,11 +1618,13 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None, **k
             stream_uuid=stream_uuid,
             default_topic_name=default_topic_name,
             session=session,
+            default_topic_uuid=default_topic_uuid,
+            binding_uuids=binding_uuids,
             **kwargs,
         )
 
     _ensure_color(kwargs)
-    default_topic_uuid = sys_uuid.uuid4()
+    default_topic_uuid = default_topic_uuid or sys_uuid.uuid4()
     stream = models.WorkspaceStream(
         uuid=stream_uuid,
         project_id=project_id,
@@ -1469,6 +1640,7 @@ def get_or_create_workspace_user_stream(project_id, user_uuid, session=None, **k
         user_uuid=user_uuid,
         who_uuid=user_uuid,
         session=session,
+        uuid=(binding_uuids or {}).get(str(user_uuid)),
     )
 
     default_topic = create_workspace_stream_topic_with_flags(
@@ -1649,6 +1821,7 @@ def create_workspace_user_folder_item(project_id, user_uuid, session=None, **kwa
         project_id=project_id,
         user_uuid=user_uuid,
         folder_uuid=item.folder_uuid,
+        session=session,
     )
     messenger_events.create_folder_updated_event(
         folder=user_folder,
@@ -1658,6 +1831,7 @@ def create_workspace_user_folder_item(project_id, user_uuid, session=None, **kwa
         project_id=project_id,
         user_uuid=user_uuid,
         item_uuid=item.uuid,
+        session=session,
     )
 
 
@@ -1670,11 +1844,22 @@ def delete_workspace_user_folder_item(project_id, user_uuid, item_uuid, session=
         },
         session=session,
     )
+    folder_uuid = item.folder_uuid
     item.delete(session=session)
     messenger_events.create_folder_item_deleted_event(
         project_id=project_id,
         user_uuid=user_uuid,
         item_uuid=item_uuid,
+        session=session,
+    )
+    user_folder = get_workspace_user_folder(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        folder_uuid=folder_uuid,
+        session=session,
+    )
+    messenger_events.create_folder_updated_event(
+        folder=user_folder,
         session=session,
     )
 

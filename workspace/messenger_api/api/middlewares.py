@@ -18,8 +18,10 @@ import json
 
 import webob
 
+from gcl_iam import middlewares as iam_middlewares
 from restalchemy.api import middlewares
 
+from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import versions
 
 
@@ -82,3 +84,14 @@ class ServerSettingsMiddleware(middlewares.Middleware):
                 charset="utf-8",
             )
         return None
+
+
+class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
+    def _construct_error_response(self, req, error):
+        if isinstance(error, messenger_exceptions.EventsCursorExpiredError):
+            return req.ResponseClass(
+                status=410,
+                json=error.as_dict(),
+                headers={"Cache-Control": "no-store"},
+            )
+        return super()._construct_error_response(req, error)

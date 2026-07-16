@@ -6,9 +6,8 @@
 import uuid as sys_uuid
 
 import pytest
-from restalchemy.common import exceptions as ra_exc
 
-from workspace.messenger_api.api import controllers
+from workspace.messenger_api.api import routes
 from workspace.messenger_api.dm import models
 
 
@@ -100,26 +99,6 @@ def test_workspace_gravatar_avatar_normalizes_email():
     )
 
 
-def test_external_account_controller_rejects_provider_user_info():
-    settings = models.ZulipExternalAccountKind(
-        credentials=_zulip_credentials(),
-        user_info=models.ZulipExternalAccountUserInfoKind(
-            email="remote@example.com",
-            user_id=42,
-            avatar_version=1,
-            is_admin=False,
-            is_owner=False,
-            is_guest=False,
-            role=400,
-            is_bot=False,
-            full_name="Remote User",
-            timezone="UTC",
-            is_active=True,
-            date_joined="2026-01-01T00:00:00Z",
-        ),
-    )
-
-    with pytest.raises(ra_exc.ValidationErrorException):
-        controllers.ExternalAccountController._reject_user_info_from_api(
-            settings,
-        )
+def test_external_accounts_are_not_exposed_by_messenger_api():
+    assert not hasattr(routes.ApiEndpointRoute, "external_accounts")
+    assert not hasattr(routes, "ExternalAccountRoute")

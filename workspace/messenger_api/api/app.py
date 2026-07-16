@@ -24,6 +24,7 @@ from restalchemy.openapi import structures as openapi_structures
 
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
+from workspace.messenger_api.api import openapi_contract
 from workspace.messenger_api.api import routes as app_routes
 from workspace.messenger_api.api import versions
 from workspace import version as app_version
@@ -31,6 +32,25 @@ from workspace import version as app_version
 
 class MessengerApiApp(routes.RootRoute):
     pass
+
+
+class MessengerOpenApiComponents(openapi_structures.OpenApiComponents):
+    def build(self, request):
+        specification = super().build(request)
+        return openapi_contract.add_avatar_upload_schema(specification)
+
+
+class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
+    def build(self, request, components):
+        specification = super().build(request, components)
+        specification = openapi_contract.add_message_pagination_contract(
+            specification,
+            "/v1/messages/",
+        )
+        return openapi_contract.add_current_user_contract(
+            specification,
+            "/v1/me/",
+        )
 
 
 setattr(
@@ -51,8 +71,8 @@ def get_openapi_engine():
             version=app_version.version_info,
             description=f"OpenAPI - Workspace {versions.API_VERSION_1_0}",
         ),
-        paths=openapi_structures.OpenApiPaths(),
-        components=openapi_structures.OpenApiComponents(),
+        paths=MessengerOpenApiPaths(),
+        components=MessengerOpenApiComponents(),
     )
     return openapi_engine
 
@@ -70,7 +90,7 @@ def build_wsgi_application(iam_engine_driver):
                 context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
-            iam_mw.ErrorsHandlerMiddleware,
+            app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],
     )

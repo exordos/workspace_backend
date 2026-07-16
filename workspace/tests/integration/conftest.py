@@ -50,8 +50,10 @@ from workspace.common import file_storage_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
+from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import models as messenger_models
-from workspace.provider_api.api import app as provider_app
+from workspace.tests.integration import memory_mail
 from workspace.workspace_api.api import app as workspace_app
 
 
@@ -68,6 +70,7 @@ MIGRATIONS_DIR = REPO_ROOT / "migrations"
 # Headers used by the mocked auth middleware to build the request context.
 HEADER_USER = "X-Test-User-Uuid"
 HEADER_PROJECT = "X-Test-Project-Id"
+TEST_MAIL_RUNTIME = memory_mail.RuntimeFactory()
 
 
 # --------------------------------------------------------------------------- #
@@ -176,10 +179,6 @@ def build_test_wsgi_application(app_module=messenger_app):
     )
 
 
-def build_provider_test_wsgi_application():
-    return provider_app.build_wsgi_application()
-
-
 # --------------------------------------------------------------------------- #
 # HTTP test client
 # --------------------------------------------------------------------------- #
@@ -259,9 +258,13 @@ def _database():
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
     engine.apply_migration(engine.get_latest_migration())
+    api_store.configure_store_factory(
+        sql_store.SQLProjectedMessengerStoreFactory(TEST_MAIL_RUNTIME)
+    )
 
     yield
 
+    api_store.reset_store_factory()
     engines.engine_factory.destroy_all_engines()
 
 
@@ -291,25 +294,6 @@ def workspace_http_server(_database):
         "127.0.0.1",
         0,
         build_test_wsgi_application(workspace_app),
-        handler_class=_QuietHandler,
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    host, port = server.server_address
-    try:
-        yield f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-
-
-@pytest.fixture(scope="session")
-def provider_http_server(_database):
-    server = wsgiref.simple_server.make_server(
-        "127.0.0.1",
-        0,
-        build_provider_test_wsgi_application(),
         handler_class=_QuietHandler,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -355,15 +339,6 @@ def workspace_api(workspace_http_server, db):
 
 
 @pytest.fixture
-def provider_api(provider_http_server):
-    return ApiClient(
-        base_url=provider_http_server,
-        user_uuid=sys_uuid.uuid4(),
-        project_id=sys_uuid.uuid4(),
-    )
-
-
-@pytest.fixture
 def db():
     """Direct DB connection for seeding rows the API only needs to read."""
     conn = psycopg.connect(TEST_DB_URL, autocommit=True)
@@ -385,6 +360,7 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
     """
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
     stream_uuid = sys_uuid.uuid4()
+    binding_uuid = sys_uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -404,13 +380,33 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
             ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
             """,
             (
-                str(sys_uuid.uuid4()),
+                str(binding_uuid),
                 str(project_id),
                 str(stream_uuid),
                 str(user_uuid),
                 str(user_uuid),
             ),
         )
+    TEST_MAIL_RUNTIME.seed_stream(
+        project_id,
+        user_uuid,
+        stream_uuid,
+        {
+            "name": name,
+            "description": description,
+            "kind": "stream",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    TEST_MAIL_RUNTIME.seed_binding(
+        project_id,
+        user_uuid,
+        binding_uuid,
+        stream_uuid,
+        user_uuid,
+        "owner",
+    )
     return str(stream_uuid)
 
 
@@ -448,6 +444,7 @@ def seed_workspace_user(conn, user_uuid, username, status="active", last_ping_at
 
 def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="member"):
     seed_workspace_user(conn, user_uuid, f"user-{user_uuid}")
+    binding_uuid = sys_uuid.uuid4()
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -458,7 +455,7 @@ def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="mem
             ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
             """,
             (
-                str(sys_uuid.uuid4()),
+                str(binding_uuid),
                 str(project_id),
                 str(stream_uuid),
                 str(user_uuid),
@@ -466,6 +463,14 @@ def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="mem
                 role,
             ),
         )
+    TEST_MAIL_RUNTIME.seed_binding(
+        project_id,
+        user_uuid,
+        binding_uuid,
+        stream_uuid,
+        user_uuid,
+        role,
+    )
 
 
 def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default=False):
@@ -490,6 +495,14 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default
                 """,
                 (str(topic_uuid), str(stream_uuid), str(project_id)),
             )
+    TEST_MAIL_RUNTIME.seed_topic(
+        project_id,
+        user_uuid,
+        topic_uuid,
+        stream_uuid,
+        name,
+        is_default,
+    )
     return str(topic_uuid)
 
 

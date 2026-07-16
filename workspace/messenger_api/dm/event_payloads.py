@@ -363,6 +363,34 @@ class StreamBindingsCreatedEventPayload(
     )
 
 
+class StreamBindingUpdatedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+):
+    KIND = "stream_binding.updated"
+
+    stream_uuid = properties.property(types.UUID(), required=True)
+    user_uuid = properties.property(types.UUID(), required=True)
+    who_uuid = properties.property(types.UUID(), required=True)
+    role = properties.property(types.String(min_length=1), required=True)
+    notification_mode = properties.property(
+        types.String(min_length=1),
+        required=True,
+    )
+
+
+class StreamBindingDeletedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    KIND = "stream_binding.deleted"
+
+    stream_uuid = properties.property(types.UUID(), required=True)
+    user_uuid = properties.property(types.UUID(), required=True)
+
+
 class UserUpdatedEventPayload(
     types_dynamic.AbstractKindModel,
     models.ModelWithUUID,
@@ -441,6 +469,49 @@ class FolderItemDeletedEventPayload(
     KIND = "folder_item.deleted"
 
 
+class FileEventPayloadBase(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithRequiredNameDesc,
+    models.ModelWithTimestamp,
+):
+    user_uuid = properties.property(types.UUID(), required=True)
+    stream_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    content_type = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+    size_bytes = properties.property(types.Integer(min_value=0), required=True)
+    hash = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+
+
+class FileCreatedEventPayload(FileEventPayloadBase):
+    KIND = "file.created"
+
+
+class FileUpdatedEventPayload(FileEventPayloadBase):
+    KIND = "file.updated"
+
+
+class FileDeletedEventPayload(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    KIND = "file.deleted"
+
+    stream_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(MessageUpdatedEventPayload),
@@ -461,7 +532,12 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(TopicDeletedEventPayload),
     types_dynamic.KindModelType(StreamDeletedEventPayload),
     types_dynamic.KindModelType(StreamBindingsCreatedEventPayload),
+    types_dynamic.KindModelType(StreamBindingUpdatedEventPayload),
+    types_dynamic.KindModelType(StreamBindingDeletedEventPayload),
     types_dynamic.KindModelType(UserUpdatedEventPayload),
     types_dynamic.KindModelType(FolderDeletedEventPayload),
     types_dynamic.KindModelType(FolderItemDeletedEventPayload),
+    types_dynamic.KindModelType(FileCreatedEventPayload),
+    types_dynamic.KindModelType(FileUpdatedEventPayload),
+    types_dynamic.KindModelType(FileDeletedEventPayload),
 )

@@ -1,6 +1,7 @@
 [Unit]
 Description=Workspace API
-After=network.target postgresql.service
+After=network-online.target dovecot.service exim4.service
+Wants=network-online.target
 
 [Service]
 Type=simple

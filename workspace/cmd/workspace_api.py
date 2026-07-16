@@ -17,6 +17,9 @@ from restalchemy.storage.sql import engines
 from workspace.common import config
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
+from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import store as api_store
+from workspace.messenger_mail import runtime as mail_runtime
 from workspace.workspace_api.api import app
 
 
@@ -33,6 +36,7 @@ CONF.register_cli_opts(api_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
 iam_opts.register_iam_cli_opts(CONF)
 file_storage_opts.register_opts(CONF)
+mail_runtime.register_opts(CONF)
 
 
 def main():
@@ -49,6 +53,11 @@ def main():
         CONF.iam.iam_endpoint,
         CONF.iam.audience,
         CONF.iam.hs256_jwks_decryption_key,
+    )
+    api_store.configure_store_factory(
+        sql_store.SQLProjectedMessengerStoreFactory(
+            mail_runtime.RuntimeFactory(CONF),
+        )
     )
     for _ in range(CONF[DOMAIN].workers):
         service = bjoern_service.BjoernService(

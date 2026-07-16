@@ -3,6 +3,14 @@ description: "Workspace backend element"
 schema_version: 1
 version: "{{ version }}"
 api_version: "v1"
+# {% set mail_migration_stage1_enabled = mail_migration_stage1 | default(false) %}
+# {% set mail_migration_cutover_enabled = mail_migration_cutover_keep_legacy_disk | default(false) %}
+# {% if mail_migration_stage1_enabled and not (workspace_backend_image | default('')) %}
+# {{ missing_required_manifest_var.workspace_backend_image }}
+# {% endif %}
+# {% if mail_migration_stage1_enabled and mail_migration_cutover_enabled %}
+# {{ incompatible_manifest_vars.mail_migration_stage1_and_mail_migration_cutover_keep_legacy_disk }}
+# {% endif %}
 
 requirements:
   core:
@@ -54,21 +62,62 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       cores: $workspace.imports.$var_default_cores:value
       ram: $workspace.imports.$var_default_ram:value
+# {% if mail_migration_stage1_enabled %}
       disk_spec:
         kind: "disks"
         disks:
-          - size: 8
-            image: "workspace-backend"
+          - size: 10
+            image: "{{ workspace_backend_image }}"
             label: root
+          - size: 20
+            label: data
+# {% elif mail_migration_cutover_enabled %}
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 10
+            image: "{{ images['workspace_backend'] }}"
+            label: root
+          - size: 20
+            label: data
+# {% else %}
+      disk_spec:
+        kind: "root_disk"
+        size: 10
+        image: "{{ images['workspace_backend'] }}"
+# {% endif %}
+    workspace_mail:
+      name: workspace-mail
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cores: 1
+      ram: 1024
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 10
+            image: "{{ workspace_mail_image | default(images['workspace_mail_raw_zst'], true) }}"
+            label: root
+          - size: 20
+            label: data
 
   $core.secret.passwords:
-    workspace_db_password:
-      name: workspace_db_password
-      description: "Workspace PostgreSQL password"
+    workspace_projection_db_password:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_projection_db_password
+      description: "Workspace rebuildable PostgreSQL projection password"
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_mail_master_password:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_mail_master_password
+      description: "Workspace Messenger internal mail service password"
+      default_length: 40
       constructor:
         kind: plain
       method: AUTO_HEX
     workspace_s3_access_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace_s3_access_key
       description: "Workspace messenger files S3 access key"
       default_length: 20
@@ -76,6 +125,7 @@ resources:
         kind: plain
       method: AUTO_HEX
     workspace_s3_secret_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace_s3_secret_key
       description: "Workspace messenger files S3 secret key"
       default_length: 40
@@ -84,8 +134,8 @@ resources:
       method: AUTO_HEX
 
   $dbaas.types.postgres.instances:
-    workspace_cluster_pg:
-      name: "workspace-pg-cluster"
+    workspace_projection_cluster:
+      name: "workspace-projection-pg-cluster"
       nodes_number: 1
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       cpu: 1
@@ -93,19 +143,19 @@ resources:
       disk_size: 15
       version: $workspace.imports.$pg18:uuid
 
-  $dbaas.types.postgres.instances.$workspace_cluster_pg.users:
-    workspace_db_user:
+  $dbaas.types.postgres.instances.$workspace_projection_cluster.users:
+    workspace_projection_user:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace
-      password: $core.secret.passwords.$workspace_db_password:value
-      instance: $dbaas.types.postgres.instances.$workspace_cluster_pg:uuid
+      password: $core.secret.passwords.$workspace_projection_db_password:value
+      instance: $dbaas.types.postgres.instances.$workspace_projection_cluster:uuid
 
-  $dbaas.types.postgres.instances.$workspace_cluster_pg.databases:
-    workspace_db:
+  $dbaas.types.postgres.instances.$workspace_projection_cluster.databases:
+    workspace_projection_db:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace
-      owner: $dbaas.types.postgres.instances.$workspace_cluster_pg.users.$workspace_db_user:uuid
-      instance: $dbaas.types.postgres.instances.$workspace_cluster_pg:uuid
+      owner: $dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_projection_user:uuid
+      instance: $dbaas.types.postgres.instances.$workspace_projection_cluster:uuid
 
   $s3aas.types.s3.instances:
     workspace_s3:
@@ -168,7 +218,34 @@ resources:
       instance: $s3aas.types.s3.instances.$workspace_s3:uuid
 
   $core.config.configs:
-    workspace_backend_config:
+    workspace_mail_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mail.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-mail-reload
+      body:
+        kind: text
+        content: |
+          f"
+          [messenger_mail]
+          smtp_host = 127.0.0.1
+          smtp_port = 25
+          smtp_security = plain
+          smtp_username = workspace-service
+          smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+          imap_host = 127.0.0.1
+          imap_port = 1143
+          imap_security = plain
+          imap_master_username = workspace-service
+          imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+          technical_domain = messenger.workspace.invalid
+          "
+    workspace_backend_config{{ '' if mail_migration_stage1_enabled else '_remote_mail_v1' }}:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/workspace.conf
       mode: "0600"
@@ -183,7 +260,7 @@ resources:
         content: |
           f"
           [db]
-          connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_cluster_pg.users.$workspace_db_user:name}:{$core.secret.passwords.$workspace_db_password:value}@{$dbaas.types.postgres.instances.$workspace_cluster_pg:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_cluster_pg.databases.$workspace_db:name}
+          connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_projection_user:name}:{$core.secret.passwords.$workspace_projection_db_password:value}@{$dbaas.types.postgres.instances.$workspace_projection_cluster:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_projection_cluster.databases.$workspace_projection_db:name}
 
 
           [logging]
@@ -205,12 +282,6 @@ resources:
           workers = 1
 
 
-          [workspace_provider_api]
-          bind_host = 127.0.0.1
-          bind_port = 21083
-          workers = 1
-
-
           [messenger_api]
           bind_host = 127.0.0.1
           bind_port = 21081
@@ -226,6 +297,20 @@ resources:
           catchup_limit = 500
           send_queue_limit = 32
           poll_interval = 3
+
+
+          [messenger_mail]
+          smtp_host = {{ '127.0.0.1' if mail_migration_stage1_enabled else 'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}
+          smtp_port = 25
+          smtp_security = plain{{ '' if mail_migration_stage1_enabled else '\n          smtp_username = workspace-service\n          smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}' }}
+          imap_host = {{ '127.0.0.1' if mail_migration_stage1_enabled else 'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}
+          imap_port = 1143
+          imap_security = plain
+          imap_master_username = workspace-service
+          imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+          technical_domain = messenger.workspace.invalid
+          state_mailbox = Workspace/State
+          event_mailbox_prefix = Workspace/Events
 
 
           [messenger_files]
@@ -300,38 +385,11 @@ resources:
               }
 
               location / {
-                  proxy_pass http://127.0.0.1:5173;
-                  proxy_set_header Host $http_host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-
-                  # Vite HMR / WebSocket
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection "upgrade";
+                  root /opt/workspace-ui/packages/web/dist;
+                  try_files $uri $uri/ /index.html;
               }
           }
 
-          # Platform-internal listener used only by provider elements. It is
-          # intentionally separate from the browser-facing listener on port 80.
-          server {
-              listen 21085;
-              server_name _;
-              client_max_body_size 50m;
-
-              location /api/workspace-service/v1/ {
-                  proxy_pass http://127.0.0.1:21083/v1/;
-                  proxy_set_header Host $http_host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-              }
-
-              location / {
-                  return 404;
-              }
-          }
     workspace_backend_nginx_core_upstream:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/nginx/workspace.d/core-upstream.conf
@@ -346,7 +404,28 @@ resources:
         content: |
           f"server {$workspace.imports.$var_core_ip_address:value}:80;"
 
+  $workspace.imports.$core_local_domain.records:
+    workspace_mail:
+      domain: $workspace.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-mail
+        address: $core.compute.nodes.$workspace_mail:default_network:ipv4
+
   $core.em.services:
+    workspace_mail_bootstrap:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-mail-bootstrap
+      path: /usr/local/bin/workspace-mail-bootstrap
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      service_type:
+        kind: oneshot
+      target_status: enabled
     workspace_bootstrap:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-bootstrap
@@ -373,10 +452,10 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-nginx-reload --check-only
-    workspace_api:
+    workspace_api{{ '' if mail_migration_stage1_enabled else '_remote_mail_v1' }}:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-api
-      path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf
+      path: "{{ '' if mail_migration_stage1_enabled else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-api --config-file /etc/workspace/workspace.conf"
       user: root
       target:
         kind: node
@@ -385,13 +464,15 @@ resources:
         kind: simple
         count: 1
       target_status: enabled
+# {% if mail_migration_stage1_enabled %}
       before:
         - kind: shell
           command: /usr/local/bin/workspace-wait-ready
-    workspace_messenger_api:
+# {% endif %}
+    workspace_messenger_api{{ '' if mail_migration_stage1_enabled else '_remote_mail_v1' }}:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-api
-      path: /usr/bin/workspace-messenger-api --config-file /etc/workspace/workspace.conf
+      path: "{{ '' if mail_migration_stage1_enabled else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-messenger-api --config-file /etc/workspace/workspace.conf"
       user: root
       target:
         kind: node
@@ -400,28 +481,15 @@ resources:
         kind: simple
         count: 1
       target_status: enabled
+# {% if mail_migration_stage1_enabled %}
       before:
         - kind: shell
           command: /usr/local/bin/workspace-wait-ready
-    workspace_provider_api:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-provider-api
-      path: /usr/bin/workspace-provider-api --config-file /etc/workspace/workspace.conf
-      user: root
-      target:
-        kind: node
-        node: $core.compute.nodes.$workspace_backend:uuid
-      service_type:
-        kind: simple
-        count: 1
-      target_status: enabled
-      before:
-        - kind: shell
-          command: /usr/local/bin/workspace-wait-ready
-    workspace_messenger_worker:
+# {% endif %}
+    workspace_messenger_worker{{ '' if mail_migration_stage1_enabled else '_remote_mail_v1' }}:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-worker
-      path: /usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf
+      path: "{{ '' if mail_migration_stage1_enabled else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf"
       user: root
       target:
         kind: node
@@ -430,13 +498,15 @@ resources:
         kind: simple
         count: 1
       target_status: enabled
+# {% if mail_migration_stage1_enabled %}
       before:
         - kind: shell
           command: /usr/local/bin/workspace-wait-ready
-    workspace_messenger_events:
+# {% endif %}
+    workspace_messenger_events{{ '' if mail_migration_stage1_enabled else '_remote_mail_v1' }}:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-events
-      path: /usr/bin/workspace-messenger-events --config-file /etc/workspace/workspace.conf
+      path: "{{ '' if mail_migration_stage1_enabled else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-messenger-events --config-file /etc/workspace/workspace.conf"
       user: root
       target:
         kind: node
@@ -445,14 +515,16 @@ resources:
         kind: simple
         count: 1
       target_status: enabled
+# {% if mail_migration_stage1_enabled %}
       before:
         - kind: shell
           command: /usr/local/bin/workspace-wait-ready
+# {% endif %}
 
 exports:
-  backend_node:
-    link: "$core.compute.nodes.$workspace_backend"
+  mail_node:
+    link: "$core.compute.nodes.$workspace_mail"
     kind: "resource"
-  db_instance:
-    link: "$dbaas.types.postgres.instances.$workspace_cluster_pg"
+  projection_db_instance:
+    link: "$dbaas.types.postgres.instances.$workspace_projection_cluster"
     kind: "resource"

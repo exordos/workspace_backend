@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from restalchemy.api import constants
 from restalchemy.api import routes
 
 from workspace.messenger_api.api import controllers
@@ -83,17 +84,6 @@ class WorkspaceFileRoute(routes.Route):
     ]
 
     download = routes.action(WorkspaceFileDownloadAction)
-
-
-class ExternalAccountRoute(routes.Route):
-    __controller__ = controllers.ExternalAccountController
-    __allow_methods__ = [
-        routes.CREATE,
-        routes.FILTER,
-        routes.GET,
-        routes.UPDATE,
-        routes.DELETE,
-    ]
 
 
 class FolderRoute(routes.Route):
@@ -212,6 +202,22 @@ class WorkspaceUserPresenceAction(routes.Action):
     __controller__ = controllers.WorkspaceUserController
 
 
+class WorkspaceUserAvatarUploadAction(routes.Action):
+    __controller__ = controllers.WorkspaceUserController
+
+    def do(self, resource, **kwargs):
+        if constants.CONTENT_TYPE_MULTIPART in self._req.content_type:
+            controller = self.get_controller(self._req)
+            packer = controller.get_packer(self._req.content_type)
+            packer._rt = None
+            kwargs.update(packer.unpack(value=self._req.body))
+        return super().do(resource, **kwargs)
+
+
+class WorkspaceUserAvatarResetAction(routes.Action):
+    __controller__ = controllers.WorkspaceUserController
+
+
 class WorkspaceStreamTopicRoute(routes.Route):
     __controller__ = controllers.WorkspaceStreamTopicController
     __allow_methods__ = [
@@ -245,10 +251,18 @@ class WorkspaceUserRoute(routes.Route):
     ]
 
     presence = routes.action(WorkspaceUserPresenceAction, invoke=True)
+    avatar_upload = routes.action(
+        WorkspaceUserAvatarUploadAction,
+        invoke=True,
+    )
+    avatar_reset = routes.action(
+        WorkspaceUserAvatarResetAction,
+        invoke=True,
+    )
 
 
 class MeRoute(routes.Route):
-    """Handler for /v1/me/ endpoint."""
+    """Handler for the current IAM user endpoint."""
 
     __controller__ = controllers.MeController
     __allow_methods__ = [routes.FILTER]
@@ -268,6 +282,5 @@ class ApiEndpointRoute(routes.Route):
     messages = routes.route(WorkspaceMessageRoute)
     message_reactions = routes.route(WorkspaceMessageReactionRoute)
     files = routes.route(WorkspaceFileRoute)
-    external_accounts = routes.route(ExternalAccountRoute)
     users = routes.route(WorkspaceUserRoute)
     me = routes.route(MeRoute)

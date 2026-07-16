@@ -3,15 +3,15 @@
 This document describes the browser-facing API contract composed by nginx from
 the preserved `workspace-messenger-api`, the common `workspace-api`, and the
 companion `workspace-messenger-events` websocket service. Public Messenger
-requests use the dedicated Messenger process; Mail, Calendar, common users,
-External Users, provider catalog, and REST events use `workspace-api`.
+requests use the dedicated Messenger process; common users, client service
+settings, and REST events use `workspace-api`. Mail, Calendar, External Users,
+and provider-management endpoints are not part of this release.
 
-Provider daemons are independent full-state services. They do not use this UI
-API and they never read Workspace database tables. They register, push
-projections, upload blobs, poll outbound commands, and report delivery results
-through the separate trusted Provider Service API documented in
-[`provider_service_api.md`](provider_service_api.md). UI code must never call
-that service API.
+Native Messenger state is canonical in the local SMTP/IMAP journal. PostgreSQL
+is a rebuildable read projection and may also store client-only settings. A
+future provider must exchange messages through mail protocols rather than a
+separate provider API; the existing Messenger provenance fields are reserved
+for that transport.
 
 ## Runtime Entry Points
 
@@ -20,7 +20,6 @@ Direct local services:
 ```text
 Messenger REST API:  http://127.0.0.1:21081/v1
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
-Provider Service:    http://127.0.0.1:21083/v1
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
 Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
@@ -32,10 +31,8 @@ The deployed nginx manifest exposes the UI contract through:
 ```text
 Workspace REST root: /api/workspace/v1/...
 Messenger REST:      /api/workspace/v1/messenger/...
-Mail REST:           /api/workspace/v1/mail/...
-Calendar REST:       /api/workspace/v1/calendar/...
 Events REST:         /api/workspace/v1/events/...
-Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>
+Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epoch_generation=<generation>
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
@@ -43,10 +40,7 @@ OpenAPI spec:        /api/workspace/specifications/3.0.3
 service on `127.0.0.1:21081`; the remainder of `/api/workspace/` is proxied to
 the Workspace REST service on `127.0.0.1:21084`.
 The exact nginx location `/api/workspace/v1/events/ws` is proxied to the
-websocket service endpoint `/v1/events/ws` on `127.0.0.1:21082`. The
-provider service is a separate trust boundary exposed only on the
-platform-internal listener `:21085` under `/api/workspace-service/v1/`; the
-prefix is absent from the browser-facing listener on port `80`.
+websocket service endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
 The deployed nginx manifest sets `client_max_body_size 50m` for proxied
 requests.
@@ -152,8 +146,8 @@ Typical RESTAlchemy/IAM error response:
 }
 ```
 
-Provider-backed Messenger, Mail, and Calendar resources expose a canonical UI
-projection instead of transport identifiers:
+Messenger resources keep a canonical provenance projection instead of exposing
+transport identifiers:
 
 ```json
 {
@@ -170,7 +164,7 @@ projection instead of transport identifiers:
 }
 ```
 
-`provider.name` is the short badge label supplied at provider registration.
+`provider.name` is the short badge label supplied by a future provider.
 `delivery.status` is `pending`, `delivered`, or `failed`. Provider external IDs,
 sync cursors, queue IDs, ETags, raw protocol payloads, and provider database
 state are not part of the UI contract. Local resources have `provider: null`
@@ -185,7 +179,7 @@ unauthenticated Workspace endpoint used by the UI.
 This is a greenfield public layout. There are no compatibility aliases for
 `/api/messenger/**`, `/api/v1/**`,
 `/api/workspace/v1/messenger/events/**`, or the former messenger websocket
-path. Provider commands are not UI events and are not exposed by this API.
+path. There is no browser-facing or internal Provider API in this release.
 
 ## Pagination And Filters
 
@@ -194,10 +188,20 @@ Collection endpoints use RESTAlchemy cursor pagination:
 | Query parameter | Type | Description |
 | --- | --- | --- |
 | `page_limit` | integer | Maximum number of items. `0` or an omitted value means no explicit limit. |
-| `page_marker` | UUID or integer | Marker for the next page. UUID resources use the previous page's last `uuid`; events use the previous page's last `epoch_version`. |
+| `page_marker` | UUID or integer | Marker for the next page. UUID resources use the previous page's last `uuid`; events use the previous page's last `epoch_version` and require the matching `epoch_generation` whenever that marker is non-zero. |
 
 If `page_limit` is provided, responses include `X-Pagination-Limit`. If another
 page exists, responses also include `X-Pagination-Marker`.
+
+`GET /api/workspace/v1/messenger/messages/` uses a stable composite keyset.
+Set `sort_key=created_at` and `sort_dir=asc` or `sort_dir=desc`; rows are ordered
+by `(created_at, uuid)` in that direction. `page_marker` remains the UUID of the
+last row returned to preserve the public client contract. The server resolves
+that UUID inside the same IAM project, authenticated-user view, and message
+filter scope, then continues strictly after its composite key. A marker outside
+that scope is not accepted. `X-Pagination-Marker` is emitted only when a
+`page_limit + 1` probe proves that another row exists, so a full final page does
+not advertise a nonexistent continuation.
 
 Workspace collection controllers also support conditional filter suffixes:
 
@@ -212,8 +216,15 @@ When a query parameter name contains `>` or `<`, URL-encode it if the HTTP
 client does not do that automatically:
 
 ```http
-GET /api/workspace/v1/events/?epoch_version%3E=123&page_limit=500
+GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_limit=500
 ```
+
+Event pagination and reconnect use the cursor pair
+`(epoch_generation, epoch_version)`, not an epoch number alone. A cold cursor
+of `0` may omit `epoch_generation`. If the retained event suffix no longer
+starts at epoch `1`, that cold request returns the same HTTP 410 gap response
+as any other cursor that cannot produce a complete delta; the client must load
+authoritative snapshots before starting a new cursor.
 
 ## Endpoint Summary
 
@@ -274,48 +285,15 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&page_limit=500
 | `PUT` | `/api/workspace/v1/messenger/files/{file_uuid}` | Update an owned file metadata record. |
 | `DELETE` | `/api/workspace/v1/messenger/files/{file_uuid}` | Delete an owned file and its access rows. |
 | `GET` | `/api/workspace/v1/messenger/files/{file_uuid}/actions/download` | Download visible file bytes. |
-| `GET` | `/api/workspace/v1/external_users/` | List current user's external accounts. |
-| `POST` | `/api/workspace/v1/external_users/` | Create an external account binding. |
-| `GET` | `/api/workspace/v1/external_users/{external_account_uuid}` | Get an external account binding. |
-| `PUT` | `/api/workspace/v1/external_users/{external_account_uuid}` | Update an external account binding. |
-| `DELETE` | `/api/workspace/v1/external_users/{external_account_uuid}` | Delete an external account binding. |
-| `GET` | `/api/workspace/v1/providers/` | List enabled provider catalog entries available for External User setup. |
-| `GET` | `/api/workspace/v1/providers/{provider_uuid}` | Get one provider catalog entry. |
 | `GET` | `/api/workspace/v1/services/` | List available Workspace services. |
-| `GET` | `/api/workspace/v1/mail/folders/` | List mail folders. |
-| `POST` | `/api/workspace/v1/mail/folders/` | Create a local or provider-backed mail folder. |
-| `GET` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Get a mail folder. |
-| `PUT` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Update a mail folder. |
-| `DELETE` | `/api/workspace/v1/mail/folders/{folder_uuid}` | Delete or tombstone a mail folder. |
-| `GET` | `/api/workspace/v1/mail/messages/` | List mail messages ordered by `sent_at` descending. |
-| `POST` | `/api/workspace/v1/mail/messages/` | Create a mail message or draft. |
-| `GET` | `/api/workspace/v1/mail/messages/{message_uuid}` | Get a mail message. |
-| `PUT` | `/api/workspace/v1/mail/messages/{message_uuid}` | Update a mail message. |
-| `DELETE` | `/api/workspace/v1/mail/messages/{message_uuid}` | Delete or tombstone a mail message. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/send/invoke` | Queue a draft for provider delivery. |
-| `POST` | `/api/workspace/v1/mail/messages/{message_uuid}/actions/move/invoke` | Move a message to another owned folder. |
-| `GET` | `/api/workspace/v1/mail/attachments/` | List visible mail attachment metadata. |
-| `POST` | `/api/workspace/v1/mail/attachments/` | Upload a multipart attachment. |
-| `GET` | `/api/workspace/v1/mail/attachments/{attachment_uuid}` | Get attachment metadata. |
-| `DELETE` | `/api/workspace/v1/mail/attachments/{attachment_uuid}` | Delete an attachment. |
-| `GET` | `/api/workspace/v1/mail/attachments/{attachment_uuid}/actions/download` | Download attachment bytes. |
-| `GET` | `/api/workspace/v1/calendar/calendars/` | List calendars. |
-| `POST` | `/api/workspace/v1/calendar/calendars/` | Create a local or provider-backed calendar. |
-| `GET` | `/api/workspace/v1/calendar/calendars/{calendar_uuid}` | Get a calendar. |
-| `PUT` | `/api/workspace/v1/calendar/calendars/{calendar_uuid}` | Update a calendar. |
-| `DELETE` | `/api/workspace/v1/calendar/calendars/{calendar_uuid}` | Delete or tombstone a calendar. |
-| `GET` | `/api/workspace/v1/calendar/events/` | List calendar events ordered by `starts_at` ascending. |
-| `POST` | `/api/workspace/v1/calendar/events/` | Create a calendar event. |
-| `GET` | `/api/workspace/v1/calendar/events/{event_uuid}` | Get a calendar event. |
-| `PUT` | `/api/workspace/v1/calendar/events/{event_uuid}` | Update a calendar event. |
-| `DELETE` | `/api/workspace/v1/calendar/events/{event_uuid}` | Delete or tombstone a calendar event. |
-| `POST` | `/api/workspace/v1/calendar/events/{event_uuid}/actions/move/invoke` | Move an event to another owned calendar. |
 | `GET` | `/api/workspace/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/api/workspace/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/api/workspace/v1/users/` | List workspace users. |
 | `GET` | `/api/workspace/v1/users/{user_uuid}` | Get a workspace user. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/presence/invoke` | Update current user's presence status and heartbeat timestamp. |
-| `GET` | `/api/workspace/v1/me/` | List routes below `/api/workspace/v1/me/`. |
+| `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Upload and select the current user's avatar. |
+| `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Remove the current user's custom avatar and restore the canonical Gravatar URN. |
+| `GET` | `/api/workspace/v1/me/` | Return the current authenticated Workspace user. |
 
 ## Server Settings
 
@@ -571,22 +549,22 @@ Realtime side effects:
 
 ## Streams
 
-`POST /api/workspace/v1/messenger/streams/` writes to `m_workspace_streams`, creates owner bindings,
-creates a default topic named `General Topic`, and stores its UUID in
-`m_workspace_streams.default_topic_uuid`. Reads use `m_workspace_user_streams`.
+`POST /api/workspace/v1/messenger/streams/` appends the canonical stream,
+binding, and default-topic operations to the IMAP journal before updating the
+PostgreSQL projection. It creates a default topic named `General Topic` and
+stores its UUID as `default_topic_uuid`.
 The reference is nullable and becomes `null` when the current default topic is
 deleted. REST resource responses follow the standard RestAlchemy JSON packer
 and omit nullable fields whose value is `null`, so clients must also treat a
 missing `default_topic_uuid` as `null`. Durable `stream.updated` events are full
 snapshots and keep `default_topic_uuid: null` explicitly.
 
-If `direct_user_uuid` is provided, the backend creates a two-user private
-stream, sets `private: true`, stores `private_index` as
-`":".join(sorted([current_user_uuid, direct_user_uuid]))`, and creates owner
-bindings for both users. `private_index` is a technical read-only field for
-database deduplication, is hidden from the public API, and must not be sent by
-the client. Repeating the same request for the same user pair returns the
-existing stream.
+If `direct_user_uuid` is provided, the backend creates an ordinary stream with
+the same bindings, roles, topics, events, and file ACL rules as every other
+chat. Its only additional invariants are `private: true`, exactly two distinct
+IAM participants, a deterministic project-scoped stream UUID for the unordered
+pair, and `owner` bindings for both users. Repeating the same request for the
+same pair returns the existing stream.
 
 Supported source payloads:
 
@@ -612,29 +590,10 @@ Supported source payloads:
 }
 ```
 
-For Zulip source payloads, `stream_id` is required. `server_url`,
-`topic_name`, and `message_id` may be `null` while the integration bridge is
-still syncing the object. Zulip-backed streams should include `server_url`;
-topics and messages inherit source data from their parent stream/topic, then
-the bridge fills `topic_name` and `message_id` when the external Zulip state is
-known.
-
-External source visibility is gated by the current user's confirmed external
-account access. `m_workspace_user_streams`, `m_workspace_user_topics_view`,
-`m_workspace_user_messages_view`, unread counters, folder item views, and event
-delivery only expose non-native source rows when there is a matching
-`m_external_users` row with `access_status = confirmed`, populated
-`account_settings.credentials`, the same `project_id`, `user_uuid`,
-`account_type = source_name`, and matching source scope. For Zulip the source
-scope is the normalized `server_url`; future providers can map their own source
-scope into the same gate.
-
-Folder and stream-binding event replay also follows the same stream visibility
-gate. Historical folder snapshots that contain only hidden external streams are
-not delivered while the account is unconfirmed, so hidden external unread flags
-behave as read from the UI perspective without rewriting stored flags. Once the
-external account is confirmed, the same stream/message state becomes visible and
-the provider sync can refresh read/unread status normally.
+The `zulip` payload shape is reserved contract metadata for a future provider.
+No Zulip runtime or access-account gate exists in this release. When provider
+transport is implemented, it will populate these fields from SMTP/IMAP data;
+the browser contract will continue to hide raw mail protocol identifiers.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -703,11 +662,9 @@ Content-Type: application/json
 }
 ```
 
-Updating the name or description of a provider-backed stream changes the local
-projection immediately, sets `delivery.status` to `pending`, and appends a
-durable `stream.update` provider command. Notification, archive, and read
-actions are local Workspace state and do not create provider commands. Native
-stream mutations never enter a provider command feed.
+Native stream mutations append durable IMAP journal operations before updating
+the rebuildable projection. The nullable `provider` and `delivery` fields stay
+reserved for a future mail-protocol provider and are `null` for native streams.
 
 Stream read action:
 
@@ -745,8 +702,9 @@ or `Channels` when it is not private.
 
 ## Stream Bindings
 
-Stream bindings are stored in `m_workspace_stream_bindings`. New bindings are
-created through `POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke`, where
+Stream bindings are canonical chat membership records in the IMAP journal and
+are projected to PostgreSQL. New bindings are created through
+`POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke`, where
 the request body groups added users by role. `who_uuid` is always overwritten
 with the current IAM user's UUID.
 When a new binding is created, the added user receives a `stream.created`
@@ -787,9 +745,9 @@ custom folders. Other stream users do not receive a binding-delete event.
 
 ## Stream Topics
 
-`POST /api/workspace/v1/messenger/stream_topics/` writes to `m_workspace_stream_topics` and creates
-`m_workspace_user_topic_flags` rows for stream recipients. Reads use
-`m_workspace_user_topics_view` and are scoped to the current IAM user.
+`POST /api/workspace/v1/messenger/stream_topics/` journals the canonical topic
+before projecting it and its per-user flags. Reads are scoped to the current
+IAM user through current stream membership.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -822,9 +780,8 @@ Create request:
 
 `PUT /api/workspace/v1/messenger/stream_topics/{topic_uuid}` requires a body with `name`. The backend
 checks that the current user has a binding to the topic's stream before
-renaming the topic. A provider-backed rename sets the local delivery projection
-to `pending` and appends `topic.update`. Notification, done, default-topic, and
-read actions remain local and do not append provider commands.
+renaming the topic. Native changes append durable IMAP operations before the
+rebuildable projection is updated. Provenance remains unchanged by a rename.
 
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/toggle_done/` flips `is_done` for all
 topic users and returns the current user's updated topic view.
@@ -872,14 +829,11 @@ Realtime side effects:
 
 ## Messages
 
-`POST /api/workspace/v1/messenger/messages/` writes to `m_workspace_messages`, creates per-recipient
-rows in `m_workspace_user_message_flags`, and writes one durable workspace event
-per recipient to `m_workspace_events`. Reads use
-`m_workspace_user_messages_view` and are scoped to the current IAM user.
-Message creation first checks the selected stream/topic through the same
-user-facing visibility views. A client cannot create a message in a stream or
-topic that is hidden because the corresponding external account access is not
-confirmed.
+`POST /api/workspace/v1/messenger/messages/` validates current IMAP-derived
+stream membership, delivers a canonical UTF-8 markdown message through local
+SMTP to every current participant Maildir, and appends journal and per-recipient
+event records before updating PostgreSQL projections. Reads are scoped to the
+current IAM user.
 
 The only supported message payload in v1 is markdown:
 
@@ -977,16 +931,12 @@ Update request:
 }
 ```
 
-`PUT /api/workspace/v1/messenger/messages/{message_uuid}` updates the root message payload and returns
+`PUT /api/workspace/v1/messenger/messages/{message_uuid}` journals the updated root message payload and returns
 the current user's message view. Only the message author can update the root
-message. `DELETE /api/workspace/v1/messenger/messages/{message_uuid}` deletes the root message and
-cascades per-user message flags through database foreign keys.
-
-Creating, updating, or deleting a message in a provider-backed stream appends
-`message.create`, `message.update`, or `message.delete`, respectively. The UI
-mutation and durable pending command are one transaction. Provider ingress
-does not pass through these UI controllers, so an inbound provider PUT cannot
-loop back into the command feed.
+message. `DELETE /api/workspace/v1/messenger/messages/{message_uuid}` performs
+an immediate hard delete: it marks and UID-expunges every copy delivered to the
+original participant set, then appends a bodyless tombstone that preserves the
+required message identity and provenance fields for `message.deleted`.
 
 Read action:
 
@@ -1026,8 +976,9 @@ Realtime side effects:
 
 ## Message Reactions
 
-Message reactions are stored in `m_workspace_message_reactions`. Reads are
-scoped to messages visible to the current IAM user. Creating, updating, or
+Message reactions are canonical journal operations with a rebuildable SQL
+projection. Reads are scoped to messages visible to the current IAM user.
+Creating, updating, or
 deleting a reaction emits a `message_reaction.*` event for the acting user and
 `message.updated` events for every user that can see the message; the message
 snapshot contains aggregated `reactions`.
@@ -1056,9 +1007,9 @@ Create request:
 The same user cannot create duplicate reactions with the same `message_uuid`
 and `emoji_name`. Any user that can see the message can list or get its
 reactions. Only the reaction owner can update or delete that reaction.
-For a provider-backed message these operations append `reaction.create`,
-`reaction.update`, and `reaction.delete`; native reactions append no provider
-command.
+These operations append `reaction.create`, `reaction.update`, and
+`reaction.delete` journal records. Native responses retain `provider: null` and
+`delivery: null`.
 
 The `reactions` field on message views is an aggregate map:
 
@@ -1076,24 +1027,55 @@ Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
 
 ## Files
 
-Files are stored in `m_workspace_files`; visibility is stored separately in
-`m_workspace_file_accesses`. Creating a file grants access to every current
-stream recipient. Users added to a stream later receive access to existing
-stream files; users removed from a stream lose access to those stream files.
+File bytes and a separate JSON sidecar are stored through the configured
+messenger file storage backend. S3 is the deployed backend; the local backend
+implements the same layout for tests. PostgreSQL rows and
+`m_workspace_file_accesses` are rebuildable projections only.
 
-File bytes are stored through the configured messenger file storage backend.
-Local storage uses `messenger_files.storage_path`, which defaults to
-`/var/lib/workspace/messenger/files` and can be overridden with
-`WORKSPACE_FILE_STORAGE_PATH`; S3 storage uses the `messenger_files_s3`
-configuration section. Nginx rejects multipart requests larger than `50m`
-before they reach `workspace-messenger-api`.
+The sidecar contains the file UUID, project UUID, owner UUID, display metadata,
+content type, size, SHA-256, creation time, and an ACL rule. Chat files include
+their stream UUID and use the dynamic stream-membership rule:
+
+```json
+{
+  "acl": {
+    "mode": "stream_members",
+    "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6"
+  }
+}
+```
+
+The sidecar never contains a participant snapshot. Every chat-file list,
+metadata, and download request checks the authenticated user against the
+current stream bindings reconstructed from the IMAP journal. A newly added
+participant gains access immediately; a removed participant loses it
+immediately without an S3 rewrite.
+
+Files intentionally visible throughout the authenticated Workspace use this
+ACL instead:
+
+```json
+{
+  "acl": {
+    "mode": "public"
+  }
+}
+```
+
+`public` is not anonymous access. Metadata and bytes remain behind the
+Workspace IAM middleware, and any request without a valid Workspace bearer
+token is rejected. A valid Workspace bearer token may read or download a
+`public` file regardless of project or stream membership. A `public` sidecar
+must not contain `stream_uuid`; it retains `owner_uuid` and all integrity
+metadata. Nginx rejects multipart requests larger than `50m` before they reach
+`workspace-messenger-api`.
 
 | Field | Type | Required on JSON create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | File identifier. |
 | `project_id` | UUID | no | yes | IAM project scope; hidden in API responses. |
 | `user_uuid` | UUID | no | yes | Owner/uploader. |
-| `stream_uuid` | UUID | yes | no | Stream that owns the file access scope. |
+| `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. `null` is reserved for files created by server actions with `acl.mode=public`. |
 | `name` | string | yes | no | File display name. |
 | `description` | string | yes | no | File description. |
 | `content_type` | string | yes | no | MIME content type. |
@@ -1136,396 +1118,29 @@ stores the bytes, sets `content_type` from the uploaded part, calculates
 `GET /api/workspace/v1/messenger/files/`, `GET /api/workspace/v1/messenger/files/{file_uuid}`, and
 `GET /api/workspace/v1/messenger/files/{file_uuid}/actions/download` require file access. `PUT` and
 `DELETE` require file ownership. Downloads return raw bytes with the stored
-`Content-Type` and a `Content-Disposition` attachment filename. File operations
-do not currently emit durable workspace realtime events.
+`Content-Type`, a `Content-Disposition` attachment filename, and a strong
+`ETag` equal to the quoted SHA-256 `hash` exposed by file metadata. The binary
+is immutable for its file UUID; metadata changes emit `file.updated`. Deleting an
+owned file removes both its binary object and JSON sidecar after the canonical
+file deletion is journaled.
 
-## External Users
-
-External service bindings are stored in `m_external_accounts` and exposed to
-the browser as `/api/workspace/v1/external_users/`. They are scoped to the
-current IAM `project_id` and `user_uuid`. Request values for those scope
-fields are ignored; the backend writes scope from the authenticated context.
-
-An External User binds one Workspace user to one registered provider. The UI
-first reads `GET /api/workspace/v1/providers/`, presents an account form for a
-known `account_settings.kind`, and submits the selected `provider_uuid`.
-The backend verifies that the provider exists, is enabled, and advertises the
-requested kind. V1 has fixed forms for `zulip`, `mail`, and `calendar`;
-provider-defined dynamic forms are intentionally deferred.
-
-Provider credentials are accepted on create/update but are never returned to
-the browser. In every API response,
-`account_settings.credentials` is `null`. Credential validation and remote
-identity discovery are performed asynchronously by the owning provider. The
-backend stores the binding as `pending` until the provider reports its status.
-
-| Field | Type | Required on create | Read-only | Description |
-| --- | --- | --- | --- | --- |
-| `uuid` | UUID | no | yes | External User binding identifier. |
-| `provider_uuid` | UUID | yes | no | Owning registered provider. |
-| `project_id` | UUID | no | yes | IAM project scope. |
-| `user_uuid` | UUID | no | yes | Workspace user owner. |
-| `server_url` | URL | yes | no | Remote service base URL. |
-| `source_scope` | string or `null` | no | yes | Server-managed source scope, normally normalized from `server_url`. |
-| `account_type` | `zulip`, `mail`, `calendar`, `iam` | no | yes | Kind derived from `account_settings.kind`; public creation of `iam` is rejected. |
-| `status` | `new`, `active` | no | yes | External User lifecycle state. |
-| `access_status` | `pending`, `missing_credentials`, `confirmed`, `invalid_credentials`, `unavailable` | no | yes | Provider-reported access state. |
-| `access_checked_at` | datetime or `null` | no | yes | Last provider access check. |
-| `access_confirmed_at` | datetime or `null` | no | yes | Last successful provider access check. |
-| `access_last_error` | string or `null` | no | yes | Safe account-level failure text. |
-| `account_settings` | object | yes | no | Kind-specific settings. Credentials are masked in responses. |
-| `created_at` | datetime | no | yes | Creation time. |
-| `updated_at` | datetime | no | yes | Update time. |
-
-Zulip External User create request:
-
-```json
-{
-  "provider_uuid": "3ca1b24e-2222-4cf6-93de-0123456789ab",
-  "server_url": "https://zulip.example.com",
-  "account_settings": {
-    "kind": "zulip",
-    "credentials": {
-      "kind": "zulip",
-      "login": "user@example.com",
-      "token": "zulip-token"
-    }
-  }
-}
-```
-
-Mail External User create request:
-
-```json
-{
-  "provider_uuid": "7dcb731c-3333-4e4a-a94d-0123456789ab",
-  "server_url": "https://mail.example.com",
-  "account_settings": {
-    "kind": "mail",
-    "credentials": {
-      "kind": "mail",
-      "username": "user@example.com",
-      "password": "application-password"
-    },
-    "email": "user@example.com",
-    "imap_host": "imap.example.com",
-    "imap_port": 993,
-    "imap_security": "tls",
-    "smtp_host": "smtp.example.com",
-    "smtp_port": 465,
-    "smtp_security": "tls"
-  }
-}
-```
-
-Calendar External User create request:
-
-```json
-{
-  "provider_uuid": "a896f310-4444-4af8-babc-0123456789ab",
-  "server_url": "https://calendar.example.com",
-  "account_settings": {
-    "kind": "calendar",
-    "credentials": {
-      "kind": "calendar",
-      "username": "user@example.com",
-      "password": "application-password"
-    }
-  }
-}
-```
-
-External Users belong to the UI API, but synchronization does not. Providers
-discover only their own bindings through the Provider Service API, may mutate
-only rows carrying their `provider_uuid`, and keep all transport cursors,
-queue identifiers, ETags, raw protocol payloads, and reconciliation state in a
-separate provider database. There is no direct database sharing and no
-backend-owned Zulip, IMAP, SMTP, or CalDAV bridge worker.
-
-## Mail
-
-Mail resources are scoped to the authenticated `project_id` and `user_uuid`.
-The UI sees canonical Workspace UUIDs and never sees IMAP UIDs, provider object
-IDs, sync cursors, raw source payloads, or provider database state. A local
-mutation is committed first, a provider command is created when the resource is
-provider-backed, and a durable UI event is appended in the same request
-transaction.
-
-Provider-backed responses append the common projection:
-
-```json
-{
-  "provider": {
-    "uuid": "7dcb731c-3333-4e4a-a94d-0123456789ab",
-    "name": "Mail",
-    "kind": "mail"
-  },
-  "delivery": {
-    "status": "pending",
-    "safe_error": null,
-    "updated_at": "2026-07-15T09:30:00.000000Z"
-  }
-}
-```
-
-For local-only resources both values are `null`. Delivery status is
-`pending`, `delivered`, or `failed`.
-
-### Mail Folders
-
-Folders default to `delimiter: "/"`, zero counters, and `deleted: false`.
-Collections omit tombstoned rows. A folder with `external_user_uuid` must
-belong to the current user and have account type `mail`.
-
-| Field | Type | Required on create | Description |
-| --- | --- | --- | --- |
-| `uuid` | UUID | no | Workspace folder identifier. |
-| `external_user_uuid` | UUID or `null` | no | Mail External User owner; `null` creates a local-only folder. |
-| `path` | string, 1..1024 | yes | Provider-neutral mailbox path. |
-| `name` | string, 1..256 | yes | Display name. |
-| `delimiter` | string, 1..8 | no | Hierarchy delimiter, default `/`. |
-| `special_use` | string or `null` | no | Mailbox role such as `inbox`, `sent`, `drafts`, or `trash`. |
-| `unread_count` | integer >= 0 | no | Unread message count. |
-| `total_count` | integer >= 0 | no | Total message count. |
-| `deleted` | boolean | no | Visible responses normally contain only `false`. |
-| `provider` | object or `null` | no | Provider badge projection. |
-| `delivery` | object or `null` | no | Delivery state projection. |
-| `created_at`, `updated_at` | datetime | no | Server timestamps. |
-
-Create request:
-
-```http
-POST /api/workspace/v1/mail/folders/
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "external_user_uuid": "c39e25a0-5555-49d1-a0ff-0123456789ab",
-  "path": "INBOX/Projects",
-  "name": "Projects",
-  "delimiter": "/",
-  "special_use": null
-}
-```
-
-Deleting a local folder removes it immediately. Deleting a provider-backed
-folder stores a tombstone and queues `folder.delete`; normal UI collection
-queries hide the tombstone.
-
-### Mail Messages
-
-Messages are ordered by `sent_at` descending. The selected folder must belong
-to the current user. The backend derives `external_user_uuid` from the folder
-and, when possible, derives `from_address` from the Mail External User.
-
-| Field | Type | Required on create | Description |
-| --- | --- | --- | --- |
-| `uuid` | UUID | no | Workspace message identifier. |
-| `folder_uuid` | UUID | yes | Owned destination folder. |
-| `external_user_uuid` | UUID or `null` | no | Read-only account inherited from the folder. |
-| `from_address` | string | no | Sender; server-derived for provider-backed folders. |
-| `to_addresses` | array | no | Primary recipient addresses. |
-| `cc_addresses` | array | no | CC recipient addresses. |
-| `bcc_addresses` | array | no | BCC recipient addresses. |
-| `reply_to` | string or `null` | no | Reply-To address. |
-| `subject` | string | no | Subject. |
-| `snippet` | string | no | Short preview text. |
-| `body_html` | string or `null` | no | HTML body. |
-| `body_text` | string or `null` | no | Plain-text body. |
-| `message_id` | string or `null` | no | RFC message identifier when known. |
-| `references` | string or `null` | no | Reply/thread references. |
-| `sent_at` | datetime | no | Message timestamp; defaults to current UTC time. |
-| `seen` | boolean | no | Read flag. |
-| `flagged` | boolean | no | Star/flag state. |
-| `draft` | boolean | no | Draft state. |
-| `deleted` | boolean | no | Tombstone state. |
-| `provider` | object or `null` | no | Provider badge projection. |
-| `delivery` | object or `null` | no | Delivery state projection. |
-| `created_at`, `updated_at` | datetime | no | Server timestamps. |
-
-Create a draft:
-
-```http
-POST /api/workspace/v1/mail/messages/
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "folder_uuid": "28d981a7-6666-4cc2-9412-0123456789ab",
-  "to_addresses": ["recipient@example.com"],
-  "cc_addresses": [],
-  "bcc_addresses": [],
-  "subject": "Workspace status",
-  "body_text": "The test stand is ready.",
-  "body_html": "<p>The test stand is ready.</p>",
-  "draft": true
-}
-```
-
-Send a draft:
-
-```http
-POST /api/workspace/v1/mail/messages/6ad2c7d8-7777-4d54-b117-0123456789ab/actions/send/invoke
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{}
-```
-
-The action changes `draft` to `false`, returns the full message, appends
-`mail.message.updated`, and queues `message.send`. The current account
-contract does not contain a configured sent-folder UUID. A provider discovers
-the IMAP mailbox marked with SPECIAL-USE `\\Sent`.
-
-Move a message:
-
-```http
-POST /api/workspace/v1/mail/messages/6ad2c7d8-7777-4d54-b117-0123456789ab/actions/move/invoke
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{"folder_uuid": "04720138-8888-4869-8123-0123456789ab"}
-```
-
-### Mail Attachments
-
-Attachment creation uses `multipart/form-data` with required
-`message_uuid` and `file` parts. The message must belong to the current
-user. Downloads return the stored content type and attachment disposition.
-The maximum proxied request body is 50 MiB.
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `uuid` | UUID | Attachment and blob identifier. |
-| `message_uuid` | UUID | Owning message. |
-| `name` | string | Original filename. |
-| `content_id` | string or `null` | Inline MIME content ID. |
-| `content_type` | string | MIME type. |
-| `size_bytes` | integer | Stored byte size. |
-| `hash` | string | SHA-256 digest. |
-| `storage_type` | `file` or `s3` | Backend storage type. |
-| `created_at`, `updated_at` | datetime | Server timestamps. |
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "message_uuid=6ad2c7d8-7777-4d54-b117-0123456789ab" \
-  -F "file=@report.pdf;type=application/pdf" \
-  https://workspace.example.com/api/workspace/v1/mail/attachments/
-```
-
-An attachment change emits `mail.message.updated` with the message snapshot;
-attachments are included in the event payload. Provider-backed attachments are
-also represented as provider blobs so command payloads can reference their
-`urn:file:<uuid>`.
-
-## Calendar
-
-Calendar resources follow the same local-first transaction and provider
-delivery rules as Mail. Provider CalDAV URLs, CTags, ETags, ICS source,
-sync tokens, and raw source metadata are hidden from the UI API.
-
-### Calendars
-
-| Field | Type | Required on create | Description |
-| --- | --- | --- | --- |
-| `uuid` | UUID | no | Workspace calendar identifier. |
-| `external_user_uuid` | UUID or `null` | no | Calendar External User owner. |
-| `name` | string, 1..256 | yes | Display name. |
-| `color` | string or `null` | no | UI color value. |
-| `deleted` | boolean | no | Tombstone state. |
-| `provider` | object or `null` | no | Provider badge projection. |
-| `delivery` | object or `null` | no | Delivery state projection. |
-| `created_at`, `updated_at` | datetime | no | Server timestamps. |
-
-```http
-POST /api/workspace/v1/calendar/calendars/
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "external_user_uuid": "45b827c9-9999-440c-a845-0123456789ab",
-  "name": "Work",
-  "color": "#3366ff"
-}
-```
-
-A local calendar is deleted immediately. A provider-backed calendar is
-tombstoned, queued for `calendar.delete`, and remains hidden from normal list
-requests while the provider handles remote delivery.
-
-### Calendar Events
-
-Events are ordered by `starts_at` ascending. The selected calendar must belong
-to the current user. The public create schema requires a stable `uid`; providers
-normally use the remote iCalendar UID, while local clients may generate one.
-
-| Field | Type | Required on create | Description |
-| --- | --- | --- | --- |
-| `uuid` | UUID | no | Workspace event identifier. |
-| `calendar_uuid` | UUID | yes | Owned calendar. |
-| `external_user_uuid` | UUID or `null` | no | Read-only account inherited from the calendar. |
-| `uid` | string, 1..1024 | yes | Stable calendar UID. |
-| `summary` | string | no | Event title. |
-| `description` | string or `null` | no | Description. |
-| `location` | string or `null` | no | Location. |
-| `starts_at` | UTC datetime | yes | Inclusive start. |
-| `ends_at` | UTC datetime | yes | End. |
-| `all_day` | boolean | no | All-day flag. |
-| `recurrence` | object or `null` | no | Canonical recurrence data. |
-| `attendees` | array | no | Canonical attendee objects. |
-| `alarms` | array | no | Canonical alarm objects. |
-| `recurrence_id` | string or `null` | no | Recurrence instance identifier. |
-| `deleted` | boolean | no | Tombstone state. |
-| `provider` | object or `null` | no | Provider badge projection. |
-| `delivery` | object or `null` | no | Delivery state projection. |
-| `created_at`, `updated_at` | datetime | no | Server timestamps. |
-
-```http
-POST /api/workspace/v1/calendar/events/
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{
-  "calendar_uuid": "e756f659-aaaa-41e7-83aa-0123456789ab",
-  "uid": "architecture-review-20260716@example.com",
-  "summary": "Architecture review",
-  "description": "Review provider boundaries and event payloads.",
-  "location": "Room 2",
-  "starts_at": "2026-07-16T09:00:00Z",
-  "ends_at": "2026-07-16T10:00:00Z",
-  "all_day": false,
-  "attendees": [{"email": "reviewer@example.com"}],
-  "alarms": [{"minutes_before": 15}]
-}
-```
-
-Move an event:
-
-```http
-POST /api/workspace/v1/calendar/events/bfa467ca-bbbb-45b6-a91d-0123456789ab/actions/move/invoke
-Authorization: Bearer <token>
-Content-Type: application/json
-
-{"calendar_uuid": "cab6f39e-cccc-4c04-8549-0123456789ab"}
-```
-
-Create/update/move return the full canonical snapshot. Local deletes emit an
-identity payload; provider-backed deletes retain a tombstone snapshot so the UI
-can display delivery state until the provider reports the result.
 
 ## Events And Epoch
 
-Events are durable outbox rows stored in `m_workspace_events`. They are scoped to
-the affected `user_uuid`: message, stream, topic, folder, and user snapshots are
+Events are durable records in the IMAP event journal and are scoped to the
+affected `user_uuid`: message, stream, topic, folder, and user snapshots are
 created per visible recipient, while delete events are sent only to users that
-must remove local state. `epoch_version` is a monotonically increasing cursor.
+must remove local state. `m_workspace_events` is a rebuildable PostgreSQL read
+projection. Only event records are retained for seven days; messages, files,
+stream/topic state, and the canonical operation journal are never removed by
+this policy. Pruning removes a contiguous oldest UID prefix so the retained
+journal remains a complete suffix. `epoch_version` is monotonic within one
+`epoch_generation` (the IMAP event mailbox UIDVALIDITY).
 
 `GET /api/workspace/v1/events/` returns events sorted by `epoch_version` ascending by default.
 REST `/events/` and websocket delivery use the same flat schema:
-both read from the visible event surface, so external-source events are hidden
-whenever the current user's matching external account access is not confirmed.
-`GET /api/workspace/v1/epoch/` uses that same visible event surface.
+both read from the current user's visible IMAP-backed event surface.
+`GET /api/workspace/v1/epoch/` uses that same surface.
 
 ```json
 {
@@ -1601,9 +1216,7 @@ plus `payload.kind`. Delete events are minimal:
 Read actions emit `message.read`, `topic.read`, or `stream.read` with the full
 action response object in `payload`. When unread counters change, the backend
 also emits `topic.updated`, `stream.updated`, and `folder.updated` events so UI
-badges can be updated from normal snapshots. Historical rows with
-`payload.kind == "messages.read"` are preserved as best-effort legacy events
-with `message_uuids`; new runtime events use the singular read kinds.
+badges can be updated from normal snapshots.
 
 Supported values:
 
@@ -1612,44 +1225,57 @@ Supported values:
 | `message` | `created`, `updated`, `deleted`, `read` | `message.created`, `message.updated`, `message.deleted`, `message.read` |
 | `message_reaction` | `created`, `updated`, `deleted` | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` |
 | `stream` | `created`, `updated`, `deleted`, `read` | `stream.created`, `stream.updated`, `stream.deleted`, `stream.read` |
-| `stream_binding` | `created` | `stream_bindings.created` |
+| `stream_binding` | `created`, `updated`, `deleted` | `stream_bindings.created`, `stream_binding.updated`, `stream_binding.deleted` |
 | `topic` | `created`, `updated`, `deleted`, `read` | `topic.created`, `topic.updated`, `topic.deleted`, `topic.read` |
 | `user` | `updated` | `user.updated` |
 | `folder` | `created`, `updated`, `deleted` | `folder.created`, `folder.updated`, `folder.deleted` |
 | `folder_item` | `deleted` | `folder_item.deleted` |
-| `external_account` | `updated` | `external_account.updated` |
-| `mail_folder` | `created`, `updated`, `deleted` | `mail.folder.created`, `mail.folder.updated`, `mail.folder.deleted` |
-| `mail_message` | `created`, `updated`, `deleted` | `mail.message.created`, `mail.message.updated`, `mail.message.deleted` |
-| `calendar` | `created`, `updated`, `deleted` | `calendar.calendar.created`, `calendar.calendar.updated`, `calendar.calendar.deleted` |
-| `calendar_event` | `created`, `updated`, `deleted` | `calendar.event.created`, `calendar.event.updated`, `calendar.event.deleted` |
-
-The unification migration adds `schema_version`, `object_type`, and `action` to
-`m_workspace_events`, backfills them from `payload.kind`, converts legacy
-`stream_bindings.created` payloads to `items`, and leaves historical
-`messages.read` rows readable as legacy payloads.
+| `file` | `created`, `updated`, `deleted` | `file.created`, `file.updated`, `file.deleted` |
 
 For strict catch-up after a processed cursor, use:
 
 ```http
-GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&page_limit=500
+GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_generation=<saved_generation>&page_limit=500
 ```
 
-`GET /api/workspace/v1/epoch/` returns the latest visible event epoch for the current IAM user,
-or `0` when there are no visible events:
+`GET /api/workspace/v1/epoch/` returns the latest visible event cursor and the
+oldest retained epoch for the current IAM user. `epoch_version` is the direct
+alias of `current_epoch_version`:
 
 ```json
-{"epoch_version": 124}
+{
+  "epoch_version": 124,
+  "epoch_generation": "781203",
+  "current_epoch_version": 124,
+  "minimum_epoch_version": 37
+}
 ```
+
+Clients persist `epoch_generation` together with `epoch_version`. A resume
+cursor above zero without a generation, a changed generation, a future epoch,
+or an epoch older than the retained suffix returns HTTP `410` with
+`type=EventsCursorExpiredError`, `error=epoch_pruned`, the reason, and the
+current/minimum cursor fields. The response is `Cache-Control: no-store`.
+Clients then clear derived entity/blob caches, load authoritative snapshots,
+and restart tracking from the returned generation; server messages and domain
+data are not deleted.
 
 ## Workspace Users
 
 Workspace users are stored in `m_workspace_users`. The route is global rather
 than project-scoped.
 
+`GET /api/workspace/v1/me/` returns the same `WorkspaceUser_Get` object as
+`GET /api/workspace/v1/users/{user_uuid}`, using the user UUID from the IAM
+token. The client does not send or derive a user UUID for this request. The
+backend takes `project_id` from IAM introspection, refreshes the IAM-owned
+username, first name, last name, and email projection, and returns the local
+Workspace status, avatar, and presence fields.
+
 When the current IAM user requests their own UUID, the API materializes or
-refreshes the IAM identity projection before returning it. Provider-projected
-users are upserted through the trusted Messenger Provider API; the browser
-cannot submit provider ownership fields.
+refreshes the IAM identity projection before returning it. The browser cannot
+submit source ownership fields. The `zulip` source literal remains reserved for
+a future mail-protocol provider transport; no provider runtime exists now.
 
 | Field | Type | Description |
 | --- | --- | --- |
@@ -1667,16 +1293,9 @@ cannot submit provider ownership fields.
 | `created_at` | datetime | Creation time. |
 | `updated_at` | datetime | Update time. |
 
-A Zulip provider projection sets `avatar` to
-`urn:gravatar:<md5(trim(lower(delivery_email)))>`, falling back to the Zulip
-profile `email` only when `delivery_email` is empty. This matches the Gravatar
-identifier generated by Zulip 12.1. A later provider upsert may also correct the avatar of an already matched
-Workspace user.
-
-Migration `0095-fix-workspace-gravatar-avatar-urn-f75679.py` converts the
-misspelled legacy `urn:gavatar:<user-uuid>` values in users, user events, and
-avatar URNs embedded in message/event markdown. After the migration, the legacy
-form is rejected rather than handled through a compatibility path.
+A future provider may project a Gravatar-compatible avatar as
+`urn:gravatar:<md5(trim(lower(delivery_email)))>`. Raw provider identifiers and
+mail addresses used only for transport are not exposed in this contract.
 
 Presence update:
 
@@ -1697,6 +1316,40 @@ the supplied status and the current time in `last_ping_at`. Optional `emoji` and
 fields keep previous values, and explicit `null` clears them. The Workspace messenger worker marks stale users offline and emits `user.updated` events with full user
 snapshots, including `avatar`, to all Workspace users in every project.
 
+Avatar upload is an atomic own-user action:
+
+```http
+POST /api/workspace/v1/users/11111111-1111-1111-1111-111111111111/actions/avatar_upload/invoke
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data
+
+file=<PNG, JPEG, GIF, or WebP binary part>
+```
+
+Only the authenticated user's own UUID is accepted. The maximum avatar size is
+25 MiB. The backend validates the declared MIME type and binary signature,
+stores the bytes and JSON sidecar through the configured file backend, sets
+`acl.mode` to `public`, omits `stream_uuid`, and updates only `user.avatar` to
+`urn:image:<file-uuid>`. IAM-owned username, name, and email fields remain
+read-only. The action emits the full `user.updated` snapshot in every Workspace
+project.
+
+Resetting the avatar uses the same own-user authorization:
+
+```http
+POST /api/workspace/v1/users/11111111-1111-1111-1111-111111111111/actions/avatar_reset/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{}
+```
+
+Reset replaces `user.avatar` with
+`urn:gravatar:<md5(trim(lower(email)))>` or the canonical non-reversible UUID
+fallback for a user without email. A replaced custom avatar loses public access
+as soon as the user reference and projection row are updated; its binary and
+sidecar are then removed from object storage.
+
 ## WebSocket Realtime Summary
 
 The common websocket service uses subprotocol `workspace.events.v1` and authenticates
@@ -1704,18 +1357,30 @@ the bearer token from `Sec-WebSocket-Protocol`:
 
 ```ts
 const ws = new WebSocket(
-  "/api/workspace/v1/events/ws?last_epoch_version=124",
+  "/api/workspace/v1/events/ws?last_epoch_version=124&epoch_generation=781203",
   ["workspace.events.v1", `bearer.${accessToken}`],
 );
 ```
 
 After the connection is accepted, the server sends missed events newer than
-`last_epoch_version`, then live events. Each websocket message is the same flat event object returned by REST
-`/api/workspace/v1/events/`, including Mail and Calendar event kinds. The websocket service does not send
+the saved cursor. It then sends exactly one control frame
+`{"type":"ready","epoch_generation":"...","epoch_version":124}` before any
+live event can be delivered. UI notification gates remain closed until this
+frame. Each event message is the same flat event object returned by REST
+`/api/workspace/v1/events/`. The websocket service does not send
 application-level JSON `hello` or `ping` messages and does not process client
 JSON `pong` or `ack` messages. It sends protocol-level WebSocket ping control
 frames at the configured heartbeat interval. Reconnect and catch-up are driven
-by the persisted `last_epoch_version` cursor.
+by the persisted cursor pair. An expired cursor sends the same typed
+`epoch_pruned` JSON error as REST and closes with code `4410` and reason
+`epoch_pruned`.
+
+For protected file caches, `file.created/updated/deleted` invalidates one UUID.
+On membership removal the removed user receives `stream.deleted`; clients
+immediately evict every protected blob whose cached metadata has that
+`stream_uuid`. Remaining participants receive `stream_binding.deleted` (and
+role/settings changes produce `stream_binding.updated`) to update participant
+state. A 410 gap clears all derived protected-blob cache entries.
 
 Detailed UI integration rules are documented in
 `docs/workspace_ui_realtime_integration.md`.
@@ -1724,23 +1389,17 @@ Detailed UI integration rules are documented in
 
 The runtime Workspace OpenAPI document is available at
 `/api/workspace/specifications/3.0.3`. It describes the IAM-authenticated UI
-surface. The Provider Service has a separate runtime specification on its
-private listener; its command acknowledgement/result bodies and ownership
-rules are additionally documented in
-[`provider_service_api.md`](provider_service_api.md).
+surface. There is no Provider, Mail, or Calendar specification in this release.
 
 The Workspace backend element installs independent `workspace-messenger-api`,
-`workspace-api`, `workspace-provider-api`, `workspace-messenger-events`, and
-`workspace-messenger-worker` processes. Providers are deployed as three
-separate Exordos elements: `workspace-zulip-provider`,
-`workspace-mail-provider`, and `workspace-calendar-provider`. Each provider
-element has its own compute image, manifest, daemon, PostgreSQL instance, user,
-and database. No provider daemon runs in the Workspace backend element, and no
-removed UI-side mail proxy or backend-owned integration bridge is required.
+`workspace-api`, `workspace-messenger-events`, and
+`workspace-messenger-worker` processes together with Exim4 and Dovecot on the
+dedicated internal mail node.
+The element requires S3aaS for binary objects and JSON sidecars and DBaaS for
+the disposable PostgreSQL projection. It builds the existing Workspace UI in
+Messenger-only mode and serves it from nginx.
 
 Related documents:
 
 - [Workspace architecture](architecture.md)
-- [Provider Service API](provider_service_api.md)
-- [Provider integration guide](provider_integration_guide.md)
 - [Workspace UI realtime integration](workspace_ui_realtime_integration.md)

@@ -142,6 +142,11 @@ class WorkspaceUserMessageBase(
         types.Boolean(),
         default=False,
     )
+    mentioned = properties.property(
+        types.Boolean(),
+        default=False,
+        read_only=True,
+    )
     reactions = properties.property(
         types.Dict(),
         default=dict,

@@ -14,6 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import re
+
 from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
@@ -28,11 +30,13 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
     )
 
     def is_user_mentioned(self, user_uuid):
-        needle = str(user_uuid)
         return (
-            ("@" + needle) in self.content
-            or ("<@" + needle + ">") in self.content
-            or ("urn:user:" + needle) in self.content
+            re.search(
+                r"\]\(urn:user:" + re.escape(str(user_uuid)) + r"\)",
+                self.content,
+                flags=re.IGNORECASE,
+            )
+            is not None
         )
 
 

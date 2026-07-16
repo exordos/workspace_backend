@@ -22,10 +22,6 @@ set -o pipefail
 READY_FILE="/run/workspace/bootstrap.ready"
 TIMEOUT="${WORKSPACE_BOOTSTRAP_WAIT_TIMEOUT:-900}"
 
-if [ ! -f "$READY_FILE" ]; then
-    /usr/local/bin/workspace-bootstrap
-fi
-
 deadline=$((SECONDS + TIMEOUT))
 while [ ! -f "$READY_FILE" ]; do
     if [ "$SECONDS" -ge "$deadline" ]; then
@@ -34,3 +30,7 @@ while [ ! -f "$READY_FILE" ]; do
     fi
     sleep 1
 done
+
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi

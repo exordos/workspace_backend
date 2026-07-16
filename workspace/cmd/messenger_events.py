@@ -27,6 +27,9 @@ from restalchemy.storage.sql import engines
 from workspace.common import config
 from workspace.common import log as infra_log
 from workspace.messenger_api import websocket_service
+from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import store as api_store
+from workspace.messenger_mail import runtime as messenger_mail_runtime
 
 
 events_cli_opts = [
@@ -80,6 +83,7 @@ CONF = cfg.CONF
 CONF.register_cli_opts(events_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
 iam_opts.register_iam_cli_opts(CONF)
+messenger_mail_runtime.register_opts(CONF)
 
 
 def main():
@@ -96,6 +100,10 @@ def main():
         )
 
     engines.engine_factory.configure_postgresql_factory(conf=CONF)
+    runtime_factory = messenger_mail_runtime.RuntimeFactory(CONF)
+    api_store.configure_store_factory(
+        sql_store.SQLProjectedMessengerStoreFactory(runtime_factory)
+    )
     iam_driver = drivers.HttpDriver(
         CONF.iam.iam_endpoint,
         CONF.iam.audience,

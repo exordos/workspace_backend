@@ -28,6 +28,7 @@ from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.messenger_mail import repository as mail_repository
 from workspace.tests.integration import conftest
 
 
@@ -240,6 +241,116 @@ def test_user_presence_action_updates_current_user_presence(api, db):
         json={"status": "active"},
     )
     assert resp.status_code == 404, resp.text
+
+
+def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
+    api, db, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
+    other_user_uuid = sys_uuid.uuid4()
+    other_project_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        other_user_uuid,
+        f"user-{other_user_uuid}",
+    )
+    data = b"\x89PNG\r\n\x1a\nworkspace-avatar"
+
+    resp = api.post(
+        f"{USERS}{api.user_uuid}/actions/avatar_upload/invoke",
+        files={"file": ("avatar.png", io.BytesIO(data), "image/png")},
+    )
+    assert resp.status_code == 200, resp.text
+    user = resp.json()
+    assert user["avatar"].startswith("urn:image:")
+    file_uuid = user["avatar"].removeprefix("urn:image:")
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT project_id, user_uuid, stream_uuid
+            FROM m_workspace_files
+            WHERE uuid = %s
+            """,
+            (file_uuid,),
+        )
+        row = cur.fetchone()
+    assert str(row[0]) == str(api.project_id)
+    assert str(row[1]) == str(api.user_uuid)
+    assert row[2] is None
+
+    metadata = file_storage.read_workspace_file_metadata(file_uuid)
+    assert metadata.acl_mode == "public"
+    assert metadata.stream_uuid is None
+    assert metadata.owner_uuid == sys_uuid.UUID(api.user_uuid)
+
+    resp = api.get(
+        f"{FILES}{file_uuid}",
+        user=other_user_uuid,
+        project=other_project_uuid,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = api.get(
+        f"{FILES}{file_uuid}/actions/download",
+        user=other_user_uuid,
+        project=other_project_uuid,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == data
+
+    resp = api.post(
+        f"{USERS}{api.user_uuid}/actions/avatar_reset/invoke",
+        json={},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["avatar"] == (
+        messenger_models.build_workspace_user_default_avatar(api.user_uuid)
+    )
+    assert not file_storage.get_workspace_file_path(
+        file_uuid,
+        storage_path=tmp_path,
+    ).exists()
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM m_workspace_files WHERE uuid = %s",
+            (file_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_avatar_actions_reject_another_user_uuid(api, db, tmp_path, monkeypatch):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    target_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, target_uuid, f"user-{target_uuid}")
+
+    resp = api.post(
+        f"{USERS}{target_uuid}/actions/avatar_upload/invoke",
+        files={
+            "file": (
+                "avatar.png",
+                io.BytesIO(b"\x89PNG\r\n\x1a\nworkspace-avatar"),
+                "image/png",
+            )
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    resp = api.post(
+        f"{USERS}{target_uuid}/actions/avatar_reset/invoke",
+        json={},
+    )
+    assert resp.status_code == 400, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT avatar FROM m_workspace_users WHERE uuid = %s",
+            (target_uuid,),
+        )
+        assert cur.fetchone()[0] == (
+            messenger_models.build_workspace_user_default_avatar(target_uuid)
+        )
+        cur.execute("SELECT COUNT(*) FROM m_workspace_files")
+        assert cur.fetchone()[0] == 0
 
 
 def test_user_presence_action_skips_event_for_heartbeat(api, db):
@@ -685,8 +796,7 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
         )
 
     resp = api.get(f"{FILES}{file_uuid}", user=outsider_user)
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["uuid"] == file_uuid
+    assert resp.status_code == 404, resp.text
 
     resp = api.put(
         f"{FILES}{file_uuid}",
@@ -894,6 +1004,33 @@ def test_folder_create_writes_realtime_event(api, db):
     assert event["payload"]["kind"] == "folder.created"
     assert event["payload"]["uuid"] == folder["uuid"]
     assert event["payload"]["title"] == "Inbox"
+
+
+def test_canonical_event_append_failure_rolls_back_sql_event(api, db, monkeypatch):
+    def fail_append_event(self, record):
+        del self, record
+        raise RuntimeError("canonical event append failed")
+
+    monkeypatch.setattr(
+        mail_repository.MessengerMailRepository,
+        "append_event",
+        fail_append_event,
+    )
+
+    resp = api.post(FOLDERS, json={"title": "Must roll back"})
+
+    assert resp.status_code == 500, resp.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        event_count = cur.fetchone()[0]
+    assert event_count == 0
 
 
 def test_folder_update_writes_realtime_event(api, db):
@@ -1663,7 +1800,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         stored_private_index = cur.fetchone()[0]
         cur.execute(
             """
-            SELECT user_uuid, role
+            SELECT uuid, user_uuid, role
             FROM m_workspace_stream_bindings
             WHERE project_id = %s
                 AND stream_uuid = %s
@@ -1697,7 +1834,7 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         folder_events = cur.fetchall()
 
     assert stored_private_index == expected_index
-    assert [(str(user_uuid), role) for user_uuid, role in bindings] == [
+    assert [(str(user_uuid), role) for _uuid, user_uuid, role in bindings] == [
         (user_uuid, "owner")
         for user_uuid in sorted([str(api.user_uuid), str(direct_user_uuid)])
     ]
@@ -1714,6 +1851,45 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
             ("00000000-0000-0000-0000-000000000000", "All chats"),
             ("00000000-0000-0000-0000-000000000001", "Personal"),
         )
+    ]
+
+    third_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        third_user_uuid,
+        f"user-{third_user_uuid}",
+    )
+    resp = api.post(
+        f"{STREAMS}{first_stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(third_user_uuid)]},
+    )
+    assert resp.status_code == 400, resp.text
+
+    first_binding_uuid = bindings[0][0]
+    resp = api.put(
+        f"{STREAM_BINDINGS}{first_binding_uuid}",
+        json={"role": "member"},
+    )
+    assert resp.status_code == 400, resp.text
+
+    resp = api.delete(f"{STREAM_BINDINGS}{first_binding_uuid}")
+    assert resp.status_code == 400, resp.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, role
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+                AND stream_uuid = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        unchanged_bindings = cur.fetchall()
+    assert [(str(user_uuid), role) for user_uuid, role in unchanged_bindings] == [
+        (user_uuid, "owner")
+        for user_uuid in sorted([str(api.user_uuid), str(direct_user_uuid)])
     ]
 
 
@@ -2013,6 +2189,146 @@ def test_streams_cursor_pagination_with_composite_pk(api, db):
     assert sorted(collected) == sorted(seeded)
     assert len(collected) == len(set(collected)) == 5
     assert pages == 3  # 2 + 2 + 1
+
+
+def test_messages_cursor_pagination_uses_created_at_uuid_keyset(api, db):
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE indexname = 'm_workspace_messages_project_created_uuid_idx'
+            """
+        )
+        index_definition = cur.fetchone()[0]
+    assert "(project_id, created_at, uuid)" in index_definition.replace('"', "")
+
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "message-keyset-pagination",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = [
+        sys_uuid.UUID(f"40000000-0000-4000-8000-{value:012d}") for value in range(1, 5)
+    ]
+    for message_uuid in message_uuids:
+        messenger_dm_helpers.create_workspace_user_message(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content=str(message_uuid)),
+        )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_messages
+            SET created_at = CASE
+                WHEN uuid = %s THEN '2026-07-15T09:00:00Z'::timestamptz
+                ELSE '2026-07-15T10:00:00Z'::timestamptz
+            END
+            WHERE uuid = ANY(%s)
+            """,
+            (message_uuids[-1], message_uuids),
+        )
+
+    other_stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "message-keyset-other-scope",
+    )
+    other_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        other_stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    other_message_uuid = sys_uuid.UUID("50000000-0000-4000-8000-000000000001")
+    messenger_dm_helpers.create_workspace_user_message(
+        uuid=other_message_uuid,
+        project_id=sys_uuid.UUID(api.project_id),
+        user_uuid=sys_uuid.UUID(api.user_uuid),
+        stream_uuid=sys_uuid.UUID(other_stream_uuid),
+        topic_uuid=sys_uuid.UUID(other_topic_uuid),
+        payload=message_payloads.MarkdownPayload(content="other scope"),
+    )
+
+    def collect(direction):
+        collected = []
+        marker = None
+        page_headers = []
+        while True:
+            params = {
+                "page_limit": 2,
+                "sort_key": "created_at",
+                "sort_dir": direction,
+                "stream_uuid": stream_uuid,
+            }
+            if marker is not None:
+                params["page_marker"] = marker
+            response = api.get(MESSAGES, params=params)
+            assert response.status_code == 200, response.text
+            page = response.json()
+            collected.extend(item["uuid"] for item in page)
+            marker = response.headers.get("X-Pagination-Marker")
+            page_headers.append(marker)
+            if marker is None:
+                break
+        return collected, page_headers
+
+    descending, descending_headers = collect("desc")
+    ascending, ascending_headers = collect("asc")
+
+    assert descending == [
+        str(message_uuids[2]),
+        str(message_uuids[1]),
+        str(message_uuids[0]),
+        str(message_uuids[3]),
+    ]
+    assert ascending == [
+        str(message_uuids[3]),
+        str(message_uuids[0]),
+        str(message_uuids[1]),
+        str(message_uuids[2]),
+    ]
+    assert descending_headers == [str(message_uuids[1]), None]
+    assert ascending_headers == [str(message_uuids[0]), None]
+
+    wrong_scope = api.get(
+        MESSAGES,
+        params={
+            "page_limit": 2,
+            "page_marker": str(other_message_uuid),
+            "sort_key": "created_at",
+            "sort_dir": "asc",
+            "stream_uuid": stream_uuid,
+        },
+    )
+    assert wrong_scope.status_code == 404, wrong_scope.text
+
+    unsupported_sort = api.get(
+        MESSAGES,
+        params={
+            "page_limit": 2,
+            "sort_key": "updated_at",
+            "sort_dir": "asc",
+            "stream_uuid": stream_uuid,
+        },
+    )
+    assert unsupported_sort.status_code == 400, unsupported_sort.text
 
 
 # --------------------------------------------------------------------------- #
@@ -2487,248 +2803,6 @@ def test_epoch_is_zero_without_visible_events(api, workspace_api):
     resp = workspace_api.get(EPOCH)
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"epoch_version": 0}
-
-
-def test_external_folder_and_binding_events_follow_stream_visibility(
-    api,
-    workspace_api,
-    db,
-):
-    workspace_api.user_uuid = api.user_uuid
-    workspace_api.project_id = api.project_id
-    conftest.seed_workspace_user(
-        db,
-        api.user_uuid,
-        f"user-{api.user_uuid}",
-    )
-    stream_uuid = sys_uuid.uuid4()
-    server_url = "https://zulip-hidden.example.test"
-    with db.cursor() as cur:
-        cur.execute(
-            """
-            SELECT COALESCE(MAX(epoch_version), 0)
-            FROM m_workspace_events
-            WHERE project_id = %s
-              AND user_uuid = %s
-            """,
-            (api.project_id, api.user_uuid),
-        )
-        before_epoch = cur.fetchone()[0]
-
-        cur.execute(
-            """
-            INSERT INTO m_workspace_streams
-                (uuid, name, description, source_name, source,
-                 user_uuid, project_id, created_at, updated_at)
-            VALUES (
-                %s,
-                'hidden-zulip',
-                'hidden',
-                'zulip',
-                jsonb_build_object(
-                    'kind', 'zulip',
-                    'server_url', %s::text,
-                    'stream_id', 42
-                ),
-                %s,
-                %s,
-                NOW(),
-                NOW()
-            )
-            """,
-            (
-                str(stream_uuid),
-                server_url,
-                api.user_uuid,
-                api.project_id,
-            ),
-        )
-        cur.execute(
-            """
-            INSERT INTO m_workspace_stream_bindings
-                (uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
-                 created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, 'member', NOW(), NOW())
-            """,
-            (
-                str(sys_uuid.uuid4()),
-                api.project_id,
-                str(stream_uuid),
-                api.user_uuid,
-                api.user_uuid,
-            ),
-        )
-        cur.execute(
-            """
-            INSERT INTO m_workspace_events
-                (uuid, project_id, user_uuid, schema_version, object_type,
-                 action, payload, created_at, updated_at)
-            VALUES (
-                %s,
-                %s,
-                %s,
-                1,
-                'folder',
-                'updated',
-                jsonb_build_object(
-                    'kind', 'folder.updated',
-                    'uuid', '00000000-0000-0000-0000-000000000000',
-                    'title', 'All chats',
-                    'system_type', 'all',
-                    'unread_count', 7,
-                    'folder_items', jsonb_build_array(jsonb_build_object(
-                        'uuid', %s::text,
-                        'folder', '00000000-0000-0000-0000-000000000000',
-                        'project_id', %s::text,
-                        'user_uuid', %s::text,
-                        'stream_uuid', %s::text,
-                        'chat_type', 'stream',
-                        'unread_count', 7
-                    )),
-                    'created_at', '2026-07-10T00:00:00.000000Z',
-                    'updated_at', '2026-07-10T00:00:00.000000Z'
-                ),
-                NOW(),
-                NOW()
-            )
-            RETURNING epoch_version
-            """,
-            (
-                str(sys_uuid.uuid4()),
-                api.project_id,
-                api.user_uuid,
-                str(sys_uuid.uuid4()),
-                api.project_id,
-                api.user_uuid,
-                str(stream_uuid),
-            ),
-        )
-        folder_epoch = cur.fetchone()[0]
-        cur.execute(
-            """
-            INSERT INTO m_workspace_events
-                (uuid, project_id, user_uuid, schema_version, object_type,
-                 action, payload, created_at, updated_at)
-            VALUES (
-                %s,
-                %s,
-                %s,
-                1,
-                'stream_binding',
-                'created',
-                jsonb_build_object(
-                    'kind', 'stream_bindings.created',
-                    'uuid', %s::text,
-                    'items', jsonb_build_array(jsonb_build_object(
-                        'uuid', %s::text,
-                        'project_id', %s::text,
-                        'user_uuid', %s::text,
-                        'stream_uuid', %s::text,
-                        'who_uuid', %s::text,
-                        'role', 'member',
-                        'notification_mode', 'all_messages'
-                    ))
-                ),
-                NOW(),
-                NOW()
-            )
-            RETURNING epoch_version
-            """,
-            (
-                str(sys_uuid.uuid4()),
-                api.project_id,
-                api.user_uuid,
-                str(stream_uuid),
-                str(sys_uuid.uuid4()),
-                api.project_id,
-                api.user_uuid,
-                str(stream_uuid),
-                api.user_uuid,
-            ),
-        )
-        binding_epoch = cur.fetchone()[0]
-
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM m_workspace_visible_events
-            WHERE epoch_version IN (%s, %s)
-            """,
-            (folder_epoch, binding_epoch),
-        )
-        assert cur.fetchone()[0] == 0
-
-    resp = workspace_api.get(
-        EVENTS,
-        params=[
-            ("page_limit", 100),
-            ("epoch_version>", before_epoch),
-        ],
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == []
-
-    with db.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO m_external_accounts
-                (uuid, project_id, user_uuid, server_url, account_type,
-                 status, account_settings, source_scope, access_status,
-                 access_checked_at, access_confirmed_at, created_at,
-                 updated_at)
-            VALUES (
-                %s,
-                %s,
-                %s,
-                %s,
-                'zulip',
-                'active',
-                jsonb_build_object(
-                    'kind', 'zulip',
-                    'credentials', jsonb_build_object(
-                        'kind', 'zulip',
-                        'email', 'agent@example.test',
-                        'api_key', 'token'
-                    )
-                ),
-                %s,
-                'confirmed',
-                NOW(),
-                NOW(),
-                NOW(),
-                NOW()
-            )
-            """,
-            (
-                str(sys_uuid.uuid4()),
-                api.project_id,
-                api.user_uuid,
-                server_url,
-                server_url,
-            ),
-        )
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM m_workspace_visible_events
-            WHERE epoch_version IN (%s, %s)
-            """,
-            (folder_epoch, binding_epoch),
-        )
-        assert cur.fetchone()[0] == 2
-
-    resp = workspace_api.get(
-        EVENTS,
-        params=[
-            ("page_limit", 100),
-            ("epoch_version>", before_epoch),
-        ],
-    )
-    assert resp.status_code == 200, resp.text
-    assert [event["epoch_version"] for event in resp.json()] == [
-        folder_epoch,
-        binding_epoch,
-    ]
 
 
 def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
@@ -3651,7 +3725,9 @@ def test_message_create_without_topic_rejects_stream_without_default(api, db):
     assert resp.json()["code"] == 400001007
 
 
-def test_message_helper_writes_visible_event(api, workspace_api, db):
+def test_projection_helper_does_not_bypass_canonical_event_journal(
+    api, workspace_api, db
+):
     workspace_api.user_uuid = api.user_uuid
     workspace_api.project_id = api.project_id
     stream_uuid = conftest.seed_user_stream(
@@ -3661,7 +3737,7 @@ def test_message_helper_writes_visible_event(api, workspace_api, db):
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
     message_uuid = sys_uuid.uuid4()
-    message = messenger_dm_helpers.create_workspace_user_message(
+    messenger_dm_helpers.create_workspace_user_message(
         uuid=message_uuid,
         project_id=sys_uuid.UUID(api.project_id),
         user_uuid=sys_uuid.UUID(api.user_uuid),
@@ -3672,12 +3748,7 @@ def test_message_helper_writes_visible_event(api, workspace_api, db):
 
     resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text
-    events = resp.json()
-    assert len(events) == 1
-    assert events[0]["payload"]["uuid"] == str(message_uuid)
-    assert events[0]["payload"]["kind"] == "message.created"
-    assert events[0]["payload"]["user_uuid"] == str(message.user_uuid)
-    assert events[0]["payload"]["read"] is True
+    assert resp.json() == []
 
 
 def test_zulip_message_flag_sync_keeps_author_read(api, db):
@@ -3796,17 +3867,20 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
     message_uuids = []
-    for content in ("first through model", "second through model"):
-        message_uuid = sys_uuid.uuid4()
-        message_uuids.append(str(message_uuid))
-        messenger_dm_helpers.create_workspace_user_message(
-            uuid=message_uuid,
-            project_id=sys_uuid.UUID(api.project_id),
-            user_uuid=sys_uuid.UUID(api.user_uuid),
-            stream_uuid=sys_uuid.UUID(stream_uuid),
-            topic_uuid=sys_uuid.UUID(topic_uuid),
-            payload=message_payloads.MarkdownPayload(content=content),
+    for content in ("first through API", "second through API"):
+        create_resp = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": content,
+                },
+            },
         )
+        assert create_resp.status_code == 201, create_resp.text
+        message_uuids.append(create_resp.json()["uuid"])
 
     resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text

@@ -1,1 +1,0 @@
-"""Zulip Workspace messenger provider."""

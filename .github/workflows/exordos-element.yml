@@ -18,6 +18,8 @@ on:
 env:
   ARTIFACTS_PATH: output
   EXORDOS_CFG: exordos/exordos.yaml
+  WORKSPACE_UI_REPOSITORY: https://github.com/exordos/workspace_ui.git
+  WORKSPACE_UI_REF: 183508d5dd90efa8ab3ccf24c9e5aaaf8fe50ef3
 
 jobs:
   build:
@@ -31,11 +33,51 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout compatible Workspace UI
+        run: |
+          set -euo pipefail
+
+          ui_dir="${GITHUB_WORKSPACE}/../workspace_ui"
+          rm -rf "${ui_dir}"
+          git init --quiet "${ui_dir}"
+          git -C "${ui_dir}" remote add origin "${WORKSPACE_UI_REPOSITORY}"
+          git -C "${ui_dir}" fetch --depth=1 origin "${WORKSPACE_UI_REF}"
+          git -C "${ui_dir}" checkout --detach --quiet FETCH_HEAD
+          test "$(git -C "${ui_dir}" rev-parse HEAD)" = "${WORKSPACE_UI_REF}"
+
+      - name: Install compatible Exordos CLI
+        env:
+          EXORDOS_RELEASE_URL: https://github.com/exordos/exordos/releases/download/3.0.2/exordos-linux
+          EXORDOS_RELEASE_SHA256: 469007b01253f69b5fcf540b8f6605a360c2539019a5b148fbabb0353bee6a5b
+        run: |
+          set -euo pipefail
+
+          command -v curl
+          command -v sha256sum
+          exordos_bin="${RUNNER_TEMP}/exordos"
+          exordos_download="${exordos_bin}.download"
+          rm -f "${exordos_download}"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 \
+            --max-time 180 \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --retry-max-time 600 \
+            "${EXORDOS_RELEASE_URL}" \
+            --output "${exordos_download}"
+          printf "%s  %s\n" "${EXORDOS_RELEASE_SHA256}" "${exordos_download}" \
+            | sha256sum --check -
+          mv "${exordos_download}" "${exordos_bin}"
+          chmod 0755 "${exordos_bin}"
+          printf "EXORDOS_BIN=%s\n" "${exordos_bin}" >> "${GITHUB_ENV}"
+          "${exordos_bin}" version
+
       - name: Check Exordos build prerequisites
         run: |
           set -euo pipefail
 
-          exordos version
+          "${EXORDOS_BIN}" version
           command -v packer
           command -v qemu-img
           command -v qemu-system-x86_64
@@ -46,7 +88,7 @@ jobs:
           set -euo pipefail
 
           rm -rf "${ARTIFACTS_PATH}"
-          exordos build . \
+          "${EXORDOS_BIN}" build . \
             --exordos-cfg-file "${EXORDOS_CFG}" \
             --output-dir "${ARTIFACTS_PATH}" \
             --force
@@ -72,7 +114,7 @@ jobs:
             latest_arg=(--latest)
           fi
 
-          exordos push . \
+          "${EXORDOS_BIN}" push . \
             --exordos-cfg-file "${push_cfg_path}" \
             --element-dir "${ARTIFACTS_PATH}" \
             --force \

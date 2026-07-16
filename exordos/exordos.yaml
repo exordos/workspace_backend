@@ -20,6 +20,7 @@ build:
       path:
         src: ../../workspace_backend
       exclude:
+        - .git
         - .venv
         - .tox
         - .pytest_cache
@@ -28,6 +29,17 @@ build:
         - cover
         - output
         - workspace.egg-info
+    - dst: /opt/workspace-ui
+      path:
+        src: ../../workspace_ui
+      exclude:
+        - .git
+        - node_modules
+        - playwright-report
+        - e2e/results
+        - packages/web/dist
+        - packages/electron-app/dist
+        - packages/electron-app/release
 
   elements:
     - manifest: manifests/workspace.yaml.j2
@@ -37,28 +49,10 @@ build:
           profile: exordos_base
           script: images/backend-install.sh
           override:
-            disk_size: "8G"
-    - manifest: manifests/workspace-zulip-provider.yaml.j2
-      images:
-        - name: workspace-zulip-provider
+            disk_size: "10G"
+        - name: workspace-mail
           format: zst
           profile: exordos_base
-          script: images/provider-install.sh
+          script: images/mail-install.sh
           override:
-            disk_size: "8G"
-    - manifest: manifests/workspace-mail-provider.yaml.j2
-      images:
-        - name: workspace-mail-provider
-          format: zst
-          profile: exordos_base
-          script: images/provider-install.sh
-          override:
-            disk_size: "8G"
-    - manifest: manifests/workspace-calendar-provider.yaml.j2
-      images:
-        - name: workspace-calendar-provider
-          format: zst
-          profile: exordos_base
-          script: images/provider-install.sh
-          override:
-            disk_size: "8G"
+            disk_size: "10G"

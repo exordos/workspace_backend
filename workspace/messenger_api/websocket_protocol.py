@@ -46,3 +46,12 @@ def parse_last_epoch_version(path):
     values = params.get("last_epoch_version") or []
     value = values[0] if values else None
     return messenger_events.normalize_epoch_version(value)
+
+
+def parse_epoch_generation(path):
+    parsed = urllib.parse.urlsplit(path or "")
+    params = urllib.parse.parse_qs(parsed.query)
+    values = params.get("epoch_generation") or []
+    if len(values) > 1:
+        raise ValueError("epoch_generation must be specified once")
+    return values[0] if values else None

@@ -21,7 +21,6 @@ set -o pipefail
 
 SERVICE_NAMES=(
     workspace-api
-    workspace-provider-api
     workspace-messenger-api
     workspace-messenger-worker
     workspace-messenger-events
