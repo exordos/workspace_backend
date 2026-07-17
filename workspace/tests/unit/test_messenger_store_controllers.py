@@ -66,6 +66,46 @@ class FakeStore:
         self.calls.append(("delete_message", message_uuid))
         return {"uuid": message_uuid}
 
+    def filter_draft_page(
+        self,
+        filters,
+        marker_uuid,
+        sort_direction,
+        limit,
+    ):
+        self.calls.append(
+            (
+                "filter_draft_page",
+                filters,
+                marker_uuid,
+                sort_direction,
+                limit,
+            )
+        )
+        return []
+
+    def create_draft(self, values):
+        self.calls.append(("create_draft", values))
+        return {**values, "revision": 1}, True
+
+    def get_draft(self, draft_uuid):
+        self.calls.append(("get_draft", draft_uuid))
+        return {"uuid": draft_uuid, "revision": 1}
+
+    def update_draft(self, draft_uuid, payload, expected_revision):
+        self.calls.append(
+            ("update_draft", draft_uuid, payload, expected_revision)
+        )
+        return {
+            "uuid": draft_uuid,
+            "payload": payload,
+            "revision": expected_revision + 1,
+        }
+
+    def delete_draft(self, draft_uuid, expected_revision):
+        self.calls.append(("delete_draft", draft_uuid, expected_revision))
+        return None
+
     def events_after(self, filters, order_by=None):
         self.calls.append(("events_after", filters, order_by))
         return [{"epoch_version": 2}]
@@ -100,7 +140,8 @@ def _controller(controller_class):
         context=types.SimpleNamespace(
             project_id=PROJECT_UUID,
             user_uuid=USER_UUID,
-        )
+        ),
+        headers={},
     )
     return controller_class(request)
 
@@ -207,6 +248,54 @@ def test_reaction_mutations_reject_internal_provider_projection_fields(fake_stor
             sys_uuid.uuid4(),
             delivery_status="pending",
         )
+
+    assert fake_store.calls == []
+
+
+def test_draft_mutations_use_postgres_only_store_operations_and_if_match(fake_store):
+    draft_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    controller = _controller(controllers.WorkspaceDraftController)
+
+    created = controller.create(
+        uuid=draft_uuid,
+        stream_uuid=stream_uuid,
+        topic_uuid=topic_uuid,
+        payload={"kind": "markdown", "content": "draft"},
+    )
+    controller.request.headers["If-Match"] = '"1"'
+    updated = controller.update(
+        draft_uuid,
+        payload={"kind": "markdown", "content": "updated"},
+    )
+    controller.request.headers["If-Match"] = '"2"'
+    deleted = controller.delete(draft_uuid)
+
+    assert created["revision"] == 1
+    assert updated["revision"] == 2
+    assert deleted is None
+    assert [call[0] for call in fake_store.calls] == [
+        "create_draft",
+        "update_draft",
+        "delete_draft",
+    ]
+    assert fake_store.calls[0][1]["project_id"] == PROJECT_UUID
+    assert fake_store.calls[0][1]["user_uuid"] == USER_UUID
+    assert fake_store.calls[1][-1] == 1
+    assert fake_store.calls[2][-1] == 2
+
+
+def test_draft_mutations_require_if_match(fake_store):
+    controller = _controller(controllers.WorkspaceDraftController)
+
+    with pytest.raises(Exception):
+        controller.update(
+            sys_uuid.uuid4(),
+            payload={"kind": "markdown", "content": "updated"},
+        )
+    with pytest.raises(Exception):
+        controller.delete(sys_uuid.uuid4())
 
     assert fake_store.calls == []
 

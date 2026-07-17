@@ -86,3 +86,22 @@ class EventsCursorExpiredError(ra_exc.RestAlchemyException):
             "current_epoch_version": self.current_epoch_version,
             "minimum_epoch_version": self.minimum_epoch_version,
         }
+
+
+class DraftConflictError(ra_exc.RestAlchemyException):
+    message = "Draft UUID already exists with different canonical fields"
+    code = 409
+
+
+class DraftPreconditionRequiredError(ra_exc.RestAlchemyException):
+    message = "Draft mutation requires If-Match"
+    code = 428
+
+
+class DraftPreconditionFailedError(ra_exc.RestAlchemyException):
+    message = "Draft revision does not match If-Match"
+    code = 412
+
+    def __init__(self, current):
+        super().__init__()
+        self.current = current

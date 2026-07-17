@@ -36,6 +36,7 @@ RESOURCE_MODELS = {
     "message_reactions": models.WorkspaceMessageReactions,
     "files": models.WorkspaceFile,
     "users": models.WorkspaceUser,
+    "drafts": models.WorkspaceDraft,
 }
 USER_SCOPED_RESOURCES = {
     "folders",
@@ -43,6 +44,7 @@ USER_SCOPED_RESOURCES = {
     "streams",
     "stream_topics",
     "messages",
+    "drafts",
 }
 EXTENSION_RESOURCES = {
     "streams",
@@ -113,6 +115,127 @@ def _plain_values(values):
         if name not in {"provider", "delivery"}
     }
     return result
+
+
+class SQLDraftStore:
+    """PostgreSQL-only draft storage that does not initialize mail services."""
+
+    def __init__(self, project_uuid, user_uuid):
+        self.project_uuid = project_uuid
+        self.user_uuid = user_uuid
+
+    def get_draft(self, draft_uuid):
+        row = helpers.get_workspace_draft(
+            self.project_uuid,
+            self.user_uuid,
+            draft_uuid,
+        )
+        return _as_dict(row, "drafts")
+
+    def filter_draft_page(
+        self,
+        filters,
+        marker_uuid,
+        sort_direction,
+        limit,
+    ):
+        allowed_filters = {"stream_uuid", "topic_uuid"}
+        if not set(filters).issubset(allowed_filters):
+            raise ra_exceptions.ValidationErrorException()
+        where = ['"project_id" = %s', '"user_uuid" = %s']
+        params = [self.project_uuid, self.user_uuid]
+        scoped_filters = {
+            "project_id": dm_filters.EQ(self.project_uuid),
+            "user_uuid": dm_filters.EQ(self.user_uuid),
+        }
+        for name, clause in filters.items():
+            if not isinstance(clause, dm_filters.EQ):
+                raise ra_exceptions.ValidationErrorException()
+            where.append(f'"{name}" = %s')
+            params.append(clause.value)
+            scoped_filters[name] = clause
+        if marker_uuid is not None:
+            marker_filters = scoped_filters.copy()
+            marker_filters["uuid"] = dm_filters.EQ(marker_uuid)
+            marker = models.WorkspaceDraft.objects.get_one(
+                filters=marker_filters,
+            )
+            operator = ">" if sort_direction == "asc" else "<"
+            where.append(
+                f'("updated_at" {operator} %s OR '
+                f'("updated_at" = %s AND "uuid" {operator} %s))'
+            )
+            params.extend([marker.updated_at, marker.updated_at, marker.uuid])
+        direction = sort_direction.upper()
+        statement = (
+            'SELECT "uuid" FROM "m_workspace_drafts" WHERE '
+            + " AND ".join(where)
+            + f' ORDER BY "updated_at" {direction}, "uuid" {direction}'
+        )
+        if limit is not None:
+            statement += " LIMIT %s"
+            params.append(limit)
+        engine = models.WorkspaceDraft._get_engine()
+        with engine.session_manager() as session:
+            result = session.execute(statement, tuple(params))
+            draft_uuids = [row["uuid"] for row in result.fetchall()]
+            if not draft_uuids:
+                return []
+            rows = models.WorkspaceDraft.objects.get_all(
+                filters={
+                    "uuid": dm_filters.In(draft_uuids),
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=session,
+            )
+        rows_by_uuid = {row.uuid: row for row in rows}
+        return [
+            _as_dict(rows_by_uuid[draft_uuid], "drafts")
+            for draft_uuid in draft_uuids
+        ]
+
+    @staticmethod
+    def _public_draft(row):
+        return _as_dict(row, "drafts")
+
+    def create_draft(self, values):
+        draft, created = helpers.create_workspace_draft(
+            project_id=self.project_uuid,
+            user_uuid=self.user_uuid,
+            draft_uuid=values["uuid"],
+            stream_uuid=values["stream_uuid"],
+            topic_uuid=values["topic_uuid"],
+            payload=values["payload"],
+        )
+        return _as_dict(draft, "drafts"), created
+
+    def update_draft(self, draft_uuid, payload, expected_revision):
+        draft, updated = helpers.update_workspace_draft(
+            project_id=self.project_uuid,
+            user_uuid=self.user_uuid,
+            draft_uuid=draft_uuid,
+            payload=payload,
+            expected_revision=expected_revision,
+        )
+        if not updated:
+            raise messenger_exc.DraftPreconditionFailedError(
+                self._public_draft(draft)
+            )
+        return _as_dict(draft, "drafts")
+
+    def delete_draft(self, draft_uuid, expected_revision):
+        draft, deleted = helpers.delete_workspace_draft(
+            project_id=self.project_uuid,
+            user_uuid=self.user_uuid,
+            draft_uuid=draft_uuid,
+            expected_revision=expected_revision,
+        )
+        if not deleted:
+            raise messenger_exc.DraftPreconditionFailedError(
+                self._public_draft(draft)
+            )
+        return None
 
 
 class SQLProjectedMessengerStore:
@@ -257,6 +380,64 @@ class SQLProjectedMessengerStore:
             query["limit"] = limit
         rows = models.WorkspaceUserMessage.objects.get_all(**query)
         return [_as_dict(row, "messages") for row in rows]
+
+    def filter_draft_page(
+        self,
+        filters,
+        marker_uuid,
+        sort_direction,
+        limit,
+    ):
+        allowed_filters = {"stream_uuid", "topic_uuid"}
+        if not set(filters).issubset(allowed_filters):
+            raise ra_exceptions.ValidationErrorException()
+        where = ['"project_id" = %s', '"user_uuid" = %s']
+        params = [self.project_uuid, self.user_uuid]
+        scoped_filters = {}
+        for name, clause in filters.items():
+            if not isinstance(clause, dm_filters.EQ):
+                raise ra_exceptions.ValidationErrorException()
+            where.append(f'"{name}" = %s')
+            params.append(clause.value)
+            scoped_filters[name] = clause
+        scoped_filters = self._scope_filters("drafts", scoped_filters)
+        if marker_uuid is not None:
+            marker_filters = scoped_filters.copy()
+            marker_filters["uuid"] = dm_filters.EQ(marker_uuid)
+            marker = models.WorkspaceDraft.objects.get_one(
+                filters=marker_filters,
+            )
+            operator = ">" if sort_direction == "asc" else "<"
+            where.append(
+                f'("updated_at" {operator} %s OR '
+                f'("updated_at" = %s AND "uuid" {operator} %s))'
+            )
+            params.extend([marker.updated_at, marker.updated_at, marker.uuid])
+        direction = sort_direction.upper()
+        statement = (
+            'SELECT "uuid" FROM "m_workspace_drafts" WHERE '
+            + " AND ".join(where)
+            + f' ORDER BY "updated_at" {direction}, "uuid" {direction}'
+        )
+        if limit is not None:
+            statement += " LIMIT %s"
+            params.append(limit)
+        engine = models.WorkspaceDraft._get_engine()
+        with engine.session_manager() as session:
+            result = session.execute(statement, tuple(params))
+            draft_uuids = [row["uuid"] for row in result.fetchall()]
+            if not draft_uuids:
+                return []
+            rows = models.WorkspaceDraft.objects.get_all(
+                filters={
+                    "uuid": dm_filters.In(draft_uuids),
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=session,
+            )
+        rows_by_uuid = {row.uuid: row for row in rows}
+        return [_as_dict(rows_by_uuid[draft_uuid], "drafts") for draft_uuid in draft_uuids]
 
     def get_resource(self, resource, resource_uuid):
         if resource == "folder_items":
@@ -615,6 +796,53 @@ class SQLProjectedMessengerStore:
         )
         self._sync_projection_events()
         return None if row is None else _as_dict(row, "messages")
+
+    @staticmethod
+    def _public_draft(row):
+        return _as_dict(row, "drafts")
+
+    def create_draft(self, values):
+        draft, created = helpers.create_workspace_draft(
+            project_id=self.project_uuid,
+            user_uuid=self.user_uuid,
+            draft_uuid=values["uuid"],
+            stream_uuid=values["stream_uuid"],
+            topic_uuid=values["topic_uuid"],
+            payload=values["payload"],
+        )
+        return _as_dict(draft, "drafts"), created
+
+    def update_draft(
+        self,
+        draft_uuid,
+        payload,
+        expected_revision,
+    ):
+        draft, updated = helpers.update_workspace_draft(
+            project_id=self.project_uuid,
+            user_uuid=self.user_uuid,
+            draft_uuid=draft_uuid,
+            payload=payload,
+            expected_revision=expected_revision,
+        )
+        if not updated:
+            raise messenger_exc.DraftPreconditionFailedError(
+                self._public_draft(draft)
+            )
+        return _as_dict(draft, "drafts")
+
+    def delete_draft(self, draft_uuid, expected_revision):
+        draft, deleted = helpers.delete_workspace_draft(
+            project_id=self.project_uuid,
+            user_uuid=self.user_uuid,
+            draft_uuid=draft_uuid,
+            expected_revision=expected_revision,
+        )
+        if not deleted:
+            raise messenger_exc.DraftPreconditionFailedError(
+                self._public_draft(draft)
+            )
+        return None
 
     def perform_action(self, resource, resource_uuid, action, values):
         resource_uuid = sys_uuid.UUID(str(resource_uuid))
@@ -1119,6 +1347,10 @@ class SQLProjectedMessengerStoreFactory:
     def _state(self, project_uuid: sys_uuid.UUID) -> _ProjectProjectionState:
         with self._states_lock:
             return self._states.setdefault(project_uuid, _ProjectProjectionState())
+
+    @contextlib.contextmanager
+    def draft_store(self, project_uuid, user_uuid):
+        yield SQLDraftStore(project_uuid, user_uuid)
 
     @contextlib.contextmanager
     def __call__(

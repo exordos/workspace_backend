@@ -39,10 +39,24 @@ class MessengerStore(typing.Protocol):
     ) -> list[dict[str, typing.Any]]:
         """Read one stable ``(created_at, uuid)`` keyset page."""
 
+    def filter_draft_page(
+        self,
+        filters: dict[str, typing.Any],
+        marker_uuid: sys_uuid.UUID | None,
+        sort_direction: str,
+        limit: int | None,
+    ) -> list[dict[str, typing.Any]]:
+        """Read one owner-scoped ``(updated_at, uuid)`` keyset page."""
+
     def get_resource(
         self,
         resource: str,
         resource_uuid: sys_uuid.UUID,
+    ) -> dict[str, typing.Any]: ...
+
+    def get_draft(
+        self,
+        draft_uuid: sys_uuid.UUID,
     ) -> dict[str, typing.Any]: ...
 
     def create_resource(
@@ -90,6 +104,24 @@ class MessengerStore(typing.Protocol):
     ) -> dict[str, typing.Any] | None:
         """Expunge every participant copy, then append a bodyless tombstone."""
 
+    def create_draft(
+        self,
+        values: dict[str, typing.Any],
+    ) -> tuple[dict[str, typing.Any], bool]: ...
+
+    def update_draft(
+        self,
+        draft_uuid: sys_uuid.UUID,
+        payload: dict[str, typing.Any],
+        expected_revision: int,
+    ) -> dict[str, typing.Any]: ...
+
+    def delete_draft(
+        self,
+        draft_uuid: sys_uuid.UUID,
+        expected_revision: int,
+    ) -> None: ...
+
     def events_after(
         self,
         filters: dict[str, typing.Any],
@@ -121,17 +153,27 @@ def _missing_store_factory(
 
 
 _store_factory: StoreFactory = _missing_store_factory
+_draft_store_factory: StoreFactory = _missing_store_factory
 
 
 def configure_store_factory(factory: StoreFactory) -> None:
-    global _store_factory
+    global _store_factory, _draft_store_factory
     _store_factory = factory
+    _draft_store_factory = getattr(factory, "draft_store", factory)
 
 
 def reset_store_factory() -> None:
-    global _store_factory
+    global _store_factory, _draft_store_factory
     _store_factory = _missing_store_factory
+    _draft_store_factory = _missing_store_factory
 
 
 def open_store(project_uuid: sys_uuid.UUID, user_uuid: sys_uuid.UUID) -> StoreContext:
     return _store_factory(project_uuid, user_uuid)
+
+
+def open_draft_store(
+    project_uuid: sys_uuid.UUID,
+    user_uuid: sys_uuid.UUID,
+) -> StoreContext:
+    return _draft_store_factory(project_uuid, user_uuid)

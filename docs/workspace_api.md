@@ -203,6 +203,12 @@ that scope is not accepted. `X-Pagination-Marker` is emitted only when a
 `page_limit + 1` probe proves that another row exists, so a full final page does
 not advertise a nonexistent continuation.
 
+`GET /api/workspace/v1/messenger/drafts/` uses the same UUID-marker contract,
+ordered by `(updated_at, uuid)`. Set `sort_key=updated_at` and
+`sort_dir=asc|desc`; optional `stream_uuid` and `topic_uuid` filters remain
+inside the authenticated owner and project scope. A marker outside that exact
+scope returns `404`.
+
 Workspace collection controllers also support conditional filter suffixes:
 
 | Suffix | Meaning | Example |
@@ -275,6 +281,11 @@ authoritative snapshots before starting a new cursor.
 | `DELETE` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Delete a message. |
 | `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read/invoke` | Mark message as read for the current user. |
 | `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read_up_to/invoke` | Mark unread messages in the same topic up to this message as read. |
+| `GET` | `/api/workspace/v1/messenger/drafts/` | List the current user's drafts, optionally filtered by stream or topic. |
+| `POST` | `/api/workspace/v1/messenger/drafts/` | Create a draft with a client-generated UUID. |
+| `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Get an owned draft and its strong revision ETag. |
+| `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Replace only the Markdown payload using `If-Match`. |
+| `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Hard-delete an owned draft using `If-Match`. |
 | `GET` | `/api/workspace/v1/messenger/message_reactions/` | List reactions for messages visible to the current IAM user. |
 | `POST` | `/api/workspace/v1/messenger/message_reactions/` | Create a message reaction. |
 | `GET` | `/api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Get a message reaction visible through message access. |
@@ -302,9 +313,15 @@ authoritative snapshots before starting a new cursor.
 `GET /api/workspace/v1/messenger/server_settings` is public and does not require `Authorization`. It is
 implemented by middleware and does not use the resource router. Unsupported
 query parameters are reported in
-`ignored_parameters_unsupported`. `realm_url` and `realm_uri` are derived from
-the request `Host` header and `X-Forwarded-Proto` when a reverse proxy provides
-it.
+`ignored_parameters_unsupported`. `realm_url` and `realm_uri` use the request
+`Host` header and default to the public HTTPS scheme. A trusted reverse proxy
+may explicitly provide `X-Forwarded-Proto`; the packaged Workspace nginx
+configuration sets it to `https` because TLS is terminated before the internal
+HTTP hop. `realm_icon` uses `urn:url:<https-url>` for an anonymously
+retrievable organization emblem. Clients unwrap the URN and use its HTTPS URL
+directly. The value is derived from the canonical request realm as
+`urn:url:<realm>/logo-512x512.png`; nginx serves that path from the packaged
+512×512 organization emblem.
 
 Example response:
 
@@ -331,7 +348,7 @@ Example response:
   "require_email_format_usernames": true,
   "realm_url": "https://workspace.example.com",
   "realm_name": "Exordos Workspace",
-  "realm_icon": "",
+  "realm_icon": "urn:url:https://workspace.example.com/logo-512x512.png",
   "realm_description": "<p>Exordos Workspace messenger.</p>",
   "realm_web_public_access_enabled": false,
   "meet_url": "https://meet.genesis-core.tech",
@@ -975,6 +992,33 @@ Realtime side effects:
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the deleted message was unread. |
+
+## Drafts
+
+Drafts are PostgreSQL-owned client state and never create or modify canonical
+messages, Maildir data, unread counters, reactions, or file references. Each
+draft belongs to exactly one IAM project, owner, stream, and topic. The
+`stream_uuid` and `topic_uuid` are immutable, the topic must belong to the
+stream, and the owner must currently be a stream participant. Multiple drafts
+may exist for the same stream/topic pair.
+
+Create requests require `uuid`, `stream_uuid`, `topic_uuid`, and a Markdown
+payload. Markdown content is trimmed, must remain non-empty, and is limited to
+10,000 characters. Retrying the exact same canonical create UUID returns the
+existing draft without another mutation; reusing the UUID with different fields
+returns `409`.
+
+`GET`, `POST`, and `PUT` single-resource responses return a strong ETag such as
+`ETag: "3"`. `PUT` accepts only `payload`; `PUT` and `DELETE` require the exact
+current value in `If-Match`. Missing preconditions return `428`. A stale or
+invalid value returns `412` with the current draft snapshot and current ETag.
+Successful updates increment `revision`; successful deletes return `204`.
+
+Draft CRUD emits no Workspace events, websocket notifications, desktop
+notifications, or canonical IMAP records. Another client observes changes on
+reload or an explicit drafts API refetch. Removing the owner from the stream or
+deleting the topic/stream hard-deletes affected drafts through PostgreSQL
+foreign-key cascades, without tombstones or notification side effects.
 
 ## Message Reactions
 

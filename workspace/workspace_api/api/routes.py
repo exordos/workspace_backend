@@ -20,6 +20,7 @@ class MessengerRoute(routes.Route):
     stream_bindings = routes.route(messenger_routes.WorkspaceStreamBindingRoute)
     stream_topics = routes.route(messenger_routes.WorkspaceStreamTopicRoute)
     messages = routes.route(messenger_routes.WorkspaceMessageRoute)
+    drafts = routes.route(messenger_routes.WorkspaceDraftRoute)
     message_reactions = routes.route(
         messenger_routes.WorkspaceMessageReactionRoute,
     )

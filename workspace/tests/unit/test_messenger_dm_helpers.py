@@ -1122,6 +1122,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             FakeWorkspaceStreamBinding,
         ), mock.patch.object(
             dm_helpers,
+            "_lock_workspace_stream_binding",
+        ), mock.patch.object(
+            dm_helpers,
             "get_workspace_user_stream",
             return_value=user_stream,
         ) as get_user_stream, mock.patch.object(
@@ -1178,6 +1181,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         get_folder_targets.assert_called_once_with(
             project_id=project_id,
@@ -1690,6 +1694,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         with mock.patch.object(
             dm_helpers, "get_workspace_user_stream", return_value=actor_stream
         ) as get_user_stream, mock.patch.object(
+            dm_helpers,
+            "_lock_workspace_stream",
+        ), mock.patch.object(
             dm_helpers, "get_workspace_user_folder", return_value=object()
         ) as get_user_folder, mock.patch.object(
             dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
@@ -1716,6 +1723,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         create_stream_deleted.assert_has_calls(
             [
@@ -1773,6 +1781,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         with mock.patch.object(
             dm_helpers, "get_workspace_user_stream", return_value=user_stream
+        ), mock.patch.object(
+            dm_helpers,
+            "_lock_workspace_stream",
         ), mock.patch.object(
             dm_helpers,
             "_get_stream_folder_event_targets",
@@ -1947,6 +1958,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_topics.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
+            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -2047,8 +2059,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def update_dm(self, values):
                 deleted_topic["stream_values"] = values
 
-            def update(self):
+            def update(self, session=None):
                 deleted_topic["stream_updated"] = True
+                deleted_topic["stream_update_session"] = session
 
         get_stream = mock.Mock(return_value=ExistingStream())
 
@@ -2060,6 +2073,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             "_get_workspace_stream_topic_for_user",
             return_value=ExistingTopic(),
         ) as get_topic, mock.patch.object(
+            dm_helpers,
+            "_lock_workspace_topic",
+        ), mock.patch.object(
             dm_helpers,
             "_get_workspace_user_stream_topics",
             return_value=[returned_topic, other_topic],
@@ -2084,24 +2100,29 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             deleted_topic["stream_values"],
         )
         self.assertTrue(deleted_topic["stream_updated"])
+        self.assertIs(session, deleted_topic["stream_update_session"])
         get_stream.assert_called_once_with(
             filters={
                 "uuid": mock.ANY,
                 "project_id": mock.ANY,
             },
+            session=session,
         )
         get_topic.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
+            session=session,
         )
         get_topics.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,
+            session=session,
         )
         create_stream_events.assert_called_once_with(
             project_id=project_id,
             stream_uuid=stream_uuid,
+            session=session,
         )
         create_event.assert_has_calls(
             [

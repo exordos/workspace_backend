@@ -53,6 +53,11 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/messenger/messages/",
         )
+        specification = openapi_contract.add_draft_contract(
+            specification,
+            "/v1/messenger/drafts/",
+            components,
+        )
         specification = openapi_contract.add_events_cursor_contract(
             specification,
             "/v1/events/",

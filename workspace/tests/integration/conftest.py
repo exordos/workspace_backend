@@ -173,7 +173,7 @@ def build_test_wsgi_application(app_module=messenger_app):
         [
             middlewares.configure_middleware(MockedIamAuthMiddleware),
             app_middlewares.ServerSettingsMiddleware,
-            iam_mw.ErrorsHandlerMiddleware,
+            app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],
     )
@@ -206,10 +206,12 @@ class ApiClient:
     def request(self, method, path, user=None, project=None, **kwargs):
         if self._user_seeder is not None:
             self._user_seeder(str(user or self.user_uuid))
+        headers = self._headers(user, project)
+        headers.update(kwargs.pop("headers", {}))
         return requests.request(
             method,
             self.base_url + path,
-            headers=self._headers(user, project),
+            headers=headers,
             timeout=10,
             **kwargs,
         )

@@ -30,6 +30,7 @@ from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
 from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import message_payloads
 
 
 class ChatType(str, enum.Enum):
@@ -1018,6 +1019,43 @@ class WorkspaceStreamTopic(
             stream_uuid=self.stream_uuid,
             session=session,
         )
+
+
+class WorkspaceDraft(
+    base.UserScopedModelWithUUID,
+    models.ModelWithProject,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_drafts"
+
+    project_id = properties.property(
+        types.UUID(),
+        required=True,
+        read_only=True,
+    )
+    user_uuid = properties.property(
+        types.UUID(),
+        required=True,
+        read_only=True,
+    )
+    stream_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    topic_uuid = properties.property(
+        types.UUID(),
+        required=True,
+    )
+    payload = properties.property(
+        message_payloads.WORKSPACE_MESSAGE_PAYLOAD_TYPE,
+        required=True,
+    )
+    revision = properties.property(
+        types.Integer(min_value=1),
+        default=1,
+        read_only=True,
+    )
 
 
 class WorkspaceUserTopic(

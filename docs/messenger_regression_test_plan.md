@@ -34,7 +34,7 @@ storage.
 | ID | Scenario | Expected result |
 | --- | --- | --- |
 | MSG-API-001 | Request every Messenger collection and action below `/api/workspace/v1/messenger`. | Methods, status codes, schemas, pagination, and action paths match the baseline. |
-| MSG-API-002 | Request `/api/workspace/v1/messenger/server_settings` with and without a trailing slash. | The established public response is returned without authentication. |
+| MSG-API-002 | Request `/api/workspace/v1/messenger/server_settings` with and without a trailing slash, then unwrap and fetch the `realm_icon` target without credentials. | The public response contains `urn:url:<realm>/logo-512x512.png`, and the packaged organization emblem is returned anonymously as `image/png`. |
 | MSG-API-003 | Request old `/api/messenger/**` paths and removed provider, mail, or calendar paths. | Nginx or the application returns `404` and does not redirect. |
 | MSG-API-004 | Compare generated OpenAPI with the Messenger baseline. | Existing resources, required values, multipart requirements, and actions are unchanged. |
 | MSG-API-005 | Inspect browser-visible traffic during Messenger use. | No SMTP, IMAP, Maildir, provider, mail, or calendar implementation detail is exposed. |
@@ -61,6 +61,17 @@ storage.
 | MSG-MAIL-005 | Create, update, and delete reactions as different users. | User scoping, aggregate reactions, and message update events remain correct. |
 | MSG-MAIL-006 | Attempt to act without membership or with another project's token. | IAM authorization rejects the request and Maildir remains unchanged. |
 | MSG-MAIL-007 | Submit the same retryable request after an ambiguous transport failure. | The documented idempotency behavior is preserved and duplicate user-visible messages are not created. |
+
+## Drafts
+
+| ID | Scenario | Expected result |
+| --- | --- | --- |
+| MSG-DRAFT-001 | Create multiple drafts for one stream/topic and retry one UUID with identical and changed canonical fields. | All distinct UUIDs persist; the identical retry returns the original revision without another mutation, while changed fields return `409`. |
+| MSG-DRAFT-002 | Read and paginate drafts in both `updated_at` directions with stream/topic filters and a UUID marker. | Ordering is stable by `(updated_at, uuid)`; markers cannot cross owner, project, or filter scope. |
+| MSG-DRAFT-003 | Update and delete with missing, current, stale, weak, and malformed `If-Match` values. | Missing returns `428`; only the exact strong revision succeeds; stale or invalid values return `412` with the current snapshot and ETag. |
+| MSG-DRAFT-004 | Attempt draft CRUD as another user/project, without stream membership, or with a topic from another stream. | Access is rejected without exposing or mutating another owner's draft. |
+| MSG-DRAFT-005 | Remove the owner binding, delete the topic, and delete the stream while drafts exist. | PostgreSQL cascades hard-delete every affected draft without tombstones or events. |
+| MSG-DRAFT-006 | Observe events, notifications, messages, mail, unread, reactions, and files around draft CRUD. | Only draft rows change. No Workspace event, websocket/desktop notification, canonical mail, or unrelated projection changes; another client refreshes drafts on reload or explicit API refetch. |
 
 ## Files and S3-compatible storage
 

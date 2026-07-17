@@ -19,6 +19,8 @@
 import hashlib
 import importlib.util
 import io
+import concurrent.futures
+import threading
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
@@ -40,6 +42,7 @@ FILES = f"{V1}/files/"
 FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
+DRAFTS = f"{V1}/drafts/"
 MESSAGE_REACTIONS = f"{V1}/message_reactions/"
 EVENTS = f"{V1}/events/"
 EPOCH = f"{V1}/epoch/"
@@ -1108,6 +1111,140 @@ def test_canonical_event_append_failure_rolls_back_sql_event(api, db, monkeypatc
         )
         event_count = cur.fetchone()[0]
     assert event_count == 0
+
+
+def test_draft_crud_creates_no_events_notifications_or_imap(api, db, monkeypatch):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "postgres-only-drafts",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "postgres-only-drafts",
+    )
+    project_mailbox = conftest.TEST_MAIL_RUNTIME.project_mailboxes[
+        sys_uuid.UUID(api.project_id)
+    ]
+    before = {
+        path: len(messages)
+        for path, messages in project_mailbox.mailboxes.items()
+    }
+    original_append_event = mail_repository.MessengerMailRepository.append_event
+    appended_object_types = []
+
+    def record_mail_event(self, record):
+        appended_object_types.append(record.object_type)
+        return original_append_event(self, record)
+
+    monkeypatch.setattr(
+        mail_repository.MessengerMailRepository,
+        "append_event",
+        record_mail_event,
+    )
+
+    draft_uuid = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        json={
+            "uuid": str(draft_uuid),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "initial"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    response = api.put(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"1"'},
+        json={"payload": {"kind": "markdown", "content": "updated"}},
+    )
+    assert response.status_code == 200, response.text
+    response = api.delete(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"2"'},
+    )
+    assert response.status_code == 204, response.text
+
+    after_drafts = {
+        path: len(messages)
+        for path, messages in project_mailbox.mailboxes.items()
+    }
+    assert after_drafts == before
+    assert appended_object_types == []
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'uuid' = %s
+            """,
+            (api.project_id, str(draft_uuid)),
+        )
+        assert cur.fetchone()[0] == 0
+
+    response = api.post(FOLDERS, json={"title": "Sync non-draft events"})
+    assert response.status_code == 201, response.text
+    assert appended_object_types == ["folder"]
+
+
+def test_draft_crud_remains_available_when_mail_service_is_unavailable(
+    api,
+    db,
+    monkeypatch,
+):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-without-mail",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "draft-without-mail",
+    )
+
+    def unavailable_mail_service(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("mail service must not be initialized for draft CRUD")
+
+    monkeypatch.setattr(
+        conftest.TEST_MAIL_RUNTIME,
+        "messenger_service",
+        unavailable_mail_service,
+    )
+
+    draft_uuid = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        json={
+            "uuid": str(draft_uuid),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "offline mail"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert api.get(f"{DRAFTS}{draft_uuid}").status_code == 200
+    response = api.put(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"1"'},
+        json={"payload": {"kind": "markdown", "content": "updated"}},
+    )
+    assert response.status_code == 200, response.text
+    response = api.delete(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"2"'},
+    )
+    assert response.status_code == 204, response.text
 
 
 def test_folder_update_writes_realtime_event(api, db):
@@ -2422,6 +2559,710 @@ def test_messages_cursor_pagination_uses_created_at_uuid_keyset(api, db):
         },
     )
     assert unsupported_sort.status_code == 400, unsupported_sort.text
+
+
+def test_draft_crud_idempotency_etags_owner_scope_and_no_events(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-crud",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        other_user,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "drafts",
+    )
+    draft_uuid = sys_uuid.uuid4()
+    create_body = {
+        "uuid": str(draft_uuid),
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "payload": {"kind": "markdown", "content": "  first draft  "},
+    }
+
+    response = api.post(DRAFTS, json=create_body)
+    assert response.status_code == 201, response.text
+    assert response.headers["ETag"] == '"1"'
+    created = response.json()
+    assert created["project_id"] == api.project_id
+    assert created["user_uuid"] == api.user_uuid
+    assert created["payload"]["content"] == "first draft"
+    assert created["revision"] == 1
+
+    response = api.post(DRAFTS, json=create_body)
+    assert response.status_code == 200, response.text
+    assert response.headers["ETag"] == '"1"'
+    assert response.json() == created
+
+    conflict_body = dict(create_body)
+    conflict_body["payload"] = {"kind": "markdown", "content": "different"}
+    response = api.post(DRAFTS, json=conflict_body)
+    assert response.status_code == 409, response.text
+
+    response = api.get(f"{DRAFTS}{draft_uuid}")
+    assert response.status_code == 200, response.text
+    assert response.headers["ETag"] == '"1"'
+    response = api.get(f"{DRAFTS}{draft_uuid}", user=other_user)
+    assert response.status_code == 404, response.text
+
+    response = api.put(
+        f"{DRAFTS}{draft_uuid}",
+        json={"payload": {"kind": "markdown", "content": "updated"}},
+    )
+    assert response.status_code == 428, response.text
+
+    for invalid_etag in ('W/"1"', '"0"', '"01"', "1"):
+        response = api.put(
+            f"{DRAFTS}{draft_uuid}",
+            headers={"If-Match": invalid_etag},
+            json={"payload": {"kind": "markdown", "content": "updated"}},
+        )
+        assert response.status_code == 412, response.text
+        assert response.headers["ETag"] == '"1"'
+        assert response.json()["current"]["uuid"] == str(draft_uuid)
+        assert response.json()["current"]["project_id"] == api.project_id
+        assert response.json()["current"]["user_uuid"] == api.user_uuid
+
+    response = api.put(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"1"'},
+        json={"payload": {"kind": "markdown", "content": "  updated  "}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["ETag"] == '"2"'
+    assert response.json()["payload"]["content"] == "updated"
+    assert response.json()["revision"] == 2
+
+    response = api.delete(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"1"'},
+    )
+    assert response.status_code == 412, response.text
+    assert response.headers["ETag"] == '"2"'
+    assert response.json()["current"]["revision"] == 2
+
+    response = api.delete(f"{DRAFTS}{draft_uuid}")
+    assert response.status_code == 428, response.text
+    response = api.delete(
+        f"{DRAFTS}{draft_uuid}",
+        headers={"If-Match": '"2"'},
+    )
+    assert response.status_code == 204, response.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'uuid' = %s
+            """,
+            (api.project_id, str(draft_uuid)),
+        )
+        event_count = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_messages
+            WHERE project_id = %s
+                AND stream_uuid = %s
+            """,
+            (api.project_id, stream_uuid),
+        )
+        message_count = cur.fetchone()[0]
+
+    assert event_count == 0
+    assert message_count == 0
+
+
+def test_draft_pagination_uses_updated_at_uuid_owner_filter_scope(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-pagination",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "draft-pagination",
+    )
+    draft_uuids = [
+        sys_uuid.UUID(f"60000000-0000-4000-8000-{value:012d}")
+        for value in range(1, 5)
+    ]
+    for draft_uuid in draft_uuids:
+        response = api.post(
+            DRAFTS,
+            json={
+                "uuid": str(draft_uuid),
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": str(draft_uuid),
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_drafts
+            SET updated_at = CASE
+                WHEN uuid = %s THEN '2026-07-16T09:00:00Z'::timestamptz
+                ELSE '2026-07-16T10:00:00Z'::timestamptz
+            END
+            WHERE uuid = ANY(%s)
+            """,
+            (draft_uuids[-1], draft_uuids),
+        )
+
+    def collect(direction):
+        result = []
+        marker = None
+        pages = 0
+        while True:
+            params = {
+                "page_limit": 2,
+                "sort_key": "updated_at",
+                "sort_dir": direction,
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+            }
+            if marker is not None:
+                params["page_marker"] = marker
+            response = api.get(DRAFTS, params=params)
+            assert response.status_code == 200, response.text
+            page = response.json()
+            result.extend(item["uuid"] for item in page)
+            marker = response.headers.get("X-Pagination-Marker")
+            pages += 1
+            assert pages < 10, (direction, marker, result)
+            if marker is None:
+                break
+        return result
+
+    assert collect("asc") == [
+        str(draft_uuids[3]),
+        str(draft_uuids[0]),
+        str(draft_uuids[1]),
+        str(draft_uuids[2]),
+    ]
+    assert collect("desc") == [
+        str(draft_uuids[2]),
+        str(draft_uuids[1]),
+        str(draft_uuids[0]),
+        str(draft_uuids[3]),
+    ]
+
+    other_user = sys_uuid.uuid4()
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        other_user,
+    )
+    other_draft_uuid = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        user=other_user,
+        json={
+            "uuid": str(other_draft_uuid),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "other"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    response = api.get(
+        DRAFTS,
+        params={
+            "page_limit": 2,
+            "page_marker": str(other_draft_uuid),
+            "sort_key": "updated_at",
+            "sort_dir": "asc",
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+        },
+    )
+    assert response.status_code == 404, response.text
+
+
+def test_draft_cascades_hard_delete_for_binding_topic_and_stream(api, db):
+    other_user = sys_uuid.uuid4()
+
+    binding_stream = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-binding-cascade",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        binding_stream,
+        other_user,
+    )
+    binding_topic = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        binding_stream,
+        api.user_uuid,
+        "binding",
+    )
+    binding_draft = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        user=other_user,
+        json={
+            "uuid": str(binding_draft),
+            "stream_uuid": binding_stream,
+            "topic_uuid": binding_topic,
+            "payload": {"kind": "markdown", "content": "binding"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+                AND stream_uuid = %s
+                AND user_uuid = %s
+            """,
+            (api.project_id, binding_stream, str(other_user)),
+        )
+        binding_uuid = cur.fetchone()[0]
+    response = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert response.status_code in (200, 204), response.text
+
+    topic_stream = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-topic-cascade",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        topic_stream,
+        api.user_uuid,
+        "topic",
+    )
+    topic_draft = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        json={
+            "uuid": str(topic_draft),
+            "stream_uuid": topic_stream,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "topic"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    response = api.delete(f"{STREAM_TOPICS}{topic_uuid}")
+    assert response.status_code in (200, 204), response.text
+
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-stream-cascade",
+    )
+    stream_topic = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "stream",
+    )
+    stream_draft = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        json={
+            "uuid": str(stream_draft),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": stream_topic,
+            "payload": {"kind": "markdown", "content": "stream"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    response = api.delete(f"{STREAMS}{stream_uuid}")
+    assert response.status_code in (200, 204), response.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_drafts
+            WHERE uuid = ANY(%s)
+            """,
+            ([binding_draft, topic_draft, stream_draft],),
+        )
+        remaining = cur.fetchone()[0]
+
+    assert remaining == 0
+
+
+def test_draft_create_serializes_before_stream_cascade(api, db, monkeypatch):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-create-delete-race",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "draft-create-delete-race",
+    )
+    draft_uuid = sys_uuid.uuid4()
+    scope_locked = threading.Event()
+    release_create = threading.Event()
+    original_lock_scope = messenger_dm_helpers._lock_workspace_draft_scope
+
+    def pause_create_scope(*args, **kwargs):
+        result = original_lock_scope(*args, **kwargs)
+        scope_locked.set()
+        assert release_create.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        messenger_dm_helpers,
+        "_lock_workspace_draft_scope",
+        pause_create_scope,
+    )
+
+    def create_side():
+        return messenger_dm_helpers.create_workspace_draft(
+            project_id,
+            user_uuid,
+            draft_uuid,
+            sys_uuid.UUID(stream_uuid),
+            sys_uuid.UUID(topic_uuid),
+            {"kind": "markdown", "content": "created"},
+        )
+
+    def delete_side():
+        return messenger_dm_helpers.delete_workspace_user_stream(
+            project_id,
+            user_uuid,
+            sys_uuid.UUID(stream_uuid),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        create_future = executor.submit(create_side)
+        assert scope_locked.wait(timeout=5)
+        delete_future = executor.submit(delete_side)
+        _, pending = concurrent.futures.wait(
+            [delete_future],
+            timeout=0.1,
+        )
+        assert pending == {delete_future}
+        release_create.set()
+        _, created = create_future.result(timeout=5)
+        assert created is True
+        assert delete_future.result(timeout=5) is None
+
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM m_workspace_drafts WHERE uuid = %s",
+            (draft_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'uuid' = %s
+            """,
+            (project_id, str(draft_uuid)),
+        )
+        event_count = cur.fetchone()[0]
+    assert event_count == 0
+
+
+def test_draft_update_waits_for_stream_cascade_and_cannot_recreate_deleted_draft(
+    api,
+    db,
+    monkeypatch,
+):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-update-delete-race",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "draft-update-delete-race",
+    )
+    draft_uuid = sys_uuid.uuid4()
+    response = api.post(
+        DRAFTS,
+        json={
+            "uuid": str(draft_uuid),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "initial"},
+        },
+    )
+    assert response.status_code == 201, response.text
+
+    stream_locked = threading.Event()
+    release_delete = threading.Event()
+    original_lock_stream = messenger_dm_helpers._lock_workspace_stream
+
+    def pause_stream_delete(*args, **kwargs):
+        result = original_lock_stream(*args, **kwargs)
+        stream_locked.set()
+        assert release_delete.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        messenger_dm_helpers,
+        "_lock_workspace_stream",
+        pause_stream_delete,
+    )
+
+    def delete_side():
+        return messenger_dm_helpers.delete_workspace_user_stream(
+            project_id,
+            user_uuid,
+            sys_uuid.UUID(stream_uuid),
+        )
+
+    def update_side():
+        try:
+            return messenger_dm_helpers.update_workspace_draft(
+                project_id,
+                user_uuid,
+                draft_uuid,
+                {"kind": "markdown", "content": "must not survive"},
+                1,
+            )
+        except Exception as exc:
+            return exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        delete_future = executor.submit(delete_side)
+        assert stream_locked.wait(timeout=5)
+        update_future = executor.submit(update_side)
+        _, pending = concurrent.futures.wait(
+            [update_future],
+            timeout=0.1,
+        )
+        assert pending == {update_future}
+        release_delete.set()
+        assert delete_future.result(timeout=5) is None
+        update_result = update_future.result(timeout=5)
+        assert isinstance(update_result, Exception)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+                AND payload->>'uuid' = %s
+            """,
+            (project_id, str(draft_uuid)),
+        )
+        event_count = cur.fetchone()[0]
+    assert event_count == 0
+
+
+def test_draft_revision_compare_and_swap_serializes_concurrent_mutations(api, db):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-concurrency",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "draft-concurrency",
+    )
+
+    def create(draft_uuid):
+        response = api.post(
+            DRAFTS,
+            json={
+                "uuid": str(draft_uuid),
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": "initial"},
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    update_race_uuid = sys_uuid.uuid4()
+    create(update_race_uuid)
+    barrier = threading.Barrier(2)
+
+    def concurrent_update(content):
+        barrier.wait()
+        return messenger_dm_helpers.update_workspace_draft(
+            project_id,
+            user_uuid,
+            update_race_uuid,
+            {"kind": "markdown", "content": content},
+            1,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(concurrent_update, ("first winner", "second winner"))
+        )
+    assert sorted(updated for _, updated in results) == [False, True]
+    response = api.get(f"{DRAFTS}{update_race_uuid}")
+    assert response.status_code == 200, response.text
+    assert response.json()["revision"] == 2
+
+    mixed_race_uuid = sys_uuid.uuid4()
+    create(mixed_race_uuid)
+    barrier = threading.Barrier(2)
+
+    def update_side():
+        barrier.wait()
+        try:
+            _, updated = messenger_dm_helpers.update_workspace_draft(
+                project_id,
+                user_uuid,
+                mixed_race_uuid,
+                {"kind": "markdown", "content": "updated"},
+                1,
+            )
+            return "updated" if updated else "stale"
+        except Exception:
+            return "missing"
+
+    def delete_side():
+        barrier.wait()
+        try:
+            _, deleted = messenger_dm_helpers.delete_workspace_draft(
+                project_id,
+                user_uuid,
+                mixed_race_uuid,
+                1,
+            )
+            return "deleted" if deleted else "stale"
+        except Exception:
+            return "missing"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        update_future = executor.submit(update_side)
+        delete_future = executor.submit(delete_side)
+        outcomes = {update_future.result(), delete_future.result()}
+    assert outcomes in ({"updated", "stale"}, {"deleted", "missing"})
+
+
+def test_different_drafts_in_same_scope_do_not_share_an_exclusive_hot_lock(
+    api,
+    db,
+    monkeypatch,
+):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "draft-shared-scope-lock",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "draft-shared-scope-lock",
+    )
+    first_uuid = sys_uuid.uuid4()
+    second_uuid = sys_uuid.uuid4()
+    for draft_uuid in (first_uuid, second_uuid):
+        response = api.post(
+            DRAFTS,
+            json={
+                "uuid": str(draft_uuid),
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": "initial"},
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    first_scope_locked = threading.Event()
+    release_first = threading.Event()
+    pause_guard = threading.Lock()
+    first_scope_seen = False
+    original_lock_scope = messenger_dm_helpers._lock_workspace_draft_scope
+
+    def pause_first_scope(*args, **kwargs):
+        nonlocal first_scope_seen
+        result = original_lock_scope(*args, **kwargs)
+        with pause_guard:
+            should_pause = not first_scope_seen
+            first_scope_seen = True
+        if should_pause:
+            first_scope_locked.set()
+            assert release_first.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        messenger_dm_helpers,
+        "_lock_workspace_draft_scope",
+        pause_first_scope,
+    )
+
+    def update(draft_uuid, content):
+        return messenger_dm_helpers.update_workspace_draft(
+            project_id,
+            user_uuid,
+            draft_uuid,
+            {"kind": "markdown", "content": content},
+            1,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(update, first_uuid, "first")
+        assert first_scope_locked.wait(timeout=5)
+        second_future = executor.submit(update, second_uuid, "second")
+        second_draft, second_updated = second_future.result(timeout=2)
+        assert second_updated is True
+        assert second_draft.revision == 2
+        release_first.set()
+        first_draft, first_updated = first_future.result(timeout=5)
+        assert first_updated is True
+        assert first_draft.revision == 2
 
 
 # --------------------------------------------------------------------------- #

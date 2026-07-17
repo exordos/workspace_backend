@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import logging
+import re
 import typing
 import urllib.parse
 import uuid as sys_uuid
@@ -23,6 +24,7 @@ from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
@@ -646,6 +648,119 @@ class WorkspaceMessageController(StoreResourceController):
     def read_up_to(self, resource, *args, **kwargs):
         del args, kwargs
         return self._action(resource, "read_up_to")
+
+
+class WorkspaceDraftController(StoreResourceController):
+    resource_name = "drafts"
+    __default_sort__ = {"updated_at": "asc"}
+    __sortable_fields__ = ("updated_at",)
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceDraft,
+        convert_underscore=False,
+        process_filters=True,
+    )
+
+    @staticmethod
+    def _etag(revision):
+        return f'"{revision}"'
+
+    def _required_if_match(self):
+        value = self.request.headers.get("If-Match")
+        if value is None:
+            raise messenger_exc.DraftPreconditionRequiredError()
+        if re.fullmatch(r'"[1-9][0-9]*"', value) is None:
+            return 0
+        return int(value[1:-1])
+
+    def filter(self, filters, order_by=None):
+        order_by = order_by or self.__default_sort__
+        if tuple(order_by) != ("updated_at",):
+            raise ra_exc.ValidationErrorException()
+        sort_direction = order_by["updated_at"].lower()
+        if sort_direction not in {"asc", "desc"}:
+            raise ra_exc.ValidationErrorException()
+        limit = self._pagination_limit or None
+        fetch_limit = None if limit is None else limit + 1
+        with api_store.open_draft_store(
+            self._get_project_id(),
+            self._get_user_uuid(),
+        ) as db:
+            result = db.filter_draft_page(
+                filters=filters,
+                marker_uuid=getattr(self, "_pagination_marker", None),
+                sort_direction=sort_direction,
+                limit=fetch_limit,
+            )
+        self._draft_page_has_more = limit is not None and len(result) > limit
+        return result if limit is None else result[:limit]
+
+    def _create_response(self, body, status, headers):
+        if self._pagination_limit:
+            headers[self._header_page_limit] = str(self._pagination_limit)
+            if self._draft_page_has_more:
+                marker = (
+                    body[-1]["uuid"] if isinstance(body[-1], dict) else body[-1].uuid
+                )
+                headers[self._header_page_marker] = str(marker)
+        elif isinstance(body, dict) and "revision" in body:
+            headers["ETag"] = self._etag(body["revision"])
+        if status == 201 and getattr(self, "_draft_create_existing", False):
+            status = 200
+        return ra_controllers.Controller._create_response(
+            self,
+            body,
+            status,
+            headers,
+        )
+
+    def get(self, uuid, **kwargs):
+        del kwargs
+        with api_store.open_draft_store(
+            self._get_project_id(),
+            self._get_user_uuid(),
+        ) as db:
+            return db.get_draft(uuid)
+
+    def create(self, **kwargs):
+        required = {"uuid", "stream_uuid", "topic_uuid", "payload"}
+        if set(kwargs) != required:
+            raise ra_exc.ValidationErrorException()
+        values = kwargs.copy()
+        values.update(
+            {
+                "project_id": self._get_project_id(),
+                "user_uuid": self._get_user_uuid(),
+            }
+        )
+        with api_store.open_draft_store(
+            self._get_project_id(),
+            self._get_user_uuid(),
+        ) as db:
+            result, created = db.create_draft(values)
+        self._draft_create_existing = not created
+        return result
+
+    def update(self, uuid, **kwargs):
+        if set(kwargs) != {"payload"}:
+            raise ra_exc.ValidationErrorException()
+        expected_revision = self._required_if_match()
+        with api_store.open_draft_store(
+            self._get_project_id(),
+            self._get_user_uuid(),
+        ) as db:
+            return db.update_draft(
+                uuid,
+                kwargs["payload"],
+                expected_revision,
+            )
+
+    def delete(self, uuid):
+        expected_revision = self._required_if_match()
+        with api_store.open_draft_store(
+            self._get_project_id(),
+            self._get_user_uuid(),
+        ) as db:
+            return db.delete_draft(uuid, expected_revision)
 
 
 class WorkspaceMessageReactionController(StoreResourceController):

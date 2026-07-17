@@ -14,7 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextlib
 import datetime
+import json
 import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
@@ -24,6 +26,7 @@ from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.dm import base as messenger_dm_base
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 
 
@@ -54,6 +57,15 @@ WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
     "status_emoji",
     "status_text",
 )
+
+
+@contextlib.contextmanager
+def _workspace_session(model, session=None):
+    if session is not None:
+        yield session
+        return
+    with model._get_engine().session_manager() as active_session:
+        yield active_session
 
 
 def _random_color():
@@ -116,6 +128,399 @@ def get_workspace_own_user(user_uuid, current_user_uuid, session=None):
         filters={"uuid": dm_filters.EQ(user_uuid)},
         session=session,
     )
+
+
+def _normalize_workspace_draft_payload(payload):
+    if isinstance(payload, dict):
+        if payload["kind"] != message_payloads.MarkdownPayload.KIND:
+            raise ra_exc.ValidationErrorException()
+        content = payload["content"]
+    else:
+        if not isinstance(payload, message_payloads.MarkdownPayload):
+            raise ra_exc.ValidationErrorException()
+        content = payload.content
+    content = content.strip()
+    if not content or len(content) > 10000:
+        raise ra_exc.ValidationErrorException()
+    return message_payloads.MarkdownPayload(content=content)
+
+
+def _lock_workspace_draft_scope(
+    project_id,
+    user_uuid,
+    stream_uuid,
+    topic_uuid,
+    session,
+):
+    stream = session.execute(
+        """
+        SELECT "uuid"
+        FROM "m_workspace_streams"
+        WHERE "uuid" = %s AND "project_id" = %s
+        FOR KEY SHARE
+        """,
+        (stream_uuid, project_id),
+    ).fetchone()
+    if stream is None:
+        return False
+    topic = session.execute(
+        """
+        SELECT "uuid"
+        FROM "m_workspace_stream_topics"
+        WHERE "uuid" = %s
+            AND "project_id" = %s
+            AND "stream_uuid" = %s
+        FOR KEY SHARE
+        """,
+        (topic_uuid, project_id, stream_uuid),
+    ).fetchone()
+    if topic is None:
+        return False
+    binding = session.execute(
+        """
+        SELECT "uuid"
+        FROM "m_workspace_stream_bindings"
+        WHERE "project_id" = %s
+            AND "stream_uuid" = %s
+            AND "user_uuid" = %s
+        FOR KEY SHARE
+        """,
+        (project_id, stream_uuid, user_uuid),
+    ).fetchone()
+    return binding is not None
+
+
+def _get_workspace_draft_scope(
+    project_id,
+    user_uuid,
+    draft_uuid,
+    session,
+):
+    return session.execute(
+        """
+        SELECT "stream_uuid", "topic_uuid"
+        FROM "m_workspace_drafts"
+        WHERE "uuid" = %s
+            AND "project_id" = %s
+            AND "user_uuid" = %s
+        """,
+        (draft_uuid, project_id, user_uuid),
+    ).fetchone()
+
+
+def _lock_workspace_stream(project_id, stream_uuid, session):
+    return session.execute(
+        """
+        SELECT "uuid"
+        FROM "m_workspace_streams"
+        WHERE "uuid" = %s AND "project_id" = %s
+        FOR UPDATE
+        """,
+        (stream_uuid, project_id),
+    ).fetchone()
+
+
+def _lock_workspace_topic(project_id, topic_uuid, session):
+    scope = session.execute(
+        """
+        SELECT "stream_uuid"
+        FROM "m_workspace_stream_topics"
+        WHERE "uuid" = %s AND "project_id" = %s
+        """,
+        (topic_uuid, project_id),
+    ).fetchone()
+    if scope is None:
+        return None
+    _lock_workspace_stream(project_id, scope["stream_uuid"], session)
+    return session.execute(
+        """
+        SELECT "uuid", "stream_uuid"
+        FROM "m_workspace_stream_topics"
+        WHERE "uuid" = %s AND "project_id" = %s
+        FOR UPDATE
+        """,
+        (topic_uuid, project_id),
+    ).fetchone()
+
+
+def _lock_workspace_stream_binding(project_id, binding_uuid, session):
+    scope = session.execute(
+        """
+        SELECT "stream_uuid"
+        FROM "m_workspace_stream_bindings"
+        WHERE "uuid" = %s AND "project_id" = %s
+        """,
+        (binding_uuid, project_id),
+    ).fetchone()
+    if scope is None:
+        return None
+    _lock_workspace_stream(project_id, scope["stream_uuid"], session)
+    return session.execute(
+        """
+        SELECT "uuid", "stream_uuid"
+        FROM "m_workspace_stream_bindings"
+        WHERE "uuid" = %s AND "project_id" = %s
+        FOR UPDATE
+        """,
+        (binding_uuid, project_id),
+    ).fetchone()
+
+
+def get_workspace_draft(project_id, user_uuid, draft_uuid, session=None):
+    return models.WorkspaceDraft.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(draft_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        },
+        session=session,
+    )
+
+
+def create_workspace_draft(
+    project_id,
+    user_uuid,
+    draft_uuid,
+    stream_uuid,
+    topic_uuid,
+    payload,
+    session=None,
+):
+    with _workspace_session(models.WorkspaceDraft, session=session) as s:
+        payload = _normalize_workspace_draft_payload(payload)
+        if not _lock_workspace_draft_scope(
+            project_id,
+            user_uuid,
+            stream_uuid,
+            topic_uuid,
+            s,
+        ):
+            raise ra_exc.ValidationErrorException()
+        result = s.execute(
+            """
+            INSERT INTO "m_workspace_drafts"
+                ("uuid", "project_id", "user_uuid", "stream_uuid",
+                 "topic_uuid", "payload")
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT ("uuid") DO NOTHING
+            RETURNING "uuid"
+            """,
+            (
+                draft_uuid,
+                project_id,
+                user_uuid,
+                stream_uuid,
+                topic_uuid,
+                json.dumps(
+                    {
+                        "kind": message_payloads.MarkdownPayload.KIND,
+                        "content": payload.content,
+                    }
+                ),
+            ),
+        )
+        if result.fetchone() is not None:
+            draft = get_workspace_draft(
+                project_id,
+                user_uuid,
+                draft_uuid,
+                session=s,
+            )
+            return draft, True
+        existing = models.WorkspaceDraft.objects.get_one_or_none(
+            filters={"uuid": dm_filters.EQ(draft_uuid)},
+            session=s,
+        )
+        if existing is not None:
+            same_create = (
+                existing.project_id == project_id
+                and existing.user_uuid == user_uuid
+                and existing.stream_uuid == stream_uuid
+                and existing.topic_uuid == topic_uuid
+                and existing.payload.content == payload.content
+            )
+            if not same_create:
+                raise messenger_exc.DraftConflictError()
+            return existing, False
+        raise messenger_exc.DraftConflictError()
+
+
+def update_workspace_draft(
+    project_id,
+    user_uuid,
+    draft_uuid,
+    payload,
+    expected_revision,
+    session=None,
+):
+    with _workspace_session(models.WorkspaceDraft, session=session) as s:
+        payload = _normalize_workspace_draft_payload(payload)
+        scope = _get_workspace_draft_scope(
+            project_id,
+            user_uuid,
+            draft_uuid,
+            s,
+        )
+        if scope is None:
+            return (
+                get_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    session=s,
+                ),
+                False,
+            )
+        if not _lock_workspace_draft_scope(
+            project_id,
+            user_uuid,
+            scope["stream_uuid"],
+            scope["topic_uuid"],
+            s,
+        ):
+            return (
+                get_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    session=s,
+                ),
+                False,
+            )
+        locked = s.execute(
+            """
+            SELECT "uuid"
+            FROM "m_workspace_drafts"
+            WHERE "uuid" = %s
+                AND "project_id" = %s
+                AND "user_uuid" = %s
+            FOR UPDATE
+            """,
+            (draft_uuid, project_id, user_uuid),
+        ).fetchone()
+        if locked is None:
+            return (
+                get_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    session=s,
+                ),
+                False,
+            )
+        result = s.execute(
+            """
+            UPDATE "m_workspace_drafts"
+            SET "payload" = %s::jsonb,
+                "revision" = "revision" + 1,
+                "updated_at" = NOW()
+            WHERE "uuid" = %s
+                AND "project_id" = %s
+                AND "user_uuid" = %s
+                AND "revision" = %s
+            RETURNING "uuid"
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": message_payloads.MarkdownPayload.KIND,
+                        "content": payload.content,
+                    }
+                ),
+                draft_uuid,
+                project_id,
+                user_uuid,
+                expected_revision,
+            ),
+        )
+        if result.fetchone() is None:
+            draft = get_workspace_draft(
+                project_id,
+                user_uuid,
+                draft_uuid,
+                session=s,
+            )
+            return draft, False
+        draft = get_workspace_draft(
+            project_id,
+            user_uuid,
+            draft_uuid,
+            session=s,
+        )
+        return draft, True
+
+
+def delete_workspace_draft(
+    project_id,
+    user_uuid,
+    draft_uuid,
+    expected_revision,
+    session=None,
+):
+    with _workspace_session(models.WorkspaceDraft, session=session) as s:
+        scope = _get_workspace_draft_scope(
+            project_id,
+            user_uuid,
+            draft_uuid,
+            s,
+        )
+        if scope is None:
+            return (
+                get_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    session=s,
+                ),
+                False,
+            )
+        if not _lock_workspace_draft_scope(
+            project_id,
+            user_uuid,
+            scope["stream_uuid"],
+            scope["topic_uuid"],
+            s,
+        ):
+            return (
+                get_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    session=s,
+                ),
+                False,
+            )
+        locked = s.execute(
+            """
+            SELECT "uuid"
+            FROM "m_workspace_drafts"
+            WHERE "uuid" = %s
+                AND "project_id" = %s
+                AND "user_uuid" = %s
+            FOR UPDATE
+            """,
+            (draft_uuid, project_id, user_uuid),
+        ).fetchone()
+        if locked is None:
+            return (
+                get_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    session=s,
+                ),
+                False,
+            )
+        draft = get_workspace_draft(
+            project_id,
+            user_uuid,
+            draft_uuid,
+            session=s,
+        )
+        if draft.revision != expected_revision:
+            return draft, False
+        draft.delete(session=s)
+        return None, True
 
 
 def update_workspace_user_presence(
@@ -794,59 +1199,62 @@ def create_workspace_stream_bindings_created_events(bindings, session=None):
 
 
 def delete_workspace_stream_binding(project_id, binding_uuid, session=None):
-    binding = models.WorkspaceStreamBinding.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(binding_uuid),
-            "project_id": dm_filters.EQ(project_id),
-        },
-        session=session,
-    )
-    user_stream = get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=binding.user_uuid,
-        stream_uuid=binding.stream_uuid,
-    )
-    folder_targets = _get_user_stream_folder_event_targets(
-        project_id=project_id,
-        user_uuid=binding.user_uuid,
-        stream_uuid=binding.stream_uuid,
-        private=user_stream.private,
-    )
-
-    messenger_events.create_stream_deleted_event(
-        project_id=project_id,
-        user_uuid=binding.user_uuid,
-        stream_uuid=binding.stream_uuid,
-        source_name=user_stream.source_name,
-        source=user_stream.source,
-        session=session,
-    )
-    _delete_workspace_stream_binding_file_accesses(
-        project_id=project_id,
-        stream_uuid=binding.stream_uuid,
-        user_uuid=binding.user_uuid,
-        session=session,
-    )
-    remaining_user_uuids = [
-        user_uuid
-        for user_uuid in models.get_stream_recipients(
-            project_id,
-            binding.stream_uuid,
-            session=session,
+    with _workspace_session(models.WorkspaceStreamBinding, session=session) as s:
+        _lock_workspace_stream_binding(project_id, binding_uuid, s)
+        binding = models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(binding_uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+            session=s,
         )
-        if user_uuid != binding.user_uuid
-    ]
-    messenger_events.create_stream_binding_deleted_events(
-        binding,
-        remaining_user_uuids,
-        session=session,
-    )
-    binding.delete(session=session)
-    _create_available_folder_updated_events(
-        project_id=project_id,
-        folder_targets=folder_targets,
-        session=session,
-    )
+        user_stream = get_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=binding.user_uuid,
+            stream_uuid=binding.stream_uuid,
+            session=s,
+        )
+        folder_targets = _get_user_stream_folder_event_targets(
+            project_id=project_id,
+            user_uuid=binding.user_uuid,
+            stream_uuid=binding.stream_uuid,
+            private=user_stream.private,
+        )
+
+        messenger_events.create_stream_deleted_event(
+            project_id=project_id,
+            user_uuid=binding.user_uuid,
+            stream_uuid=binding.stream_uuid,
+            source_name=user_stream.source_name,
+            source=user_stream.source,
+            session=s,
+        )
+        _delete_workspace_stream_binding_file_accesses(
+            project_id=project_id,
+            stream_uuid=binding.stream_uuid,
+            user_uuid=binding.user_uuid,
+            session=s,
+        )
+        remaining_user_uuids = [
+            user_uuid
+            for user_uuid in models.get_stream_recipients(
+                project_id,
+                binding.stream_uuid,
+                session=s,
+            )
+            if user_uuid != binding.user_uuid
+        ]
+        messenger_events.create_stream_binding_deleted_events(
+            binding,
+            remaining_user_uuids,
+            session=s,
+        )
+        binding.delete(session=s)
+        _create_available_folder_updated_events(
+            project_id=project_id,
+            folder_targets=folder_targets,
+            session=s,
+        )
 
 
 def create_workspace_stream_binding_updated_events(binding, session=None):
@@ -1133,12 +1541,13 @@ def get_workspace_user_stream_topic(project_id, user_uuid, topic_uuid, session=N
     )
 
 
-def _get_workspace_user_stream_topics(project_id, topic_uuid):
+def _get_workspace_user_stream_topics(project_id, topic_uuid, session=None):
     return models.WorkspaceUserTopic.objects.get_all(
         filters={
             "uuid": dm_filters.EQ(topic_uuid),
             "project_id": dm_filters.EQ(project_id),
         },
+        session=session,
     )
 
 
@@ -1146,6 +1555,7 @@ def _create_workspace_stream_topic_events(project_id, topic_uuid, session=None):
     user_topics = _get_workspace_user_stream_topics(
         project_id=project_id,
         topic_uuid=topic_uuid,
+        session=session,
     )
     for user_topic in user_topics:
         messenger_events.create_topic_event(
@@ -1155,15 +1565,19 @@ def _create_workspace_stream_topic_events(project_id, topic_uuid, session=None):
     return user_topics
 
 
-def _create_workspace_stream_updated_events(project_id, stream_uuid):
+def _create_workspace_stream_updated_events(project_id, stream_uuid, session=None):
     user_streams = models.WorkspaceUserStream.objects.get_all(
         filters={
             "uuid": dm_filters.EQ(stream_uuid),
             "project_id": dm_filters.EQ(project_id),
         },
+        session=session,
     )
     for user_stream in user_streams:
-        messenger_events.create_stream_updated_event(stream=user_stream)
+        messenger_events.create_stream_updated_event(
+            stream=user_stream,
+            session=session,
+        )
     return user_streams
 
 
@@ -1177,17 +1591,24 @@ def _create_workspace_stream_topic_updated_events(project_id, topic_uuid):
         messenger_events.create_topic_updated_event(topic=user_topic)
 
 
-def _get_workspace_stream_topic_for_user(project_id, user_uuid, topic_uuid):
+def _get_workspace_stream_topic_for_user(
+    project_id,
+    user_uuid,
+    topic_uuid,
+    session=None,
+):
     user_topic = get_workspace_user_stream_topic(
         project_id=project_id,
         user_uuid=user_uuid,
         topic_uuid=topic_uuid,
+        session=session,
     )
     return models.WorkspaceStreamTopic.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(user_topic.uuid),
             "project_id": dm_filters.EQ(project_id),
         },
+        session=session,
     )
 
 
@@ -1237,39 +1658,45 @@ def update_workspace_user_stream_topic(
 
 
 def delete_workspace_user_stream_topic(project_id, user_uuid, topic_uuid, session=None):
-    topic = _get_workspace_stream_topic_for_user(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        topic_uuid=topic_uuid,
-    )
-    user_topics = _get_workspace_user_stream_topics(
-        project_id=project_id,
-        topic_uuid=topic_uuid,
-    )
-    stream = models.WorkspaceStream.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(topic.stream_uuid),
-            "project_id": dm_filters.EQ(project_id),
-        },
-    )
-    if stream.default_topic_uuid == topic.uuid:
-        stream.update_dm(values={"default_topic_uuid": None})
-        stream.update()
-        _create_workspace_stream_updated_events(
+    with _workspace_session(models.WorkspaceStreamTopic, session=session) as s:
+        _lock_workspace_topic(project_id, topic_uuid, s)
+        topic = _get_workspace_stream_topic_for_user(
             project_id=project_id,
-            stream_uuid=topic.stream_uuid,
-        )
-    for user_topic in user_topics:
-        messenger_events.create_topic_deleted_event(
-            project_id=project_id,
-            user_uuid=user_topic.user_uuid,
+            user_uuid=user_uuid,
             topic_uuid=topic_uuid,
-            stream_uuid=topic.stream_uuid,
-            source_name=topic.source_name,
-            source=topic.source,
-            session=session,
+            session=s,
         )
-    topic.delete(session=session)
+        user_topics = _get_workspace_user_stream_topics(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=s,
+        )
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(topic.stream_uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+            session=s,
+        )
+        if stream.default_topic_uuid == topic.uuid:
+            stream.update_dm(values={"default_topic_uuid": None})
+            stream.update(session=s)
+            _create_workspace_stream_updated_events(
+                project_id=project_id,
+                stream_uuid=topic.stream_uuid,
+                session=s,
+            )
+        for user_topic in user_topics:
+            messenger_events.create_topic_deleted_event(
+                project_id=project_id,
+                user_uuid=user_topic.user_uuid,
+                topic_uuid=topic_uuid,
+                stream_uuid=topic.stream_uuid,
+                source_name=topic.source_name,
+                source=topic.source,
+                session=s,
+            )
+        topic.delete(session=s)
 
 
 def set_workspace_user_stream_topic_default(project_id, user_uuid, topic_uuid):
@@ -1743,48 +2170,51 @@ def update_workspace_user_stream_notifications(
 
 
 def delete_workspace_user_stream(project_id, user_uuid, stream_uuid, session=None):
-    get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-    )
-    stream = models.WorkspaceStream.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(stream_uuid),
-            "project_id": dm_filters.EQ(project_id),
-        },
-        session=session,
-    )
-    user_streams = models.WorkspaceUserStream.objects.get_all(
-        filters={
-            "uuid": dm_filters.EQ(stream_uuid),
-            "project_id": dm_filters.EQ(project_id),
-        },
-        session=session,
-    )
-    folder_targets = _get_stream_folder_event_targets(
-        project_id=project_id,
-        stream_uuid=stream_uuid,
-        user_streams=user_streams,
-    )
-
-    for user_stream in user_streams:
-        messenger_events.create_stream_deleted_event(
+    with _workspace_session(models.WorkspaceStream, session=session) as s:
+        _lock_workspace_stream(project_id, stream_uuid, s)
+        get_workspace_user_stream(
             project_id=project_id,
-            user_uuid=user_stream.user_uuid,
+            user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-            source_name=user_stream.source_name,
-            source=user_stream.source,
-            session=session,
+            session=s,
+        )
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(stream_uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+            session=s,
+        )
+        user_streams = models.WorkspaceUserStream.objects.get_all(
+            filters={
+                "uuid": dm_filters.EQ(stream_uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+            session=s,
+        )
+        folder_targets = _get_stream_folder_event_targets(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            user_streams=user_streams,
         )
 
-    stream.delete(session=session)
+        for user_stream in user_streams:
+            messenger_events.create_stream_deleted_event(
+                project_id=project_id,
+                user_uuid=user_stream.user_uuid,
+                stream_uuid=stream_uuid,
+                source_name=user_stream.source_name,
+                source=user_stream.source,
+                session=s,
+            )
 
-    _create_available_folder_updated_events(
-        project_id=project_id,
-        folder_targets=folder_targets,
-        session=session,
-    )
+        stream.delete(session=s)
+
+        _create_available_folder_updated_events(
+            project_id=project_id,
+            folder_targets=folder_targets,
+            session=s,
+        )
 
 
 def create_workspace_user_folder(project_id, user_uuid, session=None, **kwargs):

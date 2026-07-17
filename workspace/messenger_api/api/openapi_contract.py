@@ -50,6 +50,79 @@ MESSAGE_PAGINATION_HEADERS = {
     },
 }
 
+DRAFT_PAGINATION_PARAMETERS = (
+    {**PAGINATION_LIMIT_PARAMETER, "description": "Maximum drafts returned."},
+    {
+        "name": "page_marker",
+        "in": "query",
+        "description": (
+            "UUID of the last draft from the previous page in the same owner "
+            "and filter scope."
+        ),
+        "schema": {"type": "string", "format": "uuid"},
+    },
+    {
+        "name": "sort_key",
+        "in": "query",
+        "description": "Drafts are keyset-paginated by updated_at and uuid.",
+        "schema": {"type": "string", "enum": ["updated_at"]},
+    },
+    {
+        "name": "sort_dir",
+        "in": "query",
+        "schema": {"type": "string", "enum": ["asc", "desc"]},
+    },
+    {
+        "name": "stream_uuid",
+        "in": "query",
+        "schema": {"type": "string", "format": "uuid"},
+    },
+    {
+        "name": "topic_uuid",
+        "in": "query",
+        "schema": {"type": "string", "format": "uuid"},
+    },
+)
+
+DRAFT_ETAG_HEADER = {
+    "ETag": {
+        "description": "Strong entity tag containing the current draft revision.",
+        "schema": {"type": "string", "pattern": '^"[1-9][0-9]*"$'},
+    }
+}
+
+DRAFT_IF_MATCH_PARAMETER = {
+    "name": "If-Match",
+    "in": "header",
+    "required": True,
+    "description": "Strong ETag returned by the latest draft response.",
+    "schema": {"type": "string", "pattern": '^"[1-9][0-9]*"$'},
+}
+
+DRAFT_PAYLOAD_SCHEMA = {
+    "type": "object",
+    "required": ["kind", "content"],
+    "additionalProperties": False,
+    "properties": {
+        "kind": {"type": "string", "enum": ["markdown"]},
+        "content": {"type": "string", "minLength": 1, "maxLength": 10000},
+    },
+}
+
+DRAFT_ERROR_SCHEMA = {
+    "type": "object",
+    "required": ["message"],
+    "additionalProperties": False,
+    "properties": {"message": {"type": "string"}},
+}
+
+DRAFT_SIDE_EFFECTS_DESCRIPTION = (
+    "Drafts are PostgreSQL-only client state. This operation emits no Workspace "
+    "events, websocket or desktop notifications, messages, or IMAP/Maildir "
+    "records. Other clients observe changes after reload or an explicit API "
+    "refetch."
+)
+
 PROVIDER_SCHEMA = {
     "type": "object",
     "nullable": True,
@@ -208,6 +281,100 @@ def add_message_pagination_contract(specification, path):
         if (parameter["in"], parameter["name"]) not in existing
     )
     operation["responses"][200]["headers"] = copy.deepcopy(MESSAGE_PAGINATION_HEADERS)
+    return specification
+
+
+def add_draft_contract(specification, path, components):
+    schemas = components["components"]["schemas"]
+    collection = specification["paths"][path]
+    operation = collection["get"]
+    operation["description"] = DRAFT_SIDE_EFFECTS_DESCRIPTION
+    operation["parameters"] = copy.deepcopy(DRAFT_PAGINATION_PARAMETERS)
+    operation["responses"][200]["headers"] = copy.deepcopy(
+        MESSAGE_PAGINATION_HEADERS
+    )
+
+    create = collection["post"]
+    create["description"] = DRAFT_SIDE_EFFECTS_DESCRIPTION
+    create_schema = schemas["WorkspaceDraft_Create"]
+    create["requestBody"]["content"]["application/json"]["schema"] = {
+        "type": "object",
+        "required": ["uuid", "stream_uuid", "topic_uuid", "payload"],
+        "properties": {
+            name: {
+                key: value
+                for key, value in copy.deepcopy(create_schema["properties"][name]).items()
+                if key != "readOnly"
+            }
+            for name in ("uuid", "stream_uuid", "topic_uuid", "payload")
+        },
+    }
+    create["requestBody"]["content"]["application/json"]["schema"]["properties"][
+        "payload"
+    ] = copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)
+    create["responses"][200] = copy.deepcopy(create["responses"][201])
+    create["responses"][200]["description"] = (
+        "Existing draft returned for an identical idempotent create."
+    )
+    for status in (200, 201):
+        create["responses"][status]["headers"] = copy.deepcopy(DRAFT_ETAG_HEADER)
+    create["responses"][409] = {
+        "description": "The UUID exists with different canonical create fields.",
+        "content": {
+            "application/json": {
+                "schema": copy.deepcopy(DRAFT_ERROR_SCHEMA),
+            }
+        },
+    }
+
+    resource_path = f"{path}{{WorkspaceDraftUuid}}"
+    resource = specification["paths"][resource_path]
+    resource["get"]["description"] = DRAFT_SIDE_EFFECTS_DESCRIPTION
+    resource["get"]["responses"][200]["headers"] = copy.deepcopy(
+        DRAFT_ETAG_HEADER
+    )
+    for method in ("put", "delete"):
+        mutation = resource[method]
+        mutation["description"] = DRAFT_SIDE_EFFECTS_DESCRIPTION
+        mutation.setdefault("parameters", []).append(
+            copy.deepcopy(DRAFT_IF_MATCH_PARAMETER)
+        )
+        mutation["responses"][412] = {
+            "description": "Revision mismatch; body and ETag contain current draft.",
+            "headers": copy.deepcopy(DRAFT_ETAG_HEADER),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["current"],
+                        "properties": {
+                            "current": {
+                                "$ref": "#/components/schemas/WorkspaceDraft_Get"
+                            }
+                        },
+                    }
+                }
+            },
+        }
+        mutation["responses"][428] = {
+            "description": "If-Match is required.",
+            "content": {
+                "application/json": {
+                    "schema": copy.deepcopy(DRAFT_ERROR_SCHEMA),
+                }
+            },
+        }
+    resource["put"]["responses"][200]["headers"] = copy.deepcopy(
+        DRAFT_ETAG_HEADER
+    )
+    resource["put"]["requestBody"]["content"]["application/json"]["schema"] = {
+        "type": "object",
+        "required": ["payload"],
+        "additionalProperties": False,
+        "properties": {
+            "payload": copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)
+        },
+    }
     return specification
 
 

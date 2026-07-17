@@ -51,6 +51,11 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/messages/",
         )
+        specification = openapi_contract.add_draft_contract(
+            specification,
+            "/v1/drafts/",
+            components,
+        )
         return openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",

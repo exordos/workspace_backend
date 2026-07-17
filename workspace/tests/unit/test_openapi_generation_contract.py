@@ -87,6 +87,32 @@ def _assert_collection_pagination_contract(operation, marker_schema):
     assert headers["X-Pagination-Marker"]["schema"] == marker_schema
 
 
+def _assert_draft_contract(paths, collection_path):
+    for operation in paths[collection_path].values():
+        assert "emits no Workspace events" in operation["description"]
+    payload_schema = paths[collection_path]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]["properties"]["payload"]
+    assert payload_schema["required"] == ["kind", "content"]
+    assert payload_schema["properties"]["kind"]["enum"] == ["markdown"]
+    assert payload_schema["properties"]["content"]["maxLength"] == 10000
+    error_schema = paths[collection_path]["post"]["responses"][409]["content"][
+        "application/json"
+    ]["schema"]
+    assert error_schema["required"] == ["message"]
+
+    resource_path = f"{collection_path}{{WorkspaceDraftUuid}}"
+    for operation in paths[resource_path].values():
+        assert "emits no Workspace events" in operation["description"]
+    update_payload_schema = paths[resource_path]["put"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]["properties"]["payload"]
+    assert update_payload_schema == payload_schema
+    for method in ("put", "delete"):
+        response = paths[resource_path][method]["responses"][428]
+        assert response["content"]["application/json"]["schema"] == error_schema
+
+
 def _build_openapi(app_module):
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
@@ -163,6 +189,7 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         paths["/v1/folders/"]["get"],
         {"type": "string", "format": "uuid"},
     )
+    _assert_draft_contract(paths, "/v1/drafts/")
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
@@ -201,6 +228,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         event_operation,
         {"type": "integer", "minimum": 0},
     )
+    _assert_draft_contract(paths, "/v1/messenger/drafts/")
     avatar_upload_path = (
         "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"
     )
