@@ -42,10 +42,13 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
         self.assertEqual(response.content_type, "application/json")
         self.assertEqual(result["result"], "success")
         self.assertEqual(result["msg"], "Welcome to Exordos Workspace")
-        self.assertEqual(result["realm_url"], "http://127.0.0.1:3000")
-        self.assertEqual(result["realm_uri"], "http://127.0.0.1:3000")
+        self.assertEqual(result["realm_url"], "https://127.0.0.1:3000")
+        self.assertEqual(result["realm_uri"], "https://127.0.0.1:3000")
         self.assertEqual(result["realm_name"], "Exordos Workspace")
-        self.assertEqual(result["realm_icon"], "")
+        self.assertEqual(
+            result["realm_icon"],
+            "urn:url:https://127.0.0.1:3000/logo-512x512.png",
+        )
         self.assertEqual(result["meet_url"], "https://meet.genesis-core.tech")
         self.assertTrue(result["authentication_methods"]["password"])
         self.assertEqual(result["external_authentication_methods"], [])
@@ -64,6 +67,21 @@ class ServerSettingsMiddlewareTest(unittest.TestCase):
 
         self.assertEqual(result["realm_url"], "https://workspace.exordos.local")
         self.assertEqual(result["realm_uri"], "https://workspace.exordos.local")
+
+    def test_explicit_forwarded_http_is_preserved(self):
+        req = webob.Request.blank(
+            "/v1/server_settings",
+            headers={
+                "Host": "workspace.test.local",
+                "X-Forwarded-Proto": "http",
+            },
+        )
+
+        response = req.get_response(self._make_app())
+        result = json.loads(response.text)
+
+        self.assertEqual(result["realm_url"], "http://workspace.test.local")
+        self.assertEqual(result["realm_uri"], "http://workspace.test.local")
 
     def test_reports_unsupported_parameters(self):
         req = webob.Request.blank(

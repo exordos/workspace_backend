@@ -39,9 +39,12 @@ Nginx exposes:
 - Upload request limit: `50m`
 
 `GET /v1/messenger/server_settings` is public and is handled by middleware for
-Zulip-compatible client bootstrap behavior. All other Workspace and Messenger
-resources are scoped using the IAM bearer token, its user UUID, and its project
-ID.
+Zulip-compatible client bootstrap behavior. Its `realm_icon` is a public URL
+URN derived from the canonical request realm as
+`urn:url:<realm>/logo-512x512.png`; nginx serves that path without
+authentication from the packaged `pwa-512x512.png` organization emblem. All
+other Workspace and Messenger resources are scoped using the IAM bearer token,
+its user UUID, and its project ID.
 
 An event cursor is the pair `(epoch_generation, epoch_version)`. A cold
 connection may use `last_epoch_version=0` without a generation; every non-zero

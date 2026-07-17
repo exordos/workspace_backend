@@ -265,6 +265,7 @@ def test_workspace_api_and_common_websocket_routes_use_dedicated_ports():
     assert "proxy_pass http://127.0.0.1:21084/;" in manifest
     assert "location = /api/workspace/v1/events/ws {" in manifest
     assert "proxy_pass http://127.0.0.1:21082/v1/events/ws;" in manifest
+    assert manifest.count("proxy_set_header X-Forwarded-Proto https;") == 4
 
 
 def test_legacy_public_messenger_routes_are_absent():
@@ -1556,6 +1557,10 @@ def test_element_builds_and_serves_the_existing_workspace_ui():
     assert "npm ci --include=dev" in install_script
     assert "VITE_MESSENGER_ONLY=true npm run build --workspace=web" in install_script
     assert "packages/web/dist/index.html" in install_script
+    assert "location = /logo-512x512.png {" in manifest
+    assert (
+        "alias /opt/workspace-ui/packages/web/dist/pwa-512x512.png;" in manifest
+    )
     assert "root /opt/workspace-ui/packages/web/dist;" in manifest
     assert "try_files $uri $uri/ /index.html;" in manifest
     assert "127.0.0.1:5173" not in manifest
@@ -1565,7 +1570,7 @@ def test_element_workflow_checks_out_compatible_ui_and_publishes():
     workflow = _read(".github/workflows/exordos-element.yml")
 
     assert (
-        "WORKSPACE_UI_REF: 5510e6b01db456d183a86a2e7088ab254cb83db9"
+        "WORKSPACE_UI_REF: 3c906069677d5ae7416f363edafee3a84085dfdb"
         in workflow
     )
     assert 'ui_dir="${GITHUB_WORKSPACE}/../workspace_ui"' in workflow

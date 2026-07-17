@@ -33,7 +33,7 @@ def _normalize_path(path):
 
 
 def _get_realm_url(req):
-    proto = req.headers.get("X-Forwarded-Proto", req.scheme)
+    proto = req.headers.get("X-Forwarded-Proto", "https")
     return f"{proto}://{req.headers['Host']}"
 
 
@@ -61,7 +61,7 @@ def build_server_settings(req):
         "require_email_format_usernames": True,
         "realm_url": realm_url,
         "realm_name": "Exordos Workspace",
-        "realm_icon": "",
+        "realm_icon": f"urn:url:{realm_url}/logo-512x512.png",
         "realm_description": "<p>Exordos Workspace messenger.</p>",
         "realm_web_public_access_enabled": False,
         "meet_url": "https://meet.genesis-core.tech",
@@ -93,5 +93,15 @@ class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
                 status=410,
                 json=error.as_dict(),
                 headers={"Cache-Control": "no-store"},
+            )
+        if isinstance(error, messenger_exceptions.DraftConflictError):
+            return req.ResponseClass(status=409, json={"message": error.msg})
+        if isinstance(error, messenger_exceptions.DraftPreconditionRequiredError):
+            return req.ResponseClass(status=428, json={"message": error.msg})
+        if isinstance(error, messenger_exceptions.DraftPreconditionFailedError):
+            return req.ResponseClass(
+                status=412,
+                json={"current": error.current},
+                headers={"ETag": f'"{error.current["revision"]}"'},
             )
         return super()._construct_error_response(req, error)

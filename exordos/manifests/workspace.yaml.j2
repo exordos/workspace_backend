@@ -409,7 +409,7 @@ resources:
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Proto https;
               }
 
               location = /api/workspace/v1/events/ws {
@@ -417,7 +417,7 @@ resources:
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Proto https;
 
                   proxy_http_version 1.1;
                   proxy_set_header Upgrade $http_upgrade;
@@ -431,7 +431,7 @@ resources:
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Proto https;
               }
 
               location /api/workspace/ {
@@ -439,7 +439,11 @@ resources:
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+
+              location = /logo-512x512.png {
+                  alias /opt/workspace-ui/packages/web/dist/pwa-512x512.png;
               }
 
               location / {

@@ -84,6 +84,17 @@ ROUTE_MANIFEST = {
             ra_routes.DELETE,
         },
     ),
+    "drafts": (
+        routes.WorkspaceDraftRoute,
+        controllers.WorkspaceDraftController,
+        {
+            ra_routes.CREATE,
+            ra_routes.FILTER,
+            ra_routes.GET,
+            ra_routes.UPDATE,
+            ra_routes.DELETE,
+        },
+    ),
     "message_reactions": (
         routes.WorkspaceMessageReactionRoute,
         controllers.WorkspaceMessageReactionController,
@@ -225,6 +236,8 @@ def test_server_settings_origin_path_and_fields_are_preserved():
     )
 
     settings = middlewares.build_server_settings(request)
+
+    assert settings["realm_icon"] == "urn:url:https://127.0.0.1:3000/logo-512x512.png"
 
     assert set(settings) == {
         "result",
