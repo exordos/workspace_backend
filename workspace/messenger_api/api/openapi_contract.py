@@ -214,8 +214,14 @@ def add_avatar_upload_schema(specification):
 
 def add_public_projection_contract(specification):
     schemas = specification["components"]["schemas"]
+    projection_schema_prefixes = (
+        "WorkspaceUserStream_",
+        "WorkspaceUserTopic_",
+        "WorkspaceUserMessage_",
+        "WorkspaceMessageReactions_",
+    )
     for name, schema in schemas.items():
-        if not name.startswith("WorkspaceMessageReactions_"):
+        if not name.startswith(projection_schema_prefixes):
             continue
         properties = schema["properties"]
         properties["provider"] = copy.deepcopy(PROVIDER_SCHEMA)

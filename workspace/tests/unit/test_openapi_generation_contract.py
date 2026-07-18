@@ -244,9 +244,15 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     assert raw_provider_fields.isdisjoint(
         schemas["WorkspaceFile_Filter"]["properties"],
     )
-    reaction_properties = schemas["WorkspaceMessageReactions_Filter"]["properties"]
-    assert raw_provider_fields.isdisjoint(reaction_properties)
-    assert {"provider", "delivery"} <= set(reaction_properties)
+    for schema_name in (
+        "WorkspaceUserStream_Filter",
+        "WorkspaceUserTopic_Filter",
+        "WorkspaceUserMessage_Filter",
+        "WorkspaceMessageReactions_Filter",
+    ):
+        projection_properties = schemas[schema_name]["properties"]
+        assert raw_provider_fields.isdisjoint(projection_properties)
+        assert {"provider", "delivery"} <= set(projection_properties)
     assert schemas["WorkspaceEvent_Filter"]["properties"]["object_type"]["enum"] == [
         "file",
         "folder",

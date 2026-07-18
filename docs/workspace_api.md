@@ -137,14 +137,22 @@ Typical RESTAlchemy/IAM error response:
 
 ```json
 {
+  "type": "ValidationErrorException",
   "code": 400,
-  "json": {
-    "code": 400,
-    "type": "ValidationErrorException",
-    "message": "Validation error occurred."
-  }
+  "message": "Validation error occurred."
 }
 ```
+
+The HTTP response body is the error object itself; there is no outer `json`
+wrapper. Messenger validation errors use HTTP `400`. The following public
+operations provide a more specific application code in the same `code` field:
+
+| Application code | Type | Operation |
+| --- | --- | --- |
+| `400001004` | `InvalidStreamBindingRoleError` | Add users with an unsupported binding role. |
+| `400001005` | `StreamBindingUsersPayloadError` | Add users with a role value that is not a list of user UUIDs. |
+| `400001006` | `InvalidTopicNotificationModeError` | Select a topic notification mode that is incompatible with the stream mode. |
+| `400001007` | `StreamDefaultTopicNotConfiguredError` | Create a message without `topic_uuid` when the stream has no default topic. |
 
 Messenger resources keep a canonical provenance projection instead of exposing
 transport identifiers:
@@ -617,16 +625,16 @@ the browser contract will continue to hide raw mail protocol identifiers.
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | Stream identifier. |
-| `name` | string | yes | no | Stream name. |
-| `description` | string | yes | no | Stream description. |
+| `name` | string, max 255 | yes | no | Stream name. |
+| `description` | string, max 255 | no | no | Stream description; defaults to an empty string. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `owner` | UUID | no | yes | Owner from the user stream view. |
 | `user_uuid` | UUID | no | yes | Current user in the user stream view. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | yes | Current user's role. |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | user-scoped action-managed | Current user's stream notification mode; defaults to `all_messages`. |
 | `unread_count` | integer | no | yes | Current user's unread count. |
-| `source_name` | `native`, `zulip` | yes | no | Source name. |
-| `source` | object | yes | no | Source payload. |
+| `source_name` | `native`, `zulip` | no | no | Source name; defaults to `native`. |
+| `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
 | `announce` | boolean | no | no | Announcement stream flag. |
 | `direct_user_uuid` | UUID | no | no | Other direct-chat participant. |
@@ -668,6 +676,10 @@ Direct chat create request:
   "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
 }
 ```
+
+`direct_user_uuid` must identify the other participant. Sending the current IAM
+user UUID, including the token subject UUID, returns HTTP `400` with the generic
+`ValidationErrorException` response shown above.
 
 Stream notification mode request:
 
@@ -712,6 +724,7 @@ Realtime side effects:
 | add stream bindings | `stream_bindings.created` | `stream_binding` | New stream binding snapshots for existing stream participants. |
 | add stream binding | `folder.updated` | `folder` | Updated added user's `All chats` and `Channels`/`Personal` system folder snapshots. |
 | delete stream binding | `stream.deleted` | `stream` | Only stream `uuid`, sent to the removed user. |
+| delete stream binding | `stream_binding.deleted` | `stream_binding` | Removed binding `uuid`, `stream_uuid`, and `user_uuid`, sent to every remaining stream participant. |
 | delete stream binding | `folder.updated` | `folder` | Updated removed user's system/custom folder snapshots after access is removed. |
 
 For direct private streams, one `stream.created` event is written for each
@@ -760,7 +773,9 @@ Add users request:
 
 Deleting a binding removes that user's access to the stream. The removed user
 receives `stream.deleted` and then `folder.updated` for affected system and
-custom folders. Other stream users do not receive a binding-delete event.
+custom folders. Every remaining stream participant receives
+`stream_binding.deleted` with the removed binding `uuid`, `stream_uuid`, and
+`user_uuid`.
 
 ## Stream Topics
 
@@ -884,15 +899,16 @@ syntax. The URL part is a Workspace URN:
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
 | `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. The request fails with code `400001007` when the stream has no default. |
 | `author_uuid` | UUID | no | yes | Message author. |
-| `payload` | object | yes | no | Message payload. |
+| `payload` | object | yes | no | Markdown message payload; trimmed content must be 1..10,000 characters. |
 | `user_uuid` | UUID | no | yes | Current user in the user message view. |
 | `read` | boolean | no | yes | Current user's read flag. Authors are created as read. |
 | `pinned` | boolean | no | yes | Current user's pinned flag. |
 | `starred` | boolean | no | yes | Current user's starred flag. |
 | `is_own` | boolean | no | yes | Whether `author_uuid` equals the current user. |
+| `mentioned` | boolean | no | yes | Whether the markdown payload mentions the current user; defaults to `false`. |
 | `reactions` | object | no | yes | Aggregated reaction counts keyed by `emoji_name`. |
-| `source_name` | `native`, `zulip` | no | no | Message source name; defaults from the selected topic when omitted. |
-| `source` | object | no | no | Message source payload; Zulip `message_id` can be `null` until outbound sync succeeds. |
+| `source_name` | `native`, `zulip` | no | no | Message source name; the public API defaults it to `native` when omitted. |
+| `source` | object | no | no | Message source payload; defaults to `{"kind": "native"}`. Zulip `message_id` can be `null` until outbound sync succeeds. |
 | `provider` | object or `null` | no | yes | Provider badge inherited from the selected provider-backed stream. |
 | `delivery` | object or `null` | no | yes | Current create/update/delete delivery projection. |
 | `created_at` | datetime | no | yes | Creation time. |
@@ -933,7 +949,10 @@ Response example:
   "pinned": false,
   "starred": false,
   "is_own": true,
+  "mentioned": false,
   "reactions": {},
+  "provider": null,
+  "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
   "updated_at": "2026-06-22T10:10:00Z"
 }
@@ -1001,6 +1020,67 @@ draft belongs to exactly one IAM project, owner, stream, and topic. The
 `stream_uuid` and `topic_uuid` are immutable, the topic must belong to the
 stream, and the owner must currently be a stream participant. Multiple drafts
 may exist for the same stream/topic pair.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | yes | after create | Client-generated idempotency key and draft identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `user_uuid` | UUID | no | yes | Draft owner from the IAM token. |
+| `stream_uuid` | UUID | yes | after create | Stream containing the draft. |
+| `topic_uuid` | UUID | yes | after create | Topic containing the draft; it must belong to `stream_uuid`. |
+| `payload` | object | yes | no | Markdown draft payload. It is the only field accepted by `PUT`. |
+| `revision` | integer, minimum 1 | no | yes | Strong ETag revision, starting at `1`. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Last update time. |
+
+Create request:
+
+```json
+{
+  "uuid": "ca14d274-0057-4a9a-a34b-fb1174be6a17",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "payload": {
+    "kind": "markdown",
+    "content": "Draft message"
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "uuid": "ca14d274-0057-4a9a-a34b-fb1174be6a17",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "payload": {
+    "kind": "markdown",
+    "content": "Draft message"
+  },
+  "revision": 1,
+  "created_at": "2026-07-17T08:00:00Z",
+  "updated_at": "2026-07-17T08:00:00Z"
+}
+```
+
+Update request:
+
+```http
+PUT /api/workspace/v1/messenger/drafts/ca14d274-0057-4a9a-a34b-fb1174be6a17
+Authorization: Bearer <access_token>
+Content-Type: application/json
+If-Match: "1"
+
+{
+  "payload": {
+    "kind": "markdown",
+    "content": "Updated draft message"
+  }
+}
+```
 
 Create requests require `uuid`, `stream_uuid`, `topic_uuid`, and a Markdown
 payload. Markdown content is trimmed, must remain non-empty, and is limited to
@@ -1123,8 +1203,8 @@ metadata. Nginx rejects multipart requests larger than `50m` before they reach
 | `project_id` | UUID | no | yes | IAM project scope; hidden in API responses. |
 | `user_uuid` | UUID | no | yes | Owner/uploader. |
 | `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. Required for JSON create and `stream_members` multipart uploads; omitted for multipart uploads with `acl.mode=public`. |
-| `name` | string | yes | no | File display name. |
-| `description` | string | yes | no | File description. |
+| `name` | string, max 255 | yes | no | File display name. |
+| `description` | string, max 255 | no | no | File description; defaults to an empty string. |
 | `content_type` | string | yes | no | MIME content type. |
 | `size_bytes` | integer | yes | no | File size in bytes. |
 | `hash` | string | yes | no | File hash, currently SHA-256 for multipart uploads. |
@@ -1191,6 +1271,37 @@ owned file removes both its binary object and JSON sidecar after the canonical
 file deletion is journaled.
 
 
+## Services
+
+Services are read-only catalog entries exposed by the common Workspace API.
+`GET /api/workspace/v1/services/` lists the available services and
+`GET /api/workspace/v1/services/{service_uuid}` returns one service.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `uuid` | UUID | Service identifier. |
+| `name` | string, max 255 | Service name. |
+| `description` | string, max 255 | Service description; defaults to an empty string. |
+| `service_url` | URL | Service entry URL. |
+| `icon` | URL or `null` | Optional icon URL. |
+| `created_at` | datetime | Creation time. |
+| `updated_at` | datetime | Last update time. |
+
+Response example:
+
+```json
+{
+  "uuid": "608919f5-ae0f-44fb-85bf-f1bf56534238",
+  "name": "Messenger",
+  "description": "Workspace Messenger",
+  "service_url": "https://workspace.example.com/",
+  "icon": "https://workspace.example.com/icon.svg",
+  "created_at": "2026-07-17T08:00:00Z",
+  "updated_at": "2026-07-17T08:00:00Z"
+}
+```
+
+
 ## Events And Epoch
 
 Events are durable records in the IMAP event journal and are scoped to the
@@ -1234,7 +1345,10 @@ both read from the current user's visible IMAP-backed event surface.
     "pinned": false,
     "starred": false,
     "is_own": true,
+    "mentioned": false,
     "reactions": {},
+    "provider": null,
+    "delivery": null,
     "created_at": "2026-07-02T16:37:49.552044Z",
     "updated_at": "2026-07-02T16:37:49.552047Z"
   }
