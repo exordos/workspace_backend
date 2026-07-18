@@ -32,6 +32,23 @@ if [ ! -s "$WORKSPACE_CONFIG" ]; then
     exit 0
 fi
 
+STORAGE_MODE=$(python3 - "$WORKSPACE_CONFIG" <<'PY'
+import configparser
+import sys
+
+config = configparser.ConfigParser()
+config.read(sys.argv[1])
+print(config.get("messenger_storage", "mode", fallback="mail_projection"))
+PY
+)
+
+if [ "$STORAGE_MODE" = "postgresql_canonical" ]; then
+    rm -f "$READY_FILE"
+    "$WORKSPACE_BOOTSTRAP"
+    "$RESTART_SERVICES"
+    exit 0
+fi
+
 STARTTLS_REQUIRED=0
 if grep -Eq '^[[:space:]]*(smtp|imap)_security[[:space:]]*=[[:space:]]*starttls[[:space:]]*$' \
     "$WORKSPACE_CONFIG"; then

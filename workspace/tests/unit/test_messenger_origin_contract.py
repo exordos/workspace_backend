@@ -95,6 +95,42 @@ ROUTE_MANIFEST = {
             ra_routes.DELETE,
         },
     ),
+    "external_accounts": (
+        routes.ExternalAccountRoute,
+        controllers.ExternalAccountController,
+        {
+            ra_routes.CREATE,
+            ra_routes.FILTER,
+            ra_routes.GET,
+            ra_routes.UPDATE,
+            ra_routes.DELETE,
+        },
+    ),
+    "external_chats": (
+        routes.ExternalChatRoute,
+        controllers.ExternalChatController,
+        {ra_routes.FILTER, ra_routes.GET},
+    ),
+    "external_operations": (
+        routes.ExternalOperationRoute,
+        controllers.ExternalOperationController,
+        {ra_routes.FILTER, ra_routes.GET, ra_routes.DELETE},
+    ),
+    "external_bridge_instances": (
+        routes.ExternalBridgeInstanceRoute,
+        controllers.ExternalBridgeInstanceController,
+        {ra_routes.FILTER, ra_routes.GET},
+    ),
+    "external_provider_policies": (
+        routes.ExternalProviderPolicyRoute,
+        controllers.ExternalProviderPolicyController,
+        {ra_routes.GET, ra_routes.UPDATE},
+    ),
+    "external_provider_health": (
+        routes.ExternalProviderHealthRoute,
+        controllers.ExternalProviderHealthController,
+        {ra_routes.GET},
+    ),
     "message_reactions": (
         routes.WorkspaceMessageReactionRoute,
         controllers.WorkspaceMessageReactionController,
@@ -131,6 +167,50 @@ ROUTE_MANIFEST = {
 
 
 ACTION_MANIFEST = {
+    (routes.ExternalAccountRoute, "reconnect"): (
+        controllers.ExternalAccountController,
+        True,
+    ),
+    (routes.ExternalAccountRoute, "disconnect"): (
+        controllers.ExternalAccountController,
+        True,
+    ),
+    (routes.ExternalChatRoute, "select"): (
+        controllers.ExternalChatController,
+        True,
+    ),
+    (routes.ExternalChatRoute, "deselect"): (
+        controllers.ExternalChatController,
+        True,
+    ),
+    (routes.ExternalChatRoute, "move"): (
+        controllers.ExternalChatController,
+        True,
+    ),
+    (routes.ExternalOperationRoute, "retry"): (
+        controllers.ExternalOperationController,
+        True,
+    ),
+    (routes.ExternalBridgeInstanceRoute, "suspend"): (
+        controllers.ExternalBridgeInstanceController,
+        True,
+    ),
+    (routes.ExternalBridgeInstanceRoute, "resume"): (
+        controllers.ExternalBridgeInstanceController,
+        True,
+    ),
+    (routes.ExternalBridgeInstanceRoute, "revoke"): (
+        controllers.ExternalBridgeInstanceController,
+        True,
+    ),
+    (routes.ExternalProviderPolicyRoute, "suspend"): (
+        controllers.ExternalProviderPolicyController,
+        True,
+    ),
+    (routes.ExternalProviderPolicyRoute, "resume"): (
+        controllers.ExternalProviderPolicyController,
+        True,
+    ),
     (routes.FolderItemRoute, "pin"): (
         controllers.FolderItemController,
         True,

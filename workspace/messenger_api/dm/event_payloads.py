@@ -15,6 +15,7 @@
 #    under the License.
 
 import datetime
+import typing
 
 from restalchemy.dm import properties
 from restalchemy.dm import models
@@ -26,7 +27,7 @@ from workspace.messenger_api.dm import models as messenger_models
 
 
 class MessageEventTimestampType(types.UTCDateTimeZ):
-    def from_simple_type(self, value):
+    def from_simple_type(self, value: typing.Any) -> datetime.datetime:
         try:
             return super().from_simple_type(value)
         except ValueError:
@@ -512,6 +513,49 @@ class FileDeletedEventPayload(
     )
 
 
+class ExternalEventPayloadBase(
+    types_dynamic.AbstractKindModel,
+    models.ModelWithUUID,
+):
+    snapshot = properties.property(types.Dict(), required=True)
+
+
+class ExternalAccountCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_account.created"
+
+
+class ExternalAccountUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_account.updated"
+
+
+class ExternalAccountDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_account.deleted"
+
+
+class ExternalChatCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_chat.created"
+
+
+class ExternalChatUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_chat.updated"
+
+
+class ExternalChatDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_chat.deleted"
+
+
+class ExternalOperationCreatedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_operation.created"
+
+
+class ExternalOperationUpdatedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_operation.updated"
+
+
+class ExternalOperationDeletedEventPayload(ExternalEventPayloadBase):
+    KIND = "external_operation.deleted"
+
+
 WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MessageCreatedEventPayload),
     types_dynamic.KindModelType(MessageUpdatedEventPayload),
@@ -540,4 +584,13 @@ WORKSPACE_EVENT_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(FileCreatedEventPayload),
     types_dynamic.KindModelType(FileUpdatedEventPayload),
     types_dynamic.KindModelType(FileDeletedEventPayload),
+    types_dynamic.KindModelType(ExternalAccountCreatedEventPayload),
+    types_dynamic.KindModelType(ExternalAccountUpdatedEventPayload),
+    types_dynamic.KindModelType(ExternalAccountDeletedEventPayload),
+    types_dynamic.KindModelType(ExternalChatCreatedEventPayload),
+    types_dynamic.KindModelType(ExternalChatUpdatedEventPayload),
+    types_dynamic.KindModelType(ExternalChatDeletedEventPayload),
+    types_dynamic.KindModelType(ExternalOperationCreatedEventPayload),
+    types_dynamic.KindModelType(ExternalOperationUpdatedEventPayload),
+    types_dynamic.KindModelType(ExternalOperationDeletedEventPayload),
 )

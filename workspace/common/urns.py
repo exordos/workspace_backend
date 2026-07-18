@@ -18,11 +18,11 @@ MESSENGER_REACTION = "messenger-reaction"
 FILE = "file"
 
 
-def build(entity_type, entity_uuid):
+def build(entity_type: str, entity_uuid: sys_uuid.UUID | str) -> str:
     return f"urn:{entity_type}:{sys_uuid.UUID(str(entity_uuid))}"
 
 
-def parse(value, expected_type=None):
+def parse(value: str, expected_type: str | None = None) -> tuple[str, sys_uuid.UUID]:
     prefix, separator, remainder = value.partition(":")
     entity_type, separator2, raw_uuid = remainder.partition(":")
     if prefix != "urn" or not separator or not separator2:

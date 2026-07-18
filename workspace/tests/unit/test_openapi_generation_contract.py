@@ -180,9 +180,9 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     assert set(paths[avatar_reset_path]) == {"post"}
     me_operation = paths["/v1/me/"]["get"]
     assert me_operation["parameters"] == []
-    assert me_operation["responses"][200]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/WorkspaceUser_Get"}
+    assert me_operation["responses"][200]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceUser_Get"
+    }
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
     _assert_file_upload_contract(paths["/v1/files/"]["post"])
     _assert_collection_pagination_contract(
@@ -208,9 +208,9 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         parameter["name"] == "epoch_generation"
         for parameter in event_operation["parameters"]
     )
-    assert event_operation["responses"][410]["content"]["application/json"][
-        "schema"
-    ]["properties"]["error"]["enum"] == ["epoch_pruned"]
+    assert event_operation["responses"][410]["content"]["application/json"]["schema"][
+        "properties"
+    ]["error"]["enum"] == ["epoch_pruned"]
     epoch_schema = paths["/v1/epoch/"]["get"]["responses"][200]["content"][
         "application/json"
     ]["schema"]
@@ -219,9 +219,9 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     assert not any("/blobs/" in path for path in paths)
     me_operation = paths["/v1/me/"]["get"]
     assert me_operation["parameters"] == []
-    assert me_operation["responses"][200]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/WorkspaceUser_Get"}
+    assert me_operation["responses"][200]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WorkspaceUser_Get"
+    }
     _assert_message_pagination_contract(paths["/v1/messenger/messages/"]["get"])
     _assert_file_upload_contract(paths["/v1/messenger/files/"]["post"])
     _assert_collection_pagination_contract(
@@ -229,9 +229,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         {"type": "integer", "minimum": 0},
     )
     _assert_draft_contract(paths, "/v1/messenger/drafts/")
-    avatar_upload_path = (
-        "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"
-    )
+    avatar_upload_path = "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
 
     schemas = specification["components"]["schemas"]
@@ -240,7 +238,14 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "external_account_uuid",
         "provider_external_id",
     }
-    assert raw_provider_fields.isdisjoint(schemas["WorkspaceUser_Get"]["properties"])
+    user_properties = schemas["WorkspaceUser_Get"]["properties"]
+    assert raw_provider_fields.isdisjoint(user_properties)
+    assert user_properties["identity_kind"]["enum"] == ["external"]
+    assert user_properties["display_name"]["readOnly"] is True
+    assert set(user_properties["provider"]["properties"]) == {
+        "kind",
+        "account_uuid",
+    }
     assert raw_provider_fields.isdisjoint(
         schemas["WorkspaceFile_Filter"]["properties"],
     )
@@ -253,7 +258,12 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         projection_properties = schemas[schema_name]["properties"]
         assert raw_provider_fields.isdisjoint(projection_properties)
         assert {"provider", "delivery"} <= set(projection_properties)
+        assert "identity_kind" not in projection_properties
+        assert "external_id" in projection_properties["provider"]["properties"]
     assert schemas["WorkspaceEvent_Filter"]["properties"]["object_type"]["enum"] == [
+        "external_account",
+        "external_chat",
+        "external_operation",
         "file",
         "folder",
         "folder_item",

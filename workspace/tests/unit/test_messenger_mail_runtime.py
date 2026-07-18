@@ -4,7 +4,6 @@
 # you may not use this file except in compliance with the License.
 
 import pathlib
-import re
 import uuid as sys_uuid
 
 from oslo_config import cfg
@@ -53,6 +52,10 @@ class FakeImapClient:
 
     def __exit__(self, exc_type, exc, traceback):
         self.exited = True
+
+    def ensure_mailbox(self, path):
+        self.ensured_mailbox = path
+        return True
 
 
 class FakeSmtpClient:
@@ -115,6 +118,32 @@ def test_user_and_project_master_logins_are_deterministic_and_context_managed(
     assert "master-secret" not in service.technical_address(USER_UUID)
 
 
+def test_external_bridge_mailboxes_use_master_only_producer_and_ingress_targets(
+    monkeypatch,
+):
+    FakeImapClient.instances = []
+    monkeypatch.setattr(runtime.protocol, "ImapClient", FakeImapClient)
+    factory = runtime.RuntimeFactory(_conf())
+    account_uuid = sys_uuid.UUID("30000000-0000-0000-0000-000000000003")
+
+    with factory.external_bridge_outbox(account_uuid) as (client, path):
+        assert client is FakeImapClient.instances[0]
+        assert path == (
+            "Workspace/Bridge/Zulip/V1/Accounts/"
+            "30000000-0000-0000-0000-000000000003/Outbox"
+        )
+    outbox = FakeImapClient.instances[0]
+    assert outbox.settings.credentials.username == (
+        "zulip-bridge-producer@bridge.workspace.invalid*master"
+    )
+
+    with factory.external_bridge_ingress() as ingress:
+        assert ingress is FakeImapClient.instances[1]
+    assert FakeImapClient.instances[1].settings.credentials.username == (
+        "zulip-bridge-ingress@messenger.workspace.invalid*master"
+    )
+
+
 def test_runtime_factory_passes_internal_ca_to_verified_mail_clients(monkeypatch):
     FakeImapClient.instances = []
     FakeSmtpClient.instances = []
@@ -122,9 +151,13 @@ def test_runtime_factory_passes_internal_ca_to_verified_mail_clients(monkeypatch
     monkeypatch.setattr(runtime.protocol, "SmtpClient", FakeSmtpClient)
     conf = _conf()
     conf.set_override("imap_security", "starttls", group=runtime.DOMAIN)
-    conf.set_override("imap_ca_file", "/etc/workspace/mail-ca.crt", group=runtime.DOMAIN)
+    conf.set_override(
+        "imap_ca_file", "/etc/workspace/mail-ca.crt", group=runtime.DOMAIN
+    )
     conf.set_override("smtp_security", "starttls", group=runtime.DOMAIN)
-    conf.set_override("smtp_ca_file", "/etc/workspace/mail-ca.crt", group=runtime.DOMAIN)
+    conf.set_override(
+        "smtp_ca_file", "/etc/workspace/mail-ca.crt", group=runtime.DOMAIN
+    )
     factory = runtime.RuntimeFactory(conf)
 
     with factory.user_imap_client(USER_UUID):
@@ -195,10 +228,5 @@ def test_service_entrypoints_register_mail_options_without_runtime_wiring():
         "cmd/workspace_api.py",
     ):
         source = (root / relative_path).read_text()
-        assert "from workspace.messenger_mail import runtime" in source
-        alias_match = re.search(
-            r"from workspace\.messenger_mail import runtime as (?P<alias>\w+)",
-            source,
-        )
-        assert alias_match is not None
-        assert f"{alias_match.group('alias')}.register_opts(CONF)" in source
+        assert "from workspace.common import messenger_mail_opts" in source
+        assert "messenger_mail_opts.register_opts(CONF)" in source

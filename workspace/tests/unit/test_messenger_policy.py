@@ -32,8 +32,8 @@ class RecordingStore:
     def __init__(self):
         self.calls = []
 
-    def filter_resources(self, resource, filters, order_by=None):
-        self.calls.append(("filter", resource, filters, order_by))
+    def filter_resources(self, resource, filters, order_by=None, limit=None):
+        self.calls.append(("filter", resource, filters, order_by, limit))
         return []
 
     def get_resource(self, resource, resource_uuid):
@@ -405,11 +405,12 @@ def test_file_filter_is_delegated_with_current_scope(store_factory):
 
 
 def test_reaction_projection_hides_raw_provider_fields_and_nests_delivery():
+    account_uuid = sys_uuid.uuid4()
     result = sql_store._as_dict(
         {
             "uuid": sys_uuid.uuid4(),
             "provider_uuid": sys_uuid.uuid4(),
-            "external_account_uuid": sys_uuid.uuid4(),
+            "external_account_uuid": account_uuid,
             "provider_external_id": "remote-reaction",
             "delivery_status": "failed",
             "delivery_error": "Retry later",
@@ -418,7 +419,12 @@ def test_reaction_projection_hides_raw_provider_fields_and_nests_delivery():
         "message_reactions",
     )
 
-    assert result["provider"] is None
+    assert result["provider"] == {
+        "kind": "zulip",
+        "account_uuid": str(account_uuid),
+        "external_id": "remote-reaction",
+        "capabilities": {},
+    }
     assert result["delivery"] == {
         "status": "failed",
         "safe_error": "Retry later",

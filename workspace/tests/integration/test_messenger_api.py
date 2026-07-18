@@ -20,17 +20,39 @@ import hashlib
 import importlib.util
 import io
 import concurrent.futures
+import base64
+import datetime
+import json
 import threading
+import types
 import uuid as sys_uuid
 
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.x509.oid import NameOID
+from restalchemy.common import contexts as ra_contexts
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage.sql import sessions as ra_sessions
+from oslo_config import cfg
 
+from workspace.common import external_bridge_opts
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.api import controllers as messenger_controllers
+from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.messenger_mail import external_bridge_codec
+from workspace.messenger_mail import external_bridge_data_plane
 from workspace.messenger_mail import repository as mail_repository
+from workspace.messenger_migration import legacy_provider_outbox
+from workspace.services.messenger_workers import agents as messenger_agents
 from workspace.tests.integration import conftest
 
 
@@ -47,6 +69,95 @@ MESSAGE_REACTIONS = f"{V1}/message_reactions/"
 EVENTS = f"{V1}/events/"
 EPOCH = f"{V1}/epoch/"
 USERS = f"{V1}/users/"
+EXTERNAL_ACCOUNTS = f"{V1}/external_accounts/"
+EXTERNAL_OPERATIONS = f"{V1}/external_operations/"
+EXTERNAL_CHATS = f"{V1}/external_chats/"
+EXTERNAL_PROVIDER_POLICIES = f"{V1}/external_provider_policies/"
+EXTERNAL_PROVIDER_HEALTH = f"{V1}/external_provider_health/"
+
+
+def _run_database_operation(callback):
+    with ra_contexts.Context().session_manager() as session:
+        return callback(session)
+
+
+def _enable_zulip_policy(db, *, max_accounts=100):
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_policies_v1 (
+                uuid, provider, enabled, limits
+            ) VALUES (%s, 'zulip', TRUE, %s::jsonb)
+            ON CONFLICT (provider) DO UPDATE SET
+                enabled = EXCLUDED.enabled,
+                emergency_suspended = FALSE,
+                limits = EXCLUDED.limits
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                json.dumps(
+                    {
+                        "max_accounts": max_accounts,
+                        "max_selected_chats_per_account": 1000,
+                        "max_file_bytes": 104857600,
+                    }
+                ),
+            ),
+        )
+    db.commit()
+
+
+def _seed_zulip_bridge_target(db):
+    bridge_instance_uuid = sys_uuid.uuid4()
+    key_uuid = sys_uuid.uuid4()
+    private_key = x25519.X25519PrivateKey.generate()
+    public_key = (
+        base64.urlsafe_b64encode(private_key.public_key().public_bytes_raw())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE m_external_bridge_instances_v2 "
+            "SET status = 'revoked' WHERE provider = 'zulip'"
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (
+                uuid, provider, identity_generation, status
+            ) VALUES (%s, 'zulip', 1, 'active')
+            """,
+            (str(bridge_instance_uuid),),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_control_instances_v1 (
+                bridge_instance_uuid, provider_kind, identity_generation,
+                encryption_key_uuid, encryption_public_key
+            ) VALUES (%s, 'zulip', 1, %s, %s)
+            """,
+            (str(bridge_instance_uuid), str(key_uuid), public_key),
+        )
+    db.commit()
+    return bridge_instance_uuid, key_uuid, private_key
+
+
+def _ca_certificate_pem():
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.timezone.utc)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Zulip CA")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=30))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+        .sign(key, hashes.SHA256())
+    )
+    return certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +168,1430 @@ USERS = f"{V1}/users/"
 def test_root_endpoint_is_served(api):
     resp = api.get(f"{V1}/")
     assert resp.status_code == 200, resp.text
+
+
+def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
+    api,
+    db,
+    tmp_path,
+):
+    _enable_zulip_policy(db)
+    del tmp_path
+    realm_uuid = sys_uuid.uuid4()
+    _seed_zulip_bridge_target(db)
+    cfg.CONF.set_override(
+        "realm_uuid",
+        str(realm_uuid),
+        group=external_bridge_opts.DOMAIN,
+    )
+    try:
+        account_uuid = sys_uuid.uuid4()
+        create = api.post(
+            EXTERNAL_ACCOUNTS,
+            json={
+                "uuid": str(account_uuid),
+                "settings": {
+                    "kind": "zulip",
+                    "server_url": "https://zulip.example.invalid",
+                    "email": "owner@example.invalid",
+                    "api_key": "provider-secret",
+                    "selection_mode": "explicit",
+                    "history_depth": "30_days",
+                    "default_project_id": api.project_id,
+                },
+            },
+        )
+        assert create.status_code == 201, create.text
+        account = create.json()
+        assert account["uuid"] == str(account_uuid)
+        assert account["credential_present"] is True
+        assert "api_key" not in account["settings"]
+        assert create.headers["ETag"] == '"1"'
+
+        duplicate = api.post(
+            EXTERNAL_ACCOUNTS,
+            json={
+                "uuid": str(sys_uuid.uuid4()),
+                "settings": {
+                    **account["settings"],
+                    "api_key": "another-secret",
+                },
+            },
+        )
+        assert duplicate.status_code == 409, duplicate.text
+
+        another_user = sys_uuid.uuid4()
+        foreign_list = api.get(EXTERNAL_ACCOUNTS, user=another_user)
+        assert foreign_list.status_code == 200, foreign_list.text
+        assert foreign_list.json() == []
+        foreign_get = api.get(
+            f"{EXTERNAL_ACCOUNTS}{account_uuid}",
+            user=another_user,
+        )
+        assert foreign_get.status_code == 404, foreign_get.text
+
+        reconnect_path = f"{EXTERNAL_ACCOUNTS}{account_uuid}/actions/reconnect/invoke"
+        reconnect_body = {
+            "settings": {
+                "kind": "zulip",
+                "server_url": "https://zulip.example.invalid",
+                "email": "owner@example.invalid",
+                "api_key": "replacement-secret",
+            }
+        }
+        missing_etag = api.post(reconnect_path, json=reconnect_body)
+        assert missing_etag.status_code == 428, missing_etag.text
+        reconnect = api.post(
+            reconnect_path,
+            json=reconnect_body,
+            headers={"If-Match": '"1"'},
+        )
+        assert reconnect.status_code == 200, reconnect.text
+        assert reconnect.headers["ETag"] == '"2"'
+        assert "api_key" not in reconnect.text
+
+        disconnect = api.post(
+            f"{EXTERNAL_ACCOUNTS}{account_uuid}/actions/disconnect/invoke"
+        )
+        assert disconnect.status_code == 200, disconnect.text
+        assert disconnect.json()["status"] == "disconnected"
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT envelope::text
+                FROM m_external_credentials_v2
+                WHERE external_account_uuid = %s
+                """,
+                (str(account_uuid),),
+            )
+            envelope = cursor.fetchone()[0]
+            assert "provider-secret" not in envelope
+            assert "replacement-secret" not in envelope
+            encrypted = json.loads(envelope)
+            assert set(encrypted) == {
+                "schema",
+                "algorithm",
+                "associated_data",
+                "encapsulated_key",
+                "ciphertext",
+            }
+            assert encrypted["associated_data"] == {
+                "realm_uuid": str(realm_uuid),
+                "provider_kind": "zulip",
+                "bridge_instance_uuid": encrypted["associated_data"][
+                    "bridge_instance_uuid"
+                ],
+                "identity_generation": 1,
+                "credential_key_uuid": encrypted["associated_data"][
+                    "credential_key_uuid"
+                ],
+                "account_uuid": str(account_uuid),
+                "owner_user_uuid": api.user_uuid,
+                "account_generation": 2,
+                "schema": "workspace.external-credential.zulip/v1",
+                "algorithm": ("HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM"),
+            }
+            cursor.execute(
+                """
+                SELECT object_type, action, payload
+                FROM m_workspace_events
+                WHERE project_id = %s AND user_uuid = %s
+                ORDER BY epoch_version
+                """,
+                (api.project_id, api.user_uuid),
+            )
+            events = cursor.fetchall()
+        assert [row[0:2] for row in events] == [
+            ("external_account", "created"),
+            ("external_account", "updated"),
+            ("external_account", "updated"),
+        ]
+        assert all("api_key" not in json.dumps(row[2]) for row in events)
+
+        deleted = api.delete(f"{EXTERNAL_ACCOUNTS}{account_uuid}")
+        assert deleted.status_code == 204, deleted.text
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM m_external_credentials_v2 "
+                "WHERE external_account_uuid = %s",
+                (str(account_uuid),),
+            )
+            assert cursor.fetchone()[0] == 0
+            cursor.execute(
+                """
+                SELECT operation, generation
+                FROM m_external_bridge_desired_changes_v1
+                WHERE resource_type = 'external_account'
+                  AND resource_uuid = %s
+                ORDER BY sequence
+                """,
+                (str(account_uuid),),
+            )
+            assert cursor.fetchall() == [
+                ("upsert", 1),
+                ("upsert", 2),
+                ("upsert", 3),
+                ("delete", 4),
+            ]
+    finally:
+        cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
+
+
+def test_external_provider_policy_blocks_account_and_operation_boundaries(
+    api,
+    db,
+    tmp_path,
+):
+    realm_uuid = sys_uuid.uuid4()
+    del tmp_path
+    _seed_zulip_bridge_target(db)
+    cfg.CONF.set_override(
+        "realm_uuid", str(realm_uuid), group=external_bridge_opts.DOMAIN
+    )
+    account_uuid = sys_uuid.uuid4()
+    payload = {
+        "uuid": str(account_uuid),
+        "settings": {
+            "kind": "zulip",
+            "server_url": "https://zulip.example.invalid",
+            "email": "owner@example.invalid",
+            "api_key": "provider-secret",
+            "selection_mode": "explicit",
+            "history_depth": "30_days",
+            "default_project_id": api.project_id,
+        },
+    }
+    try:
+        _enable_zulip_policy(db, max_accounts=1)
+        created = api.post(EXTERNAL_ACCOUNTS, json=payload)
+        assert created.status_code == 201, created.text
+
+        reached = api.post(
+            EXTERNAL_ACCOUNTS,
+            json={**payload, "uuid": str(sys_uuid.uuid4())},
+        )
+        assert reached.status_code == 403, reached.text
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_external_provider_policies_v1
+                SET emergency_suspended = TRUE
+                WHERE provider = 'zulip'
+                """
+            )
+        db.commit()
+        reconnect = api.post(
+            f"{EXTERNAL_ACCOUNTS}{account_uuid}/actions/reconnect/invoke",
+            headers={"If-Match": '"1"'},
+            json={
+                "settings": {
+                    "kind": "zulip",
+                    "server_url": "https://zulip.example.invalid",
+                    "email": "owner@example.invalid",
+                    "api_key": "replacement-secret",
+                }
+            },
+        )
+        assert reconnect.status_code == 403, reconnect.text
+        preflight = api.post(
+            f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+            json={
+                "external_account_uuid": str(account_uuid),
+                "action": "message.create",
+                "target": {},
+            },
+        )
+        assert preflight.status_code == 403, preflight.text
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_external_provider_policies_v1
+                SET enabled = FALSE, emergency_suspended = FALSE
+                WHERE provider = 'zulip'
+                """
+            )
+        db.commit()
+        disabled = api.post(
+            EXTERNAL_ACCOUNTS,
+            json={**payload, "uuid": str(sys_uuid.uuid4())},
+        )
+        assert disabled.status_code == 403, disabled.text
+    finally:
+        cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
+
+
+def test_external_provider_admin_policy_ca_and_health_are_permission_scoped(api, db):
+    _seed_zulip_bridge_target(db)
+    denied = api.get(f"{EXTERNAL_PROVIDER_POLICIES}zulip")
+    assert denied.status_code == 403, denied.text
+
+    read_permission = ("workspace.external_provider_policy.read",)
+    current = api.get(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip",
+        permissions=read_permission,
+    )
+    assert current.status_code == 200, current.text
+    ca_pem = _ca_certificate_pem()
+    settings = {
+        "settings": {
+            "kind": "zulip",
+            "enabled": True,
+            "limits": {
+                "max_accounts": 50,
+                "max_selected_chats_per_account": 500,
+                "max_file_bytes": 104857600,
+            },
+            "custom_ca_bundle": {"certificates_pem": [ca_pem]},
+        }
+    }
+    updated = api.put(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip",
+        permissions=("workspace.external_provider_policy.update",),
+        headers={"If-Match": current.headers["ETag"]},
+        json=settings,
+    )
+    assert updated.status_code == 200, updated.text
+    policy = updated.json()
+    assert policy["enabled"] is True
+    assert policy["custom_ca_bundle"]["certificate_count"] == 1
+    assert "certificates_pem" not in updated.text
+    assert "PRIVATE KEY" not in updated.text
+
+    invalid = api.put(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip",
+        permissions=("workspace.external_provider_policy.update",),
+        headers={"If-Match": updated.headers["ETag"]},
+        json={
+            "settings": {
+                **settings["settings"],
+                "custom_ca_bundle": {
+                    "certificates_pem": [ca_pem + "-----BEGIN PRIVATE KEY-----"]
+                },
+            }
+        },
+    )
+    assert invalid.status_code == 400, invalid.text
+
+    suspended = api.post(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip/actions/suspend/invoke",
+        permissions=("workspace.external_provider_policy.suspend",),
+    )
+    assert suspended.status_code == 200, suspended.text
+    assert suspended.json()["emergency_suspended"] is True
+    resumed = api.post(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip/actions/resume/invoke",
+        permissions=("workspace.external_provider_policy.resume",),
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["emergency_suspended"] is False
+
+    health_denied = api.get(f"{EXTERNAL_PROVIDER_HEALTH}zulip")
+    assert health_denied.status_code == 403, health_denied.text
+    health = api.get(
+        f"{EXTERNAL_PROVIDER_HEALTH}zulip",
+        permissions=("workspace.external_provider_health.read",),
+    )
+    assert health.status_code == 200, health.text
+    assert health.json()["provider"] == "zulip"
+    assert health.json()["status"] == "healthy"
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT resource_type, operation, resource
+            FROM m_external_bridge_desired_changes_v1
+            WHERE resource_type IN (
+                'external_provider_policy', 'custom_ca_bundle'
+            )
+            ORDER BY sequence
+            """
+        )
+        desired = cursor.fetchall()
+    assert any(row[0:2] == ("custom_ca_bundle", "upsert") for row in desired)
+    assert desired[-1][0:2] == ("external_provider_policy", "upsert")
+    assert desired[-1][2]["emergency_suspended"] is False
+
+
+def test_zb_msg_003_manual_reconciliation_retry_is_explicit_and_auditable(
+    api,
+    db,
+):
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    provider_operation_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            api.project_id,
+            api.user_uuid,
+            "Provider retry target",
+        )
+    )
+    topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            api.project_id,
+            stream_uuid,
+            api.user_uuid,
+            "Provider retry",
+            is_default=True,
+        )
+    )
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.create_workspace_user_message(
+            uuid=target_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            payload=message_payloads.MarkdownPayload(content="retry me"),
+            session=session,
+        )
+    )
+    realm_uuid = sys_uuid.uuid4()
+    enrollment_secret = "legacy provider conversion secret"
+    bridge_instance_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    occurred_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    provider_payload = {
+        "uuid": str(target_uuid),
+        "stream_uuid": str(stream_uuid),
+        "topic_uuid": str(topic_uuid),
+        "author_uuid": str(api.user_uuid),
+        "payload": {"kind": "markdown", "content": "retry me"},
+        "reply_to_message_uuid": None,
+        "user_uuid": str(api.user_uuid),
+        "created_at": occurred_at.isoformat().replace("+00:00", "Z"),
+    }
+    legacy_record = {
+        "schema": external_bridge_codec.SCHEMA,
+        "schema_version": external_bridge_codec.SCHEMA_VERSION,
+        "record_kind": "operation",
+        "record_uuid": str(provider_operation_uuid),
+        "operation_uuid": str(operation_uuid),
+        "attempt": 1,
+        "operation_sha256": "0" * 64,
+        "account_uuid": str(account_uuid),
+        "project_uuid": str(api.project_id),
+        "origin": "workspace",
+        "causal_lane": f"chat:{account_uuid}:channel:legacy",
+        "sequence": 1,
+        "predecessor_operation_uuid": None,
+        "created_at": occurred_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": (occurred_at + datetime.timedelta(hours=24))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "operation": {
+            "kind": "message.create",
+            "entity_uuid": str(target_uuid),
+            "actor_uuid": str(api.user_uuid),
+            "occurred_at": occurred_at.isoformat().replace("+00:00", "Z"),
+            "provider": {
+                "kind": "zulip",
+                "chat_id": "channel:legacy",
+                "entity_id": None,
+                "revision": None,
+            },
+            "payload": {
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "author_uuid": str(api.user_uuid),
+                "payload": {"kind": "markdown", "content": "retry me"},
+                "reply_to_message_uuid": None,
+            },
+            "extensions": {},
+        },
+    }
+    legacy_record["operation_sha256"] = external_bridge_codec.operation_sha256(
+        legacy_record
+    )
+    legacy_key = external_bridge_codec.derive_direction_key(
+        enrollment_secret,
+        realm_uuid,
+        bridge_instance_uuid,
+        1,
+        "workspace-to-zulip",
+    )
+    legacy_raw = external_bridge_codec.build_message(
+        legacy_record,
+        "workspace-to-zulip",
+        legacy_key,
+        external_bridge_data_plane.WORKSPACE_SENDER,
+        external_bridge_data_plane.BRIDGE_ADDRESS,
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb, TRUE, 'degraded'
+            )
+            """,
+            (
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "email": "owner@example.invalid",
+                        "selection_mode": "explicit",
+                        "history_depth": "30_days",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:legacy',
+                '{"kind":"zulip","chat_type":"channel"}'::jsonb,
+                'Provider retry target', TRUE, %s, %s, 'live',
+                '{"messenger.message.send":{"available":false}}'::jsonb
+            )
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                api.user_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET external_account_uuid = %s,
+                provider_metadata = '{"kind":"zulip"}'::jsonb
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (account_uuid, api.project_id, stream_uuid),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_events WHERE project_id = %s",
+            (api.project_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid, action,
+                target_type, target_uuid, status, attempt, safe_error,
+                can_retry, can_discard, duplicate_risk,
+                retry_requires_confirmation, original_url,
+                reconciliation_state, reconciliation_reason,
+                reconciliation_evidence
+            ) VALUES (
+                %s, %s, %s, 'message.create', 'message', %s,
+                'manual_reconciliation_required', 1,
+                'Provider history was unavailable after the safe retry window',
+                TRUE, TRUE, TRUE, TRUE, NULL,
+                'manual_required', 'provider_history_unavailable',
+                '{"checks_completed": 3}'::jsonb
+            )
+            """,
+            (
+                str(operation_uuid),
+                str(account_uuid),
+                api.user_uuid,
+                str(target_uuid),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_mail_outbox_v1 (
+                record_uuid, operation_uuid, record_kind, attempt,
+                external_account_uuid, project_uuid, operation_sha256,
+                raw_message, status, send_attempts, sent_at
+            ) VALUES (
+                %s, %s, 'operation', 1, %s, %s, %s, %s,
+                'sent', 1, NOW()
+            )
+            """,
+            (
+                provider_operation_uuid,
+                operation_uuid,
+                account_uuid,
+                api.project_id,
+                legacy_record["operation_sha256"],
+                legacy_raw,
+            ),
+        )
+
+    conversion = _run_database_operation(
+        lambda session: legacy_provider_outbox.convert_required_operations(
+            session,
+            project_id=api.project_id,
+            realm_uuid=realm_uuid,
+            bridge_instance_uuid=bridge_instance_uuid,
+            identity_generation=1,
+            enrollment_secret=enrollment_secret,
+        )
+    )
+    assert conversion == {
+        "project_id": str(api.project_id),
+        "required": 1,
+        "already_provider": 0,
+        "converted": 1,
+        "blockers": [],
+        "ok": True,
+        "provider_ready": 1,
+    }
+    repeated_conversion = _run_database_operation(
+        lambda session: legacy_provider_outbox.convert_required_operations(
+            session,
+            project_id=api.project_id,
+            realm_uuid=realm_uuid,
+            bridge_instance_uuid=bridge_instance_uuid,
+            identity_generation=1,
+            enrollment_secret=enrollment_secret,
+        )
+    )
+    assert repeated_conversion == {
+        "project_id": str(api.project_id),
+        "required": 1,
+        "already_provider": 1,
+        "converted": 0,
+        "blockers": [],
+        "ok": True,
+        "provider_ready": 1,
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET payload = '{"tampered": true}'::jsonb
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+    mismatched_conversion = _run_database_operation(
+        lambda session: legacy_provider_outbox.convert_required_operations(
+            session,
+            project_id=api.project_id,
+            realm_uuid=realm_uuid,
+            bridge_instance_uuid=bridge_instance_uuid,
+            identity_generation=1,
+            enrollment_secret=enrollment_secret,
+        )
+    )
+    assert mismatched_conversion == {
+        "project_id": str(api.project_id),
+        "required": 1,
+        "already_provider": 0,
+        "converted": 0,
+        "blockers": [
+            {
+                "external_operation_uuid": str(operation_uuid),
+                "code": "provider_operation_mismatch",
+            }
+        ],
+        "ok": False,
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT raw_message
+            FROM m_external_bridge_mail_outbox_v1
+            WHERE operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert bytes(cursor.fetchone()[0]) == legacy_raw
+        cursor.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET payload = %s::jsonb
+            WHERE external_operation_uuid = %s
+            """,
+            (json.dumps(provider_payload), operation_uuid),
+        )
+
+    listed = api.get(
+        EXTERNAL_OPERATIONS,
+        params={
+            "external_account_uuid": str(account_uuid),
+            "status": "manual_reconciliation_required",
+        },
+    )
+    assert listed.status_code == 200, listed.text
+    operation = listed.json()[0]
+    assert operation["uuid"] == str(operation_uuid)
+    assert operation["reconciliation_state"] == "manual_required"
+    assert operation["reconciliation_reason"] == "provider_history_unavailable"
+    assert operation["retry_requires_confirmation"] is True
+    assert "match" not in json.dumps(operation["reconciliation_evidence"])
+
+    preflight = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "message", "uuid": str(target_uuid)},
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["allowed"] is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET live_ready = TRUE,
+                capabilities = %s::jsonb
+            WHERE uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "messenger.message.send": {
+                            "available": True,
+                            "losses": [
+                                {
+                                    "code": "unsupported_formatting",
+                                    "message": "Formatting will be simplified.",
+                                }
+                            ],
+                        }
+                    }
+                ),
+                str(account_uuid),
+            ),
+        )
+    chat_blocked = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "message", "uuid": str(target_uuid)},
+        },
+    )
+    assert chat_blocked.status_code == 200, chat_blocked.text
+    assert chat_blocked.json()["allowed"] is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET capabilities = %s::jsonb
+            WHERE external_account_uuid = %s
+              AND projection_stream_uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "messenger.message.send": {
+                            "available": True,
+                            "losses": [
+                                {
+                                    "code": "unsupported_formatting",
+                                    "message": "Formatting will be simplified.",
+                                }
+                            ],
+                        }
+                    }
+                ),
+                str(account_uuid),
+                stream_uuid,
+            ),
+        )
+    allowed = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "message", "uuid": str(target_uuid)},
+        },
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json() == {
+        "allowed": True,
+        "action": "messenger.message.send",
+        "target": {"type": "message", "uuid": str(target_uuid)},
+        "losses": [
+            {
+                "code": "unsupported_formatting",
+                "message": "Formatting will be simplified.",
+            }
+        ],
+        "requires_confirmation": True,
+    }
+
+    retry_path = f"{EXTERNAL_OPERATIONS}{operation_uuid}/actions/retry/invoke"
+    missing_confirmation = api.post(retry_path, json={})
+    assert missing_confirmation.status_code == 400, missing_confirmation.text
+    retried = api.post(
+        retry_path,
+        json={"confirm_duplicate_risk": True},
+    )
+    assert retried.status_code == 200, retried.text
+    retry = retried.json()
+    assert retry["status"] == "queued"
+    assert retry["attempt"] == 2
+    assert retry["reconciliation_state"] == "not_required"
+    assert retry["attempt_history"][0]["status"] == ("manual_reconciliation_required")
+    assert retry["attempt_history"][0]["reconciliation_reason"] == (
+        "provider_history_unavailable"
+    )
+    assert retry["details"]["record_uuid"] == str(provider_operation_uuid)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT attempt, status, payload, completed_at
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        provider_row = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_bridge_mail_outbox_v1
+            WHERE operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        mail_outbox_count = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_metadata->>'status'
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, target_uuid),
+        )
+        retry_delivery = cursor.fetchone()
+    assert provider_row[0:3] == (1, "queued", provider_payload)
+    assert provider_row[3] is None
+    assert retry_delivery == ("pending", "pending")
+    # Cutover conversion is intentionally read-only for the legacy transport.
+    # Public retry now targets the Provider queue while the signed legacy row
+    # remains available for rollback and audit until post-acceptance cleanup.
+    assert mail_outbox_count == 1
+
+    discarded = api.delete(f"{EXTERNAL_OPERATIONS}{operation_uuid}")
+    assert discarded.status_code == 204, discarded.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT object_type, action, payload
+            FROM m_workspace_events
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, api.user_uuid),
+        )
+        events = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_metadata->>'status'
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, target_uuid),
+        )
+        discarded_delivery = cursor.fetchone()
+    assert [row[0:2] for row in events] == [
+        ("external_operation", "updated"),
+        ("message", "updated"),
+        ("message", "updated"),
+        ("external_operation", "deleted"),
+    ]
+    assert discarded_delivery == ("failed", "discarded")
+    assert events[0][2]["snapshot"]["reconciliation_state"] == "not_required"
+
+
+def test_zb_catalog_001_external_chat_catalog_and_assignment_are_owner_scoped(
+    api,
+    db,
+):
+    _enable_zulip_policy(db)
+    bridge_instance_uuid, key_uuid, _ = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+            """,
+            (
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "email": "owner@example.invalid",
+                        "selection_mode": "explicit",
+                        "history_depth": "30_days",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(account_uuid),
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_instance_uuid),
+                            "credential_key_uuid": str(key_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, history_depth,
+                capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'provider-stream-42', %s::jsonb,
+                'Engineering', '30_days', %s::jsonb
+            )
+            """,
+            (
+                str(chat_uuid),
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "chat_type": "channel",
+                        "original_url": (
+                            "https://zulip.example.invalid/#narrow/channel/42"
+                        ),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message.create": {
+                            "available": True,
+                            "revision": 1,
+                            "limits": {},
+                        }
+                    }
+                ),
+            ),
+        )
+
+    listed = api.get(
+        EXTERNAL_CHATS,
+        params={"external_account_uuid": str(account_uuid)},
+    )
+    assert listed.status_code == 200, listed.text
+    chat = listed.json()[0]
+    assert chat["uuid"] == str(chat_uuid)
+    assert chat["display_name"] == "Engineering"
+    assert chat["source"]["chat_type"] == "channel"
+    assert chat["history_depth"] == "30_days"
+    assert "provider_chat_id" not in chat
+    assert chat["capabilities"]["message.create"]["available"] is True
+
+    foreign = api.get(f"{EXTERNAL_CHATS}{chat_uuid}", user=sys_uuid.uuid4())
+    assert foreign.status_code == 404, foreign.text
+
+    selected = api.post(
+        f"{EXTERNAL_CHATS}{chat_uuid}/actions/select/invoke",
+        json={"project_id": api.project_id},
+    )
+    assert selected.status_code == 200, selected.text
+    selected_chat = selected.json()
+    assert selected_chat["selected"] is True
+    assert selected_chat["project_id"] == api.project_id
+    assert selected_chat["status"] == "syncing"
+    assert selected.headers["ETag"] == '"2"'
+
+    projection_stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            api.project_id,
+            api.user_uuid,
+            "External Engineering",
+        )
+    )
+    projection_topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            api.project_id,
+            projection_stream_uuid,
+            api.user_uuid,
+            "General",
+            is_default=True,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET projection_stream_uuid = %s, status = 'live'
+            WHERE uuid = %s
+            """,
+            (projection_stream_uuid, chat_uuid),
+        )
+    message_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    old_repository = conftest.TEST_MAIL_RUNTIME._repository(api.project_id)
+    old_repository.append_operation(
+        mail_repository.OperationRecord(
+            project_uuid=sys_uuid.UUID(api.project_id),
+            operation_uuid=sys_uuid.uuid4(),
+            actor_uuid=sys_uuid.UUID(api.user_uuid),
+            operation="message.create",
+            entity_uuid=message_uuid,
+            payload={
+                "stream_uuid": str(projection_stream_uuid),
+                "topic_uuid": str(projection_topic_uuid),
+                "source_name": "zulip",
+                "source": {"kind": "zulip"},
+                "payload": {"kind": "markdown", "content": "move me"},
+            },
+            occurred_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+    )
+    old_repository.append_operation(
+        mail_repository.OperationRecord(
+            project_uuid=sys_uuid.UUID(api.project_id),
+            operation_uuid=sys_uuid.uuid4(),
+            actor_uuid=sys_uuid.UUID(api.user_uuid),
+            operation="file.create",
+            entity_uuid=file_uuid,
+            payload={
+                "stream_uuid": str(projection_stream_uuid),
+                "name": "moved.txt",
+            },
+            occurred_at=datetime.datetime.now(datetime.timezone.utc),
+        )
+    )
+
+    new_project = sys_uuid.uuid4()
+    move_path = f"{EXTERNAL_CHATS}{chat_uuid}/actions/move/invoke"
+    forbidden_project = api.post(
+        move_path,
+        json={"project_id": str(new_project)},
+        headers={"If-Match": '"2"'},
+    )
+    assert forbidden_project.status_code == 403, forbidden_project.text
+    missing_etag = api.post(
+        move_path,
+        json={"project_id": str(new_project)},
+        project=new_project,
+    )
+    assert missing_etag.status_code == 428, missing_etag.text
+    moved = api.post(
+        move_path,
+        json={"project_id": str(new_project)},
+        headers={"If-Match": '"2"'},
+        project=new_project,
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["project_id"] == str(new_project)
+    assert moved.json()["transition_pending"] is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT project_id FROM m_workspace_streams WHERE uuid = %s",
+            (projection_stream_uuid,),
+        )
+        assert cursor.fetchone()[0] == new_project
+        cursor.execute(
+            "SELECT project_id FROM m_workspace_stream_topics WHERE uuid = %s",
+            (projection_topic_uuid,),
+        )
+        assert cursor.fetchone()[0] == new_project
+        cursor.execute(
+            """
+            SELECT phase FROM m_external_projection_transitions_v1
+            WHERE external_chat_uuid = %s AND action = 'move'
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone()[0] == "completed"
+    assert projection_stream_uuid not in (
+        conftest.TEST_MAIL_RUNTIME._repository(api.project_id).projection.streams
+    )
+    assert projection_stream_uuid in (
+        conftest.TEST_MAIL_RUNTIME._repository(new_project).projection.streams
+    )
+    old_projection = conftest.TEST_MAIL_RUNTIME._repository(api.project_id).projection
+    new_projection = conftest.TEST_MAIL_RUNTIME._repository(new_project).projection
+    assert message_uuid not in old_projection.messages
+    assert file_uuid not in old_projection.files
+    assert message_uuid in new_projection.messages
+    assert file_uuid in new_projection.files
+
+    deselected = api.post(f"{EXTERNAL_CHATS}{chat_uuid}/actions/deselect/invoke")
+    assert deselected.status_code == 200, deselected.text
+    assert deselected.json()["selected"] is False
+    assert deselected.json()["project_id"] is None
+    assert deselected.json()["status"] == "deselected"
+    assert deselected.json()["transition_pending"] is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_workspace_streams WHERE uuid = %s",
+            (projection_stream_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT phase FROM m_external_projection_transitions_v1
+            WHERE external_chat_uuid = %s AND action = 'deselect'
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone()[0] == "completed"
+        cursor.execute(
+            """
+            SELECT operation, generation, resource
+            FROM m_external_bridge_desired_changes_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            ORDER BY sequence
+            """,
+            (str(chat_uuid),),
+        )
+        changes = cursor.fetchall()
+    assert projection_stream_uuid not in (
+        conftest.TEST_MAIL_RUNTIME._repository(new_project).projection.streams
+    )
+    deselected_projection = conftest.TEST_MAIL_RUNTIME._repository(
+        new_project
+    ).projection
+    assert message_uuid not in deselected_projection.messages
+    assert file_uuid not in deselected_projection.files
+    assert [(row[0], row[1]) for row in changes] == [
+        ("upsert", 2),
+        ("upsert", 3),
+        ("delete", 4),
+    ]
+    assert changes[0][2]["project_id"] == api.project_id
+    assert changes[1][2]["project_id"] == str(new_project)
+    assert changes[2][2] is None
+
+
+@pytest.mark.parametrize(
+    "crash_phase",
+    [
+        "canonical_new",
+        "canonical_old",
+        "sql_applied",
+        "files_purged",
+    ],
+)
+def test_external_projection_move_is_request_atomic_after_each_phase(
+    api, db, monkeypatch, crash_phase
+):
+    _enable_zulip_policy(db)
+    bridge_instance_uuid, key_uuid, _ = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    old_project = sys_uuid.UUID(api.project_id)
+    new_project = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(db, old_project, api.user_uuid, "Crash replay")
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings, credential_present, status
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+            """,
+            (
+                account_uuid,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "selection_mode": "explicit",
+                        "history_depth": "30_days",
+                        "default_project_id": str(old_project),
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_instance_uuid),
+                            "credential_key_uuid": str(key_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, revision
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'crash-chat',
+                '{"kind":"zulip","chat_type":"channel"}'::jsonb,
+                'Crash replay', TRUE, %s, %s, 'live', 2
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                api.user_uuid,
+                old_project,
+                stream_uuid,
+            ),
+        )
+
+    original = messenger_controllers.ExternalChatController._transition_phase
+    crashed = False
+
+    def crash_after_phase(session, transition_uuid, phase, safe_error=None):
+        nonlocal crashed
+        original(session, transition_uuid, phase, safe_error)
+        if phase == crash_phase and not crashed:
+            crashed = True
+            raise RuntimeError(f"crash after {phase}")
+
+    monkeypatch.setattr(
+        messenger_controllers.ExternalChatController,
+        "_transition_phase",
+        staticmethod(crash_after_phase),
+    )
+    path = f"{EXTERNAL_CHATS}{chat_uuid}/actions/move/invoke"
+    failed = api.post(
+        path,
+        project=new_project,
+        headers={"If-Match": '"2"'},
+        json={"project_id": str(new_project)},
+    )
+    assert failed.status_code == 500
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT phase FROM m_external_projection_transitions_v1
+            WHERE external_chat_uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone() is None
+        cursor.execute(
+            """
+            SELECT selected, project_id, projection_stream_uuid, status, revision
+            FROM m_external_chats_v2
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone() == (
+            True,
+            old_project,
+            stream_uuid,
+            "live",
+            2,
+        )
+        cursor.execute(
+            "SELECT COUNT(*), ARRAY_AGG(project_id) FROM m_workspace_streams WHERE uuid = %s",
+            (stream_uuid,),
+        )
+        assert cursor.fetchone() == (1, [old_project])
+
+    monkeypatch.setattr(
+        messenger_controllers.ExternalChatController,
+        "_transition_phase",
+        staticmethod(original),
+    )
+    resumed = api.post(
+        path,
+        project=new_project,
+        headers={"If-Match": '"2"'},
+        json={"project_id": str(new_project)},
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["project_id"] == str(new_project)
+    assert resumed.json()["transition_pending"] is False
+    repeated = api.post(
+        path,
+        project=new_project,
+        headers={"If-Match": '"3"'},
+        json={"project_id": str(new_project)},
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["revision"] == 3
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT phase, COUNT(*) OVER ()
+            FROM m_external_projection_transitions_v1
+            WHERE external_chat_uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone() == ("completed", 1)
+        cursor.execute(
+            "SELECT COUNT(*), ARRAY_AGG(project_id) FROM m_workspace_streams WHERE uuid = %s",
+            (stream_uuid,),
+        )
+        assert cursor.fetchone() == (1, [new_project])
+
+
+def test_database_operation_boundary_owns_one_isolated_session_per_worker(
+    _database,
+    monkeypatch,
+):
+    del _database
+    created_sessions = []
+    created_sessions_lock = threading.Lock()
+    workers_ready = threading.Barrier(2)
+    original_start_new_session = ra_contexts.Context.start_new_session
+
+    def record_started_session(context):
+        session = original_start_new_session(context)
+        with created_sessions_lock:
+            created_sessions.append((threading.get_ident(), session))
+        return session
+
+    monkeypatch.setattr(
+        ra_contexts.Context,
+        "start_new_session",
+        record_started_session,
+    )
+
+    def run_worker_operation():
+        def operation(session):
+            assert ra_contexts.Context().get_session() is session
+            workers_ready.wait(timeout=5)
+            assert ra_contexts.Context().get_session() is session
+            return session
+
+        session = _run_database_operation(operation)
+        with pytest.raises(ra_sessions.SessionNotFound):
+            ra_contexts.Context().get_session()
+        return session
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        sessions = list(executor.map(lambda _: run_worker_operation(), range(2)))
+
+    assert sessions[0] is not sessions[1]
+    assert len(created_sessions) == 2
+    assert len({thread_id for thread_id, _ in created_sessions}) == 2
+    assert {id(session) for session in sessions} == {
+        id(session) for _, session in created_sessions
+    }
+
+
+def test_worker_ingress_starts_after_outer_transaction(_database, monkeypatch):
+    calls = []
+
+    class BridgeConfig:
+        realm_uuid = sys_uuid.uuid4()
+        bridge_instance_uuid = sys_uuid.uuid4()
+        identity_generation = 1
+        enrollment_secret = "worker ingress test secret"
+
+    def mark_stale_workspace_users_offline(*, session):
+        assert ra_contexts.Context().get_session() is session
+        calls.append("mark_stale")
+
+    def flush_outbox(session, runtime_factory):
+        assert ra_contexts.Context().get_session() is session
+        assert runtime_factory is runtime
+        calls.append("flush_outbox")
+
+    def refresh_effective_capabilities(session, *, now):
+        assert ra_contexts.Context().get_session() is session
+        assert now.tzinfo is not None
+        calls.append("refresh_capabilities")
+
+    def consume_ingress(session, runtime_factory, **kwargs):
+        assert runtime_factory is runtime
+        assert kwargs == {
+            "realm_uuid": BridgeConfig.realm_uuid,
+            "bridge_instance_uuid": BridgeConfig.bridge_instance_uuid,
+            "identity_generation": BridgeConfig.identity_generation,
+            "enrollment_secret": BridgeConfig.enrollment_secret,
+        }
+        assert ra_contexts.Context().get_session() is session
+        calls.append("consume_ingress")
+
+    runtime = object()
+    worker = messenger_agents.MessengerWorkerAgent(
+        runtime_factory=runtime,
+        bridge_config=BridgeConfig(),
+    )
+    monkeypatch.setattr(
+        messenger_agents.messenger_dm_helpers,
+        "mark_stale_workspace_users_offline",
+        mark_stale_workspace_users_offline,
+    )
+    monkeypatch.setattr(
+        messenger_agents.external_bridge_data_plane,
+        "flush_outbox",
+        flush_outbox,
+    )
+    monkeypatch.setattr(
+        messenger_agents.sql_state,
+        "refresh_effective_capabilities",
+        refresh_effective_capabilities,
+    )
+    monkeypatch.setattr(
+        messenger_agents.external_bridge_data_plane,
+        "consume_ingress",
+        consume_ingress,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_prune_expired_events",
+        lambda session, now: calls.append("prune_events") or 0,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_repair_external_projection_transitions",
+        lambda session: (
+            ra_contexts.Context().get_session() is session
+            and calls.append("repair_transitions")
+        ),
+    )
+
+    worker._iteration()
+
+    assert calls == [
+        "mark_stale",
+        "refresh_capabilities",
+        "flush_outbox",
+        "prune_events",
+        "consume_ingress",
+        "repair_transitions",
+    ]
 
 
 def test_user_get_by_uuid_uses_global_user_table(api, db):
@@ -93,13 +1628,16 @@ def test_own_message_read_backfill_migration(api, db):
     )
     conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     message_uuid = sys_uuid.uuid4()
-    messenger_dm_helpers.create_workspace_user_message(
-        uuid=message_uuid,
-        project_id=sys_uuid.UUID(api.project_id),
-        user_uuid=sys_uuid.UUID(api.user_uuid),
-        stream_uuid=sys_uuid.UUID(stream_uuid),
-        topic_uuid=sys_uuid.UUID(topic_uuid),
-        payload=message_payloads.MarkdownPayload(content="backfill me"),
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.create_workspace_user_message(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content="backfill me"),
+            session=session,
+        )
     )
     with db.cursor() as cur:
         cur.execute(
@@ -336,10 +1874,11 @@ def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
             (file_uuid,),
         )
         event_rows = cur.fetchall()
-    assert {
-        str(api.user_uuid),
-        str(other_user_uuid),
-    }.issubset({str(row[0]) for row in event_rows})
+        # Public download ACL is global for authenticated users, while realtime
+        # file invalidations stay scoped to identities participating in the
+        # file's project.
+        assert str(api.user_uuid) in {str(row[0]) for row in event_rows}
+        assert str(other_user_uuid) not in {str(row[0]) for row in event_rows}
     assert all(
         row[1]
         == {
@@ -355,6 +1894,9 @@ def test_avatar_actions_reject_another_user_uuid(api, db, tmp_path, monkeypatch)
     monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
     target_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, target_uuid, f"user-{target_uuid}")
+    with db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM m_workspace_files")
+        file_count_before = cur.fetchone()[0]
 
     resp = api.post(
         f"{USERS}{target_uuid}/actions/avatar_upload/invoke",
@@ -382,7 +1924,7 @@ def test_avatar_actions_reject_another_user_uuid(api, db, tmp_path, monkeypatch)
             messenger_models.build_workspace_user_default_avatar(target_uuid)
         )
         cur.execute("SELECT COUNT(*) FROM m_workspace_files")
-        assert cur.fetchone()[0] == 0
+        assert cur.fetchone()[0] == file_count_before
 
 
 def test_user_presence_action_skips_event_for_heartbeat(api, db):
@@ -463,7 +2005,11 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
             (str(user_uuid),),
         )
 
-    messenger_dm_helpers.mark_stale_workspace_users_offline()
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.mark_stale_workspace_users_offline(
+            session=session
+        )
+    )
 
     resp = api.get(f"{USERS}{user_uuid}")
     assert resp.status_code == 200, resp.text
@@ -498,7 +2044,11 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
         assert payload["username"] == username
         assert payload["status"] == "offline"
 
-    messenger_dm_helpers.mark_stale_workspace_users_offline()
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.mark_stale_workspace_users_offline(
+            session=session
+        )
+    )
 
     with db.cursor() as cur:
         cur.execute(
@@ -998,24 +2548,34 @@ def test_system_folders_exist_for_user_without_streams(api, db):
         api.user_uuid,
         f"user-{api.user_uuid}",
     )
+    external_account_uuid = sys_uuid.uuid4()
     with db.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO m_external_accounts
-                (uuid, project_id, user_uuid, server_url, account_type,
-                 status, account_settings, created_at, updated_at)
-            VALUES
-                (%s, %s, %s, 'https://iam.example.local', 'iam', 'active',
-                 %s::jsonb, NOW(), NOW())
+            INSERT INTO m_external_accounts_v2
+                (uuid, owner_user_uuid, provider, settings,
+                 credential_present, status, live_ready)
+            VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live', TRUE)
+            """,
+            (
+                str(external_account_uuid),
+                api.user_uuid,
+                '{"kind":"zulip","server_url":"https://zulip.example"}',
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_chats_v2
+                (uuid, external_account_uuid, owner_user_uuid, provider,
+                 provider_chat_id, source, display_name, selected, project_id)
+            VALUES (%s, %s, %s, 'zulip', 'without-streams', '{}'::jsonb,
+                    'Without streams', TRUE, %s)
             """,
             (
                 str(sys_uuid.uuid4()),
-                api.project_id,
+                str(external_account_uuid),
                 api.user_uuid,
-                (
-                    '{"kind": "iam", "credentials": {"kind": "iam", '
-                    '"username": "admin", "access_token": "token"}}'
-                ),
+                api.project_id,
             ),
         )
 
@@ -1131,8 +2691,7 @@ def test_draft_crud_creates_no_events_notifications_or_imap(api, db, monkeypatch
         sys_uuid.UUID(api.project_id)
     ]
     before = {
-        path: len(messages)
-        for path, messages in project_mailbox.mailboxes.items()
+        path: len(messages) for path, messages in project_mailbox.mailboxes.items()
     }
     original_append_event = mail_repository.MessengerMailRepository.append_event
     appended_object_types = []
@@ -1171,8 +2730,7 @@ def test_draft_crud_creates_no_events_notifications_or_imap(api, db, monkeypatch
     assert response.status_code == 204, response.text
 
     after_drafts = {
-        path: len(messages)
-        for path, messages in project_mailbox.mailboxes.items()
+        path: len(messages) for path, messages in project_mailbox.mailboxes.items()
     }
     assert after_drafts == before
     assert appended_object_types == []
@@ -2450,15 +4008,20 @@ def test_messages_cursor_pagination_uses_created_at_uuid_keyset(api, db):
     message_uuids = [
         sys_uuid.UUID(f"40000000-0000-4000-8000-{value:012d}") for value in range(1, 5)
     ]
-    for message_uuid in message_uuids:
-        messenger_dm_helpers.create_workspace_user_message(
-            uuid=message_uuid,
-            project_id=sys_uuid.UUID(api.project_id),
-            user_uuid=sys_uuid.UUID(api.user_uuid),
-            stream_uuid=sys_uuid.UUID(stream_uuid),
-            topic_uuid=sys_uuid.UUID(topic_uuid),
-            payload=message_payloads.MarkdownPayload(content=str(message_uuid)),
-        )
+
+    def seed_messages(session):
+        for message_uuid in message_uuids:
+            messenger_dm_helpers.create_workspace_user_message(
+                uuid=message_uuid,
+                project_id=sys_uuid.UUID(api.project_id),
+                user_uuid=sys_uuid.UUID(api.user_uuid),
+                stream_uuid=sys_uuid.UUID(stream_uuid),
+                topic_uuid=sys_uuid.UUID(topic_uuid),
+                payload=message_payloads.MarkdownPayload(content=str(message_uuid)),
+                session=session,
+            )
+
+    _run_database_operation(seed_messages)
     with db.cursor() as cur:
         cur.execute(
             """
@@ -2487,13 +4050,16 @@ def test_messages_cursor_pagination_uses_created_at_uuid_keyset(api, db):
         is_default=True,
     )
     other_message_uuid = sys_uuid.UUID("50000000-0000-4000-8000-000000000001")
-    messenger_dm_helpers.create_workspace_user_message(
-        uuid=other_message_uuid,
-        project_id=sys_uuid.UUID(api.project_id),
-        user_uuid=sys_uuid.UUID(api.user_uuid),
-        stream_uuid=sys_uuid.UUID(other_stream_uuid),
-        topic_uuid=sys_uuid.UUID(other_topic_uuid),
-        payload=message_payloads.MarkdownPayload(content="other scope"),
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.create_workspace_user_message(
+            uuid=other_message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(other_stream_uuid),
+            topic_uuid=sys_uuid.UUID(other_topic_uuid),
+            payload=message_payloads.MarkdownPayload(content="other scope"),
+            session=session,
+        )
     )
 
     def collect(direction):
@@ -2700,8 +4266,7 @@ def test_draft_pagination_uses_updated_at_uuid_owner_filter_scope(api, db):
         "draft-pagination",
     )
     draft_uuids = [
-        sys_uuid.UUID(f"60000000-0000-4000-8000-{value:012d}")
-        for value in range(1, 5)
+        sys_uuid.UUID(f"60000000-0000-4000-8000-{value:012d}") for value in range(1, 5)
     ]
     for draft_uuid in draft_uuids:
         response = api.post(
@@ -2952,20 +4517,26 @@ def test_draft_create_serializes_before_stream_cascade(api, db, monkeypatch):
     )
 
     def create_side():
-        return messenger_dm_helpers.create_workspace_draft(
-            project_id,
-            user_uuid,
-            draft_uuid,
-            sys_uuid.UUID(stream_uuid),
-            sys_uuid.UUID(topic_uuid),
-            {"kind": "markdown", "content": "created"},
+        return _run_database_operation(
+            lambda session: messenger_dm_helpers.create_workspace_draft(
+                project_id,
+                user_uuid,
+                draft_uuid,
+                sys_uuid.UUID(stream_uuid),
+                sys_uuid.UUID(topic_uuid),
+                {"kind": "markdown", "content": "created"},
+                session=session,
+            )
         )
 
     def delete_side():
-        return messenger_dm_helpers.delete_workspace_user_stream(
-            project_id,
-            user_uuid,
-            sys_uuid.UUID(stream_uuid),
+        return _run_database_operation(
+            lambda session: messenger_dm_helpers.delete_workspace_user_stream(
+                project_id,
+                user_uuid,
+                sys_uuid.UUID(stream_uuid),
+                session=session,
+            )
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -3050,20 +4621,26 @@ def test_draft_update_waits_for_stream_cascade_and_cannot_recreate_deleted_draft
     )
 
     def delete_side():
-        return messenger_dm_helpers.delete_workspace_user_stream(
-            project_id,
-            user_uuid,
-            sys_uuid.UUID(stream_uuid),
+        return _run_database_operation(
+            lambda session: messenger_dm_helpers.delete_workspace_user_stream(
+                project_id,
+                user_uuid,
+                sys_uuid.UUID(stream_uuid),
+                session=session,
+            )
         )
 
     def update_side():
         try:
-            return messenger_dm_helpers.update_workspace_draft(
-                project_id,
-                user_uuid,
-                draft_uuid,
-                {"kind": "markdown", "content": "must not survive"},
-                1,
+            return _run_database_operation(
+                lambda session: messenger_dm_helpers.update_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    draft_uuid,
+                    {"kind": "markdown", "content": "must not survive"},
+                    1,
+                    session=session,
+                )
             )
         except Exception as exc:
             return exc
@@ -3131,12 +4708,15 @@ def test_draft_revision_compare_and_swap_serializes_concurrent_mutations(api, db
 
     def concurrent_update(content):
         barrier.wait()
-        return messenger_dm_helpers.update_workspace_draft(
-            project_id,
-            user_uuid,
-            update_race_uuid,
-            {"kind": "markdown", "content": content},
-            1,
+        return _run_database_operation(
+            lambda session: messenger_dm_helpers.update_workspace_draft(
+                project_id,
+                user_uuid,
+                update_race_uuid,
+                {"kind": "markdown", "content": content},
+                1,
+                session=session,
+            )
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -3155,12 +4735,15 @@ def test_draft_revision_compare_and_swap_serializes_concurrent_mutations(api, db
     def update_side():
         barrier.wait()
         try:
-            _, updated = messenger_dm_helpers.update_workspace_draft(
-                project_id,
-                user_uuid,
-                mixed_race_uuid,
-                {"kind": "markdown", "content": "updated"},
-                1,
+            _, updated = _run_database_operation(
+                lambda session: messenger_dm_helpers.update_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    mixed_race_uuid,
+                    {"kind": "markdown", "content": "updated"},
+                    1,
+                    session=session,
+                )
             )
             return "updated" if updated else "stale"
         except Exception:
@@ -3169,11 +4752,14 @@ def test_draft_revision_compare_and_swap_serializes_concurrent_mutations(api, db
     def delete_side():
         barrier.wait()
         try:
-            _, deleted = messenger_dm_helpers.delete_workspace_draft(
-                project_id,
-                user_uuid,
-                mixed_race_uuid,
-                1,
+            _, deleted = _run_database_operation(
+                lambda session: messenger_dm_helpers.delete_workspace_draft(
+                    project_id,
+                    user_uuid,
+                    mixed_race_uuid,
+                    1,
+                    session=session,
+                )
             )
             return "deleted" if deleted else "stale"
         except Exception:
@@ -3244,12 +4830,15 @@ def test_different_drafts_in_same_scope_do_not_share_an_exclusive_hot_lock(
     )
 
     def update(draft_uuid, content):
-        return messenger_dm_helpers.update_workspace_draft(
-            project_id,
-            user_uuid,
-            draft_uuid,
-            {"kind": "markdown", "content": content},
-            1,
+        return _run_database_operation(
+            lambda session: messenger_dm_helpers.update_workspace_draft(
+                project_id,
+                user_uuid,
+                draft_uuid,
+                {"kind": "markdown", "content": content},
+                1,
+                session=session,
+            )
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -4555,6 +6144,227 @@ def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
     }
 
 
+def test_message_read_up_to_uses_created_at_uuid_boundary(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "read-up-to-compound-boundary",
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = []
+    for index in range(3):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": f"compound boundary {index}",
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    equal_created_at = datetime.datetime(
+        2026,
+        7,
+        18,
+        tzinfo=datetime.timezone.utc,
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE m_workspace_messages SET created_at = %s "
+            "WHERE project_id = %s AND uuid = ANY(%s)",
+            (equal_created_at, api.project_id, message_uuids),
+        )
+    projection = conftest.TEST_MAIL_RUNTIME._repository(
+        sys_uuid.UUID(api.project_id)
+    ).projection
+    for message_uuid in message_uuids:
+        projection.messages[message_uuid]["created_at"] = equal_created_at.isoformat()
+
+    lower_uuid, boundary_uuid, higher_uuid = sorted(message_uuids)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    realm_uuid = sys_uuid.uuid4()
+    bridge_instance_uuid = sys_uuid.uuid4()
+    enrollment_secret = "compound boundary test secret"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, TRUE, 'live', TRUE)
+            """,
+            (account_uuid, reader_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:compound-boundary',
+                '{"kind":"zulip","chat_type":"channel"}'::jsonb,
+                'Compound boundary', TRUE, %s, %s, 'live',
+                '{"messenger.message.read":{"available":true}}'::jsonb
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                reader_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+    bridge_factory = sql_store.SQLProjectedMessengerStoreFactory(
+        conftest.TEST_MAIL_RUNTIME,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=realm_uuid,
+            bridge_instance_uuid=bridge_instance_uuid,
+            identity_generation=1,
+            enrollment_secret=enrollment_secret,
+        ),
+    )
+    bridge_factory._state(sys_uuid.UUID(api.project_id)).projection = projection
+    api_store.configure_store_factory(bridge_factory)
+    try:
+        response = api.post(
+            f"{MESSAGES}{boundary_uuid}/actions/read_up_to/invoke",
+            user=reader_uuid,
+        )
+    finally:
+        api_store.configure_store_factory(
+            sql_store.SQLProjectedMessengerStoreFactory(conftest.TEST_MAIL_RUNTIME)
+        )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT uuid, read FROM m_workspace_user_message_flags "
+            "WHERE project_id = %s AND user_uuid = %s AND uuid = ANY(%s)",
+            (api.project_id, reader_uuid, message_uuids),
+        )
+        assert dict(cursor.fetchall()) == {
+            lower_uuid: True,
+            boundary_uuid: True,
+            higher_uuid: False,
+        }
+        cursor.execute(
+            "SELECT raw_message FROM m_external_bridge_mail_outbox_v1 "
+            "WHERE external_account_uuid = %s",
+            (account_uuid,),
+        )
+        raw_message = bytes(cursor.fetchone()[0])
+    key = external_bridge_codec.derive_direction_key(
+        enrollment_secret,
+        realm_uuid,
+        bridge_instance_uuid,
+        1,
+        "workspace-to-zulip",
+    )
+    record = external_bridge_codec.parse_message(
+        raw_message,
+        "workspace-to-zulip",
+        [key],
+        external_bridge_data_plane.WORKSPACE_SENDER,
+        external_bridge_data_plane.BRIDGE_ADDRESS,
+    )
+    assert record["operation"]["payload"]["message_uuids"] == [
+        str(lower_uuid),
+        str(boundary_uuid),
+    ]
+    assert "through_message_uuid" not in record["operation"]["payload"]
+
+
+def test_empty_external_stream_read_does_not_emit_bridge_operation(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "empty-external-read",
+    )
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, TRUE, 'live', TRUE)
+            """,
+            (account_uuid, api.user_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:empty-read',
+                '{"kind":"zulip","chat_type":"channel"}'::jsonb,
+                'Empty external read', TRUE, %s, %s, 'live',
+                '{"messenger.message.read":{"available":true}}'::jsonb
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                api.user_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+
+    bridge_factory = sql_store.SQLProjectedMessengerStoreFactory(
+        conftest.TEST_MAIL_RUNTIME,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="empty read test secret",
+        ),
+    )
+    api_store.configure_store_factory(bridge_factory)
+    try:
+        response = api.post(f"{STREAMS}{stream_uuid}/actions/read/invoke")
+    finally:
+        api_store.configure_store_factory(
+            sql_store.SQLProjectedMessengerStoreFactory(conftest.TEST_MAIL_RUNTIME)
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["uuid"] == stream_uuid
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_external_bridge_mail_outbox_v1 "
+            "WHERE project_uuid = %s",
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_external_operations_v2 WHERE owner_user_uuid = %s",
+            (api.user_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
 def test_unbound_user_cannot_send_message(api, db):
     other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
@@ -4677,13 +6487,16 @@ def test_projection_helper_does_not_bypass_canonical_event_journal(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
     message_uuid = sys_uuid.uuid4()
-    messenger_dm_helpers.create_workspace_user_message(
-        uuid=message_uuid,
-        project_id=sys_uuid.UUID(api.project_id),
-        user_uuid=sys_uuid.UUID(api.user_uuid),
-        stream_uuid=sys_uuid.UUID(stream_uuid),
-        topic_uuid=sys_uuid.UUID(topic_uuid),
-        payload=message_payloads.MarkdownPayload(content="created through model"),
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.create_workspace_user_message(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content="created through model"),
+            session=session,
+        )
     )
 
     resp = workspace_api.get(EVENTS, params={"page_limit": 100})
@@ -4708,75 +6521,72 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
     conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
     with db.cursor() as cur:
         for user_uuid in (api.user_uuid, other_user):
+            external_account_uuid = sys_uuid.uuid4()
             cur.execute(
                 """
-                INSERT INTO m_external_accounts
-                    (uuid, project_id, user_uuid, server_url, account_type,
-                     status, account_settings, source_scope, access_status,
-                     access_checked_at, access_confirmed_at, created_at,
-                     updated_at)
-                VALUES (
-                    %s,
-                    %s,
-                    %s,
-                    %s,
-                    'zulip',
-                    'active',
-                    jsonb_build_object(
-                        'kind', 'zulip',
-                        'credentials', jsonb_build_object(
-                            'kind', 'zulip',
-                            'login', 'agent@example.test',
-                            'token', 'token'
-                        )
-                    ),
-                    %s,
-                    'confirmed',
-                    NOW(),
-                    NOW(),
-                    NOW(),
-                    NOW()
-                )
+                INSERT INTO m_external_accounts_v2
+                    (uuid, owner_user_uuid, provider, settings,
+                     credential_present, status, live_ready)
+                VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live', TRUE)
+                """,
+                (
+                    str(external_account_uuid),
+                    str(user_uuid),
+                    f'{{"kind":"zulip","server_url":"{server_url}"}}',
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_external_chats_v2
+                    (uuid, external_account_uuid, owner_user_uuid, provider,
+                     provider_chat_id, source, display_name, selected,
+                     project_id)
+                VALUES (%s, %s, %s, 'zulip', %s, '{}'::jsonb,
+                        'Zulip test', TRUE, %s)
                 """,
                 (
                     str(sys_uuid.uuid4()),
-                    api.project_id,
+                    str(external_account_uuid),
                     str(user_uuid),
-                    server_url,
-                    server_url,
+                    f"chat-{user_uuid}",
+                    api.project_id,
                 ),
             )
     message_uuid = sys_uuid.uuid4()
-    message = messenger_dm_helpers.create_workspace_user_message(
-        uuid=message_uuid,
-        project_id=sys_uuid.UUID(api.project_id),
-        user_uuid=sys_uuid.UUID(api.user_uuid),
-        stream_uuid=sys_uuid.UUID(stream_uuid),
-        topic_uuid=sys_uuid.UUID(topic_uuid),
-        payload=message_payloads.MarkdownPayload(content="sent through Zulip"),
-        source_name=messenger_models.SourceName.ZULIP.value,
-        source=messenger_models.ZulipSource(
-            stream_id=42,
-            server_url=server_url,
-            topic_name="general",
-            message_id=123,
-        ),
-    )
 
-    assert message.read is True
-    message = messenger_dm_helpers.sync_workspace_user_message_flags(
-        project_id=sys_uuid.UUID(api.project_id),
-        user_uuid=sys_uuid.UUID(api.user_uuid),
-        message_uuid=message_uuid,
-        values={"read": False},
-    )
-    assert message.read is True
+    def create_and_sync_flags(session):
+        message = messenger_dm_helpers.create_workspace_user_message(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content="sent through Zulip"),
+            source_name=messenger_models.SourceName.ZULIP.value,
+            source=messenger_models.ZulipSource(
+                stream_id=42,
+                server_url=server_url,
+                topic_name="general",
+                message_id=123,
+            ),
+            session=session,
+        )
+        assert message.read is True
+        message = messenger_dm_helpers.sync_workspace_user_message_flags(
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            message_uuid=message_uuid,
+            values={"read": False},
+            session=session,
+        )
+        assert message.read is True
+        return messenger_dm_helpers.get_workspace_user_message(
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=other_user,
+            message_uuid=message_uuid,
+        )
 
-    other_message = messenger_dm_helpers.get_workspace_user_message(
-        project_id=sys_uuid.UUID(api.project_id),
-        user_uuid=other_user,
-        message_uuid=message_uuid,
-    )
+    other_message = _run_database_operation(create_and_sync_flags)
     assert other_message.read is False
 
     with db.cursor() as cur:

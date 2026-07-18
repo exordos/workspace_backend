@@ -28,6 +28,7 @@ dependencies = [
     "boto3>=1.37.11,<2.0.0",  # Apache-2.0
     "websockets>=10.4,<13.0",  # BSD License (BSD-3-Clause)
     "requests>=2.32.0,<3.0.0",  # Apache-2.0
+    "cryptography>=43.0.0,<47.0.0",  # Apache-2.0 or BSD-3-Clause
 ]
 [project.urls]
 homepage = "https://github.com/infraguys/workspace/"
@@ -57,6 +58,8 @@ test = [
 ]
 mypy = [
     "mypy",
+    "types-PyYAML",
+    "types-requests",
 ]
 ruff = [
     "ruff",
@@ -128,6 +131,7 @@ workspace-api = "workspace.cmd.workspace_api:main"
 workspace-messenger-api = "workspace.cmd.messenger_api:main"
 workspace-messenger-worker = "workspace.cmd.messenger_worker:main"
 workspace-messenger-events = "workspace.cmd.messenger_events:main"
+workspace-external-bridge-api = "workspace.cmd.external_bridge_api:main"
 
 [tool.uv]
 package = true

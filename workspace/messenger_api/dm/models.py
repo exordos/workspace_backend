@@ -18,14 +18,15 @@ import datetime
 import enum
 import hashlib
 import re
+import typing
 import uuid as sys_uuid
 
+from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import types
-from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 from workspace.common import file_storage_opts
@@ -162,7 +163,7 @@ class SystemFolderItemBase(
     )
 
     @property
-    def folder_uuid(self):
+    def folder_uuid(self) -> sys_uuid.UUID:
         return self.folder
 
 
@@ -191,7 +192,7 @@ class WorkspaceUserSource(str, enum.Enum):
 
 
 class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
-    def to_simple_type(self, value):
+    def to_simple_type(self, value: datetime.datetime) -> str:
         return value.isoformat()
 
 
@@ -205,7 +206,7 @@ WORKSPACE_USER_GRAVATAR_HASH_RE = re.compile(
 )
 
 
-def build_workspace_user_gravatar_avatar(email):
+def build_workspace_user_gravatar_avatar(email: str) -> str:
     normalized_email = email.strip().lower().encode()
     email_hash = hashlib.md5(
         normalized_email,
@@ -214,23 +215,23 @@ def build_workspace_user_gravatar_avatar(email):
     return "%s%s" % (WORKSPACE_USER_GRAVATAR_PREFIX, email_hash)
 
 
-def build_workspace_user_default_avatar(user_uuid):
+def build_workspace_user_default_avatar(user_uuid: object) -> str:
     return build_workspace_user_gravatar_avatar(str(user_uuid))
 
 
 class WorkspaceUserAvatarType(types.String):
-    def __init__(self):
+    def __init__(self) -> None:
         super(WorkspaceUserAvatarType, self).__init__(
             min_length=1,
             max_length=WORKSPACE_USER_AVATAR_MAX_LENGTH,
         )
 
-    def validate(self, value):
+    def validate(self, value: str) -> bool:
         return super(WorkspaceUserAvatarType, self).validate(
             value,
         ) and self._is_workspace_user_avatar_urn(value)
 
-    def _is_workspace_user_avatar_urn(self, value):
+    def _is_workspace_user_avatar_urn(self, value: str) -> bool:
         return (
             self._is_uuid_urn(value, WORKSPACE_USER_IMAGE_AVATAR_PREFIX)
             or self._is_url_urn(value)
@@ -238,14 +239,14 @@ class WorkspaceUserAvatarType(types.String):
         )
 
     @staticmethod
-    def _is_gravatar_urn(value):
+    def _is_gravatar_urn(value: str) -> bool:
         if not value.startswith(WORKSPACE_USER_GRAVATAR_PREFIX):
             return False
         avatar_hash = value[len(WORKSPACE_USER_GRAVATAR_PREFIX) :]
         return WORKSPACE_USER_GRAVATAR_HASH_RE.fullmatch(avatar_hash) is not None
 
     @staticmethod
-    def _is_uuid_urn(value, prefix):
+    def _is_uuid_urn(value: str, prefix: str) -> bool:
         if not value.startswith(prefix):
             return False
         try:
@@ -255,7 +256,7 @@ class WorkspaceUserAvatarType(types.String):
         return True
 
     @staticmethod
-    def _is_url_urn(value):
+    def _is_url_urn(value: str) -> bool:
         if not value.startswith(WORKSPACE_USER_URL_AVATAR_PREFIX):
             return False
         url = value[len(WORKSPACE_USER_URL_AVATAR_PREFIX) :]
@@ -282,7 +283,7 @@ class WorkspaceUser(
         default=None,
     )
 
-    def pour(self, **kwargs):
+    def pour(self, **kwargs: typing.Any) -> None:
         if "uuid" not in kwargs:
             kwargs["uuid"] = sys_uuid.uuid4()
         if "avatar" not in kwargs or kwargs["avatar"] is None:
@@ -339,13 +340,13 @@ class WorkspaceUser(
     @classmethod
     def sync_iam_identity(
         cls,
-        user_uuid,
-        username,
-        first_name,
-        last_name,
-        email,
-        status=WorkspaceUserStatus.ACTIVE.value,
-    ):
+        user_uuid: sys_uuid.UUID,
+        username: str,
+        first_name: str | None,
+        last_name: str | None,
+        email: str | None,
+        status: str = WorkspaceUserStatus.ACTIVE.value,
+    ) -> "WorkspaceUser":
         values = {
             "username": username,
             "source": WorkspaceUserSource.IAM.value,
@@ -380,302 +381,6 @@ class WorkspaceUser(
         return workspace_user
 
 
-class ExternalAccountType(str, enum.Enum):
-    ZULIP = "zulip"
-    IAM = "iam"
-    MAIL = "mail"
-    CALENDAR = "calendar"
-
-
-class ExternalAccountStatus(str, enum.Enum):
-    NEW = "new"
-    ACTIVE = "active"
-
-
-class ExternalAccountAccessStatus(str, enum.Enum):
-    PENDING = "pending"
-    MISSING_CREDENTIALS = "missing_credentials"
-    CONFIRMED = "confirmed"
-    INVALID_CREDENTIALS = "invalid_credentials"
-    UNAVAILABLE = "unavailable"
-
-
-DEFAULT_ZULIP_TIMEZONE = "Europe/Moscow"
-
-
-class ZulipExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.ZULIP.value
-
-    login = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    token = properties.property(
-        types.String(min_length=1, max_length=4096),
-        required=True,
-    )
-
-
-class ZulipExternalAccountUserInfoKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.ZULIP.value
-
-    email = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    user_id = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    avatar_version = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    is_admin = properties.property(
-        types.Boolean(),
-        required=True,
-    )
-    is_owner = properties.property(
-        types.Boolean(),
-        required=True,
-    )
-    is_guest = properties.property(
-        types.Boolean(),
-        required=True,
-    )
-    role = properties.property(
-        types.Integer(min_value=0),
-        required=True,
-    )
-    is_bot = properties.property(
-        types.Boolean(),
-        required=True,
-    )
-    full_name = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    timezone = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=128)),
-        default=DEFAULT_ZULIP_TIMEZONE,
-    )
-    is_active = properties.property(
-        types.Boolean(),
-        required=True,
-    )
-    date_joined = properties.property(
-        types.String(min_length=1, max_length=64),
-        required=True,
-    )
-    delivery_email = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=256)),
-        default=None,
-    )
-    avatar_url = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=2048)),
-        default=None,
-    )
-
-
-ZULIP_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(ZulipExternalAccountCredentialsKind),
-)
-
-ZULIP_EXTERNAL_ACCOUNT_USER_INFO_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(ZulipExternalAccountUserInfoKind),
-)
-
-
-class ZulipExternalAccountKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.ZULIP.value
-
-    credentials = properties.property(
-        types.AllowNone(ZULIP_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
-        default=None,
-    )
-    user_info = properties.property(
-        types.AllowNone(ZULIP_EXTERNAL_ACCOUNT_USER_INFO_TYPE),
-        default=None,
-    )
-
-
-class IamExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.IAM.value
-
-    username = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    access_token = properties.property(
-        types.String(min_length=1, max_length=4096),
-        required=True,
-    )
-
-
-IAM_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(IamExternalAccountCredentialsKind),
-)
-
-
-class IamExternalAccountKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.IAM.value
-
-    credentials = properties.property(
-        IAM_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE,
-        required=True,
-    )
-
-
-class MailExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.MAIL.value
-
-    username = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    password = properties.property(
-        types.String(min_length=1, max_length=4096),
-        required=True,
-    )
-
-
-MAIL_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(MailExternalAccountCredentialsKind),
-)
-
-
-class MailExternalAccountKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.MAIL.value
-
-    credentials = properties.property(
-        types.AllowNone(MAIL_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
-        default=None,
-    )
-    email = properties.property(types.Email(), required=True)
-    imap_host = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    imap_port = properties.property(
-        types.Integer(min_value=1, max_value=65535),
-        default=993,
-    )
-    imap_security = properties.property(
-        types.Enum(["tls", "starttls", "plain"]),
-        default="tls",
-    )
-    smtp_host = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    smtp_port = properties.property(
-        types.Integer(min_value=1, max_value=65535),
-        default=465,
-    )
-    smtp_security = properties.property(
-        types.Enum(["tls", "starttls", "plain"]),
-        default="tls",
-    )
-
-
-class CalendarExternalAccountCredentialsKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.CALENDAR.value
-
-    username = properties.property(
-        types.String(min_length=1, max_length=256),
-        required=True,
-    )
-    password = properties.property(
-        types.String(min_length=1, max_length=4096),
-        required=True,
-    )
-
-
-CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(CalendarExternalAccountCredentialsKind),
-)
-
-
-class CalendarExternalAccountKind(types_dynamic.AbstractKindModel):
-    KIND = ExternalAccountType.CALENDAR.value
-
-    credentials = properties.property(
-        types.AllowNone(CALENDAR_EXTERNAL_ACCOUNT_CREDENTIALS_TYPE),
-        default=None,
-    )
-
-
-EXTERNAL_ACCOUNT_SETTINGS_TYPE = types_dynamic.KindModelSelectorType(
-    types_dynamic.KindModelType(ZulipExternalAccountKind),
-    types_dynamic.KindModelType(IamExternalAccountKind),
-    types_dynamic.KindModelType(MailExternalAccountKind),
-    types_dynamic.KindModelType(CalendarExternalAccountKind),
-)
-
-
-class ExternalAccount(
-    models.ModelWithUUID,
-    models.ModelWithProject,
-    models.ModelWithTimestamp,
-    orm.SQLStorableMixin,
-):
-    __tablename__ = "m_external_accounts"
-
-    provider_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
-
-    user_uuid = properties.property(
-        types.UUID(),
-        required=True,
-    )
-    server_url = properties.property(
-        types.Url(),
-        required=True,
-    )
-    source_scope = properties.property(
-        types.AllowNone(types.String(min_length=1, max_length=2048)),
-        default=None,
-    )
-    account_type = properties.property(
-        types.Enum([account_type.value for account_type in ExternalAccountType]),
-        default=ExternalAccountType.ZULIP.value,
-    )
-    status = properties.property(
-        types.Enum([status.value for status in ExternalAccountStatus]),
-        default=ExternalAccountStatus.NEW.value,
-    )
-    access_status = properties.property(
-        types.Enum([status.value for status in ExternalAccountAccessStatus]),
-        default=ExternalAccountAccessStatus.MISSING_CREDENTIALS.value,
-    )
-    access_checked_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
-    )
-    access_confirmed_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()),
-        default=None,
-    )
-    access_last_error = properties.property(
-        types.AllowNone(types.String(max_length=4096)),
-        default=None,
-    )
-    account_settings = properties.property(
-        EXTERNAL_ACCOUNT_SETTINGS_TYPE,
-        required=True,
-    )
-
-    def get_source_scope(self):
-        if self.source_scope is not None:
-            return self.source_scope
-        return self.server_url
-
-    def has_credentials(self):
-        return self.account_settings.credentials is not None
-
-
 class WorkspaceFile(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -692,6 +397,10 @@ class WorkspaceFile(
     stream_uuid = properties.property(
         types.AllowNone(types.UUID()),
         default=None,
+    )
+    acl_mode = properties.property(
+        types.Enum(["owner", "stream", "public"]),
+        default="stream",
     )
     provider_uuid = properties.property(
         types.AllowNone(types.UUID()),
@@ -745,6 +454,14 @@ class WorkspaceFileAccess(
     )
 
 
+class WorkspaceVisibleFile(WorkspaceFile):
+    __tablename__ = "m_workspace_visible_files_v1"
+
+    # Public files have no materialized viewer row.  The canonical read path
+    # combines ``viewer_user_uuid = current user`` with ``acl_mode = public``.
+    viewer_user_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
+
+
 class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_streams"
 
@@ -763,8 +480,10 @@ class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
     delivery_updated_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
+    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
+    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
 
-    def get_recipients(self, session=None):
+    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
             stream_uuid=self.uuid,
@@ -801,7 +520,7 @@ class WorkspaceStreamBinding(
         default=WorkspaceStreamNotificationMode.ALL_MESSAGES.value,
     )
 
-    def get_stream(self):
+    def get_stream(self) -> WorkspaceStream:
         return WorkspaceStream.objects.get_one(
             filters={
                 "uuid": dm_filters.EQ(self.stream_uuid),
@@ -810,7 +529,11 @@ class WorkspaceStreamBinding(
         )
 
 
-def get_stream_recipients(project_id, stream_uuid, session=None):
+def get_stream_recipients(
+    project_id: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
+    session: typing.Any = None,
+) -> list[sys_uuid.UUID]:
     bindings = WorkspaceStreamBinding.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
@@ -825,7 +548,7 @@ def get_stream_recipients(project_id, stream_uuid, session=None):
 class WorkspaceUserStream(base.WorkspaceUserStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_user_streams"
 
-    def get_default_topic(self):
+    def get_default_topic(self) -> "WorkspaceStreamTopic | None":
         if self.default_topic_uuid is None:
             return None
         return WorkspaceStreamTopic.objects.get_one(
@@ -836,7 +559,7 @@ class WorkspaceUserStream(base.WorkspaceUserStreamBase, orm.SQLStorableMixin):
             }
         )
 
-    def get_recipients(self, session=None):
+    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
             stream_uuid=self.uuid,
@@ -867,6 +590,8 @@ class WorkspaceMessageReactions(
     delivery_updated_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
+    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
+    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
 
     message_uuid = properties.property(
         types.UUID(),
@@ -882,6 +607,12 @@ class WorkspaceMessageReactions(
     )
 
 
+class WorkspaceVisibleMessageReaction(WorkspaceMessageReactions):
+    __tablename__ = "m_workspace_visible_message_reactions_v1"
+
+    viewer_user_uuid = properties.property(types.UUID(), required=True)
+
+
 WORKSPACE_EVENT_SCHEMA_VERSION = 1
 WORKSPACE_EVENT_OBJECT_TYPES = (
     "message",
@@ -893,6 +624,9 @@ WORKSPACE_EVENT_OBJECT_TYPES = (
     "folder",
     "folder_item",
     "file",
+    "external_account",
+    "external_chat",
+    "external_operation",
 )
 WORKSPACE_EVENT_ACTIONS = (
     "created",
@@ -932,17 +666,20 @@ class WorkspaceEvent(
     )
 
     @classmethod
-    def get_id_property(cls):
+    def get_id_property(cls) -> dict[str, typing.Any]:
         return {"epoch_version": cls.properties.properties["epoch_version"]}
 
-    def _get_prepared_data(self, properties=None):
+    def _get_prepared_data(
+        self, properties: typing.Any = None
+    ) -> dict[str, typing.Any]:
         data = super()._get_prepared_data(properties=properties)
         if "epoch_version" in data and data["epoch_version"] is None:
             data.pop("epoch_version")
         return data
 
-    def insert(self, session=None):
+    def insert(self, session: typing.Any = None) -> int:
         engine = self._get_engine()
+        session = session or contexts.Context().get_session()
         data = self._get_prepared_data()
         data.pop("epoch_version", None)
         columns = tuple(data)
@@ -952,10 +689,24 @@ class WorkspaceEvent(
             f"VALUES ({', '.join(['%s'] * len(columns))}) "
             f"RETURNING {engine.escape('epoch_version')}"
         )
-        with engine.session_manager(session=session) as s:
-            row = s.execute(statement, tuple(data[column] for column in columns))
-            self.epoch_version = row.fetchone()["epoch_version"]
-            self._saved = True
+        row = session.execute(statement, tuple(data[column] for column in columns))
+        self.epoch_version = row.fetchone()["epoch_version"]
+        session.execute(
+            """
+            INSERT INTO "m_workspace_event_cursors" (
+                "project_id", "user_uuid", "current_epoch_version"
+            ) VALUES (%s, %s, %s)
+            ON CONFLICT ("project_id", "user_uuid") DO UPDATE
+            SET
+                "current_epoch_version" = GREATEST(
+                    "m_workspace_event_cursors"."current_epoch_version",
+                    EXCLUDED."current_epoch_version"
+                ),
+                "updated_at" = NOW()
+            """,
+            (self.project_id, self.user_uuid, self.epoch_version),
+        )
+        self._saved = True
         return self.epoch_version
 
 
@@ -970,7 +721,7 @@ class WorkspaceProject(
     __tablename__ = "m_workspace_projects_view"
 
     @classmethod
-    def get_id_property(cls):
+    def get_id_property(cls) -> dict[str, typing.Any]:
         return {"project_id": cls.properties.properties["project_id"]}
 
 
@@ -999,6 +750,8 @@ class WorkspaceStreamTopic(
     delivery_updated_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
+    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
+    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
 
     name = properties.property(
         types.String(max_length=128),
@@ -1013,7 +766,7 @@ class WorkspaceStreamTopic(
         default=base.random_color,
     )
 
-    def get_recipients(self, session=None):
+    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
             stream_uuid=self.stream_uuid,
@@ -1100,7 +853,7 @@ class WorkspaceUserTopic(
         default=WorkspaceTopicNotificationMode.DEFAULT.value,
     )
 
-    def get_flags(self):
+    def get_flags(self) -> "WorkspaceUserTopicFlags":
         return WorkspaceUserTopicFlags.objects.get_one(
             filters={
                 "uuid": dm_filters.EQ(self.uuid),
@@ -1109,7 +862,7 @@ class WorkspaceUserTopic(
             }
         )
 
-    def get_recipients(self, session=None):
+    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
             stream_uuid=self.stream_uuid,
@@ -1139,13 +892,15 @@ class WorkspaceMessage(
     delivery_updated_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None
     )
+    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
+    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
 
     user_uuid = properties.property(
         types.UUID(),
         required=True,
     )
 
-    def validate(self):
+    def validate(self) -> None:
         super().validate()
         binding = WorkspaceStreamBinding.objects.get_one_or_none(
             filters={
@@ -1166,7 +921,7 @@ class WorkspaceMessage(
         if topic is None:
             raise ra_exc.ValidationErrorException()
 
-    def get_recipients(self, session=None):
+    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
             stream_uuid=self.stream_uuid,
@@ -1180,7 +935,7 @@ class WorkspaceUserMessage(
 ):
     __tablename__ = "m_workspace_user_messages_view"
 
-    def get_recipients(self, session=None):
+    def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
             project_id=self.project_id,
             stream_uuid=self.stream_uuid,

@@ -53,6 +53,90 @@ class FakeWebsocket:
 
 
 class MessengerEventsTestCase(unittest.TestCase):
+    def test_fixture_suppression_blocks_runtime_events_but_not_planned_events(self):
+        session = mock.Mock()
+        project_id = sys_uuid.uuid4()
+        entity_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+
+        with events.suppress_unplanned_fixture_events():
+            self.assertEqual(
+                [],
+                events.create_broadcast_event(
+                    project_id,
+                    entity_uuid,
+                    [recipient_uuid],
+                    "message.created",
+                    {"uuid": str(entity_uuid)},
+                    session=session,
+                ),
+            )
+        session.execute.assert_not_called()
+
+        def planned_event(*args, **kwargs):
+            self.assertFalse(events._FIXTURE_EVENTS_SUPPRESSED.get())
+            return [72]
+
+        with (
+            events.suppress_unplanned_fixture_events(),
+            mock.patch.object(
+                events,
+                "create_broadcast_event",
+                side_effect=planned_event,
+            ) as create,
+        ):
+            result = events.create_deterministic_fixture_broadcast_event(
+                project_id,
+                entity_uuid,
+                [recipient_uuid],
+                "message.created",
+                {"uuid": str(entity_uuid)},
+                sys_uuid.uuid4(),
+                datetime.datetime.now(datetime.timezone.utc),
+                session,
+            )
+
+        self.assertEqual([72], result)
+        create.assert_called_once()
+
+    def test_deterministic_fixture_event_forwards_exact_identity_and_time(self):
+        project_id = sys_uuid.uuid4()
+        entity_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        event_uuid = sys_uuid.uuid4()
+        created_at = datetime.datetime(
+            2026, 7, 18, 10, 30, tzinfo=datetime.timezone.utc
+        )
+        session = object()
+
+        with mock.patch.object(
+            events,
+            "create_broadcast_event",
+            return_value=[71],
+        ) as create:
+            result = events.create_deterministic_fixture_broadcast_event(
+                project_id,
+                entity_uuid,
+                [recipient_uuid],
+                "message.created",
+                {"uuid": str(entity_uuid)},
+                event_uuid,
+                created_at,
+                session,
+            )
+
+        self.assertEqual([71], result)
+        create.assert_called_once_with(
+            project_id,
+            entity_uuid,
+            [recipient_uuid],
+            "message.created",
+            {"uuid": str(entity_uuid)},
+            session=session,
+            event_uuid=event_uuid,
+            created_at=created_at,
+        )
+
     def test_websocket_event_reads_use_canonical_store_boundary(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -60,8 +144,10 @@ class MessengerEventsTestCase(unittest.TestCase):
         calls = []
 
         class Store:
-            def events_after(self, filters, order_by=None):
-                calls.append(("events", filters["epoch_version"].value, order_by))
+            def events_after(self, filters, order_by=None, limit=None):
+                calls.append(
+                    ("events", filters["epoch_version"].value, order_by, limit)
+                )
                 return [event] if filters["epoch_version"].value < 7 else []
 
             def current_epoch(self):
@@ -93,8 +179,8 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         self.assertEqual(
             [
-                ("events", 0, {"epoch_version": "asc"}),
-                ("events", 6, {"epoch_version": "asc"}),
+                ("events", 0, {"epoch_version": "asc"}, 10),
+                ("events", 6, {"epoch_version": "asc"}, 1),
                 ("epoch",),
             ],
             calls,
@@ -140,9 +226,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
 
     def test_conditional_filter_suffixes(self):
-        split = (
-            controllers.StoreResourceController._split_filter_operator
-        )
+        split = controllers.StoreResourceController._split_filter_operator
         self.assertEqual(
             ("created_at", dm_filters.GE),
             split("created_at=>"),
@@ -720,17 +804,22 @@ class MessengerEventsTestCase(unittest.TestCase):
         session.execute.return_value.fetchone.return_value = {"epoch_version": 42}
         engine = mock.MagicMock()
         engine.escape.side_effect = lambda value: f'"{value}"'
-        engine.session_manager.return_value.__enter__.return_value = session
 
         with mock.patch.object(
             models.WorkspaceEvent, "_get_engine", return_value=engine
         ):
-            result = event.insert()
+            result = event.insert(session=session)
 
-        statement = session.execute.call_args.args[0]
+        statement = session.execute.call_args_list[0].args[0]
         inserted_columns = statement.split("VALUES", 1)[0]
         self.assertNotIn("epoch_version", inserted_columns)
         self.assertIn('RETURNING "epoch_version"', statement)
+        cursor_statement = session.execute.call_args_list[1].args[0]
+        self.assertIn('INSERT INTO "m_workspace_event_cursors"', cursor_statement)
+        self.assertEqual(
+            (project_id, user_uuid, 42),
+            session.execute.call_args_list[1].args[1],
+        )
         self.assertEqual(42, result)
         self.assertEqual(42, event.epoch_version)
 
@@ -1190,9 +1279,9 @@ class MessengerEventsTestCase(unittest.TestCase):
                 events.create_file_created_events(file, [recipient_uuid]),
                 events.create_file_updated_events(file, [recipient_uuid]),
                 events.create_file_deleted_events(
-                file.project_id,
-                file.stream_uuid,
-                file.uuid,
+                    file.project_id,
+                    file.stream_uuid,
+                    file.uuid,
                     [recipient_uuid],
                 ),
             )
@@ -1316,6 +1405,88 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual([event], sent_messages)
         self.assertEqual(8, connection.last_epoch_version)
+
+    def test_websocket_multi_connection_poll_uses_event_store_only(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        project_id = sys_uuid.uuid4()
+        full_store_opens = []
+        event_store_opens = []
+
+        class EventStore:
+            def events_after(
+                self,
+                filters,
+                order_by=None,
+                epoch_generation=None,
+                limit=None,
+            ):
+                del filters, order_by, epoch_generation, limit
+                return []
+
+        class Factory:
+            def __call__(self, opened_project, opened_user):
+                full_store_opens.append((opened_project, opened_user))
+                return contextlib.nullcontext(EventStore())
+
+            def event_store(self, opened_project, opened_user):
+                event_store_opens.append((opened_project, opened_user))
+                return contextlib.nullcontext(EventStore())
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connections = []
+        for _index in range(6):
+            connection = websocket_service.ClientConnection(
+                websocket=FakeWebsocket([]),
+                project_id=project_id,
+                user_uuid=sys_uuid.uuid4(),
+                last_epoch_version=7,
+                epoch_generation="91",
+            )
+            connection.ready = True
+            server._add_connection(connection)
+            connections.append(connection)
+
+        sleep_calls = 0
+
+        async def run_one_poll():
+            nonlocal sleep_calls
+
+            async def sleep_once(_interval):
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls > 1:
+                    raise asyncio.CancelledError
+
+            with mock.patch.object(websocket_service.asyncio, "sleep", new=sleep_once):
+                try:
+                    await server._poll_connections()
+                except asyncio.CancelledError:
+                    pass
+
+        api_store.configure_store_factory(Factory())
+        try:
+            asyncio.run(run_one_poll())
+        finally:
+            api_store.reset_store_factory()
+
+        self.assertEqual(2, sleep_calls)
+        self.assertEqual([], full_store_opens)
+        self.assertCountEqual(
+            [(project_id, connection.user_uuid) for connection in connections],
+            event_store_opens,
+        )
 
     def test_websocket_cursor_gap_is_typed_and_closes_with_4410(self):
         websockets_stub = types.ModuleType("websockets")
@@ -1441,19 +1612,22 @@ class MessengerEventsTestCase(unittest.TestCase):
             last_epoch_version=0,
         )
 
-        with mock.patch.object(
-            websocket_service.messenger_events,
-            "get_event_cursor",
-            return_value={
-                "epoch_generation": "91",
-                "current_epoch_version": 3,
-                "minimum_epoch_version": 1,
-            },
-        ), mock.patch.object(
-            server,
-            "_catch_up",
-            side_effect=[2, 1],
-        ) as catch_up:
+        with (
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_event_cursor",
+                return_value={
+                    "epoch_generation": "91",
+                    "current_epoch_version": 3,
+                    "minimum_epoch_version": 1,
+                },
+            ),
+            mock.patch.object(
+                server,
+                "_catch_up",
+                side_effect=[2, 1],
+            ) as catch_up,
+        ):
             result = asyncio.run(server._catch_up_until_current(connection))
 
         self.assertTrue(result)

@@ -10,6 +10,7 @@ from restalchemy.api import routes
 from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
+from typing import Any
 
 from workspace import version as app_version
 from workspace.messenger_api.api import context as auth_context
@@ -26,7 +27,7 @@ WorkspaceApiApp.v1 = routes.route(app_routes.WorkspaceApiEndpointRoute)
 
 
 class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
-    def build(self, request):
+    def build(self, request: Any) -> dict[str, Any]:
         specification = super().build(request)
         specification["components"]["securitySchemes"] = {
             "bearerAuth": {
@@ -40,7 +41,7 @@ class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
 
 
 class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
-    def build(self, request, components):
+    def build(self, request: Any, components: Any) -> dict[str, Any]:
         specification = super().build(request, components)
         for path in specification["paths"].values():
             for operation in path.values():
@@ -58,6 +59,11 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/drafts/",
             components,
         )
+        specification = openapi_contract.add_external_bridge_public_contract(
+            specification,
+            "/v1/messenger/",
+            components,
+        )
         specification = openapi_contract.add_events_cursor_contract(
             specification,
             "/v1/events/",
@@ -69,11 +75,11 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
         )
 
 
-def get_api_application():
+def get_api_application() -> type[WorkspaceApiApp]:
     return WorkspaceApiApp
 
 
-def get_openapi_engine():
+def get_openapi_engine() -> openapi_engines.OpenApiEngine:
     return openapi_engines.OpenApiEngine(
         info=openapi_structures.OpenApiInfo(
             title="Workspace v1 API",
@@ -85,7 +91,7 @@ def get_openapi_engine():
     )
 
 
-def build_wsgi_application(iam_engine_driver):
+def build_wsgi_application(iam_engine_driver: Any) -> Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
             route_class=get_api_application(),

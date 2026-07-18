@@ -15,6 +15,7 @@
 #    under the License.
 
 import enum
+import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
@@ -107,11 +108,11 @@ class FolderItem(
     )
 
     @property
-    def folder_uuid(self):
+    def folder_uuid(self) -> sys_uuid.UUID:
         return self.folder.uuid
 
     @folder_uuid.setter
-    def folder_uuid(self, value):
+    def folder_uuid(self, value: sys_uuid.UUID | str | None) -> None:
         if value is None:
             raise ValueError("folder_uuid must not be None")
 

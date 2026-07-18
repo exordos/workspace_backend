@@ -736,12 +736,15 @@ class MessengerMailRepository:
         self,
         user_uuid: sys_uuid.UUID,
         cursor: EpochCursor,
+        limit: int | None = None,
     ) -> list[EpochEvent]:
         self.imap_client.ensure_mailbox(self.event_mailbox(user_uuid))
         metadata = self.imap_client.select(self.event_mailbox(user_uuid))
         if metadata.uid_validity != cursor.uid_validity:
             raise UidValidityChanged("Event mailbox UIDVALIDITY changed")
         uids = self.imap_client.search(f"UID {cursor.epoch_version + 1}:*")
+        if limit is not None:
+            uids = sorted(uids)[:limit]
         events = []
         for message in sorted(self.imap_client.fetch(uids), key=lambda item: item.uid):
             record = decode_event(message.raw_message)

@@ -9,51 +9,18 @@ import uuid as sys_uuid
 
 from oslo_config import cfg
 
+from workspace.common import messenger_mail_opts
 from workspace.messenger_mail import protocol
 from workspace.messenger_mail import repository
 from workspace.messenger_mail import service
 
 
-DOMAIN = "messenger_mail"
-
-mail_opts = [
-    cfg.StrOpt("smtp-host", default="127.0.0.1"),
-    cfg.IntOpt("smtp-port", default=25, min=1, max=65535),
-    cfg.StrOpt(
-        "smtp-security",
-        default="plain",
-        choices=tuple(sorted(protocol.SECURITY_MODES)),
-    ),
-    cfg.StrOpt("smtp-username", default=None),
-    cfg.StrOpt("smtp-password", default=None, secret=True),
-    cfg.StrOpt("smtp-ca-file", default=None),
-    cfg.FloatOpt("smtp-timeout", default=10.0, min=0.1),
-    cfg.StrOpt("imap-host", default="127.0.0.1"),
-    cfg.IntOpt("imap-port", default=143, min=1, max=65535),
-    cfg.StrOpt(
-        "imap-security",
-        default="plain",
-        choices=tuple(sorted(protocol.SECURITY_MODES)),
-    ),
-    cfg.StrOpt("imap-master-username", default="workspace-master"),
-    cfg.StrOpt("imap-master-password", default=None, secret=True),
-    cfg.StrOpt("imap-ca-file", default=None),
-    cfg.FloatOpt("imap-timeout", default=10.0, min=0.1),
-    cfg.StrOpt(
-        "technical-domain",
-        default=service.DEFAULT_TECHNICAL_DOMAIN,
-    ),
-    cfg.StrOpt("state-mailbox", default=repository.STATE_MAILBOX),
-    cfg.StrOpt(
-        "event-mailbox-prefix",
-        default=repository.EVENT_MAILBOX_PREFIX,
-    ),
-    cfg.StrOpt("message-mailbox", default=service.MESSAGE_MAILBOX),
-]
+DOMAIN = messenger_mail_opts.DOMAIN
+mail_opts = messenger_mail_opts.mail_opts
 
 
 def register_opts(conf: cfg.ConfigOpts = cfg.CONF) -> None:
-    conf.register_opts(mail_opts, DOMAIN)
+    messenger_mail_opts.register_opts(conf)
 
 
 def project_service_address(
@@ -137,6 +104,29 @@ class RuntimeFactory:
     @contextlib.contextmanager
     def smtp_client(self) -> typing.Iterator[protocol.SmtpClient]:
         with protocol.SmtpClient(self._smtp_settings()) as client:
+            yield client
+
+    @contextlib.contextmanager
+    def external_bridge_outbox(
+        self,
+        external_account_uuid: sys_uuid.UUID,
+    ) -> typing.Iterator[tuple[protocol.ImapClient, str]]:
+        group = self.conf[DOMAIN]
+        path = f"{group.external_bridge_outbox_prefix}/{external_account_uuid}/Outbox"
+        with protocol.ImapClient(
+            self._imap_settings(group.external_bridge_outbox_target)
+        ) as client:
+            client.ensure_mailbox(path)
+            yield client, path
+
+    @contextlib.contextmanager
+    def external_bridge_ingress(
+        self,
+    ) -> typing.Iterator[protocol.ImapClient]:
+        group = self.conf[DOMAIN]
+        with protocol.ImapClient(
+            self._imap_settings(group.external_bridge_ingress_target)
+        ) as client:
             yield client
 
     @contextlib.contextmanager

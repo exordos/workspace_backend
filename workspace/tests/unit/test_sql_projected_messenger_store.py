@@ -52,17 +52,13 @@ class FakeRepository:
         position = protocol.AppendUid(1, self.next_uid)
         self.next_uid += 1
         self.projection.apply(record, position)
-        self.entries.append(
-            repository.JournalEntry(position, frozenset(), record)
-        )
+        self.entries.append(repository.JournalEntry(position, frozenset(), record))
         return position
 
     def read_operations(self, after_uid=0):
         return repository.JournalReplay(
             protocol.MailboxMetadata(1, self.next_uid, None),
-            tuple(
-                entry for entry in self.entries if entry.position.uid > after_uid
-            ),
+            tuple(entry for entry in self.entries if entry.position.uid > after_uid),
         )
 
 
@@ -72,9 +68,7 @@ class FakeMailService:
         self.repository = FakeRepository(order)
 
     def deliver_message(self, record):
-        previous = self.repository.projection.message_positions.get(
-            record.entity_uuid
-        )
+        previous = self.repository.projection.message_positions.get(record.entity_uuid)
         if previous is not None:
             return previous
         self.order.append(("smtp", record.operation, record.entity_uuid))
@@ -236,6 +230,686 @@ def test_message_smtp_and_expunge_happen_before_sql_projection(monkeypatch):
     ]
 
 
+def test_bridge_outbox_reuses_request_database_session(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    service.repository.projection.streams[stream_uuid] = {
+        "uuid": str(stream_uuid),
+        "kind": "stream",
+    }
+    binding_uuid = sys_uuid.uuid4()
+    service.repository.projection.bindings[binding_uuid] = {
+        "uuid": str(binding_uuid),
+        "stream_uuid": str(stream_uuid),
+        "user_uuid": str(USER_UUID),
+    }
+    bridge_config = types.SimpleNamespace(
+        realm_uuid=sys_uuid.uuid4(),
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        identity_generation=1,
+        enrollment_secret="opaque enrollment secret",
+    )
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=bridge_config,
+    )
+    request_session = object()
+    context = types.SimpleNamespace(get_session=lambda: request_session)
+    monkeypatch.setattr(sql_store.contexts, "Context", lambda: context)
+    queued = []
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        lambda session, **values: (session, values),
+    )
+
+    def queue_message_create(session, **values):
+        queued.append((session, values))
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_message_create",
+        queue_message_create,
+    )
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "get_workspace_user_message",
+        lambda **kwargs: (_ for _ in ()).throw(
+            storage_exceptions.RecordNotFound(model="message", filters=kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "create_workspace_user_message",
+        lambda **values: values,
+    )
+
+    result = store.create_message(
+        {
+            "uuid": message_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "hello bridge"},
+        }
+    )
+
+    assert result["uuid"] == str(message_uuid)
+    assert len(queued) == 1
+    assert queued[0][0] is request_session
+    assert queued[0][1]["message"]["uuid"] == message_uuid
+
+
+def test_external_topic_create_publishes_mapping_without_rename_operation(monkeypatch):
+    class Topic(dict):
+        __getattr__ = dict.__getitem__
+
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    request_session = object()
+    bridge_instance_uuid = sys_uuid.uuid4()
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=bridge_instance_uuid,
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "create_workspace_user_stream_topic",
+        lambda **values: Topic(values["values"]),
+    )
+    published = []
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "ensure_topic_projection_mapping",
+        lambda session, **values: published.append((session, values)),
+    )
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("topic creation must not queue topic.upsert")
+        ),
+    )
+
+    result = store.create_resource(
+        "stream_topics",
+        {
+            "uuid": topic_uuid,
+            "stream_uuid": stream_uuid,
+            "name": "new topic",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+
+    assert result["uuid"] == str(topic_uuid)
+    assert len(published) == 1
+    assert published[0][0] is request_session
+    assert published[0][1] == {
+        "project_uuid": PROJECT_UUID,
+        "owner_user_uuid": USER_UUID,
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "topic_name": "new topic",
+        "bridge_instance_uuid": bridge_instance_uuid,
+    }
+    assert [entry.record.operation for entry in service.repository.entries] == [
+        "topic.create"
+    ]
+
+
+def test_external_preflight_rejects_before_canonical_message_mutation(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    service.repository.projection.streams[stream_uuid] = {
+        "uuid": str(stream_uuid),
+        "kind": "stream",
+    }
+    binding_uuid = sys_uuid.uuid4()
+    service.repository.projection.bindings[binding_uuid] = {
+        "uuid": str(binding_uuid),
+        "stream_uuid": str(stream_uuid),
+        "user_uuid": str(USER_UUID),
+    }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+
+    def reject(session, **values):
+        assert session is request_session
+        assert values["operation_kind"] == "message.create"
+        raise ValueError("external_operation_unavailable")
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        reject,
+    )
+
+    with pytest.raises(sql_store.ra_exceptions.ValidationErrorException):
+        store.create_message(
+            {
+                "uuid": message_uuid,
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": "must not persist"},
+            }
+        )
+
+    assert order == []
+    assert message_uuid not in service.repository.projection.messages
+
+
+@pytest.mark.parametrize(
+    ("resource", "action"),
+    (
+        ("streams", "read"),
+        ("stream_topics", "read"),
+        ("messages", "read"),
+        ("messages", "read_up_to"),
+    ),
+)
+def test_external_read_preflight_rejects_before_canonical_mutation(
+    monkeypatch,
+    resource,
+    action,
+):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    service.repository.projection.messages[message_uuid] = {
+        "uuid": str(message_uuid),
+        "stream_uuid": str(stream_uuid),
+        "topic_uuid": str(topic_uuid),
+        "created_at": "2026-07-18T00:00:00+00:00",
+    }
+    service.repository.projection.topics[topic_uuid] = {
+        "uuid": str(topic_uuid),
+        "stream_uuid": str(stream_uuid),
+    }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+
+    def reject(session, **values):
+        assert session is request_session
+        assert values["project_uuid"] == PROJECT_UUID
+        assert values["owner_user_uuid"] == USER_UUID
+        assert values["operation_kind"] == "read_state.set"
+        assert sys_uuid.UUID(str(values["target_stream_uuid"])) == stream_uuid
+        raise ValueError("external_operation_unavailable")
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        reject,
+    )
+
+    resource_uuid = {
+        "streams": stream_uuid,
+        "stream_topics": topic_uuid,
+        "messages": message_uuid,
+    }[resource]
+    with pytest.raises(sql_store.ra_exceptions.ValidationErrorException):
+        store.perform_action(resource, resource_uuid, action, {})
+
+    assert order == []
+    assert service.repository.entries == []
+
+
+def test_empty_external_stream_read_does_not_queue_empty_exact_selector(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    service.repository.projection.streams[stream_uuid] = {
+        "uuid": str(stream_uuid),
+        "kind": "stream",
+    }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    preflights = []
+
+    def validate(session, **values):
+        assert session is request_session
+        preflights.append(values)
+        return {"chat_uuid": sys_uuid.uuid4()}
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        validate,
+    )
+
+    def reject_queue(*args, **kwargs):
+        raise AssertionError("empty exact read selector must not be queued")
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        reject_queue,
+    )
+    row = {"uuid": str(stream_uuid), "unread_count": 0}
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "read_workspace_user_stream_messages",
+        lambda *args, **kwargs: row,
+    )
+
+    result = store.perform_action("streams", stream_uuid, "read", {})
+    assert result["uuid"] == str(stream_uuid)
+    assert result["unread_count"] == 0
+    assert len(preflights) == 1
+    assert preflights[0]["operation_kind"] == "read_state.set"
+    assert preflights[0]["target_stream_uuid"] == stream_uuid
+    assert order == []
+    assert service.repository.entries == []
+
+
+def test_external_stream_read_queues_exact_canonical_message_set(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    lower_uuid = sys_uuid.UUID("10000000-0000-0000-0000-000000000010")
+    higher_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000020")
+    service.repository.projection.streams[stream_uuid] = {
+        "uuid": str(stream_uuid),
+        "kind": "stream",
+    }
+    for message_uuid in (higher_uuid, lower_uuid):
+        service.repository.projection.messages[message_uuid] = {
+            "uuid": str(message_uuid),
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "created_at": "2026-07-18T00:00:00+00:00",
+        }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        lambda session, **values: {"chat_uuid": sys_uuid.uuid4()},
+    )
+    queued = []
+
+    def queue(session, **values):
+        assert session is request_session
+        queued.append(values)
+        return sys_uuid.uuid4()
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        queue,
+    )
+    row = {"uuid": str(stream_uuid), "unread_count": 0}
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "read_workspace_user_stream_messages",
+        lambda *args, **kwargs: row,
+    )
+
+    result = store.perform_action("streams", stream_uuid, "read", {})
+
+    assert result["uuid"] == str(stream_uuid)
+    assert len(queued) == 1
+    payload = queued[0]["payload"]
+    assert payload["message_uuids"] == [str(lower_uuid), str(higher_uuid)]
+    assert "through_message_uuid" not in payload
+    assert [entry.record.entity_uuid for entry in service.repository.entries] == [
+        lower_uuid,
+        higher_uuid,
+    ]
+
+
+def test_external_read_up_to_queues_native_compound_prefix_as_exact_selector(
+    monkeypatch,
+):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    lower_uuid = sys_uuid.UUID("10000000-0000-0000-0000-000000000010")
+    boundary_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000020")
+    higher_uuid = sys_uuid.UUID("30000000-0000-0000-0000-000000000030")
+    for message_uuid in (higher_uuid, lower_uuid, boundary_uuid):
+        service.repository.projection.messages[message_uuid] = {
+            "uuid": str(message_uuid),
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "created_at": "2026-07-18T00:00:00+00:00",
+        }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        lambda session, **values: {"chat_uuid": sys_uuid.uuid4()},
+    )
+    queued = []
+
+    def queue(session, **values):
+        assert session is request_session
+        queued.append(values)
+        return sys_uuid.uuid4()
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        queue,
+    )
+    row = {"uuid": str(boundary_uuid), "read": True}
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "read_workspace_user_topic_messages_to_message",
+        lambda *args, **kwargs: row,
+    )
+
+    result = store.perform_action("messages", boundary_uuid, "read_up_to", {})
+
+    assert result["uuid"] == str(boundary_uuid)
+    assert len(queued) == 1
+    payload = queued[0]["payload"]
+    assert payload["message_uuids"] == [str(lower_uuid), str(boundary_uuid)]
+    assert "through_message_uuid" not in payload
+    assert [entry.record.entity_uuid for entry in service.repository.entries] == [
+        lower_uuid,
+        boundary_uuid,
+    ]
+
+
+def test_external_topic_read_queues_exact_canonical_message_set(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    lower_uuid = sys_uuid.UUID("10000000-0000-0000-0000-000000000010")
+    higher_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000020")
+    service.repository.projection.topics[topic_uuid] = {
+        "uuid": str(topic_uuid),
+        "stream_uuid": str(stream_uuid),
+    }
+    for message_uuid in (higher_uuid, lower_uuid):
+        service.repository.projection.messages[message_uuid] = {
+            "uuid": str(message_uuid),
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "created_at": "2026-07-18T00:00:00+00:00",
+        }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        lambda session, **values: {"chat_uuid": sys_uuid.uuid4()},
+    )
+    queued = []
+
+    def queue(session, **values):
+        assert session is request_session
+        queued.append(values)
+        return sys_uuid.uuid4()
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        queue,
+    )
+    row = {"uuid": str(topic_uuid), "unread_count": 0}
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "read_workspace_user_stream_topic_messages",
+        lambda *args, **kwargs: row,
+    )
+
+    result = store.perform_action("stream_topics", topic_uuid, "read", {})
+
+    assert result["uuid"] == str(topic_uuid)
+    assert len(queued) == 1
+    payload = queued[0]["payload"]
+    assert payload["message_uuids"] == [str(lower_uuid), str(higher_uuid)]
+    assert "through_message_uuid" not in payload
+
+
+def test_external_message_read_queues_single_exact_selector(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    service.repository.projection.messages[message_uuid] = {
+        "uuid": str(message_uuid),
+        "stream_uuid": str(stream_uuid),
+        "topic_uuid": str(topic_uuid),
+        "created_at": "2026-07-18T00:00:00+00:00",
+    }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        lambda session, **values: {"chat_uuid": sys_uuid.uuid4()},
+    )
+    queued = []
+
+    def queue(session, **values):
+        assert session is request_session
+        queued.append(values)
+        return sys_uuid.uuid4()
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        queue,
+    )
+    row = {"uuid": str(message_uuid), "read": True}
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "read_workspace_user_message",
+        lambda *args, **kwargs: row,
+    )
+
+    result = store.perform_action("messages", message_uuid, "read", {})
+
+    assert result["uuid"] == str(message_uuid)
+    assert len(queued) == 1
+    payload = queued[0]["payload"]
+    assert payload["message_uuids"] == [str(message_uuid)]
+    assert "through_message_uuid" not in payload
+
+
+def test_empty_external_topic_read_does_not_queue_bridge_operation(monkeypatch):
+    order = []
+    service = FakeMailService(order)
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    service.repository.projection.topics[topic_uuid] = {
+        "uuid": str(topic_uuid),
+        "stream_uuid": str(stream_uuid),
+    }
+    store = sql_store.SQLProjectedMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+        service,
+        bridge_config=types.SimpleNamespace(
+            realm_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            identity_generation=1,
+            enrollment_secret="opaque enrollment secret",
+        ),
+    )
+    request_session = object()
+    monkeypatch.setattr(
+        sql_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: request_session),
+    )
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "validate_workspace_operation",
+        lambda session, **values: {"chat_uuid": sys_uuid.uuid4()},
+    )
+
+    def reject_queue(*args, **kwargs):
+        raise AssertionError("empty topic read must not queue a bridge operation")
+
+    monkeypatch.setattr(
+        sql_store.external_bridge_data_plane,
+        "queue_workspace_operation",
+        reject_queue,
+    )
+    row = {"uuid": str(topic_uuid), "unread_count": 0}
+    monkeypatch.setattr(
+        sql_store.helpers,
+        "read_workspace_user_stream_topic_messages",
+        lambda *args, **kwargs: row,
+    )
+
+    result = store.perform_action("stream_topics", topic_uuid, "read", {})
+
+    assert result["uuid"] == str(topic_uuid)
+    assert order == []
+    assert service.repository.entries == []
+
+
+def test_draft_page_reuses_request_database_session(monkeypatch):
+    result = types.SimpleNamespace(fetchall=lambda: [])
+    request_session = types.SimpleNamespace(execute=lambda *args: result)
+    context = types.SimpleNamespace(get_session=lambda: request_session)
+    monkeypatch.setattr(sql_store.contexts, "Context", lambda: context)
+
+    store = sql_store.SQLDraftStore(PROJECT_UUID, USER_UUID)
+
+    assert store.filter_draft_page({}, None, "asc", 20) == []
+
+
 def test_message_retry_reuses_existing_sql_projection(monkeypatch):
     order = []
     service = FakeMailService(order)
@@ -347,9 +1021,10 @@ def test_event_cursor_rejects_missing_changed_future_and_pruned_resumes():
             assert user_uuid == USER_UUID
             return repository.EventCursorState("91", 20, 10)
 
-        def events_after(self, user_uuid, cursor):
+        def events_after(self, user_uuid, cursor, limit=None):
             assert user_uuid == USER_UUID
             assert cursor == repository.EpochCursor(91, 9)
+            assert limit is None
             return []
 
     service = types.SimpleNamespace(repository=EventRepository())
@@ -366,9 +1041,7 @@ def test_event_cursor_rejects_missing_changed_future_and_pruned_resumes():
         (8, "91", "epoch_pruned"),
     )
     for after, generation, reason in cases:
-        with pytest.raises(
-            messenger_exceptions.EventsCursorExpiredError
-        ) as error:
+        with pytest.raises(messenger_exceptions.EventsCursorExpiredError) as error:
             store.events_after(
                 {"epoch_version": dm_filters.GT(after)},
                 epoch_generation=generation,
@@ -376,7 +1049,10 @@ def test_event_cursor_rejects_missing_changed_future_and_pruned_resumes():
         assert error.value.reason == reason
         assert error.value.minimum_epoch_version == 10
 
-    assert store.events_after(
-        {"epoch_version": dm_filters.GT(9)},
-        epoch_generation="91",
-    ) == []
+    assert (
+        store.events_after(
+            {"epoch_version": dm_filters.GT(9)},
+            epoch_generation="91",
+        )
+        == []
+    )

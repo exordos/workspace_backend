@@ -1,0 +1,1976 @@
+openapi: 3.1.0
+info:
+  title: Workspace Zulip Bridge Private Control API
+  version: 1.0.0
+  description: |
+    Version 1 of the private control plane between a Workspace realm and one
+    certificate-bound Zulip bridge installation. The API carries provisioning,
+    desired state, liveness, capabilities, and observed state only. Messenger
+    operations and events use the separate private Provider API, and file bytes
+    use the separate private file API.
+
+    Except for CA bootstrap and initial enrollment, every operation requires a
+    valid mTLS client certificate. The backend derives realm, provider kind,
+    bridge instance, and identity generation exclusively from the verified
+    certificate and checks current instance state on every request, including
+    requests received on a reused TLS connection. Bodies cannot override it.
+
+    First trust uses the realm-bound, HMAC-authenticated Workspace bootstrap
+    pattern. The bridge sends a fresh 256-bit nonce, expected
+    control hostname, bridge instance UUID, and unopened enrollment generation
+    to the plain-HTTP internal
+    `GET /ca.crt` endpoint. The enrollment secret is never sent. The backend
+    selects only that unopened instance generation and authenticates exact CA
+    bytes with HMAC-SHA256 over every lookup value and the PEM. The bridge rejects
+    redirects, missing or oversized bodies, invalid HMAC, and invalid PEM, then
+    atomically installs the CA before opening the HTTPS listener.
+
+    Initial enrollment is the only HTTPS route that does not require an existing
+    client certificate. It uses the same one-time enrollment secret in
+    `X-Workspace-Enrollment-Token`; successful CSR signing atomically consumes
+    its generation. TLS JSON responses are non-cacheable. Both peers ignore
+    unknown JSON object fields so additive metadata remains compatible within
+    `/v1`; required behavior is negotiated through named capabilities.
+
+    HTTPS request framing is strict: every request, including a bodyless GET,
+    carries exactly one canonical non-negative decimal `Content-Length` (zero
+    for a bodyless request). `Transfer-Encoding`, duplicate or comma-joined
+    lengths, signed values, and leading-zero values are rejected and the
+    connection is closed. Except for the bounded initial-enrollment request,
+    the listener verifies that a TLS client certificate is present before it
+    reads a request body; certificate identity/generation authorization is then
+    repeated by the application for every request.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: https://bridge-control.example.invalid
+    description: Platform-internal listener; never exposed by public Workspace nginx.
+tags:
+  - name: CA bootstrap
+  - name: Enrollment
+  - name: Certificates
+  - name: Desired state
+  - name: Bridge instance
+  - name: Observed state
+security:
+  - bridgeMtls: []
+paths:
+  /ca.crt:
+    get:
+      tags: [CA bootstrap]
+      operationId: getControlCaBootstrapV1
+      summary: Fetch the public control CA with nonce-bound HMAC authentication.
+      description: |
+        This operation defines the `workspace-external-bridge-control-ca-v1`
+        producer/consumer pattern. It includes instance and generation lookup because
+        a realm can have several independently enrolled bridge installations. It
+        runs on a separate internal plain-HTTP listener before TLS trust exists.
+        The request carries no secret. The bridge generates `nonce` with
+        `secrets.token_hex(32)`, supplies the exact configured control hostname,
+        disables redirects, and uses a ten-second timeout.
+
+        The backend returns the exact PEM bytes and lower-case hexadecimal
+        HMAC-SHA256 in `X-Workspace-CA-HMAC-SHA256`. Both peers derive the HMAC
+        key as `SHA-256(b"workspace-bridge-enrollment-v1\0" + token_utf8)`;
+        this is also the verifier persisted by the backend. The backend looks up
+        exactly the requested bridge instance and unopened generation before it
+        selects that verifier. Its HMAC message is:
+
+        `b"workspace-external-bridge-control-ca-v1\0" + nonce_ascii + b"\0" + hostname_utf8 + b"\0" + bridge_instance_uuid_ascii + b"\0" + enrollment_generation_ascii + b"\0" + ca_pem_bytes`
+
+        The distinct context provides domain separation from every other
+        bootstrap protocol. A CA fetch does not consume the enrollment generation;
+        successful CSR signing does. The consumer requires `Content-Length`,
+        rejects bodies over 1 MiB, compares HMAC in constant time, validates the
+        PEM with the system TLS parser, and atomically installs mode `0644` using
+        fsync, rename, and parent-directory fsync.
+      servers:
+        - url: http://bridge-control.example.invalid:21085
+          description: Symbolic platform-internal CA bootstrap listener.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CaBootstrapNonce'
+        - $ref: '#/components/parameters/CaBootstrapHostname'
+        - $ref: '#/components/parameters/CaBootstrapBridgeInstanceUuid'
+        - $ref: '#/components/parameters/CaBootstrapEnrollmentGeneration'
+      responses:
+        '200':
+          description: Public control CA authenticated by the one-time enrollment secret.
+          headers:
+            Content-Length:
+              description: Exact PEM byte length; required and at most 1 MiB.
+              schema:
+                type: integer
+                minimum: 1
+                maximum: 1048576
+            X-Workspace-CA-HMAC-SHA256:
+              $ref: '#/components/headers/CaBootstrapHmac'
+          content:
+            application/x-pem-file:
+              schema:
+                $ref: '#/components/schemas/PemCertificate'
+        '400':
+          description: Malformed query encoding or nonce.
+        '404':
+          description: Path/query shape or an unopened instance generation was not found.
+        '409':
+          description: Requested hostname or persistent realm metadata does not match.
+        '414':
+          description: Request target exceeds 512 bytes.
+        '503':
+          description: Enrollment config, persistent realm metadata, or CA is unavailable.
+
+  /v1/enrollments:
+    post:
+      tags: [Enrollment]
+      operationId: enrollBridgeInstanceV1
+      summary: Consume one enrollment generation and sign a bridge CSR.
+      description: |
+        This is the only operation that does not require an existing client
+        certificate. The backend authenticates the one-time enrollment token,
+        verifies that every identity field matches its unopened enrollment
+        generation, validates proof of possession in the CSR, persists the
+        bridge encryption public key, signs the CSR, and atomically consumes the
+        enrollment generation before responding. Reuse never signs another CSR.
+
+        The issued certificate contains exactly one URI SAN:
+        `https://schemas.genesis-corporation.ru/workspace/external-bridge/v1/realms/{realm_uuid}/providers/{provider_kind}/instances/{bridge_instance_uuid}/generations/{identity_generation}`.
+        The four path values are authorization claims, not a network endpoint.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentRequest'
+      responses:
+        '201':
+          description: The generation was consumed and the certificate was issued.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CertificateIssuance'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The enrollment token is absent or invalid.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ControlProblem'
+        '409':
+          description: The generation was consumed, closed, or does not match the request.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ControlProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: The CSR or encryption public key is invalid.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ControlProblem'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/certificate-renewals:
+    post:
+      tags: [Certificates]
+      operationId: renewBridgeCertificateV1
+      summary: Renew the current bridge identity with a locally generated key.
+      description: |
+        The caller must present a still-valid certificate. Renewal is accepted
+        during the seven-day renewal window or while an explicit control-CA
+        migration requires a leaf under the new CA. Renewal preserves the
+        certificate identity claims and `identity_generation`. A new CSR public
+        key is required. The old and new leaves may overlap for at most 24 hours.
+        Repeating `request_uuid` with the same CSR returns the same issuance;
+        reusing it with different canonical input returns `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CertificateRenewalRequest'
+      responses:
+        '200':
+          description: A renewed leaf certificate was issued.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CertificateIssuance'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/BridgeForbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: The CSR is invalid or does not prove possession of a new key.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ControlProblem'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/desired-state/changes:
+    get:
+      tags: [Desired state]
+      operationId: getDesiredStateChangesV1
+      summary: Read the next transactional desired-state batch.
+      description: |
+        The opaque cursor is bound to the authenticated realm, provider kind,
+        bridge instance, normalized `resource_types`, and control schema major.
+        A response is an ordered idempotent transaction. The bridge applies all
+        changes atomically and persists `next_cursor` only after commit. It must
+        roll back the whole batch for an unknown resource type, unknown
+        operation, or unsupported required capability.
+
+        For an upsert, the outer resource type, UUID, and generation equal the
+        corresponding fields in the replacement snapshot. Applying the same or
+        an older resource generation is a no-op; a newer generation atomically
+        replaces local desired state. A delete contains no prior snapshot or
+        secret and its generation is applied with the same monotonic rule.
+
+        Only one poll may be outstanding for an instance. Empty responses
+        return immediately with an unchanged cursor. After a successful call,
+        the bridge waits two seconds before polling again. Retryable failures
+        use full-jitter exponential backoff from one to 30 seconds; `429` and
+        `503` honor `Retry-After` up to 300 seconds.
+      parameters:
+        - $ref: '#/components/parameters/ChangeCursor'
+        - $ref: '#/components/parameters/ResourceTypes'
+        - $ref: '#/components/parameters/ChangePageLimit'
+      responses:
+        '200':
+          description: Ordered desired changes and the checkpoint to commit.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesiredChangeBatch'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/BridgeForbidden'
+        '409':
+          description: Another poll is outstanding or instance state conflicts with polling.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ControlProblem'
+        '410':
+          $ref: '#/components/responses/ControlCursorExpired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/desired-state/snapshots:
+    post:
+      tags: [Desired state]
+      operationId: createDesiredStateSnapshotV1
+      summary: Open a 15-minute logical desired-state snapshot session.
+      description: |
+        The snapshot is scoped to the authenticated bridge and normalized
+        resource-type filter. The backend does not retain a database transaction
+        for the session. Concurrent mutations are guaranteed to appear either in
+        the stable pages or in the change feed strictly after `anchor_cursor`.
+        Repeating `request_uuid` with the same filter while the session is valid
+        returns the same session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SnapshotCreateRequest'
+      responses:
+        '201':
+          description: A logical snapshot session was created.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotSession'
+        '200':
+          description: An existing idempotent snapshot session was returned.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/BridgeForbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/desired-state/snapshots/{snapshot_token}/pages:
+    get:
+      tags: [Desired state]
+      operationId: getDesiredStateSnapshotPageV1
+      summary: Read one stable page from a logical snapshot.
+      description: |
+        Pages are ordered by `(resource_type, resource_uuid)`. The first page
+        omits `page_cursor`; later pages use `next_page_cursor`. The bridge
+        stages every page, replays changes strictly after `anchor_cursor`, and
+        atomically installs the staged state and resulting checkpoint.
+      parameters:
+        - $ref: '#/components/parameters/SnapshotToken'
+        - $ref: '#/components/parameters/SnapshotPageCursor'
+        - $ref: '#/components/parameters/SnapshotPageLimit'
+      responses:
+        '200':
+          description: One stable snapshot page.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/BridgeForbidden'
+        '410':
+          $ref: '#/components/responses/SnapshotExpired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/bridge-instances/self/heartbeat:
+    put:
+      tags: [Bridge instance]
+      operationId: putBridgeHeartbeatV1
+      summary: Publish liveness and negotiate the fail-closed capability intersection.
+      description: |
+        The bridge sends a heartbeat every ten seconds using an independent
+        retry loop. It contains no account, chat, credential, message, or file
+        details. Backend receipt time is authoritative; health becomes
+        `degraded` after 30 seconds and `offline` after 60 seconds. Unknown
+        capability names are ignored. A later compatible heartbeat clears the
+        `incompatible` state but never overrides administrative suspension or
+        revocation. Repeating a `heartbeat_uuid` with identical canonical input
+        is idempotent; reusing it with different input returns `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequest'
+      responses:
+        '200':
+          description: Heartbeat accepted and current capability intersection returned.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/BridgeForbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/observed-state/reports:
+    post:
+      tags: [Observed state]
+      operationId: reportObservedStateV1
+      summary: Submit up to 500 idempotent observed-state records.
+      description: |
+        The backend persists accepted items before responding and returns one
+        result per `report_uuid` in request order. Invalid independent items do
+        not block valid items. Repeated UUIDs are no-ops, and stale generations
+        cannot overwrite newer observed state. An invalid batch envelope applies
+        nothing. The bridge removes only `applied`, `duplicate`, and deliberately
+        discarded `stale` items from its durable outbox.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ObservedReportBatch'
+      responses:
+        '200':
+          description: Per-item application results in request order.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservedReportResults'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/BridgeForbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bridgeMtls:
+      type: mutualTLS
+      description: |
+        TLS 1.2 or newer terminates in the private backend process; identity is
+        never accepted from an HTTP forwarding header. The bridge validates the
+        backend certificate against the realm control CA and configured server
+        name. Disabling chain or hostname verification is forbidden.
+
+        A client leaf must chain to the realm control CA, contain EKU
+        `clientAuth`, and contain exactly the one URI SAN encoded by
+        `BridgeIdentityClaims`. UUIDs are canonical lower-case strings,
+        provider kind is lower-case, and generation is positive base-10 without
+        leading zeroes. Subject CN and DNS SAN are not identity inputs. The
+        backend validates chain, validity, URI claims, active generation,
+        provider assignment, and suspend/revoke state on every request. TLS
+        authentication failure normally terminates the handshake and therefore
+        may produce no HTTP response.
+    enrollmentToken:
+      type: apiKey
+      in: header
+      name: X-Workspace-Enrollment-Token
+      description: |
+        Opaque one-time, generation-bound value from the per-installation
+        Exordos secret resource. Producer and consumer use the exact UTF-8 bytes
+        delivered by protected Core-managed config; clients do not impose a new
+        encoding or length on that existing resource contract. The backend
+        persists only `SHA-256(b"workspace-bridge-enrollment-v1\0" + token_utf8)`
+        and its generation on the secrets disk. That verifier is the CA-response
+        HMAC key and is compared in constant time during enrollment. Never log
+        the header, config value, verifier, or derivation input.
+
+  headers:
+    CaBootstrapHmac:
+      description: |
+        Lower-case hexadecimal HMAC-SHA256 of the protocol context, fresh nonce,
+        expected hostname, bridge instance, enrollment generation, and exact
+        response bytes using the derived enrollment verifier.
+      schema:
+        type: string
+        pattern: '^[a-f0-9]{64}$'
+    NoStore:
+      description: Private control responses must not be cached.
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: Retry delay in seconds. A bridge honors at most 300 seconds.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 300
+
+  parameters:
+    CaBootstrapNonce:
+      name: nonce
+      in: query
+      required: true
+      description: Fresh 256-bit nonce encoded as exactly 64 lower-case hex characters.
+      schema:
+        type: string
+        pattern: '^[a-f0-9]{64}$'
+    CaBootstrapHostname:
+      name: hostname
+      in: query
+      required: true
+      description: Exact configured HTTPS control-listener hostname covered by the HMAC.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 253
+        pattern: '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+    CaBootstrapBridgeInstanceUuid:
+      name: bridge_instance_uuid
+      in: query
+      required: true
+      description: Bridge installation whose unopened verifier signs this response.
+      schema:
+        $ref: '#/components/schemas/Uuid'
+    CaBootstrapEnrollmentGeneration:
+      name: enrollment_generation
+      in: query
+      required: true
+      description: Positive unopened enrollment generation, encoded without leading zeroes.
+      schema:
+        $ref: '#/components/schemas/PositiveGeneration'
+    ChangeCursor:
+      name: cursor
+      in: query
+      required: true
+      description: Opaque checkpoint returned by a committed batch or snapshot.
+      schema:
+        $ref: '#/components/schemas/OpaqueCursor'
+    ResourceTypes:
+      name: resource_types
+      in: query
+      required: false
+      description: |
+        Comma-separated normalized filter. Omission means all resource types.
+        Ordering is irrelevant; duplicates are rejected. The normalized set is
+        bound into the cursor and must match snapshot recovery.
+      style: form
+      explode: false
+      schema:
+        type: array
+        minItems: 1
+        uniqueItems: true
+        items:
+          $ref: '#/components/schemas/DesiredResourceType'
+    ChangePageLimit:
+      name: page_limit
+      in: query
+      required: false
+      description: Maximum changes in one transactional batch.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 200
+    SnapshotToken:
+      name: snapshot_token
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 32
+        maxLength: 2048
+        pattern: '^[A-Za-z0-9_-]+$'
+    SnapshotPageCursor:
+      name: page_cursor
+      in: query
+      required: false
+      description: Opaque cursor from the preceding page; omitted for page one.
+      schema:
+        $ref: '#/components/schemas/OpaqueCursor'
+    SnapshotPageLimit:
+      name: page_limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 200
+
+  responses:
+    BadRequest:
+      description: The request envelope, query, or JSON schema is invalid; nothing is applied.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+    Unauthenticated:
+      description: No currently valid bridge identity was authenticated.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+    BridgeForbidden:
+      description: The identity is suspended, revoked, generation-stale, or outside resource scope.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+    Conflict:
+      description: Idempotency input, generation, or current state conflicts with the request.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+    ControlCursorExpired:
+      description: The incremental journal cannot satisfy this cursor; start a snapshot.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlCursorExpiredProblem'
+    SnapshotExpired:
+      description: The snapshot session cannot be continued; start another session.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlSnapshotExpiredProblem'
+    PayloadTooLarge:
+      description: The JSON body exceeds 1 MiB or a bounded field exceeds its schema limit.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+    TooManyRequests:
+      description: Per-instance request rate or concurrency limit exceeded.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+    ServiceUnavailable:
+      description: A retryable backend dependency is unavailable.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ControlProblem'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    PositiveGeneration:
+      type: integer
+      format: int64
+      minimum: 1
+      maximum: 9223372036854775807
+    OpaqueCursor:
+      type: string
+      minLength: 16
+      maxLength: 4096
+      pattern: '^[A-Za-z0-9._~-]+$'
+    Sha256Hex:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    Base64Url:
+      type: string
+      pattern: '^[A-Za-z0-9_-]+$'
+    PemCertificate:
+      type: string
+      minLength: 64
+      maxLength: 32768
+      pattern: '^-----BEGIN CERTIFICATE-----[\\s\\S]+-----END CERTIFICATE-----\\s*$'
+    PemCsr:
+      type: string
+      minLength: 64
+      maxLength: 16384
+      pattern: '^-----BEGIN CERTIFICATE REQUEST-----[\\s\\S]+-----END CERTIFICATE REQUEST-----\\s*$'
+    ProviderKind:
+      type: string
+      enum: [zulip]
+    ControlSchemaVersion:
+      type: string
+      enum: [v1]
+    DesiredResourceType:
+      type: string
+      enum:
+        - external_account
+        - external_chat_assignment
+        - external_provider_policy
+        - custom_ca_bundle
+    ObservedResourceType:
+      type: string
+      enum:
+        - external_account
+        - external_chat_assignment
+        - external_chat_catalog
+        - external_provider_policy
+        - custom_ca_bundle
+
+    ControlProblem:
+      type: object
+      additionalProperties: true
+      required: [type, status, error, message, request_uuid]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          maxLength: 256
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        error:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z][a-z0-9_]*$'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        retryable:
+          type: boolean
+          default: false
+
+    ControlCursorExpiredProblem:
+      type: object
+      additionalProperties: true
+      required:
+        - type
+        - status
+        - error
+        - message
+        - request_uuid
+        - reason
+        - snapshot_generation
+      properties:
+        type:
+          type: string
+          const: ControlCursorExpiredError
+        status:
+          type: integer
+          const: 410
+        error:
+          type: string
+          const: control_cursor_pruned
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        reason:
+          type: string
+          enum: [retention, generation_mismatch, scope_mismatch, schema_mismatch]
+        snapshot_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+
+    ControlSnapshotExpiredProblem:
+      type: object
+      additionalProperties: true
+      required: [type, status, error, message, request_uuid, reason]
+      properties:
+        type:
+          type: string
+          const: ControlSnapshotExpiredError
+        status:
+          type: integer
+          const: 410
+        error:
+          type: string
+          const: control_snapshot_expired
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        reason:
+          type: string
+          enum: [expired, unknown, scope_mismatch, schema_mismatch]
+
+    EnrollmentRequest:
+      type: object
+      additionalProperties: true
+      required:
+        - request_uuid
+        - enrollment_generation
+        - realm_uuid
+        - provider_kind
+        - bridge_instance_uuid
+        - csr_pem
+        - encryption_public_key
+      properties:
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        enrollment_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        realm_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+        bridge_instance_uuid:
+          $ref: '#/components/schemas/Uuid'
+        csr_pem:
+          $ref: '#/components/schemas/PemCsr'
+        encryption_public_key:
+          $ref: '#/components/schemas/BridgeEncryptionPublicKey'
+
+    BridgeEncryptionPublicKey:
+      type: object
+      additionalProperties: true
+      required: [key_uuid, algorithm, public_key]
+      properties:
+        key_uuid:
+          $ref: '#/components/schemas/Uuid'
+        algorithm:
+          type: string
+          const: X25519
+        public_key:
+          allOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - description: Unpadded base64url encoding of exactly 32 raw X25519 bytes.
+              minLength: 43
+              maxLength: 43
+
+    BridgeIdentityClaims:
+      type: object
+      additionalProperties: true
+      required:
+        - realm_uuid
+        - provider_kind
+        - bridge_instance_uuid
+        - identity_generation
+        - uri_san
+      properties:
+        realm_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+        bridge_instance_uuid:
+          $ref: '#/components/schemas/Uuid'
+        identity_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        uri_san:
+          type: string
+          format: uri
+          pattern: '^https://schemas\\.genesis-corporation\\.ru/workspace/external-bridge/v1/realms/[0-9a-f-]{36}/providers/zulip/instances/[0-9a-f-]{36}/generations/[1-9][0-9]*$'
+
+    CertificateIssuance:
+      type: object
+      additionalProperties: true
+      required:
+        - request_uuid
+        - certificate_uuid
+        - issuer_ca_generation
+        - identity
+        - certificate_pem
+        - ca_chain_pem
+        - trust_bundle_pem
+        - not_before
+        - not_after
+        - renew_after
+        - overlap_ends_at
+      properties:
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        certificate_uuid:
+          $ref: '#/components/schemas/Uuid'
+        issuer_ca_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        identity:
+          $ref: '#/components/schemas/BridgeIdentityClaims'
+        certificate_pem:
+          $ref: '#/components/schemas/PemCertificate'
+        ca_chain_pem:
+          type: array
+          minItems: 1
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/PemCertificate'
+        trust_bundle_pem:
+          type: array
+          minItems: 1
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/PemCertificate'
+          description: Active control roots; contains old and new roots during the 30-day CA overlap.
+        not_before:
+          type: string
+          format: date-time
+        not_after:
+          type: string
+          format: date-time
+          description: Exactly 30 days after issuance, subject to CA expiry.
+        renew_after:
+          type: string
+          format: date-time
+          description: Seven days before `not_after`.
+        overlap_ends_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+          description: Null for first enrollment; at most 24 hours after renewal.
+
+    CertificateRenewalRequest:
+      type: object
+      additionalProperties: true
+      required: [request_uuid, csr_pem]
+      properties:
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        csr_pem:
+          $ref: '#/components/schemas/PemCsr'
+
+    DesiredChangeBatch:
+      type: object
+      additionalProperties: true
+      required:
+        - control_schema_version
+        - snapshot_generation
+        - current_cursor
+        - next_cursor
+        - changes
+        - retained_since
+      properties:
+        control_schema_version:
+          $ref: '#/components/schemas/ControlSchemaVersion'
+        snapshot_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        current_cursor:
+          $ref: '#/components/schemas/OpaqueCursor'
+        next_cursor:
+          $ref: '#/components/schemas/OpaqueCursor'
+        changes:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/DesiredChange'
+        retained_since:
+          type: string
+          format: date-time
+          description: Exact seven-day journal retention boundary at response time.
+
+    DesiredChange:
+      oneOf:
+        - $ref: '#/components/schemas/DesiredUpsertChange'
+        - $ref: '#/components/schemas/DesiredDeleteChange'
+      discriminator:
+        propertyName: operation
+        mapping:
+          upsert: '#/components/schemas/DesiredUpsertChange'
+          delete: '#/components/schemas/DesiredDeleteChange'
+
+    DesiredUpsertChange:
+      type: object
+      additionalProperties: true
+      required:
+        - change_uuid
+        - sequence
+        - resource_type
+        - resource_uuid
+        - operation
+        - generation
+        - required_capabilities
+        - resource
+      properties:
+        change_uuid:
+          $ref: '#/components/schemas/Uuid'
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        resource_type:
+          $ref: '#/components/schemas/DesiredResourceType'
+        resource_uuid:
+          $ref: '#/components/schemas/Uuid'
+        operation:
+          type: string
+          const: upsert
+        generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        required_capabilities:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            $ref: '#/components/schemas/CapabilityRequirement'
+        resource:
+          $ref: '#/components/schemas/DesiredResource'
+
+    DesiredDeleteChange:
+      type: object
+      additionalProperties: true
+      required:
+        - change_uuid
+        - sequence
+        - resource_type
+        - resource_uuid
+        - operation
+        - generation
+      properties:
+        change_uuid:
+          $ref: '#/components/schemas/Uuid'
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        resource_type:
+          $ref: '#/components/schemas/DesiredResourceType'
+        resource_uuid:
+          $ref: '#/components/schemas/Uuid'
+        operation:
+          type: string
+          const: delete
+        generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+
+    DesiredResource:
+      oneOf:
+        - $ref: '#/components/schemas/ExternalAccountDesired'
+        - $ref: '#/components/schemas/ExternalChatAssignmentDesired'
+        - $ref: '#/components/schemas/ExternalProviderPolicyDesired'
+        - $ref: '#/components/schemas/CustomCaBundleDesired'
+      discriminator:
+        propertyName: resource_type
+        mapping:
+          external_account: '#/components/schemas/ExternalAccountDesired'
+          external_chat_assignment: '#/components/schemas/ExternalChatAssignmentDesired'
+          external_provider_policy: '#/components/schemas/ExternalProviderPolicyDesired'
+          custom_ca_bundle: '#/components/schemas/CustomCaBundleDesired'
+
+    ExternalAccountDesired:
+      type: object
+      additionalProperties: true
+      required:
+        - resource_type
+        - uuid
+        - generation
+        - owner_user_uuid
+        - settings
+        - synchronization_enabled
+        - credential_envelope
+      properties:
+        resource_type:
+          type: string
+          const: external_account
+        uuid:
+          $ref: '#/components/schemas/Uuid'
+        generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        owner_user_uuid:
+          $ref: '#/components/schemas/Uuid'
+        settings:
+          $ref: '#/components/schemas/ZulipAccountDesiredSettings'
+        synchronization_enabled:
+          type: boolean
+          description: False for disconnect, IAM deactivation, or policy suspension.
+        credential_envelope:
+          oneOf:
+            - $ref: '#/components/schemas/EncryptedCredentialEnvelope'
+            - type: 'null'
+          description: Null after credential deletion; never contains plaintext.
+
+    ZulipAccountDesiredSettings:
+      type: object
+      additionalProperties: true
+      required:
+        - kind
+        - server_url
+        - selection_mode
+        - history_depth
+        - default_project_id
+      properties:
+        kind:
+          type: string
+          const: zulip
+        server_url:
+          type: string
+          format: uri
+          pattern: '^https://'
+          maxLength: 2048
+        selection_mode:
+          type: string
+          enum: [explicit, all]
+        history_depth:
+          type: string
+          enum: [new, 7_days, 30_days, 90_days, all]
+        default_project_id:
+          $ref: '#/components/schemas/Uuid'
+
+    EncryptedCredentialEnvelope:
+      type: object
+      additionalProperties: false
+      required:
+        - schema
+        - algorithm
+        - associated_data
+        - encapsulated_key
+        - ciphertext
+      properties:
+        schema:
+          type: string
+          const: workspace.external-credential.zulip/v1
+          description: |
+            Decrypted bytes are RFC 8785 canonical JSON with exactly `server_url`,
+            `email`, and `api_key` string properties and no additional properties.
+        algorithm:
+          type: string
+          const: HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM
+          description: RFC 9180 base mode, KEM 0x0020, KDF 0x0001, AEAD 0x0002.
+        associated_data:
+          $ref: '#/components/schemas/CredentialAssociatedData'
+        encapsulated_key:
+          allOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - description: Unpadded base64url HPKE `enc` value; exactly 32 bytes.
+              minLength: 43
+              maxLength: 43
+        ciphertext:
+          allOf:
+            - $ref: '#/components/schemas/Base64Url'
+            - minLength: 22
+              maxLength: 16384
+              description: Unpadded base64url ciphertext including the AEAD tag.
+
+    CredentialAssociatedData:
+      type: object
+      additionalProperties: false
+      required:
+        - realm_uuid
+        - provider_kind
+        - bridge_instance_uuid
+        - identity_generation
+        - credential_key_uuid
+        - account_uuid
+        - owner_user_uuid
+        - account_generation
+        - schema
+        - algorithm
+      properties:
+        realm_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+        bridge_instance_uuid:
+          $ref: '#/components/schemas/Uuid'
+        account_uuid:
+          $ref: '#/components/schemas/Uuid'
+        account_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        identity_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        credential_key_uuid:
+          $ref: '#/components/schemas/Uuid'
+        owner_user_uuid:
+          $ref: '#/components/schemas/Uuid'
+        schema:
+          type: string
+          const: workspace.external-credential.zulip/v1
+        algorithm:
+          type: string
+          const: HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM
+      description: |
+        Serialize this object with RFC 8785 and use the UTF-8 bytes as HPKE
+        associated data. HPKE `info` is the ASCII string
+        `workspace-external-credential-zulip-v1`.
+
+    ExternalChatAssignmentDesired:
+      type: object
+      additionalProperties: true
+      required:
+        - resource_type
+        - uuid
+        - generation
+        - external_account_uuid
+        - provider_chat
+        - project_id
+        - selected
+        - history_depth
+        - workspace_projection
+      properties:
+        resource_type:
+          type: string
+          const: external_chat_assignment
+        uuid:
+          $ref: '#/components/schemas/Uuid'
+        generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        external_account_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_chat:
+          $ref: '#/components/schemas/ZulipChatReference'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        selected:
+          type: boolean
+          const: true
+          description: Deselection is represented by a desired-state tombstone.
+        history_depth:
+          type: string
+          enum: [new, 7_days, 30_days, 90_days, all]
+        workspace_projection:
+          $ref: '#/components/schemas/WorkspaceProjectionMapping'
+
+    WorkspaceProjectionMapping:
+      type: object
+      additionalProperties: false
+      required: [stream, participants, topics]
+      properties:
+        stream:
+          $ref: '#/components/schemas/WorkspaceProjectionStream'
+        participants:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/WorkspaceProjectionParticipant'
+        topics:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceProjectionTopic'
+
+    WorkspaceProjectionStream:
+      type: object
+      additionalProperties: false
+      required: [uuid, name, description, chat_kind, private, default_topic_uuid]
+      properties:
+        uuid:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        description:
+          type: string
+          maxLength: 4096
+        chat_kind:
+          type: string
+          enum: [channel, personal_dm, group_dm]
+        private:
+          type: boolean
+        default_topic_uuid:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+
+    WorkspaceProjectionParticipant:
+      type: object
+      additionalProperties: false
+      required: [identity_uuid, provider_user_id, display_name, email, avatar_urn, role]
+      properties:
+        identity_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_user_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        email:
+          oneOf:
+            - type: string
+              format: email
+            - type: 'null'
+        avatar_urn:
+          oneOf:
+            - type: string
+              pattern: '^urn:'
+            - type: 'null'
+        role:
+          type: string
+          enum: [owner, member]
+
+    WorkspaceProjectionTopic:
+      type: object
+      additionalProperties: false
+      required: [topic_uuid, provider_topic_id, name, is_default]
+      properties:
+        topic_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_topic_id:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        is_default:
+          type: boolean
+
+    ZulipChatReference:
+      type: object
+      additionalProperties: true
+      required: [kind, chat_type, provider_chat_key]
+      properties:
+        kind:
+          type: string
+          const: zulip
+        chat_type:
+          type: string
+          enum: [channel, direct, group_direct]
+        provider_chat_key:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Stable bridge-authorized opaque provider identity; never public.
+        original_url:
+          oneOf:
+            - type: string
+              format: uri
+              maxLength: 2048
+            - type: 'null'
+          description: Safe provider URL used by the Workspace Open original action.
+
+    ExternalProviderPolicyDesired:
+      type: object
+      additionalProperties: true
+      required:
+        - resource_type
+        - uuid
+        - generation
+        - provider_kind
+        - enabled
+        - emergency_suspended
+        - limits
+        - custom_ca_bundle_uuid
+      properties:
+        resource_type:
+          type: string
+          const: external_provider_policy
+        uuid:
+          $ref: '#/components/schemas/Uuid'
+        generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+        enabled:
+          type: boolean
+        emergency_suspended:
+          type: boolean
+        limits:
+          $ref: '#/components/schemas/ProviderPolicyLimits'
+        custom_ca_bundle_uuid:
+          oneOf:
+            - $ref: '#/components/schemas/Uuid'
+            - type: 'null'
+
+    ProviderPolicyLimits:
+      type: object
+      additionalProperties: true
+      required: [max_accounts, max_selected_chats_per_account, max_file_bytes]
+      properties:
+        max_accounts:
+          type: integer
+          minimum: 0
+          maximum: 100000
+        max_selected_chats_per_account:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+        max_file_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 5368709120
+
+    CustomCaBundleDesired:
+      type: object
+      additionalProperties: true
+      description: |
+        Adds CA certificates to the system trust store for outbound Zulip TLS.
+        It never replaces system trust, never contains a private key, and never
+        disables certificate-chain or hostname verification.
+      required:
+        - resource_type
+        - uuid
+        - generation
+        - provider_kind
+        - sha256
+        - certificates_pem
+      properties:
+        resource_type:
+          type: string
+          const: custom_ca_bundle
+        uuid:
+          $ref: '#/components/schemas/Uuid'
+        generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        certificates_pem:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/PemCertificate'
+          description: CA certificates only. Private keys are forbidden.
+
+    SnapshotCreateRequest:
+      type: object
+      additionalProperties: true
+      required: [request_uuid]
+      properties:
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        resource_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/DesiredResourceType'
+          description: Omission means every desired resource type.
+
+    SnapshotSession:
+      type: object
+      additionalProperties: true
+      required:
+        - request_uuid
+        - snapshot_token
+        - anchor_cursor
+        - snapshot_generation
+        - resource_types
+        - expires_at
+      properties:
+        request_uuid:
+          $ref: '#/components/schemas/Uuid'
+        snapshot_token:
+          type: string
+          minLength: 32
+          maxLength: 2048
+          pattern: '^[A-Za-z0-9_-]+$'
+        anchor_cursor:
+          $ref: '#/components/schemas/OpaqueCursor'
+        snapshot_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        resource_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/DesiredResourceType'
+        expires_at:
+          type: string
+          format: date-time
+          description: Exactly 15 minutes after session creation.
+
+    SnapshotPage:
+      type: object
+      additionalProperties: true
+      required:
+        - snapshot_generation
+        - anchor_cursor
+        - resources
+        - next_page_cursor
+        - complete
+      properties:
+        snapshot_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        anchor_cursor:
+          $ref: '#/components/schemas/OpaqueCursor'
+        resources:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/DesiredSnapshotResource'
+        next_page_cursor:
+          oneOf:
+            - $ref: '#/components/schemas/OpaqueCursor'
+            - type: 'null'
+        complete:
+          type: boolean
+          description: True exactly when `next_page_cursor` is null.
+
+    DesiredSnapshotResource:
+      allOf:
+        - $ref: '#/components/schemas/DesiredResource'
+        - type: object
+          required: [required_capabilities]
+          properties:
+            required_capabilities:
+              type: object
+              maxProperties: 32
+              additionalProperties:
+                $ref: '#/components/schemas/CapabilityRequirement'
+
+    CapabilityName:
+      type: string
+      enum:
+        - messenger.chat_catalog
+        - messenger.message.send
+        - messenger.message.edit
+        - messenger.message.delete
+        - messenger.message.read
+        - messenger.stream.rename
+        - messenger.topic.rename
+        - messenger.file.transfer
+    CapabilityScalar:
+      oneOf:
+        - type: boolean
+        - type: integer
+          format: int64
+        - type: string
+          maxLength: 256
+        - type: array
+          maxItems: 32
+          items:
+            type: string
+            maxLength: 64
+    CapabilityDescriptor:
+      type: object
+      additionalProperties: true
+      required: [revision, limits]
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+        limits:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            $ref: '#/components/schemas/CapabilityScalar'
+    CapabilityRequirement:
+      type: object
+      additionalProperties: true
+      required: [min_revision, limits]
+      properties:
+        min_revision:
+          type: integer
+          minimum: 1
+        limits:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            $ref: '#/components/schemas/CapabilityScalar'
+
+    HeartbeatRequest:
+      type: object
+      additionalProperties: true
+      required:
+        - heartbeat_uuid
+        - client_timestamp
+        - image_version
+        - provider_kind
+        - capabilities
+        - blocked_batch
+      properties:
+        heartbeat_uuid:
+          $ref: '#/components/schemas/Uuid'
+        client_timestamp:
+          type: string
+          format: date-time
+          description: Diagnostic only; backend receipt time is authoritative.
+        image_version:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Diagnostic only and never substitutes for capabilities.
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+          description: Must equal the certificate-bound provider kind.
+        capabilities:
+          type: object
+          maxProperties: 64
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '^[a-z][a-z0-9_.]*$'
+          additionalProperties:
+            $ref: '#/components/schemas/CapabilityDescriptor'
+        blocked_batch:
+          oneOf:
+            - $ref: '#/components/schemas/BlockedDesiredBatch'
+            - type: 'null'
+          description: |
+            Bounded incompatibility report for the first uncommitted item in a
+            rolled-back desired-state batch. It contains no resource UUID,
+            account detail, credential, or message data. Null does not clear a
+            prior incompatibility unless advertised capabilities now cover the
+            blocked batch retained by the backend.
+
+    BlockedDesiredBatch:
+      type: object
+      additionalProperties: true
+      required:
+        - cursor
+        - first_change_uuid
+        - resource_type
+        - operation
+        - reason
+        - safe_error
+      properties:
+        cursor:
+          $ref: '#/components/schemas/OpaqueCursor'
+        first_change_uuid:
+          $ref: '#/components/schemas/Uuid'
+        resource_type:
+          type: string
+          minLength: 1
+          maxLength: 64
+        operation:
+          type: string
+          minLength: 1
+          maxLength: 64
+        reason:
+          type: string
+          enum: [unknown_resource_type, unknown_operation, unsupported_capability]
+        safe_error:
+          $ref: '#/components/schemas/SafeError'
+
+    HeartbeatResponse:
+      type: object
+      additionalProperties: true
+      required:
+        - heartbeat_uuid
+        - received_at
+        - instance_state
+        - negotiated_capabilities
+        - poll_interval_seconds
+        - heartbeat_interval_seconds
+        - degraded_after_seconds
+        - offline_after_seconds
+        - snapshot_generation
+        - ca_migration
+        - incompatibility
+      properties:
+        heartbeat_uuid:
+          $ref: '#/components/schemas/Uuid'
+        received_at:
+          type: string
+          format: date-time
+        instance_state:
+          type: string
+          enum: [healthy, degraded, offline, incompatible, suspended]
+        negotiated_capabilities:
+          type: object
+          maxProperties: 64
+          additionalProperties:
+            $ref: '#/components/schemas/CapabilityDescriptor'
+        poll_interval_seconds:
+          type: integer
+          const: 2
+        heartbeat_interval_seconds:
+          type: integer
+          const: 10
+        degraded_after_seconds:
+          type: integer
+          const: 30
+        offline_after_seconds:
+          type: integer
+          const: 60
+        snapshot_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        ca_migration:
+          $ref: '#/components/schemas/ControlCaMigration'
+        incompatibility:
+          oneOf:
+            - $ref: '#/components/schemas/SafeError'
+            - type: 'null'
+
+    ControlCaMigration:
+      type: object
+      additionalProperties: true
+      required: [active_ca_generations, renewal_required, overlap_ends_at]
+      properties:
+        active_ca_generations:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/PositiveGeneration'
+        renewal_required:
+          type: boolean
+          description: True when this bridge must obtain a leaf under the newest active CA.
+        overlap_ends_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+          description: Null outside an explicit CA migration; otherwise the 30-day retirement deadline.
+
+    SafeError:
+      type: object
+      additionalProperties: true
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[a-z][a-z0-9_]*$'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: No credentials, message content, provider payloads, or internal addresses.
+        retryable:
+          type: boolean
+
+    ObservedProgress:
+      type: object
+      additionalProperties: true
+      required: [phase, completed, total, last_progress_at]
+      properties:
+        phase:
+          type: string
+          enum: [provisioning, discovery, live, backfill, retry, purge, idle]
+        completed:
+          type: integer
+          format: int64
+          minimum: 0
+        total:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 0
+            - type: 'null'
+        last_progress_at:
+          oneOf:
+            - type: string
+              format: date-time
+            - type: 'null'
+
+    ObservedReport:
+      type: object
+      additionalProperties: true
+      required:
+        - report_uuid
+        - resource_type
+        - resource_uuid
+        - observed_generation
+        - status
+        - progress
+        - safe_error
+        - observed_at
+      properties:
+        report_uuid:
+          $ref: '#/components/schemas/Uuid'
+        resource_type:
+          $ref: '#/components/schemas/ObservedResourceType'
+        resource_uuid:
+          $ref: '#/components/schemas/Uuid'
+        observed_generation:
+          $ref: '#/components/schemas/PositiveGeneration'
+        status:
+          type: string
+          enum:
+            - applying
+            - ready
+            - live_ready
+            - backfill
+            - degraded
+            - auth_required
+            - disconnected
+            - suspended
+            - unsupported_capability
+            - deleted
+            - failed
+        progress:
+          $ref: '#/components/schemas/ObservedProgress'
+        safe_error:
+          oneOf:
+            - $ref: '#/components/schemas/SafeError'
+            - type: 'null'
+        observed_at:
+          type: string
+          format: date-time
+        catalog:
+          $ref: '#/components/schemas/ExternalChatCatalogObserved'
+          description: Required only when `resource_type` is `external_chat_catalog`.
+
+    ExternalChatCatalogObserved:
+      type: object
+      additionalProperties: false
+      required:
+        - operation
+        - external_account_uuid
+        - owner_user_uuid
+        - provider_kind
+        - project_id
+        - source
+        - display_name
+        - capabilities
+        - description
+        - participants
+        - topics
+      properties:
+        operation:
+          type: string
+          enum: [upsert, delete]
+        external_account_uuid:
+          $ref: '#/components/schemas/Uuid'
+        owner_user_uuid:
+          $ref: '#/components/schemas/Uuid'
+        provider_kind:
+          $ref: '#/components/schemas/ProviderKind'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        source:
+          $ref: '#/components/schemas/ZulipChatReference'
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        capabilities:
+          type: object
+          additionalProperties: true
+        description:
+          type: string
+          maxLength: 4096
+        participants:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ZulipCatalogParticipant'
+        topics:
+          type: array
+          items:
+            $ref: '#/components/schemas/ZulipCatalogTopic'
+
+    ZulipCatalogParticipant:
+      type: object
+      additionalProperties: false
+      required: [provider_user_id, display_name, is_owner]
+      properties:
+        provider_user_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        email:
+          oneOf:
+            - type: string
+              format: email
+            - type: 'null'
+        avatar_urn:
+          oneOf:
+            - type: string
+              pattern: '^urn:'
+            - type: 'null'
+        is_owner:
+          type: boolean
+
+    ZulipCatalogTopic:
+      type: object
+      additionalProperties: false
+      required: [provider_topic_id, name, is_default]
+      properties:
+        provider_topic_id:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        name:
+          type: string
+          minLength: 1
+          maxLength: 512
+        is_default:
+          type: boolean
+
+    ObservedReportBatch:
+      type: object
+      additionalProperties: true
+      required: [reports]
+      properties:
+        reports:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/ObservedReport'
+
+    ObservedReportResult:
+      type: object
+      additionalProperties: true
+      required: [report_uuid, status, safe_error]
+      properties:
+        report_uuid:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [applied, duplicate, stale, rejected]
+        safe_error:
+          oneOf:
+            - $ref: '#/components/schemas/SafeError'
+            - type: 'null'
+
+    ObservedReportResults:
+      type: object
+      additionalProperties: true
+      required: [results]
+      properties:
+        results:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/ObservedReportResult'

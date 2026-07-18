@@ -15,6 +15,7 @@
 #    under the License.
 
 import urllib.parse
+import typing
 
 from workspace.messenger_api import events as messenger_events
 
@@ -23,24 +24,27 @@ WORKSPACE_EVENTS_PROTOCOL = "workspace.events.v1"
 BEARER_PROTOCOL_PREFIX = "bearer."
 
 
-def select_subprotocol(client_subprotocols, server_subprotocols):
+def select_subprotocol(
+    client_subprotocols: typing.Sequence[str],
+    server_subprotocols: typing.Sequence[str],
+) -> str | None:
     if WORKSPACE_EVENTS_PROTOCOL in client_subprotocols:
         return WORKSPACE_EVENTS_PROTOCOL
     return None
 
 
-def bearer_token_from_subprotocols(header_value):
+def bearer_token_from_subprotocols(header_value: str | None) -> str | None:
     if not header_value:
         return None
     for item in header_value.split(","):
         protocol = item.strip()
         if protocol.startswith(BEARER_PROTOCOL_PREFIX):
-            token = protocol[len(BEARER_PROTOCOL_PREFIX):].strip()
+            token = protocol[len(BEARER_PROTOCOL_PREFIX) :].strip()
             return token or None
     return None
 
 
-def parse_last_epoch_version(path):
+def parse_last_epoch_version(path: str | None) -> int:
     parsed = urllib.parse.urlsplit(path or "")
     params = urllib.parse.parse_qs(parsed.query)
     values = params.get("last_epoch_version") or []
@@ -48,7 +52,7 @@ def parse_last_epoch_version(path):
     return messenger_events.normalize_epoch_version(value)
 
 
-def parse_epoch_generation(path):
+def parse_epoch_generation(path: str | None) -> str | None:
     parsed = urllib.parse.urlsplit(path or "")
     params = urllib.parse.parse_qs(parsed.query)
     values = params.get("epoch_generation") or []

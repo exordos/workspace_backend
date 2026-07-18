@@ -4,14 +4,16 @@ This document describes the browser-facing API contract composed by nginx from
 the preserved `workspace-messenger-api`, the common `workspace-api`, and the
 companion `workspace-messenger-events` websocket service. Public Messenger
 requests use the dedicated Messenger process; common users, client service
-settings, and REST events use `workspace-api`. Mail, Calendar, External Users,
-and provider-management endpoints are not part of this release.
+settings, and REST events use `workspace-api`. Standalone Mail, Calendar, and
+External Users endpoints are not part of this release. Provider-neutral
+external account, chat, operation, policy, health, and bridge-instance
+resources are part of the Messenger API.
 
-Native Messenger state is canonical in the local SMTP/IMAP journal. PostgreSQL
-is a rebuildable read projection and may also store client-only settings. A
-future provider must exchange messages through mail protocols rather than a
-separate provider API; the existing Messenger provenance fields are reserved
-for that transport.
+Native Messenger resources, membership, user state, events, provider mappings,
+and client settings are canonical in PostgreSQL. The former SMTP/IMAP journal
+is a read-only migration source during the controlled cutover and is not used
+by the PostgreSQL-canonical runtime. The existing provenance fields preserve
+provider identity without changing the browser API.
 
 ## Runtime Entry Points
 
@@ -160,23 +162,37 @@ transport identifiers:
 ```json
 {
   "provider": {
-    "uuid": "provider-uuid",
-    "name": "Short provider name",
-    "kind": "zulip"
+    "kind": "zulip",
+    "account_uuid": "account-uuid",
+    "external_id": "provider-entity-id",
+    "capabilities": {},
+    "delivery_class": "live",
+    "notification_eligible": true
   },
   "delivery": {
+    "external_operation_uuid": "operation-uuid",
     "status": "pending",
     "safe_error": null,
+    "can_retry": false,
+    "can_discard": false,
+    "duplicate_risk": false,
+    "retry_requires_confirmation": false,
+    "original_url": null,
+    "reconciliation_reason": null,
     "updated_at": "2026-07-15T09:30:00.000000Z"
   }
 }
 ```
 
-`provider.name` is the short badge label supplied by a future provider.
-`delivery.status` is `pending`, `delivered`, or `failed`. Provider external IDs,
-sync cursors, queue IDs, ETags, raw protocol payloads, and provider database
-state are not part of the UI contract. Local resources have `provider: null`
-and `delivery: null`.
+`provider.capabilities` contains effective action descriptors. For inbound
+provider projections `delivery_class` is `live` or `backfill`, and
+`notification_eligible` freezes whether the message could notify when the
+backend accepted it. Backfill and live traffic accepted before the account
+notification gate opens are `false`; clients must suppress desktop
+notification, sound, and attention for those messages. Local resources have
+`provider: null` and `delivery: null`. Provider sync cursors, raw protocol
+payloads, credential material, and internal database state are not part of the
+UI contract.
 
 
 The browser client uses the same IAM bearer token and project scope for every
@@ -187,7 +203,12 @@ unauthenticated Workspace endpoint used by the UI.
 This is a greenfield public layout. There are no compatibility aliases for
 `/api/messenger/**`, `/api/v1/**`,
 `/api/workspace/v1/messenger/events/**`, or the former messenger websocket
-path. There is no browser-facing or internal Provider API in this release.
+path. There is no browser-facing Provider API. Independently deployed provider
+runtimes use the private bridge-authenticated API rooted at
+`/api/workspace-provider/v1`; its operations commit ordinary Messenger
+resources into PostgreSQL, so it does not change the browser contract described
+in this document. The private contract is defined in
+[`workspace_provider_api_v1.yaml`](workspace_provider_api_v1.yaml).
 
 ## Pagination And Filters
 
@@ -294,6 +315,33 @@ authoritative snapshots before starting a new cursor.
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Get an owned draft and its strong revision ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Replace only the Markdown payload using `If-Match`. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Hard-delete an owned draft using `If-Match`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's realm-global external accounts. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account with a client-generated UUID and write-only credential. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Get the owner's sanitized external-account snapshot. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable non-secret settings using `If-Match`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Delete the account and its projection. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validate and replace the write-only credential, then resume synchronization. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop synchronization while retaining the read-only projection. |
+| `GET` | `/api/workspace/v1/messenger/external_chats/` | List the owner's sanitized external chat catalog and assignment state. |
+| `GET` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}` | Get one sanitized external-chat snapshot. |
+| `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/select/invoke` | Select a chat and assign it to a project. |
+| `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/deselect/invoke` | Cancel work and remove the chat projection. |
+| `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/move/invoke` | Atomically move a projection to another project using `If-Match`. |
+| `GET` | `/api/workspace/v1/messenger/external_operations/` | List the owner's external operations. |
+| `GET` | `/api/workspace/v1/messenger/external_operations/{operation_uuid}` | Get sanitized operation status. |
+| `DELETE` | `/api/workspace/v1/messenger/external_operations/{operation_uuid}` | Discard eligible work. |
+| `POST` | `/api/workspace/v1/messenger/external_operations/{operation_uuid}/actions/retry/invoke` | Retry an eligible failed operation. |
+| `POST` | `/api/workspace/v1/messenger/external_operations/actions/preflight/invoke` | Check capability and conversion loss before an outgoing mutation. |
+| `GET` | `/api/workspace/v1/messenger/external_bridge_instances/` | List sanitized bridge instances; requires the dedicated IAM read permission. |
+| `GET` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}` | Get sanitized bridge identity, health, capability, and certificate state. |
+| `POST` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/suspend/invoke` | Suspend a bridge identity. |
+| `POST` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/resume/invoke` | Resume a non-revoked bridge identity. |
+| `POST` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/revoke/invoke` | Revoke the active bridge certificate generation. |
+| `GET` | `/api/workspace/v1/messenger/external_provider_policies/{kind}` | Read the sanitized realm policy for a provider kind. |
+| `PUT` | `/api/workspace/v1/messenger/external_provider_policies/{kind}` | Update provider policy using `If-Match` and the dedicated IAM permission. |
+| `POST` | `/api/workspace/v1/messenger/external_provider_policies/{kind}/actions/suspend/invoke` | Suspend a provider kind realm-wide. |
+| `POST` | `/api/workspace/v1/messenger/external_provider_policies/{kind}/actions/resume/invoke` | Resume a provider kind after validation. |
+| `GET` | `/api/workspace/v1/messenger/external_provider_health/{kind}` | Read sanitized aggregate provider health. |
 | `GET` | `/api/workspace/v1/messenger/message_reactions/` | List reactions for messages visible to the current IAM user. |
 | `POST` | `/api/workspace/v1/messenger/message_reactions/` | Create a message reaction. |
 | `GET` | `/api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Get a message reaction visible through message access. |
@@ -315,6 +363,12 @@ authoritative snapshots before starting a new cursor.
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Upload and select the current user's avatar. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Remove the current user's custom avatar and restore the canonical Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | Return the current authenticated Workspace user. |
+
+External account settings, chat source metadata, and operation details use
+dynamic kind models. Zulip is the first registered kind; adding another kind
+does not add provider-specific collection routes. The full sanitized resource
+shapes, ETag rules, action permissions, and realtime events are defined in
+[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
 
 ## Server Settings
 
@@ -576,10 +630,10 @@ Realtime side effects:
 
 ## Streams
 
-`POST /api/workspace/v1/messenger/streams/` appends the canonical stream,
-binding, and default-topic operations to the IMAP journal before updating the
-PostgreSQL projection. It creates a default topic named `General Topic` and
-stores its UUID as `default_topic_uuid`.
+`POST /api/workspace/v1/messenger/streams/` commits the canonical stream,
+binding, default topic, and realtime side effects in PostgreSQL. It creates a
+default topic named `General Topic` and stores its UUID as
+`default_topic_uuid`.
 The reference is nullable and becomes `null` when the current default topic is
 deleted. REST resource responses follow the standard RestAlchemy JSON packer
 and omit nullable fields whose value is `null`, so clients must also treat a
@@ -617,10 +671,9 @@ Supported source payloads:
 }
 ```
 
-The `zulip` payload shape is reserved contract metadata for a future provider.
-No Zulip runtime or access-account gate exists in this release. When provider
-transport is implemented, it will populate these fields from SMTP/IMAP data;
-the browser contract will continue to hide raw mail protocol identifiers.
+The `zulip` payload shape is provider provenance. An enrolled Zulip runtime
+populates it through the private Provider HTTP API; the browser contract hides
+raw provider protocol identifiers, credentials, and synchronization state.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -693,9 +746,10 @@ Content-Type: application/json
 }
 ```
 
-Native stream mutations append durable IMAP journal operations before updating
-the rebuildable projection. The nullable `provider` and `delivery` fields stay
-reserved for a future mail-protocol provider and are `null` for native streams.
+Native stream mutations update canonical PostgreSQL state and their realtime
+side effects in the request transaction. The nullable `provider` and
+`delivery` fields describe an external projection and operation state; both are
+`null` for native streams.
 
 Stream read action:
 
@@ -734,8 +788,8 @@ or `Channels` when it is not private.
 
 ## Stream Bindings
 
-Stream bindings are canonical chat membership records in the IMAP journal and
-are projected to PostgreSQL. New bindings are created through
+Stream bindings are canonical PostgreSQL chat-membership records. New bindings
+are created through
 `POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke`, where
 the request body groups added users by role. `who_uuid` is always overwritten
 with the current IAM user's UUID.
@@ -779,9 +833,9 @@ custom folders. Every remaining stream participant receives
 
 ## Stream Topics
 
-`POST /api/workspace/v1/messenger/stream_topics/` journals the canonical topic
-before projecting it and its per-user flags. Reads are scoped to the current
-IAM user through current stream membership.
+`POST /api/workspace/v1/messenger/stream_topics/` commits the canonical topic,
+its per-user flags, and realtime side effects in PostgreSQL. Reads are scoped
+to the current IAM user through current stream membership.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -814,8 +868,8 @@ Create request:
 
 `PUT /api/workspace/v1/messenger/stream_topics/{topic_uuid}` requires a body with `name`. The backend
 checks that the current user has a binding to the topic's stream before
-renaming the topic. Native changes append durable IMAP operations before the
-rebuildable projection is updated. Provenance remains unchanged by a rename.
+renaming the topic. Native changes update canonical PostgreSQL state and their
+realtime side effects atomically. Provenance remains unchanged by a rename.
 
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/toggle_done/` flips `is_done` for all
 topic users and returns the current user's updated topic view.
@@ -863,11 +917,11 @@ Realtime side effects:
 
 ## Messages
 
-`POST /api/workspace/v1/messenger/messages/` validates current IMAP-derived
-stream membership, delivers a canonical UTF-8 markdown message through local
-SMTP to every current participant Maildir, and appends journal and per-recipient
-event records before updating PostgreSQL projections. Reads are scoped to the
-current IAM user.
+`POST /api/workspace/v1/messenger/messages/` validates current PostgreSQL stream
+membership and commits the canonical UTF-8 markdown message, flags, one shared
+recipient-audience snapshot, and compact message/topic/stream events in the
+request transaction. It does not create one canonical event row per recipient.
+Reads remain scoped to the current IAM user and keep the existing response.
 
 The only supported message payload in v1 is markdown:
 
@@ -969,12 +1023,12 @@ Update request:
 }
 ```
 
-`PUT /api/workspace/v1/messenger/messages/{message_uuid}` journals the updated root message payload and returns
+`PUT /api/workspace/v1/messenger/messages/{message_uuid}` commits the updated canonical message payload and returns
 the current user's message view. Only the message author can update the root
 message. `DELETE /api/workspace/v1/messenger/messages/{message_uuid}` performs
-an immediate hard delete: it marks and UID-expunges every copy delivered to the
-original participant set, then appends a bodyless tombstone that preserves the
-required message identity and provenance fields for `message.deleted`.
+an immediate hard delete of the canonical message and its per-user state. The
+same transaction emits a minimal `message.deleted` event for the original
+audience that preserves the required message identity and provenance fields.
 
 Read action:
 
@@ -994,28 +1048,30 @@ POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/a
 Authorization: Bearer <access_token>
 ```
 
-`read_up_to` marks unread messages in the same topic as read up to and
-including the selected message's `created_at`, then returns the selected
-message view.
+`read_up_to` marks unread messages in the same topic through the selected
+message's inclusive `(created_at, uuid)` boundary, then returns the selected
+message view. For an external chat, Workspace sends the already resolved UUID
+prefix as an exact selector; provider-specific message ordering cannot change
+which messages become read.
 
 Realtime side effects:
 
 | Operation | payload.kind | object_type | Payload |
 | --- | --- | --- | --- |
 | create message | `message.created` | `message` | Full user message snapshot for every stream user. |
-| create unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the new message is unread. |
+| create unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the new message is unread; UI derives folder aggregates from the stream snapshot. |
 | update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
 | create/update/delete reaction | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` | `message_reaction` | Reaction snapshot for the acting user. |
 | create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
 | read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
-| delete unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for users where the deleted message was unread. |
+| delete unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the deleted message was unread; UI derives folder aggregates from the stream snapshot. |
 
 ## Drafts
 
 Drafts are PostgreSQL-owned client state and never create or modify canonical
-messages, Maildir data, unread counters, reactions, or file references. Each
+messages, unread counters, reactions, or file references. Each
 draft belongs to exactly one IAM project, owner, stream, and topic. The
 `stream_uuid` and `topic_uuid` are immutable, the topic must belong to the
 stream, and the owner must currently be a stream participant. Multiple drafts
@@ -1095,15 +1151,16 @@ invalid value returns `412` with the current draft snapshot and current ETag.
 Successful updates increment `revision`; successful deletes return `204`.
 
 Draft CRUD emits no Workspace events, websocket notifications, desktop
-notifications, or canonical IMAP records. Another client observes changes on
-reload or an explicit drafts API refetch. Removing the owner from the stream or
-deleting the topic/stream hard-deletes affected drafts through PostgreSQL
-foreign-key cascades, without tombstones or notification side effects.
+notifications, provider commands, or ordinary Messenger messages. Another
+client observes changes on reload or an explicit drafts API refetch. Removing
+the owner from the stream or deleting the topic/stream hard-deletes affected
+drafts through PostgreSQL foreign-key cascades, without tombstones or
+notification side effects.
 
 ## Message Reactions
 
-Message reactions are canonical journal operations with a rebuildable SQL
-projection. Reads are scoped to messages visible to the current IAM user.
+Message reactions are canonical PostgreSQL resources. Reads are scoped to
+messages visible to the current IAM user.
 Creating, updating, or
 deleting a reaction emits a `message_reaction.*` event for the acting user and
 `message.updated` events for every user that can see the message; the message
@@ -1133,9 +1190,8 @@ Create request:
 The same user cannot create duplicate reactions with the same `message_uuid`
 and `emoji_name`. Any user that can see the message can list or get its
 reactions. Only the reaction owner can update or delete that reaction.
-These operations append `reaction.create`, `reaction.update`, and
-`reaction.delete` journal records. Native responses retain `provider: null` and
-`delivery: null`.
+These operations commit the reaction and corresponding realtime side effects
+in PostgreSQL. Native responses retain `provider: null` and `delivery: null`.
 
 The `reactions` field on message views is an aggregate map:
 
@@ -1156,8 +1212,9 @@ Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
 File bytes and a separate JSON sidecar are stored through the configured
 messenger file storage backend. S3 is the deployed backend; the local backend
 implements the same layout for tests. The backend is selected by server
-configuration and cannot be chosen by a browser request. PostgreSQL rows and
-`m_workspace_file_accesses` are rebuildable projections only.
+configuration and cannot be chosen by a browser request. PostgreSQL stores the
+canonical file metadata and ACL/access state; S3 stores the binary and its JSON
+sidecar.
 
 The sidecar contains the file UUID, project UUID, owner UUID, display metadata,
 content type, size, SHA-256, creation time, and an ACL rule. Chat files include
@@ -1174,7 +1231,7 @@ their stream UUID and use the dynamic stream-membership rule:
 
 The sidecar never contains a participant snapshot. Every chat-file list,
 metadata, and download request checks the authenticated user against the
-current stream bindings reconstructed from the IMAP journal. A newly added
+current canonical PostgreSQL stream bindings. A newly added
 participant gains access immediately; a removed participant loses it
 immediately without an S3 rewrite.
 
@@ -1268,7 +1325,7 @@ the same `urn:file`, `urn:image`, or `urn:video` client contract.
 `ETag` equal to the quoted SHA-256 `hash` exposed by file metadata. The binary
 is immutable for its file UUID; metadata changes emit `file.updated`. Deleting an
 owned file removes both its binary object and JSON sidecar after the canonical
-file deletion is journaled.
+file deletion is committed.
 
 
 ## Services
@@ -1304,19 +1361,19 @@ Response example:
 
 ## Events And Epoch
 
-Events are durable records in the IMAP event journal and are scoped to the
-affected `user_uuid`: message, stream, topic, folder, and user snapshots are
-created per visible recipient, while delete events are sent only to users that
-must remove local state. `m_workspace_events` is a rebuildable PostgreSQL read
-projection. Only event records are retained for seven days; messages, files,
-stream/topic state, and the canonical operation journal are never removed by
-this policy. Pruning removes a contiguous oldest UID prefix so the retained
-journal remains a complete suffix. `epoch_version` is monotonic within one
-`epoch_generation` (the IMAP event mailbox UIDVALIDITY).
+Events are durable PostgreSQL records scoped to their audience. Recipient
+events carry `user_uuid`; compact broadcast events use a stored audience so
+each visible client observes the same public event contract without requiring
+one canonical event row per recipient. Only event records are retained for
+seven days; messages, files, stream/topic state, provider mappings, and other
+canonical resources are never removed by this policy. Pruning advances the
+stored retained floor so the remaining events form a complete visible suffix.
+`epoch_version` is monotonic within one PostgreSQL-owned
+`epoch_generation`.
 
 `GET /api/workspace/v1/events/` returns events sorted by `epoch_version` ascending by default.
-REST `/events/` and websocket delivery use the same flat schema:
-both read from the current user's visible IMAP-backed event surface.
+REST `/events/` and websocket delivery use the same flat schema and both read
+from the current user's visible PostgreSQL event surface.
 `GET /api/workspace/v1/epoch/` uses that same surface.
 
 ```json
@@ -1394,9 +1451,11 @@ plus `payload.kind`. Delete events are minimal:
 ```
 
 Read actions emit `message.read`, `topic.read`, or `stream.read` with the full
-action response object in `payload`. When unread counters change, the backend
-also emits `topic.updated`, `stream.updated`, and `folder.updated` events so UI
-badges can be updated from normal snapshots.
+action response object in `payload`. Read reconciliation emits
+`topic.updated`, `stream.updated`, and `folder.updated`. Message create/delete
+uses compact `topic.updated` and `stream.updated` events; the UI projects folder
+aggregates from the stream snapshot instead of receiving a potentially large
+user-specific folder snapshot per message.
 
 Supported values:
 
@@ -1431,9 +1490,9 @@ alias of `current_epoch_version`:
 }
 ```
 
-For a newly created empty event mailbox, `epoch_version` and
+For a newly created empty event stream, `epoch_version` and
 `current_epoch_version` are `0`, `minimum_epoch_version` is `1`, and
-`epoch_generation` is still a non-empty mailbox generation. A cold
+`epoch_generation` is still a non-empty PostgreSQL-owned generation. A cold
 `GET /api/workspace/v1/events/?epoch_version%3E=0` returns an empty list rather
 than a cursor-gap error.
 
@@ -1467,14 +1526,19 @@ materialized by their own authenticated Workspace activity.
 
 When the current IAM user requests their own UUID, the API materializes or
 refreshes the IAM identity projection before returning it. The browser cannot
-submit source ownership fields. The `zulip` source literal remains reserved for
-a future mail-protocol provider transport; no provider runtime exists now.
+submit source ownership fields. The `zulip` source literal identifies an
+external identity projected by the Zulip runtime through the private Provider
+API. Provider credentials and raw identifiers are not part of this browser
+resource.
 
 | Field | Type | Description |
 | --- | --- | --- |
 | `uuid` | UUID | User identifier. |
 | `username` | string, 1..128 | Username. |
 | `source` | `iam`, `zulip` | User source. |
+| `identity_kind` | `external` or omitted | Read-only marker present only for an external provider identity. |
+| `display_name` | string or omitted | Read-only provider display name for an external identity. |
+| `provider` | object or omitted | Read-only external identity envelope containing `kind` and `account_uuid`; raw provider identifiers and credentials are never exposed. |
 | `status` | `active`, `idle`, `offline`, `do_not_disturb` | Presence status. |
 | `status_emoji` | string or `null`, max 64 | Custom presence emoji. |
 | `status_text` | string or `null`, max 256 | Custom presence text. |
@@ -1486,9 +1550,9 @@ a future mail-protocol provider transport; no provider runtime exists now.
 | `created_at` | datetime | Creation time. |
 | `updated_at` | datetime | Update time. |
 
-A future provider may project a Gravatar-compatible avatar as
+An external provider may project a Gravatar-compatible avatar as
 `urn:gravatar:<md5(trim(lower(delivery_email)))>`. Raw provider identifiers and
-mail addresses used only for transport are not exposed in this contract.
+provider-only delivery addresses are not exposed in this contract.
 
 Presence update:
 
@@ -1582,17 +1646,22 @@ Detailed UI integration rules are documented in
 
 The runtime Workspace OpenAPI document is available at
 `/api/workspace/specifications/3.0.3`. It describes the IAM-authenticated UI
-surface. There is no Provider, Mail, or Calendar specification in this release.
+surface and contains no Provider, Mail, or Calendar browser routes. The private
+Provider contract is maintained separately in
+[`workspace_provider_api_v1.yaml`](workspace_provider_api_v1.yaml).
 
 The Workspace backend element installs independent `workspace-messenger-api`,
 `workspace-api`, `workspace-messenger-events`, and
-`workspace-messenger-worker` processes together with Exim4 and Dovecot on the
-dedicated internal mail node.
-The element requires S3aaS for binary objects and JSON sidecars and DBaaS for
-the disposable PostgreSQL projection. It builds the existing Workspace UI in
-Messenger-only mode and serves it from nginx.
+`workspace-messenger-worker` processes plus the private
+`workspace-external-bridge-api` service. The PostgreSQL-canonical runtime does
+not start or connect to a mail service. The element requires S3aaS for binary
+objects and JSON sidecars and DBaaS for canonical Messenger and provider state.
+It builds the existing Workspace UI in Messenger-only mode and serves it from
+nginx.
 
 Related documents:
 
 - [Workspace architecture](architecture.md)
 - [Workspace UI realtime integration](workspace_ui_realtime_integration.md)
+- [Private Workspace Provider API](workspace_provider_api_v1.yaml)
+- [Zulip provider product and public API contract](zulip_bridge_v1_product_and_api.md)

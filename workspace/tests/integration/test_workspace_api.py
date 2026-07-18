@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+
 def test_only_workspace_v1_contract_is_exposed(workspace_api):
     api = workspace_api
     assert api.get("/v1/").status_code == 200

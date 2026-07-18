@@ -15,6 +15,7 @@
 #    under the License.
 
 from restalchemy.common import exceptions as ra_exc
+import typing
 
 
 class OnlyOneAllFolderPerUserError(ra_exc.ValidationErrorException):
@@ -64,18 +65,18 @@ class EventsCursorExpiredError(ra_exc.RestAlchemyException):
     def __init__(
         self,
         *,
-        reason,
-        epoch_generation,
-        current_epoch_version,
-        minimum_epoch_version,
-    ):
+        reason: str,
+        epoch_generation: str,
+        current_epoch_version: int,
+        minimum_epoch_version: int,
+    ) -> None:
         super().__init__()
         self.reason = reason
         self.epoch_generation = epoch_generation
         self.current_epoch_version = current_epoch_version
         self.minimum_epoch_version = minimum_epoch_version
 
-    def as_dict(self):
+    def as_dict(self) -> dict[str, typing.Any]:
         return {
             "type": self.__class__.__name__,
             "code": self.code,
@@ -102,6 +103,26 @@ class DraftPreconditionFailedError(ra_exc.RestAlchemyException):
     message = "Draft revision does not match If-Match"
     code = 412
 
-    def __init__(self, current):
+    def __init__(self, current: dict[str, typing.Any]) -> None:
         super().__init__()
         self.current = current
+
+
+class ExternalResourceForbiddenError(ra_exc.RestAlchemyException):
+    message = "External resource access is forbidden"
+    code = 403
+
+
+class ExternalAccountConflictError(ra_exc.RestAlchemyException):
+    message = "An external account for this provider already exists"
+    code = 409
+
+
+class ExternalPreconditionRequiredError(ra_exc.RestAlchemyException):
+    message = "External resource mutation requires If-Match"
+    code = 428
+
+
+class ExternalPreconditionFailedError(ra_exc.RestAlchemyException):
+    message = "External resource revision does not match If-Match"
+    code = 412

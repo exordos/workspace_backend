@@ -9,6 +9,7 @@ import types
 import uuid as sys_uuid
 
 from workspace.services.messenger_workers import agents
+from workspace.common import messenger_storage_opts
 
 
 def test_worker_prunes_canonical_event_mailboxes_before_sql_event_rows(monkeypatch):
@@ -49,3 +50,23 @@ def test_worker_prunes_canonical_event_mailboxes_before_sql_event_rows(monkeypat
         ("imap_events_pruned", user_uuid, now),
         ("sql_event_deleted", session),
     ]
+
+
+def test_canonical_worker_prunes_only_postgresql_in_owned_session(monkeypatch):
+    now = datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc)
+    session = types.SimpleNamespace()
+    calls = []
+    monkeypatch.setattr(
+        agents.sql_canonical_store,
+        "prune_expired_events",
+        lambda target_session, target_now: (
+            calls.append((target_session, target_now)) or 9
+        ),
+    )
+    worker = agents.MessengerWorkerAgent(
+        runtime_factory=None,
+        storage_mode=messenger_storage_opts.POSTGRESQL_CANONICAL,
+    )
+
+    assert worker._prune_expired_events(session, now) == 9
+    assert calls == [(session, now)]

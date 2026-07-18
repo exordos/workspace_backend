@@ -15,6 +15,7 @@
 #    under the License.
 
 import re
+import uuid as sys_uuid
 
 from restalchemy.dm import properties
 from restalchemy.dm import types
@@ -29,7 +30,7 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
         required=True,
     )
 
-    def is_user_mentioned(self, user_uuid):
+    def is_user_mentioned(self, user_uuid: sys_uuid.UUID) -> bool:
         return (
             re.search(
                 r"\]\(urn:user:" + re.escape(str(user_uuid)) + r"\)",

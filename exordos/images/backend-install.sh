@@ -30,11 +30,13 @@ WORKSPACE_BINARIES=(
     workspace-messenger-api
     workspace-messenger-worker
     workspace-messenger-events
+    workspace-external-bridge-api
 )
 WORKSPACE_HELPERS=(
     backend-bootstrap.sh:workspace-bootstrap
     workspace-mail-ca-sync.py:workspace-mail-ca-sync
     workspace-mail-healthcheck.py:workspace-mail-healthcheck
+    workspace-external-bridge-control-prepare.sh:workspace-external-bridge-control-prepare
     workspace-nginx-reload.sh:workspace-nginx-reload
     workspace-reload-config.sh:workspace-reload-config
     workspace-restart-services.sh:workspace-restart-services
@@ -52,8 +54,12 @@ disable_packaged_nginx_service() {
 
 source "$GC_PATH/exordos/images/install-universal-agent-umask.sh"
 
-sudo apt update
-sudo DEBIAN_FRONTEND=noninteractive apt install -y \
+sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout=600 \
+    update
+sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout=600 \
+    install -y \
     ca-certificates \
     curl \
     libev-dev \
@@ -64,14 +70,8 @@ sudo DEBIAN_FRONTEND=noninteractive apt install -y \
 
 sudo systemctl enable ssh.service
 
-node_major=0
-if command -v node >/dev/null 2>&1; then
-    node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
-fi
-if (( node_major < 22 )); then
-    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-    sudo DEBIAN_FRONTEND=noninteractive apt install -y nodejs
-fi
+WORKSPACE_NODE_MAJOR="$(tr -d '[:space:]' < "$UI_PATH/.nvmrc")" \
+    bash "$GC_PATH/exordos/images/install-node-toolchain.sh"
 
 if ! getent group workspace >/dev/null; then
     sudo groupadd --system workspace

@@ -54,7 +54,9 @@ class ZulipAPIError(RuntimeError):
     pass
 
 
-def _require_success(data):
+def _require_success(
+    data: typing.Dict[str, typing.Any],
+) -> typing.Dict[str, typing.Any]:
     if data["result"] != "success":
         raise ZulipAPIError(data["msg"])
     return data
@@ -70,21 +72,26 @@ class ZulipClient(common.RESTClientMixIn):
     ME_PATH_AUTH = "api/v1/users/me"
     ME_PATH_COOKIE = "json/users/me"
 
-    def __init__(self, endpoint: str, timeout: int = 5, client_cls=None):
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: int = 5,
+        client_cls: typing.Any = None,
+    ) -> None:
         super().__init__()
         self._timeout = timeout
         self._client = bz_client.Client(default_timeout=timeout)
         self._sdk_client_cls = client_cls
         self._endpoint = endpoint
 
-    def _get_sdk_client_cls(self):
+    def _get_sdk_client_cls(self) -> typing.Any:
         if self._sdk_client_cls is not None:
             return self._sdk_client_cls
         if zulip is None:
             raise ImportError("The official zulip Python SDK is not installed")
         return zulip.Client
 
-    def _get_sdk_client(self, login: str, token: str):
+    def _get_sdk_client(self, login: str, token: str) -> typing.Any:
         client_cls = self._get_sdk_client_cls()
         return client_cls(
             email=login,
@@ -92,7 +99,7 @@ class ZulipClient(common.RESTClientMixIn):
             site=self._endpoint,
         )
 
-    def _build_api_url(self, path: str):
+    def _build_api_url(self, path: str) -> str:
         return urllib.parse.urljoin(
             f"{self._endpoint.rstrip('/')}/",
             f"api/v1/{path.lstrip('/')}",
@@ -101,7 +108,7 @@ class ZulipClient(common.RESTClientMixIn):
     def _format_api_params(
         self,
         params: typing.Optional[typing.Dict[str, typing.Any]],
-    ):
+    ) -> typing.Optional[typing.Dict[str, typing.Any]]:
         if params is None:
             return None
         formatted = {}
@@ -120,7 +127,7 @@ class ZulipClient(common.RESTClientMixIn):
         path: str,
         params: typing.Optional[typing.Dict[str, typing.Any]] = None,
         timeout: typing.Optional[int] = None,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         if timeout is None:
             timeout = self._timeout
         response = requests.get(
@@ -138,7 +145,7 @@ class ZulipClient(common.RESTClientMixIn):
         path: str,
         data: typing.Optional[typing.Dict[str, typing.Any]] = None,
         timeout: typing.Optional[int] = None,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         if timeout is None:
             timeout = self._timeout
         response = requests.post(
@@ -183,7 +190,7 @@ class ZulipClient(common.RESTClientMixIn):
         self,
         login: str,
         token: str,
-    ):
+    ) -> list[typing.Dict[str, typing.Any]]:
         data = self._get_api_json_with_api_key(
             login=login,
             token=token,
@@ -197,7 +204,7 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
         message_filters: typing.Dict[str, typing.Any],
-    ):
+    ) -> list[typing.Dict[str, typing.Any]]:
         data = self._get_api_json_with_api_key(
             login=login,
             token=token,
@@ -212,7 +219,7 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
         message_id: int,
-    ):
+    ) -> typing.Optional[typing.Dict[str, typing.Any]]:
         data = self._get_api_json_with_api_key(
             login=login,
             token=token,
@@ -224,8 +231,8 @@ class ZulipClient(common.RESTClientMixIn):
             timeout=MESSAGE_FETCH_TIMEOUT,
         )
         if (
-            data.get("code") == INVALID_MESSAGE_CODE and
-            data.get("msg") == INVALID_MESSAGE_MSG
+            data.get("code") == INVALID_MESSAGE_CODE
+            and data.get("msg") == INVALID_MESSAGE_MSG
         ):
             return None
         return data["message"]
@@ -237,15 +244,19 @@ class ZulipClient(common.RESTClientMixIn):
         stream_name: str,
         topic_name: str,
         content: str,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
-        return _require_success(client.send_message({
-            "type": "stream",
-            "to": stream_name,
-            "topic": topic_name,
-            "content": content,
-            "read_by_sender": True,
-        }))
+        return _require_success(
+            client.send_message(
+                {
+                    "type": "stream",
+                    "to": stream_name,
+                    "topic": topic_name,
+                    "content": content,
+                    "read_by_sender": True,
+                }
+            )
+        )
 
     def send_private_message_with_api_key(
         self,
@@ -253,14 +264,18 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         recipient_ids: list[int],
         content: str,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
-        return _require_success(client.send_message({
-            "type": "direct",
-            "to": recipient_ids,
-            "content": content,
-            "read_by_sender": True,
-        }))
+        return _require_success(
+            client.send_message(
+                {
+                    "type": "direct",
+                    "to": recipient_ids,
+                    "content": content,
+                    "read_by_sender": True,
+                }
+            )
+        )
 
     def update_message_with_api_key(
         self,
@@ -268,19 +283,23 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         message_id: int,
         content: str,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
-        return _require_success(client.update_message({
-            "message_id": message_id,
-            "content": content,
-        }))
+        return _require_success(
+            client.update_message(
+                {
+                    "message_id": message_id,
+                    "content": content,
+                }
+            )
+        )
 
     def delete_message_with_api_key(
         self,
         login: str,
         token: str,
         message_id: int,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
         return _require_success(client.delete_message(message_id))
 
@@ -292,17 +311,19 @@ class ZulipClient(common.RESTClientMixIn):
         emoji_name: str,
         emoji_code: typing.Optional[str] = None,
         reaction_type: typing.Optional[str] = None,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
-        return _require_success(client.call_endpoint(
-            url=f"messages/{message_id}/reactions",
-            method="POST",
-            request={
-                "emoji_name": emoji_name,
-                "emoji_code": emoji_code,
-                "reaction_type": reaction_type,
-            },
-        ))
+        return _require_success(
+            client.call_endpoint(
+                url=f"messages/{message_id}/reactions",
+                method="POST",
+                request={
+                    "emoji_name": emoji_name,
+                    "emoji_code": emoji_code,
+                    "reaction_type": reaction_type,
+                },
+            )
+        )
 
     def remove_reaction_with_api_key(
         self,
@@ -312,33 +333,37 @@ class ZulipClient(common.RESTClientMixIn):
         emoji_name: str,
         emoji_code: typing.Optional[str] = None,
         reaction_type: typing.Optional[str] = None,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
-        return _require_success(client.call_endpoint(
-            url=f"messages/{message_id}/reactions",
-            method="DELETE",
-            request={
-                "emoji_name": emoji_name,
-                "emoji_code": emoji_code,
-                "reaction_type": reaction_type,
-            },
-        ))
+        return _require_success(
+            client.call_endpoint(
+                url=f"messages/{message_id}/reactions",
+                method="DELETE",
+                request={
+                    "emoji_name": emoji_name,
+                    "emoji_code": emoji_code,
+                    "reaction_type": reaction_type,
+                },
+            )
+        )
 
     def update_subscription_settings_with_api_key(
         self,
         login: str,
         token: str,
         subscription_data: list[typing.Dict[str, typing.Any]],
-    ):
-        return _require_success(self._post_api_json_with_api_key(
-            login=login,
-            token=token,
-            path="users/me/subscriptions/properties",
-            data={
-                "subscription_data": subscription_data,
-            },
-            timeout=SUBSCRIPTION_UPDATE_TIMEOUT,
-        ))
+    ) -> typing.Dict[str, typing.Any]:
+        return _require_success(
+            self._post_api_json_with_api_key(
+                login=login,
+                token=token,
+                path="users/me/subscriptions/properties",
+                data={
+                    "subscription_data": subscription_data,
+                },
+                timeout=SUBSCRIPTION_UPDATE_TIMEOUT,
+            )
+        )
 
     def update_user_topic_with_api_key(
         self,
@@ -347,18 +372,20 @@ class ZulipClient(common.RESTClientMixIn):
         stream_id: int,
         topic: str,
         visibility_policy: int,
-    ):
-        return _require_success(self._post_api_json_with_api_key(
-            login=login,
-            token=token,
-            path="user_topics",
-            data={
-                "stream_id": stream_id,
-                "topic": topic,
-                "visibility_policy": visibility_policy,
-            },
-            timeout=USER_TOPIC_UPDATE_TIMEOUT,
-        ))
+    ) -> typing.Dict[str, typing.Any]:
+        return _require_success(
+            self._post_api_json_with_api_key(
+                login=login,
+                token=token,
+                path="user_topics",
+                data={
+                    "stream_id": stream_id,
+                    "topic": topic,
+                    "visibility_policy": visibility_policy,
+                },
+                timeout=USER_TOPIC_UPDATE_TIMEOUT,
+            )
+        )
 
     def upload_file_with_api_key(
         self,
@@ -366,7 +393,7 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         file_name: str,
         data: bytes,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         client = self._get_sdk_client(login=login, token=token)
         file = io.BytesIO(data)
         file.name = file_name
@@ -377,7 +404,7 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
         url: str,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         file_url = urllib.parse.urljoin(
             f"{self._endpoint.rstrip('/')}/",
             url.lstrip("/"),
@@ -393,7 +420,12 @@ class ZulipClient(common.RESTClientMixIn):
             "content_type": response.headers.get("Content-Type"),
         }
 
-    def _register_message_event_queue(self, login, token, event_types):
+    def _register_message_event_queue(
+        self,
+        login: str,
+        token: str,
+        event_types: typing.Optional[list[str]],
+    ) -> typing.Dict[str, typing.Any]:
         return self._post_api_json_with_api_key(
             login=login,
             token=token,
@@ -410,18 +442,21 @@ class ZulipClient(common.RESTClientMixIn):
             timeout=MESSAGE_EVENT_REGISTER_TIMEOUT,
         )
 
-    def _is_registered_event_queue(self, data):
+    def _is_registered_event_queue(
+        self,
+        data: typing.Dict[str, typing.Any],
+    ) -> bool:
         return (
-            data.get("result") == "success" and
-            "queue_id" in data and
-            "last_event_id" in data
+            data.get("result") == "success"
+            and "queue_id" in data
+            and "last_event_id" in data
         )
 
     def register_message_event_queue_with_api_key(
         self,
         login: str,
         token: str,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         data = self._register_message_event_queue(
             login=login,
             token=token,
@@ -441,7 +476,7 @@ class ZulipClient(common.RESTClientMixIn):
         token: str,
         queue_id: str,
         last_event_id: int,
-    ):
+    ) -> typing.Dict[str, typing.Any]:
         return self._get_api_json_with_api_key(
             login=login,
             token=token,
@@ -457,7 +492,7 @@ class ZulipClient(common.RESTClientMixIn):
         self,
         login: str,
         token: str,
-    ):
+    ) -> list[typing.Dict[str, typing.Any]]:
         data = self._get_api_json_with_api_key(
             login=login,
             token=token,
@@ -475,7 +510,7 @@ class ZulipClient(common.RESTClientMixIn):
         login: str,
         token: str,
         stream_id: int,
-    ):
+    ) -> list[int]:
         data = self._get_api_json_with_api_key(
             login=login,
             token=token,

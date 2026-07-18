@@ -15,6 +15,7 @@
 #    under the License.
 
 from http import client as http_client
+from typing import Any
 
 from bazooka import exceptions as bazooka_exc
 from restalchemy.api.middlewares import errors as ra_errors
@@ -31,7 +32,7 @@ class ErrorsHandlerMiddleware(ra_errors.ErrorsHandlerMiddleware):
     forbidden_exc = (bazooka_exc.ForbiddenError,)
     external_http_exc = (bazooka_exc.BaseHTTPException,)
 
-    def _construct_error_response(self, req, exc):
+    def _construct_error_response(self, req: Any, exc: Exception) -> Any:
         # Auth backend (Zulip) / bazooka HTTP errors first
         if isinstance(exc, self.unauthorized_exc):
             return req.ResponseClass(

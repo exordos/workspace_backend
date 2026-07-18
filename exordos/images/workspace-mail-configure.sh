@@ -8,11 +8,15 @@
 set -eu
 set -o pipefail
 
+source "${WORKSPACE_MAIL_READINESS_LIB:-/usr/local/lib/workspace/mail-runtime-readiness.sh}"
+
 WORKSPACE_CONFIG=${WORKSPACE_CONFIG:-/etc/workspace/workspace.conf}
 MASTER_PASSWD=/etc/dovecot/workspace-master.passwd
 SMTP_PASSWD=/etc/exim4/workspace-smtp.passwd
 TLS_BUNDLE=/etc/workspace/tls/workspace-mail.pem
 TLS_CA=/etc/workspace/tls/workspace-mail-ca.crt
+SMTP_WRITER_GATE_HOLD=${SMTP_WRITER_GATE_HOLD:-/var/lib/workspace/messenger/mail/.writer-gate/smtp-ingress-hold.json}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}
 
 if [[ ! -s "$WORKSPACE_CONFIG" ]]; then
     echo "Workspace configuration is not available" >&2
@@ -69,4 +73,5 @@ doveconf -n | /usr/local/bin/workspace-dovecot-validate
 exim4 -bV >/dev/null
 
 systemctl restart dovecot.service
-systemctl restart exim4.service
+workspace_mail_reconcile_configured_exim \
+    "$SMTP_WRITER_GATE_HOLD" "$SYSTEMCTL_BIN"

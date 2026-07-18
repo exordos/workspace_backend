@@ -9,49 +9,30 @@ import contextlib
 import copy
 import dataclasses
 import datetime
-import enum
 import threading
 import typing
 import uuid as sys_uuid
 
+from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.api import resource_projection
+from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
 from workspace.messenger_mail import repository as mail_repository
 from workspace.messenger_mail import runtime as mail_runtime
+from workspace.messenger_mail import external_bridge_data_plane
 
 
-RESOURCE_MODELS = {
-    "folders": models.UserFolder,
-    "folder_items": models.UserFolderItem,
-    "streams": models.WorkspaceUserStream,
-    "stream_bindings": models.WorkspaceStreamBinding,
-    "stream_topics": models.WorkspaceUserTopic,
-    "messages": models.WorkspaceUserMessage,
-    "message_reactions": models.WorkspaceMessageReactions,
-    "files": models.WorkspaceFile,
-    "users": models.WorkspaceUser,
-    "drafts": models.WorkspaceDraft,
-}
-USER_SCOPED_RESOURCES = {
-    "folders",
-    "folder_items",
-    "streams",
-    "stream_topics",
-    "messages",
-    "drafts",
-}
-EXTENSION_RESOURCES = {
-    "streams",
-    "stream_topics",
-    "messages",
-    "message_reactions",
-}
+RESOURCE_MODELS = resource_projection.RESOURCE_MODELS
+USER_SCOPED_RESOURCES = resource_projection.USER_SCOPED_RESOURCES
+EXTENSION_RESOURCES = resource_projection.EXTENSION_RESOURCES
+EXTENSION_CANONICAL_MODELS = resource_projection.EXTENSION_CANONICAL_MODELS
 EVENT_NAMESPACE = sys_uuid.UUID("798900cd-aef4-5277-9989-d4aac5fbfc8a")
 
 
@@ -61,70 +42,37 @@ class _CanonicalEventState:
     event_uuids: set[sys_uuid.UUID] = dataclasses.field(default_factory=set)
 
 
-def _simple(value):
-    if isinstance(value, sys_uuid.UUID):
-        return str(value)
-    if isinstance(value, datetime.datetime):
-        return value.isoformat().replace("+00:00", "Z")
-    if isinstance(value, enum.Enum):
-        return value.value
-    if isinstance(value, dict):
-        return {name: _simple(item) for name, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_simple(item) for item in value]
-    if hasattr(value, "properties") and hasattr(value.properties, "items"):
-        return {
-            name: _simple(prop.value)
-            for name, prop in value.properties.items()
-            if prop.value is not None
-        }
-    return value
+_CANONICAL_NOT_PROVIDED = resource_projection.CANONICAL_NOT_PROVIDED
 
 
-def _as_dict(value, resource=None):
-    result = _simple(value)
-    if not isinstance(result, dict):
-        raise TypeError("Messenger projection rows must serialize to dictionaries")
-    if resource == "message_reactions":
-        delivery_status = result.pop("delivery_status", None)
-        delivery_error = result.pop("delivery_error", None)
-        delivery_updated_at = result.pop("delivery_updated_at", None)
-        result.pop("provider_uuid", None)
-        result.pop("external_account_uuid", None)
-        result.pop("provider_external_id", None)
-        result["provider"] = None
-        result["delivery"] = (
-            None
-            if delivery_status is None
-            else {
-                "status": delivery_status,
-                "safe_error": delivery_error,
-                "updated_at": delivery_updated_at,
-            }
-        )
-    elif resource in EXTENSION_RESOURCES:
-        result.setdefault("provider", None)
-        result.setdefault("delivery", None)
-    return result
+def _simple(value: typing.Any) -> typing.Any:
+    return resource_projection.simple(value)
 
 
-def _plain_values(values):
-    result = {
-        name: value
-        for name, value in values.items()
-        if name not in {"provider", "delivery"}
-    }
-    return result
+def _as_dict(
+    value: typing.Any,
+    resource: typing.Any = None,
+    canonical: typing.Any = _CANONICAL_NOT_PROVIDED,
+) -> typing.Any:
+    return resource_projection.as_dict(value, resource, canonical=canonical)
+
+
+def _plain_values(values: typing.Any) -> typing.Any:
+    return resource_projection.plain_values(values)
 
 
 class SQLDraftStore:
     """PostgreSQL-only draft storage that does not initialize mail services."""
 
-    def __init__(self, project_uuid, user_uuid):
+    def __init__(
+        self,
+        project_uuid: sys_uuid.UUID,
+        user_uuid: sys_uuid.UUID,
+    ) -> None:
         self.project_uuid = project_uuid
         self.user_uuid = user_uuid
 
-    def get_draft(self, draft_uuid):
+    def get_draft(self, draft_uuid: object) -> typing.Any:
         row = helpers.get_workspace_draft(
             self.project_uuid,
             self.user_uuid,
@@ -134,11 +82,11 @@ class SQLDraftStore:
 
     def filter_draft_page(
         self,
-        filters,
-        marker_uuid,
-        sort_direction,
-        limit,
-    ):
+        filters: typing.Any,
+        marker_uuid: object,
+        sort_direction: typing.Any,
+        limit: typing.Any,
+    ) -> typing.Any:
         allowed_filters = {"stream_uuid", "topic_uuid"}
         if not set(filters).issubset(allowed_filters):
             raise ra_exceptions.ValidationErrorException()
@@ -175,31 +123,29 @@ class SQLDraftStore:
         if limit is not None:
             statement += " LIMIT %s"
             params.append(limit)
-        engine = models.WorkspaceDraft._get_engine()
-        with engine.session_manager() as session:
-            result = session.execute(statement, tuple(params))
-            draft_uuids = [row["uuid"] for row in result.fetchall()]
-            if not draft_uuids:
-                return []
-            rows = models.WorkspaceDraft.objects.get_all(
-                filters={
-                    "uuid": dm_filters.In(draft_uuids),
-                    "project_id": dm_filters.EQ(self.project_uuid),
-                    "user_uuid": dm_filters.EQ(self.user_uuid),
-                },
-                session=session,
-            )
+        session = contexts.Context().get_session()
+        result = session.execute(statement, tuple(params))
+        draft_uuids = [row["uuid"] for row in result.fetchall()]
+        if not draft_uuids:
+            return []
+        rows = models.WorkspaceDraft.objects.get_all(
+            filters={
+                "uuid": dm_filters.In(draft_uuids),
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+            },
+            session=session,
+        )
         rows_by_uuid = {row.uuid: row for row in rows}
         return [
-            _as_dict(rows_by_uuid[draft_uuid], "drafts")
-            for draft_uuid in draft_uuids
+            _as_dict(rows_by_uuid[draft_uuid], "drafts") for draft_uuid in draft_uuids
         ]
 
     @staticmethod
-    def _public_draft(row):
+    def _public_draft(row: typing.Any) -> typing.Any:
         return _as_dict(row, "drafts")
 
-    def create_draft(self, values):
+    def create_draft(self, values: typing.Any) -> typing.Any:
         draft, created = helpers.create_workspace_draft(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
@@ -210,7 +156,12 @@ class SQLDraftStore:
         )
         return _as_dict(draft, "drafts"), created
 
-    def update_draft(self, draft_uuid, payload, expected_revision):
+    def update_draft(
+        self,
+        draft_uuid: object,
+        payload: typing.Any,
+        expected_revision: typing.Any,
+    ) -> typing.Any:
         draft, updated = helpers.update_workspace_draft(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
@@ -219,12 +170,14 @@ class SQLDraftStore:
             expected_revision=expected_revision,
         )
         if not updated:
-            raise messenger_exc.DraftPreconditionFailedError(
-                self._public_draft(draft)
-            )
+            raise messenger_exc.DraftPreconditionFailedError(self._public_draft(draft))
         return _as_dict(draft, "drafts")
 
-    def delete_draft(self, draft_uuid, expected_revision):
+    def delete_draft(
+        self,
+        draft_uuid: sys_uuid.UUID,
+        expected_revision: int,
+    ) -> None:
         draft, deleted = helpers.delete_workspace_draft(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
@@ -232,9 +185,7 @@ class SQLDraftStore:
             expected_revision=expected_revision,
         )
         if not deleted:
-            raise messenger_exc.DraftPreconditionFailedError(
-                self._public_draft(draft)
-            )
+            raise messenger_exc.DraftPreconditionFailedError(self._public_draft(draft))
         return None
 
 
@@ -245,18 +196,20 @@ class SQLProjectedMessengerStore:
         self,
         project_uuid: sys_uuid.UUID,
         user_uuid: sys_uuid.UUID,
-        mail_service,
-        canonical_event_states=None,
-    ):
+        mail_service: typing.Any,
+        canonical_event_states: typing.Any = None,
+        bridge_config: typing.Any = None,
+    ) -> None:
         self.project_uuid = project_uuid
         self.user_uuid = user_uuid
         self.mail_service = mail_service
+        self.bridge_config = bridge_config
         self._projection_event_epoch = self._latest_projection_event_epoch()
         self._canonical_event_states = (
             {} if canonical_event_states is None else canonical_event_states
         )
 
-    def _latest_projection_event_epoch(self):
+    def _latest_projection_event_epoch(self) -> int:
         events = models.WorkspaceEvent.objects.get_all(
             filters={"project_id": dm_filters.EQ(self.project_uuid)},
             order_by={"epoch_version": "desc"},
@@ -264,7 +217,10 @@ class SQLProjectedMessengerStore:
         )
         return 0 if not events else events[0].epoch_version
 
-    def _known_event_uuids(self, user_uuid):
+    def _known_event_uuids(
+        self,
+        user_uuid: sys_uuid.UUID,
+    ) -> set[sys_uuid.UUID]:
         state = self._canonical_event_states.setdefault(
             user_uuid,
             _CanonicalEventState(),
@@ -283,7 +239,7 @@ class SQLProjectedMessengerStore:
         state.cursor = current
         return state.event_uuids
 
-    def _sync_projection_events(self):
+    def _sync_projection_events(self) -> None:
         rows = models.WorkspaceEvent.objects.get_all(
             filters={
                 "project_id": dm_filters.EQ(self.project_uuid),
@@ -316,7 +272,7 @@ class SQLProjectedMessengerStore:
                 row.epoch_version,
             )
 
-    def _scope_filters(self, resource, filters):
+    def _scope_filters(self, resource: typing.Any, filters: typing.Any) -> typing.Any:
         result = filters.copy()
         model = RESOURCE_MODELS[resource]
         properties = model.properties.properties
@@ -333,14 +289,21 @@ class SQLProjectedMessengerStore:
             )
         return result
 
-    def sync_iam_identity(self, values):
+    def sync_iam_identity(self, values: typing.Any) -> typing.Any:
         row = models.WorkspaceUser.sync_iam_identity(**values)
         return _as_dict(row, "users")
 
-    def filter_resources(self, resource, filters, order_by=None):
+    def filter_resources(
+        self,
+        resource: typing.Any,
+        filters: typing.Any,
+        order_by: typing.Any = None,
+        limit: typing.Any = None,
+    ) -> typing.Any:
         rows = RESOURCE_MODELS[resource].objects.get_all(
             filters=self._scope_filters(resource, filters),
             order_by=order_by,
+            limit=limit,
         )
         if resource == "files":
             rows = [row for row in rows if self._can_read_file(row)]
@@ -348,11 +311,11 @@ class SQLProjectedMessengerStore:
 
     def filter_message_page(
         self,
-        filters,
-        marker_uuid,
-        sort_direction,
-        limit,
-    ):
+        filters: typing.Any,
+        marker_uuid: object,
+        sort_direction: typing.Any,
+        limit: typing.Any,
+    ) -> typing.Any:
         scoped_filters = self._scope_filters("messages", filters)
         if marker_uuid is not None:
             marker_filters = scoped_filters.copy()
@@ -383,11 +346,11 @@ class SQLProjectedMessengerStore:
 
     def filter_draft_page(
         self,
-        filters,
-        marker_uuid,
-        sort_direction,
-        limit,
-    ):
+        filters: typing.Any,
+        marker_uuid: object,
+        sort_direction: typing.Any,
+        limit: typing.Any,
+    ) -> typing.Any:
         allowed_filters = {"stream_uuid", "topic_uuid"}
         if not set(filters).issubset(allowed_filters):
             raise ra_exceptions.ValidationErrorException()
@@ -422,24 +385,25 @@ class SQLProjectedMessengerStore:
         if limit is not None:
             statement += " LIMIT %s"
             params.append(limit)
-        engine = models.WorkspaceDraft._get_engine()
-        with engine.session_manager() as session:
-            result = session.execute(statement, tuple(params))
-            draft_uuids = [row["uuid"] for row in result.fetchall()]
-            if not draft_uuids:
-                return []
-            rows = models.WorkspaceDraft.objects.get_all(
-                filters={
-                    "uuid": dm_filters.In(draft_uuids),
-                    "project_id": dm_filters.EQ(self.project_uuid),
-                    "user_uuid": dm_filters.EQ(self.user_uuid),
-                },
-                session=session,
-            )
+        session = contexts.Context().get_session()
+        result = session.execute(statement, tuple(params))
+        draft_uuids = [row["uuid"] for row in result.fetchall()]
+        if not draft_uuids:
+            return []
+        rows = models.WorkspaceDraft.objects.get_all(
+            filters={
+                "uuid": dm_filters.In(draft_uuids),
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+            },
+            session=session,
+        )
         rows_by_uuid = {row.uuid: row for row in rows}
-        return [_as_dict(rows_by_uuid[draft_uuid], "drafts") for draft_uuid in draft_uuids]
+        return [
+            _as_dict(rows_by_uuid[draft_uuid], "drafts") for draft_uuid in draft_uuids
+        ]
 
-    def get_resource(self, resource, resource_uuid):
+    def get_resource(self, resource: typing.Any, resource_uuid: object) -> typing.Any:
         if resource == "folder_items":
             row = helpers.get_workspace_user_folder_item(
                 self.project_uuid,
@@ -464,18 +428,28 @@ class SQLProjectedMessengerStore:
             )
         return _as_dict(row, resource)
 
-    def _record(self, operation, entity_uuid, payload):
+    def _record(
+        self,
+        operation: typing.Any,
+        entity_uuid: object,
+        payload: typing.Any,
+    ) -> typing.Any:
         return mail_repository.OperationRecord(
             project_uuid=self.project_uuid,
             operation_uuid=sys_uuid.uuid4(),
             actor_uuid=self.user_uuid,
             operation=operation,
-            entity_uuid=entity_uuid,
+            entity_uuid=typing.cast(sys_uuid.UUID, entity_uuid),
             payload=typing.cast(dict, _simple(payload)),
             occurred_at=datetime.datetime.now(datetime.timezone.utc),
         )
 
-    def _append(self, operation, entity_uuid, payload):
+    def _append(
+        self,
+        operation: typing.Any,
+        entity_uuid: object,
+        payload: typing.Any,
+    ) -> typing.Any:
         payload = self._canonical_snapshot(operation, entity_uuid, payload)
         payload.setdefault(
             "_event_recipient_uuids",
@@ -485,7 +459,59 @@ class SQLProjectedMessengerStore:
         self.mail_service.repository.append_operation(record)
         return record
 
-    def create_resource(self, resource, values):
+    def _queue_bridge_operation(
+        self,
+        record: typing.Any,
+        operation_kind: typing.Any,
+        entity_uuid: sys_uuid.UUID,
+        payload: typing.Any,
+        target_type: typing.Any,
+        *,
+        target_stream_uuid: sys_uuid.UUID | None = None,
+        provider_entity_id: typing.Any = None,
+        provider_revision: typing.Any = None,
+    ) -> typing.Any:
+        if self.bridge_config is None:
+            return None
+        return external_bridge_data_plane.queue_workspace_operation(
+            contexts.Context().get_session(),
+            project_uuid=self.project_uuid,
+            owner_user_uuid=self.user_uuid,
+            operation_uuid=record.operation_uuid,
+            operation_kind=operation_kind,
+            entity_uuid=entity_uuid,
+            payload=typing.cast(dict, _simple(payload)),
+            target_type=target_type,
+            target_stream_uuid=target_stream_uuid,
+            provider_entity_id=provider_entity_id,
+            provider_revision=provider_revision,
+            realm_uuid=self.bridge_config.realm_uuid,
+            bridge_instance_uuid=self.bridge_config.bridge_instance_uuid,
+            identity_generation=self.bridge_config.identity_generation,
+            enrollment_secret=self.bridge_config.enrollment_secret,
+            now=record.occurred_at,
+        )
+
+    def _preflight_bridge_operation(
+        self,
+        operation_kind: typing.Any,
+        target_stream_uuid: sys_uuid.UUID,
+    ) -> typing.Any:
+        if self.bridge_config is None:
+            return False
+        try:
+            target = external_bridge_data_plane.validate_workspace_operation(
+                contexts.Context().get_session(),
+                project_uuid=self.project_uuid,
+                owner_user_uuid=self.user_uuid,
+                operation_kind=operation_kind,
+                target_stream_uuid=target_stream_uuid,
+            )
+        except ValueError as exc:
+            raise ra_exceptions.ValidationErrorException() from exc
+        return target is not None
+
+    def create_resource(self, resource: typing.Any, values: typing.Any) -> typing.Any:
         values = _plain_values(values)
         entity_uuid = values.get("uuid") or sys_uuid.uuid4()
         values["uuid"] = entity_uuid
@@ -570,6 +596,19 @@ class SQLProjectedMessengerStore:
                 user_uuid=self.user_uuid,
                 values=self._projection_values(values),
             )
+            if self.bridge_config is not None:
+                try:
+                    external_bridge_data_plane.ensure_topic_projection_mapping(
+                        contexts.Context().get_session(),
+                        project_uuid=self.project_uuid,
+                        owner_user_uuid=self.user_uuid,
+                        stream_uuid=row.stream_uuid,
+                        topic_uuid=row.uuid,
+                        topic_name=row.name,
+                        bridge_instance_uuid=(self.bridge_config.bridge_instance_uuid),
+                    )
+                except ValueError as exc:
+                    raise ra_exceptions.ValidationErrorException() from exc
         elif resource == "message_reactions":
             self._append("reaction.create", entity_uuid, values)
             row = helpers.create_workspace_message_reaction(
@@ -589,8 +628,23 @@ class SQLProjectedMessengerStore:
         self._sync_projection_events()
         return _as_dict(row, resource)
 
-    def update_resource(self, resource, resource_uuid, values):
+    def update_resource(
+        self,
+        resource: typing.Any,
+        resource_uuid: sys_uuid.UUID,
+        values: typing.Any,
+    ) -> typing.Any:
         values = _plain_values(values)
+        if resource == "streams":
+            self._preflight_bridge_operation("stream.upsert", resource_uuid)
+        elif resource == "stream_topics":
+            topic = self.mail_service.repository.projection.topics[
+                sys_uuid.UUID(str(resource_uuid))
+            ]
+            self._preflight_bridge_operation(
+                "topic.upsert",
+                topic["stream_uuid"],
+            )
         if resource == "stream_bindings":
             binding = self.mail_service.repository.projection.bindings.get(
                 sys_uuid.UUID(str(resource_uuid))
@@ -608,8 +662,9 @@ class SQLProjectedMessengerStore:
             "stream_topics": "topic.update",
             "message_reactions": "reaction.update",
         }.get(resource)
+        record: typing.Any = None
         if operation is not None:
-            self._append(operation, resource_uuid, values)
+            record = self._append(operation, resource_uuid, values)
         if resource == "folders":
             row = helpers.update_workspace_user_folder(
                 self.project_uuid,
@@ -624,12 +679,52 @@ class SQLProjectedMessengerStore:
                 resource_uuid,
                 self._projection_values(values),
             )
+            provider = record.payload.get("provider") or {}
+            self._queue_bridge_operation(
+                record,
+                "stream.upsert",
+                row.uuid,
+                {
+                    "name": row.name,
+                    "description": row.description or "",
+                    "private": row.private,
+                    "chat_kind": (
+                        "personal_dm"
+                        if self._is_direct_stream(row.uuid)
+                        else "group_dm"
+                        if row.private
+                        else "channel"
+                    ),
+                    "participant_uuids": [
+                        str(value) for value in self._stream_participants(row.uuid)
+                    ],
+                    "default_topic_uuid": (
+                        None
+                        if row.default_topic_uuid is None
+                        else str(row.default_topic_uuid)
+                    ),
+                },
+                "stream",
+                target_stream_uuid=row.uuid,
+                provider_entity_id=provider.get("external_id"),
+                provider_revision=provider.get("revision"),
+            )
         elif resource == "stream_topics":
             row = helpers.update_workspace_user_stream_topic(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
                 self._projection_values(values),
+            )
+            provider = record.payload.get("provider") or {}
+            self._queue_bridge_operation(
+                record,
+                "topic.upsert",
+                row.uuid,
+                {"stream_uuid": str(row.stream_uuid), "name": row.name},
+                "topic",
+                provider_entity_id=provider.get("external_id"),
+                provider_revision=provider.get("revision"),
             )
         elif resource == "message_reactions":
             row = helpers.update_workspace_message_reaction(
@@ -662,7 +757,28 @@ class SQLProjectedMessengerStore:
         self._sync_projection_events()
         return _as_dict(row, resource)
 
-    def delete_resource(self, resource, resource_uuid):
+    def delete_resource(
+        self,
+        resource: typing.Any,
+        resource_uuid: sys_uuid.UUID,
+    ) -> typing.Any:
+        external_target = False
+        target_stream_uuid = None
+        if resource == "streams":
+            target_stream_uuid = resource_uuid
+            external_target = self._preflight_bridge_operation(
+                "stream.delete",
+                target_stream_uuid,
+            )
+        elif resource == "stream_topics":
+            topic = self.mail_service.repository.projection.topics[
+                sys_uuid.UUID(str(resource_uuid))
+            ]
+            target_stream_uuid = topic["stream_uuid"]
+            external_target = self._preflight_bridge_operation(
+                "topic.delete",
+                target_stream_uuid,
+            )
         if resource == "stream_bindings":
             binding = self.mail_service.repository.projection.bindings.get(
                 sys_uuid.UUID(str(resource_uuid))
@@ -683,46 +799,87 @@ class SQLProjectedMessengerStore:
             "stream_topics": "topic.delete",
             "message_reactions": "reaction.delete",
         }.get(resource)
+        record: typing.Any = None
         if operation is not None:
-            self._append(operation, resource_uuid, {})
+            record = self._append(operation, resource_uuid, {})
         if resource == "folders":
-            row = helpers.delete_workspace_user_folder(
-                self.project_uuid, self.user_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_user_folder(
+                    self.project_uuid, self.user_uuid, resource_uuid
+                ),
             )
         elif resource == "folder_items":
-            row = helpers.delete_workspace_user_folder_item(
-                self.project_uuid, self.user_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_user_folder_item(
+                    self.project_uuid, self.user_uuid, resource_uuid
+                ),
             )
         elif resource == "streams":
-            row = helpers.delete_workspace_user_stream(
-                self.project_uuid, self.user_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_user_stream(
+                    self.project_uuid, self.user_uuid, resource_uuid
+                ),
             )
         elif resource == "stream_bindings":
-            row = helpers.delete_workspace_stream_binding(
-                self.project_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_stream_binding(
+                    self.project_uuid, resource_uuid
+                ),
             )
         elif resource == "stream_topics":
-            row = helpers.delete_workspace_user_stream_topic(
-                self.project_uuid, self.user_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_user_stream_topic(
+                    self.project_uuid, self.user_uuid, resource_uuid
+                ),
             )
         elif resource == "message_reactions":
-            row = helpers.delete_workspace_message_reaction(
-                self.project_uuid, self.user_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_message_reaction(
+                    self.project_uuid, self.user_uuid, resource_uuid
+                ),
             )
         elif resource == "files":
             file = helpers.get_workspace_owned_file(
                 self.project_uuid, self.user_uuid, resource_uuid
             )
             self._append("file.delete", resource_uuid, _as_dict(file))
-            row = helpers.delete_workspace_file(
-                self.project_uuid, self.user_uuid, resource_uuid
+            row = typing.cast(
+                typing.Any,
+                helpers.delete_workspace_file(
+                    self.project_uuid, self.user_uuid, resource_uuid
+                ),
             )
         else:
             raise ValueError(f"Unsupported Messenger delete resource {resource}")
+        if external_target:
+            provider = record.payload.get("provider") or {}
+            self._queue_bridge_operation(
+                record,
+                "stream.delete" if resource == "streams" else "topic.delete",
+                resource_uuid,
+                (
+                    {"stream_uuid": str(resource_uuid)}
+                    if resource == "streams"
+                    else {
+                        "stream_uuid": str(target_stream_uuid),
+                        "topic_uuid": str(resource_uuid),
+                    }
+                ),
+                "stream" if resource == "streams" else "topic",
+                target_stream_uuid=target_stream_uuid,
+                provider_entity_id=provider.get("external_id"),
+                provider_revision=provider.get("revision"),
+            )
         self._sync_projection_events()
         return None if row is None else _as_dict(row, resource)
 
-    def create_message(self, values):
+    def create_message(self, values: typing.Any) -> typing.Any:
         values = _plain_values(values)
         message_uuid = values.get("uuid") or sys_uuid.uuid4()
         values["uuid"] = message_uuid
@@ -742,6 +899,7 @@ class SQLProjectedMessengerStore:
         values["_event_recipient_uuids"] = [
             str(value) for value in self._stream_participants(stream_uuid)
         ]
+        self._preflight_bridge_operation("message.create", stream_uuid)
         record_values = values.copy()
         record_values["author_uuid"] = str(self.user_uuid)
         record = self._record("message.create", message_uuid, record_values)
@@ -761,23 +919,68 @@ class SQLProjectedMessengerStore:
                 enforce_visibility=True,
                 **self._projection_values(projection_values),
             )
+        if self.bridge_config is not None:
+            session = contexts.Context().get_session()
+            external_bridge_data_plane.queue_message_create(
+                session,
+                project_uuid=self.project_uuid,
+                owner_user_uuid=self.user_uuid,
+                message={
+                    **values,
+                    "uuid": message_uuid,
+                    "payload": _simple(values["payload"]),
+                },
+                realm_uuid=self.bridge_config.realm_uuid,
+                bridge_instance_uuid=self.bridge_config.bridge_instance_uuid,
+                identity_generation=self.bridge_config.identity_generation,
+                enrollment_secret=self.bridge_config.enrollment_secret,
+                now=record.occurred_at,
+            )
         self._sync_projection_events()
         return _as_dict(row, "messages")
 
-    def update_message(self, message_uuid, values):
+    def update_message(
+        self,
+        message_uuid: sys_uuid.UUID,
+        values: typing.Any,
+    ) -> typing.Any:
         values = _plain_values(values)
-        self._append("message.update", message_uuid, values)
+        current = self.mail_service.repository.projection.messages[message_uuid]
+        self._preflight_bridge_operation(
+            "message.update",
+            current["stream_uuid"],
+        )
+        record = self._append("message.update", message_uuid, values)
         row = helpers.update_workspace_user_message(
             self.project_uuid,
             self.user_uuid,
             message_uuid,
             self._projection_values(values),
         )
+        provider = record.payload.get("provider") or {}
+        self._queue_bridge_operation(
+            record,
+            "message.update",
+            row.uuid,
+            {
+                "stream_uuid": str(row.stream_uuid),
+                "topic_uuid": str(row.topic_uuid),
+                "author_uuid": str(row.author_uuid),
+                "payload": _simple(row.payload),
+            },
+            "message",
+            provider_entity_id=provider.get("external_id"),
+            provider_revision=provider.get("revision"),
+        )
         self._sync_projection_events()
         return _as_dict(row, "messages")
 
-    def delete_message(self, message_uuid):
+    def delete_message(self, message_uuid: sys_uuid.UUID) -> typing.Any:
         message = self.mail_service.repository.projection.messages[message_uuid]
+        self._preflight_bridge_operation(
+            "message.delete",
+            message["stream_uuid"],
+        )
         record = self._record(
             "message.delete",
             message_uuid,
@@ -789,19 +992,36 @@ class SQLProjectedMessengerStore:
             },
         )
         self.mail_service.delete_message(record)
-        row = helpers.delete_workspace_user_message(
-            self.project_uuid,
-            self.user_uuid,
+        provider = message.get("provider") or {}
+        self._queue_bridge_operation(
+            record,
+            "message.delete",
             message_uuid,
+            {
+                "stream_uuid": message["stream_uuid"],
+                "topic_uuid": message["topic_uuid"],
+                "author_uuid": message["author_uuid"],
+            },
+            "message",
+            provider_entity_id=provider.get("external_id"),
+            provider_revision=provider.get("revision"),
+        )
+        row = typing.cast(
+            typing.Any,
+            helpers.delete_workspace_user_message(
+                self.project_uuid,
+                self.user_uuid,
+                message_uuid,
+            ),
         )
         self._sync_projection_events()
         return None if row is None else _as_dict(row, "messages")
 
     @staticmethod
-    def _public_draft(row):
+    def _public_draft(row: typing.Any) -> typing.Any:
         return _as_dict(row, "drafts")
 
-    def create_draft(self, values):
+    def create_draft(self, values: typing.Any) -> typing.Any:
         draft, created = helpers.create_workspace_draft(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
@@ -814,10 +1034,10 @@ class SQLProjectedMessengerStore:
 
     def update_draft(
         self,
-        draft_uuid,
-        payload,
-        expected_revision,
-    ):
+        draft_uuid: object,
+        payload: typing.Any,
+        expected_revision: typing.Any,
+    ) -> typing.Any:
         draft, updated = helpers.update_workspace_draft(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
@@ -826,12 +1046,12 @@ class SQLProjectedMessengerStore:
             expected_revision=expected_revision,
         )
         if not updated:
-            raise messenger_exc.DraftPreconditionFailedError(
-                self._public_draft(draft)
-            )
+            raise messenger_exc.DraftPreconditionFailedError(self._public_draft(draft))
         return _as_dict(draft, "drafts")
 
-    def delete_draft(self, draft_uuid, expected_revision):
+    def delete_draft(
+        self, draft_uuid: object, expected_revision: typing.Any
+    ) -> typing.Any:
         draft, deleted = helpers.delete_workspace_draft(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
@@ -839,12 +1059,16 @@ class SQLProjectedMessengerStore:
             expected_revision=expected_revision,
         )
         if not deleted:
-            raise messenger_exc.DraftPreconditionFailedError(
-                self._public_draft(draft)
-            )
+            raise messenger_exc.DraftPreconditionFailedError(self._public_draft(draft))
         return None
 
-    def perform_action(self, resource, resource_uuid, action, values):
+    def perform_action(
+        self,
+        resource: typing.Any,
+        resource_uuid: object,
+        action: typing.Any,
+        values: typing.Any,
+    ) -> typing.Any:
         resource_uuid = sys_uuid.UUID(str(resource_uuid))
         if resource == "folder_items" and action in {"pin", "unpin"}:
             self._append(f"folder_item.{action}", resource_uuid, values)
@@ -873,16 +1097,43 @@ class SQLProjectedMessengerStore:
                 values["notification_mode"],
             )
         elif resource == "streams" and action == "read":
-            for (
-                message_uuid,
-                message,
-            ) in self.mail_service.repository.projection.messages.items():
-                if message.get("stream_uuid") == str(resource_uuid):
-                    self._append(
-                        "message.read",
-                        message_uuid,
-                        {"user_uuid": str(self.user_uuid)},
-                    )
+            self._preflight_bridge_operation("read_state.set", resource_uuid)
+            stream_messages = [
+                (message_uuid, message)
+                for message_uuid, message in (
+                    self.mail_service.repository.projection.messages.items()
+                )
+                if message.get("stream_uuid") == str(resource_uuid)
+            ]
+            stream_messages.sort(
+                key=lambda item: (item[1].get("created_at", ""), str(item[0]))
+            )
+            message_uuids = [message_uuid for message_uuid, _message in stream_messages]
+            for message_uuid in message_uuids:
+                self._append(
+                    "message.read",
+                    message_uuid,
+                    {"user_uuid": str(self.user_uuid)},
+                )
+            if message_uuids:
+                bridge_record = self._record(
+                    "message.read",
+                    resource_uuid,
+                    {"user_uuid": str(self.user_uuid)},
+                )
+                self._queue_bridge_operation(
+                    bridge_record,
+                    "read_state.set",
+                    resource_uuid,
+                    {
+                        "stream_uuid": str(resource_uuid),
+                        "topic_uuid": None,
+                        "reader_uuid": str(self.user_uuid),
+                        "message_uuids": [str(value) for value in message_uuids],
+                        "read": True,
+                    },
+                    "stream",
+                )
             row = helpers.read_workspace_user_stream_messages(
                 self.project_uuid, self.user_uuid, resource_uuid
             )
@@ -952,34 +1203,129 @@ class SQLProjectedMessengerStore:
                 self.project_uuid, self.user_uuid, resource_uuid
             )
         elif resource == "stream_topics" and action == "read":
+            topic = self.mail_service.repository.projection.topics[resource_uuid]
+            self._preflight_bridge_operation(
+                "read_state.set",
+                topic["stream_uuid"],
+            )
+            topic_messages = [
+                (message_uuid, message)
+                for message_uuid, message in (
+                    self.mail_service.repository.projection.messages.items()
+                )
+                if message.get("topic_uuid") == str(resource_uuid)
+            ]
+            topic_messages.sort(
+                key=lambda item: (item[1].get("created_at", ""), str(item[0]))
+            )
+            if topic_messages:
+                bridge_record = self._record(
+                    "message.read",
+                    topic_messages[-1][0],
+                    {"user_uuid": str(self.user_uuid)},
+                )
+                self._queue_bridge_operation(
+                    bridge_record,
+                    "read_state.set",
+                    topic_messages[-1][0],
+                    {
+                        "stream_uuid": topic["stream_uuid"],
+                        "topic_uuid": str(resource_uuid),
+                        "reader_uuid": str(self.user_uuid),
+                        "message_uuids": [
+                            str(message_uuid)
+                            for message_uuid, _message in topic_messages
+                        ],
+                        "read": True,
+                    },
+                    "message",
+                )
             row = helpers.read_workspace_user_stream_topic_messages(
                 self.project_uuid, self.user_uuid, resource_uuid
             )
         elif resource == "messages" and action == "read":
-            self._append(
+            message = self.mail_service.repository.projection.messages[resource_uuid]
+            self._preflight_bridge_operation(
+                "read_state.set",
+                message["stream_uuid"],
+            )
+            record = self._append(
                 "message.read",
                 resource_uuid,
                 {"user_uuid": str(self.user_uuid)},
+            )
+            self._queue_bridge_operation(
+                record,
+                "read_state.set",
+                resource_uuid,
+                {
+                    "stream_uuid": message["stream_uuid"],
+                    "topic_uuid": message["topic_uuid"],
+                    "reader_uuid": str(self.user_uuid),
+                    "message_uuids": [str(resource_uuid)],
+                    "read": True,
+                },
+                "message",
             )
             row = helpers.read_workspace_user_message(
                 self.project_uuid, self.user_uuid, resource_uuid
             )
         elif resource == "messages" and action == "read_up_to":
             target = self.mail_service.repository.projection.messages[resource_uuid]
+            self._preflight_bridge_operation(
+                "read_state.set",
+                target["stream_uuid"],
+            )
             target_created_at = target.get("created_at", "")
-            for (
-                message_uuid,
-                message,
-            ) in self.mail_service.repository.projection.messages.items():
-                if (
-                    message.get("topic_uuid") == target.get("topic_uuid")
-                    and message.get("created_at", "") <= target_created_at
-                ):
-                    self._append(
-                        "message.read",
-                        message_uuid,
-                        {"user_uuid": str(self.user_uuid)},
+            target_boundary = (
+                target_created_at,
+                sys_uuid.UUID(str(resource_uuid)),
+            )
+            selected_messages = sorted(
+                (
+                    (
+                        message.get("created_at", ""),
+                        sys_uuid.UUID(str(message_uuid)),
                     )
+                    for message_uuid, message in (
+                        self.mail_service.repository.projection.messages.items()
+                    )
+                    if message.get("topic_uuid") == target.get("topic_uuid")
+                    and (
+                        message.get("created_at", ""),
+                        sys_uuid.UUID(str(message_uuid)),
+                    )
+                    <= target_boundary
+                ),
+                key=lambda item: item,
+            )
+            for _created_at, message_uuid in selected_messages:
+                self._append(
+                    "message.read",
+                    message_uuid,
+                    {"user_uuid": str(self.user_uuid)},
+                )
+            bridge_record = self._record(
+                "message.read",
+                resource_uuid,
+                {"user_uuid": str(self.user_uuid)},
+            )
+            self._queue_bridge_operation(
+                bridge_record,
+                "read_state.set",
+                resource_uuid,
+                {
+                    "stream_uuid": target["stream_uuid"],
+                    "topic_uuid": target["topic_uuid"],
+                    "reader_uuid": str(self.user_uuid),
+                    "message_uuids": [
+                        str(message_uuid)
+                        for _created_at, message_uuid in selected_messages
+                    ],
+                    "read": True,
+                },
+                "message",
+            )
             row = helpers.read_workspace_user_topic_messages_to_message(
                 self.project_uuid, self.user_uuid, resource_uuid
             )
@@ -1039,7 +1385,7 @@ class SQLProjectedMessengerStore:
         return _as_dict(row, resource)
 
     @staticmethod
-    def _after_epoch_version(filters):
+    def _after_epoch_version(filters: typing.Any) -> typing.Any:
         clause = filters.get("epoch_version")
         clauses = (
             clause.clauses
@@ -1055,14 +1401,15 @@ class SQLProjectedMessengerStore:
                 after = max(after, value - 1)
         return after, clauses
 
-    def _validate_event_cursor(self, after, epoch_generation):
+    def _validate_event_cursor(
+        self, after: typing.Any, epoch_generation: typing.Any
+    ) -> typing.Any:
         state = self.mail_service.repository.event_cursor_state(self.user_uuid)
         reason = None
         if after > 0 and epoch_generation is None:
             reason = "epoch_generation_required"
         elif (
-            epoch_generation is not None
-            and epoch_generation != state.epoch_generation
+            epoch_generation is not None and epoch_generation != state.epoch_generation
         ):
             reason = "epoch_generation_changed"
         elif after > state.current_epoch_version:
@@ -1078,13 +1425,20 @@ class SQLProjectedMessengerStore:
             )
         return state
 
-    def events_after(self, filters, order_by=None, epoch_generation=None):
+    def events_after(
+        self,
+        filters: typing.Any,
+        order_by: typing.Any = None,
+        epoch_generation: typing.Any = None,
+        limit: typing.Any = None,
+    ) -> typing.Any:
         del order_by
         after, clauses = self._after_epoch_version(filters)
         state = self._validate_event_cursor(after, epoch_generation)
         events = self.mail_service.repository.events_after(
             self.user_uuid,
             mail_repository.EpochCursor(int(state.epoch_generation), after),
+            limit=limit,
         )
         result = [event.as_dict() for event in events]
         for item in clauses:
@@ -1101,23 +1455,23 @@ class SQLProjectedMessengerStore:
                 result = [event for event in result if event["epoch_version"] == value]
         return result
 
-    def current_epoch(self):
+    def current_epoch(self) -> typing.Any:
         return self.event_cursor()["current_epoch_version"]
 
-    def event_cursor(self):
-        return self.mail_service.repository.event_cursor_state(
-            self.user_uuid
-        ).as_dict()
+    def event_cursor(self) -> typing.Any:
+        return self.mail_service.repository.event_cursor_state(self.user_uuid).as_dict()
 
-    def replay_operations(self, projector, after_uid=0):
+    def replay_operations(
+        self, projector: typing.Any, after_uid: typing.Any = 0
+    ) -> typing.Any:
         replay = self.mail_service.repository.read_operations(after_uid=after_uid)
         for entry in replay.entries:
             projector(entry.record)
         return replay
 
-    def rebuild_sql_projection(self):
+    def rebuild_sql_projection(self) -> typing.Any:
         projection = self.mail_service.repository.rebuild()
-        collections = (
+        collections: tuple[tuple[typing.Any, typing.Any], ...] = (
             (models.WorkspaceStream, projection.streams),
             (models.WorkspaceStreamBinding, projection.bindings),
             (models.WorkspaceStreamTopic, projection.topics),
@@ -1142,11 +1496,11 @@ class SQLProjectedMessengerStore:
 
     def _upsert_projection_row(
         self,
-        model,
-        entity_uuid,
-        payload,
-        user_uuid=None,
-    ):
+        model: typing.Any,
+        entity_uuid: object,
+        payload: typing.Any,
+        user_uuid: object = None,
+    ) -> typing.Any:
         values = {
             name: value
             for name, value in payload.items()
@@ -1173,7 +1527,7 @@ class SQLProjectedMessengerStore:
             row.update()
         return row
 
-    def _binding_uuid(self, stream_uuid, user_uuid):
+    def _binding_uuid(self, stream_uuid: object, user_uuid: object) -> typing.Any:
         for (
             binding_uuid,
             binding,
@@ -1186,14 +1540,16 @@ class SQLProjectedMessengerStore:
             "User is not an ordinary stream participant"
         )
 
-    def _is_direct_stream(self, stream_uuid):
+    def _is_direct_stream(self, stream_uuid: object) -> typing.Any:
         stream = self.mail_service.repository.projection.streams.get(
             sys_uuid.UUID(str(stream_uuid)),
             {},
         )
         return stream.get("kind") == "direct"
 
-    def _validate_stream_participants(self, stream_uuid, participants):
+    def _validate_stream_participants(
+        self, stream_uuid: object, participants: typing.Any
+    ) -> None:
         try:
             self.mail_service.validate_stream_participants(
                 sys_uuid.UUID(str(stream_uuid)),
@@ -1202,7 +1558,7 @@ class SQLProjectedMessengerStore:
         except mail_repository.InvalidJournalRecord as exc:
             raise ra_exceptions.ValidationErrorException() from exc
 
-    def _can_read_file(self, file):
+    def _can_read_file(self, file: typing.Any) -> typing.Any:
         if file.user_uuid == self.user_uuid:
             return True
         if file.stream_uuid is None:
@@ -1224,7 +1580,7 @@ class SQLProjectedMessengerStore:
             return False
         return True
 
-    def _delete_replaced_avatar_file(self, avatar):
+    def _delete_replaced_avatar_file(self, avatar: typing.Any) -> None:
         if not avatar.startswith(models.WORKSPACE_USER_IMAGE_AVATAR_PREFIX):
             return
         helpers.delete_workspace_avatar_file(
@@ -1232,7 +1588,9 @@ class SQLProjectedMessengerStore:
             sys_uuid.UUID(avatar[len(models.WORKSPACE_USER_IMAGE_AVATAR_PREFIX) :]),
         )
 
-    def _event_recipients(self, operation, payload):
+    def _event_recipients(
+        self, operation: typing.Any, payload: typing.Any
+    ) -> typing.Any:
         if "_event_recipient_uuids" in payload:
             return tuple(
                 sys_uuid.UUID(value) for value in payload["_event_recipient_uuids"]
@@ -1282,7 +1640,12 @@ class SQLProjectedMessengerStore:
             return self._stream_participants(stream_uuid)
         return (self.user_uuid,)
 
-    def _canonical_snapshot(self, operation, entity_uuid, payload):
+    def _canonical_snapshot(
+        self,
+        operation: typing.Any,
+        entity_uuid: object,
+        payload: typing.Any,
+    ) -> typing.Any:
         collection_name = {
             "stream": "streams",
             "binding": "bindings",
@@ -1305,7 +1668,7 @@ class SQLProjectedMessengerStore:
         result["uuid"] = str(entity_uuid)
         return result
 
-    def _stream_participants(self, stream_uuid):
+    def _stream_participants(self, stream_uuid: object) -> typing.Any:
         return tuple(
             sys_uuid.UUID(binding["user_uuid"])
             for binding in self.mail_service.repository.projection.bindings.values()
@@ -1313,20 +1676,8 @@ class SQLProjectedMessengerStore:
         )
 
     @staticmethod
-    def _projection_values(values):
-        result = values.copy()
-        for name in ("project_id", "user_uuid", "provider", "delivery"):
-            result.pop(name, None)
-        source = result.get("source")
-        if isinstance(source, dict):
-            kind = source.get("kind", result.get("source_name", "native"))
-            if kind == models.SourceName.NATIVE.value:
-                result["source"] = models.NativeSource()
-            else:
-                source_values = source.copy()
-                source_values.pop("kind", None)
-                result["source"] = models.ZulipSource(**source_values)
-        return result
+    def _projection_values(values: typing.Any) -> typing.Any:
+        return resource_projection.projection_values(values)
 
 
 @dataclasses.dataclass
@@ -1338,9 +1689,105 @@ class _ProjectProjectionState:
     )
 
 
+class MailEventStore:
+    """Read one user's event journal without loading the project state journal."""
+
+    def __init__(
+        self,
+        project_uuid: object,
+        user_uuid: object,
+        repository: typing.Any,
+    ) -> None:
+        self.project_uuid = project_uuid
+        self.user_uuid = user_uuid
+        self.repository = repository
+
+    @staticmethod
+    def _after_epoch_version(filters: typing.Any) -> typing.Any:
+        clause = filters.get("epoch_version")
+        clauses = (
+            clause.clauses
+            if isinstance(clause, dm_filters.AND)
+            else (() if clause is None else (clause,))
+        )
+        after = 0
+        for item in clauses:
+            value = int(item.value)
+            if isinstance(item, dm_filters.GT):
+                after = max(after, value)
+            elif isinstance(item, (dm_filters.GE, dm_filters.EQ)):
+                after = max(after, value - 1)
+        return after, clauses
+
+    def _validate_event_cursor(
+        self, after: typing.Any, epoch_generation: typing.Any
+    ) -> typing.Any:
+        state = self.repository.event_cursor_state(self.user_uuid)
+        reason = None
+        if after > 0 and epoch_generation is None:
+            reason = "epoch_generation_required"
+        elif (
+            epoch_generation is not None and epoch_generation != state.epoch_generation
+        ):
+            reason = "epoch_generation_changed"
+        elif after > state.current_epoch_version:
+            reason = "future_epoch"
+        elif after < state.minimum_epoch_version - 1:
+            reason = "epoch_pruned"
+        if reason is not None:
+            raise messenger_exc.EventsCursorExpiredError(
+                reason=reason,
+                epoch_generation=state.epoch_generation,
+                current_epoch_version=state.current_epoch_version,
+                minimum_epoch_version=state.minimum_epoch_version,
+            )
+        return state
+
+    def events_after(
+        self,
+        filters: typing.Any,
+        order_by: typing.Any = None,
+        epoch_generation: typing.Any = None,
+        limit: typing.Any = None,
+    ) -> typing.Any:
+        del order_by
+        after, clauses = self._after_epoch_version(filters)
+        state = self._validate_event_cursor(after, epoch_generation)
+        events = self.repository.events_after(
+            self.user_uuid,
+            mail_repository.EpochCursor(int(state.epoch_generation), after),
+            limit=limit,
+        )
+        result = [event.as_dict() for event in events]
+        for item in clauses:
+            value = int(item.value)
+            if isinstance(item, dm_filters.GT):
+                result = [event for event in result if event["epoch_version"] > value]
+            elif isinstance(item, dm_filters.GE):
+                result = [event for event in result if event["epoch_version"] >= value]
+            elif isinstance(item, dm_filters.LT):
+                result = [event for event in result if event["epoch_version"] < value]
+            elif isinstance(item, dm_filters.LE):
+                result = [event for event in result if event["epoch_version"] <= value]
+            else:
+                result = [event for event in result if event["epoch_version"] == value]
+        return result
+
+    def current_epoch(self) -> typing.Any:
+        return self.event_cursor()["current_epoch_version"]
+
+    def event_cursor(self) -> typing.Any:
+        return self.repository.event_cursor_state(self.user_uuid).as_dict()
+
+
 class SQLProjectedMessengerStoreFactory:
-    def __init__(self, runtime_factory: mail_runtime.RuntimeFactory):
+    def __init__(
+        self,
+        runtime_factory: mail_runtime.RuntimeFactory,
+        bridge_config: typing.Any = None,
+    ) -> None:
         self.runtime_factory = runtime_factory
+        self.bridge_config = bridge_config
         self._states: dict[sys_uuid.UUID, _ProjectProjectionState] = {}
         self._states_lock: typing.Any = threading.Lock()
 
@@ -1348,9 +1795,198 @@ class SQLProjectedMessengerStoreFactory:
         with self._states_lock:
             return self._states.setdefault(project_uuid, _ProjectProjectionState())
 
+    def move_stream_projection(
+        self,
+        *,
+        chat_uuid: object,
+        revision: typing.Any,
+        owner_uuid: object,
+        stream_uuid: object,
+        old_project_uuid: object,
+        new_project_uuid: object = None,
+        write_new: typing.Any = True,
+        write_old: typing.Any = True,
+    ) -> None:
+        """Preserve the transitional mail journal during a project move."""
+        if stream_uuid is None or old_project_uuid is None:
+            return
+        stream_uuid = sys_uuid.UUID(str(stream_uuid))
+        old_project_uuid = sys_uuid.UUID(str(old_project_uuid))
+        owner_uuid = sys_uuid.UUID(str(owner_uuid))
+        occurred_at = datetime.datetime.now(datetime.timezone.utc)
+        with self(old_project_uuid, owner_uuid) as old_store:
+            projection = copy.deepcopy(old_store.mail_service.repository.projection)
+        stream = projection.streams.get(stream_uuid)
+        if stream is None:
+            return
+        message_uuids = {
+            message_uuid
+            for message_uuid, value in projection.messages.items()
+            if value.get("stream_uuid") == str(stream_uuid)
+        }
+
+        def record(
+            project_uuid: object,
+            operation: typing.Any,
+            entity_uuid: object,
+            payload: typing.Any,
+            suffix: typing.Any,
+            when: typing.Any = None,
+        ) -> typing.Any:
+            return mail_repository.OperationRecord(
+                project_uuid=typing.cast(sys_uuid.UUID, project_uuid),
+                operation_uuid=sys_uuid.uuid5(
+                    sys_uuid.UUID(str(chat_uuid)),
+                    f"projection:{revision}:{project_uuid}:{suffix}:{entity_uuid}",
+                ),
+                actor_uuid=owner_uuid,
+                operation=operation,
+                entity_uuid=sys_uuid.UUID(str(entity_uuid)),
+                payload=payload,
+                occurred_at=when or occurred_at,
+            )
+
+        if new_project_uuid is not None and write_new:
+            new_project_uuid = sys_uuid.UUID(str(new_project_uuid))
+            operations = []
+            stream_payload = copy.deepcopy(stream)
+            stream_payload.pop("uuid", None)
+            operations.append(
+                record(
+                    new_project_uuid,
+                    "stream.create",
+                    stream_uuid,
+                    stream_payload,
+                    "stream-create",
+                )
+            )
+            for collection, operation, reference in (
+                (projection.bindings, "binding.create", "stream_uuid"),
+                (projection.topics, "topic.create", "stream_uuid"),
+                (projection.files, "file.create", "stream_uuid"),
+            ):
+                for entity_uuid, value in collection.items():
+                    if value.get(reference) != str(stream_uuid):
+                        continue
+                    payload = copy.deepcopy(value)
+                    payload.pop("uuid", None)
+                    operations.append(
+                        record(
+                            new_project_uuid,
+                            operation,
+                            entity_uuid,
+                            payload,
+                            operation,
+                        )
+                    )
+            for message_uuid, value in projection.messages.items():
+                if value.get("stream_uuid") != str(stream_uuid):
+                    continue
+                payload = copy.deepcopy(value)
+                payload.pop("uuid", None)
+                created_at = payload.pop("created_at", occurred_at)
+                if isinstance(created_at, str):
+                    created_at = datetime.datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00")
+                    )
+                operations.append(
+                    record(
+                        new_project_uuid,
+                        "message.create",
+                        message_uuid,
+                        payload,
+                        "message-create",
+                        when=created_at,
+                    )
+                )
+            for reaction_uuid, value in projection.reactions.items():
+                if sys_uuid.UUID(value["message_uuid"]) not in message_uuids:
+                    continue
+                payload = copy.deepcopy(value)
+                payload.pop("uuid", None)
+                operations.append(
+                    record(
+                        new_project_uuid,
+                        "reaction.create",
+                        reaction_uuid,
+                        payload,
+                        "reaction-create",
+                    )
+                )
+            for (user_uuid, message_uuid), value in projection.message_states.items():
+                if message_uuid not in message_uuids:
+                    continue
+                operations.append(
+                    record(
+                        new_project_uuid,
+                        "message.state",
+                        message_uuid,
+                        {
+                            "user_uuid": str(user_uuid),
+                            "message_uuid": str(message_uuid),
+                            **value,
+                        },
+                        f"message-state:{user_uuid}",
+                    )
+                )
+            with self(new_project_uuid, owner_uuid) as new_store:
+                for operation in operations:
+                    new_store.mail_service.repository.append_operation(operation)
+        if write_old:
+            with self(old_project_uuid, owner_uuid) as old_store:
+                repository = old_store.mail_service.repository
+                for file_uuid, value in sorted(
+                    projection.files.items(), key=lambda item: str(item[0])
+                ):
+                    if value.get("stream_uuid") != str(stream_uuid):
+                        continue
+                    repository.append_operation(
+                        record(
+                            old_project_uuid,
+                            "file.delete",
+                            file_uuid,
+                            {},
+                            "file-delete",
+                        )
+                    )
+                for message_uuid in sorted(message_uuids, key=str):
+                    repository.append_operation(
+                        record(
+                            old_project_uuid,
+                            "message.delete",
+                            message_uuid,
+                            {},
+                            "message-delete",
+                        )
+                    )
+                repository.append_operation(
+                    record(
+                        old_project_uuid,
+                        "stream.delete",
+                        stream_uuid,
+                        {},
+                        "stream-delete",
+                    )
+                )
+
     @contextlib.contextmanager
-    def draft_store(self, project_uuid, user_uuid):
-        yield SQLDraftStore(project_uuid, user_uuid)
+    def draft_store(
+        self, project_uuid: sys_uuid.UUID, user_uuid: sys_uuid.UUID
+    ) -> typing.Iterator[typing.Any]:
+        yield api_store.guard_api_store(
+            project_uuid,
+            typing.cast(
+                api_store.MessengerStore,
+                SQLDraftStore(project_uuid, user_uuid),
+            ),
+        )
+
+    @contextlib.contextmanager
+    def event_store(
+        self, project_uuid: sys_uuid.UUID, user_uuid: sys_uuid.UUID
+    ) -> typing.Iterator[typing.Any]:
+        with self.runtime_factory.messenger_service(project_uuid) as service:
+            yield MailEventStore(project_uuid, user_uuid, service.repository)
 
     @contextlib.contextmanager
     def __call__(
@@ -1365,11 +2001,22 @@ class SQLProjectedMessengerStoreFactory:
                     if state.projection is not None:
                         service.repository.projection = state.projection
                     state.projection = service.repository.refresh()
-                    yield SQLProjectedMessengerStore(
+                    projected_store = SQLProjectedMessengerStore(
                         project_uuid,
                         user_uuid,
                         service,
                         canonical_event_states=state.canonical_event_states,
+                        bridge_config=self.bridge_config,
+                    )
+                    yield typing.cast(
+                        SQLProjectedMessengerStore,
+                        api_store.guard_api_store(
+                            project_uuid,
+                            typing.cast(
+                                api_store.MessengerStore,
+                                projected_store,
+                            ),
+                        ),
                     )
                     state.projection = service.repository.projection
             except Exception:

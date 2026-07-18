@@ -1,6 +1,6 @@
 [Unit]
 Description=Workspace API
-After=network-online.target dovecot.service exim4.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

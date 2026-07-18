@@ -23,12 +23,12 @@ class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
     """IAM-only context for workspace messenger models."""
 
     @property
-    def user_uuid(self):
+    def user_uuid(self) -> sys_uuid.UUID:
         user_uuid = self.iam_context.token_info.user_uuid
         if isinstance(user_uuid, sys_uuid.UUID):
             return user_uuid
         return sys_uuid.UUID(user_uuid)
 
     @property
-    def project_id(self):
+    def project_id(self) -> sys_uuid.UUID:
         return self.iam_context.get_introspection_info().project_id

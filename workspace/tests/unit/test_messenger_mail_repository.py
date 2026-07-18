@@ -17,6 +17,7 @@ import pytest
 from workspace.messenger_mail import protocol
 from workspace.messenger_mail import repository
 from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import store as api_store
 
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
@@ -75,6 +76,8 @@ class FakeImapClient:
         self.current_mailbox = None
         self.append_calls = []
         self.ensure_calls = []
+        self.select_calls = []
+        self.search_calls = []
         self.fetch_calls = []
 
     def ensure_mailbox(self, path):
@@ -93,6 +96,7 @@ class FakeImapClient:
 
     def select(self, path, readonly=True):
         assert readonly is True
+        self.select_calls.append(path)
         self.current_mailbox = path
         return protocol.MailboxMetadata(
             self.uid_validities[path],
@@ -101,6 +105,7 @@ class FakeImapClient:
         )
 
     def search(self, criteria="ALL"):
+        self.search_calls.append((self.current_mailbox, criteria))
         messages = self.mailboxes[self.current_mailbox]
         if criteria == "ALL":
             return [message.uid for message in messages]
@@ -121,9 +126,7 @@ class FakeImapClient:
     def delete_uids(self, path, uids):
         expired = set(uids)
         self.mailboxes[path] = [
-            message
-            for message in self.mailboxes[path]
-            if message.uid not in expired
+            message for message in self.mailboxes[path] if message.uid not in expired
         ]
 
 
@@ -488,6 +491,33 @@ def test_events_use_append_uid_as_epoch_and_strict_uidvalidity_cursor():
         )
 
 
+def test_events_after_limits_imap_fetch_before_materializing_catchup():
+    imap = FakeImapClient()
+    mail_repository = repository.MessengerMailRepository(imap, PROJECT_UUID)
+    records = [
+        _event(sys_uuid.uuid4(), "created", second=second) for second in range(1, 11)
+    ]
+    for record in records:
+        mail_repository.append_event(record)
+
+    fetched_uids = []
+    original_fetch = imap.fetch
+
+    def recording_fetch(uids):
+        fetched_uids.extend(uids)
+        return original_fetch(uids)
+
+    imap.fetch = recording_fetch
+    result = mail_repository.events_after(
+        OTHER_USER_UUID,
+        repository.EpochCursor(321, 0),
+        limit=3,
+    )
+
+    assert fetched_uids == [1, 2, 3]
+    assert [event.cursor.epoch_version for event in result] == [1, 2, 3]
+
+
 def test_file_operations_rebuild_metadata_without_storing_object_bytes():
     imap = FakeImapClient()
     mail_repository = repository.MessengerMailRepository(imap, PROJECT_UUID)
@@ -555,9 +585,7 @@ def test_event_retention_prunes_only_the_expired_contiguous_uid_prefix():
     boundary_uuid = sys_uuid.uuid4()
     backdated_uuid = sys_uuid.uuid4()
     mail_repository.append_event(_event(expired_uuid, "created", second=0))
-    mail_repository.append_event(
-        _event(boundary_uuid, "updated", second=24 * 60 * 60)
-    )
+    mail_repository.append_event(_event(boundary_uuid, "updated", second=24 * 60 * 60))
     mail_repository.append_event(_event(backdated_uuid, "deleted", second=1))
 
     deleted_uids = mail_repository.prune_events(OTHER_USER_UUID, now=now)
@@ -645,6 +673,16 @@ def test_incremental_refresh_fetches_only_new_bodies_and_detects_expunge():
 def test_store_factory_bootstrap_is_single_flight_and_ws_poll_is_incremental(
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        api_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: object()),
+    )
+    monkeypatch.setattr(
+        api_store.writer_gate,
+        "acknowledge",
+        lambda *args, **kwargs: None,
+    )
     imap = FakeImapClient()
     writer = repository.MessengerMailRepository(imap, PROJECT_UUID)
     writer.rebuild()
@@ -662,9 +700,7 @@ def test_store_factory_bootstrap_is_single_flight_and_ws_poll_is_incremental(
         "_latest_projection_event_epoch",
         lambda self: 0,
     )
-    factory = sql_store.SQLProjectedMessengerStoreFactory(
-        FakeRuntimeFactory(imap)
-    )
+    factory = sql_store.SQLProjectedMessengerStoreFactory(FakeRuntimeFactory(imap))
 
     with factory(PROJECT_UUID, OTHER_USER_UUID) as store:
         first = store.events_after(
@@ -693,6 +729,49 @@ def test_store_factory_bootstrap_is_single_flight_and_ws_poll_is_incremental(
     assert second == []
 
 
+def test_event_store_never_reads_project_state_mailbox():
+    imap = FakeImapClient()
+    writer = repository.MessengerMailRepository(imap, PROJECT_UUID)
+    writer.append_operation(
+        _operation(
+            "stream.create",
+            STREAM_UUID,
+            {"kind": "stream", "name": "Must remain untouched"},
+        )
+    )
+    event_uuid = sys_uuid.uuid4()
+    writer.append_event(_event(event_uuid, "created"))
+    imap.ensure_calls.clear()
+    imap.select_calls.clear()
+    imap.search_calls.clear()
+    imap.fetch_calls.clear()
+    factory = sql_store.SQLProjectedMessengerStoreFactory(FakeRuntimeFactory(imap))
+
+    with factory.event_store(PROJECT_UUID, OTHER_USER_UUID) as store:
+        first = store.events_after(
+            {"epoch_version": sql_store.dm_filters.GT(0)},
+        )
+        cursor = store.event_cursor()
+    with factory.event_store(PROJECT_UUID, OTHER_USER_UUID) as store:
+        second = store.events_after(
+            {"epoch_version": sql_store.dm_filters.GT(first[-1]["epoch_version"])},
+            epoch_generation=cursor["epoch_generation"],
+        )
+
+    event_mailbox = writer.event_mailbox(OTHER_USER_UUID)
+    assert [event["uuid"] for event in first] == [str(event_uuid)]
+    assert second == []
+    assert repository.STATE_MAILBOX not in imap.ensure_calls
+    assert repository.STATE_MAILBOX not in imap.select_calls
+    assert all(
+        mailbox != repository.STATE_MAILBOX for mailbox, _criteria in imap.search_calls
+    )
+    assert all(
+        mailbox != repository.STATE_MAILBOX for mailbox, _uids in imap.fetch_calls
+    )
+    assert event_mailbox in imap.select_calls
+
+
 def test_store_factory_concurrent_bootstrap_fetches_journal_bodies_once(monkeypatch):
     imap = FakeImapClient()
     writer = repository.MessengerMailRepository(imap, PROJECT_UUID)
@@ -710,15 +789,11 @@ def test_store_factory_concurrent_bootstrap_fetches_journal_bodies_once(monkeypa
         "_latest_projection_event_epoch",
         lambda self: 0,
     )
-    factory = sql_store.SQLProjectedMessengerStoreFactory(
-        FakeRuntimeFactory(imap)
-    )
+    factory = sql_store.SQLProjectedMessengerStoreFactory(FakeRuntimeFactory(imap))
 
     def open_store():
         with factory(PROJECT_UUID, OTHER_USER_UUID) as store:
-            return store.mail_service.repository.projection.streams[
-                STREAM_UUID
-            ]["name"]
+            return store.mail_service.repository.projection.streams[STREAM_UUID]["name"]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         results = list(executor.map(lambda _index: open_store(), range(8)))
@@ -761,9 +836,7 @@ def test_store_factory_refreshes_acl_after_external_canonical_change(monkeypatch
         "_latest_projection_event_epoch",
         lambda self: 0,
     )
-    factory = sql_store.SQLProjectedMessengerStoreFactory(
-        FakeRuntimeFactory(imap)
-    )
+    factory = sql_store.SQLProjectedMessengerStoreFactory(FakeRuntimeFactory(imap))
     file = types.SimpleNamespace(
         user_uuid=ACTOR_UUID,
         stream_uuid=STREAM_UUID,
@@ -808,9 +881,7 @@ def test_store_factory_invalidates_projection_after_failed_request(monkeypatch):
         "_latest_projection_event_epoch",
         lambda self: 0,
     )
-    factory = sql_store.SQLProjectedMessengerStoreFactory(
-        FakeRuntimeFactory(imap)
-    )
+    factory = sql_store.SQLProjectedMessengerStoreFactory(FakeRuntimeFactory(imap))
 
     with pytest.raises(RuntimeError, match="projection failed"):
         with factory(PROJECT_UUID, OTHER_USER_UUID):

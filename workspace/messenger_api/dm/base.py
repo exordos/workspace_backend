@@ -16,6 +16,7 @@
 
 import enum
 import random
+import typing
 
 from restalchemy.dm import models
 from restalchemy.dm import properties
@@ -31,7 +32,7 @@ FOLDER_SYSTEM_TYPES = (FOLDER_SYSTEM_TYPE_ALL, FOLDER_SYSTEM_TYPE_CREATED)
 COLOR_MAX_VALUE = 0xFFFFFF
 
 
-def random_color():
+def random_color() -> int:
     return random.randint(0, COLOR_MAX_VALUE)
 
 
@@ -65,7 +66,7 @@ class SourceName(str, enum.Enum):
     NATIVE = NativeSource.KIND
 
 
-def native_source():
+def native_source() -> NativeSource:
     return NativeSource()
 
 
@@ -91,7 +92,7 @@ class UserScopedModelWithUUID(models.ModelWithUUID):
     )
 
     @classmethod
-    def get_id_property(cls):
+    def get_id_property(cls) -> dict[str, typing.Any]:
         return {"uuid": cls.properties.properties["uuid"]}
 
 

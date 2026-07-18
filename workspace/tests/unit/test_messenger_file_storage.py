@@ -14,8 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import io
 import datetime
+import dataclasses
+import io
 import types
 import uuid as sys_uuid
 from unittest import mock
@@ -122,6 +123,46 @@ def test_local_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
 
     file_storage.delete_workspace_file_metadata(file_uuid)
     assert not metadata_path.exists()
+
+
+def test_local_storage_lists_stable_object_ids_without_temporary_files(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_conf(monkeypatch, tmp_path)
+    storage = file_storage.LocalWorkspaceFileStorage()
+    first_uuid = sys_uuid.uuid4()
+    second_uuid = sys_uuid.uuid4()
+    first = storage.save(first_uuid, b"first").storage_object_id
+    second = storage.save(second_uuid, b"second").storage_object_id
+    temporary = tmp_path / f"{first}.tmp"
+    temporary.write_bytes(b"partial")
+
+    assert storage.list_object_ids() == sorted((first, second))
+
+
+def test_local_storage_reads_external_provider_sidecar_v2(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    file_uuid = sys_uuid.uuid4()
+    metadata = dataclasses.replace(
+        _metadata(file_uuid),
+        origin={
+            "kind": "external_provider",
+            "provider_kind": "zulip",
+            "external_account_uuid": str(sys_uuid.uuid4()),
+            "external_chat_uuid": str(sys_uuid.uuid4()),
+            "operation_uuid": str(sys_uuid.uuid4()),
+        },
+    )
+
+    file_storage.save_workspace_file_metadata(metadata)
+
+    assert file_storage.read_workspace_file_metadata(file_uuid) == metadata
+    payload = (
+        tmp_path / file_storage.get_workspace_file_metadata_object_id(file_uuid)
+    ).read_bytes()
+    assert b'"schema_version":2' in payload
+    assert b'"kind":"external_provider"' in payload
 
 
 def test_public_file_metadata_has_no_stream_uuid(tmp_path, monkeypatch):
@@ -234,3 +275,24 @@ def test_s3_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
         Bucket="workspace-files",
         Key=object_id,
     )
+
+
+def test_s3_storage_lists_every_paginated_object(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path)
+    client = mock.Mock()
+    client.list_objects_v2.side_effect = [
+        {
+            "Contents": [{"Key": "z"}],
+            "IsTruncated": True,
+            "NextContinuationToken": "next",
+        },
+        {"Contents": [{"Key": "a"}], "IsTruncated": False},
+    ]
+    storage = file_storage.S3WorkspaceFileStorage()
+    storage._client = client
+
+    assert storage.list_object_ids() == ["a", "z"]
+    assert client.list_objects_v2.call_args_list == [
+        mock.call(Bucket="workspace-files"),
+        mock.call(Bucket="workspace-files", ContinuationToken="next"),
+    ]

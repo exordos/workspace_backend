@@ -2,22 +2,44 @@
 
 Backend services for **Genesis Workspace Messenger**. The public Messenger API
 is IAM-authenticated and preserves the existing REST and realtime contracts.
-Message persistence is implemented by the local mail stack described in
-[`docs/mail_backed_messenger_architecture.md`](docs/mail_backed_messenger_architecture.md):
-Exim4, Dovecot, and Maildir run on a dedicated mail node in the same element.
-Their authenticated protocol listeners remain on the platform-internal network
-and require CA-verified STARTTLS.
+Canonical Messenger persistence is PostgreSQL. The former mail-backed design in
+[`docs/mail_backed_messenger_architecture.md`](docs/mail_backed_messenger_architecture.md)
+is retained only as the transitional import/rollback source described by
+[`docs/postgresql_canonical_messenger_migration.md`](docs/postgresql_canonical_messenger_migration.md).
 
-The backend does not expose provider, mail, calendar, or external-integration
-APIs. Messenger attachments continue to use the configured S3-compatible file
-storage and IAM remains the source of users and authentication.
+The browser-facing contract does not expose mail or calendar APIs. Provider
+runtimes use the private, bridge-authenticated Workspace Provider HTTP API at
+`/api/workspace-provider/v1`; it projects ordinary Messenger resources into the
+same public API used by the UI. Messenger attachments continue to use the
+configured S3-compatible file storage and IAM remains the source of users and
+authentication.
 
 Current contracts and integration guidance:
 
 - [`docs/architecture.md`](docs/architecture.md)
 - [`docs/workspace_api.md`](docs/workspace_api.md)
 - [`docs/workspace_ui_realtime_integration.md`](docs/workspace_ui_realtime_integration.md)
+- [`docs/workspace_provider_api_v1.yaml`](docs/workspace_provider_api_v1.yaml)
+- [`docs/postgresql_canonical_messenger_migration.md`](docs/postgresql_canonical_messenger_migration.md)
+- [`docs/postgresql_canonical_production_cutover.md`](docs/postgresql_canonical_production_cutover.md)
+- [`docs/postgresql_canonical_messenger_test_plan.md`](docs/postgresql_canonical_messenger_test_plan.md)
+
+Provider product, control-plane, file-boundary, and reusable acceptance
+contracts:
+
+- [`docs/zulip_bridge_v1_product_and_api.md`](docs/zulip_bridge_v1_product_and_api.md)
+- [`docs/zulip_bridge_control_api_v1.yaml`](docs/zulip_bridge_control_api_v1.yaml)
+- [`docs/zulip_bridge_file_api_v1.yaml`](docs/zulip_bridge_file_api_v1.yaml)
+- [`docs/zulip_bridge_v1_test_plan.md`](docs/zulip_bridge_v1_test_plan.md)
+
+Superseded designs retained only as migration and decision history:
+
 - [`docs/mail_backed_messenger_architecture.md`](docs/mail_backed_messenger_architecture.md)
+- [`docs/zulip_bridge_mail_protocol_v1.md`](docs/zulip_bridge_mail_protocol_v1.md)
+
+The private Provider, control, and file specifications are not browser routes.
+The generated public Workspace and Messenger specification remains OpenAPI
+3.0.3 and preserves the existing UI contract.
 
 ## Runtime entry points
 
@@ -26,6 +48,7 @@ Direct local services:
 - Messenger REST API: `http://127.0.0.1:21081/v1`
 - WebSocket API: `ws://127.0.0.1:21082/v1/events/ws`
 - Workspace REST API: `http://127.0.0.1:21084/v1`
+- Private bridge control and Provider API: `workspace-external-bridge-api`
 - Messenger worker: `workspace-messenger-worker`
 - Messenger OpenAPI spec: `http://127.0.0.1:21081/specifications/3.0.3`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
@@ -53,19 +76,15 @@ sends a `ready` control frame before it can deliver live events.
 
 ## Storage
 
-Maildir is the source of truth for message content and state. The Maildir tree
-must be placed on the mail node's persistent data disk. The backend accesses
-Exim4 and Dovecot only through authenticated internal SMTP and IMAP with
-hostname verification against the Workspace mail CA. The CA, leaf certificate,
-and private keys are created on the mail node during first persistent-disk
-initialization and survive root-image replacement. The backend obtains only the
-public CA through an HMAC-authenticated internal endpoint. These protocols and
-the CA endpoint are not public API surfaces.
+PostgreSQL is the source of truth for messages, membership, user state, events,
+provider mappings, and client settings. The canonical runtime does not require
+SMTP, IMAP, Exim, Dovecot, or Maildir. An existing Maildir remains read-only
+during migration and rollback acceptance and is removed only after the full
+PostgreSQL gate passes.
 
-Files and their metadata and access-control records use the configured
-S3-compatible storage backend. PostgreSQL stores a rebuildable projection for
-fast reads, search, counters, events, and client settings; it is never the only
-copy of a message or shared Messenger state.
+Files use the configured S3-compatible storage backend. PostgreSQL stores file
+metadata and ACL state; S3 stores file bytes and JSON sidecars. Messages contain
+authorized URNs, never binary MIME parts.
 
 ## Local development
 

@@ -1,5 +1,14 @@
 # Mail-Backed Workspace Messenger Architecture
 
+> **Superseded design history — not the current runtime.** Workspace Messenger
+> now uses PostgreSQL as its canonical store and does not require SMTP, IMAP,
+> Exim, Dovecot, or Maildir at runtime. See the current
+> [`architecture.md`](architecture.md), public
+> [`workspace_api.md`](workspace_api.md), and controlled
+> [`postgresql_canonical_messenger_migration.md`](postgresql_canonical_messenger_migration.md)
+> runbook. The material below is retained only to explain the former design and
+> migration source.
+
 This document records the confirmed requirements and target architecture for
 the native Workspace messenger. It makes the local SMTP/IMAP service canonical
 for the messenger domain while retaining PostgreSQL only as a rebuildable read

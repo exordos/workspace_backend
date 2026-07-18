@@ -17,6 +17,7 @@
 import logging
 from logging import config as logging_config
 import sys
+from typing import NoReturn
 
 from oslo_config import cfg
 import yaml
@@ -62,7 +63,7 @@ class ConfigNotFound(Exception):
     pass
 
 
-def configure():
+def configure() -> None:
     config = cfg.CONF.logging.config
     config_file = cfg.CONF.find_file(config)
 
@@ -80,6 +81,6 @@ def configure():
         )
 
 
-def die(logger, message):
+def die(logger: logging.Logger, message: str) -> NoReturn:
     logger.error(message)
     sys.exit(1)

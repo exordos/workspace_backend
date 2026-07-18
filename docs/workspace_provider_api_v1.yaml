@@ -1,0 +1,347 @@
+openapi: 3.1.0
+info:
+  title: Workspace Provider Data API
+  version: 1.0.0
+  description: |
+    Private provider-neutral HTTP data plane used by enrolled bridge instances.
+    It is not routed to browsers and does not change the public Messenger API.
+    The same mTLS bridge identity and heartbeat negotiated by the control API
+    authorize every request. PostgreSQL is the canonical transaction boundary;
+    IMAP and SMTP are not part of this protocol.
+servers:
+  - url: https://workspace-provider.example.invalid
+    description: Symbolic private backend listener.
+security:
+  - bridgeMtls: []
+tags:
+  - name: Operations
+  - name: Results
+  - name: Events
+paths:
+  /api/workspace-provider/v1/operations/actions/lease:
+    post:
+      tags: [Operations]
+      operationId: leaseWorkspaceProviderOperationsV1
+      summary: Lease the next compatible Workspace-to-provider operation batch.
+      description: |
+        A healthy compatible heartbeat received within the previous 60 seconds
+        is required. Eligible operations are leased in FIFO sequence order with
+        `FOR UPDATE SKIP LOCKED`. Expired leases return to the queue. Repeating
+        the same request UUID while its lease remains active returns the same
+        batch. Known operation kinds whose required named capability is absent
+        remain queued and are never disclosed to the bridge.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OperationLeaseRequest'
+      responses:
+        '200':
+          description: A possibly empty leased operation batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationLeaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: The bridge has no current compatible heartbeat.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProviderProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+  /api/workspace-provider/v1/operation-results:
+    post:
+      tags: [Results]
+      operationId: reportWorkspaceProviderOperationResultsV1
+      summary: Report terminal provider outcomes with per-item acceptance.
+      description: |
+        Up to 500 results are processed in request order. Each result is bound
+        to the authenticated bridge, provider-operation UUID, and active lease
+        UUID. `result_uuid` is idempotent: identical replay is `duplicate` and
+        reuse with different canonical input is `conflict`. Invalid, missing,
+        stale-lease, and valid independent items do not block each other.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OperationResultBatch'
+      responses:
+        '200':
+          description: One application status per input item.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResultResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+  /api/workspace-provider/v1/events:
+    post:
+      tags: [Events]
+      operationId: applyWorkspaceProviderEventsV1
+      summary: Apply one atomic provider-to-Workspace event batch.
+      description: |
+        Up to 500 provider events are authenticated against the bridge provider
+        kind and external account, deduplicated by bridge instance plus
+        `provider_event_uuid`, and applied to canonical Messenger state in the
+        request transaction. Replaying an identical event returns `duplicate`.
+        Reusing a UUID with different canonical input or rejecting any event
+        rolls back the complete batch; the provider retries it unchanged. A
+        healthy heartbeat received within the previous 60 seconds is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderEventBatch'
+      responses:
+        '200':
+          description: Every event was applied or was an identical duplicate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderEventResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: The bridge has no current compatible heartbeat.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProviderProblem'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          description: The atomic event batch was rejected and no item committed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProviderProblem'
+        '503':
+          description: Canonical provider-event application is not enabled.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProviderProblem'
+components:
+  securitySchemes:
+    bridgeMtls:
+      type: mutualTLS
+      description: |
+        The certificate identity is the realm, provider kind, bridge instance,
+        and active identity generation issued by the bridge control API. HTTP
+        forwarding headers are never identity inputs.
+  schemas:
+    OperationLeaseRequest:
+      type: object
+      additionalProperties: false
+      required: [request_uuid]
+      properties:
+        request_uuid: {type: string, format: uuid}
+        limit: {type: integer, minimum: 1, maximum: 100, default: 50}
+        lease_seconds: {type: integer, minimum: 10, maximum: 300, default: 30}
+    OperationLeaseResponse:
+      type: object
+      additionalProperties: false
+      required: [request_uuid, operations]
+      properties:
+        request_uuid: {type: string, format: uuid}
+        operations:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/ProviderOperation'}
+    ProviderOperation:
+      type: object
+      additionalProperties: false
+      required:
+        - provider_operation_uuid
+        - external_operation_uuid
+        - lease_uuid
+        - lease_expires_at
+        - external_account_uuid
+        - project_id
+        - operation_kind
+        - required_capability
+        - attempt
+        - payload
+      properties:
+        provider_operation_uuid: {type: string, format: uuid}
+        external_operation_uuid: {type: string, format: uuid}
+        lease_uuid: {type: string, format: uuid}
+        lease_expires_at: {type: string, format: date-time}
+        external_account_uuid: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        operation_kind: {type: string, minLength: 1, maxLength: 128}
+        required_capability: {type: [string, 'null']}
+        attempt: {type: integer, minimum: 1}
+        payload: {type: object}
+    OperationResultBatch:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: {$ref: '#/components/schemas/OperationResult'}
+    OperationResult:
+      type: object
+      additionalProperties: false
+      required: [result_uuid, provider_operation_uuid, lease_uuid, status]
+      properties:
+        result_uuid: {type: string, format: uuid}
+        provider_operation_uuid: {type: string, format: uuid}
+        lease_uuid: {type: string, format: uuid}
+        status:
+          enum: [succeeded, failed, manual_reconciliation_required]
+        safe_error: {type: [string, 'null'], maxLength: 1024}
+        original_url: {type: [string, 'null'], format: uri}
+        reconciliation: {type: object}
+    OperationResultResponse:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [result_uuid, status]
+            properties:
+              result_uuid: {type: string}
+              status:
+                enum: [applied, duplicate, conflict, not_found, stale_lease, rejected]
+    ProviderEventBatch:
+      type: object
+      additionalProperties: false
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: {$ref: '#/components/schemas/ProviderEvent'}
+    ProviderEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - provider_event_uuid
+        - external_account_uuid
+        - external_chat_uuid
+        - project_id
+        - kind
+        - payload
+      properties:
+        provider_event_uuid: {type: string, format: uuid}
+        external_account_uuid: {type: string, format: uuid}
+        external_chat_uuid: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        provider_sequence: {type: [string, 'null']}
+        kind:
+          enum:
+            - stream.upsert
+            - stream.delete
+            - topic.upsert
+            - topic.delete
+            - message.upsert
+            - message.delete
+            - reaction.upsert
+            - reaction.delete
+            - read_state.set
+        payload:
+          type: object
+          additionalProperties: false
+          required: [resource]
+          properties:
+            resource:
+              type: object
+              required: [uuid, provider_external_id]
+              properties:
+                uuid: {type: string, format: uuid}
+                provider_external_id: {type: string, minLength: 1}
+                provider_metadata: {type: object}
+                stream_uuid: {type: string, format: uuid}
+                topic_uuid: {type: string, format: uuid}
+                message_uuid: {type: string, format: uuid}
+                message_uuids:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  uniqueItems: true
+                  items: {type: string, format: uuid}
+                reader_uuid: {type: string, format: uuid}
+                read: {type: boolean}
+                user_uuid: {type: string, format: uuid}
+                payload: {type: object}
+              description: |
+                Full canonical replacement for an upsert or a minimal
+                tombstone for a delete. Every resource includes its Workspace
+                `uuid`, stable non-empty `provider_external_id`, and the
+                relation UUIDs needed to prove it belongs to the assigned
+                projection stream.
+    ProviderEventResponse:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [provider_event_uuid, status, target_uuid, safe_error, duplicate]
+            properties:
+              provider_event_uuid: {type: string, format: uuid}
+              status: {enum: [applied, rejected]}
+              target_uuid: {type: [string, 'null'], format: uuid}
+              safe_error: {type: [string, 'null']}
+              duplicate: {type: boolean}
+    ProviderProblem:
+      type: object
+      required: [type, status, error, message]
+      properties:
+        type: {const: ProviderProblem}
+        status: {type: integer}
+        error: {type: string}
+        message: {type: string}
+  responses:
+    BadRequest:
+      description: The request envelope is invalid.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}
+    Unauthenticated:
+      description: A current bridge certificate was not presented.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}
+    Forbidden:
+      description: The bridge identity cannot access this provider scope.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}
+    PayloadTooLarge:
+      description: The request exceeds the private listener body limit.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}

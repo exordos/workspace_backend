@@ -15,6 +15,7 @@
 #    under the License.
 
 import json
+import typing
 
 import webob
 
@@ -28,16 +29,16 @@ from workspace.messenger_api.api import versions
 SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/server_settings"
 
 
-def _normalize_path(path):
+def _normalize_path(path: str) -> str:
     return path.rstrip("/") or "/"
 
 
-def _get_realm_url(req):
+def _get_realm_url(req: typing.Any) -> str:
     proto = req.headers.get("X-Forwarded-Proto", "https")
     return f"{proto}://{req.headers['Host']}"
 
 
-def build_server_settings(req):
+def build_server_settings(req: typing.Any) -> dict[str, typing.Any]:
     realm_url = _get_realm_url(req)
     result = {
         "result": "success",
@@ -74,7 +75,7 @@ def build_server_settings(req):
 
 
 class ServerSettingsMiddleware(middlewares.Middleware):
-    def process_request(self, req):
+    def process_request(self, req: typing.Any) -> webob.Response | None:
         if req.method == "GET" and _normalize_path(req.path) == SERVER_SETTINGS_PATH:
             body = json.dumps(build_server_settings(req)).encode("utf-8")
             return webob.Response(
@@ -87,7 +88,11 @@ class ServerSettingsMiddleware(middlewares.Middleware):
 
 
 class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
-    def _construct_error_response(self, req, error):
+    def _construct_error_response(
+        self,
+        req: typing.Any,
+        error: Exception,
+    ) -> typing.Any:
         if isinstance(error, messenger_exceptions.EventsCursorExpiredError):
             return req.ResponseClass(
                 status=410,

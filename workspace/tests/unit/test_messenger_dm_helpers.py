@@ -64,7 +64,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             objects = types.SimpleNamespace(get_all=get_all)
 
         with mock.patch.object(
-            dm_helpers.models, "WorkspaceProject", FakeWorkspaceProject,
+            dm_helpers.models,
+            "WorkspaceProject",
+            FakeWorkspaceProject,
         ):
             result = dm_helpers._get_workspace_event_project_ids()
 
@@ -72,18 +74,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_all.assert_called_once_with(order_by={"project_id": "asc"})
 
     def test_mark_stale_workspace_users_offline_skips_projects_without_users(self):
-        with mock.patch.object(
-            dm_helpers, "_get_stale_workspace_users", return_value=[],
-        ) as get_users, mock.patch.object(
-            dm_helpers, "_get_workspace_event_project_ids",
-        ) as get_project_ids:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_stale_workspace_users",
+                return_value=[],
+            ) as get_users,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_event_project_ids",
+            ) as get_project_ids,
+        ):
             result = dm_helpers.mark_stale_workspace_users_offline()
 
         self.assertEqual([], result)
         get_users.assert_called_once()
         get_project_ids.assert_not_called()
 
-    def test_get_or_create_workspace_user_stream_creates_topic_event_and_returns_view(self):
+    def test_get_or_create_workspace_user_stream_creates_topic_event_and_returns_view(
+        self,
+    ):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         other_user_uuid = sys_uuid.uuid4()
@@ -148,30 +158,36 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers, "_random_color", return_value=12345
-        ), mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_topic_with_flags",
-            return_value=types.SimpleNamespace(uuid=topic_uuid),
-        ) as create_topic, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_topic_events",
-        ) as create_topic_events, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", get_user_folder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(dm_helpers, "_random_color", return_value=12345),
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_topic_with_flags",
+                return_value=types.SimpleNamespace(uuid=topic_uuid),
+            ) as create_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_topic_events",
+            ) as create_topic_events,
+            mock.patch.object(dm_helpers, "get_workspace_user_folder", get_user_folder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_event,
+        ):
             result = dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -201,6 +217,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertIs(session, created_binding["insert_session"])
         create_topic.assert_called_once_with(
             project_id=project_id,
+            session=session,
             uuid=mock.ANY,
             stream_uuid=stream_uuid,
             name="zulip",
@@ -269,7 +286,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(4, create_folder_event.call_count)
 
-    def test_get_or_create_workspace_user_stream_with_direct_user_creates_private_pair(self):
+    def test_get_or_create_workspace_user_stream_with_direct_user_creates_private_pair(
+        self,
+    ):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         direct_user_uuid = sys_uuid.uuid4()
@@ -321,9 +340,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 self._values["insert_session"] = session
 
-        expected_index = ":".join(
-            sorted([str(user_uuid), str(direct_user_uuid)])
-        )
+        expected_index = ":".join(sorted([str(user_uuid), str(direct_user_uuid)]))
         get_all_streams = mock.Mock(return_value=[])
 
         FakeWorkspaceStream.objects = types.SimpleNamespace(
@@ -343,30 +360,36 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers, "_random_color", return_value=23456
-        ), mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_topic_with_flags",
-            return_value=types.SimpleNamespace(uuid=topic_uuid),
-        ) as create_topic, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_topic_events",
-        ) as create_topic_events, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", get_user_folder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(dm_helpers, "_random_color", return_value=23456),
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_topic_with_flags",
+                return_value=types.SimpleNamespace(uuid=topic_uuid),
+            ) as create_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_topic_events",
+            ) as create_topic_events,
+            mock.patch.object(dm_helpers, "get_workspace_user_folder", get_user_folder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_event,
+        ):
             result = dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -422,6 +445,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         create_topic.assert_called_once_with(
             project_id=project_id,
+            session=session,
             uuid=mock.ANY,
             stream_uuid=stream_uuid,
             name="General Topic",
@@ -530,30 +554,36 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers, "_random_color", return_value=23456
-        ), mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_topic_with_flags",
-            return_value=types.SimpleNamespace(uuid=topic_uuid),
-        ) as create_topic, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_topic_events",
-        ) as create_topic_events, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", get_user_folder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(dm_helpers, "_random_color", return_value=23456),
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_topic_with_flags",
+                return_value=types.SimpleNamespace(uuid=topic_uuid),
+            ) as create_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_topic_events",
+            ) as create_topic_events,
+            mock.patch.object(dm_helpers, "get_workspace_user_folder", get_user_folder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_event,
+        ):
             result = dm_helpers.create_workspace_private_group_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -578,6 +608,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(user_uuid, created_bindings[0]["who_uuid"])
         create_topic.assert_called_once_with(
             project_id=project_id,
+            session=session,
             uuid=mock.ANY,
             stream_uuid=stream_uuid,
             name="zulip",
@@ -621,7 +652,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(2, create_folder_event.call_count)
 
-    def test_get_or_create_workspace_user_stream_with_direct_user_returns_existing(self):
+    def test_get_or_create_workspace_user_stream_with_direct_user_returns_existing(
+        self,
+    ):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         direct_user_uuid = sys_uuid.uuid4()
@@ -654,13 +687,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceUserStream:
             objects = types.SimpleNamespace(get_all=get_user_streams)
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -729,13 +766,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceUserStream:
             objects = types.SimpleNamespace(get_all=get_user_streams)
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_event"
+            ) as create_event,
+        ):
             result = dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -816,21 +857,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
         )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=user_stream,
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder",
-            side_effect=[all_folder, channels_folder],
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_stream_event",
-        ) as create_stream_event, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_folder_updated_event",
-        ) as create_folder_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=user_stream,
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder",
+                side_effect=[all_folder, channels_folder],
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_event",
+            ) as create_stream_event,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_folder_updated_event",
+            ) as create_folder_event,
+        ):
             dm_helpers.create_workspace_stream_binding_events(
                 binding=binding,
                 session=session,
@@ -882,29 +928,33 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             private=True,
         )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=user_stream,
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder",
-            side_effect=[
-                types.SimpleNamespace(uuid=dm_helpers.ALL_CHATS_FOLDER_UUID),
-                types.SimpleNamespace(uuid=dm_helpers.PERSONAL_FOLDER_UUID),
-            ],
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_stream_event",
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_folder_updated_event",
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=user_stream,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder",
+                side_effect=[
+                    types.SimpleNamespace(uuid=dm_helpers.ALL_CHATS_FOLDER_UUID),
+                    types.SimpleNamespace(uuid=dm_helpers.PERSONAL_FOLDER_UUID),
+                ],
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_event",
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_folder_updated_event",
+            ),
         ):
             dm_helpers.create_workspace_stream_binding_events(binding=binding)
 
         folder_uuids = [
-            call.kwargs["folder_uuid"]
-            for call in get_user_folder.call_args_list
+            call.kwargs["folder_uuid"] for call in get_user_folder.call_args_list
         ]
         self.assertEqual(
             [
@@ -935,24 +985,29 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         FakeWorkspaceStream.objects.get_one.return_value = stream
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            side_effect=dm_helpers.storage_exc.RecordNotFound(
-                model=dm_helpers.models.WorkspaceUserStream,
-                filters={},
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                side_effect=dm_helpers.storage_exc.RecordNotFound(
+                    model=dm_helpers.models.WorkspaceUserStream,
+                    filters={},
+                ),
             ),
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStream",
-            FakeWorkspaceStream,
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_stream_event",
-        ) as create_stream_event, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_folder_updated_event",
-        ) as create_folder_event:
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStream",
+                FakeWorkspaceStream,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_event",
+            ) as create_stream_event,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_folder_updated_event",
+            ) as create_folder_event,
+        ):
             dm_helpers.create_workspace_stream_binding_events(
                 binding=binding,
                 session=session,
@@ -986,17 +1041,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         FakeWorkspaceStream.objects.get_one.return_value = stream
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            side_effect=dm_helpers.storage_exc.RecordNotFound(
-                model=dm_helpers.models.WorkspaceUserStream,
-                filters={},
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                side_effect=dm_helpers.storage_exc.RecordNotFound(
+                    model=dm_helpers.models.WorkspaceUserStream,
+                    filters={},
+                ),
             ),
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStream",
-            FakeWorkspaceStream,
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStream",
+                FakeWorkspaceStream,
+            ),
         ):
             with self.assertRaises(dm_helpers.storage_exc.RecordNotFound):
                 dm_helpers.create_workspace_stream_binding_events(
@@ -1035,14 +1093,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceStreamBinding:
             objects = types.SimpleNamespace(get_all=get_bindings)
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_stream_bindings_created_event",
-        ) as create_binding_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_bindings_created_event",
+            ) as create_binding_event,
+        ):
             dm_helpers.create_workspace_stream_bindings_created_events(
                 bindings=[added_binding, second_added_binding],
                 session=session,
@@ -1116,54 +1177,65 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         def create_folder_updated_event(**kwargs):
             order.append(("folder.updated", kwargs))
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers,
-            "_lock_workspace_stream_binding",
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=user_stream,
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers,
-            "_get_user_stream_folder_event_targets",
-            return_value=[
-                (user_uuid, dm_helpers.ALL_CHATS_FOLDER_UUID),
-                (user_uuid, dm_helpers.CHANNELS_FOLDER_UUID),
-                (user_uuid, custom_folder_uuid),
-            ],
-        ) as get_folder_targets, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder",
-            side_effect=[all_folder, channels_folder, custom_folder],
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_stream_deleted_event",
-            side_effect=create_stream_deleted_event,
-        ) as create_stream_deleted, mock.patch.object(
-            dm_helpers,
-            "_delete_workspace_stream_binding_file_accesses",
-            side_effect=lambda **kwargs: order.append(
-                ("file_accesses.deleted", kwargs)
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
             ),
-        ) as delete_file_accesses, mock.patch.object(
-            dm_helpers.models,
-            "get_stream_recipients",
-            return_value=[user_uuid, remaining_user_uuid],
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_stream_binding_deleted_events",
-            side_effect=lambda *args, **kwargs: order.append(
-                ("stream_binding.deleted", args, kwargs)
+            mock.patch.object(
+                dm_helpers,
+                "_lock_workspace_stream_binding",
             ),
-        ) as create_binding_deleted, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_folder_updated_event",
-            side_effect=create_folder_updated_event,
-        ) as create_folder_updated:
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=user_stream,
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers,
+                "_get_user_stream_folder_event_targets",
+                return_value=[
+                    (user_uuid, dm_helpers.ALL_CHATS_FOLDER_UUID),
+                    (user_uuid, dm_helpers.CHANNELS_FOLDER_UUID),
+                    (user_uuid, custom_folder_uuid),
+                ],
+            ) as get_folder_targets,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder",
+                side_effect=[all_folder, channels_folder, custom_folder],
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_deleted_event",
+                side_effect=create_stream_deleted_event,
+            ) as create_stream_deleted,
+            mock.patch.object(
+                dm_helpers,
+                "_delete_workspace_stream_binding_file_accesses",
+                side_effect=lambda **kwargs: order.append(
+                    ("file_accesses.deleted", kwargs)
+                ),
+            ) as delete_file_accesses,
+            mock.patch.object(
+                dm_helpers.models,
+                "get_stream_recipients",
+                return_value=[user_uuid, remaining_user_uuid],
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_binding_deleted_events",
+                side_effect=lambda *args, **kwargs: order.append(
+                    ("stream_binding.deleted", args, kwargs)
+                ),
+            ) as create_binding_deleted,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_folder_updated_event",
+                side_effect=create_folder_updated_event,
+            ) as create_folder_updated,
+        ):
             result = dm_helpers.delete_workspace_stream_binding(
                 project_id=project_id,
                 binding_uuid=binding_uuid,
@@ -1172,9 +1244,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         self.assertIsNone(result)
         FakeWorkspaceStreamBinding.objects.get_one.assert_called_once()
-        filters = FakeWorkspaceStreamBinding.objects.get_one.call_args.kwargs[
-            "filters"
-        ]
+        filters = FakeWorkspaceStreamBinding.objects.get_one.call_args.kwargs["filters"]
         self.assertEqual(binding_uuid, filters["uuid"].value)
         self.assertEqual(project_id, filters["project_id"].value)
         get_user_stream.assert_called_once_with(
@@ -1243,20 +1313,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def __init__(self, **kwargs):
                 raise AssertionError("existing binding should be returned")
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_binding_events",
-        ) as create_events, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_binding_message_flags",
-        ) as create_flags, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_binding_file_accesses",
-        ) as create_file_accesses:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_binding_events",
+            ) as create_events,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_binding_message_flags",
+            ) as create_flags,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_binding_file_accesses",
+            ) as create_file_accesses,
+        ):
             result = dm_helpers.get_or_create_workspace_stream_binding(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
@@ -1303,34 +1378,36 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 self.insert_session = session
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_binding_events",
-        ) as create_user_events, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_binding_message_flags",
-        ) as create_flags, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_stream_binding_file_accesses",
-        ) as create_file_accesses, mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_bindings_created_events",
-        ) as create_batch_events:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_binding_events",
+            ) as create_user_events,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_binding_message_flags",
+            ) as create_flags,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_stream_binding_file_accesses",
+            ) as create_file_accesses,
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_bindings_created_events",
+            ) as create_batch_events,
+        ):
             result = dm_helpers.get_or_create_workspace_stream_bindings(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
                 who_uuid=who_uuid,
                 role_user_uuids={
-                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value: [
-                        member_uuid
-                    ],
-                    dm_helpers.models.WorkspaceStreamRole.OWNER.value: [
-                        owner_uuid
-                    ],
+                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value: [member_uuid],
+                    dm_helpers.models.WorkspaceStreamRole.OWNER.value: [owner_uuid],
                 },
             )
 
@@ -1340,10 +1417,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 (member_uuid, "member"),
                 (owner_uuid, "owner"),
             ],
-            [
-                (binding.user_uuid, binding.role)
-                for binding in created_bindings
-            ],
+            [(binding.user_uuid, binding.role) for binding in created_bindings],
         )
         self.assertEqual(2, create_user_events.call_count)
         create_flags.assert_has_calls(
@@ -1430,27 +1504,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         self.assertIn("not-a-role", error_context.exception.msg)
 
-    def test_create_workspace_stream_binding_message_flags_uses_engine_session(self):
+    def test_create_workspace_stream_binding_message_flags_uses_request_session(self):
         project_id = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         session = types.SimpleNamespace(execute=mock.Mock())
-
-        class SessionManager:
-            def __enter__(self):
-                return session
-
-            def __exit__(self, exc_type, exc, traceback):
-                return None
-
-        engine = types.SimpleNamespace(
-            session_manager=mock.Mock(return_value=SessionManager()),
-        )
-
         with mock.patch.object(
-            dm_helpers.models.WorkspaceUserMessageFlags,
-            "_get_engine",
-            return_value=engine,
+            dm_helpers.contexts,
+            "Context",
+            return_value=types.SimpleNamespace(get_session=lambda: session),
         ):
             dm_helpers._create_workspace_stream_binding_message_flags(
                 project_id=project_id,
@@ -1458,7 +1520,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 user_uuid=user_uuid,
             )
 
-        engine.session_manager.assert_called_once_with()
         session.execute.assert_called_once()
 
     def test_get_or_create_workspace_stream_bindings_rejects_non_list_users(self):
@@ -1470,8 +1531,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 stream_uuid=sys_uuid.uuid4(),
                 who_uuid=sys_uuid.uuid4(),
                 role_user_uuids={
-                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value:
-                        str(sys_uuid.uuid4()),
+                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value: str(
+                        sys_uuid.uuid4()
+                    ),
                 },
             )
 
@@ -1530,15 +1592,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_all=mock.Mock(return_value=[returned_stream, other_stream])
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers, "get_workspace_user_stream", return_value=returned_stream
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_stream", return_value=returned_stream
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -1604,15 +1671,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingBinding())
             )
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers, "get_workspace_user_stream", return_value=returned_stream
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_stream", return_value=returned_stream
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_user_stream_notifications(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -1628,9 +1699,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertIs(session, updated_binding["update_session"])
         FakeWorkspaceStreamBinding.objects.get_one.assert_called_once()
-        filters = FakeWorkspaceStreamBinding.objects.get_one.call_args.kwargs[
-            "filters"
-        ]
+        filters = FakeWorkspaceStreamBinding.objects.get_one.call_args.kwargs["filters"]
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
@@ -1691,24 +1760,31 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_all=mock.Mock(return_value=[custom_item])
             )
 
-        with mock.patch.object(
-            dm_helpers, "get_workspace_user_stream", return_value=actor_stream
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers,
-            "_lock_workspace_stream",
-        ), mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=object()
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers.models, "FolderItem", FakeFolderItem
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_deleted_event"
-        ) as create_stream_deleted, mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_updated:
+        with (
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_stream", return_value=actor_stream
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers,
+                "_lock_workspace_stream",
+            ),
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=object()
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_deleted_event"
+            ) as create_stream_deleted,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_updated,
+        ):
             result = dm_helpers.delete_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -1779,42 +1855,51 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_all=mock.Mock(return_value=[user_stream])
             )
 
-        with mock.patch.object(
-            dm_helpers, "get_workspace_user_stream", return_value=user_stream
-        ), mock.patch.object(
-            dm_helpers,
-            "_lock_workspace_stream",
-        ), mock.patch.object(
-            dm_helpers,
-            "_get_stream_folder_event_targets",
-            return_value=[
-                (user_uuid, dm_helpers.ALL_CHATS_FOLDER_UUID),
-                (user_uuid, dm_helpers.CHANNELS_FOLDER_UUID),
-                (user_uuid, custom_folder_uuid),
-            ],
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder",
-            side_effect=[
-                dm_helpers.storage_exc.RecordNotFound(
-                    model=dm_helpers.models.UserFolder,
-                    filters={},
-                ),
-                dm_helpers.storage_exc.RecordNotFound(
-                    model=dm_helpers.models.UserFolder,
-                    filters={},
-                ),
-                custom_folder,
-            ],
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_deleted_event"
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_updated:
+        with (
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_stream", return_value=user_stream
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_lock_workspace_stream",
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_get_stream_folder_event_targets",
+                return_value=[
+                    (user_uuid, dm_helpers.ALL_CHATS_FOLDER_UUID),
+                    (user_uuid, dm_helpers.CHANNELS_FOLDER_UUID),
+                    (user_uuid, custom_folder_uuid),
+                ],
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder",
+                side_effect=[
+                    dm_helpers.storage_exc.RecordNotFound(
+                        model=dm_helpers.models.UserFolder,
+                        filters={},
+                    ),
+                    dm_helpers.storage_exc.RecordNotFound(
+                        model=dm_helpers.models.UserFolder,
+                        filters={},
+                    ),
+                    custom_folder,
+                ],
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_deleted_event"
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_updated,
+        ):
             result = dm_helpers.delete_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -1862,20 +1947,23 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 self.kwargs["insert_session"] = session
                 created_flags.append(self.kwargs)
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamTopic",
-            FakeWorkspaceStreamTopic,
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceStreamBinding",
-            FakeWorkspaceStreamBinding,
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserTopicFlags",
-            FakeWorkspaceUserTopicFlags,
-        ), mock.patch.object(
-            dm_helpers, "_random_color", return_value=445566
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamTopic",
+                FakeWorkspaceStreamTopic,
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserTopicFlags",
+                FakeWorkspaceUserTopicFlags,
+            ),
+            mock.patch.object(dm_helpers, "_random_color", return_value=445566),
         ):
             topic = dm_helpers.create_workspace_stream_topic_with_flags(
                 project_id=project_id,
@@ -1888,9 +1976,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(445566, created_topic["color"])
         self.assertIsNone(created_topic["insert_session"])
         FakeWorkspaceStreamBinding.objects.get_all.assert_called_once()
-        filters = FakeWorkspaceStreamBinding.objects.get_all.call_args.kwargs[
-            "filters"
-        ]
+        filters = FakeWorkspaceStreamBinding.objects.get_all.call_args.kwargs["filters"]
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertNotIn(
@@ -1921,19 +2007,24 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         returned_topic = types.SimpleNamespace(user_uuid=user_uuid)
         other_topic = types.SimpleNamespace(user_uuid=other_user_uuid)
 
-        with mock.patch.object(
-            dm_helpers, "get_workspace_user_stream", return_value=object()
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers,
-            "create_workspace_stream_topic_with_flags",
-            return_value=created_topic,
-        ) as create_topic, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_stream_topics",
-            return_value=[other_topic, returned_topic],
-        ) as get_topics, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_stream", return_value=object()
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_topic_with_flags",
+                return_value=created_topic,
+            ) as create_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_stream_topics",
+                return_value=[other_topic, returned_topic],
+            ) as get_topics,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_event"
+            ) as create_event,
+        ):
             result = dm_helpers.create_workspace_user_stream_topic(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -1952,6 +2043,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         create_topic.assert_called_once_with(
             project_id=project_id,
+            session=session,
             name="Planning",
             stream_uuid=stream_uuid,
         )
@@ -1984,17 +2076,21 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def update(self, session=None):
                 updated_topic["update_session"] = session
 
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_stream_topic_for_user",
-            return_value=ExistingTopic(),
-        ) as get_topic, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_stream_topics",
-            return_value=[returned_topic, other_topic],
-        ) as get_topics, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_stream_topic_for_user",
+                return_value=ExistingTopic(),
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_stream_topics",
+                return_value=[returned_topic, other_topic],
+            ) as get_topics,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_user_stream_topic(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2068,24 +2164,31 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceStream:
             objects = types.SimpleNamespace(get_one=get_stream)
 
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_stream_topic_for_user",
-            return_value=ExistingTopic(),
-        ) as get_topic, mock.patch.object(
-            dm_helpers,
-            "_lock_workspace_topic",
-        ), mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_stream_topics",
-            return_value=[returned_topic, other_topic],
-        ) as get_topics, mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers, "_create_workspace_stream_updated_events"
-        ) as create_stream_events, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_deleted_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_stream_topic_for_user",
+                return_value=ExistingTopic(),
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_lock_workspace_topic",
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_stream_topics",
+                return_value=[returned_topic, other_topic],
+            ) as get_topics,
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers, "_create_workspace_stream_updated_events"
+            ) as create_stream_events,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_deleted_event"
+            ) as create_event,
+        ):
             result = dm_helpers.delete_workspace_user_stream_topic(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2171,21 +2274,27 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceStream:
             objects = types.SimpleNamespace(get_one=get_stream)
 
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_stream_topic_for_user",
-            return_value=topic,
-        ) as get_topic, mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers, "_create_workspace_stream_updated_events"
-        ) as create_stream_events, mock.patch.object(
-            dm_helpers, "_create_workspace_stream_topic_updated_events"
-        ) as create_topic_events, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream_topic",
-            return_value=returned_topic,
-        ) as get_user_topic:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_stream_topic_for_user",
+                return_value=topic,
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers, "_create_workspace_stream_updated_events"
+            ) as create_stream_events,
+            mock.patch.object(
+                dm_helpers, "_create_workspace_stream_topic_updated_events"
+            ) as create_topic_events,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_topic",
+                return_value=returned_topic,
+            ) as get_user_topic,
+        ):
             result = dm_helpers.set_workspace_user_stream_topic_default(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2251,22 +2360,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             is_done=True,
         )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream_topic",
-            return_value=current_topic,
-        ) as get_topic, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_stream_topics",
-            side_effect=[
-                [user_topic, other_topic],
-                [returned_topic, returned_other_topic],
-            ],
-        ) as get_topics, mock.patch.object(
-            dm_helpers, "_set_workspace_user_topic_done"
-        ) as set_done, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_topic",
+                return_value=current_topic,
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_stream_topics",
+                side_effect=[
+                    [user_topic, other_topic],
+                    [returned_topic, returned_other_topic],
+                ],
+            ) as get_topics,
+            mock.patch.object(dm_helpers, "_set_workspace_user_topic_done") as set_done,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.toggle_workspace_user_stream_topic_done(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2317,7 +2429,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
 
-    def test_update_workspace_user_stream_topic_notifications_allows_unmute_on_muted_stream(self):
+    def test_update_workspace_user_stream_topic_notifications_allows_unmute_on_muted_stream(
+        self,
+    ):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
@@ -2331,19 +2445,24 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             notification_mode="unmute",
         )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream_topic",
-            side_effect=[current_topic, returned_topic],
-        ) as get_topic, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=current_stream,
-        ) as get_stream, mock.patch.object(
-            dm_helpers, "_set_workspace_user_topic_notification_mode"
-        ) as set_notification, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_topic",
+                side_effect=[current_topic, returned_topic],
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=current_stream,
+            ) as get_stream,
+            mock.patch.object(
+                dm_helpers, "_set_workspace_user_topic_notification_mode"
+            ) as set_notification,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_user_stream_topic_notifications(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2384,7 +2503,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
-    def test_update_workspace_user_stream_topic_notifications_rejects_unmute_on_default_stream(self):
+    def test_update_workspace_user_stream_topic_notifications_rejects_unmute_on_default_stream(
+        self,
+    ):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
@@ -2393,20 +2514,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         current_topic = types.SimpleNamespace(stream_uuid=stream_uuid)
         current_stream = types.SimpleNamespace(notification_mode="all_messages")
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream_topic",
-            return_value=current_topic,
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=current_stream,
-        ), mock.patch.object(
-            dm_helpers, "_set_workspace_user_topic_notification_mode"
-        ) as set_notification:
-            with self.assertRaises(
-                messenger_exc.InvalidTopicNotificationModeError
-            ):
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_topic",
+                return_value=current_topic,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=current_stream,
+            ),
+            mock.patch.object(
+                dm_helpers, "_set_workspace_user_topic_notification_mode"
+            ) as set_notification,
+        ):
+            with self.assertRaises(messenger_exc.InvalidTopicNotificationModeError):
                 dm_helpers.update_workspace_user_stream_topic_notifications(
                     project_id=project_id,
                     user_uuid=user_uuid,
@@ -2480,25 +2603,32 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 self.kwargs["insert_session"] = session
                 created_flags.append(self.kwargs)
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceMessage", FakeWorkspaceMessage
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_events"
-        ) as create_message_events, mock.patch.object(
-            dm_helpers, "_create_messages_unread_updated_events"
-        ) as create_unread_events, mock.patch.object(
-            dm_helpers,
-            "_get_message_topic_source_fields",
-            return_value=source_fields,
-        ) as get_topic_source_fields, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=returned_message,
-        ) as get_user_message:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceMessage", FakeWorkspaceMessage
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_events"
+            ) as create_message_events,
+            mock.patch.object(
+                dm_helpers, "_create_messages_unread_updated_events"
+            ) as create_unread_events,
+            mock.patch.object(
+                dm_helpers,
+                "_get_message_topic_source_fields",
+                return_value=source_fields,
+            ) as get_topic_source_fields,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=returned_message,
+            ) as get_user_message,
+        ):
             result = dm_helpers.create_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2610,25 +2740,33 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 self.kwargs["insert_session"] = session
                 created_flags.append(self.kwargs)
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceMessage", FakeWorkspaceMessage
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceStreamTopic", FakeWorkspaceStreamTopic
-        ), mock.patch.object(
-            dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_events"
-        ) as create_message_events, mock.patch.object(
-            dm_helpers, "_create_messages_unread_updated_events"
-        ) as create_unread_events, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=returned_message,
-        ) as get_user_message:
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceMessage", FakeWorkspaceMessage
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStreamTopic", FakeWorkspaceStreamTopic
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_events"
+            ) as create_message_events,
+            mock.patch.object(
+                dm_helpers, "_create_messages_unread_updated_events"
+            ) as create_unread_events,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=returned_message,
+            ) as get_user_message,
+        ):
             result = dm_helpers.create_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2706,21 +2844,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def update(self, session=None):
                 updated_message["update_session"] = session
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=returned_message,
-        ) as get_user_message, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_message_for_author",
-            return_value=ExistingMessage(),
-        ) as get_author_message, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_messages",
-            return_value=[other_message, returned_message],
-        ) as get_user_messages, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=returned_message,
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_message_for_author",
+                return_value=ExistingMessage(),
+            ) as get_author_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_messages",
+                return_value=[other_message, returned_message],
+            ) as get_user_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2775,21 +2918,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         existing_message = ExistingMessage()
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            mock.Mock(),
-        ) as get_user_message, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_message_for_author",
-            return_value=existing_message,
-        ) as get_author_message, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_messages",
-            mock.Mock(),
-        ) as get_user_messages, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_updated_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                mock.Mock(),
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_message_for_author",
+                return_value=existing_message,
+            ) as get_author_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_messages",
+                mock.Mock(),
+            ) as get_user_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -2841,14 +2989,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         message.uuid = message_uuid
         message.project_id = project_id
         message.source = old_source
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_messages",
-            return_value=user_messages,
-        ) as get_user_messages, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_message_updated_event",
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_messages",
+                return_value=user_messages,
+            ) as get_user_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_updated_event",
+            ) as create_event,
+        ):
             result = dm_helpers.update_workspace_message_source(
                 message=message,
                 source=new_source,
@@ -2925,9 +3076,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertEqual([first_message_uuid, second_message_uuid], result)
-        filters = FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs[
-            "filters"
-        ]
+        filters = FakeWorkspaceUserMessage.objects.get_all.call_args.kwargs["filters"]
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
         self.assertNotIn(
@@ -2942,14 +3091,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         first_message = object()
         second_message = object()
 
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_messages",
-            return_value=[first_message, second_message],
-        ) as get_user_messages, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_message_updated_event",
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_messages",
+                return_value=[first_message, second_message],
+            ) as get_user_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_updated_event",
+            ) as create_event,
+        ):
             dm_helpers._create_workspace_message_updated_events(
                 project_id=project_id,
                 message_uuid=message_uuid,
@@ -2982,18 +3134,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 created_reaction["insert_session"] = session
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=object(),
-        ) as get_user_message, mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceMessageReactions",
-            FakeWorkspaceMessageReactions,
-        ), mock.patch.object(
-            dm_helpers,
-            "_create_workspace_message_updated_events",
-        ) as create_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=object(),
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceMessageReactions",
+                FakeWorkspaceMessageReactions,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_message_updated_events",
+            ) as create_events,
+        ):
             with mock.patch.object(
                 dm_helpers.messenger_events,
                 "create_message_reaction_created_event",
@@ -3060,21 +3216,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_reaction)
             )
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceMessageReactions",
-            FakeWorkspaceMessageReactions,
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            side_effect=[old_message, new_message],
-        ) as get_user_message, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_message_updated_events",
-        ) as create_events, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_message_reaction_updated_event",
-        ) as create_reaction_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceMessageReactions",
+                FakeWorkspaceMessageReactions,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[old_message, new_message],
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_message_updated_events",
+            ) as create_events,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_reaction_updated_event",
+            ) as create_reaction_event,
+        ):
             result = dm_helpers.update_workspace_message_reaction(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3104,18 +3265,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             updated_reaction["values"],
         )
         self.assertIs(session, updated_reaction["update_session"])
-        get_user_message.assert_has_calls([
-            mock.call(
-                project_id=project_id,
-                user_uuid=user_uuid,
-                message_uuid=old_message_uuid,
-            ),
-            mock.call(
-                project_id=project_id,
-                user_uuid=user_uuid,
-                message_uuid=message_uuid,
-            ),
-        ])
+        get_user_message.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    message_uuid=old_message_uuid,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    message_uuid=message_uuid,
+                ),
+            ]
+        )
         create_reaction_event.assert_called_once_with(
             reaction=existing_reaction,
             message=new_message,
@@ -3160,21 +3323,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingReaction())
             )
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceMessageReactions",
-            FakeWorkspaceMessageReactions,
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=object(),
-        ) as get_user_message, mock.patch.object(
-            dm_helpers,
-            "_create_workspace_message_updated_events",
-        ) as create_events, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_message_reaction_deleted_event",
-        ) as create_reaction_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceMessageReactions",
+                FakeWorkspaceMessageReactions,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=object(),
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_message_updated_events",
+            ) as create_events,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_reaction_deleted_event",
+            ) as create_reaction_event,
+        ):
             result = dm_helpers.delete_workspace_message_reaction(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3205,6 +3373,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             message_uuid=message_uuid,
             session=session,
         )
+
     def test_read_workspace_user_messages_updates_flags_and_returns_ids(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -3224,6 +3393,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid_2,
         )
+
         class ExistingFlags:
             def __init__(self):
                 self.values = None
@@ -3238,17 +3408,18 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         flags = [ExistingFlags(), ExistingFlags()]
 
         class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(side_effect=flags)
-            )
+            objects = types.SimpleNamespace(get_one=mock.Mock(side_effect=flags))
 
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_messages_read_event"
-        ) as create_event:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_messages_read_event"
+            ) as create_event,
+        ):
             stream_uuid_result, topic_uuids, message_uuids = (
                 dm_helpers._read_workspace_user_messages(
                     project_id=project_id,
@@ -3266,16 +3437,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertIs(session, flags[0].update_session)
         self.assertIs(session, flags[1].update_session)
         self.assertEqual(2, FakeWorkspaceUserMessageFlags.objects.get_one.call_count)
-        first_filters = (
-            FakeWorkspaceUserMessageFlags.objects.get_one
-            .call_args_list[0]
-            .kwargs["filters"]
-        )
-        second_filters = (
-            FakeWorkspaceUserMessageFlags.objects.get_one
-            .call_args_list[1]
-            .kwargs["filters"]
-        )
+        first_filters = FakeWorkspaceUserMessageFlags.objects.get_one.call_args_list[
+            0
+        ].kwargs["filters"]
+        second_filters = FakeWorkspaceUserMessageFlags.objects.get_one.call_args_list[
+            1
+        ].kwargs["filters"]
         self.assertEqual(message_uuid_1, first_filters["uuid"].value)
         self.assertEqual(message_uuid_2, second_filters["uuid"].value)
         create_event.assert_not_called()
@@ -3291,27 +3458,33 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         returned_stream = types.SimpleNamespace(uuid=stream_uuid, unread_count=0)
         unread_messages = [object()]
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            side_effect=[initial_stream, returned_stream],
-        ) as get_stream, mock.patch.object(
-            dm_helpers,
-            "_get_unread_workspace_user_messages",
-            return_value=unread_messages,
-        ) as get_unread, mock.patch.object(
-            dm_helpers,
-            "_read_workspace_user_messages",
-            return_value=(
-                stream_uuid,
-                [topic_uuid_1, topic_uuid_2],
-                [sys_uuid.uuid4()],
-            ),
-        ) as read_messages, mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers, "_create_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                side_effect=[initial_stream, returned_stream],
+            ) as get_stream,
+            mock.patch.object(
+                dm_helpers,
+                "_get_unread_workspace_user_messages",
+                return_value=unread_messages,
+            ) as get_unread,
+            mock.patch.object(
+                dm_helpers,
+                "_read_workspace_user_messages",
+                return_value=(
+                    stream_uuid,
+                    [topic_uuid_1, topic_uuid_2],
+                    [sys_uuid.uuid4()],
+                ),
+            ) as read_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers, "_create_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.read_workspace_user_stream_messages(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3370,23 +3543,29 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         returned_topic = types.SimpleNamespace(uuid=topic_uuid, unread_count=0)
         unread_messages = [object()]
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream_topic",
-            side_effect=[initial_topic, returned_topic],
-        ) as get_topic, mock.patch.object(
-            dm_helpers,
-            "_get_unread_workspace_user_messages",
-            return_value=unread_messages,
-        ) as get_unread, mock.patch.object(
-            dm_helpers,
-            "_read_workspace_user_messages",
-            return_value=(stream_uuid, [topic_uuid], [sys_uuid.uuid4()]),
-        ) as read_messages, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers, "_create_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_topic",
+                side_effect=[initial_topic, returned_topic],
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers,
+                "_get_unread_workspace_user_messages",
+                return_value=unread_messages,
+            ) as get_unread,
+            mock.patch.object(
+                dm_helpers,
+                "_read_workspace_user_messages",
+                return_value=(stream_uuid, [topic_uuid], [sys_uuid.uuid4()]),
+            ) as read_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers, "_create_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.read_workspace_user_stream_topic_messages(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3462,19 +3641,24 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingFlags())
             )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            side_effect=[current_message, returned_message],
-        ) as get_user_message, mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers, "_create_message_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[current_message, returned_message],
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers, "_create_message_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.read_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3545,21 +3729,27 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingFlags())
             )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            side_effect=[current_message, returned_message],
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_updated_event"
-        ) as create_updated_event, mock.patch.object(
-            dm_helpers, "_create_message_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[current_message, returned_message],
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers, "_create_message_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.sync_workspace_user_message_flags(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3604,21 +3794,27 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_flags)
             )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=current_message,
-        ) as get_user_message, mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_updated_event"
-        ) as create_updated_event, mock.patch.object(
-            dm_helpers, "_create_message_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=current_message,
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers, "_create_message_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.sync_workspace_user_message_flags(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3668,21 +3864,27 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingFlags())
             )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            side_effect=[current_message, returned_message],
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_updated_event"
-        ) as create_updated_event, mock.patch.object(
-            dm_helpers, "_create_message_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[current_message, returned_message],
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers, "_create_message_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.sync_workspace_user_message_flags(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3732,21 +3934,27 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingFlags())
             )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            side_effect=[current_message, returned_message],
-        ), mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceUserMessageFlags",
-            FakeWorkspaceUserMessageFlags,
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_message_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_updated_event"
-        ) as create_updated_event, mock.patch.object(
-            dm_helpers, "_create_message_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[current_message, returned_message],
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers, "_create_message_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.sync_workspace_user_message_flags(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3781,23 +3989,29 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         returned_message = types.SimpleNamespace(read=True)
         unread_messages = [object()]
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            side_effect=[current_message, returned_message],
-        ) as get_user_message, mock.patch.object(
-            dm_helpers,
-            "_get_unread_workspace_user_messages",
-            return_value=unread_messages,
-        ) as get_unread, mock.patch.object(
-            dm_helpers,
-            "_read_workspace_user_messages",
-            return_value=(stream_uuid, [topic_uuid], [message_uuid]),
-        ) as read_messages, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_read_event"
-        ) as create_read_event, mock.patch.object(
-            dm_helpers, "_create_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[current_message, returned_message],
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_unread_workspace_user_messages",
+                return_value=unread_messages,
+            ) as get_unread,
+            mock.patch.object(
+                dm_helpers,
+                "_read_workspace_user_messages",
+                return_value=(stream_uuid, [topic_uuid], [message_uuid]),
+            ) as read_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers, "_create_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.read_workspace_user_topic_messages_to_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3826,6 +4040,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
             created_at=created_at,
+            boundary_uuid=message_uuid,
         )
         read_messages.assert_called_once_with(
             project_id=project_id,
@@ -3871,27 +4086,33 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_all=mock.Mock(return_value=[custom_item])
             )
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream_topic",
-            return_value=user_topic,
-        ) as get_topic, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_stream",
-            return_value=user_stream,
-        ) as get_stream, mock.patch.object(
-            dm_helpers.models, "FolderItem", FakeFolderItem
-        ), mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder",
-            side_effect=[all_folder, channels_folder, custom_folder],
-        ) as get_folder, mock.patch.object(
-            dm_helpers.messenger_events, "create_topic_updated_event"
-        ) as create_topic_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_stream_updated_event"
-        ) as create_stream_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_event:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_topic",
+                return_value=user_topic,
+            ) as get_topic,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=user_stream,
+            ) as get_stream,
+            mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder",
+                side_effect=[all_folder, channels_folder, custom_folder],
+            ) as get_folder,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_topic_updated_event"
+            ) as create_topic_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_stream_updated_event"
+            ) as create_stream_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_event,
+        ):
             dm_helpers._create_message_unread_updated_events(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -3986,23 +4207,29 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def delete(self, session=None):
                 deleted_message["delete_session"] = session
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_message",
-            return_value=current_message,
-        ) as get_user_message, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_message_for_author",
-            return_value=ExistingMessage(),
-        ) as get_author_message, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_user_messages",
-            return_value=[current_message, other_message],
-        ) as get_user_messages, mock.patch.object(
-            dm_helpers.messenger_events, "create_message_deleted_event"
-        ) as create_deleted_event, mock.patch.object(
-            dm_helpers, "_create_messages_unread_updated_events"
-        ) as create_unread_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=current_message,
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_message_for_author",
+                return_value=ExistingMessage(),
+            ) as get_author_message,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_user_messages",
+                return_value=[current_message, other_message],
+            ) as get_user_messages,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_deleted_event"
+            ) as create_deleted_event,
+            mock.patch.object(
+                dm_helpers, "_create_messages_unread_updated_events"
+            ) as create_unread_events,
+        ):
             result = dm_helpers.delete_workspace_user_message(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4078,13 +4305,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 created_folder["insert_session"] = session
 
-        with mock.patch.object(
-            dm_helpers.models, "Folder", FakeFolder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
-        ) as get_user_folder:
+        with (
+            mock.patch.object(dm_helpers.models, "Folder", FakeFolder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ) as get_user_folder,
+        ):
             result = dm_helpers.create_workspace_user_folder(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4130,19 +4359,23 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             def insert(self, session=None):
                 created_item["insert_session"] = session
 
-        with mock.patch.object(
-            dm_helpers.models, "FolderItem", FakeFolderItem
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers, "get_workspace_user_stream", return_value=object()
-        ) as get_user_stream, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder_item",
-            return_value=returned_item,
-        ) as get_user_folder_item:
+        with (
+            mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_stream", return_value=object()
+            ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder_item",
+                return_value=returned_item,
+            ) as get_user_folder_item,
+        ):
             result = dm_helpers.create_workspace_user_folder_item(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4206,15 +4439,18 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_item)
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "FolderItem", FakeFolderItem
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_item_deleted_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_folder_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
-        ) as get_user_folder:
+        with (
+            mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_item_deleted_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_folder_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ) as get_user_folder,
+        ):
             result = dm_helpers.delete_workspace_user_folder_item(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4268,17 +4504,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_item)
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "FolderItem", FakeFolderItem
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder_item",
-            return_value=returned_item,
-        ) as get_user_folder_item:
+        with (
+            mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder_item",
+                return_value=returned_item,
+            ) as get_user_folder_item,
+        ):
             result = dm_helpers.pin_workspace_user_folder_item(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4330,17 +4569,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_item)
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "FolderItem", FakeFolderItem
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
-        ) as get_user_folder, mock.patch.object(
-            dm_helpers,
-            "get_workspace_user_folder_item",
-            return_value=returned_item,
-        ) as get_user_folder_item:
+        with (
+            mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ) as get_user_folder,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_folder_item",
+                return_value=returned_item,
+            ) as get_user_folder_item,
+        ):
             result = dm_helpers.unpin_workspace_user_folder_item(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4391,13 +4633,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_folder)
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "Folder", FakeFolder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
-        ) as get_user_folder:
+        with (
+            mock.patch.object(dm_helpers.models, "Folder", FakeFolder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ) as get_user_folder,
+        ):
             result = dm_helpers.update_workspace_user_folder(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4442,12 +4686,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=ExistingFolder())
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "Folder", FakeFolder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_updated_event"
-        ) as create_event, mock.patch.object(
-            dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+        with (
+            mock.patch.object(dm_helpers.models, "Folder", FakeFolder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_updated_event"
+            ) as create_event,
+            mock.patch.object(
+                dm_helpers, "get_workspace_user_folder", return_value=returned_folder
+            ),
         ):
             result = dm_helpers.update_workspace_user_folder(
                 project_id=project_id,
@@ -4483,11 +4729,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_one=mock.Mock(return_value=existing_folder)
             )
 
-        with mock.patch.object(
-            dm_helpers.models, "Folder", FakeFolder
-        ), mock.patch.object(
-            dm_helpers.messenger_events, "create_folder_deleted_event"
-        ) as create_event:
+        with (
+            mock.patch.object(dm_helpers.models, "Folder", FakeFolder),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_folder_deleted_event"
+            ) as create_event,
+        ):
             result = dm_helpers.delete_workspace_user_folder(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4529,22 +4776,26 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             storage_object_id="aa/file",
         )
 
-        with mock.patch.object(
-            dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile
-        ), mock.patch.object(
-            dm_helpers.file_storage,
-            "get_workspace_file_storage_info",
-            return_value=storage_info,
-        ) as get_storage_info, mock.patch.object(
-            dm_helpers.models,
-            "get_stream_recipients",
-            return_value=[user_uuid, other_user_uuid],
-        ) as get_recipients, mock.patch.object(
-            dm_helpers, "get_or_create_workspace_file_access"
-        ) as get_access, mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_file_created_events",
-        ) as create_events:
+        with (
+            mock.patch.object(dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile),
+            mock.patch.object(
+                dm_helpers.file_storage,
+                "get_workspace_file_storage_info",
+                return_value=storage_info,
+            ) as get_storage_info,
+            mock.patch.object(
+                dm_helpers.models,
+                "get_stream_recipients",
+                return_value=[user_uuid, other_user_uuid],
+            ) as get_recipients,
+            mock.patch.object(
+                dm_helpers, "get_or_create_workspace_file_access"
+            ) as get_access,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_file_created_events",
+            ) as create_events,
+        ):
             result = dm_helpers.create_workspace_file(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4613,13 +4864,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             types.SimpleNamespace(uuid=second_file_uuid),
         ]
 
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_stream_files",
-            return_value=files,
-        ) as get_files, mock.patch.object(
-            dm_helpers, "get_or_create_workspace_file_access"
-        ) as get_access:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_stream_files",
+                return_value=files,
+            ) as get_files,
+            mock.patch.object(
+                dm_helpers, "get_or_create_workspace_file_access"
+            ) as get_access,
+        ):
             dm_helpers._create_workspace_stream_binding_file_accesses(
                 project_id=project_id,
                 stream_uuid=stream_uuid,
@@ -4666,14 +4920,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceFileAccess:
             objects = types.SimpleNamespace(get_one_or_none=get_one_or_none)
 
-        with mock.patch.object(
-            dm_helpers,
-            "_get_workspace_stream_files",
-            return_value=files,
-        ) as get_files, mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceFileAccess",
-            FakeWorkspaceFileAccess,
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_stream_files",
+                return_value=files,
+            ) as get_files,
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceFileAccess",
+                FakeWorkspaceFileAccess,
+            ),
         ):
             dm_helpers._delete_workspace_stream_binding_file_accesses(
                 project_id=project_id,
@@ -4779,18 +5036,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         existing_file = ExistingFile()
         recipients = [user_uuid]
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_owned_file",
-            return_value=existing_file,
-        ) as get_file, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_file_event_recipients",
-            return_value=recipients,
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_file_updated_events",
-        ) as create_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_owned_file",
+                return_value=existing_file,
+            ) as get_file,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_file_event_recipients",
+                return_value=recipients,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_file_updated_events",
+            ) as create_events,
+        ):
             result = dm_helpers.update_workspace_file(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4813,6 +5074,32 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_public_file_event_recipients_are_project_scoped(self):
+        project_id = sys_uuid.uuid4()
+        first = sys_uuid.uuid4()
+        second = sys_uuid.uuid4()
+        statements = []
+        result = mock.Mock()
+        result.fetchall.return_value = [
+            {"user_uuid": first},
+            {"user_uuid": second},
+        ]
+        session = mock.Mock()
+        session.execute.side_effect = lambda statement, params: (
+            statements.append((statement, params)) or result
+        )
+        file = mock.Mock(stream_uuid=None, user_uuid=first)
+
+        recipients = dm_helpers._get_workspace_file_event_recipients(
+            project_id, file, session=session
+        )
+
+        self.assertEqual(sorted([first, second], key=str), recipients)
+        self.assertEqual((project_id, project_id), statements[0][1])
+        self.assertIn("m_workspace_stream_bindings", statements[0][0])
+        self.assertIn("m_folders", statements[0][0])
+        self.assertNotIn("m_workspace_users", statements[0][0])
+
     def test_delete_workspace_file_deletes_owned_file(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -4829,18 +5116,22 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         existing_file.stream_uuid = sys_uuid.uuid4()
         recipients = [user_uuid]
 
-        with mock.patch.object(
-            dm_helpers,
-            "get_workspace_owned_file",
-            return_value=existing_file,
-        ) as get_file, mock.patch.object(
-            dm_helpers,
-            "_get_workspace_file_event_recipients",
-            return_value=recipients,
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_file_deleted_events",
-        ) as create_events:
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_owned_file",
+                return_value=existing_file,
+            ) as get_file,
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_file_event_recipients",
+                return_value=recipients,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_file_deleted_events",
+            ) as create_events,
+        ):
             result = dm_helpers.delete_workspace_file(
                 project_id=project_id,
                 user_uuid=user_uuid,
@@ -4888,23 +5179,27 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     return existing_file
 
         get_file = mock.Mock()
-        with mock.patch.object(
-            dm_helpers.models,
-            "WorkspaceFile",
-            FakeWorkspaceFile,
-        ), mock.patch.object(
-            dm_helpers,
-            "_get_workspace_file_event_recipients",
-            return_value=recipients,
-        ), mock.patch.object(
-            dm_helpers.messenger_events,
-            "create_file_deleted_events",
-        ) as create_events:
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceFile",
+                FakeWorkspaceFile,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_file_event_recipients",
+                return_value=recipients,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_file_deleted_events",
+            ) as create_events,
+        ):
             result = dm_helpers.delete_workspace_avatar_file(
                 user_uuid=user_uuid,
                 file_uuid=file_uuid,
                 session=session,
-        )
+            )
 
         self.assertIsNone(result)
         self.assertEqual(

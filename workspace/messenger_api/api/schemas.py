@@ -101,7 +101,7 @@ FOLDER_WITH_ITEMS_SCHEMA = {
     },
 }
 
-FOLDER_FILTER_PARAMETERS = []
+FOLDER_FILTER_PARAMETERS: list[dict[str, object]] = []
 
 FOLDER_FILTER_RESPONSES = {
     ra_status.HTTP_200_OK: {

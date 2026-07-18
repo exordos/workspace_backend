@@ -16,17 +16,24 @@
 
 from bazooka import common
 from bazooka import client as bz_client
+from collections.abc import Callable
+from typing import Any
 
 
 class IamClient(common.RESTClientMixIn):
     USERS_PATH = "users"
 
-    def __init__(self, endpoint: str, timeout: int = 5, client_cls=None):
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: int = 5,
+        client_cls: Callable[..., Any] | None = None,
+    ) -> None:
         super().__init__()
         self._client = (client_cls or bz_client.Client)(default_timeout=timeout)
         self._endpoint = endpoint
 
-    def _get_users_url(self):
+    def _get_users_url(self) -> str:
         iam_root, clients_separator, _client_path = self._endpoint.partition(
             "/clients/",
         )
@@ -34,7 +41,7 @@ class IamClient(common.RESTClientMixIn):
             return self._build_collection_uri([self.USERS_PATH], init_uri=iam_root)
         return self._build_collection_uri([self.USERS_PATH])
 
-    def get_users(self, token: str):
+    def get_users(self, token: str) -> Any:
         response = self._client.get(
             self._get_users_url(),
             headers={"Authorization": f"Bearer {token}"},

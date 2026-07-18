@@ -48,6 +48,6 @@ s3_storage_opts = [
 ]
 
 
-def register_opts(conf=cfg.CONF):
+def register_opts(conf: cfg.ConfigOpts = cfg.CONF) -> None:
     conf.register_opts(file_storage_opts, DOMAIN)
     conf.register_opts(s3_storage_opts, S3_DOMAIN)

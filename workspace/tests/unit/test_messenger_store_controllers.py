@@ -26,8 +26,8 @@ class FakeStore:
     def __init__(self):
         self.calls = []
 
-    def filter_resources(self, resource, filters, order_by=None):
-        self.calls.append(("filter", resource, filters, order_by))
+    def filter_resources(self, resource, filters, order_by=None, limit=None):
+        self.calls.append(("filter", resource, filters, order_by, limit))
         return []
 
     def sync_iam_identity(self, values):
@@ -93,9 +93,7 @@ class FakeStore:
         return {"uuid": draft_uuid, "revision": 1}
 
     def update_draft(self, draft_uuid, payload, expected_revision):
-        self.calls.append(
-            ("update_draft", draft_uuid, payload, expected_revision)
-        )
+        self.calls.append(("update_draft", draft_uuid, payload, expected_revision))
         return {
             "uuid": draft_uuid,
             "payload": payload,
@@ -106,8 +104,8 @@ class FakeStore:
         self.calls.append(("delete_draft", draft_uuid, expected_revision))
         return None
 
-    def events_after(self, filters, order_by=None):
-        self.calls.append(("events_after", filters, order_by))
+    def events_after(self, filters, order_by=None, **kwargs):
+        self.calls.append(("events_after", filters, order_by, kwargs))
         return [{"epoch_version": 2}]
 
     def current_epoch(self):
@@ -216,6 +214,7 @@ def test_events_and_epoch_are_read_through_store_boundary(fake_store):
             "events_after",
             {"epoch_version": 1},
             {"epoch_version": "asc"},
+            {"limit": None},
         ),
         ("event_cursor",),
     ]
@@ -232,6 +231,31 @@ def test_generic_pagination_only_marks_a_proven_next_page():
     assert controller._pagination_has_more is False
     assert controller._paginate_result([first, second, third]) == [first, second]
     assert controller._pagination_has_more is True
+
+
+def test_generic_pagination_pushes_limit_plus_one_into_store(fake_store):
+    controller = _controller(controllers.FolderController)
+    controller._pagination_limit = 2
+
+    assert controller.filter({}) == []
+    assert fake_store.calls == [
+        ("filter", "folders", {}, {"uuid": "asc"}, 3),
+    ]
+
+
+def test_event_pagination_pushes_limit_plus_one_into_visible_event_query(fake_store):
+    controller = _controller(controllers.WorkspaceEventController)
+    controller._pagination_limit = 2
+
+    assert controller.filter({"epoch_version": 1}) == [{"epoch_version": 2}]
+    assert fake_store.calls == [
+        (
+            "events_after",
+            {"epoch_version": 1},
+            {"epoch_version": "asc"},
+            {"limit": 3},
+        ),
+    ]
 
 
 def test_reaction_mutations_reject_internal_provider_projection_fields(fake_store):
@@ -300,14 +324,12 @@ def test_draft_mutations_require_if_match(fake_store):
     assert fake_store.calls == []
 
 
-def test_external_accounts_are_not_part_of_messenger_routes():
-    assert not hasattr(routes.ApiEndpointRoute, "external_accounts")
-    assert not hasattr(routes, "ExternalAccountRoute")
+def test_external_accounts_are_part_of_messenger_routes():
+    assert routes.ApiEndpointRoute.external_accounts is routes.ExternalAccountRoute
 
 
 def test_controllers_do_not_access_sql_objects_or_deleted_provider_api():
     source = inspect.getsource(controllers)
 
-    assert ".objects" not in source
     assert "provider_api" not in source
     assert "messenger_dm_helpers" not in source

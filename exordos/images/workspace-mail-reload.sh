@@ -8,6 +8,7 @@
 set -eu
 set -o pipefail
 
-if [ -s /etc/workspace/mail.conf ] && [ -s /etc/workspace/mail-pki.conf ]; then
+if [ -s /etc/workspace/mail.conf ] && \
+   [ -s /etc/workspace/mail-pki.conf ]; then
     /usr/local/bin/workspace-mail-bootstrap
 fi

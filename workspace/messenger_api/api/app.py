@@ -14,6 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import typing
+
 from gcl_iam import middlewares as iam_mw
 from restalchemy.api import applications
 from restalchemy.api.middlewares import logging as logging_mw
@@ -35,14 +37,18 @@ class MessengerApiApp(routes.RootRoute):
 
 
 class MessengerOpenApiComponents(openapi_structures.OpenApiComponents):
-    def build(self, request):
+    def build(self, request: typing.Any) -> dict[str, typing.Any]:
         specification = super().build(request)
         specification = openapi_contract.add_public_projection_contract(specification)
         return openapi_contract.add_avatar_upload_schema(specification)
 
 
 class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
-    def build(self, request, components):
+    def build(
+        self,
+        request: typing.Any,
+        components: dict[str, typing.Any],
+    ) -> dict[str, typing.Any]:
         specification = super().build(request, components)
         specification = openapi_contract.add_collection_pagination_contract(
             specification,
@@ -54,6 +60,11 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
         specification = openapi_contract.add_draft_contract(
             specification,
             "/v1/drafts/",
+            components,
+        )
+        specification = openapi_contract.add_external_bridge_public_contract(
+            specification,
+            "/v1/",
             components,
         )
         return openapi_contract.add_current_user_contract(
@@ -69,11 +80,11 @@ setattr(
 )
 
 
-def get_api_application():
+def get_api_application() -> type[MessengerApiApp]:
     return MessengerApiApp
 
 
-def get_openapi_engine():
+def get_openapi_engine() -> typing.Any:
     openapi_engine = openapi_engines.OpenApiEngine(
         info=openapi_structures.OpenApiInfo(
             title=f"Workspace {versions.API_VERSION_1_0} Messenger API",
@@ -86,7 +97,7 @@ def get_openapi_engine():
     return openapi_engine
 
 
-def build_wsgi_application(iam_engine_driver):
+def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
             route_class=get_api_application(),

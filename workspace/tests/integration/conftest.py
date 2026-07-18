@@ -45,8 +45,10 @@ from restalchemy.api.middlewares import contexts as contexts_mw
 from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.storage.sql import engines
 from restalchemy.storage.sql import migrations as ra_migrations
+from oslo_config import cfg
 
 from workspace.common import file_storage_opts
+from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
@@ -70,6 +72,7 @@ MIGRATIONS_DIR = REPO_ROOT / "migrations"
 # Headers used by the mocked auth middleware to build the request context.
 HEADER_USER = "X-Test-User-Uuid"
 HEADER_PROJECT = "X-Test-Project-Id"
+HEADER_PERMISSIONS = "X-Test-Permissions"
 TEST_MAIL_RUNTIME = memory_mail.RuntimeFactory()
 
 
@@ -102,13 +105,13 @@ class FakeIamEngine:
     The enforcer is intentionally hostile: workspace must not call policies.
     """
 
-    def __init__(self, user_uuid, project_id):
+    def __init__(self, user_uuid, project_id, permissions=()):
         self._token = _FakeToken(user_uuid)
         self._info = {
             "project_id": str(project_id),
             "otp_verified": True,
             "otp_enabled": False,
-            "permissions": [],
+            "permissions": list(permissions),
             "user_info": {
                 "uuid": str(user_uuid),
                 "name": f"user-{user_uuid}",
@@ -153,8 +156,13 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
     def _get_response(self, ctx, req):
         user_uuid = req.headers.get(HEADER_USER) or self.DEFAULT_USER
         project_id = req.headers.get(HEADER_PROJECT) or self.DEFAULT_PROJECT
+        permissions = tuple(
+            value
+            for value in (req.headers.get(HEADER_PERMISSIONS) or "").split(",")
+            if value
+        )
         with ctx.context_manager():
-            engine = FakeIamEngine(user_uuid, project_id)
+            engine = FakeIamEngine(user_uuid, project_id, permissions)
             with ctx.iam_session(engine):
                 req.iam_engine = engine
                 # Skip GenesisCoreAuthMiddleware auth logic, just dispatch.
@@ -164,6 +172,10 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
 def build_test_wsgi_application(app_module=messenger_app):
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
+    try:
+        external_bridge_opts.register_opts()
+    except cfg.DuplicateOptError:
+        pass
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
         openapi_engine=app_module.get_openapi_engine(),
@@ -197,16 +209,27 @@ class ApiClient:
         self.project_id = str(project_id)
         self._user_seeder = user_seeder
 
-    def _headers(self, user=None, project=None):
-        return {
+    def _headers(self, user=None, project=None, permissions=()):
+        headers = {
             HEADER_USER: str(user or self.user_uuid),
             HEADER_PROJECT: str(project or self.project_id),
         }
+        if permissions:
+            headers[HEADER_PERMISSIONS] = ",".join(permissions)
+        return headers
 
-    def request(self, method, path, user=None, project=None, **kwargs):
+    def request(
+        self,
+        method,
+        path,
+        user=None,
+        project=None,
+        permissions=(),
+        **kwargs,
+    ):
         if self._user_seeder is not None:
             self._user_seeder(str(user or self.user_uuid))
-        headers = self._headers(user, project)
+        headers = self._headers(user, project, permissions)
         headers.update(kwargs.pop("headers", {}))
         return requests.request(
             method,
@@ -243,8 +266,20 @@ class _QuietHandler(wsgiref.simple_server.WSGIRequestHandler):
 def _database():
     """Configure the ORM engine against the test DB and migrate it to HEAD."""
     try:
-        with psycopg.connect(TEST_DB_URL, connect_timeout=3):
-            pass
+        with psycopg.connect(TEST_DB_URL, connect_timeout=3) as connection:
+            smtp_gate_role_exists = connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_roles
+                    WHERE rolname = 'workspace_mail_gate'
+                )
+                """
+            ).fetchone()[0]
+            if smtp_gate_role_exists:
+                pytest.skip(
+                    "The integration database must use an isolated PostgreSQL "
+                    "cluster without the workspace_mail_gate role"
+                )
     except Exception as exc:  # pragma: no cover - environment guard
         pytest.skip(
             "Test database is not reachable at %s (%s). Create it with: "
