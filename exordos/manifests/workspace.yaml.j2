@@ -6,9 +6,10 @@ api_version: "v1"
 # {% set mail_migration_stage1_enabled = mail_migration_stage1 | default(false) %}
 # {% set mail_migration_compatibility_enabled = mail_migration_compatibility | default(false) %}
 # {% set mail_migration_cutover_enabled = mail_migration_cutover_keep_legacy_disk | default(false) %}
-# {% set retain_legacy_mail_resources_enabled = retain_legacy_mail_resources | default(true) %}
-# {% set messenger_storage_mode_value = messenger_storage_mode | default('mail_projection') %}
-# {% set messenger_canonical_cutover_confirmed_value = messenger_canonical_cutover_confirmed | default(false) %}
+# {% set migration_mail_image_built = 'workspace_mail_raw_zst' in images %}
+# {% set retain_legacy_mail_resources_enabled = retain_legacy_mail_resources | default(migration_mail_image_built) %}
+# {% set messenger_storage_mode_value = messenger_storage_mode | default('mail_projection' if migration_mail_image_built else 'postgresql_canonical') %}
+# {% set messenger_canonical_cutover_confirmed_value = messenger_canonical_cutover_confirmed | default(not migration_mail_image_built) %}
 # {% set canonical_cutover_runtime_enabled = messenger_storage_mode_value == 'postgresql_canonical' and messenger_canonical_cutover_confirmed_value %}
 # {% set legacy_mail_runtime_enabled = retain_legacy_mail_resources_enabled and not canonical_cutover_runtime_enabled %}
 # {% set smtp_writer_gate_runtime_enabled = legacy_mail_runtime_enabled and not mail_migration_stage1_enabled and not mail_migration_compatibility_enabled %}
@@ -539,6 +540,7 @@ resources:
           [messenger_storage]
           mode = {{ messenger_storage_mode_value }}
           canonical_cutover_confirmed = {{ 'true' if messenger_canonical_cutover_confirmed_value else 'false' }}
+          retain_legacy_mail_resources = {{ 'true' if retain_legacy_mail_resources_enabled else 'false' }}
 
 
           {% if not canonical_cutover_runtime_enabled %}

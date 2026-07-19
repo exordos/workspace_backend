@@ -27,27 +27,55 @@ CA_SYNC=${WORKSPACE_MAIL_CA_SYNC:-/usr/local/bin/workspace-mail-ca-sync}
 MAIL_HEALTHCHECK=${WORKSPACE_MAIL_HEALTHCHECK:-/usr/local/bin/workspace-mail-healthcheck}
 WORKSPACE_BOOTSTRAP=${WORKSPACE_BOOTSTRAP:-/usr/local/bin/workspace-bootstrap}
 RESTART_SERVICES=${WORKSPACE_RESTART_SERVICES:-/usr/local/bin/workspace-restart-services}
+CANONICAL_CONFIG_SNAPSHOT=${WORKSPACE_CANONICAL_CONFIG_SNAPSHOT:-/run/workspace/workspace-postgresql-canonical.conf}
 
 if [ ! -s "$WORKSPACE_CONFIG" ]; then
     exit 0
 fi
 
-STORAGE_MODE=$(python3 - "$WORKSPACE_CONFIG" <<'PY'
+CONFIG_STATE=$(python3 - "$WORKSPACE_CONFIG" <<'PY'
 import configparser
 import sys
 
 config = configparser.ConfigParser()
 config.read(sys.argv[1])
-print(config.get("messenger_storage", "mode", fallback="mail_projection"))
+section = "messenger_storage"
+print(config.get(section, "mode", fallback="mail_projection"))
+if config.has_option(section, "retain_legacy_mail_resources"):
+    print(config.get(section, "retain_legacy_mail_resources"))
+else:
+    print("unset")
 PY
 )
+STORAGE_MODE=$(printf '%s\n' "$CONFIG_STATE" | sed -n '1p')
+RETAIN_LEGACY_MAIL_RESOURCES=$(printf '%s\n' "$CONFIG_STATE" | sed -n '2p')
 
 if [ "$STORAGE_MODE" = "postgresql_canonical" ]; then
+    if [ "$RETAIN_LEGACY_MAIL_RESOURCES" = "false" ]; then
+        install -D -m 0600 "$WORKSPACE_CONFIG" "$CANONICAL_CONFIG_SNAPSHOT"
+    else
+        rm -f "$CANONICAL_CONFIG_SNAPSHOT"
+    fi
     rm -f "$READY_FILE"
     "$WORKSPACE_BOOTSTRAP"
     "$RESTART_SERVICES"
     exit 0
 fi
+
+# Exordos Core may briefly replay a removed pre-cutover config resource while
+# a freshly imaged node converges. New migration/rollback manifests always set
+# retain_legacy_mail_resources explicitly. A mail config without that marker
+# is therefore stale and must not overwrite an accepted canonical-only config.
+if [ "$RETAIN_LEGACY_MAIL_RESOURCES" = "unset" ] && \
+    [ -s "$CANONICAL_CONFIG_SNAPSHOT" ]; then
+    install -m 0600 "$CANONICAL_CONFIG_SNAPSHOT" "$WORKSPACE_CONFIG"
+    rm -f "$READY_FILE"
+    "$WORKSPACE_BOOTSTRAP"
+    "$RESTART_SERVICES"
+    exit 0
+fi
+
+rm -f "$CANONICAL_CONFIG_SNAPSHOT"
 
 STARTTLS_REQUIRED=0
 if grep -Eq '^[[:space:]]*(smtp|imap)_security[[:space:]]*=[[:space:]]*starttls[[:space:]]*$' \

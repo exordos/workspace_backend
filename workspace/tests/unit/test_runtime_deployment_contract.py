@@ -522,12 +522,14 @@ def test_backend_config_reload_fetches_ca_after_deferred_config_delivery(
 def test_canonical_config_reload_never_touches_mail_runtime(tmp_path):
     reload_config = PROJECT_ROOT / "exordos/images/workspace-reload-config.sh"
     workspace_config = tmp_path / "workspace.conf"
+    canonical_config_snapshot = tmp_path / "workspace-postgresql-canonical.conf"
     ready_file = tmp_path / "bootstrap.ready"
     action_log = tmp_path / "actions.log"
     workspace_config.write_text(
         "[messenger_storage]\n"
         "mode = postgresql_canonical\n"
-        "canonical_cutover_confirmed = true\n",
+        "canonical_cutover_confirmed = true\n"
+        "retain_legacy_mail_resources = false\n",
         encoding="utf-8",
     )
     ready_file.write_text("ready\n", encoding="utf-8")
@@ -555,6 +557,7 @@ def test_canonical_config_reload_never_touches_mail_runtime(tmp_path):
         env={
             **os.environ,
             "WORKSPACE_CONFIG": str(workspace_config),
+            "WORKSPACE_CANONICAL_CONFIG_SNAPSHOT": str(canonical_config_snapshot),
             "READY_FILE": str(ready_file),
             "WORKSPACE_MAIL_CA_SYNC": str(forbidden),
             "WORKSPACE_MAIL_HEALTHCHECK": str(forbidden),
@@ -571,6 +574,82 @@ def test_canonical_config_reload_never_touches_mail_runtime(tmp_path):
         "restart",
     ]
     assert ready_file.read_text(encoding="utf-8") == "ready\n"
+    assert canonical_config_snapshot.read_text(encoding="utf-8") == (
+        workspace_config.read_text(encoding="utf-8")
+    )
+
+
+def test_config_reload_restores_canonical_config_after_stale_mail_replay(tmp_path):
+    reload_config = PROJECT_ROOT / "exordos/images/workspace-reload-config.sh"
+    workspace_config = tmp_path / "workspace.conf"
+    canonical_config_snapshot = tmp_path / "workspace-postgresql-canonical.conf"
+    ready_file = tmp_path / "bootstrap.ready"
+    action_log = tmp_path / "actions.log"
+    canonical_config = (
+        "[messenger_storage]\n"
+        "mode = postgresql_canonical\n"
+        "canonical_cutover_confirmed = true\n"
+        "retain_legacy_mail_resources = false\n"
+    )
+    workspace_config.write_text(canonical_config, encoding="utf-8")
+
+    def write_mock(name, body):
+        path = tmp_path / name
+        path.write_text("#!/usr/bin/env bash\nset -eu\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    forbidden = write_mock("forbidden", "exit 97\n")
+    bootstrap = write_mock(
+        "bootstrap",
+        'printf "bootstrap\\n" >> "$MOCK_ACTION_LOG"\n',
+    )
+    restart = write_mock(
+        "restart",
+        'printf "restart\\n" >> "$MOCK_ACTION_LOG"\n',
+    )
+    environment = {
+        **os.environ,
+        "WORKSPACE_CONFIG": str(workspace_config),
+        "WORKSPACE_CANONICAL_CONFIG_SNAPSHOT": str(canonical_config_snapshot),
+        "READY_FILE": str(ready_file),
+        "WORKSPACE_MAIL_CA_SYNC": str(forbidden),
+        "WORKSPACE_MAIL_HEALTHCHECK": str(forbidden),
+        "WORKSPACE_BOOTSTRAP": str(bootstrap),
+        "WORKSPACE_RESTART_SERVICES": str(restart),
+        "MOCK_ACTION_LOG": str(action_log),
+    }
+
+    accepted = subprocess.run(
+        ["bash", reload_config],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert canonical_config_snapshot.read_text(encoding="utf-8") == canonical_config
+
+    workspace_config.write_text(
+        "[messenger_storage]\nmode = mail_projection\n",
+        encoding="utf-8",
+    )
+    replayed = subprocess.run(
+        ["bash", reload_config],
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+    )
+
+    assert replayed.returncode == 0, replayed.stderr
+    assert workspace_config.read_text(encoding="utf-8") == canonical_config
+    assert action_log.read_text(encoding="utf-8").splitlines() == [
+        "bootstrap",
+        "restart",
+        "bootstrap",
+        "restart",
+    ]
 
 
 def test_backend_bootstrap_requires_smtp_role_only_before_canonical_cutover():
@@ -598,6 +677,24 @@ def test_backend_image_supports_platform_managed_ssh_keys():
 
 
 def test_manifest_defaults_to_safe_mail_retention_and_requires_explicit_cutover():
+    canonical_only_render = _render_workspace_manifest_with_jinja(
+        {
+            "version": "test",
+            "images": {"workspace_backend": "backend-image"},
+        }
+    )
+    assert canonical_only_render.returncode == 0, canonical_only_render.stderr
+    assert "[messenger_storage]\n          mode = postgresql_canonical" in (
+        canonical_only_render.stdout
+    )
+    assert "canonical_cutover_confirmed = true" in canonical_only_render.stdout
+    assert "retain_legacy_mail_resources = false" in canonical_only_render.stdout
+    canonical_only_manifest = yaml.safe_load(canonical_only_render.stdout)
+    assert (
+        "workspace_mail"
+        not in canonical_only_manifest["resources"]["$core.compute.nodes"]
+    )
+
     default_render = _render_workspace_manifest_with_jinja(
         {
             "version": "test",
