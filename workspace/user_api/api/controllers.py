@@ -17,6 +17,7 @@
 import collections
 import datetime
 import uuid as sys_uuid
+from typing import Any
 
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import controllers as ra_controllers
@@ -41,7 +42,7 @@ _TRUE_VALUES = frozenset({"1", "true", "yes"})
 _FALSE_VALUES = frozenset({"0", "false", "no"})
 
 
-def _parse_bool(value, default=False):
+def _parse_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -53,8 +54,8 @@ def _parse_bool(value, default=False):
 
 
 class UserScopedMixin:
-    def _get_user_id(self):
-        ctx = self.get_context()
+    def _get_user_id(self) -> int:
+        ctx = getattr(self, "get_context")()
         user_id = getattr(ctx, "user_id", None) if ctx is not None else None
         if user_id is None:
             raise ra_exc.ValidationErrorException()
@@ -68,7 +69,7 @@ class FolderController(UserScopedMixin, ra_controllers.BaseResourceControllerPag
         convert_underscore=False,
     )
 
-    def _check_system_type(self, change_uuid, user_id):
+    def _check_system_type(self, change_uuid: sys_uuid.UUID, user_id: int) -> None:
         for folder in self.model.objects.get_all(
             filters={
                 "user_id": dm_filters.EQ(user_id),
@@ -78,7 +79,12 @@ class FolderController(UserScopedMixin, ra_controllers.BaseResourceControllerPag
         ):
             raise user_api_exceptions.OnlyOneAllFolderPerUserError()
 
-    def create(self, uuid=None, system_type=None, **kwargs):
+    def create(
+        self,
+        uuid: sys_uuid.UUID | None = None,
+        system_type: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
         user_id = self._get_user_id()
         kwargs["user_id"] = user_id
         if system_type == models.SystemFolderType.ALL:
@@ -86,7 +92,7 @@ class FolderController(UserScopedMixin, ra_controllers.BaseResourceControllerPag
             self._check_system_type(uuid, user_id)
         return super().create(uuid=uuid, system_type=system_type, **kwargs)
 
-    def get(self, uuid):
+    def get(self, uuid: sys_uuid.UUID) -> Any:
         user_id = self._get_user_id()
         return self.model.objects.get_one(
             filters={
@@ -100,7 +106,9 @@ class FolderController(UserScopedMixin, ra_controllers.BaseResourceControllerPag
         parameters=schemas.FOLDER_FILTER_PARAMETERS,
         responses=schemas.FOLDER_FILTER_RESPONSES,
     )
-    def filter(self, filters, **kwargs):
+    def filter(
+        self, filters: dict[str, Any] | None, **kwargs: Any
+    ) -> list[dict[str, Any]]:
         user_id = self._get_user_id()
         filters = (filters or {}).copy()
         filters["user_id"] = dm_filters.EQ(user_id)
@@ -119,11 +127,11 @@ class FolderController(UserScopedMixin, ra_controllers.BaseResourceControllerPag
             result.append(folder_view)
         return result
 
-    def delete(self, uuid):
+    def delete(self, uuid: sys_uuid.UUID) -> None:
         dm = self.get(uuid=uuid)
         dm.delete()
 
-    def update(self, uuid, **kwargs):
+    def update(self, uuid: sys_uuid.UUID, **kwargs: Any) -> Any:
         dm = self.get(uuid=uuid)
         system_type = kwargs.get("system_type", dm.system_type)
         # Check for system type conflict before updating
@@ -145,12 +153,12 @@ class FolderItemController(
     )
     __pr_name__ = "folder"
 
-    def create(self, parent_resource, **kwargs):
+    def create(self, parent_resource: Any, **kwargs: Any) -> Any:
         user_id = self._get_user_id()
         kwargs["user_id"] = user_id
         return super().create(parent_resource=parent_resource, **kwargs)
 
-    def get(self, parent_resource, uuid):
+    def get(self, parent_resource: Any, uuid: sys_uuid.UUID) -> Any:
         user_id = self._get_user_id()
         return self.model.objects.get_one(
             filters={
@@ -160,7 +168,12 @@ class FolderItemController(
             },
         )
 
-    def filter(self, parent_resource, filters, **kwargs):
+    def filter(
+        self,
+        parent_resource: Any,
+        filters: dict[str, Any] | None,
+        **kwargs: Any,
+    ) -> Any:
         user_id = self._get_user_id()
         filters = (filters or {}).copy()
         filters["user_id"] = dm_filters.EQ(user_id)
@@ -170,24 +183,24 @@ class FolderItemController(
             **kwargs,
         )
 
-    def delete(self, parent_resource, uuid):
+    def delete(self, parent_resource: Any, uuid: sys_uuid.UUID) -> None:
         dm = self.get(parent_resource=parent_resource, uuid=uuid)
         dm.delete()
 
-    def update(self, parent_resource, uuid, **kwargs):
+    def update(self, parent_resource: Any, uuid: sys_uuid.UUID, **kwargs: Any) -> Any:
         dm = self.get(parent_resource=parent_resource, uuid=uuid)
         dm.update_dm(values=kwargs)
         dm.update()
         return dm
 
     @ra_actions.post
-    def pin(self, resource, *args, **kwargs):
+    def pin(self, resource: Any, *args: Any, **kwargs: Any) -> Any:
         resource.pinned_at = datetime.datetime.now(datetime.timezone.utc)
         resource.save()
         return resource
 
     @ra_actions.post
-    def unpin(self, resource, *args, **kwargs):
+    def unpin(self, resource: Any, *args: Any, **kwargs: Any) -> Any:
         resource.pinned_at = None
         resource.save()
         return resource
@@ -203,7 +216,7 @@ class FolderItemsController(
         convert_underscore=False,
     )
 
-    def filter(self, filters, **kwargs):
+    def filter(self, filters: dict[str, Any] | None, **kwargs: Any) -> Any:
         user_id = self._get_user_id()
         filters = (filters or {}).copy()
         filters["user_id"] = dm_filters.EQ(user_id)

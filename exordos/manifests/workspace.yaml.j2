@@ -1,0 +1,883 @@
+name: "workspace"
+description: "Workspace backend element"
+schema_version: 1
+version: "{{ version }}"
+api_version: "v1"
+# {% set mail_migration_stage1_enabled = mail_migration_stage1 | default(false) %}
+# {% set mail_migration_compatibility_enabled = mail_migration_compatibility | default(false) %}
+# {% set mail_migration_cutover_enabled = mail_migration_cutover_keep_legacy_disk | default(false) %}
+# {% set migration_mail_image_built = 'workspace_mail_raw_zst' in images %}
+# {% set retain_legacy_mail_resources_enabled = retain_legacy_mail_resources | default(migration_mail_image_built) %}
+# {% set messenger_storage_mode_value = messenger_storage_mode | default('mail_projection' if migration_mail_image_built else 'postgresql_canonical') %}
+# {% set messenger_canonical_cutover_confirmed_value = messenger_canonical_cutover_confirmed | default(not migration_mail_image_built) %}
+# {% set canonical_cutover_runtime_enabled = messenger_storage_mode_value == 'postgresql_canonical' and messenger_canonical_cutover_confirmed_value %}
+# {% set legacy_mail_runtime_enabled = retain_legacy_mail_resources_enabled and not canonical_cutover_runtime_enabled %}
+# {% set smtp_writer_gate_runtime_enabled = legacy_mail_runtime_enabled and not mail_migration_stage1_enabled and not mail_migration_compatibility_enabled %}
+# {% set smtp_writer_gate_guard_enabled = retain_legacy_mail_resources_enabled and not mail_migration_stage1_enabled and not mail_migration_compatibility_enabled %}
+# {% set preserve_legacy_backend_data_disk_enabled = mail_migration_stage1_enabled or mail_migration_compatibility_enabled or ((mail_migration_cutover_enabled or canonical_cutover_runtime_enabled) and retain_legacy_mail_resources_enabled) %}
+# {% if mail_migration_stage1_enabled and not (workspace_backend_image | default('')) %}
+# {{ missing_required_manifest_var.workspace_backend_image }}
+# {% endif %}
+# {% if mail_migration_stage1_enabled and mail_migration_cutover_enabled %}
+# {{ incompatible_manifest_vars.mail_migration_stage1_and_mail_migration_cutover_keep_legacy_disk }}
+# {% endif %}
+# {% if mail_migration_compatibility_enabled and (mail_migration_stage1_enabled or mail_migration_cutover_enabled or canonical_cutover_runtime_enabled) %}
+# {{ incompatible_manifest_vars.mail_migration_compatibility_is_exclusive }}
+# {% endif %}
+# {% if mail_migration_compatibility_enabled and not (workspace_backend_image | default('')) %}
+# {{ missing_required_manifest_var.workspace_backend_image }}
+# {% endif %}
+# {% if mail_migration_compatibility_enabled and not retain_legacy_mail_resources_enabled %}
+# {{ incompatible_manifest_vars.mail_migration_compatibility_requires_legacy_mail_resources }}
+# {% endif %}
+# {% if (messenger_storage_mode_value == 'postgresql_canonical' or messenger_canonical_cutover_confirmed_value) and not canonical_cutover_runtime_enabled %}
+# {{ incompatible_manifest_vars.canonical_cutover_requires_storage_mode_and_confirmation }}
+# {% endif %}
+# {% if mail_migration_stage1_enabled and not retain_legacy_mail_resources_enabled %}
+# {{ incompatible_manifest_vars.mail_migration_stage1_requires_legacy_mail_resources }}
+# {% endif %}
+# {% if mail_migration_cutover_enabled and not retain_legacy_mail_resources_enabled %}
+# {{ incompatible_manifest_vars.mail_migration_cutover_keep_legacy_disk_conflicts_with_final_removal }}
+# {% endif %}
+# {% if not retain_legacy_mail_resources_enabled and not canonical_cutover_runtime_enabled %}
+# {{ incompatible_manifest_vars.removing_legacy_mail_requires_confirmed_canonical_runtime }}
+# {% endif %}
+
+requirements:
+  core:
+    from_version: "0.0.0"
+  dbaas:
+    from_version: "0.0.0"
+  s3aas:
+    from_version: "0.0.0"
+
+imports:
+  pg18:
+    element: "$dbaas"
+    kind: "resource"
+    link: "$dbaas.types.postgres.versions.$pg18"
+  rustfs_1:
+    element: "$s3aas"
+    kind: "resource"
+    link: "$s3aas.types.s3.versions.$rustfs_1"
+  core_local_domain:
+    element: "$core"
+    kind: "resource"
+    link: "$core.dns.domains.$local_domain"
+  var_default_cores:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$default_cores"
+  var_default_ram:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$default_ram"
+  var_core_ip_address:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$core_ip_address"
+  var_hs256_jwks_encryption_key:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$hs256_jwks_encryption_key"
+  var_iam_default_client_id:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.variables.$iam_default_client_id"
+
+resources:
+
+  # Canonical action permissions for realm-level external-provider operations.
+  # The element owns only the permission catalog. Operators grant the required
+  # subset through a project-scoped role binding; deployment never elevates a
+  # Workspace user implicitly.
+  $core.iam.permissions:
+    workspace_external_provider_policy_read:
+      name: "workspace.external_provider_policy.read"
+      description: "Read Workspace external provider policy"
+    workspace_external_provider_policy_update:
+      name: "workspace.external_provider_policy.update"
+      description: "Update Workspace external provider policy"
+    workspace_external_provider_policy_suspend:
+      name: "workspace.external_provider_policy.suspend"
+      description: "Suspend a Workspace external provider"
+    workspace_external_provider_policy_resume:
+      name: "workspace.external_provider_policy.resume"
+      description: "Resume a Workspace external provider"
+    workspace_external_provider_health_read:
+      name: "workspace.external_provider_health.read"
+      description: "Read Workspace external provider health"
+    workspace_external_bridge_instance_read:
+      name: "workspace.external_bridge_instance.read"
+      description: "Read Workspace external bridge instances"
+    workspace_external_bridge_instance_suspend:
+      name: "workspace.external_bridge_instance.suspend"
+      description: "Suspend a Workspace external bridge instance"
+    workspace_external_bridge_instance_resume:
+      name: "workspace.external_bridge_instance.resume"
+      description: "Resume a Workspace external bridge instance"
+    workspace_external_bridge_instance_revoke:
+      name: "workspace.external_bridge_instance.revoke"
+      description: "Revoke a Workspace external bridge instance"
+
+  $core.compute.nodes:
+    workspace_backend:
+      name: workspace-backend
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cores: $workspace.imports.$var_default_cores:value
+      ram: 4096
+# {% if preserve_legacy_backend_data_disk_enabled %}
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 10
+            image: "{{ workspace_backend_image | default(images['workspace_backend'], true) }}"
+            label: root
+          - size: 20
+            label: data
+          - size: 2
+            label: external-bridge-control
+# {% else %}
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 10
+            image: "{{ workspace_backend_image | default(images['workspace_backend'], true) }}"
+            label: root
+          - size: 2
+            label: external-bridge-control
+# {% endif %}
+# {% if retain_legacy_mail_resources_enabled %}
+    workspace_mail:
+      name: workspace-mail
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cores: 1
+      ram: 1024
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 10
+            image: "{{ workspace_mail_image | default(images['workspace_mail_raw_zst'], true) }}"
+            label: root
+          - size: 20
+            label: data
+# {% endif %}
+
+  $core.secret.passwords:
+    workspace_projection_db_password:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_projection_db_password
+      description: "Workspace rebuildable PostgreSQL projection password"
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+# {% if retain_legacy_mail_resources_enabled %}
+    workspace_mail_gate_db_password:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_mail_gate_db_password
+      description: "Workspace SMTP writer-gate attester database password"
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_mail_master_password:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_mail_master_password
+      description: "Workspace Messenger internal mail service password"
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_mail_ca_bootstrap_secret:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_mail_ca_bootstrap_secret
+      description: "Workspace mail public CA bootstrap authentication secret"
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+# {% endif %}
+    workspace_zulip_bridge_enrollment_secret:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_zulip_bridge_enrollment_secret
+      description: "One-time Zulip bridge Provider API enrollment secret"
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_s3_access_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_s3_access_key
+      description: "Workspace messenger files S3 access key"
+      default_length: 20
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_s3_secret_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_s3_secret_key
+      description: "Workspace messenger files S3 secret key"
+      default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+
+  $dbaas.types.postgres.instances:
+    workspace_projection_cluster:
+      name: "workspace-projection-pg-cluster"
+      nodes_number: 1
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cpu: 1
+      ram: 1024
+      disk_size: 15
+      version: $workspace.imports.$pg18:uuid
+
+  $dbaas.types.postgres.instances.$workspace_projection_cluster.users:
+    workspace_projection_user:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace
+      password: $core.secret.passwords.$workspace_projection_db_password:value
+      instance: $dbaas.types.postgres.instances.$workspace_projection_cluster:uuid
+# {% if retain_legacy_mail_resources_enabled %}
+    workspace_mail_gate_user:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_mail_gate
+      password: $core.secret.passwords.$workspace_mail_gate_db_password:value
+      instance: $dbaas.types.postgres.instances.$workspace_projection_cluster:uuid
+# {% endif %}
+
+  $dbaas.types.postgres.instances.$workspace_projection_cluster.databases:
+    workspace_projection_db:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace
+      owner: $dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_projection_user:uuid
+      instance: $dbaas.types.postgres.instances.$workspace_projection_cluster:uuid
+
+  $s3aas.types.s3.instances:
+    workspace_s3:
+      name: "workspace-s3-service"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cpu: $workspace.imports.$var_default_cores:value
+      ram: $workspace.imports.$var_default_ram:value
+      disk_size: 51
+      nodes_number: 1
+      kind: "single_node"
+      version: $workspace.imports.$rustfs_1:uuid
+
+  $s3aas.types.s3.instances.$workspace_s3.buckets:
+    workspace_files_bucket:
+      name: "workspace-files"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+      versioning_enabled: false
+      quota_bytes: 0
+      object_lock_enabled: false
+      public: false
+
+  $s3aas.types.s3.instances.$workspace_s3.policies:
+    workspace_files_policy:
+      name: "workspace-files-policy"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+      content:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+              - "s3:ListBucket"
+            Resource:
+              - f"arn:aws:s3:::{$s3aas.types.s3.instances.$workspace_s3.buckets.$workspace_files_bucket:name}"
+              - f"arn:aws:s3:::{$s3aas.types.s3.instances.$workspace_s3.buckets.$workspace_files_bucket:name}/*"
+
+  $s3aas.types.s3.instances.$workspace_s3.users:
+    workspace_files_user:
+      name: "workspace-files"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+
+  $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user.policies:
+    workspace_files_policy_attachment:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      policy: $s3aas.types.s3.instances.$workspace_s3.policies.$workspace_files_policy:uuid
+      user: $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user:uuid
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+
+  $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user.access_keys:
+    workspace_files_access_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      access_key: $core.secret.passwords.$workspace_s3_access_key:value
+      secret_key: $core.secret.passwords.$workspace_s3_secret_key:value
+      user: $s3aas.types.s3.instances.$workspace_s3.users.$workspace_files_user:uuid
+      instance: $s3aas.types.s3.instances.$workspace_s3:uuid
+
+  $core.config.configs:
+# {% if smtp_writer_gate_runtime_enabled %}
+    workspace_backend_smtp_gate_role_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/smtp-writer-gate-role.conf
+      mode: "0644"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-bootstrap
+      body:
+        kind: text
+        content: |
+          f"
+          [smtp_writer_gate_role]
+          name = {$dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_mail_gate_user:name}
+          "
+# {% endif %}
+    workspace_external_bridge_enrollment_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/external-bridge-enrollment.json
+      mode: "0600"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-restart-services
+      body:
+        kind: text
+        content: |
+          f"{
+            "schema_version": 1,
+            "enrollments": [{
+              "bridge_instance_uuid": "{$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:uuid}",
+              "provider_kind": "zulip",
+              "enrollment_generation": 1,
+              "enrollment_token": "{$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:value}"
+            }]
+          }"
+# {% if retain_legacy_mail_resources_enabled %}
+    workspace_mail_pki_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mail-pki.conf
+      mode: "0640"
+      owner: root
+      group: workspace-pki
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-mail-reload
+      body:
+        kind: text
+        content: |
+          f"
+          [mail_pki]
+          hostname = workspace-mail.{$workspace.imports.$core_local_domain:name}
+          realm_id = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:uuid}
+          bootstrap_secret = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:value}
+          ca_file = /etc/workspace/tls/workspace-mail-ca.crt
+          realm_file = /etc/workspace/tls/workspace-mail-realm.json
+          "
+# {% if not mail_migration_stage1_enabled and not canonical_cutover_runtime_enabled %}
+    workspace_backend_mail_pki_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mail-pki.conf
+      mode: "0600"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-reload-config
+      body:
+        kind: text
+        content: |
+          f"
+          [mail_pki]
+          hostname = workspace-mail.{$workspace.imports.$core_local_domain:name}
+          realm_id = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:uuid}
+          bootstrap_secret = {$core.secret.passwords.$workspace_mail_ca_bootstrap_secret:value}
+          ca_file = /etc/workspace/tls/workspace-mail-ca.crt
+          realm_file = /etc/workspace/tls/workspace-mail-realm.json
+          "
+# {% endif %}
+    workspace_mail_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/mail.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-mail-reload
+      body:
+        kind: text
+        content: |
+          f"
+          [messenger_mail]
+          smtp_host = workspace-mail.{$workspace.imports.$core_local_domain:name}
+          smtp_port = 25
+          smtp_security = starttls
+          smtp_ca_file = /etc/workspace/tls/workspace-mail-ca.crt
+          smtp_username = workspace-service
+          smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+          imap_host = workspace-mail.{$workspace.imports.$core_local_domain:name}
+          imap_port = 1143
+          imap_security = starttls
+          imap_ca_file = /etc/workspace/tls/workspace-mail-ca.crt
+          imap_master_username = workspace-service
+          imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+          technical_domain = messenger.workspace.invalid
+          "
+# {% endif %}
+# {% if mail_migration_compatibility_enabled or mail_migration_stage1_enabled %}
+    workspace_smtp_writer_gate_compatibility_marker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/smtp-writer-gate.compatibility
+      mode: "0644"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-mail-reload
+      body:
+        kind: text
+        content: compatibility-prestart-v1
+# {% elif smtp_writer_gate_guard_enabled %}
+    workspace_smtp_writer_gate_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/smtp-writer-gate.conf
+      mode: "0600"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      body:
+        kind: text
+        content: |
+          f"
+          [smtp_writer_gate]
+          connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_mail_gate_user:name}:{$core.secret.passwords.$workspace_mail_gate_db_password:value}@{$dbaas.types.postgres.instances.$workspace_projection_cluster:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_projection_cluster.databases.$workspace_projection_db:name}
+          poll_interval_seconds = 5
+          drain_timeout_seconds = 120
+          hold_path = /var/lib/workspace/messenger/mail/.writer-gate/smtp-ingress-hold.json
+          "
+    workspace_smtp_writer_gate_enforced_marker_v1:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/smtp-writer-gate.enforced
+      mode: "0644"
+      owner: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-mail-reload
+      body:
+        kind: text
+        content: enforced-prestart-v1
+# {% endif %}
+    workspace_backend_config{{ '_postgresql_canonical_v1' if canonical_cutover_runtime_enabled else ('' if mail_migration_stage1_enabled else '_remote_mail_v1') }}:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace/workspace.conf
+      mode: "0600"
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-reload-config
+      body:
+        kind: text
+        content: |
+          f"
+          [db]
+          connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_projection_user:name}:{$core.secret.passwords.$workspace_projection_db_password:value}@{$dbaas.types.postgres.instances.$workspace_projection_cluster:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_projection_cluster.databases.$workspace_projection_db:name}
+
+
+          [logging]
+          config = logging.yaml
+
+
+          [iam]
+          iam_endpoint = http://core.{$workspace.imports.$core_local_domain:name}/api/core/v1/iam/clients/default
+          audience = {$workspace.imports.$var_iam_default_client_id:value}
+          hs256_jwks_decryption_key = {$workspace.imports.$var_hs256_jwks_encryption_key:value}
+
+
+          [HS256]
+
+
+          [workspace_api]
+          bind_host = 127.0.0.1
+          bind_port = 21084
+          workers = 1
+
+
+          [messenger_api]
+          bind_host = 127.0.0.1
+          bind_port = 21081
+          workers = 1
+
+
+          [messenger_events]
+          bind_host = 127.0.0.1
+          bind_port = 21082
+          workers = 1
+          heartbeat_interval = 25
+          client_timeout = 60
+          catchup_limit = 500
+          send_queue_limit = 32
+          poll_interval = 3
+
+
+          [messenger_storage]
+          mode = {{ messenger_storage_mode_value }}
+          canonical_cutover_confirmed = {{ 'true' if messenger_canonical_cutover_confirmed_value else 'false' }}
+          retain_legacy_mail_resources = {{ 'true' if retain_legacy_mail_resources_enabled else 'false' }}
+
+
+          {% if not canonical_cutover_runtime_enabled %}
+          [messenger_mail]
+          smtp_host = {{ '127.0.0.1' if mail_migration_stage1_enabled else 'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}
+          smtp_port = 25
+          smtp_security = {{ 'plain' if mail_migration_stage1_enabled else 'starttls' }}{{ '' if mail_migration_stage1_enabled else '\n          smtp_ca_file = /etc/workspace/tls/workspace-mail-ca.crt\n          smtp_username = workspace-service\n          smtp_password = {$core.secret.passwords.$workspace_mail_master_password:value}' }}
+          imap_host = {{ '127.0.0.1' if mail_migration_stage1_enabled else 'workspace-mail.{$workspace.imports.$core_local_domain:name}' }}
+          imap_port = 1143
+          imap_security = {{ 'plain' if mail_migration_stage1_enabled else 'starttls' }}{{ '' if mail_migration_stage1_enabled else '\n          imap_ca_file = /etc/workspace/tls/workspace-mail-ca.crt' }}
+          imap_master_username = workspace-service
+          imap_master_password = {$core.secret.passwords.$workspace_mail_master_password:value}
+          technical_domain = messenger.workspace.invalid
+          state_mailbox = Workspace/State
+          event_mailbox_prefix = Workspace/Events
+          external_bridge_outbox_target = zulip-bridge-producer@bridge.workspace.invalid
+          external_bridge_outbox_prefix = Workspace/Bridge/Zulip/V1/Accounts
+          external_bridge_ingress_target = zulip-bridge-ingress@messenger.workspace.invalid
+
+
+          {% endif %}
+          [messenger_files]
+          default_type = s3
+          storage_path = /var/lib/workspace/messenger/files
+
+
+          [messenger_files_s3]
+          endpoint_url = http://{$s3aas.types.s3.instances.$workspace_s3:join(ipsv4)}:9000
+          bucket_name = {$s3aas.types.s3.instances.$workspace_s3.buckets.$workspace_files_bucket:name}
+          access_key_id = {$core.secret.passwords.$workspace_s3_access_key:value}
+          secret_access_key = {$core.secret.passwords.$workspace_s3_secret_key:value}
+          region_name = us-east-1
+
+
+          [external_bridge]
+          realm_uuid = {$workspace.imports.$core_local_domain:uuid}
+          bridge_instance_uuid = {$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:uuid}
+          identity_generation = 1
+          enrollment_secret = {$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:value}
+
+
+          [external_bridge_control]
+          bind_host = 0.0.0.0
+          bootstrap_port = 21085
+          https_port = 21443
+          realm_uuid = {$workspace.imports.$core_local_domain:uuid}
+          hostname = workspace-bridge-control.{$workspace.imports.$core_local_domain:name}
+          persistent_store_path = /var/lib/workspace/external-bridge-control
+          require_dedicated_filesystem = true
+          enrollment_config_path = /etc/workspace/external-bridge-enrollment.json
+          "
+    workspace_backend_nginx:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/nginx/sites-available/workspace.conf
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-nginx-reload
+      body:
+        kind: text
+        content: |
+          upstream workspace_core_api {
+              include /etc/nginx/workspace.d/core-upstream.conf;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+              client_max_body_size 50m;
+
+              location /api/core/ {
+                  proxy_pass http://workspace_core_api/api/core/;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+
+              location = /api/workspace/v1/events/ws {
+                  proxy_pass http://127.0.0.1:21082/v1/events/ws;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+              }
+
+              location /api/workspace/v1/messenger/ {
+                  proxy_pass http://127.0.0.1:21081/v1/;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+
+              location /api/workspace/ {
+                  proxy_pass http://127.0.0.1:21084/;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+
+              location = /logo-512x512.png {
+                  alias /opt/workspace-ui/packages/web/dist/pwa-512x512.png;
+              }
+
+              location / {
+                  root /opt/workspace-ui/packages/web/dist;
+                  try_files $uri $uri/ /index.html;
+              }
+          }
+
+    workspace_backend_nginx_core_upstream:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/nginx/workspace.d/core-upstream.conf
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-nginx-reload
+      body:
+        kind: text
+        content: |
+          f"server {$workspace.imports.$var_core_ip_address:value}:80;"
+
+# {% if retain_legacy_mail_resources_enabled %}
+  $workspace.imports.$core_local_domain.records:
+    workspace_mail:
+      domain: $workspace.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-mail
+        address: $core.compute.nodes.$workspace_mail:default_network:ipv4
+# {% endif %}
+
+  $core.em.services:
+# {% if legacy_mail_runtime_enabled %}
+    workspace_mail_bootstrap:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-mail-bootstrap
+      path: /usr/local/bin/workspace-mail-bootstrap
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      service_type:
+        kind: oneshot
+      target_status: enabled
+    workspace_mail_ca:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-mail-ca
+      path: /usr/local/bin/workspace-mail-ca-server
+      user: workspace-pki
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+# {% if smtp_writer_gate_runtime_enabled %}
+    workspace_smtp_ingress_attester:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-smtp-ingress-attester
+      path: /usr/local/bin/workspace-smtp-ingress-attester run
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_mail:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-mail-bootstrap
+# {% endif %}
+# {% endif %}
+    workspace_bootstrap:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-bootstrap
+      path: /usr/local/bin/workspace-bootstrap
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: oneshot
+      target_status: enabled
+    workspace_nginx:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-nginx
+      path: '/usr/sbin/nginx -g "daemon off;"'
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-nginx-reload --check-only
+    workspace_api{{ '_postgresql_canonical_v1' if canonical_cutover_runtime_enabled else ('' if mail_migration_stage1_enabled else '_remote_mail_v1') }}:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-api
+      path: "{{ '' if (mail_migration_stage1_enabled or canonical_cutover_runtime_enabled) else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-api --config-file /etc/workspace/workspace.conf"
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+# {% if mail_migration_stage1_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+# {% elif canonical_cutover_runtime_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+# {% endif %}
+    workspace_messenger_api{{ '_postgresql_canonical_v1' if canonical_cutover_runtime_enabled else ('' if mail_migration_stage1_enabled else '_remote_mail_v1') }}:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-messenger-api
+      path: "{{ '' if (mail_migration_stage1_enabled or canonical_cutover_runtime_enabled) else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-messenger-api --config-file /etc/workspace/workspace.conf"
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+# {% if mail_migration_stage1_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+# {% elif canonical_cutover_runtime_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+# {% endif %}
+    workspace_messenger_worker{{ '_postgresql_canonical_v1' if canonical_cutover_runtime_enabled else ('' if mail_migration_stage1_enabled else '_remote_mail_v1') }}:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-messenger-worker
+      path: "{{ '' if (mail_migration_stage1_enabled or canonical_cutover_runtime_enabled) else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf"
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+# {% if mail_migration_stage1_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+# {% elif canonical_cutover_runtime_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+# {% endif %}
+    workspace_external_bridge_control:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-external-bridge-control
+      path: /usr/bin/workspace-external-bridge-api --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+# {% if canonical_cutover_runtime_enabled %}
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+# {% else %}
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+# {% endif %}
+        - kind: shell
+          command: /usr/local/bin/workspace-external-bridge-control-prepare /var/lib/workspace/external-bridge-control root:root 2
+    workspace_messenger_events{{ '_postgresql_canonical_v1' if canonical_cutover_runtime_enabled else ('' if mail_migration_stage1_enabled else '_remote_mail_v1') }}:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-messenger-events
+      path: "{{ '' if (mail_migration_stage1_enabled or canonical_cutover_runtime_enabled) else '/usr/local/bin/workspace-wait-ready ' }}/usr/bin/workspace-messenger-events --config-file /etc/workspace/workspace.conf"
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+# {% if mail_migration_stage1_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-wait-ready
+# {% elif canonical_cutover_runtime_enabled %}
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+# {% endif %}
+
+exports:
+  backend_node:
+    link: "$core.compute.nodes.$workspace_backend"
+    kind: "resource"
+# {% if retain_legacy_mail_resources_enabled %}
+  mail_node:
+    link: "$core.compute.nodes.$workspace_mail"
+    kind: "resource"
+  mail_ca_bootstrap_secret:
+    link: "$core.secret.passwords.$workspace_mail_ca_bootstrap_secret"
+    kind: "resource"
+# {% endif %}
+  zulip_bridge_enrollment_secret:
+    link: "$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret"
+    kind: "resource"
+  projection_db_instance:
+    link: "$dbaas.types.postgres.instances.$workspace_projection_cluster"
+    kind: "resource"

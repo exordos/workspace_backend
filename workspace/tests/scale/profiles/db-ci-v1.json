@@ -1,0 +1,48 @@
+{
+  "schema_version": "workspace.messenger.scale-profile/v1",
+  "profile_id": "db-ci-v1",
+  "seed": 2026071801,
+  "dimensions": {
+    "users": 30,
+    "streams": {
+      "channel": 6,
+      "group_dm": 3,
+      "direct_dm": 3
+    },
+    "topics": 48,
+    "messages": 10000,
+    "provider_messages": 2000,
+    "reactions": 1000,
+    "files": 100,
+    "visible_event_deliveries": 600000,
+    "live_users": 30,
+    "zulip_accounts": 30,
+    "provider_synced_streams": 9
+  },
+  "membership": {
+    "channel": 24,
+    "group_dm": 8,
+    "direct_dm": 2
+  },
+  "message_mix": {
+    "channel": 7614,
+    "group_dm": 2082,
+    "direct_dm": 304
+  },
+  "distribution": {
+    "kind": "zipf",
+    "exponent": 1.15
+  },
+  "provider_workload": {
+    "steady_messages_per_minute": {
+      "minimum": 100,
+      "target": 150,
+      "maximum": 200
+    },
+    "steady_minutes": 30,
+    "burst_messages_per_minute": 400,
+    "burst_minutes": 5,
+    "inbound_ratio": 0.6,
+    "burst_reconnect_ratio": 0.2
+  }
+}

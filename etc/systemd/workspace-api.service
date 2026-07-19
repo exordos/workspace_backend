@@ -1,0 +1,13 @@
+[Unit]
+Description=Workspace API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=workspace
+ExecStart=workspace-api --config-file /etc/workspace/workspace.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

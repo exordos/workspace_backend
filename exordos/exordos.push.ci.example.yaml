@@ -1,0 +1,7 @@
+push:
+  local:
+    driver: fs
+    path: /var/lib/exordos-pools/http
+  remote:
+    driver: nginx
+    url: https://repo.example.com/exordos-elements

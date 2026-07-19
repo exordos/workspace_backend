@@ -61,7 +61,6 @@ class TestFolderControllerFilter(unittest.TestCase):
             return_value=self.user_id,
         )
 
-
     @mock.patch(f"{MODELS_PATH}.FolderItem.objects")
     @mock.patch(f"{MODELS_PATH}.Folder.objects")
     def test_returns_folders_with_items(self, mock_folder_objects, mock_item_objects):
@@ -142,7 +141,6 @@ class TestFolderControllerFilter(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["items"], [])
-
 
     @mock.patch(f"{MODELS_PATH}.FolderItem.objects")
     @mock.patch(f"{MODELS_PATH}.Folder.objects")

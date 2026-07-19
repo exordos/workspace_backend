@@ -33,7 +33,7 @@ _CONFIG_NOT_FOUND_MESSAGE = (
 )
 
 
-def parse(args):
+def parse(args: list[str]) -> list[str]:
     cfg.CONF(
         args=args,
         project=GLOBAL_SERVICE_NAME,

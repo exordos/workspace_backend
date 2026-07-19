@@ -11,7 +11,7 @@ __pycache__/
 
 # IDE
 .idea/
-.vscode
+.vscode/
 
 # Distribution / packaging
 .Python
@@ -77,6 +77,9 @@ coverage.xml
 *.log
 local_settings.py
 db.sqlite3
+
+# Database backups
+workspace_db_backups/
 
 # Flask stuff:
 instance/

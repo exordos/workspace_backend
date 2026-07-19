@@ -1,0 +1,952 @@
+---
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Workspace External Bridge File API
+  version: 1.0.0
+  description: |
+    Private binary-transfer authorization API shared by the Workspace backend
+    and provider bridges. The API is served only by the platform-internal
+    `workspace-external-bridge-api` listener and is never proxied by the public
+    Workspace nginx listener.
+
+    HTTPS request framing is strict: every request, including a bodyless GET,
+    carries exactly one canonical non-negative decimal `Content-Length` (zero
+    for a bodyless request). `Transfer-Encoding`, duplicate or comma-joined
+    lengths, signed values, and leading-zero values are rejected. The listener
+    requires a TLS client certificate before it reads a file request body, then
+    repeats bridge identity and generation authorization in the application.
+
+    The API never carries file bytes. It authorizes one immutable object at a
+    time and returns a five-minute HTTPS presigned request for object storage.
+    Message operations and events remain on the private Provider API, and
+    messages contain only the returned `urn:file:*`, `urn:image:*`, or
+    `urn:video:*` value.
+
+    Every request is authorized from the current realm state. A valid client
+    certificate is necessary but not sufficient: the backend also verifies the
+    certificate generation and state, provider kind, negotiated
+    `messenger.file.transfer` capability, external account, chat assignment,
+    operation, and current file ACL. The bridge has no S3 credentials and no
+    API operation can list, delete, tag, copy, or choose an object-storage key.
+
+    JSON request bodies are limited to 16 KiB. A file is limited to 50 MiB
+    (52,428,800 bytes). The effective per-file limit is the fail-closed minimum
+    of that hard limit, realm policy `max_file_bytes`, and the negotiated
+    `messenger.file.transfer` capability's `max_file_bytes`; capability revision
+    1 or newer and that numeric limit are required. Presigned URLs and their
+    query strings are secrets and must not be persisted or written to logs,
+    metrics, traces, or error reports.
+servers:
+  - url: https://bridge-control.example.invalid
+    description: |
+      Symbolic private-listener address. Deployments replace the hostname with
+      their platform-internal DNS name. No public route is permitted.
+security:
+  - bridgeMutualTLS: []
+tags:
+  - name: Incoming files
+    description: Copy provider bytes into Workspace object storage.
+  - name: Outgoing files
+    description: Copy authorized Workspace bytes into provider storage.
+
+paths:
+  /v1/file-transfers/incoming/{file_uuid}:
+    put:
+      tags: [Incoming files]
+      operationId: AllocateIncomingFile
+      summary: Allocate or resume one incoming Workspace file
+      description: |
+        Creates the logical Workspace file identified by the client-generated
+        `file_uuid`, or returns its existing idempotent state. The immutable
+        idempotency tuple is `file_uuid` plus every request-body field.
+
+        Before returning an upload target, the backend verifies that the mTLS
+        identity is currently active, its provider kind matches the external
+        account, the account is assigned to this bridge instance, the chat is
+        selected and has a current Workspace stream assignment, and the
+        operation is authorized to import this file.
+
+        A first allocation returns 201. An exact replay returns 200. While the
+        current URL is unexpired, a replay returns the same allocation
+        generation and signed target. After expiry, an exact replay removes the
+        old pending object and issues a new generation-specific pending object
+        and URL. A finalized file returns its existing final snapshot and never
+        returns another PUT target. Reusing `file_uuid` with a different
+        immutable field returns 409 `idempotency_conflict`.
+
+        The PUT target is a generation-specific pending object, never the final
+        immutable Workspace object. Reusing an old URL therefore cannot mutate
+        finalized bytes. No sidecar or public file projection exists before
+        finalize succeeds.
+      parameters:
+        - $ref: '#/components/parameters/FileUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncomingAllocationRequest'
+      responses:
+        '200':
+          description: >-
+            Existing allocation, renewed pending generation, or finalized
+            file.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomingFileState'
+        '201':
+          description: New incoming allocation.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncomingFileState'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/InvalidBridgeIdentity'
+        '403':
+          $ref: '#/components/responses/AuthorizationDenied'
+        '404':
+          $ref: '#/components/responses/ResourceNotFound'
+        '409':
+          $ref: '#/components/responses/StateConflict'
+        '413':
+          $ref: '#/components/responses/FileTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedContentType'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+
+  /v1/file-transfers/incoming/{file_uuid}/actions/finalize:
+    post:
+      tags: [Incoming files]
+      operationId: FinalizeIncomingFile
+      summary: Verify and publish one incoming Workspace file
+      description: |
+        Finalizes only the current allocation generation. The request repeats
+        the operation UUID, size, media type, and SHA-256 so an accidental or
+        stale finalize cannot publish a different descriptor.
+
+        The backend recomputes bridge/account/chat/operation authorization and
+        the current project and stream assignment. It then compares the actual
+        object size and content type and independently verifies SHA-256. It must
+        not treat an S3 ETag as SHA-256. When the object store does not expose a
+        trusted SHA-256 value, the backend reads the pending object through its
+        own storage client and hashes it before commit; bytes still never pass
+        through this HTTP API.
+
+        On a mismatch, finalize fails closed with 422
+        `file_integrity_mismatch`, invalidates the allocation generation, and
+        removes the rejected pending object. A later exact allocation request
+        may create a fresh generation. An exact replay after successful
+        finalize returns the same 200 response and URN.
+
+        Successful finalize is a recoverable state machine, because object
+        storage and the canonical PostgreSQL transaction cannot commit
+        atomically. The backend does not return `finalized` or expose the URN
+        until the immutable final object, backend-owned sidecar, canonical file
+        record, and rebuildable projection are all committed. Crash recovery
+        completes or rolls back an incomplete state without exposing a partial
+        file.
+
+        The backend alone creates the sidecar. For this flow it uses sidecar
+        schema version 2 with `owner_uuid` set to the external account's current
+        IAM owner, never the bridge identity; `project_id` and `stream_uuid`
+        come from the current chat projection; `acl.mode` is
+        `stream_members`; and an internal `origin` record binds provider kind,
+        external account UUID, external chat UUID, and operation UUID. The
+        bridge cannot provide or modify any of those ownership or ACL fields.
+        Existing schema-version-1 sidecars remain valid and readable without
+        rewrite; schema version 2 is used only for newly finalized provider
+        imports and adds the canonical external-origin record.
+      parameters:
+        - $ref: '#/components/parameters/FileUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncomingFinalizeRequest'
+      responses:
+        '200':
+          description: File finalized, or exact replay of an earlier finalize.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FinalizedIncomingFile'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/InvalidBridgeIdentity'
+        '403':
+          $ref: '#/components/responses/AuthorizationDenied'
+        '404':
+          $ref: '#/components/responses/ResourceNotFound'
+        '409':
+          $ref: '#/components/responses/StateConflict'
+        '410':
+          $ref: '#/components/responses/AllocationExpired'
+        '422':
+          $ref: '#/components/responses/IntegrityMismatch'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+
+  /v1/file-transfers/outgoing/{transfer_uuid}:
+    put:
+      tags: [Outgoing files]
+      operationId: AuthorizeOutgoingFile
+      summary: Authorize one Workspace URN for provider export
+      description: |
+        Returns a five-minute GET target for one immutable Workspace object.
+        The client-generated `transfer_uuid` identifies one logical
+        operation/file export. Every request-body field is immutable for that
+        UUID; a changed replay returns 409 `idempotency_conflict`.
+
+        On every URL issuance or renewal the backend recomputes authorization;
+        an earlier grant is never cached as proof of current access. It verifies
+        the current bridge identity and capability, external account owner,
+        selected chat and project/stream assignment, operation state, and that
+        this URN belongs to the operation's authorized attachment manifest. It
+        then reads the current sidecar. A `stream_members` file must still be
+        accessible to the account owner through current canonical PostgreSQL
+        stream membership. A `public` file is allowed only when it is
+        in the authorized operation manifest; public never means anonymous.
+
+        Only Workspace `urn:file`, `urn:image`, and `urn:video` values are
+        accepted. URL, Gravatar, and arbitrary schemes are rejected. Query
+        metadata is not trusted for authorization. The stored UUID, media type,
+        size, SHA-256, URN kind, and sidecar determine the response.
+
+        An exact replay while the target is unexpired returns the same
+        authorization generation and target. An exact replay after expiry
+        reauthorizes current state and issues a new generation and target.
+        Because the final object is immutable, an unexpired GET may be repeated
+        only for that same object; it cannot authorize another key or method.
+      parameters:
+        - $ref: '#/components/parameters/TransferUuid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OutgoingAuthorizationRequest'
+      responses:
+        '200':
+          description: >-
+            Current authorization for the requested immutable Workspace
+            object.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutgoingFileAuthorization'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/InvalidBridgeIdentity'
+        '403':
+          $ref: '#/components/responses/AuthorizationDenied'
+        '404':
+          $ref: '#/components/responses/ResourceNotFound'
+        '409':
+          $ref: '#/components/responses/StateConflict'
+        '422':
+          $ref: '#/components/responses/InvalidUrn'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+
+components:
+  securitySchemes:
+    bridgeMutualTLS:
+      type: mutualTLS
+      description: |
+        TLS terminates in the private backend process; client-certificate
+        identity is never accepted from an HTTP forwarding header. TLS 1.2 or
+        newer is required. The bridge validates the backend server certificate
+        against the realm control CA and its configured internal DNS name;
+        disabling hostname or chain verification is forbidden.
+
+        The client leaf must chain to the same realm control CA, contain EKU
+        `clientAuth`, and contain exactly one URI SAN with this encoding:
+
+        `https://schemas.genesis-corporation.ru/workspace/external-bridge/v1/realms/{realm_uuid}/providers/{provider_kind}/instances/{bridge_instance_uuid}/generations/{identity_generation}`
+
+        This is the same authorization claim defined by the private control
+        API, not a network endpoint. UUIDs are canonical lower-case UUID
+        strings, `provider_kind` is the lower-case registered account kind, and
+        `identity_generation` is a positive base-10 integer without leading
+        zeroes. Subject CN and DNS SAN are not identity inputs. On every HTTP
+        request, including a reused TLS connection, the backend checks the
+        realm, instance, provider kind, active identity generation,
+        non-suspended/non-revoked state, account assignment, and negotiated
+        `messenger.file.transfer` capability revision 1 or newer with a
+        fail-closed `max_file_bytes` limit.
+
+        A certificate rejected during the TLS handshake produces no HTTP
+        response. HTTP 401 is reserved for a certificate that completed TLS but
+        no longer maps to an accepted application identity.
+
+  parameters:
+    FileUuid:
+      name: file_uuid
+      in: path
+      required: true
+      description: Client-generated stable UUID of the logical Workspace file.
+      schema:
+        type: string
+        format: uuid
+    TransferUuid:
+      name: transfer_uuid
+      in: path
+      required: true
+      description: >-
+        Client-generated stable UUID of one outgoing operation/file transfer.
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    NoStore:
+      description: >-
+        Presigned URLs and authorization responses must never be cached.
+      schema:
+        type: string
+        const: no-store
+    RetryAfter:
+      description: >-
+        Retry delay in whole seconds, capped by clients at 300 seconds.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 300
+
+  schemas:
+    IncomingAllocationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_uuid
+        - external_account_uuid
+        - external_chat_uuid
+        - name
+        - size_bytes
+        - content_type
+        - sha256
+      properties:
+        operation_uuid:
+          $ref: '#/components/schemas/Uuid'
+        external_account_uuid:
+          $ref: '#/components/schemas/Uuid'
+        external_chat_uuid:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          $ref: '#/components/schemas/FileName'
+        size_bytes:
+          $ref: '#/components/schemas/FileSize'
+        content_type:
+          $ref: '#/components/schemas/ContentType'
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+
+    IncomingFinalizeRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_uuid
+        - allocation_generation
+        - size_bytes
+        - content_type
+        - sha256
+      properties:
+        operation_uuid:
+          $ref: '#/components/schemas/Uuid'
+        allocation_generation:
+          type: integer
+          minimum: 1
+        size_bytes:
+          $ref: '#/components/schemas/FileSize'
+        content_type:
+          $ref: '#/components/schemas/ContentType'
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+
+    OutgoingAuthorizationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_uuid
+        - external_account_uuid
+        - external_chat_uuid
+        - file_urn
+      properties:
+        operation_uuid:
+          $ref: '#/components/schemas/Uuid'
+        external_account_uuid:
+          $ref: '#/components/schemas/Uuid'
+        external_chat_uuid:
+          $ref: '#/components/schemas/Uuid'
+        file_urn:
+          $ref: '#/components/schemas/WorkspaceFileUrn'
+
+    IncomingFileState:
+      oneOf:
+        - $ref: '#/components/schemas/PendingIncomingFile'
+        - $ref: '#/components/schemas/FinalizedIncomingFile'
+      discriminator:
+        propertyName: status
+        mapping:
+          pending: '#/components/schemas/PendingIncomingFile'
+          finalized: '#/components/schemas/FinalizedIncomingFile'
+
+    PendingIncomingFile:
+      type: object
+      additionalProperties: false
+      required:
+        - file_uuid
+        - operation_uuid
+        - status
+        - allocation_generation
+        - upload
+      properties:
+        file_uuid:
+          $ref: '#/components/schemas/Uuid'
+        operation_uuid:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          const: pending
+        allocation_generation:
+          type: integer
+          minimum: 1
+        upload:
+          $ref: '#/components/schemas/PresignedPut'
+
+    FinalizedIncomingFile:
+      type: object
+      additionalProperties: false
+      required:
+        - file_uuid
+        - operation_uuid
+        - status
+        - allocation_generation
+        - file_urn
+        - name
+        - size_bytes
+        - content_type
+        - sha256
+        - created_at
+      properties:
+        file_uuid:
+          $ref: '#/components/schemas/Uuid'
+        operation_uuid:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          const: finalized
+        allocation_generation:
+          type: integer
+          minimum: 1
+        file_urn:
+          $ref: '#/components/schemas/WorkspaceFileUrn'
+        name:
+          $ref: '#/components/schemas/FileName'
+        size_bytes:
+          $ref: '#/components/schemas/FileSize'
+        content_type:
+          $ref: '#/components/schemas/ContentType'
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        created_at:
+          type: string
+          format: date-time
+
+    OutgoingFileAuthorization:
+      type: object
+      additionalProperties: false
+      required:
+        - transfer_uuid
+        - operation_uuid
+        - status
+        - authorization_generation
+        - file_uuid
+        - file_urn
+        - name
+        - size_bytes
+        - content_type
+        - sha256
+        - download
+      properties:
+        transfer_uuid:
+          $ref: '#/components/schemas/Uuid'
+        operation_uuid:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          const: ready
+        authorization_generation:
+          type: integer
+          minimum: 1
+        file_uuid:
+          $ref: '#/components/schemas/Uuid'
+        file_urn:
+          $ref: '#/components/schemas/WorkspaceFileUrn'
+        name:
+          $ref: '#/components/schemas/FileName'
+        size_bytes:
+          $ref: '#/components/schemas/FileSize'
+        content_type:
+          $ref: '#/components/schemas/ContentType'
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        download:
+          $ref: '#/components/schemas/PresignedGet'
+
+    PresignedPut:
+      type: object
+      additionalProperties: false
+      required:
+        - method
+        - url
+        - headers
+        - expires_at
+        - expires_in_seconds
+      properties:
+        method:
+          type: string
+          const: PUT
+        url:
+          $ref: '#/components/schemas/PresignedHttpsUrl'
+        headers:
+          type: object
+          additionalProperties: false
+          required:
+            - Content-Type
+            - Content-Length
+            - x-amz-checksum-sha256
+          properties:
+            Content-Type:
+              $ref: '#/components/schemas/ContentType'
+            Content-Length:
+              type: string
+              pattern: '^(0|[1-9][0-9]{0,7})$'
+            x-amz-checksum-sha256:
+              type: string
+              pattern: '^[A-Za-z0-9+/]{43}=$'
+              description: >-
+                Base64 encoding of the declared 32-byte SHA-256 digest.
+        expires_at:
+          type: string
+          format: date-time
+        expires_in_seconds:
+          type: integer
+          const: 300
+
+    PresignedGet:
+      type: object
+      additionalProperties: false
+      required:
+        - method
+        - url
+        - headers
+        - expires_at
+        - expires_in_seconds
+      properties:
+        method:
+          type: string
+          const: GET
+        url:
+          $ref: '#/components/schemas/PresignedHttpsUrl'
+        headers:
+          type: object
+          additionalProperties: false
+          maxProperties: 0
+          description: |
+            No caller-configured signed headers are required in v1. Ordinary
+            HTTP transport headers such as Host and User-Agent are unaffected.
+            The bridge must not add Range or conditional download headers.
+        expires_at:
+          type: string
+          format: date-time
+        expires_in_seconds:
+          type: integer
+          const: 300
+
+    Uuid:
+      type: string
+      format: uuid
+
+    FileName:
+      type: string
+      minLength: 1
+      maxLength: 255
+      description: |
+        NFC-normalized display name, at most 255 UTF-8 bytes. NUL, control
+        characters, `/`, and `\\` are forbidden. The value never becomes an
+        object-storage key.
+
+    FileSize:
+      type: integer
+      minimum: 0
+      maximum: 52428800
+      description: |
+        Declared byte length. The effective maximum can be lower after realm
+        policy and negotiated bridge-capability limits are intersected.
+
+    ContentType:
+      type: string
+      minLength: 3
+      maxLength: 255
+      pattern: '^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$'
+      description: Canonical lower-case media type without parameters.
+
+    Sha256Hex:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: Lower-case hexadecimal SHA-256 digest of the exact bytes.
+
+    WorkspaceFileUrn:
+      type: string
+      minLength: 46
+      maxLength: 2048
+      # yamllint disable-line rule:line-length
+      pattern: '^urn:(file|image|video):[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}(\\?.*)?$'
+      description: |
+        Workspace file/media URN. Query parameters are display metadata only
+        and are ignored for identity and authorization. The URN kind must match
+        the stored content type: image/* uses image, video/* uses video, and all
+        other media types use file.
+
+    PresignedHttpsUrl:
+      type: string
+      format: uri
+      maxLength: 8192
+      pattern: '^https://'
+      description: Five-minute, method-bound, single-object presigned URL.
+
+    FileApiError:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - code
+        - error
+        - message
+        - retryable
+      properties:
+        type:
+          type: string
+          const: BridgeFileApiError
+        code:
+          type: integer
+          minimum: 400
+          maximum: 599
+        error:
+          type: string
+          enum:
+            - invalid_request
+            - bridge_identity_invalid
+            - bridge_identity_suspended
+            - bridge_identity_revoked
+            - provider_kind_mismatch
+            - capability_not_negotiated
+            - account_not_assigned
+            - operation_not_authorized
+            - file_access_denied
+            - resource_not_found
+            - idempotency_conflict
+            - file_uuid_conflict
+            - operation_state_conflict
+            - assignment_changed
+            - allocation_generation_mismatch
+            - allocation_not_pending
+            - upload_missing
+            - allocation_expired
+            - file_too_large
+            - unsupported_content_type
+            - file_integrity_mismatch
+            - invalid_workspace_urn
+            - urn_kind_mismatch
+            - rate_limited
+            - storage_unavailable
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: >-
+            Safe bounded text without credentials, URLs, object keys, or
+            content.
+        retryable:
+          type: boolean
+
+    ExternalProviderFileSidecar:
+      type: object
+      additionalProperties: false
+      description: |
+        Backend-owned sidecar schema for a finalized incoming provider copy.
+        It is an internal persistence/recovery contract and is never returned
+        to or accepted from the bridge. `acl.stream_uuid` must equal the
+        top-level `stream_uuid`.
+      required:
+        - schema_version
+        - uuid
+        - project_id
+        - stream_uuid
+        - owner_uuid
+        - name
+        - description
+        - content_type
+        - size_bytes
+        - sha256
+        - created_at
+        - acl
+        - origin
+      properties:
+        schema_version:
+          type: integer
+          const: 2
+        uuid:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        stream_uuid:
+          $ref: '#/components/schemas/Uuid'
+        owner_uuid:
+          allOf:
+            - $ref: '#/components/schemas/Uuid'
+          description: Current IAM owner of the external account.
+        name:
+          $ref: '#/components/schemas/FileName'
+        description:
+          type: string
+          maxLength: 4096
+        content_type:
+          $ref: '#/components/schemas/ContentType'
+        size_bytes:
+          $ref: '#/components/schemas/FileSize'
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        created_at:
+          type: string
+          format: date-time
+        acl:
+          type: object
+          additionalProperties: false
+          required: [mode, stream_uuid]
+          properties:
+            mode:
+              type: string
+              const: stream_members
+            stream_uuid:
+              $ref: '#/components/schemas/Uuid'
+        origin:
+          type: object
+          additionalProperties: false
+          required:
+            - kind
+            - provider_kind
+            - external_account_uuid
+            - external_chat_uuid
+            - operation_uuid
+          properties:
+            kind:
+              type: string
+              const: external_provider
+            provider_kind:
+              type: string
+              minLength: 1
+              maxLength: 64
+              pattern: '^[a-z][a-z0-9_]*$'
+            external_account_uuid:
+              $ref: '#/components/schemas/Uuid'
+            external_chat_uuid:
+              $ref: '#/components/schemas/Uuid'
+            operation_uuid:
+              $ref: '#/components/schemas/Uuid'
+
+  responses:
+    InvalidRequest:
+      description: Invalid JSON envelope or field (`invalid_request`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    InvalidBridgeIdentity:
+      description: >-
+        Application identity is no longer valid (`bridge_identity_invalid`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    AuthorizationDenied:
+      description: |
+        Fail-closed authorization denial. Stable errors are
+        `bridge_identity_suspended`, `bridge_identity_revoked`,
+        `provider_kind_mismatch`, `capability_not_negotiated`,
+        `account_not_assigned`, `operation_not_authorized`, or
+        `file_access_denied`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    ResourceNotFound:
+      description: |
+        Referenced account, chat, operation, allocation, or file is absent.
+        Returns only `resource_not_found` to avoid cross-account enumeration.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    StateConflict:
+      description: |
+        Current state cannot accept the request. Stable errors are
+        `idempotency_conflict`, `file_uuid_conflict`,
+        `operation_state_conflict`, `assignment_changed`,
+        `allocation_generation_mismatch`, `allocation_not_pending`, or
+        `upload_missing`.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    AllocationExpired:
+      description: >-
+        Finalize referenced an expired generation (`allocation_expired`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    FileTooLarge:
+      description: Declared file size exceeds 50 MiB (`file_too_large`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    UnsupportedContentType:
+      description: >-
+        Media type is invalid or denied by realm policy
+        (`unsupported_content_type`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    IntegrityMismatch:
+      description: |
+        Actual object size, content type, or SHA-256 differs from the declared
+        immutable descriptor (`file_integrity_mismatch`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    InvalidUrn:
+      description: >-
+        Invalid Workspace file URN or kind (`invalid_workspace_urn` or
+        `urn_kind_mismatch`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    RateLimited:
+      description: Per-bridge or realm transfer limit exceeded (`rate_limited`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+    StorageUnavailable:
+      description: >-
+        Object storage or finalize recovery state is temporarily unavailable
+        (`storage_unavailable`).
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/FileApiError'
+
+x-workspace-file-lifecycle:
+  pending-allocation-expiry-seconds: 300
+  cleanup-worker-interval-seconds: 60
+  expired-pending-object-removal-deadline-seconds: 600
+  outgoing-idempotency-retention-seconds: 86400
+  rules:
+    - |
+      Pending objects have no sidecar, no canonical file record, and no public
+      URN. Cleanup deletes every generation-specific pending object no later
+      than ten minutes after its URL expiry. An immutable descriptor tombstone
+      is retained for the operation lifetime plus 24 hours to detect conflicting
+      reuse of a client UUID.
+    - |
+      Incoming finalized files are provider-owned copies. Deselecting a chat,
+      losing provider access, deleting or deactivating the account, discarding
+      the source operation before commit, or removing the projection revokes
+      authorization synchronously and journals the canonical file deletion.
+      Object and sidecar deletion is retryable and must begin immediately;
+      physical object-store lag never restores access or permits a new URL.
+    - |
+      Finalized sidecars are backend-owned schema-version-2 records. Their
+      `origin.kind` is `external_provider`; origin account/chat/operation fields
+      support recovery and purge. They never contain a participant snapshot,
+      provider credential, presigned URL, object-store credential, or raw
+      provider payload. Current access is always recomputed from the canonical
+      chat/stream assignment and current stream membership.
+    - |
+      The final object key is derived only by the backend from `file_uuid` and
+      is immutable. The presigned PUT targets a distinct generation-specific
+      pending key. The presigned GET targets exactly the final object. Neither
+      URL authorizes bucket listing, multipart upload, delete, copy, tagging,
+      ACL mutation, sidecar access, or another HTTP method.

@@ -15,12 +15,14 @@
 #    under the License.
 
 import enum
+import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 from restalchemy.dm import models
 from restalchemy.dm import properties
 from restalchemy.dm import relationships
 from restalchemy.dm import types
+from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
 
@@ -106,11 +108,11 @@ class FolderItem(
     )
 
     @property
-    def folder_uuid(self):
+    def folder_uuid(self) -> sys_uuid.UUID:
         return self.folder.uuid
 
     @folder_uuid.setter
-    def folder_uuid(self, value):
+    def folder_uuid(self, value: sys_uuid.UUID | str | None) -> None:
         if value is None:
             raise ValueError("folder_uuid must not be None")
 
@@ -142,4 +144,46 @@ class Service(
     icon = properties.property(
         types.AllowNone(types.Url()),
         default=None,
+    )
+
+
+class ZulipSource(types_dynamic.AbstractKindModel):
+    KIND = "zulip"
+
+    stream_id = properties.property(
+        types.Integer(min_value=0, max_value=2**31 - 1),
+        required=True,
+    )
+
+
+class NativeSource(types_dynamic.AbstractKindModel):
+    KIND = "native"
+
+
+class WorkspaceStream(
+    models.ModelWithUUID,
+    models.ModelWithRequiredNameDesc,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "workspace_streams"
+
+    source_name = properties.property(
+        types.String(min_length=1, max_length=64),
+        required=True,
+    )
+    source = properties.property(
+        types_dynamic.KindModelSelectorType(
+            types_dynamic.KindModelType(ZulipSource),
+            types_dynamic.KindModelType(NativeSource),
+        ),
+        required=True,
+    )
+    invite_only = properties.property(
+        types.Boolean(),
+        default=False,
+    )
+    announce = properties.property(
+        types.Boolean(),
+        default=False,
     )
