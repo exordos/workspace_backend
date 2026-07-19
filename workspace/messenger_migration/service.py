@@ -298,12 +298,13 @@ class ImportCoordinator:
             or source.snapshot.digest != frozen["snapshot_digest"]
         ):
             raise ValueError("Source advanced during final apply or parity")
+        parity_source = self.target.normalize_snapshot_for_parity(source.snapshot)
         destination = self.target.capture_destination(
-            source.snapshot.project_id, source.snapshot
+            parity_source.project_id, parity_source
         )
         source_items = {
             (item.collection, item.entity_key): item.payload_sha256
-            for item in source.snapshot.items
+            for item in parity_source.items
             if item.operation == "upsert"
         }
         destination_items = {
@@ -332,11 +333,11 @@ class ImportCoordinator:
             file_report = self.file_verifier.verify(source.snapshot)
         report = {
             "project_id": str(source.snapshot.project_id),
-            "source_state_digest": source.snapshot.state_digest,
+            "source_state_digest": parity_source.state_digest,
             "destination_state_digest": destination.state_digest,
-            "source_inventory": source.snapshot.inventory,
+            "source_inventory": parity_source.inventory,
             "destination_inventory": destination.inventory,
-            "source_urn_inventory": source.snapshot.urn_inventory,
+            "source_urn_inventory": parity_source.urn_inventory,
             "destination_urn_inventory": destination.urn_inventory,
             "tombstone_digest": source.snapshot.tombstone_digest,
             "missing": [list(key) for key in missing],

@@ -50,6 +50,32 @@ def _lock_project(session: typing.Any, project_id: object) -> None:
     )
 
 
+def _record_release(
+    session: typing.Any,
+    project_id: object,
+    gate_uuid: object,
+    acquired_at: datetime.datetime,
+    lease_expires_at: datetime.datetime,
+    released_at: datetime.datetime,
+) -> None:
+    session.execute(
+        """
+        INSERT INTO "m_messenger_writer_gate_releases_v1" (
+            "gate_uuid", "project_id", "acquired_at",
+            "lease_expires_at", "released_at"
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT ("gate_uuid") DO NOTHING
+        """,
+        (
+            gate_uuid,
+            project_id,
+            acquired_at,
+            lease_expires_at,
+            released_at,
+        ),
+    )
+
+
 def heartbeat_instance(
     session: typing.Any,
     writer_class: str,
@@ -90,12 +116,21 @@ def close_gate(
     expires = now + (lease or DEFAULT_GATE_LEASE)
     _lock_project(session, project_id)
     current = _closed_gate(session, project_id, now, for_update=True)
-    if (
-        current is not None
-        and current["state"] == "closed"
-        and current["lease_expires_at"] > now
-    ):
-        raise ValueError("Another live Messenger writer gate already exists")
+    if current is not None and current["state"] == "closed":
+        raise ValueError(
+            "Previous Messenger writer gate must be explicitly released"
+        )
+    if current is not None:
+        if current["released_at"] is None:
+            raise ValueError("Open Messenger writer gate lacks release evidence")
+        _record_release(
+            session,
+            project_id,
+            current["gate_uuid"],
+            current["acquired_at"],
+            current["lease_expires_at"],
+            current["released_at"],
+        )
     session.execute(
         'DELETE FROM "m_messenger_writer_gates_v1" WHERE "project_id" = %s',
         (project_id,),
@@ -136,12 +171,20 @@ def release_gate(
         UPDATE "m_messenger_writer_gates_v1"
         SET "state" = 'open', "released_at" = %s, "updated_at" = NOW()
         WHERE "project_id" = %s AND "gate_uuid" = %s AND "state" = 'closed'
-        RETURNING "gate_uuid"
+        RETURNING "gate_uuid", "acquired_at", "lease_expires_at", "released_at"
         """,
         (now, project_id, gate_uuid),
     ).fetchone()
     if result is None:
         raise ValueError("Messenger writer gate is absent, replaced, or already open")
+    _record_release(
+        session,
+        project_id,
+        result["gate_uuid"],
+        result["acquired_at"],
+        result["lease_expires_at"],
+        result["released_at"],
+    )
 
 
 def _closed_gate(
@@ -154,7 +197,8 @@ def _closed_gate(
     suffix = " FOR UPDATE" if for_update else ""
     return session.execute(
         f"""
-        SELECT "gate_uuid", "state", "acquired_at", "lease_expires_at"
+        SELECT "gate_uuid", "state", "acquired_at", "lease_expires_at",
+               "released_at"
         FROM "m_messenger_writer_gates_v1"
         WHERE "project_id" = %s{suffix}
         """,

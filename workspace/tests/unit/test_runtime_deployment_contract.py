@@ -377,9 +377,25 @@ def test_retained_mail_bootstrap_requires_writer_gate_role_before_migrations():
         "SELECT 1 FROM pg_roles WHERE rolname = 'workspace_mail_gate';"
     )
     apply_migrations = bootstrap.index("ra-apply-migration")
+    repair_role_acl = bootstrap.index(
+        'GRANT CONNECT ON DATABASE %I TO "workspace_mail_gate"'
+    )
 
-    assert storage_mode < role_config < role_name < role_ready < apply_migrations
+    assert (
+        storage_mode
+        < role_config
+        < role_name
+        < role_ready
+        < apply_migrations
+        < repair_role_acl
+    )
     assert 'if [ -n "$SMTP_GATE_ROLE" ]' in bootstrap
+    assert "GRANT SELECT ON" in bootstrap
+    assert "m_messenger_writer_gate_releases_v1" in bootstrap
+    assert "GRANT INSERT, UPDATE ON" in bootstrap
+    assert "DELETE" not in bootstrap[apply_migrations:repair_role_acl]
+    assert "GRANT CREATE" not in bootstrap
+    assert "GRANT TEMPORARY" not in bootstrap
 
 
 def test_backend_bootstrap_defers_mail_readiness_to_config_on_change():

@@ -210,13 +210,21 @@ class PostgreSQLGateClient:
     def exact_gate_is_released(self, gate_id):
         rows = self._query(
             """
-            SELECT "state", "released_at" IS NOT NULL
-            FROM "m_messenger_writer_gates_v1"
-            WHERE "gate_uuid" = :'gate_id'::uuid;
+            SELECT EXISTS (
+                SELECT 1
+                FROM "m_messenger_writer_gates_v1"
+                WHERE "gate_uuid" = :'gate_id'::uuid
+                  AND "state" = 'open'
+                  AND "released_at" IS NOT NULL
+                UNION ALL
+                SELECT 1
+                FROM "m_messenger_writer_gate_releases_v1"
+                WHERE "gate_uuid" = :'gate_id'::uuid
+            );
             """,
             gate_id=gate_id,
         )
-        return rows == (("open", "t"),)
+        return rows == (("t",),)
 
     def any_live_closed_gate(self):
         rows = self._query(
@@ -266,7 +274,11 @@ class EximBoundary:
         result = self._run(("exiwhat",))
         if result.returncode != 0:
             raise AttestationError("Exim process state could not be inspected")
-        return tuple(line for line in result.stdout.splitlines() if line.strip())
+        return tuple(
+            line
+            for line in result.stdout.splitlines()
+            if line.strip() and line.strip() != "No exim process data"
+        )
 
     def listener_is_inactive(self):
         result = self._run(("systemctl", "is-active", "--quiet", "exim4.service"))

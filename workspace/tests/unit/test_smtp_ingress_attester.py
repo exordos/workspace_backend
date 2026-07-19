@@ -267,6 +267,17 @@ def test_resume_requires_every_exact_released_generation(tmp_path):
     assert attester._read_hold() is None
 
 
+def test_release_lookup_accepts_current_or_append_only_history():
+    source = SCRIPT.read_text()
+    release_lookup = source.split("def exact_gate_is_released", 1)[1].split(
+        "def any_live_closed_gate", 1
+    )[0]
+
+    assert "m_messenger_writer_gates_v1" in release_lookup
+    assert "m_messenger_writer_gate_releases_v1" in release_lookup
+    assert "SELECT EXISTS" in release_lookup
+
+
 def test_failed_resume_restores_hold_and_stops_any_partial_listener(tmp_path):
     gate = _gate()
 
@@ -337,6 +348,20 @@ def test_exim_drain_uses_queue_and_process_proofs():
     for index, call in enumerate(calls):
         if call == ("exim4", "-bpc"):
             assert calls[index - 1] == ("exiwhat",)
+
+
+def test_exim_no_process_data_is_quiescent():
+    def runner(command, **kwargs):
+        del command, kwargs
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="No exim process data\n",
+            stderr="",
+        )
+
+    boundary = smtp_ingress_attester.EximBoundary(runner=runner)
+
+    assert boundary.active_processes() == ()
 
 
 def test_exim_listener_inspection_error_fails_closed():

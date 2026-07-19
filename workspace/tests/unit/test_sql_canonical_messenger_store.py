@@ -722,6 +722,72 @@ def _event_store(monkeypatch, cursor):
     )
 
 
+def test_canonical_store_events_preserve_cursor_scope_order_and_limit(monkeypatch):
+    generation = sys_uuid.uuid4()
+    _postgres_store, _session = _event_store(
+        monkeypatch,
+        {
+            "epoch_generation": generation,
+            "current_epoch_version": 41,
+            "pruned_through_epoch_version": 12,
+        },
+    )
+    events = [types.SimpleNamespace(epoch_version=21)]
+    objects = FakeObjects(events)
+    model = _fake_model(objects, ("epoch_version", "project_id", "user_uuid"))
+    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceVisibleEvent", model)
+    monkeypatch.setattr(
+        sql_canonical_store.messenger_events,
+        "pack_workspace_event",
+        lambda event: {"epoch_version": event.epoch_version},
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+    )
+
+    result = store.events_after(
+        {"epoch_version": dm_filters.GT(20)},
+        order_by={"epoch_version": "asc"},
+        epoch_generation=str(generation),
+        limit=3,
+    )
+
+    assert result == [{"epoch_version": 21}]
+    _operation, query = objects.calls[0]
+    assert query["filters"]["project_id"].value == PROJECT_UUID
+    assert query["filters"]["user_uuid"].value == USER_UUID
+    assert query["filters"]["epoch_version"].value == 20
+    assert query["order_by"] == {"epoch_version": "asc"}
+    assert query["limit"] == 3
+
+
+def test_canonical_store_event_cursor_delegates_to_postgres_store(monkeypatch):
+    generation = sys_uuid.uuid4()
+    _postgres_store, session = _event_store(
+        monkeypatch,
+        {
+            "epoch_generation": generation,
+            "current_epoch_version": 41,
+            "pruned_through_epoch_version": 12,
+        },
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(
+        PROJECT_UUID,
+        USER_UUID,
+    )
+
+    assert store.event_cursor() == {
+        "epoch_generation": str(generation),
+        "current_epoch_version": 41,
+        "minimum_epoch_version": 13,
+    }
+    assert [params for _statement, params in session.statements] == [
+        (PROJECT_UUID, USER_UUID),
+        (PROJECT_UUID, USER_UUID),
+    ]
+
+
 def test_postgres_event_cursor_preserves_public_shape(monkeypatch):
     generation = sys_uuid.uuid4()
     store, session = _event_store(

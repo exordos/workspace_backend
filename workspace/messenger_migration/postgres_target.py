@@ -29,9 +29,68 @@ COLLECTION_MODELS: dict[str, Any] = {
     "user_references": models.WorkspaceUser,
 }
 
+_NATIVE_SOURCE = {"kind": "native"}
+
 
 def _json(value: object) -> str:
     return json.dumps(migration_snapshot.normalize(value), sort_keys=True)
+
+
+def _parity_payload(
+    collection: str,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Project transitional Maildir values onto the canonical SQL contract.
+
+    Keep unknown values by default so parity still reports data that PostgreSQL
+    cannot represent.  Only the documented transitional aliases below are
+    removed, and only when their canonical equivalent proves that no value is
+    being discarded.
+    """
+    values = cast(dict[str, object], migration_snapshot.normalize(payload))
+    result = values.copy()
+
+    if collection == "streams" and "kind" in result:
+        expected_kind = "direct" if result.get("direct_user_uuid") else "stream"
+        if result["kind"] == expected_kind:
+            result.pop("kind")
+
+    if collection == "messages" and "author_uuid" in result:
+        author_uuid = result["author_uuid"]
+        if result.get("user_uuid", author_uuid) == author_uuid:
+            result["user_uuid"] = author_uuid
+            result.pop("author_uuid")
+
+    if collection in {
+        "folders",
+        "folder_items",
+        "files",
+        "reactions",
+    }:
+        if (
+            result.get("source_name") == "native"
+            and result.get("source") == _NATIVE_SOURCE
+        ):
+            result.pop("source_name")
+            result.pop("source")
+
+    if (
+        collection == "events"
+        and result.get("updated_at") == result.get("created_at")
+    ):
+        # Maildir events only have ``occurred_at``.  The source adapter copied
+        # it into both timestamp fields, while SQL owns ``updated_at`` and may
+        # assign it a few microseconds after the preserved ``created_at``.
+        result.pop("updated_at")
+
+    model = COLLECTION_MODELS[collection]
+    for name, value in tuple(result.items()):
+        prop = model.properties.properties.get(name)
+        if prop is None:
+            continue
+        typed = prop.get_property_type().from_simple_type(value)
+        result[name] = resource_projection.simple(typed)
+    return result
 
 
 class PostgreSQLImportTarget:
@@ -124,6 +183,12 @@ class PostgreSQLImportTarget:
                 and old["payload_sha256"] == item.payload_sha256
                 and old["status"] == "applied"
             )
+            message_timestamp_reconciliation = (
+                item.collection == "messages"
+                and item.operation == "upsert"
+                and item.payload is not None
+                and "created_at" in item.payload
+            )
             session.execute(
                 """
                 INSERT INTO m_messenger_import_items_v1 (
@@ -145,7 +210,12 @@ class PostgreSQLImportTarget:
                     item.operation,
                     _json(item.payload) if item.payload is not None else None,
                     item.payload_sha256,
-                    "applied" if unchanged_applied else "staged",
+                    (
+                        "applied"
+                        if unchanged_applied
+                        and not message_timestamp_reconciliation
+                        else "staged"
+                    ),
                 ),
             )
         if final_delta:
@@ -237,7 +307,9 @@ class PostgreSQLImportTarget:
         if collection == "user_references":
             return {"uuid": dm_filters.EQ(sys_uuid.UUID(entity_key))}
         filters = {
-            "uuid": dm_filters.EQ(sys_uuid.UUID(payload.get("uuid", entity_key))),
+            "uuid": dm_filters.EQ(
+                sys_uuid.UUID(str(payload.get("uuid", entity_key)))
+            ),
             "project_id": dm_filters.EQ(project_id),
         }
         if collection == "message_states":
@@ -269,7 +341,9 @@ class PostgreSQLImportTarget:
             return False
         assert payload is not None
         values = {
-            name: value
+            name: model.properties.properties[name]
+            .get_property_type()
+            .from_simple_type(value)
             for name, value in payload.items()
             if name in model.properties.properties and not name.startswith("_")
         }
@@ -279,16 +353,36 @@ class PostgreSQLImportTarget:
             row.insert(session=session)
             return True
         immutable = set(filters)
+        message_created_at_changed = (
+            collection == "messages"
+            and "created_at" in values
+            and row.created_at != values["created_at"]
+        )
         changed = {
             name: value
             for name, value in values.items()
-            if name not in immutable and getattr(row, name, None) != value
+            if name not in immutable
+            and not model.properties.properties[name]
+            .get_property_class()
+            .is_id_property()
+            and not model.properties.properties[name]
+            .get_kwargs()
+            .get("read_only", False)
+            and getattr(row, name, None) != value
         }
         if changed:
             row.update_dm(values=changed)
             row.update(session=session)
-            return True
-        return False
+        if message_created_at_changed:
+            session.execute(
+                """
+                UPDATE "m_workspace_messages"
+                SET "created_at" = %s
+                WHERE "project_id" = %s AND "uuid" = %s
+                """,
+                (values["created_at"], project_id, row.uuid),
+            )
+        return bool(changed or message_created_at_changed)
 
     def apply_batch(
         self,
@@ -405,6 +499,48 @@ class PostgreSQLImportTarget:
             ("staged" if remaining == 0 else "applying", run_uuid),
         )
         return {"processed": len(rows), "changed": changed, "remaining": remaining}
+
+    @staticmethod
+    def normalize_snapshot_for_parity(
+        source_snapshot: migration_snapshot.CanonicalSnapshot,
+    ) -> migration_snapshot.CanonicalSnapshot:
+        bound_users = {
+            (str(item.payload["stream_uuid"]), str(item.payload["user_uuid"]))
+            for item in source_snapshot.items
+            if item.collection == "bindings"
+            and item.operation == "upsert"
+            and item.payload is not None
+        }
+
+        def normalize_item_payload(
+            item: migration_snapshot.SnapshotItem,
+        ) -> dict[str, object] | None:
+            if item.payload is None:
+                return None
+            payload = item.payload
+            if item.collection == "topics" and "user_uuid" in payload:
+                topic_user = (str(payload["stream_uuid"]), str(payload["user_uuid"]))
+                if topic_user in bound_users:
+                    # Topics became project-scoped canonical resources.
+                    # Visibility is represented by the separately verified
+                    # binding row, so this viewer-scoped alias is redundant.
+                    payload = payload.copy()
+                    payload.pop("user_uuid")
+            return _parity_payload(item.collection, payload)
+
+        return migration_snapshot.CanonicalSnapshot(
+            project_id=source_snapshot.project_id,
+            checkpoint=source_snapshot.checkpoint,
+            items=tuple(
+                migration_snapshot.SnapshotItem(
+                    item.collection,
+                    item.entity_key,
+                    item.operation,
+                    normalize_item_payload(item),
+                )
+                for item in source_snapshot.items
+            ),
+        )
 
     def capture_destination(
         self,

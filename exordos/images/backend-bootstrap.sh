@@ -136,6 +136,34 @@ fi
 source "$GC_PATH/.venv/bin/activate"
 ra-apply-migration --config-dir "$GC_CFG_DIR" --path "$GC_PATH/migrations"
 deactivate
+if [ -n "$SMTP_GATE_ROLE" ]; then
+    PGPASSWORD="$WORKSPACE_PG_PASS" psql \
+        -h "$WORKSPACE_PG_ENDPOINT" \
+        -p "$WORKSPACE_PG_PORT" \
+        -U "$WORKSPACE_PG_USER" \
+        -d "$WORKSPACE_PG_DB" \
+        --set=ON_ERROR_STOP=1 <<'SQL'
+GRANT SELECT ON
+    "m_messenger_writer_gates_v1",
+    "m_messenger_writer_gate_releases_v1",
+    "m_messenger_writer_instances_v1",
+    "m_messenger_writer_gate_expected_v1",
+    "m_messenger_writer_gate_acks_v1"
+TO "workspace_mail_gate";
+GRANT INSERT, UPDATE ON
+    "m_messenger_writer_instances_v1",
+    "m_messenger_writer_gate_acks_v1"
+TO "workspace_mail_gate";
+DO $bootstrap$
+BEGIN
+    EXECUTE format(
+        'GRANT CONNECT ON DATABASE %I TO "workspace_mail_gate"',
+        current_database()
+    );
+END
+$bootstrap$;
+SQL
+fi
 unset WORKSPACE_PG_PASS
 
 if [[ "$TRACE_ENABLED" -eq 1 ]]; then

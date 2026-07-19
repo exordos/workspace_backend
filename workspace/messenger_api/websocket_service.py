@@ -23,6 +23,7 @@ import uuid as sys_uuid
 
 import psycopg
 import websockets
+from restalchemy.common import contexts
 
 from gcl_iam import engines as iam_engines
 from gcl_iam import tokens as iam_tokens
@@ -86,6 +87,16 @@ class ClientConnection:
 
 def _json_dumps(payload: dict[str, typing.Any]) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _call_with_database_session(
+    callback: typing.Callable[..., typing.Any],
+    **kwargs: typing.Any,
+) -> typing.Any:
+    """Own one transaction at the standalone websocket worker boundary."""
+    ctx = contexts.Context()
+    with ctx.session_manager():
+        return callback(**kwargs)
 
 
 class MessengerEventsWebsocketServer:
@@ -220,6 +231,7 @@ class MessengerEventsWebsocketServer:
     async def _catch_up(self, connection: ClientConnection) -> int | bool:
         try:
             events = await asyncio.to_thread(
+                _call_with_database_session,
                 messenger_events.get_events_after,
                 project_id=connection.project_id,
                 user_uuid=connection.user_uuid,
@@ -241,6 +253,7 @@ class MessengerEventsWebsocketServer:
     ) -> bool:
         if connection.last_epoch_version == 0 and connection.epoch_generation is None:
             cursor = await asyncio.to_thread(
+                _call_with_database_session,
                 messenger_events.get_event_cursor,
                 project_id=connection.project_id,
                 user_uuid=connection.user_uuid,
@@ -255,6 +268,7 @@ class MessengerEventsWebsocketServer:
 
     async def _send_ready(self, connection: ClientConnection) -> bool:
         cursor = await asyncio.to_thread(
+            _call_with_database_session,
             messenger_events.get_event_cursor,
             project_id=connection.project_id,
             user_uuid=connection.user_uuid,

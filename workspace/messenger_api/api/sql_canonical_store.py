@@ -372,6 +372,29 @@ class SQLCanonicalReadStore:
 class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     """Read and mutate canonical Messenger state in the request transaction."""
 
+    def event_cursor(self) -> EventCursor:
+        return PostgresEventStore(
+            self.project_uuid,
+            self.user_uuid,
+        ).event_cursor()
+
+    def events_after(
+        self,
+        filters: dict[str, typing.Any],
+        order_by: dict[str, str] | None = None,
+        epoch_generation: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, typing.Any]]:
+        return PostgresEventStore(
+            self.project_uuid,
+            self.user_uuid,
+        ).events_after(
+            filters,
+            order_by=order_by,
+            epoch_generation=epoch_generation,
+            limit=limit,
+        )
+
     @staticmethod
     def _projection_values(
         values: dict[str, typing.Any],

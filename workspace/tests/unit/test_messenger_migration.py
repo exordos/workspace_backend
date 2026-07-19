@@ -9,6 +9,7 @@ import types
 import uuid as sys_uuid
 
 import pytest
+from restalchemy.storage.sql import orm
 
 from workspace.cmd import messenger_migrate
 from workspace.messenger_mail import external_bridge_codec
@@ -16,6 +17,7 @@ from workspace.messenger_mail import external_bridge_data_plane
 from workspace.messenger_mail import repository as mail_repository
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import helpers as messenger_helpers
+from workspace.messenger_api.dm import models as messenger_models
 from workspace.messenger_migration import mail_source
 from workspace.messenger_migration import legacy_provider_outbox
 from workspace.messenger_migration import postgres_target
@@ -264,6 +266,362 @@ def test_apply_sql_orders_dependencies_before_limit_and_uses_savepoints():
     assert "ROLLBACK TO SAVEPOINT {savepoint}" in source
 
 
+def test_import_target_filters_accept_deserialized_uuid():
+    message_uuid = sys_uuid.uuid4()
+
+    filters = postgres_target.PostgreSQLImportTarget._filters(
+        PROJECT_UUID,
+        "messages",
+        str(message_uuid),
+        {"uuid": message_uuid},
+    )
+
+    assert filters["uuid"].value == message_uuid
+
+
+def test_import_target_deserializes_uuid_fields_before_insert(monkeypatch):
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    provider_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    inserted = {}
+
+    monkeypatch.setattr(
+        orm.ObjectCollection,
+        "get_one_or_none",
+        lambda self, **kwargs: (
+            object()
+            if self.model_cls
+            in (
+                messenger_models.WorkspaceStreamBinding,
+                messenger_models.WorkspaceStreamTopic,
+            )
+            else None
+        ),
+    )
+
+    def insert(message, session=None):
+        inserted.update(message.properties.value)
+
+    monkeypatch.setattr(messenger_models.WorkspaceMessage, "insert", insert)
+    target = postgres_target.PostgreSQLImportTarget()
+    monkeypatch.setattr(
+        type(target), "session", property(lambda self: object())
+    )
+
+    changed = target._apply_item(
+        PROJECT_UUID,
+        "messages",
+        str(message_uuid),
+        "upsert",
+        {
+            "uuid": str(message_uuid),
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "user_uuid": str(USER_UUID),
+            "provider_uuid": str(provider_uuid),
+            "external_account_uuid": str(account_uuid),
+            "payload": {"kind": "markdown", "content": "migrated"},
+        },
+    )
+
+    assert changed is True
+    assert inserted["uuid"] == message_uuid
+    assert inserted["project_id"] == PROJECT_UUID
+    assert inserted["stream_uuid"] == stream_uuid
+    assert inserted["topic_uuid"] == topic_uuid
+    assert inserted["user_uuid"] == USER_UUID
+    assert inserted["provider_uuid"] == provider_uuid
+    assert inserted["external_account_uuid"] == account_uuid
+
+
+def test_import_target_does_not_update_equal_user_scoped_ids(monkeypatch):
+    folder_uuid = sys_uuid.uuid4()
+    created_at = datetime.datetime(2026, 7, 19, tzinfo=datetime.timezone.utc)
+    folder = messenger_models.Folder(
+        uuid=folder_uuid,
+        project_id=PROJECT_UUID,
+        user_uuid=USER_UUID,
+        title="Migrated",
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+    monkeypatch.setattr(
+        orm.ObjectCollection,
+        "get_one_or_none",
+        lambda self, **kwargs: folder,
+    )
+
+    def update_dm(values):
+        raise AssertionError(f"immutable values must not be updated: {values}")
+
+    monkeypatch.setattr(folder, "update_dm", update_dm)
+    target = postgres_target.PostgreSQLImportTarget()
+    monkeypatch.setattr(
+        type(target), "session", property(lambda self: object())
+    )
+
+    changed = target._apply_item(
+        PROJECT_UUID,
+        "folders",
+        str(folder_uuid),
+        "upsert",
+        {
+            "uuid": str(folder_uuid),
+            "project_id": str(PROJECT_UUID),
+            "user_uuid": str(USER_UUID),
+            "title": "Migrated",
+            "system_type": "created",
+            "created_at": "2026-07-19T00:00:00.000000Z",
+            "updated_at": "2026-07-19T00:00:00.000000Z",
+        },
+    )
+
+    assert changed is False
+
+
+def test_import_target_reconciles_existing_message_created_at(monkeypatch):
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    destination_created_at = datetime.datetime(
+        2026,
+        7,
+        15,
+        18,
+        38,
+        53,
+        117004,
+        tzinfo=datetime.timezone.utc,
+    )
+    source_created_at = datetime.datetime(
+        2026,
+        7,
+        15,
+        18,
+        38,
+        52,
+        852178,
+        tzinfo=datetime.timezone.utc,
+    )
+    message = types.SimpleNamespace(
+        uuid=message_uuid,
+        project_id=PROJECT_UUID,
+        stream_uuid=stream_uuid,
+        topic_uuid=topic_uuid,
+        user_uuid=USER_UUID,
+        payload=messenger_models.WorkspaceMessage.properties.properties[
+            "payload"
+        ]
+        .get_property_type()
+        .from_simple_type({"kind": "markdown", "content": "migrated"}),
+        created_at=destination_created_at,
+        updated_at=destination_created_at,
+    )
+
+    monkeypatch.setattr(
+        orm.ObjectCollection,
+        "get_one_or_none",
+        lambda self, **kwargs: message,
+    )
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params):
+            self.calls.append((statement, params))
+
+    session = Session()
+    session_lookups = []
+    target = postgres_target.PostgreSQLImportTarget()
+
+    def current_session(self):
+        session_lookups.append(True)
+        return session
+
+    monkeypatch.setattr(type(target), "session", property(current_session))
+
+    changed = target._apply_item(
+        PROJECT_UUID,
+        "messages",
+        str(message_uuid),
+        "upsert",
+        {
+            "uuid": str(message_uuid),
+            "project_id": str(PROJECT_UUID),
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "user_uuid": str(USER_UUID),
+            "payload": {"kind": "markdown", "content": "migrated"},
+            "created_at": source_created_at.isoformat().replace("+00:00", "Z"),
+            "updated_at": destination_created_at.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        },
+    )
+
+    assert changed is True
+    assert session_lookups == [True]
+    assert len(session.calls) == 1
+    statement, params = session.calls[0]
+    assert 'UPDATE "m_workspace_messages"' in statement
+    assert 'SET "created_at" = %s' in statement
+    assert 'WHERE "project_id" = %s AND "uuid" = %s' in statement
+    assert params == (source_created_at, PROJECT_UUID, message_uuid)
+
+
+def test_restaged_applied_message_reconciles_authoritative_created_at(monkeypatch):
+    run_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    destination_created_at = datetime.datetime(
+        2026,
+        7,
+        15,
+        18,
+        38,
+        53,
+        117004,
+        tzinfo=datetime.timezone.utc,
+    )
+    source_created_at = datetime.datetime(
+        2026,
+        7,
+        15,
+        18,
+        38,
+        52,
+        852178,
+        tzinfo=datetime.timezone.utc,
+    )
+    payload = {
+        "uuid": str(message_uuid),
+        "project_id": str(PROJECT_UUID),
+        "stream_uuid": str(stream_uuid),
+        "topic_uuid": str(topic_uuid),
+        "user_uuid": str(USER_UUID),
+        "payload": {"kind": "markdown", "content": "migrated"},
+        "created_at": source_created_at.isoformat().replace("+00:00", "Z"),
+        "updated_at": destination_created_at.isoformat().replace("+00:00", "Z"),
+    }
+    item = snapshot.SnapshotItem(
+        "messages",
+        str(message_uuid),
+        "upsert",
+        payload,
+    )
+    capture = mail_source.SourceCapture(_snapshot(item))
+    message = types.SimpleNamespace(
+        uuid=message_uuid,
+        project_id=PROJECT_UUID,
+        stream_uuid=stream_uuid,
+        topic_uuid=topic_uuid,
+        user_uuid=USER_UUID,
+        payload=messenger_models.WorkspaceMessage.properties.properties[
+            "payload"
+        ]
+        .get_property_type()
+        .from_simple_type(payload["payload"]),
+        created_at=destination_created_at,
+        updated_at=destination_created_at,
+    )
+
+    class Result:
+        def __init__(self, *, one=None, all_rows=None):
+            self.one = one
+            self.all_rows = all_rows or []
+
+        def fetchone(self):
+            return self.one
+
+        def fetchall(self):
+            return self.all_rows
+
+    class Session:
+        def __init__(self):
+            self.item_status = "applied"
+            self.created_at_updates = []
+
+        def execute(self, statement, params=None):
+            if "SELECT project_id, phase, source_uid_validity" in statement:
+                return Result(
+                    one={
+                        "project_id": PROJECT_UUID,
+                        "phase": "staged",
+                        "source_uid_validity": capture.snapshot.checkpoint.uid_validity,
+                    }
+                )
+            if (
+                "SELECT collection, entity_key, operation" in statement
+                and "payload_sha256, status" in statement
+            ):
+                return Result(
+                    all_rows=[
+                        {
+                            "collection": "messages",
+                            "entity_key": str(message_uuid),
+                            "operation": "upsert",
+                            "payload_sha256": item.payload_sha256,
+                            "status": self.item_status,
+                        }
+                    ]
+                )
+            if "INSERT INTO m_messenger_import_items_v1" in statement:
+                self.item_status = params[-1]
+                return Result()
+            if "SELECT project_id, phase\n" in statement:
+                return Result(one={"project_id": PROJECT_UUID, "phase": "staged"})
+            if "WHERE run_uuid = %s AND status = 'staged'" in statement:
+                rows = []
+                if self.item_status == "staged":
+                    rows.append(
+                        {
+                            "collection": "messages",
+                            "entity_key": str(message_uuid),
+                            "operation": "upsert",
+                            "payload": payload,
+                        }
+                    )
+                return Result(all_rows=rows)
+            if 'UPDATE "m_workspace_messages"' in statement:
+                self.created_at_updates.append(params)
+                message.created_at = params[0]
+                return Result()
+            if (
+                "SET status = 'applied', attempts = attempts + 1" in statement
+            ):
+                self.item_status = "applied"
+                return Result()
+            if "SELECT COUNT(*) AS count" in statement:
+                return Result(one={"count": int(self.item_status != "applied")})
+            return Result()
+
+    session = Session()
+    target = postgres_target.PostgreSQLImportTarget()
+    monkeypatch.setattr(type(target), "session", property(lambda self: session))
+    monkeypatch.setattr(
+        orm.ObjectCollection,
+        "get_one_or_none",
+        lambda self, **kwargs: message,
+    )
+
+    target.stage(run_uuid, capture)
+    assert session.item_status == "staged"
+    first = target.apply_batch(run_uuid)
+    target.stage(run_uuid, capture)
+    second = target.apply_batch(run_uuid)
+
+    assert first == {"processed": 1, "changed": 1, "remaining": 0}
+    assert second == {"processed": 1, "changed": 0, "remaining": 0}
+    assert session.created_at_updates == [
+        (source_created_at, PROJECT_UUID, message_uuid)
+    ]
+
+
 def test_parity_is_blocked_when_files_exist_without_object_verifier(monkeypatch):
     file_uuid = sys_uuid.uuid4()
     source_snapshot = _snapshot(
@@ -292,6 +650,7 @@ def test_parity_is_blocked_when_files_exist_without_object_verifier(monkeypatch)
 
     target = types.SimpleNamespace(
         capture_destination=lambda project_id, source: source_snapshot,
+        normalize_snapshot_for_parity=lambda source: source,
         session=Session(),
     )
     coordinator = service.ImportCoordinator(
@@ -312,6 +671,185 @@ def test_parity_is_blocked_when_files_exist_without_object_verifier(monkeypatch)
         "ok": False,
         "blocked": True,
     }
+
+
+def test_parity_normalizes_only_proven_transitional_fields():
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    folder_uuid = sys_uuid.uuid4()
+    event_uuid = sys_uuid.uuid4()
+    binding_uuid = sys_uuid.uuid4()
+    peer_uuid = sys_uuid.uuid4()
+    occurred_at = datetime.datetime(
+        2026,
+        7,
+        16,
+        7,
+        46,
+        24,
+        320573,
+        tzinfo=datetime.timezone.utc,
+    )
+    source = _snapshot(
+        snapshot.SnapshotItem(
+            "bindings",
+            str(binding_uuid),
+            "upsert",
+            {
+                "uuid": str(binding_uuid),
+                "project_id": str(PROJECT_UUID),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(USER_UUID),
+                "who_uuid": str(USER_UUID),
+                "role": "owner",
+            },
+        ),
+        snapshot.SnapshotItem(
+            "events",
+            str(event_uuid),
+            "upsert",
+            {
+                "uuid": str(event_uuid),
+                "project_id": str(PROJECT_UUID),
+                "user_uuid": str(USER_UUID),
+                "schema_version": 1,
+                "object_type": "message",
+                "action": "created",
+                "payload": {"kind": "message.created"},
+                "created_at": occurred_at,
+                "updated_at": occurred_at,
+            },
+        ),
+        snapshot.SnapshotItem(
+            "folders",
+            str(folder_uuid),
+            "upsert",
+            {
+                "uuid": str(folder_uuid),
+                "project_id": str(PROJECT_UUID),
+                "user_uuid": str(USER_UUID),
+                "title": "Created",
+                "source_name": "native",
+                "source": {"kind": "native"},
+            },
+        ),
+        snapshot.SnapshotItem(
+            "messages",
+            str(message_uuid),
+            "upsert",
+            {
+                "uuid": str(message_uuid),
+                "project_id": str(PROJECT_UUID),
+                "user_uuid": str(USER_UUID),
+                "author_uuid": str(USER_UUID),
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "source_name": "native",
+                "source": {"kind": "native"},
+                "payload": {"kind": "markdown", "content": "hello"},
+            },
+        ),
+        snapshot.SnapshotItem(
+            "streams",
+            str(stream_uuid),
+            "upsert",
+            {
+                "uuid": str(stream_uuid),
+                "project_id": str(PROJECT_UUID),
+                "user_uuid": str(USER_UUID),
+                "name": "Direct",
+                "description": "",
+                "kind": "direct",
+                "direct_user_uuid": str(peer_uuid),
+                "source_name": "native",
+                "source": {"kind": "native"},
+            },
+        ),
+        snapshot.SnapshotItem(
+            "topics",
+            str(topic_uuid),
+            "upsert",
+            {
+                "uuid": str(topic_uuid),
+                "project_id": str(PROJECT_UUID),
+                "user_uuid": str(USER_UUID),
+                "stream_uuid": str(stream_uuid),
+                "name": "General",
+                "source_name": "native",
+                "source": {"kind": "native"},
+            },
+        ),
+    )
+
+    normalized = postgres_target.PostgreSQLImportTarget.normalize_snapshot_for_parity(
+        source
+    )
+    payloads = {item.collection: item.payload for item in normalized.items}
+
+    assert "updated_at" not in payloads["events"]
+    assert payloads["events"]["created_at"] == "2026-07-16T07:46:24.320573Z"
+    assert "source_name" not in payloads["folders"]
+    assert "source" not in payloads["folders"]
+    assert payloads["messages"]["user_uuid"] == str(USER_UUID)
+    assert "author_uuid" not in payloads["messages"]
+    assert "kind" not in payloads["streams"]
+    assert "user_uuid" not in payloads["topics"]
+
+
+def test_parity_keeps_unproven_transitional_values_as_conflicts():
+    unbound_topic_uuid = sys_uuid.uuid4()
+    unbound_stream_uuid = sys_uuid.uuid4()
+    stream = postgres_target._parity_payload(
+        "streams",
+        {
+            "uuid": str(sys_uuid.uuid4()),
+            "project_id": str(PROJECT_UUID),
+            "kind": "direct",
+            "direct_user_uuid": None,
+        },
+    )
+    message = postgres_target._parity_payload(
+        "messages",
+        {
+            "uuid": str(sys_uuid.uuid4()),
+            "project_id": str(PROJECT_UUID),
+            "user_uuid": str(USER_UUID),
+            "author_uuid": str(sys_uuid.uuid4()),
+        },
+    )
+    folder = postgres_target._parity_payload(
+        "folders",
+        {
+            "uuid": str(sys_uuid.uuid4()),
+            "project_id": str(PROJECT_UUID),
+            "source_name": "zulip",
+            "source": {"kind": "zulip"},
+        },
+    )
+    unbound_topic = (
+        postgres_target.PostgreSQLImportTarget.normalize_snapshot_for_parity(
+            _snapshot(
+                snapshot.SnapshotItem(
+                    "topics",
+                    str(unbound_topic_uuid),
+                    "upsert",
+                    {
+                        "uuid": str(unbound_topic_uuid),
+                        "project_id": str(PROJECT_UUID),
+                        "stream_uuid": str(unbound_stream_uuid),
+                        "user_uuid": str(USER_UUID),
+                    },
+                )
+            )
+        ).items[0]
+    )
+
+    assert stream["kind"] == "direct"
+    assert "author_uuid" in message
+    assert folder["source_name"] == "zulip"
+    assert folder["source"] == {"kind": "zulip"}
+    assert unbound_topic.payload["user_uuid"] == str(USER_UUID)
 
 
 def test_cli_requires_authoritative_writer_gate_id():

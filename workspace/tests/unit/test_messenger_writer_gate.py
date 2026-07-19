@@ -38,6 +38,8 @@ class GateSession:
         self.gate_uuid = sys_uuid.uuid4()
         self.state = state
         self.expires = expires or NOW + datetime.timedelta(minutes=5)
+        self.released_at = NOW if state == "open" else None
+        self.releases = {}
         self.acks = {}
         self.expected_rows = []
 
@@ -48,6 +50,7 @@ class GateSession:
             "state": self.state,
             "acquired_at": NOW,
             "lease_expires_at": self.expires,
+            "released_at": self.released_at,
         }
 
     def execute(self, statement, params):
@@ -78,7 +81,19 @@ class GateSession:
             if self.state != "closed" or gate_uuid != self.gate_uuid:
                 return Result()
             self.state = "open"
-            return Result({"gate_uuid": self.gate_uuid})
+            self.released_at = _now
+            return Result(self.gate)
+        if normalized.startswith(
+            'INSERT INTO "m_messenger_writer_gate_releases_v1"'
+        ):
+            gate_uuid, project_id, acquired_at, lease_expires_at, released_at = params
+            self.releases[gate_uuid] = {
+                "project_id": project_id,
+                "acquired_at": acquired_at,
+                "lease_expires_at": lease_expires_at,
+                "released_at": released_at,
+            }
+            return Result()
         raise AssertionError(normalized)
 
 
@@ -107,6 +122,18 @@ def test_releasing_gate_resumes_writes():
         instance_id="test:api",
         now=NOW,
     )
+    assert session.releases[session.gate_uuid]["released_at"] == NOW
+
+
+def test_expired_closed_gate_requires_explicit_release_before_replacement():
+    session = GateSession(expires=NOW)
+
+    with pytest.raises(ValueError, match="explicitly released"):
+        writer_gate.close_gate(
+            session,
+            PROJECT_UUID,
+            now=NOW + datetime.timedelta(seconds=1),
+        )
 
 
 def test_validation_rejects_missing_or_expired_service_acknowledgements():
@@ -378,6 +405,19 @@ def test_gate_migration_has_authoritative_rows_and_live_ack_index():
     assert 'CREATE TABLE "m_messenger_writer_gate_expected_v1"' in migration
     assert 'CREATE TABLE "m_messenger_writer_gate_acks_v1"' in migration
     assert '"gate_uuid", "writer_class", "lease_expires_at"' in migration
+
+
+def test_gate_release_history_is_append_only_and_readable_by_smtp_attester():
+    migration = pathlib.Path(
+        "migrations/0116-preserve-Messenger-writer-gate-release-history-bd4625.py"
+    ).read_text()
+
+    assert 'CREATE TABLE "m_messenger_writer_gate_releases_v1"' in migration
+    assert '"gate_uuid" UUID PRIMARY KEY' in migration
+    assert 'GRANT SELECT ON "m_messenger_writer_gate_releases_v1"' in migration
+    assert "GRANT INSERT" not in migration
+    assert "GRANT UPDATE" not in migration
+    assert "GRANT DELETE" not in migration
 
 
 def test_smtp_attester_role_has_only_writer_gate_dml_privileges():

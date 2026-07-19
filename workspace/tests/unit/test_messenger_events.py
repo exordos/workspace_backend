@@ -52,7 +52,24 @@ class FakeWebsocket:
             raise StopAsyncIteration
 
 
+def _call_without_database_session(callback, **kwargs):
+    return callback(**kwargs)
+
+
+async def _call_in_current_thread(callback, *args, **kwargs):
+    return callback(*args, **kwargs)
+
+
 class MessengerEventsTestCase(unittest.TestCase):
+    def setUp(self):
+        to_thread = mock.patch.object(
+            asyncio,
+            "to_thread",
+            new=_call_in_current_thread,
+        )
+        to_thread.start()
+        self.addCleanup(to_thread.stop)
+
     def test_fixture_suppression_blocks_runtime_events_but_not_planned_events(self):
         session = mock.Mock()
         project_id = sys_uuid.uuid4()
@@ -1389,11 +1406,18 @@ class MessengerEventsTestCase(unittest.TestCase):
             "payload": {"kind": "message.created"},
         }
 
-        with mock.patch.object(
-            websocket_service.messenger_events,
-            "get_events_after",
-            return_value=[event],
-        ) as get_events:
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_events_after",
+                return_value=[event],
+            ) as get_events,
+        ):
             asyncio.run(server._broadcast_epoch(900))
 
         get_events.assert_called_once_with(
@@ -1405,6 +1429,79 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual([event], sent_messages)
         self.assertEqual(8, connection.last_epoch_version)
+
+    def test_websocket_catchup_owns_standalone_database_session(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        transitions = []
+
+        class SessionManager:
+            def __enter__(self):
+                transitions.append("session_enter")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                transitions.append("session_exit")
+
+        class Context:
+            def session_manager(self):
+                return SessionManager()
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+
+        def get_events_after(**kwargs):
+            transitions.append(("events_after", kwargs))
+            return []
+
+        with (
+            mock.patch.object(
+                websocket_service.contexts,
+                "Context",
+                return_value=Context(),
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_events_after",
+                side_effect=get_events_after,
+            ),
+        ):
+            result = asyncio.run(server._catch_up(connection))
+
+        self.assertEqual(0, result)
+        self.assertEqual(
+            [
+                "session_enter",
+                (
+                    "events_after",
+                    {
+                        "project_id": connection.project_id,
+                        "user_uuid": connection.user_uuid,
+                        "after_epoch_version": 7,
+                        "limit": 500,
+                        "epoch_generation": "91",
+                    },
+                ),
+                "session_exit",
+            ],
+            transitions,
+        )
 
     def test_websocket_multi_connection_poll_uses_event_store_only(self):
         websockets_stub = types.ModuleType("websockets")
@@ -1477,7 +1574,12 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         api_store.configure_store_factory(Factory())
         try:
-            asyncio.run(run_one_poll())
+            with mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ):
+                asyncio.run(run_one_poll())
         finally:
             api_store.reset_store_factory()
 
@@ -1526,10 +1628,17 @@ class MessengerEventsTestCase(unittest.TestCase):
             current_epoch_version=20,
             minimum_epoch_version=10,
         )
-        with mock.patch.object(
-            websocket_service.messenger_events,
-            "get_events_after",
-            side_effect=error,
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_events_after",
+                side_effect=error,
+            ),
         ):
             result = asyncio.run(server._catch_up(connection))
 
@@ -1567,14 +1676,21 @@ class MessengerEventsTestCase(unittest.TestCase):
             epoch_generation="91",
         )
         server._add_connection(connection)
-        with mock.patch.object(
-            websocket_service.messenger_events,
-            "get_event_cursor",
-            return_value={
-                "epoch_generation": "91",
-                "current_epoch_version": 9,
-                "minimum_epoch_version": 1,
-            },
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_event_cursor",
+                return_value={
+                    "epoch_generation": "91",
+                    "current_epoch_version": 9,
+                    "minimum_epoch_version": 1,
+                },
+            ),
         ):
             asyncio.run(server._broadcast_epoch(8))
             self.assertEqual([], sent_messages)
@@ -1613,6 +1729,11 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
 
         with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
             mock.patch.object(
                 websocket_service.messenger_events,
                 "get_event_cursor",
@@ -1667,14 +1788,21 @@ class MessengerEventsTestCase(unittest.TestCase):
             epoch_generation="91",
         )
 
-        with mock.patch.object(
-            websocket_service.messenger_events,
-            "get_event_cursor",
-            return_value={
-                "epoch_generation": "92",
-                "current_epoch_version": 2,
-                "minimum_epoch_version": 1,
-            },
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_event_cursor",
+                return_value={
+                    "epoch_generation": "92",
+                    "current_epoch_version": 2,
+                    "minimum_epoch_version": 1,
+                },
+            ),
         ):
             result = asyncio.run(server._send_ready(connection))
 
