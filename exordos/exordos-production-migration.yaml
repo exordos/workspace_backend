@@ -50,3 +50,9 @@ build:
           script: images/backend-install.sh
           override:
             disk_size: "10G"
+        - name: workspace-mail
+          format: zst
+          profile: exordos_base
+          script: images/mail-install.sh
+          override:
+            disk_size: "10G"

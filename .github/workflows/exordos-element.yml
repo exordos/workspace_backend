@@ -26,8 +26,9 @@ on:
 env:
   ARTIFACTS_PATH: output
   EXORDOS_CFG: exordos/exordos.yaml
+  EXORDOS_MIGRATION_CFG: exordos/exordos-production-migration.yaml
   WORKSPACE_UI_REPOSITORY: https://github.com/exordos/workspace_ui.git
-  WORKSPACE_UI_REF: 786c5d6ca399b391331eb08d1b6ea0f83f6bc578
+  WORKSPACE_UI_REF: a8cb5c990cedd57bba19085ff96007e744d2d16e
 
 jobs:
   build:
@@ -297,7 +298,7 @@ jobs:
           test "$(git describe --tags --exact-match "${compatibility_head}")" = "${compatibility_version}"
 
           if ! "${EXORDOS_BIN}" build . \
-            --exordos-cfg-file "${EXORDOS_CFG}" \
+            --exordos-cfg-file "${EXORDOS_MIGRATION_CFG}" \
             --output-dir "${compatibility_dir}" \
             --manifest-var mail_migration_compatibility=true \
             --manifest-var workspace_backend_image="${CURRENT_BACKEND_IMAGE_URN}" \
@@ -363,7 +364,7 @@ jobs:
           test "$(git describe --tags --exact-match "${stage_head}")" = "${stage_version}"
 
           if ! "${EXORDOS_BIN}" build . \
-            --exordos-cfg-file "${EXORDOS_CFG}" \
+            --exordos-cfg-file "${EXORDOS_MIGRATION_CFG}" \
             --output-dir "${stage_dir}" \
             --manifest-var messenger_storage_mode=mail_projection \
             --manifest-var messenger_canonical_cutover_confirmed=false \
@@ -431,7 +432,7 @@ jobs:
           test "$(git describe --tags --exact-match "${canonical_head}")" = "${canonical_version}"
 
           if ! "${EXORDOS_BIN}" build . \
-            --exordos-cfg-file "${EXORDOS_CFG}" \
+            --exordos-cfg-file "${EXORDOS_MIGRATION_CFG}" \
             --output-dir "${canonical_dir}" \
             --manifest-var workspace_backend_image="${STAGE_BACKEND_IMAGE_URN}" \
             --manifest-var workspace_mail_image="${COMPATIBILITY_MAIL_IMAGE_URN}" \
@@ -495,7 +496,7 @@ jobs:
           test "$(git describe --tags --exact-match "${rollback_head}")" = "${rollback_version}"
 
           if ! "${EXORDOS_BIN}" build . \
-            --exordos-cfg-file "${EXORDOS_CFG}" \
+            --exordos-cfg-file "${EXORDOS_MIGRATION_CFG}" \
             --output-dir "${rollback_dir}" \
             --manifest-var workspace_backend_image="${STAGE_BACKEND_IMAGE_URN}" \
             --manifest-var workspace_mail_image="${COMPATIBILITY_MAIL_IMAGE_URN}" \

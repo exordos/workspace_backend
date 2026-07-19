@@ -370,9 +370,7 @@ def test_retained_mail_bootstrap_requires_writer_gate_role_before_migrations():
 
     storage_mode = bootstrap.index('MESSENGER_STORAGE_MODE="$(')
     role_config = bootstrap.index('config["smtp_writer_gate_role"]["name"]')
-    role_name = bootstrap.index(
-        'if [ "$SMTP_GATE_ROLE" != "workspace_mail_gate" ]'
-    )
+    role_name = bootstrap.index('if [ "$SMTP_GATE_ROLE" != "workspace_mail_gate" ]')
     role_ready = bootstrap.index(
         "SELECT 1 FROM pg_roles WHERE rolname = 'workspace_mail_gate';"
     )
@@ -692,13 +690,14 @@ def test_external_provider_runtime_artifacts_are_absent():
     )
 
 
-def test_workspace_uses_dedicated_mail_node_and_a_secondary_projection_database():
+def test_workspace_keeps_mail_only_in_the_production_migration_build():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     backend_install = _read("exordos/images/backend-install.sh")
     backend_bootstrap = _read("exordos/images/backend-bootstrap.sh")
     mail_install = _read("exordos/images/mail-install.sh")
     mail_bootstrap = _read("exordos/images/mail-bootstrap.sh")
     build_config = _read("exordos/exordos.yaml")
+    migration_build_config = _read("exordos/exordos-production-migration.yaml")
 
     assert "workspace_projection_cluster" in manifest
     assert "rebuildable PostgreSQL projection" in manifest
@@ -710,8 +709,10 @@ def test_workspace_uses_dedicated_mail_node_and_a_secondary_projection_database(
         'image: "{{ workspace_mail_image | '
         "default(images['workspace_mail_raw_zst'], true) }}\"" in manifest
     )
-    assert "name: workspace-mail" in build_config
-    assert "script: images/mail-install.sh" in build_config
+    assert "name: workspace-mail" not in build_config
+    assert "script: images/mail-install.sh" not in build_config
+    assert "name: workspace-mail" in migration_build_config
+    assert "script: images/mail-install.sh" in migration_build_config
     assert "label: data" in manifest
     assert "[messenger_mail]" in manifest
     assert "'127.0.0.1' if mail_migration_stage1_enabled" in manifest
@@ -1174,15 +1175,14 @@ def test_actual_jinja_render_supports_mail_modes_and_rejects_invalid_flags():
     assert "smtp_host = workspace-mail." in compatibility_config
     assert "smtp_security = starttls" in compatibility_config
     assert "workspace_api_remote_mail_v1" in compatibility_services
-    assert "workspace-wait-ready" in compatibility_services[
-        "workspace_api_remote_mail_v1"
-    ]["path"]
-    assert "workspace_smtp_writer_gate_compatibility_marker" in (
-        compatibility_configs
+    assert (
+        "workspace-wait-ready"
+        in compatibility_services["workspace_api_remote_mail_v1"]["path"]
     )
-    assert compatibility_configs[
-        "workspace_smtp_writer_gate_compatibility_marker"
-    ]["on_change"] == {
+    assert "workspace_smtp_writer_gate_compatibility_marker" in (compatibility_configs)
+    assert compatibility_configs["workspace_smtp_writer_gate_compatibility_marker"][
+        "on_change"
+    ] == {
         "kind": "shell",
         "command": "/usr/local/bin/workspace-mail-reload",
     }
@@ -1358,9 +1358,9 @@ def test_production_stage_preserves_image_less_backend_data_disk():
 
     assert result.returncode == 0, result.stderr
     manifest = yaml.safe_load(result.stdout)
-    backend_disks = manifest["resources"]["$core.compute.nodes"][
-        "workspace_backend"
-    ]["disk_spec"]["disks"]
+    backend_disks = manifest["resources"]["$core.compute.nodes"]["workspace_backend"][
+        "disk_spec"
+    ]["disks"]
     assert backend_disks == [
         {
             "size": 10,
@@ -1376,9 +1376,10 @@ def test_production_stage_preserves_image_less_backend_data_disk():
         "workspace_smtp_writer_gate_config"
     ]
     assert "on_change" not in writer_gate_config
-    assert resources["$core.em.services"]["workspace_smtp_ingress_attester"][
-        "path"
-    ] == "/usr/local/bin/workspace-smtp-ingress-attester run"
+    assert (
+        resources["$core.em.services"]["workspace_smtp_ingress_attester"]["path"]
+        == "/usr/local/bin/workspace-smtp-ingress-attester run"
+    )
 
 
 def test_cutover_uses_new_backend_root_and_keeps_legacy_data_disk():
@@ -1699,8 +1700,8 @@ def test_mail_gate_readiness_covers_every_config_delivery_order(tmp_path):
                 "bash",
                 "-c",
                 (
-                    "set -eu; source \"$1\"; "
-                    "if workspace_mail_gate_is_provisioned \"$2\" \"$3\" \"$4\"; "
+                    'set -eu; source "$1"; '
+                    'if workspace_mail_gate_is_provisioned "$2" "$3" "$4"; '
                     "then printf ready; else printf deferred; fi"
                 ),
                 "gate-readiness",
@@ -1759,9 +1760,7 @@ def test_gate_markers_are_final_reload_points_after_their_inputs():
     assert stage_result.returncode == 0, stage_result.stderr
 
     compatibility_configs = list(
-        yaml.safe_load(compatibility_result.stdout)["resources"][
-            "$core.config.configs"
-        ]
+        yaml.safe_load(compatibility_result.stdout)["resources"]["$core.config.configs"]
     )
     assert compatibility_configs.index("workspace_mail_pki_config") < (
         compatibility_configs.index("workspace_smtp_writer_gate_compatibility_marker")
@@ -1862,15 +1861,15 @@ def test_mail_bootstrap_succeeds_under_valid_hold_with_smtp_inactive_healthcheck
     )
     stub_library.write_text(
         "find_persistent_disk() { printf /dev/fake; }\n"
-        "prepare_persistent_disk() { mkdir -p \"$2\"; }\n"
-        "migrate_to_persistent() { mkdir -p \"$2\"; }\n"
+        'prepare_persistent_disk() { mkdir -p "$2"; }\n'
+        'migrate_to_persistent() { mkdir -p "$2"; }\n'
         "persist_migrate_complete() { :; }\n",
         encoding="utf-8",
     )
     stub_pki.write_text(
-        "#!/usr/bin/env bash\nset -eu\nmkdir -p \"$3\"\n"
-        "printf bundle >\"$3/workspace-mail.pem\"\n"
-        "printf ca >\"$3/workspace-mail-ca.crt\"\n",
+        '#!/usr/bin/env bash\nset -eu\nmkdir -p "$3"\n'
+        'printf bundle >"$3/workspace-mail.pem"\n'
+        'printf ca >"$3/workspace-mail-ca.crt"\n',
         encoding="utf-8",
     )
     stub_configure.write_text(
@@ -1945,8 +1944,8 @@ def test_configured_mail_keeps_exim_stopped_while_persistent_hold_exists(tmp_pat
             "bash",
             "-c",
             (
-                "set -eu; source \"$1\"; "
-                "workspace_mail_reconcile_configured_exim \"$2\" \"$3\""
+                'set -eu; source "$1"; '
+                'workspace_mail_reconcile_configured_exim "$2" "$3"'
             ),
             "reconcile-exim",
             str(readiness),
@@ -2603,7 +2602,7 @@ def test_element_builds_and_serves_the_existing_workspace_ui():
 def test_element_workflow_checks_out_compatible_ui_and_publishes():
     workflow = _read(".github/workflows/exordos-element.yml")
 
-    assert "WORKSPACE_UI_REF: 786c5d6ca399b391331eb08d1b6ea0f83f6bc578" in workflow
+    assert "WORKSPACE_UI_REF: a8cb5c990cedd57bba19085ff96007e744d2d16e" in workflow
     assert 'ui_dir="${GITHUB_WORKSPACE}/../workspace_ui"' in workflow
     assert 'fetch --depth=1 origin "${WORKSPACE_UI_REF}"' in workflow
     assert (

@@ -2,11 +2,15 @@
 
 The `Exordos element` GitHub Actions workflow keeps its existing default path
 for pull requests, pushes, tags, and ordinary manual runs: it builds one element
-version and publishes it with the configured repository credentials.
+version and publishes it with the configured repository credentials. That
+steady-state path uses `exordos/exordos.yaml`, which builds only the canonical
+`workspace-backend` image and cannot reintroduce a `workspace-mail` image.
 
 Operators can select the `production_migration` profile in a manual
 `workflow_dispatch` run to prepare the four immutable Workspace versions
-required for the PostgreSQL-canonical cutover:
+required for the PostgreSQL-canonical cutover. This historical migration path
+uses the explicit `exordos/exordos-production-migration.yaml` build config so
+its accepted mail root remains available only for compatibility and rollback:
 
 1. a compatibility version that preserves the exact current backend root and
    introduces the newly built mail root without enabling the writer gate;

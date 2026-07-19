@@ -105,8 +105,7 @@ def _manifest(version, *, canonical):
                                 "node": "$core.compute.nodes.$workspace_mail:uuid"
                             },
                             "path": (
-                                "/usr/local/bin/"
-                                "workspace-smtp-ingress-attester run"
+                                "/usr/local/bin/workspace-smtp-ingress-attester run"
                             ),
                         }
                     }
@@ -121,8 +120,7 @@ def _manifest(version, *, canonical):
                         "kind": "A",
                         "name": "workspace-mail",
                         "address": (
-                            "$core.compute.nodes.$workspace_mail:"
-                            "default_network:ipv4"
+                            "$core.compute.nodes.$workspace_mail:default_network:ipv4"
                         ),
                     },
                 }
@@ -147,13 +145,11 @@ def _run_verifier(
     if missing_retained_resource == "mail_config":
         del manifest["resources"]["$core.config.configs"]["workspace_mail_config"]
     elif missing_retained_resource == "mail_pki":
-        del manifest["resources"]["$core.config.configs"][
-            "workspace_mail_pki_config"
-        ]
+        del manifest["resources"]["$core.config.configs"]["workspace_mail_pki_config"]
     elif missing_retained_resource == "mail_dns":
-        del manifest["resources"][
-            "$workspace.imports.$core_local_domain.records"
-        ]["workspace_mail"]
+        del manifest["resources"]["$workspace.imports.$core_local_domain.records"][
+            "workspace_mail"
+        ]
     manifest["resources"]["$core.compute.nodes"]["workspace_backend"]["disk_spec"][
         "disks"
     ][0]["image"] = backend_image
@@ -207,6 +203,9 @@ def test_production_migration_workflow_builds_four_secret_scoped_artifacts():
     )[1]
 
     assert "production_migration" in workflow
+    assert (
+        "EXORDOS_MIGRATION_CFG: exordos/exordos-production-migration.yaml" in workflow
+    )
     assert "WORKSPACE_PRODUCTION_CURRENT_BACKEND_IMAGE_URN" in migration
     assert "WORKSPACE_PRODUCTION_CURRENT_MAIL_IMAGE_URN" in migration
     assert "WORKSPACE_PRODUCTION_MIGRATION_EVIDENCE_DIR" in migration
@@ -216,6 +215,7 @@ def test_production_migration_workflow_builds_four_secret_scoped_artifacts():
     first_push = migration.index('push_immutable "${compatibility_dir}"')
     assert migration.index("messenger_storage_mode=mail_projection") < first_push
     assert "mail_migration_compatibility=true" in migration
+    assert migration.count('--exordos-cfg-file "${EXORDOS_MIGRATION_CFG}"') == 4
     assert "mail_migration_stage1=true" not in migration
     assert migration.index("mail_migration_cutover_keep_legacy_disk=true") < first_push
     assert migration.index("STAGE_BACKEND_IMAGE_URN") < migration.index(
@@ -224,13 +224,13 @@ def test_production_migration_workflow_builds_four_secret_scoped_artifacts():
     assert migration.index("COMPATIBILITY_MAIL_IMAGE_URN") < migration.index(
         "messenger_storage_mode=postgresql_canonical"
     )
-    stage_build = migration.split(
-        '> "${archive_tmp}/stage-build.log" 2>&1', 1
-    )[0].rsplit('if ! "${EXORDOS_BIN}" build .', 1)[1]
+    stage_build = migration.split('> "${archive_tmp}/stage-build.log" 2>&1', 1)[
+        0
+    ].rsplit('if ! "${EXORDOS_BIN}" build .', 1)[1]
     assert 'workspace_mail_image="${CURRENT_MAIL_IMAGE_URN}"' not in stage_build
-    assert migration.count(
-        'workspace_mail_image="${COMPATIBILITY_MAIL_IMAGE_URN}"'
-    ) == 3
+    assert (
+        migration.count('workspace_mail_image="${COMPATIBILITY_MAIL_IMAGE_URN}"') == 3
+    )
     assert (
         migration.index(
             'rollback_version="${rollback_version_base}-${version_channel}+'
