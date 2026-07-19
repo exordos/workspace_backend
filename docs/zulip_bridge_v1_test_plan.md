@@ -7,8 +7,8 @@ behavior must remain green throughout the rollout.
 
 Canonical Messenger resources and provider commands live in PostgreSQL and are
 exchanged through the private Workspace Provider API. This plan must be run
-with the migration, no-mail-runtime, recovery, and load gates in
-[`postgresql_canonical_messenger_test_plan.md`](postgresql_canonical_messenger_test_plan.md).
+with the recovery and load gates in
+[`messenger_regression_test_plan.md`](messenger_regression_test_plan.md).
 
 ## Required environment
 

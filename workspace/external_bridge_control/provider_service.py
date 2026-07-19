@@ -10,7 +10,6 @@ import typing
 import uuid as sys_uuid
 
 from workspace.external_bridge_control import provider_data
-from workspace.messenger_migration import writer_gate
 
 
 API_ROOT = "/api/workspace-provider/v1"
@@ -69,13 +68,6 @@ class ProviderDataService:
             if self.apply_event is None:
                 raise ProviderIngressUnavailableError(
                     "Canonical provider event application is not enabled"
-                )
-            project_ids = {event["project_id"] for event in payload.get("events", ())}
-            for project_id in project_ids:
-                writer_gate.assert_writable(
-                    session,
-                    project_id,
-                    "external_bridge",
                 )
             return provider_data.apply_provider_event_batch(
                 session,

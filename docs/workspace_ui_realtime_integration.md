@@ -84,7 +84,7 @@ socket additionally sends typed `ready` and cursor-error control messages.
 
 Top-level fields describe the event row. Resource identifiers live in
 `payload`, and `payload.kind` is the only `kind` field on the event payload.
-The local mail representation is an internal persistence detail and never
+The local persistence representation is an internal detail and never
 appears in this public event shape.
 
 Create, update, read, and action events carry the same full object snapshot as

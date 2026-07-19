@@ -13,7 +13,6 @@ import pytest
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api.api import sql_canonical_store
-from workspace.messenger_api.api import store as api_store
 
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
@@ -226,10 +225,12 @@ def test_file_list_uses_scoped_acl_without_public_user_cross_product(monkeypatch
 def test_public_file_view_has_no_users_cross_join():
     migration = (
         __import__("pathlib").Path(__file__).parents[3]
-        / "migrations/0109-add-scalable-Messenger-visibility-views-0ae35f.py"
+        / "migrations/0113-remove-legacy-Messenger-mail-storage-eec69a.py"
     ).read_text()
 
     assert "CROSS JOIN" not in migration
+    assert 'JOIN "m_workspace_stream_bindings" AS bindings' in migration
+    assert 'JOIN "m_workspace_file_accesses" AS accesses' not in migration
     assert 'NULL::UUID AS "viewer_user_uuid"' in migration
 
 
@@ -692,11 +693,7 @@ def test_canonical_factory_separates_event_store_without_mail_runtime():
     factory = sql_canonical_store.SQLCanonicalMessengerStoreFactory()
 
     with factory(PROJECT_UUID, USER_UUID) as store:
-        assert isinstance(store, api_store.WriterGateStoreProxy)
-        assert isinstance(
-            store._store,
-            sql_canonical_store.SQLCanonicalMessengerStore,
-        )
+        assert isinstance(store, sql_canonical_store.SQLCanonicalMessengerStore)
     with factory.event_store(PROJECT_UUID, USER_UUID) as store:
         assert isinstance(store, sql_canonical_store.PostgresEventStore)
 

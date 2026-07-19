@@ -565,8 +565,8 @@ class WorkspaceFileController(StoreResourceController):
             }
         )
         with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
-            # Once the sidecar exists, a failing SQL projection must not erase
-            # canonical storage: IMAP replay can repair the disposable row.
+            # Once the sidecar exists, a failing database write must not erase
+            # the already stored file bytes.
             return db.create_resource(self.resource_name, values)
 
     def create(self, **kwargs: typing.Any) -> typing.Any:

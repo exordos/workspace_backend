@@ -8,13 +8,6 @@ defined by
 realtime client behavior is documented in
 [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md).
 
-The previous mail-backed architecture is retained only as design history and
-as context for the controlled import described by
-[`postgresql_canonical_messenger_migration.md`](postgresql_canonical_messenger_migration.md).
-The exact production deployment sequence and rollback boundary are defined in
-[`postgresql_canonical_production_cutover.md`](postgresql_canonical_production_cutover.md).
-It is not the current runtime architecture.
-
 ## Architectural invariants
 
 - Workspace UI communicates only with IAM-authenticated Workspace and
@@ -22,10 +15,7 @@ It is not the current runtime architecture.
 - PostgreSQL is canonical for Messenger resources, membership, user state,
   events, provider mappings, external-account state, commands, and client
   settings.
-- The PostgreSQL-canonical runtime does not read or write SMTP, IMAP, Maildir,
-  Exim, or Dovecot. Retained mail resources are inactive migration and rollback
-  material until the canonical cutover is accepted and those resources are
-  removed separately.
+- Messenger does not read or write SMTP, IMAP, Maildir, Exim, or Dovecot.
 - IAM is the source of Workspace users, projects, bearer-token authentication,
   and authorization scope.
 - File metadata and ACL state are represented in PostgreSQL. File bytes and
@@ -35,6 +25,8 @@ It is not the current runtime architecture.
   Messenger resources into PostgreSQL; browsers never call that API.
 - The public Messenger REST and websocket shapes are independent of the
   persistence and provider implementations.
+- One backend image serves one immutable UI bundle at `/`; the `workspace_ui`
+  `master` head is resolved to an exact commit before the element build starts.
 
 ## Components and trust boundaries
 
@@ -152,7 +144,7 @@ other canonical resources are not removed when old events are pruned. A cursor
 outside the retained suffix receives the typed `epoch_pruned` response and the
 client reloads authoritative snapshots before resuming realtime updates.
 
-## Persistence, migration, and recovery
+## Persistence and recovery
 
 PostgreSQL and S3-compatible storage must survive service and node replacement.
 Recovery restores the database and object storage, applies database migrations,
@@ -160,9 +152,5 @@ and then starts the API, event, worker, and private provider services. Derived
 indexes and caches may be rebuilt from canonical PostgreSQL rows without
 changing public resource identities.
 
-The deployment requires both `messenger_storage.mode=postgresql_canonical` and
-explicit canonical-cutover confirmation before selecting this runtime. During
-the controlled migration, the old Maildir may remain mounted read-only as an
-import and rollback source. Canonical services do not construct mail runtime
-dependencies, and removal of the old mail node, disk, routes, and secrets is a
-separate post-acceptance operation.
+The deployment always starts the PostgreSQL-backed Messenger runtime. There is
+no persistence-mode switch or secondary Messenger journal.

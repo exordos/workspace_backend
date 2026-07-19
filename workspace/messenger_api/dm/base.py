@@ -36,6 +36,19 @@ def random_color() -> int:
     return random.randint(0, COLOR_MAX_VALUE)
 
 
+class Color(types.Integer):
+    def __init__(self) -> None:
+        super().__init__(min_value=0, max_value=COLOR_MAX_VALUE)
+
+    def to_openapi_spec(
+        self,
+        prop_kwargs: dict[str, typing.Any],
+    ) -> dict[str, typing.Any]:
+        prop_kwargs = dict(prop_kwargs)
+        prop_kwargs.pop("default", None)
+        return super().to_openapi_spec(prop_kwargs)
+
+
 class ZulipSource(types_dynamic.AbstractKindModel):
     KIND = "zulip"
 
@@ -254,7 +267,7 @@ class WorkspaceStreamBase(
         default=None,
     )
     color = properties.property(
-        types.Integer(min_value=0, max_value=COLOR_MAX_VALUE),
+        Color(),
         default=random_color,
     )
     default_topic_uuid = properties.property(
@@ -321,7 +334,7 @@ class WorkspaceUserStreamBase(
         default=None,
     )
     color = properties.property(
-        types.Integer(min_value=0, max_value=COLOR_MAX_VALUE),
+        Color(),
         default=random_color,
     )
     last_message_uuid = properties.property(

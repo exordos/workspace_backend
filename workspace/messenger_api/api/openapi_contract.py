@@ -119,8 +119,8 @@ DRAFT_ERROR_SCHEMA = {
 
 DRAFT_SIDE_EFFECTS_DESCRIPTION = (
     "Drafts are PostgreSQL-only client state. This operation emits no Workspace "
-    "events, websocket or desktop notifications, messages, or IMAP/Maildir "
-    "records. Other clients observe changes after reload or an explicit API "
+    "events, websocket or desktop notifications, or messages. Other clients "
+    "observe changes after reload or an explicit API "
     "refetch."
 )
 

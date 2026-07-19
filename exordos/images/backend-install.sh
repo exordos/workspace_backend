@@ -34,13 +34,10 @@ WORKSPACE_BINARIES=(
 )
 WORKSPACE_HELPERS=(
     backend-bootstrap.sh:workspace-bootstrap
-    workspace-mail-ca-sync.py:workspace-mail-ca-sync
-    workspace-mail-healthcheck.py:workspace-mail-healthcheck
     workspace-external-bridge-control-prepare.sh:workspace-external-bridge-control-prepare
     workspace-nginx-reload.sh:workspace-nginx-reload
     workspace-reload-config.sh:workspace-reload-config
     workspace-restart-services.sh:workspace-restart-services
-    workspace-wait-ready.sh:workspace-wait-ready
 )
 
 disable_packaged_nginx_service() {
@@ -87,7 +84,6 @@ fi
 
 sudo mkdir -p \
     "$GC_CFG_DIR" \
-    "$GC_CFG_DIR/tls" \
     /etc/nginx/conf.d \
     /etc/nginx/sites-available \
     /etc/nginx/sites-enabled \
@@ -99,10 +95,8 @@ sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 cd "$GC_PATH"
 uv sync --locked --no-dev
 
-cd "$UI_PATH"
-npm ci --include=dev
-VITE_MESSENGER_ONLY=true npm run build --workspace=web
-test -s "$UI_PATH/packages/web/dist/index.html"
+WORKSPACE_UI_PATH="$UI_PATH" \
+    bash "$GC_PATH/exordos/images/build-workspace-ui.sh"
 
 for binary in "${WORKSPACE_BINARIES[@]}"; do
     sudo ln -sf "$VENV_PATH/bin/$binary" "/usr/bin/$binary"
