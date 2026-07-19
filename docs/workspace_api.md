@@ -10,10 +10,8 @@ external account, chat, operation, policy, health, and bridge-instance
 resources are part of the Messenger API.
 
 Native Messenger resources, membership, user state, events, provider mappings,
-and client settings are canonical in PostgreSQL. The former SMTP/IMAP journal
-is a read-only migration source during the controlled cutover and is not used
-by the PostgreSQL-canonical runtime. The existing provenance fields preserve
-provider identity without changing the browser API.
+and client settings are canonical in PostgreSQL. The existing provenance fields
+preserve provider identity without changing the browser API.
 
 ## Runtime Entry Points
 

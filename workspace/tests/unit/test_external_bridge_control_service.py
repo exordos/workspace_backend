@@ -286,10 +286,7 @@ def test_provider_ingress_is_bound_to_authenticated_bridge_assignment(
 
         def execute(self, statement, params):
             self.statements.append((statement, params))
-            if (
-                "m_messenger_writer_gates_v1" in statement
-                or "pg_advisory_xact_lock" in statement
-            ):
+            if "pg_advisory_xact_lock" in statement:
                 return Result(None)
             return Result(next(self.rows))
 
@@ -314,10 +311,7 @@ def test_provider_ingress_is_bound_to_authenticated_bridge_assignment(
         )
 
     provider_statements = [
-        item
-        for item in session.statements
-        if "m_messenger_writer_gates_v1" not in item[0]
-        and "pg_advisory_xact_lock" not in item[0]
+        item for item in session.statements if "pg_advisory_xact_lock" not in item[0]
     ]
     assert provider_statements[0][1][0] == other_instance_uuid
     assert provider_statements[1][1][2] == other_instance_uuid

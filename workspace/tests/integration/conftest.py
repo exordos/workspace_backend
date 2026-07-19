@@ -52,10 +52,9 @@ from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
-from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import models as messenger_models
-from workspace.tests.integration import memory_mail
 from workspace.workspace_api.api import app as workspace_app
 
 
@@ -73,7 +72,6 @@ MIGRATIONS_DIR = REPO_ROOT / "migrations"
 HEADER_USER = "X-Test-User-Uuid"
 HEADER_PROJECT = "X-Test-Project-Id"
 HEADER_PERMISSIONS = "X-Test-Permissions"
-TEST_MAIL_RUNTIME = memory_mail.RuntimeFactory()
 
 
 # --------------------------------------------------------------------------- #
@@ -266,20 +264,8 @@ class _QuietHandler(wsgiref.simple_server.WSGIRequestHandler):
 def _database():
     """Configure the ORM engine against the test DB and migrate it to HEAD."""
     try:
-        with psycopg.connect(TEST_DB_URL, connect_timeout=3) as connection:
-            smtp_gate_role_exists = connection.execute(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM pg_roles
-                    WHERE rolname = 'workspace_mail_gate'
-                )
-                """
-            ).fetchone()[0]
-            if smtp_gate_role_exists:
-                pytest.skip(
-                    "The integration database must use an isolated PostgreSQL "
-                    "cluster without the workspace_mail_gate role"
-                )
+        with psycopg.connect(TEST_DB_URL, connect_timeout=3):
+            pass
     except Exception as exc:  # pragma: no cover - environment guard
         pytest.skip(
             "Test database is not reachable at %s (%s). Create it with: "
@@ -296,7 +282,7 @@ def _database():
     engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
     engine.apply_migration(engine.get_latest_migration())
     api_store.configure_store_factory(
-        sql_store.SQLProjectedMessengerStoreFactory(TEST_MAIL_RUNTIME)
+        sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
 
     yield
@@ -424,26 +410,6 @@ def seed_user_stream(conn, project_id, user_uuid, name, description="seeded"):
                 str(user_uuid),
             ),
         )
-    TEST_MAIL_RUNTIME.seed_stream(
-        project_id,
-        user_uuid,
-        stream_uuid,
-        {
-            "name": name,
-            "description": description,
-            "kind": "stream",
-            "source_name": "native",
-            "source": {"kind": "native"},
-        },
-    )
-    TEST_MAIL_RUNTIME.seed_binding(
-        project_id,
-        user_uuid,
-        binding_uuid,
-        stream_uuid,
-        user_uuid,
-        "owner",
-    )
     return str(stream_uuid)
 
 
@@ -500,14 +466,6 @@ def seed_user_stream_binding(conn, project_id, stream_uuid, user_uuid, role="mem
                 role,
             ),
         )
-    TEST_MAIL_RUNTIME.seed_binding(
-        project_id,
-        user_uuid,
-        binding_uuid,
-        stream_uuid,
-        user_uuid,
-        role,
-    )
 
 
 def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default=False):
@@ -532,14 +490,6 @@ def seed_stream_topic(conn, project_id, stream_uuid, user_uuid, name, is_default
                 """,
                 (str(topic_uuid), str(stream_uuid), str(project_id)),
             )
-    TEST_MAIL_RUNTIME.seed_topic(
-        project_id,
-        user_uuid,
-        topic_uuid,
-        stream_uuid,
-        name,
-        is_default,
-    )
     return str(topic_uuid)
 
 

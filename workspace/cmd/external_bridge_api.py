@@ -28,7 +28,6 @@ from workspace.external_bridge_control import provider_service
 from workspace.external_bridge_control import server
 from workspace.external_bridge_control import service
 from workspace.external_bridge_control import sql_state
-from workspace.messenger_migration import writer_gate
 
 
 CONF = cfg.CONF
@@ -154,10 +153,6 @@ def main() -> None:
     infra_log.configure()
     log = logging.getLogger(__name__)
     bootstrap_server, private_server = build_runtime(CONF)
-    heartbeat_stop, heartbeat_thread = writer_gate.start_heartbeat(
-        engines.engine_factory.get_engine().session_manager,
-        "external_bridge",
-    )
     bootstrap_thread = threading.Thread(
         target=bootstrap_server.serve_forever,
         name="workspace-bridge-ca-bootstrap",
@@ -172,12 +167,10 @@ def main() -> None:
     try:
         private_server.serve_forever()
     finally:
-        heartbeat_stop.set()
         bootstrap_server.shutdown()
         bootstrap_server.server_close()
         private_server.server_close()
         bootstrap_thread.join()
-        heartbeat_thread.join()
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ build:
         - workspace.egg-info
     - dst: /opt/workspace-ui
       path:
-        src: ../../workspace_ui
+        src: ../build/workspace-ui-source
       exclude:
         - .git
         - node_modules

@@ -821,9 +821,7 @@ outcome require `manual_reconciliation_required`; no further automatic resend
 is allowed.
 
 The exact wire contract is specified in
-[`workspace_provider_api_v1.yaml`](workspace_provider_api_v1.yaml). The legacy
-mail protocol document is retained only as superseded design history and is not
-an implementation input for the PostgreSQL-canonical release.
+[`workspace_provider_api_v1.yaml`](workspace_provider_api_v1.yaml).
 
 ## 9. Binary file-transfer plane
 

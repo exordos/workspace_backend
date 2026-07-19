@@ -6,18 +6,13 @@
 """Storage boundary used by the public Messenger controllers.
 
 The HTTP layer deliberately knows nothing about the canonical persistence
-implementation.  Stores return public-contract dictionaries, so PostgreSQL can
-replace the transitional mail projection without changing the UI API.  Tests
-install an in-memory factory with ``configure_store_factory``.
+implementation. Stores return public-contract dictionaries and tests install an
+in-memory factory with ``configure_store_factory``.
 """
 
 import contextlib
 import typing
 import uuid as sys_uuid
-
-from restalchemy.common import contexts
-
-from workspace.messenger_migration import writer_gate
 
 
 class MessengerStore(typing.Protocol):
@@ -143,53 +138,6 @@ class MessengerStore(typing.Protocol):
 StoreContext = contextlib.AbstractContextManager[MessengerStore]
 StoreFactory = typing.Callable[[sys_uuid.UUID, sys_uuid.UUID], StoreContext]
 
-_MUTATING_METHODS = frozenset(
-    {
-        "sync_iam_identity",
-        "create_resource",
-        "update_resource",
-        "delete_resource",
-        "perform_action",
-        "create_message",
-        "update_message",
-        "delete_message",
-        "create_draft",
-        "update_draft",
-        "delete_draft",
-    }
-)
-
-
-class WriterGateStoreProxy:
-    """Guard the real API store without changing its public contract."""
-
-    def __init__(
-        self,
-        project_uuid: sys_uuid.UUID,
-        store: MessengerStore,
-    ) -> None:
-        self._project_uuid = project_uuid
-        self._store = store
-
-    def __getattr__(self, name: str) -> typing.Any:
-        value = getattr(self._store, name)
-        if name not in _MUTATING_METHODS:
-            return value
-
-        def guarded(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
-            session = contexts.Context().get_session()
-            writer_gate.assert_writable(session, self._project_uuid, "api")
-            return value(*args, **kwargs)
-
-        return guarded
-
-
-def guard_api_store(
-    project_uuid: sys_uuid.UUID,
-    store: MessengerStore,
-) -> WriterGateStoreProxy:
-    return WriterGateStoreProxy(project_uuid, store)
-
 
 class StoreNotConfigured(RuntimeError):
     pass
@@ -200,9 +148,7 @@ def _missing_store_factory(
     user_uuid: sys_uuid.UUID,
 ) -> StoreContext:
     del project_uuid, user_uuid
-    raise StoreNotConfigured(
-        "Messenger mail service is not configured. Install a MessengerStore factory."
-    )
+    raise StoreNotConfigured("Install a MessengerStore factory before serving requests")
 
 
 _store_factory: StoreFactory = _missing_store_factory

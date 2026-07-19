@@ -18,9 +18,8 @@ from restalchemy.storage.sql import migrations
 
 
 class MigrationStep(migrations.AbstractMigrationStep):
-
     def __init__(self):
-        self._depends = ["0110-add-Messenger-canonical-import-ledger-e8e1b2.py"]
+        self._depends = ["0109-add-scalable-Messenger-visibility-views-0ae35f.py"]
 
     @property
     def migration_id(self):
@@ -41,9 +40,7 @@ class MigrationStep(migrations.AbstractMigrationStep):
         )
 
     def downgrade(self, session):
-        session.execute(
-            'DROP INDEX "m_workspace_events_retention_cutoff_idx";'
-        )
+        session.execute('DROP INDEX "m_workspace_events_retention_cutoff_idx";')
 
 
 migration_step = MigrationStep()

@@ -762,7 +762,7 @@ class WorkspaceStreamTopic(
         required=True,
     )
     color = properties.property(
-        types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
+        base.Color(),
         default=base.random_color,
     )
 
@@ -829,7 +829,7 @@ class WorkspaceUserTopic(
         required=True,
     )
     color = properties.property(
-        types.Integer(min_value=0, max_value=base.COLOR_MAX_VALUE),
+        base.Color(),
         default=base.random_color,
     )
     last_message_uuid = properties.property(

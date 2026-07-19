@@ -4,12 +4,14 @@
 # you may not use this file except in compliance with the License.
 
 import json
+from unittest import mock
 
 import webob
 from restalchemy.api import applications
 from restalchemy.api import contexts
 
 from workspace.messenger_api.api import app as messenger_app
+from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.workspace_api.api import app as workspace_app
 
 
@@ -157,6 +159,25 @@ def test_generated_openapi_references_are_self_contained():
         schemas = specification["components"]["schemas"]
         assert schemas["WorkspaceUser_AvatarUpload"] == schemas["WorkspaceUser_Get"]
         _assert_all_local_references_resolve(specification)
+
+
+def test_generated_openapi_color_defaults_are_deterministic():
+    with mock.patch.object(
+        messenger_dm_base.random,
+        "randint",
+        side_effect=AssertionError("OpenAPI generation must not select a color"),
+    ):
+        first_specification = _build_openapi(messenger_app)
+        second_specification = _build_openapi(messenger_app)
+
+    assert first_specification == second_specification
+    color_schemas = {
+        name: schema["properties"]["color"]
+        for name, schema in first_specification["components"]["schemas"].items()
+        if "color" in schema.get("properties", {})
+    }
+    assert color_schemas
+    assert all("default" not in schema for schema in color_schemas.values())
 
 
 def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():

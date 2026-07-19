@@ -22,7 +22,6 @@ set -o pipefail
 GC_PATH="/opt/workspace"
 GC_CFG_DIR="/etc/workspace"
 WORKSPACE_CONFIG="$GC_CFG_DIR/workspace.conf"
-SMTP_GATE_ROLE_CONFIG="$GC_CFG_DIR/smtp-writer-gate-role.conf"
 RUN_DIR="/run/workspace"
 READY_FILE="$RUN_DIR/bootstrap.ready"
 LOCK_FILE="$RUN_DIR/bootstrap.lock"
@@ -36,40 +35,6 @@ flock -x 9
 if [ ! -s "$WORKSPACE_CONFIG" ]; then
     echo "Workspace platform config is not available; deferring bootstrap."
     exit 0
-fi
-
-MESSENGER_STORAGE_MODE="$(
-    python3 - "$WORKSPACE_CONFIG" <<'PY'
-import configparser
-import sys
-
-config = configparser.ConfigParser()
-config.read(sys.argv[1])
-print(config.get("messenger_storage", "mode", fallback="mail_projection"))
-PY
-)"
-if [ "$MESSENGER_STORAGE_MODE" != "postgresql_canonical" ] && \
-        [ ! -s "$SMTP_GATE_ROLE_CONFIG" ]; then
-    echo "Workspace SMTP gate role config is not available; deferring bootstrap."
-    exit 0
-fi
-
-SMTP_GATE_ROLE=""
-if [ "$MESSENGER_STORAGE_MODE" != "postgresql_canonical" ]; then
-    SMTP_GATE_ROLE="$(
-        python3 - "$SMTP_GATE_ROLE_CONFIG" <<'PY'
-import configparser
-import sys
-
-config = configparser.ConfigParser()
-config.read(sys.argv[1])
-print(config["smtp_writer_gate_role"]["name"])
-PY
-    )"
-    if [ "$SMTP_GATE_ROLE" != "workspace_mail_gate" ]; then
-        echo "Workspace SMTP gate role config has an unsupported role name." >&2
-        exit 1
-    fi
 fi
 
 mkdir -p /var/lib/workspace/messenger/files
@@ -116,54 +81,9 @@ until PGPASSWORD="$WORKSPACE_PG_PASS" psql \
     attempt=$((attempt + 1))
 done
 
-if [ -n "$SMTP_GATE_ROLE" ]; then
-    attempt=1
-    until [ "$(
-        PGPASSWORD="$WORKSPACE_PG_PASS" psql \
-            -h "$WORKSPACE_PG_ENDPOINT" \
-            -p "$WORKSPACE_PG_PORT" \
-            -U "$WORKSPACE_PG_USER" \
-            -d "$WORKSPACE_PG_DB" \
-            -Atc "SELECT 1 FROM pg_roles WHERE rolname = 'workspace_mail_gate';" \
-            2>/dev/null
-    )" = "1" ]; do
-        echo "SMTP writer-gate database role attempt $attempt is not ready; waiting 5 seconds"
-        sleep 5
-        attempt=$((attempt + 1))
-    done
-fi
-
 source "$GC_PATH/.venv/bin/activate"
 ra-apply-migration --config-dir "$GC_CFG_DIR" --path "$GC_PATH/migrations"
 deactivate
-if [ -n "$SMTP_GATE_ROLE" ]; then
-    PGPASSWORD="$WORKSPACE_PG_PASS" psql \
-        -h "$WORKSPACE_PG_ENDPOINT" \
-        -p "$WORKSPACE_PG_PORT" \
-        -U "$WORKSPACE_PG_USER" \
-        -d "$WORKSPACE_PG_DB" \
-        --set=ON_ERROR_STOP=1 <<'SQL'
-GRANT SELECT ON
-    "m_messenger_writer_gates_v1",
-    "m_messenger_writer_gate_releases_v1",
-    "m_messenger_writer_instances_v1",
-    "m_messenger_writer_gate_expected_v1",
-    "m_messenger_writer_gate_acks_v1"
-TO "workspace_mail_gate";
-GRANT INSERT, UPDATE ON
-    "m_messenger_writer_instances_v1",
-    "m_messenger_writer_gate_acks_v1"
-TO "workspace_mail_gate";
-DO $bootstrap$
-BEGIN
-    EXECUTE format(
-        'GRANT CONNECT ON DATABASE %I TO "workspace_mail_gate"',
-        current_database()
-    );
-END
-$bootstrap$;
-SQL
-fi
 unset WORKSPACE_PG_PASS
 
 if [[ "$TRACE_ENABLED" -eq 1 ]]; then

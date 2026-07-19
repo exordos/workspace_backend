@@ -26,15 +26,11 @@ from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
-from workspace.common import external_bridge_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
-from workspace.common import messenger_mail_opts
-from workspace.common import messenger_storage_opts
 from workspace.messenger_api.api import app
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
-from workspace.messenger_migration import writer_gate
 
 api_cli_opts = [
     cfg.StrOpt(
@@ -62,9 +58,6 @@ CONF.register_cli_opts(api_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
 iam_opts.register_iam_cli_opts(CONF)
 file_storage_opts.register_opts(CONF)
-external_bridge_opts.register_opts(CONF)
-messenger_mail_opts.register_opts(CONF)
-messenger_storage_opts.register_opts(CONF)
 
 
 def main() -> None:
@@ -85,12 +78,7 @@ def main() -> None:
         CONF.iam.audience,
         CONF.iam.hs256_jwks_decryption_key,
     )
-    api_store.configure_store_factory(
-        store_factory.build_configured_store_factory(
-            CONF,
-            bridge_config=CONF[external_bridge_opts.DOMAIN],
-        )
-    )
+    api_store.configure_store_factory(store_factory.build_store_factory())
 
     for _ in range(CONF[DOMAIN].workers):
         service = bjoern_service.BjoernService(
@@ -103,13 +91,6 @@ def main() -> None:
         service.add_setup(
             lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
         )
-        service.add_setup(
-            lambda: writer_gate.start_heartbeat(
-                engines.engine_factory.get_engine().session_manager,
-                "api",
-            )
-        )
-
         service_hub.add_service(service)
 
     service_hub.start()

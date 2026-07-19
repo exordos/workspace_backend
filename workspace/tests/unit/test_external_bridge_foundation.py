@@ -16,7 +16,8 @@ from restalchemy.api import contexts
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
-from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import resource_projection
+from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.dm import helpers as dm_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.workspace_api.api import app as workspace_app
@@ -57,14 +58,14 @@ def test_projected_external_metadata_round_trips_as_public_nested_contract():
         },
     }
 
-    stored = sql_store.SQLProjectedMessengerStore._projection_values(values)
+    stored = sql_canonical_store.SQLCanonicalMessengerStore._projection_values(values)
     assert stored["external_account_uuid"] == str(account_uuid)
     assert stored["provider_external_id"] == "provider-message-7"
     assert stored["delivery_status"] == "manual_reconciliation_required"
     assert stored["provider_metadata"] == values["provider"]
     assert stored["delivery_metadata"] == values["delivery"]
 
-    public = sql_store._as_dict(stored, "message_reactions")
+    public = resource_projection.as_dict(stored, "message_reactions")
     assert public["provider"] == values["provider"]
     assert public["delivery"] == values["delivery"]
     assert "provider_metadata" not in public
@@ -117,8 +118,7 @@ def test_zb_acc_01_provider_neutral_routes_are_exposed():
         controllers.ExternalOperationController.delete,
         controllers.ExternalProviderPolicyController.update,
         controllers.ExternalProviderPolicyController._change_status,
-        sql_store.SQLDraftStore.filter_draft_page,
-        sql_store.SQLProjectedMessengerStore.filter_draft_page,
+        sql_canonical_store.SQLCanonicalReadStore.filter_draft_page,
         dm_helpers._workspace_session,
         dm_helpers._create_workspace_stream_binding_message_flags,
     ),

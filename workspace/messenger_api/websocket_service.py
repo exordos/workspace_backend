@@ -298,8 +298,8 @@ class MessengerEventsWebsocketServer:
 
     async def _broadcast_epoch(self, epoch_version: int) -> None:
         del epoch_version
-        # PostgreSQL epochs only wake the service; event cursors are per-user
-        # Maildir UIDs and cannot be addressed by the global outbox sequence.
+        # PostgreSQL epochs only wake the service; each connection catches up
+        # from its own per-user event cursor.
         tasks = []
         for bucket in list(self._connections.values()):
             for connection in list(bucket):

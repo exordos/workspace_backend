@@ -3,12 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""PostgreSQL-canonical Messenger store implementation.
-
-This module contains no runtime auto-switch.  The current mail projection stays
-the default until an operator explicitly completes migration and selects the
-PostgreSQL cutover mode.
-"""
+"""PostgreSQL-canonical Messenger store implementation."""
 
 import contextlib
 import collections.abc
@@ -195,13 +190,16 @@ class SQLCanonicalReadStore:
         result = filters.copy()
         model = RESOURCE_MODELS[resource]
         properties = model.properties.properties
-        if "project_id" in properties:
+        if "project_id" in properties and resource != "files":
             result["project_id"] = dm_filters.EQ(self.project_uuid)
         if resource == "files":
             result = dm_filters.AND(
                 result,
                 dm_filters.OR(
-                    {"viewer_user_uuid": dm_filters.EQ(self.user_uuid)},
+                    dm_filters.AND(
+                        {"project_id": dm_filters.EQ(self.project_uuid)},
+                        {"viewer_user_uuid": dm_filters.EQ(self.user_uuid)},
+                    ),
                     {"acl_mode": dm_filters.EQ("public")},
                 ),
             )
@@ -734,6 +732,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
         elif resource == "stream_bindings":
             row = self._binding_for_update(resource_uuid)
+            if self._is_direct_stream(row.stream_uuid):
+                raise ra_exceptions.ValidationErrorException()
             row.update_dm(values=values)
             row.update(session=contexts.Context().get_session())
             helpers.create_workspace_stream_binding_updated_events(row)
@@ -1329,12 +1329,9 @@ class SQLCanonicalMessengerStoreFactory:
         project_uuid: str | sys_uuid.UUID,
         user_uuid: str | sys_uuid.UUID,
     ) -> collections.abc.Iterator[api_store.MessengerStore]:
-        yield api_store.guard_api_store(
-            typing.cast(sys_uuid.UUID, project_uuid),
-            typing.cast(
-                api_store.MessengerStore,
-                SQLCanonicalMessengerStore(project_uuid, user_uuid),
-            ),
+        yield typing.cast(
+            api_store.MessengerStore,
+            SQLCanonicalMessengerStore(project_uuid, user_uuid),
         )
 
     @contextlib.contextmanager
@@ -1356,10 +1353,7 @@ class SQLCanonicalMessengerStoreFactory:
         project_uuid: str | sys_uuid.UUID,
         user_uuid: str | sys_uuid.UUID,
     ) -> collections.abc.Iterator[api_store.MessengerStore]:
-        yield api_store.guard_api_store(
-            typing.cast(sys_uuid.UUID, project_uuid),
-            typing.cast(
-                api_store.MessengerStore,
-                SQLCanonicalMessengerStore(project_uuid, user_uuid),
-            ),
+        yield typing.cast(
+            api_store.MessengerStore,
+            SQLCanonicalMessengerStore(project_uuid, user_uuid),
         )

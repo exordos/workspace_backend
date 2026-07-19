@@ -1,9 +1,8 @@
 # Messenger Regression Test Plan
 
 This plan verifies that PostgreSQL is the canonical Messenger store while the
-current browser-facing API and S3 file behavior remain unchanged. Detailed
-migration, rebuild, recovery, scale, and load acceptance is defined in
-[`postgresql_canonical_messenger_test_plan.md`](postgresql_canonical_messenger_test_plan.md).
+current browser-facing API and S3 file behavior remain unchanged. This plan
+also defines rebuild, recovery, scale, and load acceptance.
 
 ## Acceptance rules
 
@@ -122,29 +121,22 @@ Messenger resources with typed provider metadata.
 
 | ID | Scenario | Expected result |
 | --- | --- | --- |
-| MSG-DEPLOY-001 | Inspect listeners, processes, packages, configuration, and routes after cutover. | Only documented public HTTP/websocket and private Provider API routes are present; no mail runtime or mail protocol listener/client remains. |
+| MSG-DEPLOY-001 | Inspect listeners, processes, packages, configuration, and routes after deployment. | Only documented public HTTP/websocket and private Provider API routes are present; no secondary Messenger persistence runtime remains. |
 | MSG-DEPLOY-002 | Restart backend, PostgreSQL, provider, and S3-facing services after creating messages and files. | Canonical database and S3 state survive and the public API returns the same resources. |
 | MSG-DEPLOY-003 | Replace backend, UI, and provider root images independently while preserving canonical PostgreSQL and S3 data. | Public state, provider mappings, commands, events, and files remain available without reinstall or destructive cleanup. |
 | MSG-DEPLOY-004 | Search the deployment for runtime mail dependencies and observe network counters during acceptance. | Exim, Dovecot, Maildir paths, SMTP/IMAP clients, mail certificates, mail routes, and traffic are absent. |
 | MSG-DEPLOY-005 | Rebuild declared disposable views, counters, search indexes, and caches from canonical PostgreSQL base tables. | The complete public digest and visible UI state match the pre-rebuild baseline. |
-| MSG-DEPLOY-006 | Apply the transitional import and cutover procedure with rollback still available. | Import parity and idempotency pass; the old mail VM remains intact and unused until acceptance. |
-| MSG-DEPLOY-007 | Remove the old mail resources only after full acceptance, then repeat smoke, restart, provider, visible-UI, and critical load tests. | No contract, data, provider, file, event, performance, or availability regression appears after final removal. |
 
 ## Execution order
 
 1. Run the unchanged Messenger unit and integration suite.
 2. Run routing, OpenAPI, IAM, event, Provider API, and S3 contract tests.
-3. Execute the transitional import, parity, idempotency, interruption, and
-   rollback gates without changing the live writer.
-4. Apply an immutable PostgreSQL-canonical backend update and atomically cut
-   over while leaving the old mail VM intact but unused.
-5. Execute the Messenger API, provider, storage, restart, rebuild, failure, and
+3. Apply an immutable backend update while preserving PostgreSQL and S3 data.
+4. Execute the Messenger API, provider, storage, restart, rebuild, failure, and
    isolation scenarios.
-6. Execute the supported journeys in the visible global Playwright MCP browser.
-7. Execute the 150-concurrent-user load and provider workload from the
-   PostgreSQL canonical plan.
-8. Save sanitized evidence in the CASSI test-run archive; remove mail resources
-   only after every required gate is accepted.
+5. Execute the supported journeys in the visible global Playwright MCP browser.
+6. Execute the 150-concurrent-user load and provider workload.
+7. Save sanitized evidence in the CASSI test-run archive.
 
 The run is accepted only when every required scenario passes. Any scenario not
 executed is `NOT RUN` or `BLOCKED`; it must not be reported as verified

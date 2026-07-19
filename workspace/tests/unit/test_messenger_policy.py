@@ -18,9 +18,9 @@ from restalchemy.api import routes as ra_routes
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
-from workspace.messenger_api.api import sql_store
+from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_mail import repository
+from workspace.messenger_api.dm import helpers
 
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
@@ -321,7 +321,7 @@ def test_direct_stream_uses_project_scoped_pair_uuid_and_rejects_self(store_fact
 
     result = controller.create(name="Direct", direct_user_uuid=PEER_UUID)
 
-    expected_uuid = repository.deterministic_dm_uuid(
+    expected_uuid = helpers.deterministic_direct_stream_uuid(
         PROJECT_UUID,
         USER_UUID,
         PEER_UUID,
@@ -406,7 +406,7 @@ def test_file_filter_is_delegated_with_current_scope(store_factory):
 
 def test_reaction_projection_hides_raw_provider_fields_and_nests_delivery():
     account_uuid = sys_uuid.uuid4()
-    result = sql_store._as_dict(
+    result = resource_projection.as_dict(
         {
             "uuid": sys_uuid.uuid4(),
             "provider_uuid": sys_uuid.uuid4(),
@@ -434,107 +434,6 @@ def test_reaction_projection_hides_raw_provider_fields_and_nests_delivery():
     assert "external_account_uuid" not in result
     assert "provider_external_id" not in result
     assert "delivery_status" not in result
-
-
-class _FakeMailRepository:
-    def __init__(self):
-        self.projection = repository.Projection()
-
-    def rebuild(self):
-        return self.projection
-
-
-def test_file_acl_tracks_canonical_membership_dynamically(monkeypatch):
-    monkeypatch.setattr(
-        sql_store.SQLProjectedMessengerStore,
-        "_latest_projection_event_epoch",
-        lambda self: 0,
-    )
-    mail_repository = _FakeMailRepository()
-    service = types.SimpleNamespace(repository=mail_repository)
-    store = sql_store.SQLProjectedMessengerStore(
-        PROJECT_UUID,
-        USER_UUID,
-        service,
-    )
-    stream_uuid = sys_uuid.uuid4()
-    file = types.SimpleNamespace(user_uuid=PEER_UUID, stream_uuid=stream_uuid)
-
-    assert store._can_read_file(file) is False
-    binding_uuid = sys_uuid.uuid4()
-    mail_repository.projection.bindings[binding_uuid] = {
-        "stream_uuid": str(stream_uuid),
-        "user_uuid": str(USER_UUID),
-    }
-    assert store._can_read_file(file) is True
-    mail_repository.projection.bindings.pop(binding_uuid)
-    assert store._can_read_file(file) is False
-    assert (
-        store._can_read_file(
-            types.SimpleNamespace(user_uuid=USER_UUID, stream_uuid=None)
-        )
-        is True
-    )
-
-
-def test_public_file_acl_allows_another_authenticated_workspace_user(monkeypatch):
-    monkeypatch.setattr(
-        sql_store.SQLProjectedMessengerStore,
-        "_latest_projection_event_epoch",
-        lambda self: 0,
-    )
-    service = types.SimpleNamespace(repository=_FakeMailRepository())
-    store = sql_store.SQLProjectedMessengerStore(
-        PROJECT_UUID,
-        USER_UUID,
-        service,
-    )
-    file_uuid = sys_uuid.uuid4()
-    file = types.SimpleNamespace(
-        uuid=file_uuid,
-        user_uuid=PEER_UUID,
-        stream_uuid=None,
-        storage_type="s3",
-    )
-    metadata = types.SimpleNamespace(
-        uuid=file_uuid,
-        owner_uuid=PEER_UUID,
-        acl_mode="public",
-    )
-    monkeypatch.setattr(
-        sql_store.file_storage,
-        "read_workspace_file_metadata",
-        lambda **kwargs: metadata,
-    )
-
-    assert store._can_read_file(file) is True
-
-
-def test_unscoped_file_without_public_sidecar_is_not_visible(monkeypatch):
-    monkeypatch.setattr(
-        sql_store.SQLProjectedMessengerStore,
-        "_latest_projection_event_epoch",
-        lambda self: 0,
-    )
-    service = types.SimpleNamespace(repository=_FakeMailRepository())
-    store = sql_store.SQLProjectedMessengerStore(
-        PROJECT_UUID,
-        USER_UUID,
-        service,
-    )
-    file = types.SimpleNamespace(
-        uuid=sys_uuid.uuid4(),
-        user_uuid=PEER_UUID,
-        stream_uuid=None,
-        storage_type="s3",
-    )
-    monkeypatch.setattr(
-        sql_store.file_storage,
-        "read_workspace_file_metadata",
-        mock.Mock(side_effect=FileNotFoundError),
-    )
-
-    assert store._can_read_file(file) is False
 
 
 def test_file_create_uses_current_scope_and_storage_metadata(store_factory):

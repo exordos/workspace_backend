@@ -13,7 +13,7 @@ import pytest
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_mail import repository
+from workspace.messenger_api.dm import helpers
 
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
@@ -144,7 +144,7 @@ def _controller(controller_class):
     return controller_class(request)
 
 
-def test_message_mutations_use_dedicated_canonical_mail_operations(fake_store):
+def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
     controller = _controller(controllers.WorkspaceMessageController)
 
     created = controller.create(
@@ -181,7 +181,7 @@ def test_direct_chat_is_an_ordinary_stream_with_deterministic_pair_uuid(fake_sto
         invite_only=False,
     )
 
-    expected_uuid = repository.deterministic_dm_uuid(
+    expected_uuid = helpers.deterministic_direct_stream_uuid(
         PROJECT_UUID,
         USER_UUID,
         PEER_UUID,
