@@ -23,7 +23,6 @@ import uuid as sys_uuid
 
 import psycopg
 import websockets
-from restalchemy.common import contexts
 
 from gcl_iam import engines as iam_engines
 from gcl_iam import tokens as iam_tokens
@@ -31,6 +30,7 @@ from gcl_iam import tokens as iam_tokens
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import websocket_protocol
+from workspace.services.messenger_workers import agents as messenger_worker_agents
 
 
 LOG = logging.getLogger(__name__)
@@ -94,8 +94,7 @@ def _call_with_database_session(
     **kwargs: typing.Any,
 ) -> typing.Any:
     """Own one transaction at the standalone websocket worker boundary."""
-    ctx = contexts.Context()
-    with ctx.session_manager():
+    with messenger_worker_agents.database_session_context():
         return callback(**kwargs)
 
 

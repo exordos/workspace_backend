@@ -1446,10 +1446,6 @@ class MessengerEventsTestCase(unittest.TestCase):
             def __exit__(self, exc_type, exc_value, traceback):
                 transitions.append("session_exit")
 
-        class Context:
-            def session_manager(self):
-                return SessionManager()
-
         server = websocket_service.MessengerEventsWebsocketServer(
             db_url="postgresql://example",
             iam_engine_driver=None,
@@ -1472,9 +1468,9 @@ class MessengerEventsTestCase(unittest.TestCase):
 
         with (
             mock.patch.object(
-                websocket_service.contexts,
-                "Context",
-                return_value=Context(),
+                websocket_service.messenger_worker_agents,
+                "database_session_context",
+                return_value=SessionManager(),
             ),
             mock.patch.object(
                 websocket_service.messenger_events,
