@@ -57,6 +57,11 @@ automatically. Before a local `exordos build`, run the same script from the
 repository root. The image build fails if the resulting UI bundle does not use
 the root asset and PWA paths.
 
+For a tagged backend revision, CI publishes the versioned element and refreshes
+`workspace/latest`. The resolver records the selected UI revision in
+`.workspace-ui-ref`; the image build copies it to `/build-ref.txt`, where the
+deployed UI exposes `ref=master` and `commit=<sha>`.
+
 `GET /v1/messenger/server_settings` is public and is handled by middleware for
 Zulip-compatible client bootstrap behavior. Its `realm_icon` is a public URL
 URN derived from the canonical request realm as
