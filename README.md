@@ -55,7 +55,10 @@ resolves the `workspace_ui` `master` head to an immutable commit SHA before
 packaging its source. CI runs `exordos/ci/prepare-workspace-ui-source.sh`
 automatically. Before a local `exordos build`, run the same script from the
 repository root. The image build fails if the resulting UI bundle does not use
-the root asset and PWA paths.
+the root asset and PWA paths. `exordos/workspace-ui.minimum-ref` records the
+minimum UI commit required by the current backend build request; the resolver
+still packages the current `master` head and rejects a source that does not
+contain that commit.
 
 `GET /v1/messenger/server_settings` is public and is handled by middleware for
 Zulip-compatible client bootstrap behavior. Its `realm_icon` is a public URL

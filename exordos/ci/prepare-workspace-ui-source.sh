@@ -11,9 +11,21 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 REPOSITORY="${WORKSPACE_UI_REPOSITORY:-https://github.com/exordos/workspace_ui.git}"
 OUTPUT_DIR="${WORKSPACE_UI_OUTPUT_DIR:-$PROJECT_ROOT/build/workspace-ui-source}"
+MINIMUM_REF_FILE="${WORKSPACE_UI_MINIMUM_REF_FILE:-$PROJECT_ROOT/exordos/workspace-ui.minimum-ref}"
 
 if [[ "$(basename -- "$OUTPUT_DIR")" != "workspace-ui-source" ]]; then
     echo "Workspace UI output directory must end with workspace-ui-source" >&2
+    exit 1
+fi
+
+if [[ ! -f "$MINIMUM_REF_FILE" ]]; then
+    echo "Minimum UI reference file not found at $MINIMUM_REF_FILE" >&2
+    exit 1
+fi
+
+WORKSPACE_UI_MINIMUM_SHA="$(tr -d '[:space:]' < "$MINIMUM_REF_FILE")"
+if [[ -z "$WORKSPACE_UI_MINIMUM_SHA" ]]; then
+    echo "Minimum UI commit SHA in $MINIMUM_REF_FILE is empty" >&2
     exit 1
 fi
 
@@ -32,6 +44,12 @@ git -C "$REPOSITORY_DIR" fetch --quiet --force --prune origin \
 WORKSPACE_UI_SHA="$(
     git -C "$REPOSITORY_DIR" rev-parse "refs/remotes/origin/master^{commit}"
 )"
+
+if ! git -C "$REPOSITORY_DIR" merge-base --is-ancestor \
+    "$WORKSPACE_UI_MINIMUM_SHA" "$WORKSPACE_UI_SHA" 2>/dev/null; then
+    echo "Workspace UI master does not contain required commit $WORKSPACE_UI_MINIMUM_SHA" >&2
+    exit 1
+fi
 
 mkdir -p "$SOURCE_DIR"
 git -C "$REPOSITORY_DIR" archive "$WORKSPACE_UI_SHA" | tar -x -C "$SOURCE_DIR"

@@ -67,8 +67,11 @@ def test_workspace_ui_source_resolver_uses_master_head(tmp_path, monkeypatch):
     ).stdout.strip()
 
     output_dir = tmp_path / "workspace-ui-source"
+    minimum_ref = tmp_path / "workspace-ui.minimum-ref"
+    minimum_ref.write_text(f"{master_sha}\n")
     monkeypatch.setenv("WORKSPACE_UI_REPOSITORY", str(repository))
     monkeypatch.setenv("WORKSPACE_UI_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKSPACE_UI_MINIMUM_REF_FILE", str(minimum_ref))
     subprocess.run(
         [str(PROJECT_ROOT / "exordos/ci/prepare-workspace-ui-source.sh")],
         check=True,
@@ -83,6 +86,78 @@ def test_workspace_ui_source_resolver_uses_master_head(tmp_path, monkeypatch):
     assert (output_dir / "resolved-ref.env").read_text() == (
         f"WORKSPACE_UI_REF=master\nWORKSPACE_UI_SHA={master_sha}\n"
     )
+
+
+def test_workspace_ui_source_resolver_rejects_missing_minimum_commit(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "workspace_ui"
+    repository.mkdir()
+    _run_git(repository, "init", "--initial-branch=master")
+    _run_git(repository, "config", "user.name", "CASSI Test")
+    _run_git(repository, "config", "user.email", "cassi@example.test")
+    (repository / "channel.txt").write_text("master\n")
+    _run_git(repository, "add", "channel.txt")
+    _run_git(repository, "commit", "-m", "master head")
+
+    output_dir = tmp_path / "workspace-ui-source"
+    minimum_ref = tmp_path / "workspace-ui.minimum-ref"
+    missing_sha = "0" * 40
+    minimum_ref.write_text(f"{missing_sha}\n")
+    monkeypatch.setenv("WORKSPACE_UI_REPOSITORY", str(repository))
+    monkeypatch.setenv("WORKSPACE_UI_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKSPACE_UI_MINIMUM_REF_FILE", str(minimum_ref))
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "exordos/ci/prepare-workspace-ui-source.sh")],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "does not contain required commit" in result.stderr
+    assert not output_dir.exists()
+
+
+def test_workspace_ui_source_resolver_rejects_missing_minimum_ref_file(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "workspace-ui-source"
+    minimum_ref = tmp_path / "missing.minimum-ref"
+    monkeypatch.setenv("WORKSPACE_UI_REPOSITORY", str(tmp_path / "not-cloned"))
+    monkeypatch.setenv("WORKSPACE_UI_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKSPACE_UI_MINIMUM_REF_FILE", str(minimum_ref))
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "exordos/ci/prepare-workspace-ui-source.sh")],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr == f"Minimum UI reference file not found at {minimum_ref}\n"
+    assert not output_dir.exists()
+
+
+def test_workspace_ui_source_resolver_rejects_empty_minimum_ref_file(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / "workspace-ui-source"
+    minimum_ref = tmp_path / "workspace-ui.minimum-ref"
+    minimum_ref.write_text(" \n\t")
+    monkeypatch.setenv("WORKSPACE_UI_REPOSITORY", str(tmp_path / "not-cloned"))
+    monkeypatch.setenv("WORKSPACE_UI_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("WORKSPACE_UI_MINIMUM_REF_FILE", str(minimum_ref))
+
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "exordos/ci/prepare-workspace-ui-source.sh")],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr == f"Minimum UI commit SHA in {minimum_ref} is empty\n"
+    assert not output_dir.exists()
 
 
 def test_workspace_ui_bundle_builder_uses_root_base_path(tmp_path, monkeypatch):
