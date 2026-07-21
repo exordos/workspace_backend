@@ -123,7 +123,7 @@ Messenger resources with typed provider metadata.
 | --- | --- | --- |
 | MSG-DEPLOY-001 | Inspect listeners, processes, packages, configuration, and routes after deployment. | Only documented public HTTP/websocket and private Provider API routes are present; no secondary Messenger persistence runtime remains. |
 | MSG-DEPLOY-002 | Restart backend, PostgreSQL, provider, and S3-facing services after creating messages and files. | Canonical database and S3 state survive and the public API returns the same resources. |
-| MSG-DEPLOY-003 | Replace backend, UI, and provider root images independently while preserving canonical PostgreSQL and S3 data. | Public state, provider mappings, commands, events, and files remain available without reinstall or destructive cleanup. |
+| MSG-DEPLOY-003 | Replace the backend and provider root images and the UI artifact independently while preserving canonical PostgreSQL and S3 data. | Public state, provider mappings, commands, events, and files remain available without reinstall or destructive cleanup. |
 | MSG-DEPLOY-004 | Search the deployment for runtime mail dependencies and observe network counters during acceptance. | Exim, Dovecot, Maildir paths, SMTP/IMAP clients, mail certificates, mail routes, and traffic are absent. |
 | MSG-DEPLOY-005 | Rebuild declared disposable views, counters, search indexes, and caches from canonical PostgreSQL base tables. | The complete public digest and visible UI state match the pre-rebuild baseline. |
 
