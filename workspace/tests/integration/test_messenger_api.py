@@ -4300,7 +4300,7 @@ def test_stream_topic_is_done_flag(api, db):
     assert resp.status_code == 200, resp.text
     assert resp.json()["is_done"] is False
 
-    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/toggle_done/")
+    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/actions/toggle_done/invoke")
     assert resp.status_code == 200, resp.text
     assert resp.json()["is_done"] is True
 
@@ -4331,7 +4331,7 @@ def test_stream_topic_is_done_flag(api, db):
         assert payload["stream_uuid"] == stream_uuid
         assert payload["is_done"] is True
 
-    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/toggle_done/")
+    resp = api.post(f"{STREAM_TOPICS}{topic_uuid}/actions/toggle_done/invoke")
     assert resp.status_code == 200, resp.text
     assert resp.json()["is_done"] is False
 

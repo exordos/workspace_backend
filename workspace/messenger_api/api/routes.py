@@ -308,22 +308,8 @@ class WorkspaceEpochRoute(routes.Route):
     ]
 
 
-class WorkspaceStreamTopicToggleDoneRoute(routes.Route):
+class WorkspaceStreamTopicToggleDoneAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
-    __allow_methods__ = [
-        routes.CREATE,
-    ]
-
-    def do(
-        self,
-        parent_resource: typing.Any = None,
-        **kwargs: typing.Any,
-    ) -> typing.Any:
-        controller = self.get_controller(request=self._req)
-        return controller.toggle_done.do_post(
-            controller=controller,
-            resource=parent_resource,
-        )
 
 
 class WorkspaceStreamTopicNotificationsAction(routes.Action):
@@ -372,9 +358,9 @@ class WorkspaceStreamTopicRoute(routes.Route):
         routes.DELETE,
     ]
 
-    toggle_done = routes.route(
-        WorkspaceStreamTopicToggleDoneRoute,
-        resource_route=True,
+    toggle_done = routes.action(
+        WorkspaceStreamTopicToggleDoneAction,
+        invoke=True,
     )
     notifications = routes.action(
         WorkspaceStreamTopicNotificationsAction,
