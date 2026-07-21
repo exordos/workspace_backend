@@ -50,25 +50,23 @@ Nginx exposes:
 - OpenAPI spec: `/api/workspace/specifications/3.0.3`
 - Upload request limit: `50m`
 
-The backend image serves one Workspace UI build at `/`. The element build
-resolves the `workspace_ui` `master` head to an immutable commit SHA before
-packaging its source. CI runs `exordos/ci/prepare-workspace-ui-source.sh`
-automatically. Before a local `exordos build`, run the same script from the
-repository root. The image build fails if the resulting UI bundle does not use
-the root asset and PWA paths.
+The backend image contains only the Workspace services and their internal nginx
+API gateway. The independently versioned `workspace_ui` element owns the public
+load balancer, serves its immutable web artifact at `/`, and proxies `/api/` to
+the `backend_node` resource exported by this element. Backend releases no longer
+resolve, build, or package UI source.
 
-For a tagged backend revision, CI publishes the versioned element and refreshes
-`workspace/latest`. The resolver records the selected UI revision in
-`.workspace-ui-ref`; the image build copies it to `/build-ref.txt`, where the
-deployed UI exposes `ref=master` and `commit=<sha>`.
+For a tagged backend revision, CI publishes the versioned backend element and
+refreshes `workspace/latest`. Updating the UI does not rebuild or replace the
+backend VM.
 
 `GET /v1/messenger/server_settings` is public and is handled by middleware for
 Zulip-compatible client bootstrap behavior. Its `realm_icon` is a public URL
 URN derived from the canonical request realm as
-`urn:url:<realm>/logo-512x512.png`; nginx serves that path without
-authentication from the packaged `pwa-512x512.png` organization emblem. All
-other Workspace and Messenger resources are scoped using the IAM bearer token,
-its user UUID, and its project ID.
+`urn:url:<realm>/logo-512x512.png`; the `workspace_ui` load balancer serves that
+path from its versioned web artifact. All other Workspace and Messenger
+resources are scoped using the IAM bearer token, its user UUID, and its project
+ID.
 
 An event cursor is the pair `(epoch_generation, epoch_version)`. A cold
 connection may use `last_epoch_version=0` without a generation; every non-zero

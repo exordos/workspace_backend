@@ -26,7 +26,9 @@ Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
-The deployed nginx manifest exposes the UI contract through:
+The backend nginx manifest exposes these internal gateway routes. The public
+`workspace_ui` load balancer proxies `/api/` to this gateway without rewriting
+the path:
 
 ```text
 Workspace REST root: /api/workspace/v1/...
@@ -42,8 +44,8 @@ the Workspace REST service on `127.0.0.1:21084`.
 The exact nginx location `/api/workspace/v1/events/ws` is proxied to the
 websocket service endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
-The deployed nginx manifest sets `client_max_body_size 50m` for proxied
-requests.
+The backend nginx manifest sets `client_max_body_size 50m` for proxied requests.
+It does not serve the web UI; unmatched non-API paths return `404`.
 
 ## General Rules
 

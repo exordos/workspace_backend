@@ -44,16 +44,14 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
 
 
-def test_manifest_routes_one_workspace_ui_from_root():
+def test_manifest_exposes_only_api_routes_from_the_backend_node():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 
-    assert "location = /beta" not in manifest
-    assert "location ^~ /beta/" not in manifest
-    assert "workspace-ui-beta" not in manifest
-    assert "location = /extreme" not in manifest
-    assert "location ^~ /extreme/" not in manifest
-    assert "workspace-ui-extreme" not in manifest
-    assert "root /opt/workspace-ui/packages/web/dist;" in manifest
+    assert "location /api/workspace/" in manifest
+    assert "location = /api/workspace/v1/events/ws" in manifest
+    assert "root /opt/workspace-ui" not in manifest
+    assert "alias /opt/workspace-ui" not in manifest
+    assert "location / {\n                  return 404;" in manifest
 
 
 def test_backend_bootstrap_has_no_secondary_storage_gate():

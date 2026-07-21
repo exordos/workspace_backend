@@ -25,14 +25,16 @@ realtime client behavior is documented in
   Messenger resources into PostgreSQL; browsers never call that API.
 - The public Messenger REST and websocket shapes are independent of the
   persistence and provider implementations.
-- One backend image serves one immutable UI bundle at `/`; the `workspace_ui`
-  `master` head is resolved to an exact commit before the element build starts.
+- The backend image contains no UI source or bundle. The independently
+  versioned `workspace_ui` element owns the public load balancer, serves the
+  immutable web artifact, and proxies `/api/` to the exported backend node.
 
 ## Components and trust boundaries
 
 ```mermaid
 flowchart LR
     UI["Workspace UI"]
+    LB["Workspace UI load balancer"]
     IAM["Exordos Core IAM"]
     API["Workspace and Messenger APIs"]
     EVENTS["Event REST catch-up and WebSocket"]
@@ -42,9 +44,10 @@ flowchart LR
     PG[("Canonical PostgreSQL")]
     S3[("S3-compatible file storage")]
 
-    UI -->|"interactive login"| IAM
-    UI -->|"Bearer token"| API
-    UI <--> EVENTS
+    UI --> LB
+    LB -->|"interactive login"| IAM
+    LB -->|"Bearer token"| API
+    LB <--> EVENTS
     API --> PG
     EVENTS --> PG
     WORKER --> PG

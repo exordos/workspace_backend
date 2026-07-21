@@ -379,13 +379,8 @@ resources:
                   proxy_set_header X-Forwarded-Proto https;
               }
 
-              location = /logo-512x512.png {
-                  alias /opt/workspace-ui/packages/web/dist/pwa-512x512.png;
-              }
-
               location / {
-                  root /opt/workspace-ui/packages/web/dist;
-                  try_files $uri $uri/ /index.html;
+                  return 404;
               }
           }
 

@@ -29,18 +29,6 @@ build:
         - cover
         - output
         - workspace.egg-info
-    - dst: /opt/workspace-ui
-      path:
-        src: ../build/workspace-ui-source
-      exclude:
-        - .git
-        - node_modules
-        - playwright-report
-        - e2e/results
-        - packages/web/dist
-        - packages/electron-app/dist
-        - packages/electron-app/release
-
   elements:
     - manifest: manifests/workspace.yaml.j2
       images:

@@ -23,7 +23,6 @@ set -o pipefail
 GC_PATH="/opt/workspace"
 GC_CFG_DIR=/etc/workspace
 VENV_PATH="$GC_PATH/.venv"
-UI_PATH="/opt/workspace-ui"
 
 WORKSPACE_BINARIES=(
     workspace-api
@@ -67,9 +66,6 @@ sudo env DEBIAN_FRONTEND=noninteractive apt-get \
 
 sudo systemctl enable ssh.service
 
-WORKSPACE_NODE_MAJOR="$(tr -d '[:space:]' < "$UI_PATH/.nvmrc")" \
-    bash "$GC_PATH/exordos/images/install-node-toolchain.sh"
-
 if ! getent group workspace >/dev/null; then
     sudo groupadd --system workspace
 fi
@@ -94,9 +90,6 @@ sudo cp "$GC_PATH/etc/workspace/logging.yaml" "$GC_CFG_DIR/"
 
 cd "$GC_PATH"
 uv sync --locked --no-dev
-
-WORKSPACE_UI_PATH="$UI_PATH" \
-    bash "$GC_PATH/exordos/images/build-workspace-ui.sh"
 
 for binary in "${WORKSPACE_BINARIES[@]}"; do
     sudo ln -sf "$VENV_PATH/bin/$binary" "/usr/bin/$binary"
