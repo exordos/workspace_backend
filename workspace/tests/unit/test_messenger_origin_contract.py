@@ -239,6 +239,10 @@ ACTION_MANIFEST = {
         controllers.WorkspaceStreamController,
         True,
     ),
+    (routes.WorkspaceStreamTopicRoute, "toggle_done"): (
+        controllers.WorkspaceStreamTopicController,
+        True,
+    ),
     (routes.WorkspaceStreamTopicRoute, "notifications"): (
         controllers.WorkspaceStreamTopicController,
         True,
@@ -301,11 +305,6 @@ def test_messenger_action_manifest_is_preserved():
         assert issubclass(action_class, ra_routes.Action)
         assert action_class.__controller__ is controller_class
         assert action_class.is_invoke() is invoke
-
-    toggle_done = routes.WorkspaceStreamTopicRoute.toggle_done
-    assert toggle_done is routes.WorkspaceStreamTopicToggleDoneRoute
-    assert toggle_done.__controller__ is controllers.WorkspaceStreamTopicController
-    assert set(toggle_done.__allow_methods__) == {ra_routes.CREATE}
 
 
 def test_server_settings_origin_path_and_fields_are_preserved():

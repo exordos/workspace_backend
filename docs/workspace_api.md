@@ -297,7 +297,7 @@ authoritative snapshots before starting a new cursor.
 | `GET` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}` | Get a topic. |
 | `PUT` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}` | Rename a topic; body must contain `name`. |
 | `DELETE` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}` | Delete a topic. |
-| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/toggle_done/` | Toggle the shared `is_done` flag for all topic users. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` | Toggle the shared `is_done` flag for all topic users. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/notifications/invoke` | Set current user's topic notification mode. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` | Make the topic its stream's default topic. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/read/invoke` | Mark all unread topic messages as read for the current user. |
@@ -869,8 +869,8 @@ checks that the current user has a binding to the topic's stream before
 renaming the topic. Native changes update canonical PostgreSQL state and their
 realtime side effects atomically. Provenance remains unchanged by a rename.
 
-`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/toggle_done/` flips `is_done` for all
-topic users and returns the current user's updated topic view.
+`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` flips
+`is_done` for all topic users and returns the current user's updated topic view.
 
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` sets the
 topic as its stream's default and returns the current user's updated topic
