@@ -4,6 +4,8 @@
 # you may not use this file except in compliance with the License.
 
 import pathlib
+import subprocess
+import sys
 
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
@@ -25,6 +27,29 @@ def test_all_messenger_entrypoints_use_the_canonical_factory():
     ):
         source = pathlib.Path(relative_path).read_text()
         assert "store_factory.build_store_factory()" in source
+
+
+def test_all_messenger_http_entrypoints_register_external_bridge_options():
+    for module in (
+        "workspace.cmd.messenger_api",
+        "workspace.cmd.workspace_api",
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from oslo_config import cfg; "
+                    f"import {module}; "
+                    "assert cfg.CONF['external_bridge'].realm_uuid is None"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
 
 
 def test_projection_move_is_delegated_to_configured_storage_factory():
