@@ -9,6 +9,8 @@ import uuid as sys_uuid
 import pytest
 
 from workspace.external_bridge_control import provider_event_apply
+from workspace.messenger_api import external_projection
+from workspace.messenger_api.dm import message_payloads
 
 
 class Result:
@@ -62,6 +64,177 @@ def _message_event(stream_uuid):
     }
 
 
+def _topic_event(stream_uuid):
+    return {
+        "provider_event_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(sys_uuid.uuid4()),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(sys_uuid.uuid4()),
+        "provider_sequence": "41",
+        "kind": "topic.upsert",
+        "payload": {
+            "resource": {
+                "uuid": str(sys_uuid.uuid4()),
+                "stream_uuid": str(stream_uuid),
+                "name": "Provider topic",
+                "source_name": "zulip",
+                "source": {"kind": "zulip"},
+                "provider_external_id": "zulip-topic-41",
+            }
+        },
+    }
+
+
+def test_topic_upsert_repairs_missing_projection_owner_binding(monkeypatch):
+    identity = _identity()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    event = _topic_event(stream_uuid)
+    session = Session(
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+            "provider_chat_id": "zulip-channel-7",
+            "display_name": "Provider stream",
+            "source": {
+                "chat_type": "channel",
+                "description": "",
+                "topics": [],
+            },
+            "capabilities": {},
+            "account_settings": {"server_url": "https://zulip.example.test"},
+        }
+    )
+    ensure_calls = []
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "ensure_external_chat_stream",
+        lambda *args, **kwargs: ensure_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
+    topic_calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_workspace_user_stream_topic",
+        lambda *args, **kwargs: topic_calls.append((args, kwargs)),
+    )
+
+    target_uuid = provider_event_apply.apply_event(event, session, identity)
+
+    project_id = sys_uuid.UUID(event["project_id"])
+    assert target_uuid == sys_uuid.UUID(event["payload"]["resource"]["uuid"])
+    assert ensure_calls[0][1]["project_id"] == project_id
+    assert ensure_calls[0][1]["owner_user_uuid"] == owner_uuid
+    assert ensure_calls[0][1]["projection_stream_uuid"] == stream_uuid
+    assert ensure_calls[0][1]["external_account_uuid"] == sys_uuid.UUID(
+        event["external_account_uuid"]
+    )
+    assert topic_calls[0][0][0:2] == (project_id, owner_uuid)
+    assert topic_calls[0][1] == {"session": session}
+    assert topic_calls[0][0][2]["uuid"] == sys_uuid.UUID(
+        event["payload"]["resource"]["uuid"]
+    )
+    assert topic_calls[0][0][2]["stream_uuid"] == stream_uuid
+
+
+def test_missing_external_chat_stream_is_materialized(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    created = []
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStream",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None)
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_or_create_workspace_user_stream",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+
+    external_projection.ensure_external_chat_stream(
+        object(),
+        project_id=project_uuid,
+        owner_user_uuid=owner_uuid,
+        projection_stream_uuid=stream_uuid,
+        bridge_instance_uuid=bridge_uuid,
+        external_account_uuid=account_uuid,
+        provider_kind="zulip",
+        provider_chat_id="channel:7",
+        display_name="Engineering",
+        source={"chat_type": "channel", "description": "Team", "topics": []},
+        capabilities={"messenger.message.send": {"available": True}},
+        account_settings={"server_url": "https://zulip.example.test"},
+    )
+
+    args, values = created[0]
+    assert args == (project_uuid, owner_uuid)
+    assert values["uuid"] == stream_uuid
+    assert values["name"] == "Engineering"
+    assert values["create_default_topic"] is False
+    assert values["source_name"] == "zulip"
+    assert values["source"].stream_id == 7
+    assert values["provider_uuid"] == bridge_uuid
+    assert values["external_account_uuid"] == account_uuid
+
+
+def test_existing_external_chat_stream_repairs_owner_binding(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    stream = types.SimpleNamespace(user_uuid=owner_uuid)
+    binding = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+    created = []
+    emitted = []
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStream",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: stream)
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceUserStream",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None)
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "_create_owner_binding",
+        lambda *args, **kwargs: created.append((args, kwargs)) or binding,
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "create_workspace_stream_binding_events",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    external_projection.ensure_external_chat_stream(
+        object(),
+        project_id=project_uuid,
+        owner_user_uuid=owner_uuid,
+        projection_stream_uuid=stream_uuid,
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        external_account_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        provider_chat_id="channel:7",
+        display_name="Engineering",
+        source={"chat_type": "channel", "description": "Team", "topics": []},
+        capabilities={},
+        account_settings={"server_url": "https://zulip.example.test"},
+    )
+
+    assert created[0][0] == (project_uuid, stream_uuid, owner_uuid, owner_uuid)
+    assert emitted == [((binding,), {"session": created[0][1]["session"]})]
+
+
 def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metadata(
     monkeypatch,
 ):
@@ -105,6 +278,13 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     )
     assert values["provider_metadata"]["external_id"] == "zulip-message-42"
     assert values["provider_metadata"]["capabilities"] == {}
+    assert values["uuid"] == sys_uuid.UUID(event["payload"]["resource"]["uuid"])
+    assert values["stream_uuid"] == stream_uuid
+    assert values["topic_uuid"] == sys_uuid.UUID(
+        event["payload"]["resource"]["topic_uuid"]
+    )
+    assert isinstance(values["payload"], message_payloads.MarkdownPayload)
+    assert values["payload"].content == "hello"
     assert values["compact_events"] is True
 
 

@@ -31,6 +31,7 @@ from workspace.messenger_api import application_services
 from workspace.messenger_api import credential_crypto
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
+from workspace.messenger_api import external_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
@@ -1665,11 +1666,12 @@ class ExternalChatController(ExternalResourceController):
         status: typing.Any,
     ) -> typing.Any:
         session = contexts.Context().get_session()
-        if (
+        unchanged = (
             not resource.transition_pending
             and resource.selected == selected
             and resource.project_id == project_id
-        ):
+        )
+        if unchanged and not selected:
             return resource
         transition_action = None
         if (
@@ -1722,6 +1724,27 @@ class ExternalChatController(ExternalResourceController):
             )
             if not isinstance(maximum, int) or len(selected_chats) >= maximum:
                 raise messenger_exc.ExternalResourceForbiddenError()
+        credential = application_services.external_credential(account, session)
+        bridge_instance_uuid = credential.envelope["associated_data"][
+            "bridge_instance_uuid"
+        ]
+        if selected:
+            external_projection.ensure_external_chat_stream(
+                session,
+                project_id=sys_uuid.UUID(str(project_id)),
+                owner_user_uuid=resource.owner_user_uuid,
+                projection_stream_uuid=resource.projection_stream_uuid,
+                bridge_instance_uuid=sys_uuid.UUID(str(bridge_instance_uuid)),
+                external_account_uuid=resource.external_account_uuid,
+                provider_kind=resource.provider,
+                provider_chat_id=resource.provider_chat_id,
+                display_name=resource.display_name,
+                source=resource.source,
+                capabilities=resource.capabilities,
+                account_settings=account.settings,
+            )
+        if unchanged:
+            return resource
         _update_internal_fields(
             resource,
             {
@@ -1732,10 +1755,6 @@ class ExternalChatController(ExternalResourceController):
             },
             session=session,
         )
-        credential = ExternalAccountController._credential(account, session)
-        bridge_instance_uuid = credential.envelope["associated_data"][
-            "bridge_instance_uuid"
-        ]
         if selected:
             sql_state.append_upsert(
                 session,
