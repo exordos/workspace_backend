@@ -11,7 +11,9 @@ import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 
 
@@ -49,8 +51,12 @@ def _assignment(
     project_id = sys_uuid.UUID(str(event["project_id"]))
     row = session.execute(
         """
-        SELECT "owner_user_uuid", "projection_stream_uuid", "provider_chat_id"
+        SELECT chat."owner_user_uuid", chat."projection_stream_uuid",
+               chat."provider_chat_id", chat."display_name", chat."source",
+               chat."capabilities", account."settings" AS account_settings
         FROM "m_external_chats_v2" AS chat
+        JOIN "m_external_accounts_v2" AS account
+          ON account."uuid" = chat."external_account_uuid"
         WHERE chat."uuid" = %s AND chat."external_account_uuid" = %s
           AND chat."provider" = %s AND chat."project_id" = %s
           AND chat."selected" AND chat."status" IN ('syncing', 'live', 'degraded')
@@ -139,6 +145,40 @@ def _provider_values(
     return {name: value for name, value in resource.items() if name in allowed}
 
 
+def _message_payload(value: typing.Any) -> message_payloads.MarkdownPayload:
+    if isinstance(value, message_payloads.MarkdownPayload):
+        return value
+    if (
+        not isinstance(value, collections.abc.Mapping)
+        or value.get("kind") != message_payloads.MarkdownPayload.KIND
+    ):
+        raise ValueError("Provider message payload kind is not supported")
+    return message_payloads.MarkdownPayload(content=value["content"])
+
+
+def _ensure_projection_owner_stream(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    assignment: typing.Mapping[str, typing.Any],
+    identity: typing.Any,
+    account_uuid: sys_uuid.UUID,
+) -> None:
+    external_projection.ensure_external_chat_stream(
+        session=session,
+        project_id=project_id,
+        owner_user_uuid=assignment["owner_user_uuid"],
+        projection_stream_uuid=assignment["projection_stream_uuid"],
+        bridge_instance_uuid=identity.bridge_instance_uuid,
+        external_account_uuid=account_uuid,
+        provider_kind=identity.provider_kind,
+        provider_chat_id=assignment["provider_chat_id"],
+        display_name=assignment["display_name"],
+        source=assignment["source"],
+        capabilities=assignment["capabilities"],
+        account_settings=assignment["account_settings"],
+    )
+
+
 def _stream_event(
     session: typing.Any,
     event: dict[str, typing.Any],
@@ -181,11 +221,19 @@ def _topic_event(
     project_id: sys_uuid.UUID,
     assignment: typing.Mapping[str, typing.Any],
     resource: dict[str, typing.Any],
+    identity: typing.Any,
 ) -> sys_uuid.UUID:
     topic_uuid = sys_uuid.UUID(str(resource["uuid"]))
     stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
     if stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider topic does not belong to the selected stream")
+    _ensure_projection_owner_stream(
+        session,
+        project_id,
+        assignment,
+        identity,
+        sys_uuid.UUID(str(event["external_account_uuid"])),
+    )
     existing = _existing(models.WorkspaceStreamTopic, project_id, topic_uuid, session)
     if event["kind"] == "topic.delete":
         if existing is None:
@@ -202,6 +250,7 @@ def _topic_event(
         {"color", "name", "source", "source_name", "stream_uuid", "uuid"},
     )
     if existing is None:
+        values.update({"uuid": topic_uuid, "stream_uuid": stream_uuid})
         helpers.create_workspace_user_stream_topic(
             project_id,
             assignment["owner_user_uuid"],
@@ -257,7 +306,17 @@ def _message_event(
             "uuid",
         },
     )
+    if "payload" in values:
+        values["payload"] = _message_payload(values["payload"])
     if existing is None:
+        values.update(
+            {
+                "uuid": message_uuid,
+                "stream_uuid": stream_uuid,
+                "topic_uuid": sys_uuid.UUID(str(resource["topic_uuid"])),
+                "user_uuid": sys_uuid.UUID(str(resource["user_uuid"])),
+            }
+        )
         helpers.create_workspace_user_message(
             project_id,
             values.pop("user_uuid"),
@@ -325,6 +384,7 @@ def _reaction_event(
         {"emoji_name", "message_uuid", "uuid"},
     )
     if existing is None:
+        values.update({"uuid": reaction_uuid, "message_uuid": message_uuid})
         helpers.create_workspace_message_reaction(
             project_id,
             actor_uuid,
@@ -412,7 +472,14 @@ def apply_event(
     if resource_type == "stream":
         return _stream_event(session, event, project_id, assignment, resource)
     if resource_type == "topic":
-        return _topic_event(session, event, project_id, assignment, resource)
+        return _topic_event(
+            session,
+            event,
+            project_id,
+            assignment,
+            resource,
+            identity,
+        )
     if resource_type == "message":
         return _message_event(session, event, project_id, assignment, resource)
     return _reaction_event(session, event, project_id, assignment, resource)

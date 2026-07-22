@@ -20,6 +20,7 @@ from restalchemy.dm import filters as dm_filters
 from workspace.external_bridge_control import state
 from workspace.external_bridge_control import pki
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
 
@@ -97,6 +98,7 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
             )
             existing_by_uuid = {item["topic_uuid"]: item for item in topics}
             topics = []
+            materialized_topic_uuids = set()
             rows = session.execute(
                 """
                 SELECT uuid, name FROM m_workspace_stream_topics
@@ -108,6 +110,7 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
             stream_id = chat.provider_chat_id.removeprefix("channel:")
             for row in rows:
                 topic_uuid = str(row["uuid"])
+                materialized_topic_uuids.add(topic_uuid)
                 existing = existing_by_uuid.get(topic_uuid)
                 if existing is not None:
                     existing["name"] = row["name"]
@@ -128,6 +131,11 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
                         "is_default": False,
                     }
                 )
+            topics.extend(
+                item
+                for topic_uuid, item in existing_by_uuid.items()
+                if topic_uuid not in materialized_topic_uuids
+            )
     default_topic_uuid = next(
         (item["topic_uuid"] for item in topics if item["is_default"]),
         None,
@@ -1448,6 +1456,20 @@ class SQLControlState:
             filters={"uuid": dm_filters.EQ(chat_uuid)}, session=session
         )
         if chat.selected:
+            external_projection.ensure_external_chat_stream(
+                session,
+                project_id=chat.project_id,
+                owner_user_uuid=chat.owner_user_uuid,
+                projection_stream_uuid=chat.projection_stream_uuid,
+                bridge_instance_uuid=identity.bridge_instance_uuid,
+                external_account_uuid=chat.external_account_uuid,
+                provider_kind=chat.provider,
+                provider_chat_id=chat.provider_chat_id,
+                display_name=chat.display_name,
+                source=chat.source,
+                capabilities=chat.capabilities,
+                account_settings=account["settings"],
+            )
             append_upsert(
                 session,
                 identity.bridge_instance_uuid,
