@@ -315,13 +315,13 @@ authoritative snapshots before starting a new cursor.
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Get an owned draft and its strong revision ETag. |
 | `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Replace only the Markdown payload using `If-Match`. |
 | `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Hard-delete an owned draft using `If-Match`. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's realm-global external accounts. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account with a client-generated UUID and write-only credential. |
-| `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Get the owner's sanitized external-account snapshot. |
-| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable non-secret settings using `If-Match`. |
-| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Delete the account and its projection. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validate and replace the write-only credential, then resume synchronization. |
-| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop synchronization while retaining the read-only projection. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's realm-global external accounts; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account with a client-generated UUID and write-only credential; requires `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Get the owner's sanitized external-account snapshot; requires `workspace.external_account.read`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable non-secret settings using `If-Match`; requires `workspace.external_account.update`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Delete the account and its projection; requires `workspace.external_account.delete`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validate and replace the write-only credential, then resume synchronization; requires `workspace.external_account.reconnect`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop synchronization while retaining the read-only projection; requires `workspace.external_account.disconnect`. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/` | List the owner's sanitized external chat catalog and assignment state. |
 | `GET` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}` | Get one sanitized external-chat snapshot. |
 | `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/select/invoke` | Select a chat and assign it to a project. |

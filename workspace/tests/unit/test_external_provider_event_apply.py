@@ -143,7 +143,12 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
     stream_uuid = sys_uuid.uuid4()
     bridge_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
+    member_uuid = sys_uuid.uuid4()
+    session = object()
     created = []
+    created_users = []
+    bound = []
+    deleted = []
     monkeypatch.setattr(
         external_projection.models,
         "WorkspaceStream",
@@ -151,14 +156,49 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
             objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None)
         ),
     )
+
+    class FakeWorkspaceUser:
+        objects = types.SimpleNamespace(
+            get_all=lambda **_kwargs: [types.SimpleNamespace(uuid=owner_uuid)]
+        )
+
+        def __init__(self, **values):
+            self.__dict__.update(values)
+            created_users.append(self)
+
+        def insert(self, session=None):
+            self.insert_session = session
+
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceUser",
+        FakeWorkspaceUser,
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStreamBinding",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_all=lambda **_kwargs: [])
+        ),
+    )
     monkeypatch.setattr(
         external_projection.helpers,
         "get_or_create_workspace_user_stream",
         lambda *args, **kwargs: created.append((args, kwargs)),
     )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_or_create_workspace_stream_bindings",
+        lambda *args, **kwargs: bound.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "delete_workspace_stream_binding",
+        lambda *args, **kwargs: deleted.append((args, kwargs)),
+    )
 
     external_projection.ensure_external_chat_stream(
-        object(),
+        session,
         project_id=project_uuid,
         owner_user_uuid=owner_uuid,
         projection_stream_uuid=stream_uuid,
@@ -167,7 +207,24 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
         provider_kind="zulip",
         provider_chat_id="channel:7",
         display_name="Engineering",
-        source={"chat_type": "channel", "description": "Team", "topics": []},
+        source={
+            "chat_type": "channel",
+            "description": "Team",
+            "topics": [],
+            "participants": [
+                {
+                    "identity_uuid": str(owner_uuid),
+                    "role": "owner",
+                },
+                {
+                    "identity_uuid": str(member_uuid),
+                    "role": "member",
+                    "provider_user_id": "8",
+                    "display_name": "External Member",
+                    "avatar_urn": None,
+                },
+            ],
+        },
         capabilities={"messenger.message.send": {"available": True}},
         account_settings={"server_url": "https://zulip.example.test"},
     )
@@ -181,16 +238,46 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
     assert values["source"].stream_id == 7
     assert values["provider_uuid"] == bridge_uuid
     assert values["external_account_uuid"] == account_uuid
+    assert len(created_users) == 1
+    assert created_users[0].uuid == member_uuid
+    assert created_users[0].source == "zulip"
+    assert created_users[0].provider_uuid == bridge_uuid
+    assert created_users[0].external_account_uuid == account_uuid
+    assert created_users[0].provider_external_id == "8"
+    assert created_users[0].insert_session is session
+    assert bound == [
+        (
+            (),
+            {
+                "project_id": project_uuid,
+                "stream_uuid": stream_uuid,
+                "who_uuid": owner_uuid,
+                "role_user_uuids": {
+                    "owner": [owner_uuid],
+                    "member": [member_uuid],
+                },
+                "session": session,
+            },
+        )
+    ]
+    assert deleted == []
 
 
-def test_existing_external_chat_stream_repairs_owner_binding(monkeypatch):
+def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
+    monkeypatch,
+):
     project_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
     stream = types.SimpleNamespace(user_uuid=owner_uuid)
-    binding = types.SimpleNamespace(uuid=sys_uuid.uuid4())
-    created = []
-    emitted = []
+    member_uuid = sys_uuid.uuid4()
+    stale_member_uuid = sys_uuid.uuid4()
+    native_member_uuid = sys_uuid.uuid4()
+    session = object()
+    bound = []
+    deleted = []
+    stale_binding_uuid = sys_uuid.uuid4()
+    native_binding_uuid = sys_uuid.uuid4()
     monkeypatch.setattr(
         external_projection.models,
         "WorkspaceStream",
@@ -200,24 +287,59 @@ def test_existing_external_chat_stream_repairs_owner_binding(monkeypatch):
     )
     monkeypatch.setattr(
         external_projection.models,
-        "WorkspaceUserStream",
+        "WorkspaceUser",
         types.SimpleNamespace(
-            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None)
+            objects=types.SimpleNamespace(
+                get_all=lambda **kwargs: (
+                    [types.SimpleNamespace(uuid=stale_member_uuid)]
+                    if "provider_uuid" in kwargs["filters"]
+                    else [
+                        types.SimpleNamespace(uuid=owner_uuid),
+                        types.SimpleNamespace(uuid=member_uuid),
+                    ]
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStreamBinding",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_all=lambda **_kwargs: [
+                    types.SimpleNamespace(
+                        uuid=sys_uuid.uuid4(),
+                        user_uuid=owner_uuid,
+                    ),
+                    types.SimpleNamespace(
+                        uuid=sys_uuid.uuid4(),
+                        user_uuid=member_uuid,
+                    ),
+                    types.SimpleNamespace(
+                        uuid=stale_binding_uuid,
+                        user_uuid=stale_member_uuid,
+                    ),
+                    types.SimpleNamespace(
+                        uuid=native_binding_uuid,
+                        user_uuid=native_member_uuid,
+                    ),
+                ]
+            )
         ),
     )
     monkeypatch.setattr(
         external_projection.helpers,
-        "_create_owner_binding",
-        lambda *args, **kwargs: created.append((args, kwargs)) or binding,
+        "get_or_create_workspace_stream_bindings",
+        lambda *args, **kwargs: bound.append((args, kwargs)),
     )
     monkeypatch.setattr(
         external_projection.helpers,
-        "create_workspace_stream_binding_events",
-        lambda *args, **kwargs: emitted.append((args, kwargs)),
+        "delete_workspace_stream_binding",
+        lambda *args, **kwargs: deleted.append((args, kwargs)),
     )
 
     external_projection.ensure_external_chat_stream(
-        object(),
+        session,
         project_id=project_uuid,
         owner_user_uuid=owner_uuid,
         projection_stream_uuid=stream_uuid,
@@ -226,13 +348,45 @@ def test_existing_external_chat_stream_repairs_owner_binding(monkeypatch):
         provider_kind="zulip",
         provider_chat_id="channel:7",
         display_name="Engineering",
-        source={"chat_type": "channel", "description": "Team", "topics": []},
+        source={
+            "chat_type": "channel",
+            "description": "Team",
+            "participants": [
+                {
+                    "identity_uuid": str(owner_uuid),
+                    "role": "owner",
+                },
+                {
+                    "identity_uuid": str(member_uuid),
+                    "role": "member",
+                },
+            ],
+        },
         capabilities={},
         account_settings={"server_url": "https://zulip.example.test"},
     )
 
-    assert created[0][0] == (project_uuid, stream_uuid, owner_uuid, owner_uuid)
-    assert emitted == [((binding,), {"session": created[0][1]["session"]})]
+    assert bound == [
+        (
+            (),
+            {
+                "project_id": project_uuid,
+                "stream_uuid": stream_uuid,
+                "who_uuid": owner_uuid,
+                "role_user_uuids": {
+                    "owner": [owner_uuid],
+                    "member": [member_uuid],
+                },
+                "session": session,
+            },
+        )
+    ]
+    assert deleted == [
+        (
+            (project_uuid, stale_binding_uuid),
+            {"session": session},
+        )
+    ]
 
 
 def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metadata(
@@ -242,12 +396,17 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     stream_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
     event = _message_event(stream_uuid)
-    session = Session(
-        {
-            "owner_user_uuid": owner_uuid,
-            "projection_stream_uuid": stream_uuid,
-            "provider_chat_id": "zulip-channel-7",
-        }
+    assignment = {
+        "owner_user_uuid": owner_uuid,
+        "projection_stream_uuid": stream_uuid,
+        "provider_chat_id": "zulip-channel-7",
+    }
+    session = Session(assignment)
+    ensured = []
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_ensure_projection_owner_stream",
+        lambda *args, **kwargs: ensured.append((args, kwargs)),
     )
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
     created = []
@@ -260,6 +419,12 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     target_uuid = provider_event_apply.apply_event(event, session, identity)
 
     assert target_uuid == sys_uuid.UUID(event["payload"]["resource"]["uuid"])
+    assert ensured[0][0][0:4] == (
+        session,
+        sys_uuid.UUID(event["project_id"]),
+        assignment,
+        identity,
+    )
     assert '"selected"' in session.statements[0][0]
     assert '"projection_stream_uuid" IS NOT NULL' in session.statements[0][0]
     values = created[0][1]
@@ -382,6 +547,11 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
         )
 
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_ensure_projection_owner_stream",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         provider_event_apply.models,
         "WorkspaceMessage",

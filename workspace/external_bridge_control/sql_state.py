@@ -63,6 +63,13 @@ def _projection_uuid(
     )
 
 
+def external_chat_projection_stream_uuid(
+    chat_uuid: sys_uuid.UUID,
+) -> sys_uuid.UUID:
+    """Return the stable Workspace stream UUID for an external chat."""
+    return _projection_uuid(chat_uuid, "stream", "canonical")
+
+
 def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str, Any]:
     """Return the complete backend-owned Workspace projection mapping."""
     source = chat.source
@@ -1374,7 +1381,7 @@ class SQLControlState:
             source["chat_type"] in {"direct", "group_direct"} and default_count != 1
         ):
             raise ValueError("External chat catalog default topic is invalid")
-        projection_stream_uuid = _projection_uuid(chat_uuid, "stream", "canonical")
+        projection_stream_uuid = external_chat_projection_stream_uuid(chat_uuid)
         selection_all = account["settings"].get("selection_mode") == "all"
         maximum = account["limits"].get("max_selected_chats_per_account")
         if not isinstance(maximum, int):

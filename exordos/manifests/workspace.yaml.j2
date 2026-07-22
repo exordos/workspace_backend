@@ -53,6 +53,24 @@ resources:
   # subset through a project-scoped role binding; deployment never elevates a
   # Workspace user implicitly.
   $core.iam.permissions:
+    workspace_external_account_read:
+      name: "workspace.external_account.read"
+      description: "Read the current user's Workspace external accounts"
+    workspace_external_account_create:
+      name: "workspace.external_account.create"
+      description: "Connect a Workspace external account"
+    workspace_external_account_update:
+      name: "workspace.external_account.update"
+      description: "Update the current user's Workspace external accounts"
+    workspace_external_account_reconnect:
+      name: "workspace.external_account.reconnect"
+      description: "Reconnect the current user's Workspace external accounts"
+    workspace_external_account_disconnect:
+      name: "workspace.external_account.disconnect"
+      description: "Disconnect the current user's Workspace external accounts"
+    workspace_external_account_delete:
+      name: "workspace.external_account.delete"
+      description: "Delete the current user's Workspace external accounts"
     workspace_external_provider_policy_read:
       name: "workspace.external_provider_policy.read"
       description: "Read Workspace external provider policy"
@@ -80,6 +98,80 @@ resources:
     workspace_external_bridge_instance_revoke:
       name: "workspace.external_bridge_instance.revoke"
       description: "Revoke a Workspace external bridge instance"
+
+  # Roles are provisioned with their permission sets but are intentionally not
+  # assigned to users. Operators create project-scoped role bindings explicitly.
+  $core.iam.roles:
+    workspace_external_integration:
+      name: "workspace-external-integration"
+      description: "Use Workspace external account integrations"
+      project_id: null
+    workspace_external_integration_admin:
+      name: "workspace-external-integration-admin"
+      description: "Administer Workspace external provider integrations"
+      project_id: null
+
+  $core.iam.permissionbinding:
+    workspace_external_integration_account_read:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_read:uuid
+      project_id: null
+    workspace_external_integration_account_create:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_create:uuid
+      project_id: null
+    workspace_external_integration_account_update:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_update:uuid
+      project_id: null
+    workspace_external_integration_account_reconnect:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_reconnect:uuid
+      project_id: null
+    workspace_external_integration_account_disconnect:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_disconnect:uuid
+      project_id: null
+    workspace_external_integration_account_delete:
+      role: $core.iam.roles.$workspace_external_integration:uuid
+      permission: $core.iam.permissions.$workspace_external_account_delete:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_read:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_read:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_update:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_update:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_suspend:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_suspend:uuid
+      project_id: null
+    workspace_external_integration_admin_policy_resume:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_policy_resume:uuid
+      project_id: null
+    workspace_external_integration_admin_health_read:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_provider_health_read:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_read:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_read:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_suspend:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_suspend:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_resume:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_resume:uuid
+      project_id: null
+    workspace_external_integration_admin_bridge_revoke:
+      role: $core.iam.roles.$workspace_external_integration_admin:uuid
+      permission: $core.iam.permissions.$workspace_external_bridge_instance_revoke:uuid
+      project_id: null
 
   $core.compute.nodes:
     workspace_backend:

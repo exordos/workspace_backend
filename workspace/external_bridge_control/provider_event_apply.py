@@ -276,6 +276,7 @@ def _message_event(
     project_id: sys_uuid.UUID,
     assignment: typing.Mapping[str, typing.Any],
     resource: dict[str, typing.Any],
+    identity: typing.Any,
 ) -> sys_uuid.UUID:
     message_uuid = sys_uuid.UUID(str(resource["uuid"]))
     stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
@@ -309,6 +310,13 @@ def _message_event(
     if "payload" in values:
         values["payload"] = _message_payload(values["payload"])
     if existing is None:
+        _ensure_projection_owner_stream(
+            session,
+            project_id,
+            assignment,
+            identity,
+            sys_uuid.UUID(str(event["external_account_uuid"])),
+        )
         values.update(
             {
                 "uuid": message_uuid,
@@ -481,5 +489,12 @@ def apply_event(
             identity,
         )
     if resource_type == "message":
-        return _message_event(session, event, project_id, assignment, resource)
+        return _message_event(
+            session,
+            event,
+            project_id,
+            assignment,
+            resource,
+            identity,
+        )
     return _reaction_event(session, event, project_id, assignment, resource)

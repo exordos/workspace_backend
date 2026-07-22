@@ -622,12 +622,17 @@ def test_external_account_delete_purges_projection_and_copied_files(monkeypatch)
     controller = controllers.ExternalAccountController(
         types.SimpleNamespace(
             context=types.SimpleNamespace(
+                iam_context=types.SimpleNamespace(
+                    get_introspection_info=lambda: types.SimpleNamespace(
+                        permissions=["workspace.external_account.delete"]
+                    )
+                ),
                 project_id=project_uuid,
                 user_uuid=owner_uuid,
             )
         )
     )
-    controller.get = lambda uuid: account
+    controller._get_account = lambda uuid: account
     controller._emit_event = lambda *args, **kwargs: None
     monkeypatch.setattr(
         controllers.contexts,

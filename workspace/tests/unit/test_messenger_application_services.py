@@ -6,7 +6,10 @@
 import types
 import uuid as sys_uuid
 
+import pytest
+
 from workspace.messenger_api import application_services
+from workspace.messenger_api import exceptions
 from workspace.messenger_api.api import controllers
 
 
@@ -147,6 +150,11 @@ def test_external_account_controller_is_a_thin_request_session_adapter(monkeypat
     controller = controllers.ExternalAccountController(
         types.SimpleNamespace(
             context=types.SimpleNamespace(
+                iam_context=types.SimpleNamespace(
+                    get_introspection_info=lambda: types.SimpleNamespace(
+                        permissions=["workspace.external_account.create"]
+                    )
+                ),
                 project_id=project_uuid,
                 user_uuid=owner_uuid,
             )
@@ -177,6 +185,35 @@ def test_external_account_controller_is_a_thin_request_session_adapter(monkeypat
             spec,
         )
     ]
+
+
+def test_external_account_controller_rejects_missing_exact_permission(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    spec = _account_spec(project_uuid, sys_uuid.uuid4())
+    iam_context = types.SimpleNamespace(
+        get_introspection_info=lambda: types.SimpleNamespace(permissions=[])
+    )
+    controller = controllers.ExternalAccountController(
+        types.SimpleNamespace(
+            context=types.SimpleNamespace(
+                iam_context=iam_context,
+                project_id=project_uuid,
+                user_uuid=owner_uuid,
+            )
+        )
+    )
+    called = []
+    monkeypatch.setattr(
+        controllers.application_services.ExternalAccountApplicationService,
+        "create",
+        staticmethod(lambda *args: called.append(args)),
+    )
+
+    with pytest.raises(exceptions.ExternalResourceForbiddenError):
+        controller.create(**spec)
+
+    assert called == []
 
 
 def test_external_chat_select_materialized_reuses_the_caller_session(monkeypatch):

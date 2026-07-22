@@ -20,10 +20,10 @@ with the recovery and load gates in
   topics, a personal DM, a group DM, and files suitable for both directions.
 - S3-compatible Workspace storage and the private Workspace Provider API.
 - The normal `cassi` Workspace account in a visible Playwright MCP window.
-- All nine external-provider IAM permission resources reconciled from the
-  Workspace element manifest, with a dedicated least-privileged role bound to
-  `cassi` only in the Workspace test project. Ordinary Workspace roles must not
-  receive these permissions implicitly.
+- All fifteen external-integration IAM permission resources and both predefined
+  roles reconciled from the Workspace element manifest. Bind the required roles
+  to `cassi` only in the Workspace test project through IAM. Ordinary Workspace
+  roles must not receive these permissions implicitly.
 
 ## Deterministic visible-UI fixture
 
@@ -369,9 +369,10 @@ service logs may explain a failure but cannot replace the visible assertion.
 4. Development images are built with immutable versions.
 5. Only safe element updates are applied; no working data disk is recreated.
 6. Every required visible UI journey passes under `cassi` through Playwright MCP.
-7. The deployed Workspace manifest reconciles all nine external-provider IAM
-   permissions, while effective administrator access exists only through an
-   explicit project-scoped role binding and is removed by deleting that binding.
+7. The deployed Workspace manifest reconciles all fifteen external-integration
+   IAM permissions and both unassigned roles. Effective user and administrator
+   access exists only through explicit project-scoped role bindings and is
+   removed by deleting those bindings.
 
 Any unexecuted scenario is reported as `NOT RUN` or `BLOCKED`. The feature is
 not complete and must not be enabled for the realm while a required gate is
