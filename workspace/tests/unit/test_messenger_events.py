@@ -905,6 +905,51 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_event["payload"]["updated_at"],
         )
 
+    def test_external_metadata_falls_back_for_legacy_invalid_message(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        account_uuid = sys_uuid.uuid4()
+        session = mock.MagicMock()
+        session.execute.return_value.fetchone.return_value = {
+            "provider_metadata": {
+                "kind": "zulip",
+                "account_uuid": str(account_uuid),
+                "external_id": "42",
+                "capabilities": {"messenger.message.read": {"available": True}},
+            },
+            "external_account_uuid": account_uuid,
+            "provider_external_id": "42",
+            "delivery_metadata": None,
+            "delivery_status": "delivered",
+            "delivery_error": None,
+            "delivery_updated_at": None,
+        }
+        payload = {"uuid": message_uuid, "project_id": project_id}
+
+        with mock.patch.object(
+            events.models.WorkspaceMessage,
+            "objects",
+            types.SimpleNamespace(
+                get_one_or_none=mock.Mock(
+                    side_effect=ra_exc.ValidationErrorException()
+                ),
+            ),
+        ):
+            provider, delivery = events._external_metadata_from_canonical(
+                payload,
+                events.models.WorkspaceMessage,
+                session,
+            )
+
+        self.assertEqual("42", provider["external_id"])
+        self.assertEqual(
+            {"status": "delivered", "safe_error": None, "updated_at": None},
+            delivery,
+        )
+        statement, parameters = session.execute.call_args.args
+        self.assertIn("FROM m_workspace_messages", statement)
+        self.assertEqual((message_uuid, project_id), parameters)
+
     def test_create_messages_read_event_uses_legacy_payload(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
