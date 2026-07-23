@@ -85,8 +85,29 @@ def _manager(tmp_path, monkeypatch):
                 "provider_chat_key": "engineering",
             },
             "project_id": str(project_uuid),
-            "projection_stream_uuid": str(stream_uuid),
             "selected": True,
+            "history_depth": "30_days",
+            "workspace_projection": {
+                "stream": {
+                    "uuid": str(stream_uuid),
+                    "name": "Engineering",
+                    "description": "",
+                    "chat_kind": "channel",
+                    "private": True,
+                    "default_topic_uuid": None,
+                },
+                "participants": [
+                    {
+                        "identity_uuid": str(owner_uuid),
+                        "provider_user_id": "1",
+                        "display_name": "Owner",
+                        "email": None,
+                        "avatar_urn": None,
+                        "role": "owner",
+                    }
+                ],
+                "topics": [],
+            },
         },
     )
     commit = mock.Mock()
@@ -271,7 +292,7 @@ def test_outgoing_authorization_is_assignment_scoped_and_method_bound(
         )["chat"]["project_id"],
         "stream_uuid": manager.control_state.assignment(
             _identity(), account_uuid, chat_uuid
-        )["chat"]["projection_stream_uuid"],
+        )["chat"]["workspace_projection"]["stream"]["uuid"],
         "name": "notes.txt",
         "content_type": "text/plain",
         "size_bytes": len(content),
@@ -320,10 +341,12 @@ def test_outgoing_authorization_fails_closed_outside_exact_stream_acl(
     file_uuid = sys_uuid.uuid4()
     metadata = {
         "project_id": assignment["chat"]["project_id"],
-        "stream_uuid": assignment["chat"]["projection_stream_uuid"],
+        "stream_uuid": assignment["chat"]["workspace_projection"]["stream"]["uuid"],
         "acl": {
             "mode": "stream_members",
-            "stream_uuid": assignment["chat"]["projection_stream_uuid"],
+            "stream_uuid": (
+                assignment["chat"]["workspace_projection"]["stream"]["uuid"]
+            ),
         },
         "name": "private.txt",
         "content_type": "text/plain",
@@ -354,7 +377,7 @@ def test_outgoing_authorization_requires_current_owner_file_access(
     manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
     assignment = manager.control_state.assignment(_identity(), account_uuid, chat_uuid)
     file_uuid = sys_uuid.uuid4()
-    stream_uuid = assignment["chat"]["projection_stream_uuid"]
+    stream_uuid = assignment["chat"]["workspace_projection"]["stream"]["uuid"]
     manager.resolve_workspace_file = lambda _: {
         "project_id": assignment["chat"]["project_id"],
         "stream_uuid": stream_uuid,

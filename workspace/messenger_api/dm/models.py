@@ -919,7 +919,9 @@ class WorkspaceMessage(
                 "user_uuid": dm_filters.EQ(self.user_uuid),
             },
         )
-        if binding is None:
+        if binding is None and (
+            self.provider_uuid is None or self.external_account_uuid is None
+        ):
             raise ra_exc.ValidationErrorException()
         topic = WorkspaceStreamTopic.objects.get_one_or_none(
             filters={

@@ -280,6 +280,7 @@ components:
                 uuid: {type: string, format: uuid}
                 provider_external_id: {type: string, minLength: 1}
                 provider_metadata: {type: object}
+                created_at: {type: string, format: date-time}
                 stream_uuid: {type: string, format: uuid}
                 topic_uuid: {type: string, format: uuid}
                 message_uuid: {type: string, format: uuid}

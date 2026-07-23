@@ -210,6 +210,17 @@ def test_default_storage_type_selects_s3(tmp_path, monkeypatch):
     assert storage_info.storage_type == "s3"
 
 
+def test_s3_client_uses_v4_path_style_presigning(tmp_path, monkeypatch):
+    _patch_conf(monkeypatch, tmp_path, default_type="s3")
+    with mock.patch("boto3.client") as create_client:
+        storage = file_storage.S3WorkspaceFileStorage()
+        assert storage.client is create_client.return_value
+
+    kwargs = create_client.call_args.kwargs
+    assert kwargs["config"].signature_version == "s3v4"
+    assert kwargs["config"].s3 == {"addressing_style": "path"}
+
+
 def test_s3_storage_uses_configured_bucket_and_key(tmp_path, monkeypatch):
     _patch_conf(monkeypatch, tmp_path)
     file_uuid = sys_uuid.uuid4()

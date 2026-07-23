@@ -6,10 +6,12 @@
 """Apply the supported Provider API v1 projection events to Messenger state."""
 
 import collections.abc
+import datetime
 import typing
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage import exceptions as storage_exc
 
 from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import helpers
@@ -18,6 +20,7 @@ from workspace.messenger_api.dm import models
 
 
 SUPPORTED_EVENT_KINDS = {
+    "identity.upsert",
     "message.delete",
     "message.upsert",
     "read_state.set",
@@ -137,6 +140,70 @@ def _existing(
     )
 
 
+def _upsert_provider_identity(
+    session: typing.Any,
+    identity: typing.Any,
+    account_uuid: sys_uuid.UUID,
+    identity_uuid: sys_uuid.UUID,
+    provider_external_id: str,
+    values: collections.abc.Mapping[str, typing.Any],
+) -> sys_uuid.UUID:
+    existing = models.WorkspaceUser.objects.get_one_or_none(
+        filters={"uuid": dm_filters.EQ(identity_uuid)},
+        session=session,
+    )
+    user_values = {
+        "first_name": values["display_name"],
+        "email": values.get("email"),
+        "status": (
+            models.WorkspaceUserStatus.ACTIVE.value
+            if values["active"]
+            else models.WorkspaceUserStatus.OFFLINE.value
+        ),
+    }
+    avatar_urn = values.get("avatar_urn")
+    if avatar_urn is not None:
+        user_values["avatar"] = avatar_urn
+    if existing is None:
+        user = models.WorkspaceUser(
+            uuid=identity_uuid,
+            username=f"{identity.provider_kind}-{identity_uuid}",
+            source=models.WorkspaceUserSource.ZULIP.value,
+            provider_uuid=identity.bridge_instance_uuid,
+            external_account_uuid=account_uuid,
+            provider_external_id=provider_external_id,
+            **user_values,
+        )
+        user.insert(session=session)
+        return identity_uuid
+    if (
+        existing.provider_uuid != identity.bridge_instance_uuid
+        or existing.external_account_uuid != account_uuid
+        or existing.provider_external_id != provider_external_id
+    ):
+        raise ValueError("Provider identity UUID belongs to another identity")
+    existing.update_dm(values=user_values)
+    if existing.is_dirty():
+        existing.update(session=session)
+    return identity_uuid
+
+
+def _identity_event(
+    session: typing.Any,
+    event: dict[str, typing.Any],
+    identity: typing.Any,
+    resource: dict[str, typing.Any],
+) -> sys_uuid.UUID:
+    return _upsert_provider_identity(
+        session,
+        identity,
+        sys_uuid.UUID(str(event["external_account_uuid"])),
+        sys_uuid.UUID(str(resource["uuid"])),
+        str(resource["provider_external_id"]),
+        resource,
+    )
+
+
 def _provider_values(
     resource: collections.abc.Mapping[str, typing.Any],
     names: collections.abc.Collection[str],
@@ -154,6 +221,60 @@ def _message_payload(value: typing.Any) -> message_payloads.MarkdownPayload:
     ):
         raise ValueError("Provider message payload kind is not supported")
     return message_payloads.MarkdownPayload(content=value["content"])
+
+
+def _message_created_at(value: typing.Any) -> datetime.datetime:
+    if not isinstance(value, str):
+        raise ValueError("Provider message creation time is invalid")
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Provider message creation time is invalid")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _normalized_message_created_at(value: typing.Any) -> typing.Any:
+    if not isinstance(value, datetime.datetime):
+        return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
+
+def _message_projection_is_unchanged(
+    existing: typing.Any,
+    values: collections.abc.Mapping[str, typing.Any],
+) -> bool:
+    incoming_payload = values.get("payload")
+    current_payload = getattr(existing, "payload", None)
+    if (
+        not isinstance(incoming_payload, message_payloads.MarkdownPayload)
+        or not isinstance(current_payload, message_payloads.MarkdownPayload)
+        or incoming_payload.content != current_payload.content
+    ):
+        return False
+    if values.get("provider_external_id") != getattr(
+        existing, "provider_external_id", None
+    ):
+        return False
+    incoming_created_at = values.get("created_at")
+    if (
+        incoming_created_at is not None
+        and incoming_created_at
+        != _normalized_message_created_at(
+            getattr(existing, "created_at", incoming_created_at)
+        )
+    ):
+        return False
+
+    def stable_metadata(value: typing.Any) -> dict[str, typing.Any]:
+        metadata = dict(value or {})
+        for name in ("delivery_class", "provider_event_uuid", "provider_sequence"):
+            metadata.pop(name, None)
+        return metadata
+
+    return stable_metadata(values.get("provider_metadata")) == stable_metadata(
+        getattr(existing, "provider_metadata", None)
+    )
 
 
 def _ensure_projection_owner_stream(
@@ -295,10 +416,28 @@ def _message_event(
             compact_events=True,
         )
         return message_uuid
+    read_value = resource.get("read")
+    if read_value is not None and not isinstance(read_value, bool):
+        raise ValueError("Provider message read state is invalid")
+    author_identity = resource.get("author_identity")
+    if (
+        isinstance(author_identity, collections.abc.Mapping)
+        and sys_uuid.UUID(str(resource["user_uuid"]))
+        != assignment["owner_user_uuid"]
+    ):
+        _upsert_provider_identity(
+            session,
+            identity,
+            sys_uuid.UUID(str(event["external_account_uuid"])),
+            sys_uuid.UUID(str(resource["user_uuid"])),
+            str(author_identity["provider_external_id"]),
+            author_identity,
+        )
     values = _provider_values(
         resource,
         {
             "payload",
+            "created_at",
             "source",
             "source_name",
             "stream_uuid",
@@ -309,6 +448,8 @@ def _message_event(
     )
     if "payload" in values:
         values["payload"] = _message_payload(values["payload"])
+    if "created_at" in values:
+        values["created_at"] = _message_created_at(values["created_at"])
     if existing is None:
         _ensure_projection_owner_stream(
             session,
@@ -334,26 +475,47 @@ def _message_event(
             compact_events=True,
             **values,
         )
-        return message_uuid
-    if existing.stream_uuid != stream_uuid:
-        raise ValueError("Provider message UUID belongs to another stream")
-    existing.update_dm(
-        values=_provider_values(
+    else:
+        if existing.stream_uuid != stream_uuid:
+            raise ValueError("Provider message UUID belongs to another stream")
+        update_values = _provider_values(
             values,
             {
+                "created_at",
                 "payload",
                 "provider_external_id",
                 "provider_metadata",
             },
         )
-    )
-    existing.update(session=session)
-    helpers._create_workspace_message_updated_events(
-        project_id,
-        message_uuid,
-        session=session,
-        compact_events=True,
-    )
+        if not _message_projection_is_unchanged(existing, update_values):
+            created_at = update_values.pop("created_at", None)
+            existing.update_dm(values=update_values)
+            existing.update(session=session)
+            if created_at is not None and created_at != _normalized_message_created_at(
+                getattr(existing, "created_at", created_at)
+            ):
+                session.execute(
+                    """
+                    UPDATE "m_workspace_messages"
+                    SET "created_at" = %s
+                    WHERE "project_id" = %s AND "uuid" = %s
+                    """,
+                    (created_at, project_id, message_uuid),
+                )
+            helpers._create_workspace_message_updated_events(
+                project_id,
+                message_uuid,
+                session=session,
+                compact_events=True,
+            )
+    if read_value is not None:
+        helpers.sync_workspace_user_message_flags(
+            project_id,
+            assignment["owner_user_uuid"],
+            message_uuid,
+            {"read": read_value},
+            session=session,
+        )
     return message_uuid
 
 
@@ -437,23 +599,40 @@ def _read_state_event(
     message_uuids = [sys_uuid.UUID(str(value)) for value in message_values]
     if len(set(message_uuids)) != len(message_uuids):
         raise ValueError("Provider read state message list contains duplicates")
+    # Workspace events acquire this project-scoped lock after mutating message
+    # flags. Take it first for imported read-state batches so a concurrent
+    # writer cannot hold the event lock while waiting for one of those rows.
+    session.execute(
+        """
+        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+        """,
+        (project_id,),
+    )
     topic_value = resource.get("topic_uuid")
     topic_uuid = None if topic_value is None else sys_uuid.UUID(str(topic_value))
-    messages = [
-        helpers.get_workspace_user_message(
-            project_id,
-            reader_uuid,
-            message_uuid,
-        )
-        for message_uuid in message_uuids
-    ]
+    messages = []
+    existing_message_uuids = []
+    for message_uuid in message_uuids:
+        try:
+            message = helpers.get_workspace_user_message(
+                project_id,
+                reader_uuid,
+                message_uuid,
+            )
+        except storage_exc.RecordNotFound:
+            # Queue catch-up is deliberately started before background history
+            # import. A live flag event can therefore arrive before its message;
+            # the later history upsert carries the provider's current read flag.
+            continue
+        messages.append(message)
+        existing_message_uuids.append(message_uuid)
     if any(
         message.stream_uuid != stream_uuid
         or (topic_uuid is not None and message.topic_uuid != topic_uuid)
         for message in messages
     ):
         raise ValueError("Provider read state message is outside the selected chat")
-    for message_uuid in message_uuids:
+    for message_uuid in existing_message_uuids:
         helpers.sync_workspace_user_message_flags(
             project_id,
             reader_uuid,
@@ -474,6 +653,8 @@ def apply_event(
         raise ValueError("Provider event kind is not supported")
     account_uuid, project_id, assignment = _assignment(session, identity, event)
     resource = _resource(event, identity, account_uuid)
+    if event["kind"] == "identity.upsert":
+        return _identity_event(session, event, identity, resource)
     if event["kind"] == "read_state.set":
         return _read_state_event(session, project_id, assignment, resource)
     resource_type = event["kind"].split(".", 1)[0]
