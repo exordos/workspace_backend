@@ -271,29 +271,54 @@ def _external_metadata_from_canonical(
     project_id = _event_payload_get(event_payload, "project_id")
     if resource_uuid is None or project_id is None:
         return None, None
-    canonical = model.objects.get_one_or_none(
-        filters={
-            "uuid": dm_filters.EQ(resource_uuid),
-            "project_id": dm_filters.EQ(project_id),
-        },
-        session=session,
-    )
+    try:
+        canonical = model.objects.get_one_or_none(
+            filters={
+                "uuid": dm_filters.EQ(resource_uuid),
+                "project_id": dm_filters.EQ(project_id),
+            },
+            session=session,
+        )
+    except ra_exc.ValidationErrorException:
+        table = {
+            models.WorkspaceStream: "m_workspace_streams",
+            models.WorkspaceStreamTopic: "m_workspace_stream_topics",
+            models.WorkspaceMessage: "m_workspace_messages",
+        }.get(model)
+        if table is None:
+            raise
+        # Capability projection also updates historical rows whose current
+        # stream membership can no longer satisfy the canonical model's
+        # runtime validation. Event metadata is still safe to read directly;
+        # do not let that legacy recipient state break the bridge heartbeat.
+        canonical = session.execute(
+            f"""
+            SELECT provider_metadata, external_account_uuid,
+                   provider_external_id, delivery_metadata, delivery_status,
+                   delivery_error, delivery_updated_at
+            FROM {table}
+            WHERE uuid = %s AND project_id = %s
+            """,
+            (resource_uuid, project_id),
+        ).fetchone()
     if canonical is None:
         return None, None
-    provider = canonical.provider_metadata
-    if provider is None and canonical.external_account_uuid is not None:
+    provider = _event_payload_get(canonical, "provider_metadata")
+    external_account_uuid = _event_payload_get(canonical, "external_account_uuid")
+    if provider is None and external_account_uuid is not None:
         provider = {
             "kind": models.SourceName.ZULIP.value,
-            "account_uuid": str(canonical.external_account_uuid),
-            "external_id": canonical.provider_external_id,
+            "account_uuid": str(external_account_uuid),
+            "external_id": _event_payload_get(canonical, "provider_external_id"),
             "capabilities": {},
         }
-    delivery = canonical.delivery_metadata
-    if delivery is None and canonical.delivery_status is not None:
+    delivery = _event_payload_get(canonical, "delivery_metadata")
+    delivery_status = _event_payload_get(canonical, "delivery_status")
+    if delivery is None and delivery_status is not None:
         delivery = {
-            "status": canonical.delivery_status,
-            "safe_error": canonical.delivery_error,
-            "updated_at": canonical.delivery_updated_at,
+            "status": delivery_status,
+            "safe_error": _event_payload_get(canonical, "delivery_error"),
+            "updated_at": _event_payload_get(canonical, "delivery_updated_at"),
         }
     return (
         _event_payload_value("provider", provider),

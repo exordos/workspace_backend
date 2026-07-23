@@ -44,6 +44,47 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
 
 
+def test_manifest_provisions_unassigned_external_integration_roles():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    account_permissions = {
+        "workspace.external_account.read",
+        "workspace.external_account.create",
+        "workspace.external_account.update",
+        "workspace.external_account.reconnect",
+        "workspace.external_account.disconnect",
+        "workspace.external_account.delete",
+    }
+    admin_permissions = {
+        "workspace.external_provider_policy.read",
+        "workspace.external_provider_policy.update",
+        "workspace.external_provider_policy.suspend",
+        "workspace.external_provider_policy.resume",
+        "workspace.external_provider_health.read",
+        "workspace.external_bridge_instance.read",
+        "workspace.external_bridge_instance.suspend",
+        "workspace.external_bridge_instance.resume",
+        "workspace.external_bridge_instance.revoke",
+    }
+
+    for permission in account_permissions | admin_permissions:
+        assert f'name: "{permission}"' in manifest
+    assert 'name: "workspace-external-integration"' in manifest
+    assert 'name: "workspace-external-integration-admin"' in manifest
+    assert "  $core.iam.rolebinding:" not in manifest
+    assert "  $core.iam.role_bindings:" not in manifest
+    assert "  $core.iam.permission_bindings:" not in manifest
+
+    bindings = manifest.split("  $core.iam.permissionbinding:\n", 1)[1].split(
+        "\n  $core.compute.nodes:", 1
+    )[0]
+    assert bindings.count(
+        "role: $core.iam.roles.$workspace_external_integration:uuid"
+    ) == len(account_permissions)
+    assert bindings.count(
+        "role: $core.iam.roles.$workspace_external_integration_admin:uuid"
+    ) == len(admin_permissions)
+
+
 def test_manifest_exposes_only_api_routes_from_the_backend_node():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 

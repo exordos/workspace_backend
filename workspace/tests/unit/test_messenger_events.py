@@ -827,15 +827,21 @@ class MessengerEventsTestCase(unittest.TestCase):
         ):
             result = event.insert(session=session)
 
-        statement = session.execute.call_args_list[0].args[0]
+        lock_statement = session.execute.call_args_list[0].args[0]
+        self.assertIn("pg_advisory_xact_lock", lock_statement)
+        self.assertEqual(
+            (project_id,),
+            session.execute.call_args_list[0].args[1],
+        )
+        statement = session.execute.call_args_list[1].args[0]
         inserted_columns = statement.split("VALUES", 1)[0]
         self.assertNotIn("epoch_version", inserted_columns)
         self.assertIn('RETURNING "epoch_version"', statement)
-        cursor_statement = session.execute.call_args_list[1].args[0]
+        cursor_statement = session.execute.call_args_list[2].args[0]
         self.assertIn('INSERT INTO "m_workspace_event_cursors"', cursor_statement)
         self.assertEqual(
             (project_id, user_uuid, 42),
-            session.execute.call_args_list[1].args[1],
+            session.execute.call_args_list[2].args[1],
         )
         self.assertEqual(42, result)
         self.assertEqual(42, event.epoch_version)
@@ -904,6 +910,51 @@ class MessengerEventsTestCase(unittest.TestCase):
             "2026-06-24T10:05:00.000000Z",
             created_event["payload"]["updated_at"],
         )
+
+    def test_external_metadata_falls_back_for_legacy_invalid_message(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        account_uuid = sys_uuid.uuid4()
+        session = mock.MagicMock()
+        session.execute.return_value.fetchone.return_value = {
+            "provider_metadata": {
+                "kind": "zulip",
+                "account_uuid": str(account_uuid),
+                "external_id": "42",
+                "capabilities": {"messenger.message.read": {"available": True}},
+            },
+            "external_account_uuid": account_uuid,
+            "provider_external_id": "42",
+            "delivery_metadata": None,
+            "delivery_status": "delivered",
+            "delivery_error": None,
+            "delivery_updated_at": None,
+        }
+        payload = {"uuid": message_uuid, "project_id": project_id}
+
+        with mock.patch.object(
+            events.models.WorkspaceMessage,
+            "objects",
+            types.SimpleNamespace(
+                get_one_or_none=mock.Mock(
+                    side_effect=ra_exc.ValidationErrorException()
+                ),
+            ),
+        ):
+            provider, delivery = events._external_metadata_from_canonical(
+                payload,
+                events.models.WorkspaceMessage,
+                session,
+            )
+
+        self.assertEqual("42", provider["external_id"])
+        self.assertEqual(
+            {"status": "delivered", "safe_error": None, "updated_at": None},
+            delivery,
+        )
+        statement, parameters = session.execute.call_args.args
+        self.assertIn("FROM m_workspace_messages", statement)
+        self.assertEqual((message_uuid, project_id), parameters)
 
     def test_create_messages_read_event_uses_legacy_payload(self):
         project_id = sys_uuid.uuid4()

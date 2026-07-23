@@ -74,6 +74,19 @@ def _urn_kind(content_type: str) -> str:
     return "file"
 
 
+def _projection_stream_uuid(chat: dict[str, Any]) -> str | None:
+    legacy = chat.get("projection_stream_uuid")
+    if legacy is not None:
+        return str(legacy)
+    projection = chat.get("workspace_projection")
+    if not isinstance(projection, dict):
+        return None
+    stream = projection.get("stream")
+    if not isinstance(stream, dict) or stream.get("uuid") is None:
+        return None
+    return str(stream["uuid"])
+
+
 def _canonical_request(request: object) -> str:
     return hashlib.sha256(
         json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -226,7 +239,7 @@ class ExternalFileTransferManager:
             )
         chat = assignment["chat"]
         account = assignment["account"]
-        stream_uuid = chat.get("projection_stream_uuid")
+        stream_uuid = _projection_stream_uuid(chat)
         if stream_uuid is None:
             raise FileTransferError(
                 "operation_state_conflict",
@@ -351,7 +364,7 @@ class ExternalFileTransferManager:
             raise FileTransferError(
                 "urn_kind_mismatch", "Workspace URN kind does not match file", 422
             )
-        projection_stream_uuid = assignment["chat"].get("projection_stream_uuid")
+        projection_stream_uuid = _projection_stream_uuid(assignment["chat"])
         acl = metadata.get("acl")
         if (
             projection_stream_uuid is None

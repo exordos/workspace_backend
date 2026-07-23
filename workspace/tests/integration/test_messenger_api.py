@@ -66,6 +66,18 @@ EXTERNAL_OPERATIONS = f"{V1}/external_operations/"
 EXTERNAL_CHATS = f"{V1}/external_chats/"
 EXTERNAL_PROVIDER_POLICIES = f"{V1}/external_provider_policies/"
 EXTERNAL_PROVIDER_HEALTH = f"{V1}/external_provider_health/"
+EXTERNAL_ACCOUNT_READ = ("workspace.external_account.read",)
+EXTERNAL_ACCOUNT_CREATE = ("workspace.external_account.create",)
+EXTERNAL_ACCOUNT_UPDATE = ("workspace.external_account.update",)
+EXTERNAL_ACCOUNT_RECONNECT = (
+    "workspace.external_account.read",
+    "workspace.external_account.reconnect",
+)
+EXTERNAL_ACCOUNT_DISCONNECT = (
+    "workspace.external_account.read",
+    "workspace.external_account.disconnect",
+)
+EXTERNAL_ACCOUNT_DELETE = ("workspace.external_account.delete",)
 
 
 def _run_database_operation(callback):
@@ -178,20 +190,25 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
     )
     try:
         account_uuid = sys_uuid.uuid4()
+        account_payload = {
+            "uuid": str(account_uuid),
+            "settings": {
+                "kind": "zulip",
+                "server_url": "https://zulip.example.invalid",
+                "email": "owner@example.invalid",
+                "api_key": "provider-secret",
+                "selection_mode": "explicit",
+                "history_depth": "30_days",
+                "default_project_id": api.project_id,
+            },
+        }
+        denied = api.post(EXTERNAL_ACCOUNTS, json=account_payload)
+        assert denied.status_code == 403, denied.text
+
         create = api.post(
             EXTERNAL_ACCOUNTS,
-            json={
-                "uuid": str(account_uuid),
-                "settings": {
-                    "kind": "zulip",
-                    "server_url": "https://zulip.example.invalid",
-                    "email": "owner@example.invalid",
-                    "api_key": "provider-secret",
-                    "selection_mode": "explicit",
-                    "history_depth": "30_days",
-                    "default_project_id": api.project_id,
-                },
-            },
+            json=account_payload,
+            permissions=EXTERNAL_ACCOUNT_CREATE,
         )
         assert create.status_code == 201, create.text
         account = create.json()
@@ -209,16 +226,22 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
                     "api_key": "another-secret",
                 },
             },
+            permissions=EXTERNAL_ACCOUNT_CREATE,
         )
         assert duplicate.status_code == 409, duplicate.text
 
         another_user = sys_uuid.uuid4()
-        foreign_list = api.get(EXTERNAL_ACCOUNTS, user=another_user)
+        foreign_list = api.get(
+            EXTERNAL_ACCOUNTS,
+            user=another_user,
+            permissions=EXTERNAL_ACCOUNT_READ,
+        )
         assert foreign_list.status_code == 200, foreign_list.text
         assert foreign_list.json() == []
         foreign_get = api.get(
             f"{EXTERNAL_ACCOUNTS}{account_uuid}",
             user=another_user,
+            permissions=EXTERNAL_ACCOUNT_READ,
         )
         assert foreign_get.status_code == 404, foreign_get.text
 
@@ -231,19 +254,25 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
                 "api_key": "replacement-secret",
             }
         }
-        missing_etag = api.post(reconnect_path, json=reconnect_body)
+        missing_etag = api.post(
+            reconnect_path,
+            json=reconnect_body,
+            permissions=EXTERNAL_ACCOUNT_RECONNECT,
+        )
         assert missing_etag.status_code == 428, missing_etag.text
         reconnect = api.post(
             reconnect_path,
             json=reconnect_body,
             headers={"If-Match": '"1"'},
+            permissions=EXTERNAL_ACCOUNT_RECONNECT,
         )
         assert reconnect.status_code == 200, reconnect.text
         assert reconnect.headers["ETag"] == '"2"'
         assert "api_key" not in reconnect.text
 
         disconnect = api.post(
-            f"{EXTERNAL_ACCOUNTS}{account_uuid}/actions/disconnect/invoke"
+            f"{EXTERNAL_ACCOUNTS}{account_uuid}/actions/disconnect/invoke",
+            permissions=EXTERNAL_ACCOUNT_DISCONNECT,
         )
         assert disconnect.status_code == 200, disconnect.text
         assert disconnect.json()["status"] == "disconnected"
@@ -301,7 +330,10 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         ]
         assert all("api_key" not in json.dumps(row[2]) for row in events)
 
-        deleted = api.delete(f"{EXTERNAL_ACCOUNTS}{account_uuid}")
+        deleted = api.delete(
+            f"{EXTERNAL_ACCOUNTS}{account_uuid}",
+            permissions=EXTERNAL_ACCOUNT_DELETE,
+        )
         assert deleted.status_code == 204, deleted.text
         with db.cursor() as cursor:
             cursor.execute(
@@ -330,6 +362,255 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
+def test_external_account_history_depth_requeues_selected_chat_assignments(api, db):
+    _enable_zulip_policy(db)
+    realm_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    owner_user_uuid = sys_uuid.uuid4()
+    _seed_zulip_bridge_target(db)
+    cfg.CONF.set_override(
+        "realm_uuid",
+        str(realm_uuid),
+        group=external_bridge_opts.DOMAIN,
+    )
+    try:
+        created = api.post(
+            EXTERNAL_ACCOUNTS,
+            json={
+                "uuid": str(account_uuid),
+                "settings": {
+                    "kind": "zulip",
+                    "server_url": "https://zulip.example.invalid",
+                    "email": "owner@example.invalid",
+                    "api_key": "provider-secret",
+                    "selection_mode": "explicit",
+                    "history_depth": "30_days",
+                    "default_project_id": api.project_id,
+                },
+            },
+            user=owner_user_uuid,
+            permissions=EXTERNAL_ACCOUNT_CREATE,
+        )
+        assert created.status_code == 201, created.text
+        chat_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        identity_uuid = sys_uuid.uuid4()
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO m_external_chats_v2 (
+                    uuid, external_account_uuid, owner_user_uuid, provider,
+                    provider_chat_id, source, display_name, selected, project_id,
+                    history_depth, projection_stream_uuid, status
+                ) VALUES (
+                    %s, %s, %s, 'zulip', 'channel:42', %s::jsonb, 'Engineering',
+                    TRUE, %s, '30_days', %s, 'live'
+                )
+                """,
+                (
+                    str(chat_uuid),
+                    str(account_uuid),
+                    str(owner_user_uuid),
+                    json.dumps(
+                        {
+                            "chat_type": "channel",
+                            "description": "",
+                            "private": False,
+                            "participants": [
+                                {
+                                    "identity_uuid": str(identity_uuid),
+                                    "provider_user_id": "1",
+                                    "display_name": "Owner",
+                                    "is_owner": True,
+                                }
+                            ],
+                            "topics": [
+                                {
+                                    "topic_uuid": str(topic_uuid),
+                                    "provider_topic_id": "42:general",
+                                    "name": "general",
+                                    "is_default": True,
+                                }
+                            ],
+                        }
+                    ),
+                    api.project_id,
+                    str(stream_uuid),
+                ),
+            )
+        db.commit()
+
+        updated = api.put(
+            f"{EXTERNAL_ACCOUNTS}{account_uuid}",
+            headers={"If-Match": '"1"'},
+            json={
+                "settings": {
+                    "kind": "zulip",
+                    "selection_mode": "explicit",
+                    "history_depth": "all",
+                    "default_project_id": api.project_id,
+                }
+            },
+            user=owner_user_uuid,
+            permissions=EXTERNAL_ACCOUNT_UPDATE,
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["settings"]["history_depth"] == "all"
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT history_depth, status, revision
+                FROM m_external_chats_v2
+                WHERE uuid = %s
+                """,
+                (str(chat_uuid),),
+            )
+            assert cursor.fetchone() == ("all", "syncing", 2)
+            cursor.execute(
+                """
+                SELECT generation, resource
+                FROM m_external_bridge_desired_changes_v1
+                WHERE resource_type = 'external_chat_assignment'
+                  AND resource_uuid = %s
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (str(chat_uuid),),
+            )
+            generation, resource = cursor.fetchone()
+        assert generation == 2
+        assert resource["history_depth"] == "all"
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+                (str(account_uuid),),
+            )
+        db.commit()
+        cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
+
+
+def test_external_chat_can_be_selected_again_after_deselect(api, db):
+    _enable_zulip_policy(db)
+    bridge_instance_uuid, key_uuid, _ = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    source = {
+        "kind": "zulip",
+        "chat_type": "channel",
+        "description": "",
+        "private": False,
+        "participants": [
+            {
+                "identity_uuid": api.user_uuid,
+                "provider_user_id": "1",
+                "display_name": "Owner",
+                "email": "owner@example.invalid",
+                "avatar_urn": None,
+                "role": "owner",
+            }
+        ],
+        "topics": [
+            {
+                "topic_uuid": str(topic_uuid),
+                "provider_topic_id": "42:general",
+                "name": "general",
+                "is_default": True,
+            }
+        ],
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings, credential_present,
+                status
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+            """,
+            (
+                account_uuid,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "selection_mode": "explicit",
+                        "history_depth": "30_days",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_instance_uuid),
+                            "credential_key_uuid": str(key_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb, 'Engineering',
+                FALSE, NULL, NULL, 'deselected'
+            )
+            """,
+            (chat_uuid, account_uuid, api.user_uuid, json.dumps(source)),
+        )
+
+    selected = api.post(
+        f"{EXTERNAL_CHATS}{chat_uuid}/actions/select/invoke",
+        json={"project_id": api.project_id},
+    )
+
+    assert selected.status_code == 200, selected.text
+    expected_stream_uuid = sys_uuid.uuid5(
+        sys_uuid.UUID("71bdfd0a-35b6-54ac-83d1-54869e3c7e67"),
+        f"{chat_uuid}:stream:canonical",
+    )
+    assert selected.json()["projection_stream_uuid"] == str(expected_stream_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT selected, project_id, projection_stream_uuid, status
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone() == (
+            True,
+            sys_uuid.UUID(api.project_id),
+            expected_stream_uuid,
+            "syncing",
+        )
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, expected_stream_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+
+
 def test_external_provider_policy_blocks_account_and_operation_boundaries(
     api,
     db,
@@ -356,12 +637,17 @@ def test_external_provider_policy_blocks_account_and_operation_boundaries(
     }
     try:
         _enable_zulip_policy(db, max_accounts=1)
-        created = api.post(EXTERNAL_ACCOUNTS, json=payload)
+        created = api.post(
+            EXTERNAL_ACCOUNTS,
+            json=payload,
+            permissions=EXTERNAL_ACCOUNT_CREATE,
+        )
         assert created.status_code == 201, created.text
 
         reached = api.post(
             EXTERNAL_ACCOUNTS,
             json={**payload, "uuid": str(sys_uuid.uuid4())},
+            permissions=EXTERNAL_ACCOUNT_CREATE,
         )
         assert reached.status_code == 403, reached.text
 
@@ -385,6 +671,7 @@ def test_external_provider_policy_blocks_account_and_operation_boundaries(
                     "api_key": "replacement-secret",
                 }
             },
+            permissions=EXTERNAL_ACCOUNT_RECONNECT,
         )
         assert reconnect.status_code == 403, reconnect.text
         preflight = api.post(
@@ -409,6 +696,7 @@ def test_external_provider_policy_blocks_account_and_operation_boundaries(
         disabled = api.post(
             EXTERNAL_ACCOUNTS,
             json={**payload, "uuid": str(sys_uuid.uuid4())},
+            permissions=EXTERNAL_ACCOUNT_CREATE,
         )
         assert disabled.status_code == 403, disabled.text
     finally:
@@ -489,6 +777,13 @@ def test_external_provider_admin_policy_ca_and_health_are_permission_scoped(api,
     assert health.status_code == 200, health.text
     assert health.json()["provider"] == "zulip"
     assert health.json()["status"] == "healthy"
+    assert isinstance(health.json()["chat_counts"], dict)
+    assert set(health.json()["metrics"]) == {
+        "queue_depth",
+        "selected_chats",
+        "synchronized_messages",
+        "synchronized_users",
+    }
 
     with db.cursor() as cursor:
         cursor.execute(

@@ -321,8 +321,14 @@ class S3WorkspaceFileStorage:
 
     def _create_client(self) -> typing.Any:
         import boto3
+        import botocore.config
 
-        kwargs = {}
+        kwargs = {
+            "config": botocore.config.Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+            )
+        }
         if self._conf.access_key_id is not None:
             kwargs["aws_access_key_id"] = self._conf.access_key_id
         if self._conf.secret_access_key is not None:

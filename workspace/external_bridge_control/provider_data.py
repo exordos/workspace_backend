@@ -683,8 +683,27 @@ def apply_provider_event_batch(
         raise ProviderBatchError("Provider event batch size is invalid")
     now = now or datetime.datetime.now(datetime.timezone.utc)
     _bridge_capabilities(session, identity, now)
-    results = []
     try:
+        # A timed-out request can still be committing while the bridge retries
+        # an overlapping batch. Serialize all provider-event writers before
+        # either request inserts its idempotency ledger rows; otherwise one
+        # transaction can own a project event lock while waiting for a
+        # duplicate ledger row held by the other transaction.
+        project_ids = sorted(
+            {
+                sys_uuid.UUID(str(event["project_id"]))
+                for event in events
+            },
+            key=str,
+        )
+        for project_id in project_ids:
+            session.execute(
+                """
+                SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+                """,
+                (project_id,),
+            )
+        results = []
         for event in events:
             account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
             chat_uuid = sys_uuid.UUID(str(event["external_chat_uuid"]))

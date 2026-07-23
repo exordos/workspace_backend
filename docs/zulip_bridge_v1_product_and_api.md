@@ -177,15 +177,15 @@ kind; provider-specific routes are forbidden.
 
 ### 5.1 External accounts
 
-| Method   | Route                                                         | Purpose                                                                      |
-| -------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `GET`    | `/external_accounts/`                                         | List the current user's realm-global external accounts.                      |
-| `POST`   | `/external_accounts/`                                         | Create and validate any supported account kind with a write-only credential. |
-| `GET`    | `/external_accounts/{account_uuid}`                           | Get the owner's sanitized account snapshot.                                  |
-| `PUT`    | `/external_accounts/{account_uuid}`                           | Replace mutable non-secret settings.                                         |
-| `POST`   | `/external_accounts/{account_uuid}/actions/reconnect/invoke`  | Validate and replace the write-only credential, then resume.                 |
-| `POST`   | `/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop sync and retain a read-only projection.                                 |
-| `DELETE` | `/external_accounts/{account_uuid}`                           | Destructively purge the account and return `204`.                            |
+| Method   | Route                                                         | IAM permission                            | Purpose                                                                      |
+| -------- | ------------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------- |
+| `GET`    | `/external_accounts/`                                         | `workspace.external_account.read`         | List the current user's realm-global external accounts.                      |
+| `POST`   | `/external_accounts/`                                         | `workspace.external_account.create`       | Create and validate any supported account kind with a write-only credential. |
+| `GET`    | `/external_accounts/{account_uuid}`                           | `workspace.external_account.read`         | Get the owner's sanitized account snapshot.                                  |
+| `PUT`    | `/external_accounts/{account_uuid}`                           | `workspace.external_account.update`       | Replace mutable non-secret settings.                                         |
+| `POST`   | `/external_accounts/{account_uuid}/actions/reconnect/invoke`  | `workspace.external_account.reconnect`    | Validate and replace the write-only credential, then resume.                 |
+| `POST`   | `/external_accounts/{account_uuid}/actions/disconnect/invoke` | `workspace.external_account.disconnect`   | Stop sync and retain a read-only projection.                                 |
+| `DELETE` | `/external_accounts/{account_uuid}`                           | `workspace.external_account.delete`       | Destructively purge the account and return `204`.                            |
 
 The approved resource shape is a common envelope with a dynamic `settings`
 property. The `settings.kind` discriminator selects a concrete
@@ -459,13 +459,15 @@ resource through the manifest/CLI, Core delivers its managed node config to
 both backend and bridge, and the backend automatically opens the matching
 one-time generation. The Workspace backend receives no Exordos Core credential.
 
-The Workspace element manifest provisions all nine canonical action permission
-resources listed above. It does not grant them to any user or existing role.
-Operators create a dedicated least-privileged role, bind only the required
-permissions to it, and bind that role to an administrator in the Workspace
-project. The project on the role binding is the effective IAM scope; deleting
-that one role binding removes the administrator's external-provider access
-without changing their ordinary Workspace role.
+The Workspace element manifest provisions all fifteen canonical action
+permission resources listed above and two global roles with fixed permission
+sets. `workspace-external-integration` contains the six owner-scoped external
+account permissions. `workspace-external-integration-admin` contains the nine
+provider-policy, aggregate-health, and bridge-instance administration
+permissions. The manifest creates no user role binding. Operators assign either
+role explicitly in the Workspace project through IAM. The project on the role
+binding is the effective scope; deleting the binding removes that access without
+changing the user's ordinary Workspace role.
 
 ## 7. Private control plane
 

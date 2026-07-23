@@ -682,6 +682,16 @@ class WorkspaceEvent(
         session = session or contexts.Context().get_session()
         data = self._get_prepared_data()
         data.pop("epoch_version", None)
+        # A single transaction can emit events for many users in one project.
+        # Serialize those writers before they touch per-user cursor rows so
+        # concurrent bulk projections cannot acquire the same cursor locks in
+        # different orders and deadlock.
+        session.execute(
+            """
+            SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+            """,
+            (self.project_id,),
+        )
         columns = tuple(data)
         statement = (
             f"INSERT INTO {engine.escape(self.get_table().name)} "
@@ -909,7 +919,9 @@ class WorkspaceMessage(
                 "user_uuid": dm_filters.EQ(self.user_uuid),
             },
         )
-        if binding is None:
+        if binding is None and (
+            self.provider_uuid is None or self.external_account_uuid is None
+        ):
             raise ra_exc.ValidationErrorException()
         topic = WorkspaceStreamTopic.objects.get_one_or_none(
             filters={

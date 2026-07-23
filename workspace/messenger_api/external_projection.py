@@ -50,7 +50,7 @@ def ensure_external_chat_stream(
     capabilities: collections.abc.Mapping[str, typing.Any],
     account_settings: collections.abc.Mapping[str, typing.Any],
 ) -> None:
-    """Create the canonical stream and repair its owner binding if necessary."""
+    """Create the canonical stream and materialize all participant bindings."""
     stream = models.WorkspaceStream.objects.get_one_or_none(
         filters={
             "project_id": dm_filters.EQ(project_id),
@@ -100,24 +100,79 @@ def ensure_external_chat_stream(
                 "capabilities": dict(capabilities),
             },
         )
-        return
-    if stream.user_uuid != owner_user_uuid:
+    elif stream.user_uuid != owner_user_uuid:
         raise ValueError("Provider stream projection owner does not match assignment")
-    binding = models.WorkspaceUserStream.objects.get_one_or_none(
+    participants = {
+        sys_uuid.UUID(str(participant["identity_uuid"])): participant["role"]
+        for participant in source["participants"]
+    }
+    users = {
+        user.uuid: user
+        for user in models.WorkspaceUser.objects.get_all(
+            filters={"uuid": dm_filters.In(list(participants))},
+            session=session,
+        )
+    }
+    for participant in source["participants"]:
+        participant_uuid = sys_uuid.UUID(str(participant["identity_uuid"]))
+        if participant_uuid in users:
+            continue
+        if participant_uuid == owner_user_uuid:
+            raise ValueError("Provider stream projection owner identity is missing")
+        user = models.WorkspaceUser(
+            uuid=participant_uuid,
+            username=f"{provider_kind}-{participant_uuid}",
+            source=models.WorkspaceUserSource.ZULIP.value,
+            status=models.WorkspaceUserStatus.ACTIVE.value,
+            first_name=participant["display_name"],
+            provider_uuid=bridge_instance_uuid,
+            external_account_uuid=external_account_uuid,
+            provider_external_id=participant["provider_user_id"],
+            avatar=participant["avatar_urn"],
+        )
+        user.insert(session=session)
+        users[user.uuid] = user
+    role_user_uuids: dict[str, list[sys_uuid.UUID]] = {}
+    for user_uuid, role in participants.items():
+        role_user_uuids.setdefault(role, []).append(user_uuid)
+    helpers.get_or_create_workspace_stream_bindings(
+        project_id=project_id,
+        stream_uuid=projection_stream_uuid,
+        who_uuid=owner_user_uuid,
+        role_user_uuids=role_user_uuids,
+        session=session,
+    )
+    existing_bindings = models.WorkspaceStreamBinding.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
-            "uuid": dm_filters.EQ(projection_stream_uuid),
-            "user_uuid": dm_filters.EQ(owner_user_uuid),
+            "stream_uuid": dm_filters.EQ(projection_stream_uuid),
         },
         session=session,
     )
-    if binding is not None:
+    stale_bindings = [
+        binding
+        for binding in existing_bindings
+        if binding.user_uuid not in participants
+    ]
+    if not stale_bindings:
         return
-    binding = helpers._create_owner_binding(
-        project_id,
-        projection_stream_uuid,
-        owner_user_uuid,
-        owner_user_uuid,
-        session=session,
-    )
-    helpers.create_workspace_stream_binding_events(binding, session=session)
+    managed_user_uuids = {
+        user.uuid
+        for user in models.WorkspaceUser.objects.get_all(
+            filters={
+                "uuid": dm_filters.In(
+                    [binding.user_uuid for binding in stale_bindings]
+                ),
+                "provider_uuid": dm_filters.EQ(bridge_instance_uuid),
+                "external_account_uuid": dm_filters.EQ(external_account_uuid),
+            },
+            session=session,
+        )
+    }
+    for binding in stale_bindings:
+        if binding.user_uuid in managed_user_uuids:
+            helpers.delete_workspace_stream_binding(
+                project_id,
+                binding.uuid,
+                session=session,
+            )

@@ -34,7 +34,9 @@ class Session:
 
     def execute(self, statement, params=None):
         self.statements.append((statement, params))
-        if statement.startswith(("SAVEPOINT", "ROLLBACK", "RELEASE")):
+        if statement.startswith(("SAVEPOINT", "ROLLBACK", "RELEASE")) or (
+            "pg_advisory_xact_lock" in statement
+        ):
             return Result(None)
         return Result(next(self.values))
 
@@ -363,10 +365,12 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     assert response["results"][0]["status"] == "applied"
     assert response["results"][0]["target_uuid"] == str(target_uuid)
     assert applied == [(event, session, identity)]
-    assert "m_external_bridge_desired_resources_v1" in session.statements[1][0]
-    assert session.statements[1][1][2] == identity.bridge_instance_uuid
-    assert session.statements[1][1][4] == identity.bridge_instance_uuid
-    assert "m_external_provider_events_v1" in session.statements[2][0]
+    assert "pg_advisory_xact_lock" in session.statements[1][0]
+    assert session.statements[1][1] == (project_uuid,)
+    assert "m_external_bridge_desired_resources_v1" in session.statements[2][0]
+    assert session.statements[2][1][2] == identity.bridge_instance_uuid
+    assert session.statements[2][1][4] == identity.bridge_instance_uuid
+    assert "m_external_provider_events_v1" in session.statements[3][0]
 
 
 def test_inbound_event_batch_requires_current_heartbeat_before_account_access():
@@ -420,8 +424,8 @@ def test_inbound_event_batch_rejects_another_bridge_assignment():
             now=NOW,
         )
 
-    assert session.statements[1][1][2] == requesting_bridge.bridge_instance_uuid
-    assert session.statements[1][1][2] != assigned_bridge.bridge_instance_uuid
+    assert session.statements[2][1][2] == requesting_bridge.bridge_instance_uuid
+    assert session.statements[2][1][2] != assigned_bridge.bridge_instance_uuid
 
 
 def test_provider_http_service_dispatches_only_private_provider_routes():

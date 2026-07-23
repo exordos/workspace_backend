@@ -392,6 +392,7 @@ class ExternalProviderHealth(models.Model):
     provider = properties.property(types.String(max_length=64), default="zulip")
     status = properties.property(types.String(), required=True, read_only=True)
     account_counts = properties.property(types.Dict(), default=dict, read_only=True)
+    chat_counts = properties.property(types.Dict(), default=dict, read_only=True)
     bridge_counts = properties.property(types.Dict(), default=dict, read_only=True)
     operation_counts = properties.property(types.Dict(), default=dict, read_only=True)
     metrics = properties.property(types.Dict(), default=dict, read_only=True)

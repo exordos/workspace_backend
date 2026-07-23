@@ -1190,7 +1190,27 @@ class ExternalAccountController(ExternalResourceController):
             enabled=enabled,
         )
 
+    def _require_permission(self, action: typing.Any) -> None:
+        permissions = (
+            self.get_context().iam_context.get_introspection_info().permissions
+        )
+        if action not in permissions:
+            raise messenger_exc.ExternalResourceForbiddenError()
+
+    def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
+        self._require_permission("workspace.external_account.read")
+        return super().filter(filters, order_by=order_by)
+
+    def _get_account(self, uuid: object) -> typing.Any:
+        return super().get(uuid)
+
+    def get(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        del kwargs
+        self._require_permission("workspace.external_account.read")
+        return self._get_account(uuid)
+
     def create(self, **kwargs: typing.Any) -> typing.Any:
+        self._require_permission("workspace.external_account.create")
         session = contexts.Context().get_session()
         return application_services.ExternalAccountApplicationService.create(
             session,
@@ -1202,10 +1222,12 @@ class ExternalAccountController(ExternalResourceController):
         )
 
     def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        self._require_permission("workspace.external_account.update")
         if set(kwargs) != {"settings"}:
             raise ra_exc.ValidationErrorException()
-        account = self.get(uuid)
+        account = self._get_account(uuid)
         self._required_if_match(account)
+        previous_history_depth = account.settings["history_depth"]
         update_settings = self._settings(
             external_models.EXTERNAL_ACCOUNT_UPDATE_SETTINGS_TYPE,
             kwargs["settings"],
@@ -1224,6 +1246,48 @@ class ExternalAccountController(ExternalResourceController):
         )
         credential = self._credential(account, session)
         self._append_desired(account, credential, session)
+        if account.settings["history_depth"] != previous_history_depth:
+            bridge_instance_uuid = credential.envelope["associated_data"][
+                "bridge_instance_uuid"
+            ]
+            chats = external_models.ExternalChat.objects.get_all(
+                filters={
+                    "external_account_uuid": dm_filters.EQ(account.uuid),
+                },
+                session=session,
+            )
+            for chat in chats:
+                values = {
+                    "history_depth": account.settings["history_depth"],
+                    "revision": chat.revision + 1,
+                }
+                if chat.selected:
+                    values["status"] = (
+                        external_models.ExternalChatStatus.SYNCING.value
+                    )
+                _update_internal_fields(chat, values, session=session)
+                if chat.selected:
+                    sql_state.append_upsert(
+                        session,
+                        bridge_instance_uuid,
+                        chat.provider,
+                        sql_state.external_chat_assignment_desired(
+                            chat,
+                            session=session,
+                        ),
+                    )
+                    messenger_events.create_external_resource_event(
+                        chat.project_id,
+                        chat.owner_user_uuid,
+                        chat,
+                        messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
+                        hidden_fields=(
+                            "owner_user_uuid",
+                            "provider",
+                            "provider_chat_id",
+                        ),
+                        session=session,
+                    )
         self._emit_event(
             account,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
@@ -1237,6 +1301,7 @@ class ExternalAccountController(ExternalResourceController):
         self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
     ) -> typing.Any:
         del args
+        self._require_permission("workspace.external_account.reconnect")
         self._required_if_match(resource)
         self._require_provider_enabled(resource.provider)
         if set(kwargs) != {"settings"}:
@@ -1302,6 +1367,7 @@ class ExternalAccountController(ExternalResourceController):
         self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
     ) -> typing.Any:
         del args, kwargs
+        self._require_permission("workspace.external_account.disconnect")
         session = contexts.Context().get_session()
         _update_internal_fields(
             resource,
@@ -1328,7 +1394,8 @@ class ExternalAccountController(ExternalResourceController):
         return resource
 
     def delete(self, uuid: object) -> None:
-        account = self.get(uuid)
+        self._require_permission("workspace.external_account.delete")
+        account = self._get_account(uuid)
         session = contexts.Context().get_session()
         credential = self._credential(account, session)
         bridge_instance_uuid = credential.envelope["associated_data"][
@@ -1728,12 +1795,17 @@ class ExternalChatController(ExternalResourceController):
         bridge_instance_uuid = credential.envelope["associated_data"][
             "bridge_instance_uuid"
         ]
+        projection_stream_uuid = resource.projection_stream_uuid
+        if selected and projection_stream_uuid is None:
+            projection_stream_uuid = sql_state.external_chat_projection_stream_uuid(
+                resource.uuid
+            )
         if selected:
             external_projection.ensure_external_chat_stream(
                 session,
                 project_id=sys_uuid.UUID(str(project_id)),
                 owner_user_uuid=resource.owner_user_uuid,
-                projection_stream_uuid=resource.projection_stream_uuid,
+                projection_stream_uuid=projection_stream_uuid,
                 bridge_instance_uuid=sys_uuid.UUID(str(bridge_instance_uuid)),
                 external_account_uuid=resource.external_account_uuid,
                 provider_kind=resource.provider,
@@ -1745,16 +1817,15 @@ class ExternalChatController(ExternalResourceController):
             )
         if unchanged:
             return resource
-        _update_internal_fields(
-            resource,
-            {
-                "selected": selected,
-                "project_id": project_id,
-                "status": status,
-                "revision": resource.revision + 1,
-            },
-            session=session,
-        )
+        values = {
+            "selected": selected,
+            "project_id": project_id,
+            "status": status,
+            "revision": resource.revision + 1,
+        }
+        if selected:
+            values["projection_stream_uuid"] = projection_stream_uuid
+        _update_internal_fields(resource, values, session=session)
         if selected:
             sql_state.append_upsert(
                 session,
@@ -2444,16 +2515,44 @@ class ExternalProviderHealthController(ra_controllers.BaseResourceController):
         accounts = external_models.ExternalAccount.objects.get_all(
             filters={"provider": dm_filters.EQ(provider)}
         )
+        session = contexts.Context().get_session()
+        account_uuids = {account.uuid for account in accounts}
+        account_filter = {
+            "external_account_uuid": dm_filters.In(account_uuids)
+        }
+        chats = (
+            external_models.ExternalChat.objects.get_all(
+                filters=account_filter,
+                session=session,
+            )
+            if account_uuids
+            else []
+        )
         instances = external_models.ExternalBridgeInstance.objects.get_all(
             filters={"provider": dm_filters.EQ(provider)}
         )
         operations = external_models.ExternalOperation.objects.get_all(filters={})
-        account_uuids = {account.uuid for account in accounts}
         operations = [
             operation
             for operation in operations
             if operation.external_account_uuid in account_uuids
         ]
+        synchronized_messages = (
+            models.WorkspaceMessage.objects.count(
+                filters=account_filter,
+                session=session,
+            )
+            if account_uuids
+            else 0
+        )
+        synchronized_users = (
+            models.WorkspaceUser.objects.count(
+                filters=account_filter,
+                session=session,
+            )
+            if account_uuids
+            else 0
+        )
         healthy = any(
             instance.status == external_models.ExternalBridgeInstanceStatus.ACTIVE.value
             for instance in instances
@@ -2462,9 +2561,22 @@ class ExternalProviderHealthController(ra_controllers.BaseResourceController):
             provider=provider,
             status="healthy" if healthy else "unavailable",
             account_counts=self._counts(accounts, "status"),
+            chat_counts=self._counts(chats, "status"),
             bridge_counts=self._counts(instances, "status"),
             operation_counts=self._counts(operations, "status"),
-            metrics={"queue_depth": len(operations)},
+            metrics={
+                "queue_depth": sum(
+                    operation.status
+                    in {
+                        external_models.ExternalOperationStatus.QUEUED.value,
+                        external_models.ExternalOperationStatus.RUNNING.value,
+                    }
+                    for operation in operations
+                ),
+                "selected_chats": sum(chat.selected for chat in chats),
+                "synchronized_messages": synchronized_messages,
+                "synchronized_users": synchronized_users,
+            },
             updated_at=datetime.datetime.now(datetime.timezone.utc),
         )
 
