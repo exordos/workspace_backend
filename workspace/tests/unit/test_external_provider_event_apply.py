@@ -755,11 +755,12 @@ def test_message_update_uses_compact_broadcast_path(monkeypatch):
     event = _message_event(stream_uuid)
     resource = event["payload"]["resource"]
     message_uuid = sys_uuid.UUID(resource["uuid"])
+    updated_values = []
     existing = types.SimpleNamespace(
         uuid=message_uuid,
         user_uuid=sys_uuid.UUID(resource["user_uuid"]),
         stream_uuid=stream_uuid,
-        update_dm=lambda values: None,
+        update_dm=lambda values: updated_values.append(values),
         update=lambda session=None: None,
     )
     session = Session(
@@ -778,6 +779,12 @@ def test_message_update_uses_compact_broadcast_path(monkeypatch):
     )
 
     assert provider_event_apply.apply_event(event, session, identity) == message_uuid
+    assert len(updated_values) == 1
+    assert isinstance(
+        updated_values[0]["payload"],
+        message_payloads.MarkdownPayload,
+    )
+    assert updated_values[0]["payload"].content == "hello"
     assert compact_calls == [
         (
             (sys_uuid.UUID(event["project_id"]), message_uuid),

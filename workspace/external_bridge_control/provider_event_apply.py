@@ -339,7 +339,7 @@ def _message_event(
         raise ValueError("Provider message UUID belongs to another stream")
     existing.update_dm(
         values=_provider_values(
-            resource,
+            values,
             {
                 "payload",
                 "provider_external_id",
