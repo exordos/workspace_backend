@@ -827,15 +827,21 @@ class MessengerEventsTestCase(unittest.TestCase):
         ):
             result = event.insert(session=session)
 
-        statement = session.execute.call_args_list[0].args[0]
+        lock_statement = session.execute.call_args_list[0].args[0]
+        self.assertIn("pg_advisory_xact_lock", lock_statement)
+        self.assertEqual(
+            (project_id,),
+            session.execute.call_args_list[0].args[1],
+        )
+        statement = session.execute.call_args_list[1].args[0]
         inserted_columns = statement.split("VALUES", 1)[0]
         self.assertNotIn("epoch_version", inserted_columns)
         self.assertIn('RETURNING "epoch_version"', statement)
-        cursor_statement = session.execute.call_args_list[1].args[0]
+        cursor_statement = session.execute.call_args_list[2].args[0]
         self.assertIn('INSERT INTO "m_workspace_event_cursors"', cursor_statement)
         self.assertEqual(
             (project_id, user_uuid, 42),
-            session.execute.call_args_list[1].args[1],
+            session.execute.call_args_list[2].args[1],
         )
         self.assertEqual(42, result)
         self.assertEqual(42, event.epoch_version)
