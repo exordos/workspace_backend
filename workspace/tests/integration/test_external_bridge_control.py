@@ -312,16 +312,60 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
 def test_provider_identity_payload_rewrites_share_a_single_table_pass(
     _database,
     db,
+    monkeypatch,
 ):
     owner_uuid = sys_uuid.uuid4()
     project_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    provider_realm_uuid = sys_uuid.uuid4()
     legacy_a_uuid = sys_uuid.uuid4()
     legacy_b_uuid = sys_uuid.uuid4()
-    canonical_a_uuid = sys_uuid.uuid4()
-    canonical_b_uuid = sys_uuid.uuid4()
+    canonical_a_uuid = identity_linking.canonical_provider_identity_uuid(
+        "zulip",
+        provider_realm_uuid,
+        "20",
+    )
+    canonical_b_uuid = identity_linking.canonical_provider_identity_uuid(
+        "zulip",
+        provider_realm_uuid,
+        "21",
+    )
     event_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, owner_uuid, "payload-rewrite-owner")
     with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        for legacy_uuid, provider_user_id in (
+            (legacy_a_uuid, "20"),
+            (legacy_b_uuid, "21"),
+        ):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_users (
+                    uuid, username, source, status, avatar,
+                    provider_uuid, external_account_uuid, provider_external_id,
+                    created_at, updated_at, last_ping_at
+                )
+                SELECT %s, %s, 'zulip', 'active', avatar,
+                       %s, %s, %s, NOW(), NOW(), NOW()
+                FROM m_workspace_users
+                WHERE uuid = %s
+                """,
+                (
+                    legacy_uuid,
+                    f"zulip-{legacy_uuid}",
+                    sys_uuid.uuid4(),
+                    account_uuid,
+                    provider_user_id,
+                    owner_uuid,
+                ),
+            )
         cursor.execute(
             """
             INSERT INTO m_workspace_events (
@@ -343,26 +387,59 @@ def test_provider_identity_payload_rewrites_share_a_single_table_pass(
                 ),
             ),
         )
+    rewrite_calls = []
+    original_rewrite = identity_linking._rewrite_payload_uuid_references
+
+    def capture_rewrite(session, replacements):
+        rewrite_calls.append(list(replacements))
+        return original_rewrite(session, replacements)
+
+    monkeypatch.setattr(
+        identity_linking,
+        "_rewrite_payload_uuid_references",
+        capture_rewrite,
+    )
     session_factory = engines.engine_factory.get_engine().session_manager
     with session_factory() as session:
-        identity_linking._rewrite_payload_uuid_references(
+        assert identity_linking.merge_account_scoped_provider_identities(
             session,
-            [
-                (legacy_a_uuid, canonical_a_uuid),
-                (legacy_b_uuid, canonical_b_uuid),
-            ],
-        )
+            provider="zulip",
+            account_uuid=account_uuid,
+            provider_realm_uuid=provider_realm_uuid,
+        ) == []
+    assert len(rewrite_calls) == 1
+    assert set(rewrite_calls[0]) == {
+        (legacy_a_uuid, canonical_a_uuid),
+        (legacy_b_uuid, canonical_b_uuid),
+    }
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT payload FROM m_workspace_events WHERE uuid = %s",
             (event_uuid,),
         )
         payload = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT uuid FROM m_workspace_users
+            WHERE uuid = ANY(%s)
+            ORDER BY uuid
+            """,
+            (
+                [
+                    legacy_a_uuid,
+                    legacy_b_uuid,
+                    canonical_a_uuid,
+                    canonical_b_uuid,
+                ],
+            ),
+        )
+        user_rows = [row[0] for row in cursor.fetchall()]
     assert payload["participants"] == [
         {"uuid": str(canonical_a_uuid)},
         {"uuid": str(canonical_b_uuid)},
     ]
     assert payload["reference"] == f"provider:{canonical_a_uuid}"
+    assert user_rows == sorted([canonical_a_uuid, canonical_b_uuid])
 
 
 def test_provider_identity_merge_resumes_bounded_event_batches(

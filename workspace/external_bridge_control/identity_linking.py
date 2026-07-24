@@ -330,9 +330,11 @@ def merge_account_scoped_provider_identities(
             session,
             legacy_user_uuid,
             canonical_user_uuid,
+            rewrite_payloads=False,
             rewrite_chats=False,
             delete_legacy=False,
         )
+    _rewrite_payload_uuid_references(session, replacements)
     for legacy_user_uuid, canonical_user_uuid in replacements:
         legacy_text = str(legacy_user_uuid)
         canonical_text = str(canonical_user_uuid)
