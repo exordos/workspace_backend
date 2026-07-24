@@ -699,18 +699,30 @@ def test_canonical_factory_separates_event_store_without_mail_runtime():
 
 
 class CursorSession:
-    def __init__(self, cursor):
+    def __init__(self, cursor, events=()):
         self.cursor = cursor
+        self.events = list(events)
         self.statements = []
 
     def execute(self, statement, params):
         self.statements.append((statement, params))
-        row = None if statement.lstrip().startswith("INSERT") else self.cursor
-        return types.SimpleNamespace(fetchone=lambda: row)
+        if statement.lstrip().startswith("INSERT"):
+            row = None
+            rows = []
+        elif statement.lstrip().startswith("WITH direct_events"):
+            row = None
+            rows = self.events
+        else:
+            row = self.cursor
+            rows = []
+        return types.SimpleNamespace(
+            fetchone=lambda: row,
+            fetchall=lambda: rows,
+        )
 
 
-def _event_store(monkeypatch, cursor):
-    session = CursorSession(cursor)
+def _event_store(monkeypatch, cursor, events=()):
+    session = CursorSession(cursor, events)
     context = types.SimpleNamespace(get_session=lambda: session)
     monkeypatch.setattr(sql_canonical_store.contexts, "Context", lambda: context)
     return (
@@ -721,21 +733,19 @@ def _event_store(monkeypatch, cursor):
 
 def test_canonical_store_events_preserve_cursor_scope_order_and_limit(monkeypatch):
     generation = sys_uuid.uuid4()
-    _postgres_store, _session = _event_store(
+    events = [types.SimpleNamespace(epoch_version=21)]
+    _postgres_store, session = _event_store(
         monkeypatch,
         {
             "epoch_generation": generation,
             "current_epoch_version": 41,
             "pruned_through_epoch_version": 12,
         },
+        events,
     )
-    events = [types.SimpleNamespace(epoch_version=21)]
-    objects = FakeObjects(events)
-    model = _fake_model(objects, ("epoch_version", "project_id", "user_uuid"))
-    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceVisibleEvent", model)
     monkeypatch.setattr(
         sql_canonical_store.messenger_events,
-        "pack_workspace_event",
+        "event_row_to_messenger_event",
         lambda event: {"epoch_version": event.epoch_version},
     )
     store = sql_canonical_store.SQLCanonicalMessengerStore(
@@ -751,12 +761,22 @@ def test_canonical_store_events_preserve_cursor_scope_order_and_limit(monkeypatc
     )
 
     assert result == [{"epoch_version": 21}]
-    _operation, query = objects.calls[0]
-    assert query["filters"]["project_id"].value == PROJECT_UUID
-    assert query["filters"]["user_uuid"].value == USER_UUID
-    assert query["filters"]["epoch_version"].value == 20
-    assert query["order_by"] == {"epoch_version": "asc"}
-    assert query["limit"] == 3
+    statement, parameters = session.statements[2]
+    assert statement.count("LIMIT %s") == 3
+    assert 'FROM "m_workspace_events"' in statement
+    assert 'FROM "m_workspace_broadcast_message_events_v1"' in statement
+    assert "UNION ALL" in statement
+    assert parameters == (
+        PROJECT_UUID,
+        USER_UUID,
+        20,
+        3,
+        USER_UUID,
+        PROJECT_UUID,
+        20,
+        3,
+        3,
+    )
 
 
 def test_canonical_store_event_cursor_delegates_to_postgres_store(monkeypatch):
@@ -851,21 +871,19 @@ def test_postgres_event_cursor_rejects_mail_generation(monkeypatch):
 
 def test_postgres_events_are_user_scoped_and_keep_epoch_order(monkeypatch):
     generation = sys_uuid.uuid4()
-    store, _session = _event_store(
+    events = [types.SimpleNamespace(epoch_version=21)]
+    store, session = _event_store(
         monkeypatch,
         {
             "epoch_generation": generation,
             "current_epoch_version": 41,
             "pruned_through_epoch_version": 12,
         },
+        events,
     )
-    events = [types.SimpleNamespace(epoch_version=21)]
-    objects = FakeObjects(events)
-    model = _fake_model(objects, ("epoch_version", "project_id", "user_uuid"))
-    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceVisibleEvent", model)
     monkeypatch.setattr(
         sql_canonical_store.messenger_events,
-        "pack_workspace_event",
+        "event_row_to_messenger_event",
         lambda event: {"epoch_version": event.epoch_version},
     )
 
@@ -876,11 +894,54 @@ def test_postgres_events_are_user_scoped_and_keep_epoch_order(monkeypatch):
     )
 
     assert result == [{"epoch_version": 21}]
+    statement, parameters = session.statements[2]
+    assert 'recipient."user_uuid" = %s' in statement
+    assert 'event."project_id" = %s' in statement
+    assert 'event."epoch_version" > %s' in statement
+    assert parameters[-1] == 25
+
+
+def test_postgres_events_keep_model_path_for_additional_filters(monkeypatch):
+    generation = sys_uuid.uuid4()
+    store, session = _event_store(
+        monkeypatch,
+        {
+            "epoch_generation": generation,
+            "current_epoch_version": 41,
+            "pruned_through_epoch_version": 12,
+        },
+    )
+    events = [types.SimpleNamespace(epoch_version=21)]
+    objects = FakeObjects(events)
+    model = _fake_model(
+        objects,
+        ("epoch_version", "project_id", "user_uuid", "object_type"),
+    )
+    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceVisibleEvent", model)
+    monkeypatch.setattr(
+        sql_canonical_store.messenger_events,
+        "pack_workspace_event",
+        lambda event: {"epoch_version": event.epoch_version},
+    )
+
+    result = store.events_after(
+        {
+            "epoch_version": dm_filters.GT(20),
+            "object_type": dm_filters.EQ("message"),
+        },
+        order_by={"epoch_version": "desc"},
+        epoch_generation=str(generation),
+        limit=25,
+    )
+
+    assert result == [{"epoch_version": 21}]
+    assert len(session.statements) == 2
     _operation, query = objects.calls[0]
     assert query["filters"]["project_id"].value == PROJECT_UUID
     assert query["filters"]["user_uuid"].value == USER_UUID
     assert query["filters"]["epoch_version"].value == 20
-    assert query["order_by"] == {"epoch_version": "asc"}
+    assert query["filters"]["object_type"].value == "message"
+    assert query["order_by"] == {"epoch_version": "desc"}
     assert query["limit"] == 25
 
 
