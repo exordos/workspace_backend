@@ -447,9 +447,11 @@ def _event_row_uuid(
 
 
 def _event_row_datetime(value: object) -> object:
-    if not isinstance(value, str):
-        return value
-    parsed = datetime.datetime.fromisoformat(value)
+    parsed = value
+    if isinstance(parsed, str):
+        parsed = datetime.datetime.fromisoformat(parsed)
+    if not isinstance(parsed, datetime.datetime):
+        return parsed
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=datetime.timezone.utc)
     return parsed.astimezone(datetime.timezone.utc)

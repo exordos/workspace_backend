@@ -23,6 +23,7 @@ import sys
 import types
 import unittest
 import uuid as sys_uuid
+import zoneinfo
 from unittest import mock
 
 from restalchemy.common import exceptions as ra_exc
@@ -363,6 +364,25 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         row["created_at"] = str(row["created_at"])
         row["updated_at"] = str(row["updated_at"])
+
+        event = events.event_row_to_messenger_event(row)
+
+        self.assertEqual("2026-06-24T10:00:00.000000Z", event["created_at"])
+        self.assertEqual("2026-06-24T10:00:00.000000Z", event["updated_at"])
+
+    def test_event_row_to_messenger_event_normalizes_zoneinfo_timestamps(self):
+        payload = {
+            "kind": "message.deleted",
+            "uuid": str(sys_uuid.uuid4()),
+        }
+        row = self._workspace_event_row(
+            payload=payload,
+            object_type="message",
+            action="deleted",
+        )
+        sql_timezone = zoneinfo.ZoneInfo("Etc/UTC")
+        row["created_at"] = row["created_at"].astimezone(sql_timezone)
+        row["updated_at"] = row["updated_at"].astimezone(sql_timezone)
 
         event = events.event_row_to_messenger_event(row)
 
