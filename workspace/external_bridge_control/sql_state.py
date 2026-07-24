@@ -18,6 +18,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
 from workspace.external_bridge_control import state
+from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import external_projection
@@ -1196,12 +1197,30 @@ class SQLControlState:
         source = catalog["source"]
         if (
             not isinstance(source, dict)
-            or not {"kind", "chat_type", "provider_chat_key"} <= set(source)
-            or set(source) - {"kind", "chat_type", "provider_chat_key", "original_url"}
+            or not {
+                "kind",
+                "chat_type",
+                "provider_chat_key",
+                "provider_realm_uuid",
+                "provider_owner_user_id",
+            }
+            <= set(source)
+            or set(source)
+            - {
+                "kind",
+                "chat_type",
+                "provider_chat_key",
+                "provider_realm_uuid",
+                "provider_owner_user_id",
+                "original_url",
+            }
             or source["kind"] != identity.provider_kind
             or source["chat_type"] not in {"channel", "direct", "group_direct"}
             or not isinstance(source["provider_chat_key"], str)
             or not source["provider_chat_key"]
+            or not isinstance(source["provider_realm_uuid"], str)
+            or not isinstance(source["provider_owner_user_id"], str)
+            or not source["provider_owner_user_id"]
             or (
                 source.get("original_url") is not None
                 and (
@@ -1214,11 +1233,13 @@ class SQLControlState:
         account_uuid = sys_uuid.UUID(str(catalog["external_account_uuid"]))
         owner_uuid = sys_uuid.UUID(str(catalog["owner_user_uuid"]))
         project_uuid = sys_uuid.UUID(str(catalog["project_id"]))
+        provider_realm_uuid = sys_uuid.UUID(source["provider_realm_uuid"])
         chat_uuid = sys_uuid.UUID(str(report["resource_uuid"]))
         account = session.execute(
             """
             SELECT account.owner_user_uuid, account.provider, account.settings,
-                   account.desired_generation, policy.limits
+                   account.desired_generation, account.provider_realm_uuid,
+                   policy.limits
             FROM m_external_accounts_v2 AS account
             JOIN m_external_provider_policies_v1 AS policy
               ON policy.provider = account.provider
@@ -1237,7 +1258,7 @@ class SQLControlState:
             raise ValueError("External chat catalog ownership is invalid")
         existing = session.execute(
             """
-            SELECT uuid, selected FROM m_external_chats_v2
+            SELECT uuid, selected, source FROM m_external_chats_v2
             WHERE external_account_uuid = %s AND provider_chat_id = %s
             FOR UPDATE
             """,
@@ -1296,7 +1317,7 @@ class SQLControlState:
         ):
             raise ValueError("External chat catalog topology is invalid")
         provider_user_ids = set()
-        normalized_participants = []
+        catalog_participants = []
         owner_count = 0
         for participant in participants:
             required_participant = {"provider_user_id", "display_name", "is_owner"}
@@ -1322,17 +1343,82 @@ class SQLControlState:
                 raise ValueError("External chat catalog participant is invalid")
             provider_user_ids.add(participant["provider_user_id"])
             owner_count += int(participant["is_owner"])
+            catalog_participants.append(participant)
+        if owner_count != 1:
+            raise ValueError("External chat catalog participant owner is invalid")
+        owner_participant = next(
+            participant
+            for participant in catalog_participants
+            if participant["is_owner"]
+        )
+        if owner_participant["provider_user_id"] != source["provider_owner_user_id"]:
+            raise ValueError("External chat catalog authenticated owner is invalid")
+        changed_chat_uuids: set[sys_uuid.UUID] = set()
+        legacy_owner_uuid = identity_linking.bind_verified_account_owner(
+            session,
+            provider=identity.provider_kind,
+            account_uuid=account_uuid,
+            owner_user_uuid=owner_uuid,
+            provider_realm_uuid=provider_realm_uuid,
+            provider_user_id=source["provider_owner_user_id"],
+        )
+        if legacy_owner_uuid is not None:
+            changed_chat_uuids.update(
+                identity_linking.merge_workspace_user_identity(
+                    session,
+                    legacy_owner_uuid,
+                    owner_uuid,
+                )
+            )
+        if account["provider_realm_uuid"] is None:
+            changed_chat_uuids.update(
+                identity_linking.merge_account_scoped_provider_identities(
+                    session,
+                    provider=identity.provider_kind,
+                    account_uuid=account_uuid,
+                    provider_realm_uuid=provider_realm_uuid,
+                )
+            )
+        existing_participants = {
+            participant["provider_user_id"]: participant["identity_uuid"]
+            for participant in (
+                existing["source"].get("participants", [])
+                if existing is not None and isinstance(existing["source"], dict)
+                else []
+            )
+            if isinstance(participant, dict)
+            and isinstance(participant.get("provider_user_id"), str)
+            and isinstance(participant.get("identity_uuid"), str)
+        }
+        normalized_participants = []
+        for participant in catalog_participants:
+            identity_uuid = (
+                owner_uuid
+                if participant["is_owner"]
+                else identity_linking.resolve_provider_identity(
+                    session,
+                    provider=identity.provider_kind,
+                    provider_realm_uuid=provider_realm_uuid,
+                    provider_user_id=participant["provider_user_id"],
+                )
+            )
+            legacy_identity_uuid = existing_participants.get(
+                participant["provider_user_id"]
+            )
+            if (
+                legacy_identity_uuid is not None
+                and sys_uuid.UUID(legacy_identity_uuid) != identity_uuid
+            ):
+                changed_chat_uuids.update(
+                    identity_linking.merge_workspace_user_identity(
+                        session,
+                        sys_uuid.UUID(legacy_identity_uuid),
+                        identity_uuid,
+                    )
+                )
             normalized_participants.append(
                 {
-                    "identity_uuid": str(
-                        owner_uuid
-                        if participant["is_owner"]
-                        else _projection_uuid(
-                            account_uuid,
-                            "identity",
-                            participant["provider_user_id"],
-                        )
-                    ),
+                    "identity_uuid": str(identity_uuid),
                     "provider_user_id": participant["provider_user_id"],
                     "display_name": participant["display_name"].strip(),
                     "email": participant.get("email"),
@@ -1340,8 +1426,6 @@ class SQLControlState:
                     "role": "owner" if participant["is_owner"] else "member",
                 }
             )
-        if owner_count != 1:
-            raise ValueError("External chat catalog participant owner is invalid")
         if (source["chat_type"] == "direct" and len(normalized_participants) != 2) or (
             source["chat_type"] == "group_direct" and len(normalized_participants) < 3
         ):
@@ -1439,6 +1523,8 @@ class SQLControlState:
                 _json(
                     {
                         "kind": source["kind"],
+                        "provider_realm_uuid": str(provider_realm_uuid),
+                        "provider_owner_user_id": source["provider_owner_user_id"],
                         "chat_type": {
                             "channel": "channel",
                             "direct": "personal",
@@ -1483,6 +1569,34 @@ class SQLControlState:
                 identity.provider_kind,
                 external_chat_assignment_desired(chat, session=session),
             )
+        for changed_chat_uuid in changed_chat_uuids - {chat.uuid}:
+            changed_chat = external_models.ExternalChat.objects.get_one_or_none(
+                filters={"uuid": dm_filters.EQ(changed_chat_uuid)},
+                session=session,
+            )
+            if changed_chat is None or not changed_chat.selected:
+                continue
+            append_upsert(
+                session,
+                identity.bridge_instance_uuid,
+                changed_chat.provider,
+                external_chat_assignment_desired(
+                    changed_chat,
+                    session=session,
+                ),
+            )
+            messenger_events.create_external_resource_event(
+                changed_chat.project_id,
+                changed_chat.owner_user_uuid,
+                changed_chat,
+                messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
+                hidden_fields=(
+                    "owner_user_uuid",
+                    "provider",
+                    "provider_chat_id",
+                ),
+                session=session,
+            )
         messenger_events.create_external_resource_event(
             project_uuid,
             owner_uuid,
@@ -1491,6 +1605,7 @@ class SQLControlState:
             hidden_fields=("owner_user_uuid", "provider", "provider_chat_id"),
             session=session,
         )
+        identity_linking.delete_unreferenced_provider_identities(session)
 
     def _reconcile_observed_report(
         self,

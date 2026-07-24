@@ -163,8 +163,7 @@ def ensure_external_chat_stream(
                 "uuid": dm_filters.In(
                     [binding.user_uuid for binding in stale_bindings]
                 ),
-                "provider_uuid": dm_filters.EQ(bridge_instance_uuid),
-                "external_account_uuid": dm_filters.EQ(external_account_uuid),
+                "source": dm_filters.EQ(models.WorkspaceUserSource.ZULIP.value),
             },
             session=session,
         )

@@ -87,6 +87,9 @@ so a new message cannot make a boundary assertion ambiguous.
 | ZB-CATALOG-003 | On a fresh PostgreSQL schema, select a chat, reconcile its backfill job, invalidate the Zulip event queue, and create queue-catchup jobs.   | JSON-extracted account UUIDs are cast to the PostgreSQL UUID type in both paths; ordinary backfill and queue-loss recovery create their durable jobs without a datatype error.                                                                 |
 | ZB-CATALOG-004 | Complete backfill, deselect the chat, then reselect the same chat with the same history depth under a newer assignment generation.          | The cancelled job restarts as pending, reimport operation identities are generation-scoped, and prior deduplication cannot suppress the new import.                                                                                            |
 | ZB-CATALOG-005 | Report personal-direct catalogs with participant counts other than two and group-direct catalogs with fewer than three participants.        | Backend rejects the topology before persisting either the chat or desired assignment. Exactly two personal-direct and at least three group-direct participants remain valid.                                                                   |
+| ZB-CATALOG-006 | Connect two Workspace accounts to different authenticated users in the same Zulip realm and report overlapping participants.               | Each non-owner participant resolves by `(provider, realm_uuid, user_id)` to one shared Workspace UUID; account-scoped duplicates and their references are merged and deleted.                                                                    |
+| ZB-CATALOG-007 | Connect an IAM owner whose authenticated Zulip user already exists as an external identity, then attempt to claim the same Zulip identity from another IAM owner. | The first verified account connection merges the external identity into the existing IAM UUID. The conflicting owner is rejected fail-closed; email or display name never affects either decision.                         |
+| ZB-CATALOG-008 | Remove an external account that left both referenced and unreferenced legacy Zulip user rows, then reconcile a catalog.                     | Unreferenced legacy rows are deleted; rows still referenced by Messenger state are retained until they can be merged safely.                                                                                                                   |
 | ZB-CONTROL-001 | Poll desired changes, report observed state in partial-result batches, expire a cursor, and recover through a logical snapshot.             | Cursors are monotonic and scope-bound; typed `410` triggers a consistent snapshot and no desired change is skipped.                                                                                                                            |
 | ZB-CONTROL-002 | Change capabilities and revisions across heartbeat cycles.                                                                                  | Only the fail-closed effective intersection is enabled; incompatible batches do not advance the cursor and recover automatically after a compatible heartbeat.                                                                                 |
 | ZB-CONTROL-003 | Prune one resource scope while leaving unrelated identity and resource-type sequences sparse, including a scope with no later retained row. | Per-scope pruned-through watermarks return typed `410` only for an actually expired cursor; unrelated sequence gaps never force a snapshot.                                                                                                    |
@@ -249,9 +252,13 @@ service logs may explain a failure but cannot replace the visible assertion.
       verify the control is absent or disabled with a safe reason.
 - [ ] Verify the personal DM remains exactly two participants with one default
       topic, and the group DM remains a private group stream with one default topic.
-- [ ] Open peer A and peer B from projected messages. Verify separate external
-      identities scoped to this Zulip account, a visible Zulip badge, and no
-      accidental merge with same-email Workspace IAM users.
+- [ ] Open peer A and peer B from projected messages through two connected
+      accounts in the same Zulip realm. Verify one identity per Zulip
+      `(realm_uuid, user_id)`, no account-scoped duplicates, a visible Zulip
+      badge, and no merge with same-email Workspace IAM users.
+- [ ] Verify each connected account owner resolves to that owner's IAM UUID only
+      after authenticated Zulip registration, and a second IAM owner cannot
+      claim the same `(realm_uuid, user_id)`.
 - [ ] Verify provider metadata and the interactive badge agree in the sidebar
       stream row, topic row, message bubble, participant/profile panel, REST-hydrated
       view, realtime update, and post-reload cached view.

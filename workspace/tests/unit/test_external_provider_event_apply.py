@@ -154,6 +154,71 @@ def test_identity_upsert_materializes_user_without_stream_binding(monkeypatch):
     assert created[0].insert_session is session
 
 
+def test_identity_upsert_preserves_verified_iam_user(monkeypatch):
+    identity = _identity()
+    account_uuid = sys_uuid.uuid4()
+    iam_user_uuid = sys_uuid.uuid4()
+    session = Session(
+        {
+            "workspace_user_uuid": iam_user_uuid,
+            "link_kind": "verified_account_owner",
+        }
+    )
+    existing = types.SimpleNamespace(source="iam")
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceUser",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: existing)
+        ),
+    )
+
+    assert (
+        provider_event_apply._upsert_provider_identity(
+            session,
+            identity,
+            account_uuid,
+            iam_user_uuid,
+            "42",
+            {
+                "display_name": "Provider display name",
+                "email": "provider@example.invalid",
+                "active": True,
+            },
+        )
+        == iam_user_uuid
+    )
+    assert not hasattr(existing, "first_name")
+
+
+def test_identity_upsert_rejects_uuid_outside_verified_link():
+    identity = _identity()
+    linked_user_uuid = sys_uuid.uuid4()
+    session = Session(
+        {
+            "workspace_user_uuid": linked_user_uuid,
+            "link_kind": "verified_account_owner",
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="link does not match",
+    ):
+        provider_event_apply._upsert_provider_identity(
+            session,
+            identity,
+            sys_uuid.uuid4(),
+            sys_uuid.uuid4(),
+            "42",
+            {
+                "display_name": "Provider display name",
+                "email": None,
+                "active": True,
+            },
+        )
+
+
 def test_topic_upsert_repairs_missing_projection_owner_binding(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()
@@ -361,7 +426,7 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
             objects=types.SimpleNamespace(
                 get_all=lambda **kwargs: (
                     [types.SimpleNamespace(uuid=stale_member_uuid)]
-                    if "provider_uuid" in kwargs["filters"]
+                    if "source" in kwargs["filters"]
                     else [
                         types.SimpleNamespace(uuid=owner_uuid),
                         types.SimpleNamespace(uuid=member_uuid),

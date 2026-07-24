@@ -148,6 +148,24 @@ def _upsert_provider_identity(
     provider_external_id: str,
     values: collections.abc.Mapping[str, typing.Any],
 ) -> sys_uuid.UUID:
+    link = session.execute(
+        """
+        SELECT link.workspace_user_uuid, link.link_kind
+        FROM m_external_accounts_v2 AS account
+        JOIN m_external_provider_identity_links_v1 AS link
+          ON link.provider = account.provider
+         AND link.provider_realm_uuid = account.provider_realm_uuid
+         AND link.provider_user_id = %s
+        WHERE account.uuid = %s
+          AND account.provider = %s
+        """,
+        (provider_external_id, account_uuid, identity.provider_kind),
+    ).fetchone()
+    if (
+        link is not None
+        and sys_uuid.UUID(str(link["workspace_user_uuid"])) != identity_uuid
+    ):
+        raise ValueError("Provider identity link does not match the event UUID")
     existing = models.WorkspaceUser.objects.get_one_or_none(
         filters={"uuid": dm_filters.EQ(identity_uuid)},
         session=session,
@@ -176,7 +194,9 @@ def _upsert_provider_identity(
         )
         user.insert(session=session)
         return identity_uuid
-    if (
+    if link is not None and existing.source == models.WorkspaceUserSource.IAM.value:
+        return identity_uuid
+    if link is None and (
         existing.provider_uuid != identity.bridge_instance_uuid
         or existing.external_account_uuid != account_uuid
         or existing.provider_external_id != provider_external_id

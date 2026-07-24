@@ -84,12 +84,23 @@ resource.
 | Topic         | Topic in the projected stream                                               |
 | One-to-one DM | Private personal stream with exactly two participants and one default topic |
 | Group DM      | Private group stream with one default topic                                 |
-| Zulip user    | Stable external identity scoped by provider and external account            |
+| Zulip user    | Stable identity scoped by provider realm and provider user ID                |
 
-Stable external identity UUIDs are derived from provider type, external account
-UUID, and provider user ID. An external identity is not an IAM user even when
-its email or display name matches one. Mentions continue to use
-`urn:user:<identity-uuid>`.
+The canonical identity key is `(provider, provider_realm_uuid,
+provider_user_id)`. The realm UUID and authenticated account user ID come from
+the Zulip event-queue registration, so a changed server URL, email address,
+display name, or another Workspace account cannot silently change ownership.
+Email and display-name matches are never accepted as proof.
+
+When an IAM user successfully connects a Zulip account, only that authenticated
+account's canonical Zulip identity is linked to the account owner IAM UUID.
+Other Zulip users remain read-only external identities, but reuse one canonical
+Workspace UUID across every connected account in the same Zulip realm. A
+conflicting verified owner link is rejected without changing either identity
+and requires explicit administrative resolution. Existing account-scoped
+identities are merged into the canonical identity with their Messenger
+references, assignments, and cached event payloads updated before the duplicate
+row is deleted. Mentions continue to use `urn:user:<identity-uuid>`.
 
 ### 3.4 Synchronization semantics
 
@@ -381,9 +392,11 @@ read-only projected users with explicit identity metadata:
 }
 ```
 
-An external identity cannot authenticate, own an external account, or be used
-to open an IAM profile or native personal stream unless a later explicit
-identity-linking feature is approved.
+An unresolved external identity cannot authenticate, own an external account,
+or be used to open an IAM profile or native personal stream. A verified account
+owner identity is represented by its existing IAM UUID only after the backend
+validates the authenticated Zulip `(realm_uuid, user_id)` reported for that
+owner's account. Email and display-name equality never trigger this link.
 
 ### 5.5 Realtime events and client caching
 
