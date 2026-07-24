@@ -446,6 +446,15 @@ def _event_row_uuid(
     return sys_uuid.UUID(str(value))
 
 
+def _event_row_datetime(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    parsed = datetime.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 def _workspace_event_from_row(row: typing.Any) -> typing.Any:
     if isinstance(row, models.WorkspaceEvent):
         return row
@@ -473,9 +482,9 @@ def _workspace_event_from_row(row: typing.Any) -> typing.Any:
     created_at = _event_row_get(row, "created_at")
     updated_at = _event_row_get(row, "updated_at")
     if created_at is not None:
-        values["created_at"] = created_at
+        values["created_at"] = _event_row_datetime(created_at)
     if updated_at is not None:
-        values["updated_at"] = updated_at
+        values["updated_at"] = _event_row_datetime(updated_at)
     return models.WorkspaceEvent(**values)
 
 

@@ -351,6 +351,24 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertNotIn("message", event)
         self.assertNotIn("kind", event)
 
+    def test_event_row_to_messenger_event_parses_sql_timestamp_strings(self):
+        payload = {
+            "kind": "message.deleted",
+            "uuid": str(sys_uuid.uuid4()),
+        }
+        row = self._workspace_event_row(
+            payload=payload,
+            object_type="message",
+            action="deleted",
+        )
+        row["created_at"] = str(row["created_at"])
+        row["updated_at"] = str(row["updated_at"])
+
+        event = events.event_row_to_messenger_event(row)
+
+        self.assertEqual("2026-06-24T10:00:00.000000Z", event["created_at"])
+        self.assertEqual("2026-06-24T10:00:00.000000Z", event["updated_at"])
+
     def test_event_row_to_messenger_event_preserves_reaction_event(self):
         reaction_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
