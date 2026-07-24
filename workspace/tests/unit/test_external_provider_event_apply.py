@@ -717,7 +717,13 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
             *[
                 item
                 for epoch_version in (81, 82, 83)
-                for item in (None, None, {"epoch_version": epoch_version}, None)
+                for item in (
+                    None,
+                    None,
+                    None,
+                    {"epoch_version": epoch_version},
+                    None,
+                )
             ],
         ]
     )
@@ -863,6 +869,13 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
         if "INSERT INTO m_workspace_event_audience_members_v1" in statement
     ]
     assert audience_members == [sorted(member_uuids, key=str)] * 3
+    assert (
+        sum(
+            "pg_advisory_xact_lock" in statement
+            for statement, _params in session.statements
+        )
+        == 3
+    )
     assert (
         sum(
             "m_workspace_broadcast_message_events_v1" in statement
