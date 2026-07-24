@@ -4,6 +4,8 @@
 # you may not use this file except in compliance with the License.
 
 from restalchemy.storage.sql import migrations as ra_migrations
+import psycopg
+import pytest
 
 from workspace.tests.integration import conftest
 
@@ -17,6 +19,8 @@ LEGACY_MIGRATION_UUIDS = (
 )
 CLEANUP_MIGRATION_UUID = "eec69a95-cabb-49c5-89a1-8078732f27c2"
 CLEANUP_MIGRATION_FILE = "0113-remove-legacy-Messenger-mail-storage-eec69a.py"
+EMAIL_INDEX_MIGRATION_UUID = "1dbd2c19-1e0c-4d6c-8928-ee64ca5e2382"
+EMAIL_INDEX_MIGRATION_FILE = "0114-scope-Messenger-email-uniqueness-to-IAM-1dbd2c.py"
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -30,16 +34,60 @@ LEGACY_TABLES = (
 )
 
 
-def test_mail_cleanup_is_the_single_migration_head(_database, db):
+def test_email_index_scope_is_the_single_migration_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == CLEANUP_MIGRATION_FILE
+    assert engine.get_latest_migration() == EMAIL_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
-            'SELECT applied FROM "ra_migrations" WHERE uuid = %s',
-            (CLEANUP_MIGRATION_UUID,),
+            'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
+            ([CLEANUP_MIGRATION_UUID, EMAIL_INDEX_MIGRATION_UUID],),
         )
-        assert cur.fetchone() == (True,)
+        assert set(cur.fetchall()) == {
+            (CLEANUP_MIGRATION_UUID, True),
+            (EMAIL_INDEX_MIGRATION_UUID, True),
+        }
+
+
+def test_email_uniqueness_is_scoped_to_iam_users(_database, db):
+    shared_email = "shared-provider-identity@example.invalid"
+    rows = (
+        ("10000000-0000-4000-8000-000000000001", "zulip-one", "zulip"),
+        ("10000000-0000-4000-8000-000000000002", "zulip-two", "zulip"),
+        ("10000000-0000-4000-8000-000000000003", "iam-one", "iam"),
+    )
+    with db.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_users (
+                uuid, username, source, status, email, avatar,
+                created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, 'active', %s,
+                'urn:gravatar:00000000000000000000000000000000',
+                NOW(), NOW()
+            )
+            """,
+            ((uuid, username, source, shared_email) for uuid, username, source in rows),
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute(
+                """
+                INSERT INTO m_workspace_users (
+                    uuid, username, source, status, email, avatar,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, 'iam-two', 'iam', 'active', %s,
+                    'urn:gravatar:00000000000000000000000000000000',
+                    NOW(), NOW()
+                )
+                """,
+                ("10000000-0000-4000-8000-000000000004", shared_email),
+            )
+        cur.execute(
+            "DELETE FROM m_workspace_users WHERE uuid = ANY(%s::uuid[])",
+            ([row[0] for row in rows],),
+        )
 
 
 def test_mail_cleanup_removes_upgraded_database_artifacts(_database, db):
@@ -102,9 +150,7 @@ def test_mail_cleanup_removes_upgraded_database_artifacts(_database, db):
             ((migration_uuid,) for migration_uuid in LEGACY_MIGRATION_UUIDS),
         )
 
-    engine = ra_migrations.MigrationEngine(
-        migrations_path=str(conftest.MIGRATIONS_DIR)
-    )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine.apply_migration(CLEANUP_MIGRATION_FILE)
 
     with db.cursor() as cur:
