@@ -656,6 +656,15 @@ def create_broadcast_event(
         return []
     session = session or contexts.Context().get_session()
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
+    # WebSocket cursors assume that lower epoch versions become visible before
+    # higher versions. Serialize broadcast and direct event writers with the
+    # same per-project transaction lock so commit order preserves that invariant.
+    session.execute(
+        """
+        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+        """,
+        (project_id,),
+    )
     membership_digest = hashlib.sha256(
         "\n".join(str(value) for value in recipients).encode("ascii")
     ).hexdigest()

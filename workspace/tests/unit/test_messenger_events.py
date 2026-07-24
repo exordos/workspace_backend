@@ -154,6 +154,33 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_at=created_at,
         )
 
+    def test_broadcast_event_serializes_project_epoch_commits(self):
+        project_id = sys_uuid.uuid4()
+        entity_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        session = mock.MagicMock()
+        session.execute.return_value.fetchone.return_value = {"epoch_version": 71}
+
+        result = events.create_broadcast_event(
+            project_id,
+            entity_uuid,
+            [recipient_uuid],
+            "message.created",
+            {"uuid": str(entity_uuid)},
+            session=session,
+        )
+
+        self.assertEqual([71], result)
+        lock_statement, lock_params = session.execute.call_args_list[0].args
+        self.assertIn("pg_advisory_xact_lock", lock_statement)
+        self.assertEqual((project_id,), lock_params)
+        broadcast_insert = next(
+            index
+            for index, call in enumerate(session.execute.call_args_list)
+            if "INSERT INTO m_workspace_broadcast_message_events_v1" in call.args[0]
+        )
+        self.assertGreater(broadcast_insert, 0)
+
     def test_websocket_event_reads_use_canonical_store_boundary(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
