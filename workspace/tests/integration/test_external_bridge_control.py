@@ -365,6 +365,102 @@ def test_provider_identity_payload_rewrites_share_a_single_table_pass(
     assert payload["reference"] == f"provider:{canonical_a_uuid}"
 
 
+def test_provider_identity_merge_resumes_bounded_event_batches(
+    _database,
+    db,
+    monkeypatch,
+):
+    owner_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    canonical_user_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, "bounded-merge-owner")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_users (
+                uuid, username, source, status, avatar,
+                provider_uuid, external_account_uuid, provider_external_id,
+                created_at, updated_at, last_ping_at
+            )
+            SELECT %s, %s, 'zulip', 'active', avatar,
+                   %s, %s, '20', NOW(), NOW(), NOW()
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (
+                legacy_user_uuid,
+                f"zulip-{legacy_user_uuid}",
+                sys_uuid.uuid4(),
+                sys_uuid.uuid4(),
+                owner_uuid,
+            ),
+        )
+        for offset in range(3):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_events (
+                    uuid, project_id, user_uuid, payload, object_type, action
+                ) VALUES (
+                    %s, %s, %s, %s::jsonb, 'user', 'updated'
+                )
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    legacy_user_uuid,
+                    json.dumps(
+                        {
+                            "offset": offset,
+                            "identity_uuid": str(legacy_user_uuid),
+                        }
+                    ),
+                ),
+            )
+    monkeypatch.setattr(identity_linking, "_REFERENCE_UPDATE_ROW_BATCH_SIZE", 2)
+    monkeypatch.setattr(identity_linking, "_PAYLOAD_REWRITE_ROW_BATCH_SIZE", 2)
+    session_factory = engines.engine_factory.get_engine().session_manager
+    pending_attempts = 0
+    for _attempt in range(6):
+        completed = False
+        with session_factory() as session:
+            try:
+                identity_linking.merge_workspace_user_identity(
+                    session,
+                    legacy_user_uuid,
+                    canonical_user_uuid,
+                )
+            except identity_linking.IdentityMergePending:
+                pending_attempts += 1
+            else:
+                completed = True
+        if completed:
+            break
+    else:
+        pytest.fail("Identity reconciliation did not finish")
+
+    assert pending_attempts == 2
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+            ORDER BY epoch_version
+            """,
+            (project_uuid,),
+        )
+        rows = cursor.fetchall()
+        cursor.execute(
+            "SELECT uuid FROM m_workspace_users WHERE uuid = ANY(%s)",
+            ([legacy_user_uuid, canonical_user_uuid],),
+        )
+        user_rows = cursor.fetchall()
+    assert [row[0] for row in rows] == [canonical_user_uuid] * 3
+    assert [row[1]["identity_uuid"] for row in rows] == [str(canonical_user_uuid)] * 3
+    assert user_rows == [(canonical_user_uuid,)]
+
+
 def test_unreferenced_provider_identity_cleanup_removes_only_stale_rows(
     _database,
     db,

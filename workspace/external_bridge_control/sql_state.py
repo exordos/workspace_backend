@@ -1370,15 +1370,22 @@ class SQLControlState:
                     owner_uuid,
                 )
             )
-        if account["provider_realm_uuid"] is None:
-            changed_chat_uuids.update(
-                identity_linking.merge_account_scoped_provider_identities(
-                    session,
-                    provider=identity.provider_kind,
-                    account_uuid=account_uuid,
-                    provider_realm_uuid=provider_realm_uuid,
-                )
+            identity_linking.bind_verified_account_owner(
+                session,
+                provider=identity.provider_kind,
+                account_uuid=account_uuid,
+                owner_user_uuid=owner_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_user_id=source["provider_owner_user_id"],
             )
+        changed_chat_uuids.update(
+            identity_linking.merge_account_scoped_provider_identities(
+                session,
+                provider=identity.provider_kind,
+                account_uuid=account_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+            )
+        )
         existing_participants = {
             participant["provider_user_id"]: participant["identity_uuid"]
             for participant in (
@@ -1729,6 +1736,7 @@ class SQLControlState:
         for report in reports:
             report_uuid = sys_uuid.UUID(report["report_uuid"])
             canonical = hashlib.sha256(_json(report).encode()).hexdigest()
+            result_safe_error = None
             existing = session.execute(
                 'SELECT "canonical_sha256" '
                 'FROM "m_external_bridge_observed_reports_v1" '
@@ -1813,21 +1821,36 @@ class SQLControlState:
                 if status == "applied":
                     try:
                         self._reconcile_observed_report(session, identity, report)
+                    except identity_linking.IdentityMergePending:
+                        session.execute(
+                            """
+                            DELETE FROM m_external_bridge_observed_reports_v1
+                            WHERE report_uuid = %s
+                            """,
+                            (report_uuid,),
+                        )
+                        status = "rejected"
+                        result_safe_error = {
+                            "code": "identity_reconciliation_in_progress",
+                            "message": (
+                                "Legacy provider identity reconciliation "
+                                "is still in progress"
+                            ),
+                            "retryable": True,
+                        }
                     except ValueError:
                         status = "rejected"
+            if status == "rejected" and result_safe_error is None:
+                result_safe_error = {
+                    "code": "observed_report_rejected",
+                    "message": "Observed report does not match current desired state",
+                    "retryable": False,
+                }
             results.append(
                 {
                     "report_uuid": str(report_uuid),
                     "status": status,
-                    "safe_error": (
-                        None
-                        if status != "rejected"
-                        else {
-                            "code": "observed_report_rejected",
-                            "message": "Observed report does not match current desired state",
-                            "retryable": False,
-                        }
-                    ),
+                    "safe_error": result_safe_error,
                 }
             )
         refresh_effective_capabilities(
