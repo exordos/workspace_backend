@@ -21,6 +21,7 @@ from restalchemy.api import applications
 from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.api import middlewares
 from restalchemy.api import routes
+from restalchemy.openapi import constants as openapi_constants
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
 
@@ -92,7 +93,9 @@ def get_openapi_engine() -> typing.Any:
             description=f"OpenAPI - Workspace {versions.API_VERSION_1_0}",
         ),
         paths=MessengerOpenApiPaths(),
-        components=MessengerOpenApiComponents(),
+        components=MessengerOpenApiComponents(
+            openapi_constants.OPENAPI_SPECIFICATION_3_0_3,
+        ),
     )
     return openapi_engine
 

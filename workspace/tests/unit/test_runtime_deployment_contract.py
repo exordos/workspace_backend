@@ -44,6 +44,27 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
 
 
+def test_postgresql_runtime_has_bounded_connection_lifetimes():
+    expected = {
+        "connection_connect_timeout": 30,
+        "connection_statement_timeout": 240,
+        "connection_transaction_timeout": 300,
+        "connection_idle_in_transaction_session_timeout": 240,
+        "connection_tcp_user_timeout": 300,
+        "connection_keepalives_idle": 60,
+        "connection_keepalives_interval": 30,
+        "connection_keepalives_count": 5,
+    }
+
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        for name, value in expected.items():
+            assert f"{name} = {value}" in config
+
+
 def test_manifest_provisions_unassigned_external_integration_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     account_permissions = {
