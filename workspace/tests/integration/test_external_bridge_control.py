@@ -196,12 +196,10 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             )
             is None
         )
-        canonical_external_uuid = (
-            identity_linking.canonical_provider_identity_uuid(
-                "zulip",
-                provider_realm_uuid,
-                "20",
-            )
+        canonical_external_uuid = identity_linking.canonical_provider_identity_uuid(
+            "zulip",
+            provider_realm_uuid,
+            "20",
         )
         assert identity_linking.merge_account_scoped_provider_identities(
             session,
@@ -309,6 +307,62 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
                 provider_realm_uuid=provider_realm_uuid,
                 provider_user_id="20",
             )
+
+
+def test_provider_identity_payload_rewrites_share_a_single_table_pass(
+    _database,
+    db,
+):
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    legacy_a_uuid = sys_uuid.uuid4()
+    legacy_b_uuid = sys_uuid.uuid4()
+    canonical_a_uuid = sys_uuid.uuid4()
+    canonical_b_uuid = sys_uuid.uuid4()
+    event_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, "payload-rewrite-owner")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_events (
+                uuid, project_id, user_uuid, payload, object_type, action
+            ) VALUES (%s, %s, %s, %s::jsonb, 'user', 'updated')
+            """,
+            (
+                event_uuid,
+                project_uuid,
+                owner_uuid,
+                json.dumps(
+                    {
+                        "participants": [
+                            {"uuid": str(legacy_a_uuid)},
+                            {"uuid": str(legacy_b_uuid)},
+                        ],
+                        "reference": f"provider:{legacy_a_uuid}",
+                    }
+                ),
+            ),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        identity_linking._rewrite_payload_uuid_references(
+            session,
+            [
+                (legacy_a_uuid, canonical_a_uuid),
+                (legacy_b_uuid, canonical_b_uuid),
+            ],
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT payload FROM m_workspace_events WHERE uuid = %s",
+            (event_uuid,),
+        )
+        payload = cursor.fetchone()[0]
+    assert payload["participants"] == [
+        {"uuid": str(canonical_a_uuid)},
+        {"uuid": str(canonical_b_uuid)},
+    ]
+    assert payload["reference"] == f"provider:{canonical_a_uuid}"
 
 
 def test_unreferenced_provider_identity_cleanup_removes_only_stale_rows(

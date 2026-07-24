@@ -5,10 +5,55 @@
 
 """Verified provider-identity linking for external Messenger projections."""
 
+import typing
 import uuid as sys_uuid
 
 
 _PROVIDER_IDENTITY_NAMESPACE = sys_uuid.UUID("fda6f96e-c86d-5c94-976d-4e813e3f3655")
+_PAYLOAD_REFERENCE_TABLES = (
+    "m_workspace_events",
+    "m_workspace_broadcast_message_events_v1",
+    "m_workspace_event_recipient_payloads_v1",
+)
+_PAYLOAD_REWRITE_BATCH_SIZE = 100
+
+
+def _rewrite_payload_uuid_references(
+    session: typing.Any,
+    replacements: list[tuple[sys_uuid.UUID, sys_uuid.UUID]],
+) -> None:
+    """Rewrite many legacy UUIDs with one table scan per bounded batch."""
+    unique_replacements: dict[sys_uuid.UUID, sys_uuid.UUID] = {}
+    for legacy_user_uuid, canonical_user_uuid in replacements:
+        if legacy_user_uuid == canonical_user_uuid:
+            continue
+        existing = unique_replacements.setdefault(
+            legacy_user_uuid,
+            canonical_user_uuid,
+        )
+        if existing != canonical_user_uuid:
+            raise ValueError("Legacy identity has conflicting canonical users")
+    ordered = sorted(unique_replacements.items(), key=lambda item: item[0].int)
+    for offset in range(0, len(ordered), _PAYLOAD_REWRITE_BATCH_SIZE):
+        batch = ordered[offset : offset + _PAYLOAD_REWRITE_BATCH_SIZE]
+        expression = "payload::text"
+        values: list[object] = []
+        patterns = []
+        for legacy_user_uuid, canonical_user_uuid in batch:
+            expression = f"replace({expression}, %s, %s)"
+            legacy_text = str(legacy_user_uuid)
+            values.extend((legacy_text, str(canonical_user_uuid)))
+            patterns.append(f"%{legacy_text}%")
+        values.append(patterns)
+        for table_name in _PAYLOAD_REFERENCE_TABLES:
+            session.execute(
+                f"""
+                UPDATE "{table_name}"
+                SET payload = ({expression})::jsonb
+                WHERE payload::text LIKE ANY(%s::text[])
+                """,
+                tuple(values),
+            )
 
 
 def canonical_provider_identity_uuid(
@@ -24,7 +69,7 @@ def canonical_provider_identity_uuid(
 
 
 def bind_verified_account_owner(
-    session,
+    session: typing.Any,
     *,
     provider: str,
     account_uuid: sys_uuid.UUID,
@@ -140,7 +185,7 @@ def bind_verified_account_owner(
 
 
 def resolve_provider_identity(
-    session,
+    session: typing.Any,
     *,
     provider: str,
     provider_realm_uuid: sys_uuid.UUID,
@@ -195,7 +240,7 @@ def resolve_provider_identity(
 
 
 def merge_account_scoped_provider_identities(
-    session,
+    session: typing.Any,
     *,
     provider: str,
     account_uuid: sys_uuid.UUID,
@@ -216,27 +261,35 @@ def merge_account_scoped_provider_identities(
         (account_uuid,),
     ).fetchall()
     changed_chat_uuids: set[sys_uuid.UUID] = set()
+    payload_replacements: list[tuple[sys_uuid.UUID, sys_uuid.UUID]] = []
     for legacy_identity in legacy_identities:
+        legacy_user_uuid = sys_uuid.UUID(str(legacy_identity["uuid"]))
         canonical_user_uuid = resolve_provider_identity(
             session,
             provider=provider,
             provider_realm_uuid=provider_realm_uuid,
             provider_user_id=legacy_identity["provider_external_id"],
         )
+        if legacy_user_uuid != canonical_user_uuid:
+            payload_replacements.append((legacy_user_uuid, canonical_user_uuid))
         changed_chat_uuids.update(
             merge_workspace_user_identity(
                 session,
-                sys_uuid.UUID(str(legacy_identity["uuid"])),
+                legacy_user_uuid,
                 canonical_user_uuid,
+                rewrite_payloads=False,
             )
         )
+    _rewrite_payload_uuid_references(session, payload_replacements)
     return sorted(changed_chat_uuids)
 
 
 def merge_workspace_user_identity(
-    session,
+    session: typing.Any,
     legacy_user_uuid: sys_uuid.UUID,
     canonical_user_uuid: sys_uuid.UUID,
+    *,
+    rewrite_payloads: bool = True,
 ) -> list[sys_uuid.UUID]:
     """Move an old account-scoped external user onto its canonical UUID."""
     if legacy_user_uuid == canonical_user_uuid:
@@ -484,18 +537,10 @@ def merge_workspace_user_identity(
     )
     legacy_text = str(legacy_user_uuid)
     canonical_text = str(canonical_user_uuid)
-    for table_name in (
-        "m_workspace_events",
-        "m_workspace_broadcast_message_events_v1",
-        "m_workspace_event_recipient_payloads_v1",
-    ):
-        session.execute(
-            f"""
-            UPDATE "{table_name}"
-            SET payload = replace(payload::text, %s, %s)::jsonb
-            WHERE position(%s in payload::text) > 0
-            """,
-            (legacy_text, canonical_text, legacy_text),
+    if rewrite_payloads:
+        _rewrite_payload_uuid_references(
+            session,
+            [(legacy_user_uuid, canonical_user_uuid)],
         )
     changed_chats = session.execute(
         """
@@ -520,7 +565,9 @@ def merge_workspace_user_identity(
     return [sys_uuid.UUID(str(row["uuid"])) for row in changed_chats]
 
 
-def delete_unreferenced_provider_identities(session) -> list[sys_uuid.UUID]:
+def delete_unreferenced_provider_identities(
+    session: typing.Any,
+) -> list[sys_uuid.UUID]:
     """Remove stale external rows left behind by already deleted accounts."""
     references = session.execute(
         """
