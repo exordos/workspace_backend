@@ -7,6 +7,7 @@ import datetime
 import types
 import uuid as sys_uuid
 
+from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import sql_state
 
 
@@ -91,3 +92,83 @@ def test_observed_report_reconciliation_reuses_the_caller_session(monkeypatch):
     }
     assert reconciled == [(session, identity, report)]
     assert refreshed == [(session, {"provider_kind": "zulip"})]
+
+
+def test_pending_identity_reconciliation_keeps_report_retryable(monkeypatch):
+    bridge_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+    )
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    report = {
+        "report_uuid": str(sys_uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(chat_uuid),
+        "observed_generation": 1,
+        "status": "ready",
+        "progress": {
+            "phase": "catalog",
+            "completed": 1,
+            "total": 1,
+            "last_progress_at": observed_at,
+        },
+        "safe_error": None,
+        "observed_at": observed_at,
+        "catalog": {"external_account_uuid": str(account_uuid)},
+    }
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, statement, params):
+            self.calls.append((statement, params))
+            if 'SELECT "canonical_sha256"' in statement:
+                return _Result()
+            if 'SELECT "operation", "generation"' in statement:
+                return _Result({"operation": "upsert", "generation": 1})
+            if "SELECT MAX" in statement:
+                return _Result({"generation": None})
+            return _Result()
+
+    session = Session()
+    repository = sql_state.SQLControlState(sys_uuid.uuid4(), b"k" * 32)
+
+    def reconciliation_pending(*_args):
+        raise identity_linking.IdentityMergePending
+
+    monkeypatch.setattr(
+        repository,
+        "_reconcile_observed_report",
+        reconciliation_pending,
+    )
+    monkeypatch.setattr(
+        sql_state,
+        "refresh_effective_capabilities",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = repository.reconcile_observed_reports(session, identity, [report])
+
+    assert result == {
+        "results": [
+            {
+                "report_uuid": report["report_uuid"],
+                "status": "rejected",
+                "safe_error": {
+                    "code": "identity_reconciliation_in_progress",
+                    "message": (
+                        "Legacy provider identity reconciliation is still in progress"
+                    ),
+                    "retryable": True,
+                },
+            }
+        ]
+    }
+    assert any(
+        "DELETE FROM m_external_bridge_observed_reports_v1" in statement
+        for statement, _params in session.calls
+    )

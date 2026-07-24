@@ -23,6 +23,10 @@ EMAIL_INDEX_MIGRATION_UUID = "1dbd2c19-1e0c-4d6c-8928-ee64ca5e2382"
 EMAIL_INDEX_MIGRATION_FILE = "0114-scope-Messenger-email-uniqueness-to-IAM-1dbd2c.py"
 ZULIP_IDENTITY_MIGRATION_UUID = "39cb26af-4a18-4e87-befd-e5e540271137"
 ZULIP_IDENTITY_MIGRATION_FILE = "0115-link-Zulip-provider-identities-39cb26.py"
+IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID = "72f59f53-0bc7-4cda-ae81-79d22c3fee2f"
+IDENTITY_RECONCILIATION_INDEX_MIGRATION_FILE = (
+    "0116-index-Messenger-event-identity-reconciliation-72f59f.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -36,10 +40,10 @@ LEGACY_TABLES = (
 )
 
 
-def test_zulip_identity_linking_is_the_single_migration_head(_database, db):
+def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == ZULIP_IDENTITY_MIGRATION_FILE
+    assert engine.get_latest_migration() == IDENTITY_RECONCILIATION_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -48,6 +52,7 @@ def test_zulip_identity_linking_is_the_single_migration_head(_database, db):
                     CLEANUP_MIGRATION_UUID,
                     EMAIL_INDEX_MIGRATION_UUID,
                     ZULIP_IDENTITY_MIGRATION_UUID,
+                    IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID,
                 ],
             ),
         )
@@ -55,7 +60,10 @@ def test_zulip_identity_linking_is_the_single_migration_head(_database, db):
             (CLEANUP_MIGRATION_UUID, True),
             (EMAIL_INDEX_MIGRATION_UUID, True),
             (ZULIP_IDENTITY_MIGRATION_UUID, True),
+            (IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID, True),
         }
+        cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
+        assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
 
 
 def test_email_uniqueness_is_scoped_to_iam_users(_database, db):
