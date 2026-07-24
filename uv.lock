@@ -1286,7 +1286,7 @@ wheels = [
 
 [[package]]
 name = "restalchemy"
-version = "15.2.0"
+version = "15.2.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "email-validator" },
@@ -1299,9 +1299,9 @@ dependencies = [
     { name = "requests" },
     { name = "webob" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fc/d8/455316dd30d281651c99335949a15cebbb3812d573777bf2138ac3351976/restalchemy-15.2.0.tar.gz", hash = "sha256:d99c200998d4ed5deced2bc65a86382596d4240a86ed3e80d228a46d8321b93a", size = 442673, upload-time = "2026-06-24T11:35:03.366Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/7b/710b6c98e5705f86a26c64286b6eb0cd761e972ba366ef4ac9b7a50c7b55/restalchemy-15.2.8.tar.gz", hash = "sha256:07419f6d0bb1de2396ef20e35d5cfc8031e668b639401aef4627918c9ed8dff3", size = 468468, upload-time = "2026-07-24T10:13:52.435Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ab/d8/f90e222ae25f0e1b1e5cdc54013219e56f3df7da348e475c31c10c10f769/restalchemy-15.2.0-py3-none-any.whl", hash = "sha256:3c00f92f6399415072c7effe44abddc30fc5b936507b5b7e72320d6a4036d774", size = 495315, upload-time = "2026-06-24T11:35:01.607Z" },
+    { url = "https://files.pythonhosted.org/packages/dd/27/9c4edf3f6cddb6d4ff7c67b04746ebd07fecd2e8dd3c72b2bfba5d0f8c5a/restalchemy-15.2.8-py3-none-any.whl", hash = "sha256:1c68d9327c23267f1ccf1139d8d94b5bc578c329662618539246869996336f79", size = 527843, upload-time = "2026-07-24T10:13:50.524Z" },
 ]
 
 [[package]]
@@ -1685,7 +1685,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0,<9.0.0" },
     { name = "pytest-timer", marker = "extra == 'test'", specifier = ">=1.0.0,<2.0.0" },
     { name = "requests", specifier = ">=2.32.0,<3.0.0" },
-    { name = "restalchemy", specifier = ">=15.2.0,<16.0.0" },
+    { name = "restalchemy", specifier = ">=15.2.8,<16.0.0" },
     { name = "ruff", marker = "extra == 'ruff'" },
     { name = "shellcheck-py", marker = "extra == 'shellcheck'" },
     { name = "tox", marker = "extra == 'dev'", specifier = ">=4.0.0" },

@@ -8,6 +8,7 @@ from restalchemy.api import applications
 from restalchemy.api import middlewares
 from restalchemy.api import routes
 from restalchemy.api.middlewares import logging as logging_mw
+from restalchemy.openapi import constants as openapi_constants
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
 from typing import Any
@@ -87,7 +88,9 @@ def get_openapi_engine() -> openapi_engines.OpenApiEngine:
             description="IAM-authenticated Workspace API",
         ),
         paths=WorkspaceOpenApiPaths(),
-        components=WorkspaceOpenApiComponents(),
+        components=WorkspaceOpenApiComponents(
+            openapi_constants.OPENAPI_SPECIFICATION_3_0_3,
+        ),
     )
 
 

@@ -344,6 +344,14 @@ resources:
           f"
           [db]
           connection_url = postgresql://{$dbaas.types.postgres.instances.$workspace_projection_cluster.users.$workspace_projection_user:name}:{$core.secret.passwords.$workspace_projection_db_password:value}@{$dbaas.types.postgres.instances.$workspace_projection_cluster:join(ipsv4)}:5432/{$dbaas.types.postgres.instances.$workspace_projection_cluster.databases.$workspace_projection_db:name}
+          connection_connect_timeout = 30
+          connection_statement_timeout = 240
+          connection_transaction_timeout = 300
+          connection_idle_in_transaction_session_timeout = 240
+          connection_tcp_user_timeout = 300
+          connection_keepalives_idle = 60
+          connection_keepalives_interval = 30
+          connection_keepalives_count = 5
 
 
           [logging]
