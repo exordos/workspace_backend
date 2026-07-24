@@ -34,6 +34,119 @@ RESOURCE_MODELS: dict[str, typing.Any] = {
 _PROVIDER_TARGET_UNSET = object()
 _PROVIDER_TARGET_EXISTS = object()
 EVENT_RETENTION = datetime.timedelta(days=7)
+BOUNDED_VISIBLE_EVENTS_SQL = """
+    WITH direct_events AS (
+        SELECT
+            event."epoch_version", event."uuid", event."project_id",
+            event."user_uuid", event."payload", event."created_at",
+            event."updated_at", event."schema_version",
+            event."object_type", event."action"
+        FROM "m_workspace_events" AS event
+        WHERE event."project_id" = %s
+          AND event."user_uuid" = %s
+          AND event."epoch_version" > %s
+          AND (
+              COALESCE(event."payload"->>'source_name', 'native') = 'native'
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_confirmed_external_account_access" AS access
+                  WHERE access."project_id" = event."project_id"
+                    AND access."user_uuid" = event."user_uuid"
+                    AND access."account_type" =
+                        event."payload"->>'source_name'
+                    AND access."source_scope" = COALESCE(
+                        event."payload"->'source'->>'source_scope',
+                        event."payload"->'source'->>'server_url'
+                    )
+              )
+          )
+          AND (
+              event."payload"->>'old_source_name' IS NULL
+              OR event."payload"->>'old_source_name' = 'native'
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_confirmed_external_account_access" AS old_access
+                  WHERE old_access."project_id" = event."project_id"
+                    AND old_access."user_uuid" = event."user_uuid"
+                    AND old_access."account_type" =
+                        event."payload"->>'old_source_name'
+                    AND old_access."source_scope" = COALESCE(
+                        event."payload"->'old_source'->>'source_scope',
+                        event."payload"->'old_source'->>'server_url'
+                    )
+              )
+          )
+        ORDER BY event."epoch_version" ASC
+        LIMIT %s
+    ),
+    broadcast_payloads AS (
+        SELECT
+            event."epoch_version", event."uuid", event."project_id",
+            recipient."user_uuid",
+            event."payload"
+                || COALESCE(override."payload", '{}'::jsonb)
+                || jsonb_build_object(
+                    'user_uuid', recipient."user_uuid"
+                ) AS "payload",
+            event."created_at", event."updated_at",
+            event."schema_version", event."object_type", event."action"
+        FROM "m_workspace_broadcast_message_events_v1" AS event
+        JOIN "m_workspace_event_audience_members_v1" AS recipient
+          ON recipient."audience_snapshot_uuid" =
+              event."audience_snapshot_uuid"
+         AND recipient."user_uuid" = %s
+        LEFT JOIN "m_workspace_event_recipient_payloads_v1" AS override
+          ON override."event_uuid" = event."uuid"
+         AND override."user_uuid" = recipient."user_uuid"
+        WHERE event."project_id" = %s
+          AND event."epoch_version" > %s
+    ),
+    broadcast_events AS (
+        SELECT event.*
+        FROM broadcast_payloads AS event
+        WHERE (
+              COALESCE(event."payload"->>'source_name', 'native') = 'native'
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_confirmed_external_account_access" AS access
+                  WHERE access."project_id" = event."project_id"
+                    AND access."user_uuid" = event."user_uuid"
+                    AND access."account_type" =
+                        event."payload"->>'source_name'
+                    AND access."source_scope" = COALESCE(
+                        event."payload"->'source'->>'source_scope',
+                        event."payload"->'source'->>'server_url'
+                    )
+              )
+          )
+          AND (
+              event."payload"->>'old_source_name' IS NULL
+              OR event."payload"->>'old_source_name' = 'native'
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_confirmed_external_account_access" AS old_access
+                  WHERE old_access."project_id" = event."project_id"
+                    AND old_access."user_uuid" = event."user_uuid"
+                    AND old_access."account_type" =
+                        event."payload"->>'old_source_name'
+                    AND old_access."source_scope" = COALESCE(
+                        event."payload"->'old_source'->>'source_scope',
+                        event."payload"->'old_source'->>'server_url'
+                    )
+              )
+          )
+        ORDER BY event."epoch_version" ASC
+        LIMIT %s
+    )
+    SELECT event.*
+    FROM (
+        SELECT * FROM direct_events
+        UNION ALL
+        SELECT * FROM broadcast_events
+    ) AS event
+    ORDER BY event."epoch_version" ASC
+    LIMIT %s
+"""
 
 
 class EventCursor(typing.TypedDict):
@@ -1278,22 +1391,51 @@ class PostgresEventStore:
     ) -> list[dict[str, typing.Any]]:
         after, clauses = self._after_epoch_version(filters)
         self._validate_event_cursor(after, epoch_generation)
-        scoped_filters = {
-            name: value for name, value in filters.items() if name != "epoch_version"
-        }
-        scoped_filters.update(
-            {
-                "project_id": dm_filters.EQ(self.project_uuid),
-                "user_uuid": dm_filters.EQ(self.user_uuid),
-                "epoch_version": dm_filters.GT(after),
+        if (
+            set(filters) == {"epoch_version"}
+            and (order_by is None or order_by == {"epoch_version": "asc"})
+            and limit is not None
+        ):
+            session = contexts.Context().get_session()
+            events = session.execute(
+                BOUNDED_VISIBLE_EVENTS_SQL,
+                (
+                    self.project_uuid,
+                    self.user_uuid,
+                    after,
+                    limit,
+                    self.user_uuid,
+                    self.project_uuid,
+                    after,
+                    limit,
+                    limit,
+                ),
+            ).fetchall()
+            result = [
+                messenger_events.event_row_to_messenger_event(event)
+                for event in events
+            ]
+        else:
+            scoped_filters = {
+                name: value
+                for name, value in filters.items()
+                if name != "epoch_version"
             }
-        )
-        events = models.WorkspaceVisibleEvent.objects.get_all(
-            filters=scoped_filters,
-            order_by=order_by or {"epoch_version": "asc"},
-            limit=limit,
-        )
-        result = [messenger_events.pack_workspace_event(event) for event in events]
+            scoped_filters.update(
+                {
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                    "epoch_version": dm_filters.GT(after),
+                }
+            )
+            events = models.WorkspaceVisibleEvent.objects.get_all(
+                filters=scoped_filters,
+                order_by=order_by or {"epoch_version": "asc"},
+                limit=limit,
+            )
+            result = [
+                messenger_events.pack_workspace_event(event) for event in events
+            ]
         for item in clauses:
             value = int(item.value)
             if isinstance(item, dm_filters.GT):
