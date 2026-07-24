@@ -21,6 +21,8 @@ CLEANUP_MIGRATION_UUID = "eec69a95-cabb-49c5-89a1-8078732f27c2"
 CLEANUP_MIGRATION_FILE = "0113-remove-legacy-Messenger-mail-storage-eec69a.py"
 EMAIL_INDEX_MIGRATION_UUID = "1dbd2c19-1e0c-4d6c-8928-ee64ca5e2382"
 EMAIL_INDEX_MIGRATION_FILE = "0114-scope-Messenger-email-uniqueness-to-IAM-1dbd2c.py"
+ZULIP_IDENTITY_MIGRATION_UUID = "39cb26af-4a18-4e87-befd-e5e540271137"
+ZULIP_IDENTITY_MIGRATION_FILE = "0115-link-Zulip-provider-identities-39cb26.py"
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -34,18 +36,25 @@ LEGACY_TABLES = (
 )
 
 
-def test_email_index_scope_is_the_single_migration_head(_database, db):
+def test_zulip_identity_linking_is_the_single_migration_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == EMAIL_INDEX_MIGRATION_FILE
+    assert engine.get_latest_migration() == ZULIP_IDENTITY_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
-            ([CLEANUP_MIGRATION_UUID, EMAIL_INDEX_MIGRATION_UUID],),
+            (
+                [
+                    CLEANUP_MIGRATION_UUID,
+                    EMAIL_INDEX_MIGRATION_UUID,
+                    ZULIP_IDENTITY_MIGRATION_UUID,
+                ],
+            ),
         )
         assert set(cur.fetchall()) == {
             (CLEANUP_MIGRATION_UUID, True),
             (EMAIL_INDEX_MIGRATION_UUID, True),
+            (ZULIP_IDENTITY_MIGRATION_UUID, True),
         }
 
 

@@ -1,0 +1,593 @@
+# Copyright 2026 Genesis Corporation.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License.
+
+"""Verified provider-identity linking for external Messenger projections."""
+
+import uuid as sys_uuid
+
+
+_PROVIDER_IDENTITY_NAMESPACE = sys_uuid.UUID("fda6f96e-c86d-5c94-976d-4e813e3f3655")
+
+
+def canonical_provider_identity_uuid(
+    provider: str,
+    provider_realm_uuid: sys_uuid.UUID,
+    provider_user_id: str,
+) -> sys_uuid.UUID:
+    """Return one external UUID per provider identity inside a provider realm."""
+    return sys_uuid.uuid5(
+        _PROVIDER_IDENTITY_NAMESPACE,
+        f"{provider}:{provider_realm_uuid}:{provider_user_id}",
+    )
+
+
+def bind_verified_account_owner(
+    session,
+    *,
+    provider: str,
+    account_uuid: sys_uuid.UUID,
+    owner_user_uuid: sys_uuid.UUID,
+    provider_realm_uuid: sys_uuid.UUID,
+    provider_user_id: str,
+) -> sys_uuid.UUID | None:
+    """Bind an authenticated provider account to its IAM owner, fail closed."""
+    account = session.execute(
+        """
+        SELECT owner_user_uuid, provider, provider_realm_uuid,
+               provider_owner_user_id
+        FROM m_external_accounts_v2
+        WHERE uuid = %s
+        FOR UPDATE
+        """,
+        (account_uuid,),
+    ).fetchone()
+    if (
+        account is None
+        or account["owner_user_uuid"] != owner_user_uuid
+        or account["provider"] != provider
+    ):
+        raise ValueError("External account provider identity ownership is invalid")
+    if account["provider_realm_uuid"] is not None and (
+        account["provider_realm_uuid"] != provider_realm_uuid
+        or account["provider_owner_user_id"] != provider_user_id
+    ):
+        raise ValueError("External account provider identity changed")
+    duplicate = session.execute(
+        """
+        SELECT uuid, owner_user_uuid
+        FROM m_external_accounts_v2
+        WHERE provider = %s
+          AND provider_realm_uuid = %s
+          AND provider_owner_user_id = %s
+          AND uuid != %s
+        FOR UPDATE
+        """,
+        (
+            provider,
+            provider_realm_uuid,
+            provider_user_id,
+            account_uuid,
+        ),
+    ).fetchone()
+    if duplicate is not None:
+        raise ValueError("Provider identity is already linked to another account")
+    link = session.execute(
+        """
+        SELECT workspace_user_uuid, link_kind
+        FROM m_external_provider_identity_links_v1
+        WHERE provider = %s
+          AND provider_realm_uuid = %s
+          AND provider_user_id = %s
+        FOR UPDATE
+        """,
+        (provider, provider_realm_uuid, provider_user_id),
+    ).fetchone()
+    legacy_user_uuid = None
+    if link is not None:
+        linked_user_uuid = sys_uuid.UUID(str(link["workspace_user_uuid"]))
+        if (
+            link["link_kind"] == "verified_account_owner"
+            and linked_user_uuid != owner_user_uuid
+        ):
+            raise ValueError("Provider identity belongs to another IAM user")
+        if linked_user_uuid != owner_user_uuid:
+            legacy_user_uuid = linked_user_uuid
+        session.execute(
+            """
+            UPDATE m_external_provider_identity_links_v1
+            SET workspace_user_uuid = %s,
+                link_kind = 'verified_account_owner',
+                updated_at = NOW()
+            WHERE provider = %s
+              AND provider_realm_uuid = %s
+              AND provider_user_id = %s
+            """,
+            (
+                owner_user_uuid,
+                provider,
+                provider_realm_uuid,
+                provider_user_id,
+            ),
+        )
+    else:
+        session.execute(
+            """
+            INSERT INTO m_external_provider_identity_links_v1 (
+                provider, provider_realm_uuid, provider_user_id,
+                workspace_user_uuid, link_kind
+            ) VALUES (%s, %s, %s, %s, 'verified_account_owner')
+            """,
+            (
+                provider,
+                provider_realm_uuid,
+                provider_user_id,
+                owner_user_uuid,
+            ),
+        )
+    session.execute(
+        """
+        UPDATE m_external_accounts_v2
+        SET provider_realm_uuid = %s,
+            provider_owner_user_id = %s,
+            updated_at = NOW()
+        WHERE uuid = %s
+        """,
+        (provider_realm_uuid, provider_user_id, account_uuid),
+    )
+    return legacy_user_uuid
+
+
+def resolve_provider_identity(
+    session,
+    *,
+    provider: str,
+    provider_realm_uuid: sys_uuid.UUID,
+    provider_user_id: str,
+) -> sys_uuid.UUID:
+    """Resolve a provider identity without ever using email as proof."""
+    link = session.execute(
+        """
+        SELECT workspace_user_uuid
+        FROM m_external_provider_identity_links_v1
+        WHERE provider = %s
+          AND provider_realm_uuid = %s
+          AND provider_user_id = %s
+        """,
+        (provider, provider_realm_uuid, provider_user_id),
+    ).fetchone()
+    if link is not None:
+        return sys_uuid.UUID(str(link["workspace_user_uuid"]))
+    workspace_user_uuid = canonical_provider_identity_uuid(
+        provider,
+        provider_realm_uuid,
+        provider_user_id,
+    )
+    session.execute(
+        """
+        INSERT INTO m_external_provider_identity_links_v1 (
+            provider, provider_realm_uuid, provider_user_id,
+            workspace_user_uuid, link_kind
+        ) VALUES (%s, %s, %s, %s, 'provider_identity')
+        ON CONFLICT (
+            provider, provider_realm_uuid, provider_user_id
+        ) DO NOTHING
+        """,
+        (
+            provider,
+            provider_realm_uuid,
+            provider_user_id,
+            workspace_user_uuid,
+        ),
+    )
+    link = session.execute(
+        """
+        SELECT workspace_user_uuid
+        FROM m_external_provider_identity_links_v1
+        WHERE provider = %s
+          AND provider_realm_uuid = %s
+          AND provider_user_id = %s
+        """,
+        (provider, provider_realm_uuid, provider_user_id),
+    ).fetchone()
+    return sys_uuid.UUID(str(link["workspace_user_uuid"]))
+
+
+def merge_account_scoped_provider_identities(
+    session,
+    *,
+    provider: str,
+    account_uuid: sys_uuid.UUID,
+    provider_realm_uuid: sys_uuid.UUID,
+) -> list[sys_uuid.UUID]:
+    """Merge every legacy identity owned by one now-verified account."""
+    legacy_identities = session.execute(
+        """
+        SELECT uuid, provider_external_id
+        FROM m_workspace_users
+        WHERE source = 'zulip'
+          AND external_account_uuid = %s
+          AND provider_external_id IS NOT NULL
+          AND provider_external_id != ''
+        ORDER BY uuid
+        FOR UPDATE
+        """,
+        (account_uuid,),
+    ).fetchall()
+    changed_chat_uuids: set[sys_uuid.UUID] = set()
+    for legacy_identity in legacy_identities:
+        canonical_user_uuid = resolve_provider_identity(
+            session,
+            provider=provider,
+            provider_realm_uuid=provider_realm_uuid,
+            provider_user_id=legacy_identity["provider_external_id"],
+        )
+        changed_chat_uuids.update(
+            merge_workspace_user_identity(
+                session,
+                sys_uuid.UUID(str(legacy_identity["uuid"])),
+                canonical_user_uuid,
+            )
+        )
+    return sorted(changed_chat_uuids)
+
+
+def merge_workspace_user_identity(
+    session,
+    legacy_user_uuid: sys_uuid.UUID,
+    canonical_user_uuid: sys_uuid.UUID,
+) -> list[sys_uuid.UUID]:
+    """Move an old account-scoped external user onto its canonical UUID."""
+    if legacy_user_uuid == canonical_user_uuid:
+        return []
+    legacy = session.execute(
+        """
+        SELECT uuid, source
+        FROM m_workspace_users
+        WHERE uuid = %s
+        FOR UPDATE
+        """,
+        (legacy_user_uuid,),
+    ).fetchone()
+    if legacy is None:
+        return []
+    if legacy["source"] != "zulip":
+        raise ValueError("Only external provider identities may be merged")
+    canonical = session.execute(
+        """
+        SELECT uuid
+        FROM m_workspace_users
+        WHERE uuid = %s
+        FOR UPDATE
+        """,
+        (canonical_user_uuid,),
+    ).fetchone()
+    if canonical is None:
+        session.execute(
+            """
+            UPDATE m_workspace_users
+            SET uuid = %s
+            WHERE uuid = %s
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+    else:
+        session.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid,
+                role, notification_mode, created_at, updated_at
+            )
+            SELECT
+                gen_random_uuid(), project_id, stream_uuid, %s, who_uuid,
+                role, notification_mode, created_at, updated_at
+            FROM m_workspace_stream_bindings
+            WHERE user_uuid = %s
+            ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_drafts
+            SET user_uuid = %s,
+                updated_at = NOW()
+            WHERE user_uuid = %s
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+        session.execute(
+            "DELETE FROM m_workspace_stream_bindings WHERE user_uuid = %s",
+            (legacy_user_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read, pinned, starred,
+                created_at, updated_at
+            )
+            SELECT
+                uuid, %s, project_id, read, pinned, starred,
+                created_at, updated_at
+            FROM m_workspace_user_message_flags
+            WHERE user_uuid = %s
+            ON CONFLICT (uuid, user_uuid) DO UPDATE
+            SET read = (
+                    m_workspace_user_message_flags.read OR EXCLUDED.read
+                ),
+                pinned = (
+                    m_workspace_user_message_flags.pinned
+                    OR EXCLUDED.pinned
+                ),
+                starred = (
+                    m_workspace_user_message_flags.starred
+                    OR EXCLUDED.starred
+                ),
+                updated_at = GREATEST(
+                    m_workspace_user_message_flags.updated_at,
+                    EXCLUDED.updated_at
+                )
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+        session.execute(
+            "DELETE FROM m_workspace_user_message_flags WHERE user_uuid = %s",
+            (legacy_user_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO m_workspace_user_topic_flags (
+                uuid, user_uuid, project_id, is_done, created_at, updated_at
+            )
+            SELECT
+                uuid, %s, project_id, is_done, created_at, updated_at
+            FROM m_workspace_user_topic_flags
+            WHERE user_uuid = %s
+            ON CONFLICT (uuid, user_uuid) DO UPDATE
+            SET is_done = (
+                    m_workspace_user_topic_flags.is_done
+                    OR EXCLUDED.is_done
+                ),
+                updated_at = GREATEST(
+                    m_workspace_user_topic_flags.updated_at,
+                    EXCLUDED.updated_at
+                )
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+        session.execute(
+            "DELETE FROM m_workspace_user_topic_flags WHERE user_uuid = %s",
+            (legacy_user_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO m_workspace_file_accesses (
+                uuid, project_id, file_uuid, user_uuid,
+                created_at, updated_at
+            )
+            SELECT
+                gen_random_uuid(), project_id, file_uuid, %s,
+                created_at, updated_at
+            FROM m_workspace_file_accesses
+            WHERE user_uuid = %s
+            ON CONFLICT (project_id, file_uuid, user_uuid) DO NOTHING
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+        session.execute(
+            "DELETE FROM m_workspace_file_accesses WHERE user_uuid = %s",
+            (legacy_user_uuid,),
+        )
+        session.execute(
+            """
+            DELETE FROM m_workspace_message_reactions AS legacy
+            USING m_workspace_message_reactions AS canonical
+            WHERE legacy.user_uuid = %s
+              AND canonical.user_uuid = %s
+              AND canonical.message_uuid = legacy.message_uuid
+              AND canonical.emoji_name = legacy.emoji_name
+            """,
+            (legacy_user_uuid, canonical_user_uuid),
+        )
+        session.execute(
+            """
+            DELETE FROM m_workspace_event_cursors AS legacy
+            USING m_workspace_event_cursors AS canonical
+            WHERE legacy.user_uuid = %s
+              AND canonical.user_uuid = %s
+              AND canonical.project_id = legacy.project_id
+            """,
+            (legacy_user_uuid, canonical_user_uuid),
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_event_cursors
+            SET user_uuid = %s,
+                updated_at = NOW()
+            WHERE user_uuid = %s
+            """,
+            (canonical_user_uuid, legacy_user_uuid),
+        )
+        references = session.execute(
+            """
+            SELECT child.relname AS table_name,
+                   child_column.attname AS column_name
+            FROM pg_constraint AS foreign_key
+            JOIN pg_class AS child
+              ON child.oid = foreign_key.conrelid
+            JOIN pg_attribute AS child_column
+              ON child_column.attrelid = child.oid
+             AND child_column.attnum = foreign_key.conkey[1]
+            WHERE foreign_key.contype = 'f'
+              AND foreign_key.confrelid = 'm_workspace_users'::regclass
+              AND array_length(foreign_key.conkey, 1) = 1
+            ORDER BY child.relname, child_column.attname
+            """
+        ).fetchall()
+        for reference in references:
+            table_name = reference["table_name"].replace('"', '""')
+            column_name = reference["column_name"].replace('"', '""')
+            session.execute(
+                f'UPDATE "{table_name}" SET "{column_name}" = %s '
+                f'WHERE "{column_name}" = %s',
+                (canonical_user_uuid, legacy_user_uuid),
+            )
+        session.execute(
+            "DELETE FROM m_workspace_users WHERE uuid = %s",
+            (legacy_user_uuid,),
+        )
+    session.execute(
+        """
+        DELETE FROM m_workspace_event_audience_members_v1 AS legacy
+        USING m_workspace_event_audience_members_v1 AS canonical
+        WHERE legacy.user_uuid = %s
+          AND canonical.user_uuid = %s
+          AND canonical.audience_snapshot_uuid =
+              legacy.audience_snapshot_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_event_audience_members_v1
+        SET user_uuid = %s
+        WHERE user_uuid = %s
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        """
+        DELETE FROM m_workspace_event_recipient_payloads_v1 AS legacy
+        USING m_workspace_event_recipient_payloads_v1 AS canonical
+        WHERE legacy.user_uuid = %s
+          AND canonical.user_uuid = %s
+          AND canonical.event_uuid = legacy.event_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_event_recipient_payloads_v1
+        SET user_uuid = %s
+        WHERE user_uuid = %s
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_streams
+        SET direct_user_uuid = %s
+        WHERE direct_user_uuid = %s
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    legacy_text = str(legacy_user_uuid)
+    canonical_text = str(canonical_user_uuid)
+    for table_name in (
+        "m_workspace_events",
+        "m_workspace_broadcast_message_events_v1",
+        "m_workspace_event_recipient_payloads_v1",
+    ):
+        session.execute(
+            f"""
+            UPDATE "{table_name}"
+            SET payload = replace(payload::text, %s, %s)::jsonb
+            WHERE position(%s in payload::text) > 0
+            """,
+            (legacy_text, canonical_text, legacy_text),
+        )
+    changed_chats = session.execute(
+        """
+        UPDATE m_external_chats_v2
+        SET source = replace(source::text, %s, %s)::jsonb,
+            revision = revision + 1,
+            updated_at = NOW()
+        WHERE position(%s in source::text) > 0
+        RETURNING uuid
+        """,
+        (legacy_text, canonical_text, legacy_text),
+    ).fetchall()
+    session.execute(
+        """
+        UPDATE m_external_provider_identity_links_v1
+        SET workspace_user_uuid = %s,
+            updated_at = NOW()
+        WHERE workspace_user_uuid = %s
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    return [sys_uuid.UUID(str(row["uuid"])) for row in changed_chats]
+
+
+def delete_unreferenced_provider_identities(session) -> list[sys_uuid.UUID]:
+    """Remove stale external rows left behind by already deleted accounts."""
+    references = session.execute(
+        """
+        SELECT child.relname AS table_name,
+               child_column.attname AS column_name
+        FROM pg_constraint AS foreign_key
+        JOIN pg_class AS child
+          ON child.oid = foreign_key.conrelid
+        JOIN pg_attribute AS child_column
+          ON child_column.attrelid = child.oid
+         AND child_column.attnum = foreign_key.conkey[1]
+        WHERE foreign_key.contype = 'f'
+          AND foreign_key.confrelid = 'm_workspace_users'::regclass
+          AND array_length(foreign_key.conkey, 1) = 1
+        ORDER BY child.relname, child_column.attname
+        """
+    ).fetchall()
+    candidates = session.execute(
+        """
+        SELECT provider_user.uuid
+        FROM m_workspace_users AS provider_user
+        LEFT JOIN m_external_accounts_v2 AS account
+          ON account.uuid = provider_user.external_account_uuid
+        WHERE provider_user.source = 'zulip'
+          AND account.uuid IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM m_external_provider_identity_links_v1 AS link
+              WHERE link.workspace_user_uuid = provider_user.uuid
+          )
+        ORDER BY provider_user.created_at, provider_user.uuid
+        LIMIT 500
+        """
+    ).fetchall()
+    deleted = []
+    for candidate in candidates:
+        user_uuid = sys_uuid.UUID(str(candidate["uuid"]))
+        referenced = False
+        for reference in references:
+            table_name = reference["table_name"].replace('"', '""')
+            column_name = reference["column_name"].replace('"', '""')
+            row = session.execute(
+                f'SELECT 1 FROM "{table_name}" WHERE "{column_name}" = %s LIMIT 1',
+                (user_uuid,),
+            ).fetchone()
+            if row is not None:
+                referenced = True
+                break
+        if referenced:
+            continue
+        for table_name, column_name in (
+            ("m_workspace_streams", "direct_user_uuid"),
+            ("m_workspace_event_audience_members_v1", "user_uuid"),
+            ("m_workspace_event_recipient_payloads_v1", "user_uuid"),
+        ):
+            row = session.execute(
+                f'SELECT 1 FROM "{table_name}" WHERE "{column_name}" = %s LIMIT 1',
+                (user_uuid,),
+            ).fetchone()
+            if row is not None:
+                referenced = True
+                break
+        if referenced:
+            continue
+        session.execute(
+            "DELETE FROM m_workspace_users WHERE uuid = %s",
+            (user_uuid,),
+        )
+        deleted.append(user_uuid)
+    return deleted

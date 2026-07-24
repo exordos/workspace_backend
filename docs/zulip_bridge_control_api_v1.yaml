@@ -1364,11 +1364,30 @@ components:
     ZulipChatReference:
       type: object
       additionalProperties: true
-      required: [kind, chat_type, provider_chat_key]
+      required:
+        - kind
+        - provider_realm_uuid
+        - provider_owner_user_id
+        - chat_type
+        - provider_chat_key
       properties:
         kind:
           type: string
           const: zulip
+        provider_realm_uuid:
+          $ref: '#/components/schemas/Uuid'
+          description: |
+            Stable Zulip realm UUID returned by the authenticated event-queue
+            registration. Together with provider_user_id, this is the canonical
+            provider identity namespace; server URLs and email addresses are
+            never identity proof.
+        provider_owner_user_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: |
+            Authenticated Zulip user ID returned by the same registration. It
+            must match exactly one owner participant before an IAM link is made.
         chat_type:
           type: string
           enum: [channel, direct, group_direct]

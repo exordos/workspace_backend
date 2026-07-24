@@ -15,6 +15,7 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import engines
 
 from workspace.external_bridge_control import file_repository
+from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
 from workspace.external_bridge_control import sql_state
 from workspace.messenger_api.dm import external_models
@@ -38,6 +39,348 @@ def _identity(instance_uuid, realm_uuid):
 def _request_call(callable_, *args, **kwargs):
     with contexts.Context().session_manager():
         return callable_(*args, **kwargs)
+
+
+def test_verified_provider_identity_replaces_account_scoped_duplicates(
+    _database,
+    db,
+):
+    provider_realm_uuid = sys_uuid.uuid4()
+    owner_a_uuid = sys_uuid.uuid4()
+    owner_b_uuid = sys_uuid.uuid4()
+    conflicting_owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    account_a_uuid = sys_uuid.uuid4()
+    account_b_uuid = sys_uuid.uuid4()
+    conflicting_account_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            project_uuid,
+            owner_a_uuid,
+            "Identity merge stream",
+        )
+    )
+    conftest.seed_workspace_user(db, owner_b_uuid, "verified-owner-b")
+    conftest.seed_workspace_user(
+        db,
+        conflicting_owner_uuid,
+        "conflicting-owner",
+    )
+    settings = json.dumps({"default_project_id": str(project_uuid)})
+    with db.cursor() as cursor:
+        for account_uuid, owner_uuid in (
+            (account_a_uuid, owner_a_uuid),
+            (account_b_uuid, owner_b_uuid),
+            (conflicting_account_uuid, conflicting_owner_uuid),
+        ):
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings
+                ) VALUES (%s, %s, 'zulip', %s::jsonb)
+                """,
+                (account_uuid, owner_uuid, settings),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_users (
+                uuid, username, source, status, avatar,
+                provider_uuid, external_account_uuid, provider_external_id,
+                created_at, updated_at, last_ping_at
+            )
+            SELECT %s, %s, 'zulip', 'active', avatar,
+                   %s, %s, '20', NOW(), NOW(), NOW()
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (
+                legacy_user_uuid,
+                f"zulip-{legacy_user_uuid}",
+                sys_uuid.uuid4(),
+                account_a_uuid,
+                owner_a_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                created_at, updated_at
+            ) VALUES
+                (%s, %s, %s, %s, %s, 'member', NOW(), NOW()),
+                (%s, %s, %s, %s, %s, 'member', NOW(), NOW())
+            """,
+            (
+                sys_uuid.uuid4(),
+                project_uuid,
+                stream_uuid,
+                legacy_user_uuid,
+                owner_a_uuid,
+                sys_uuid.uuid4(),
+                project_uuid,
+                stream_uuid,
+                owner_b_uuid,
+                owner_a_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'direct:10,20', %s::jsonb, 'Peer'
+            )
+            """,
+            (
+                chat_uuid,
+                account_a_uuid,
+                owner_a_uuid,
+                json.dumps(
+                    {
+                        "participants": [
+                            {
+                                "provider_user_id": "20",
+                                "identity_uuid": str(legacy_user_uuid),
+                            }
+                        ]
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_files (
+                uuid, project_id, name, user_uuid, stream_uuid,
+                content_type, size_bytes, hash, storage_object_id
+            ) VALUES (
+                %s, %s, 'identity-merge.txt', %s, %s,
+                'text/plain', 1, 'test-hash', 'identity-merge.txt'
+            )
+            """,
+            (file_uuid, project_uuid, owner_a_uuid, stream_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_file_accesses (
+                uuid, project_id, file_uuid, user_uuid
+            ) VALUES
+                (%s, %s, %s, %s),
+                (%s, %s, %s, %s)
+            """,
+            (
+                sys_uuid.uuid4(),
+                project_uuid,
+                file_uuid,
+                legacy_user_uuid,
+                sys_uuid.uuid4(),
+                project_uuid,
+                file_uuid,
+                owner_b_uuid,
+            ),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        assert (
+            identity_linking.bind_verified_account_owner(
+                session,
+                provider="zulip",
+                account_uuid=account_a_uuid,
+                owner_user_uuid=owner_a_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_user_id="10",
+            )
+            is None
+        )
+        canonical_external_uuid = (
+            identity_linking.canonical_provider_identity_uuid(
+                "zulip",
+                provider_realm_uuid,
+                "20",
+            )
+        )
+        assert identity_linking.merge_account_scoped_provider_identities(
+            session,
+            provider="zulip",
+            account_uuid=account_a_uuid,
+            provider_realm_uuid=provider_realm_uuid,
+        ) == [chat_uuid]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid FROM m_workspace_users
+            WHERE uuid = ANY(%s)
+            ORDER BY uuid
+            """,
+            ([legacy_user_uuid, canonical_external_uuid],),
+        )
+        assert [row[0] for row in cursor.fetchall()] == [canonical_external_uuid]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE stream_uuid = %s
+              AND role = 'member'
+              AND user_uuid = %s
+            """,
+            (stream_uuid, canonical_external_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+    with session_factory() as session:
+        assert (
+            identity_linking.bind_verified_account_owner(
+                session,
+                provider="zulip",
+                account_uuid=account_b_uuid,
+                owner_user_uuid=owner_b_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_user_id="20",
+            )
+            == canonical_external_uuid
+        )
+        assert identity_linking.merge_workspace_user_identity(
+            session,
+            canonical_external_uuid,
+            owner_b_uuid,
+        ) == [chat_uuid]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE stream_uuid = %s
+              AND role = 'member'
+              AND user_uuid = %s
+            """,
+            (stream_uuid, owner_b_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT source#>>'{participants,0,identity_uuid}'
+            FROM m_external_chats_v2
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone()[0] == str(owner_b_uuid)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_file_accesses
+            WHERE file_uuid = %s AND user_uuid = %s
+            """,
+            (file_uuid, owner_b_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT workspace_user_uuid, link_kind
+            FROM m_external_provider_identity_links_v1
+            WHERE provider = 'zulip'
+              AND provider_realm_uuid = %s
+              AND provider_user_id = '20'
+            """,
+            (provider_realm_uuid,),
+        )
+        assert cursor.fetchone() == (
+            owner_b_uuid,
+            "verified_account_owner",
+        )
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_workspace_users WHERE uuid = %s",
+            (canonical_external_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+    with session_factory() as session:
+        with pytest.raises(
+            ValueError,
+            match="already linked to another account",
+        ):
+            identity_linking.bind_verified_account_owner(
+                session,
+                provider="zulip",
+                account_uuid=conflicting_account_uuid,
+                owner_user_uuid=conflicting_owner_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_user_id="20",
+            )
+
+
+def test_unreferenced_provider_identity_cleanup_removes_only_stale_rows(
+    _database,
+    db,
+):
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    orphan_uuid = sys_uuid.uuid4()
+    referenced_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            project_uuid,
+            owner_uuid,
+            "Stale identity cleanup stream",
+        )
+    )
+    with db.cursor() as cursor:
+        for user_uuid in (orphan_uuid, referenced_uuid):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_users (
+                    uuid, username, source, status, avatar,
+                    provider_uuid, external_account_uuid, provider_external_id,
+                    created_at, updated_at, last_ping_at
+                )
+                SELECT %s, %s, 'zulip', 'active', avatar,
+                       %s, %s, %s, NOW(), NOW(), NOW()
+                FROM m_workspace_users
+                WHERE uuid = %s
+                """,
+                (
+                    user_uuid,
+                    f"zulip-{user_uuid}",
+                    sys_uuid.uuid4(),
+                    sys_uuid.uuid4(),
+                    str(user_uuid),
+                    owner_uuid,
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, 'member', NOW(), NOW())
+            """,
+            (
+                sys_uuid.uuid4(),
+                project_uuid,
+                stream_uuid,
+                referenced_uuid,
+                owner_uuid,
+            ),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        assert identity_linking.delete_unreferenced_provider_identities(session) == [
+            orphan_uuid
+        ]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_users
+            WHERE uuid = ANY(%s)
+            ORDER BY uuid
+            """,
+            ([orphan_uuid, referenced_uuid],),
+        )
+        assert [row[0] for row in cursor.fetchall()] == [referenced_uuid]
 
 
 def test_external_chat_assignment_producer_matches_complete_shared_fixture(
@@ -537,6 +880,8 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
                     "kind": "zulip",
                     "chat_type": "channel",
                     "provider_chat_key": f"channel:{resource_uuid}",
+                    "provider_realm_uuid": str(realm_uuid),
+                    "provider_owner_user_id": "7",
                     "original_url": (
                         f"https://zulip.example.test/#narrow/channel/{resource_uuid}"
                     ),
@@ -610,18 +955,27 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         ][0]["status"]
         == "rejected"
     )
+    invalid_owner_uuid = sys_uuid.uuid4()
+    invalid_owner = catalog_report(invalid_owner_uuid, 1)
+    invalid_owner["catalog"]["source"]["provider_owner_user_id"] = "8"
+    assert (
+        _request_call(repository.observed_reports, identity, [invalid_owner])[
+            "results"
+        ][0]["status"]
+        == "rejected"
+    )
 
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT COUNT(*) FROM m_external_chats_v2 WHERE uuid = ANY(%s)",
-            ([invalid_direct_uuid, invalid_group_uuid],),
+            ([invalid_direct_uuid, invalid_group_uuid, invalid_owner_uuid],),
         )
         assert cursor.fetchone()[0] == 0
         cursor.execute(
             "SELECT COUNT(*) FROM m_external_bridge_desired_resources_v1 "
             "WHERE resource_type = 'external_chat_assignment' "
             "AND resource_uuid = ANY(%s)",
-            ([invalid_direct_uuid, invalid_group_uuid],),
+            ([invalid_direct_uuid, invalid_group_uuid, invalid_owner_uuid],),
         )
         assert cursor.fetchone()[0] == 0
     with db.cursor() as cursor:
@@ -636,6 +990,8 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         assert first_chat[:4] == (False, None, "available", "Engineering")
         assert first_chat[4] == {
             "kind": "zulip",
+            "provider_realm_uuid": str(realm_uuid),
+            "provider_owner_user_id": "7",
             "chat_type": "channel",
             "original_url": (f"https://zulip.example.test/#narrow/channel/{chat_uuid}"),
             "description": "Engineering discussions",
