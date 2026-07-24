@@ -226,9 +226,9 @@ resources:
       name: "workspace-projection-pg-cluster"
       nodes_number: 1
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      cpu: 1
-      ram: 1024
-      disk_size: 15
+      cpu: 8
+      ram: 4096
+      disk_size: 30
       version: $workspace.imports.$pg18:uuid
 
   $dbaas.types.postgres.instances.$workspace_projection_cluster.users:
