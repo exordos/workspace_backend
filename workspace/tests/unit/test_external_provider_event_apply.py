@@ -191,19 +191,69 @@ def test_identity_upsert_preserves_verified_iam_user(monkeypatch):
     assert not hasattr(existing, "first_name")
 
 
-def test_identity_upsert_rejects_uuid_outside_verified_link():
+def test_identity_upsert_uses_verified_link_for_stale_event_uuid(monkeypatch):
     identity = _identity()
     linked_user_uuid = sys_uuid.uuid4()
+    stale_user_uuid = sys_uuid.uuid4()
     session = Session(
         {
             "workspace_user_uuid": linked_user_uuid,
             "link_kind": "verified_account_owner",
         }
     )
+    existing = types.SimpleNamespace(source="iam")
+    lookups = []
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceUser",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_one_or_none=lambda **kwargs: lookups.append(kwargs) or existing
+            )
+        ),
+    )
+
+    assert (
+        provider_event_apply._upsert_provider_identity(
+            session,
+            identity,
+            sys_uuid.uuid4(),
+            stale_user_uuid,
+            "42",
+            {
+                "display_name": "Provider display name",
+                "email": None,
+                "active": True,
+            },
+        )
+        == linked_user_uuid
+    )
+    assert lookups[0]["filters"]["uuid"].value == linked_user_uuid
+    assert not hasattr(existing, "first_name")
+
+
+def test_identity_upsert_rejects_unlinked_uuid_owned_by_another_identity(
+    monkeypatch,
+):
+    identity = _identity()
+    session = Session(None)
+    existing = types.SimpleNamespace(
+        source="zulip",
+        provider_uuid=sys_uuid.uuid4(),
+        external_account_uuid=sys_uuid.uuid4(),
+        provider_external_id="another-user",
+    )
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceUser",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: existing)
+        ),
+    )
 
     with pytest.raises(
         ValueError,
-        match="link does not match",
+        match="UUID belongs to another identity",
     ):
         provider_event_apply._upsert_provider_identity(
             session,
@@ -544,10 +594,16 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     )
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
     identities = []
+    canonical_author_uuid = sys_uuid.uuid4()
+
+    def upsert_identity(*args):
+        identities.append(args)
+        return canonical_author_uuid
+
     monkeypatch.setattr(
         provider_event_apply,
         "_upsert_provider_identity",
-        lambda *args: identities.append(args),
+        upsert_identity,
     )
     created = []
     monkeypatch.setattr(
@@ -613,6 +669,7 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     assert isinstance(values["payload"], message_payloads.MarkdownPayload)
     assert values["payload"].content == "hello"
     assert values["compact_events"] is True
+    assert created[0][0][1] == canonical_author_uuid
 
 
 def test_provider_message_accepts_former_author_without_stream_binding(monkeypatch):
@@ -632,9 +689,7 @@ def test_provider_message_accepts_former_author_without_stream_binding(monkeypat
         "WorkspaceStreamTopic",
         types.SimpleNamespace(
             objects=types.SimpleNamespace(
-                get_one_or_none=lambda **_kwargs: types.SimpleNamespace(
-                    uuid=topic_uuid
-                )
+                get_one_or_none=lambda **_kwargs: types.SimpleNamespace(uuid=topic_uuid)
             )
         ),
     )
