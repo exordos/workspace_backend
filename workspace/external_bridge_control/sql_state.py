@@ -303,14 +303,6 @@ def _emit_projected_capability_events(session: Any, chat: dict[str, Any]) -> Non
         session=session,
     ):
         messenger_events.create_topic_updated_event(topic, session=session)
-    for message in models.WorkspaceUserMessage.objects.get_all(
-        filters={
-            "project_id": dm_filters.EQ(chat["project_id"]),
-            "stream_uuid": dm_filters.EQ(chat["projection_stream_uuid"]),
-        },
-        session=session,
-    ):
-        messenger_events.create_message_updated_event(message, session=session)
 
 
 def _update_projected_capabilities(

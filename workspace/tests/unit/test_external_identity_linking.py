@@ -37,7 +37,7 @@ def test_payload_identity_rewrites_share_one_scan_per_table():
 
     identity_linking._rewrite_payload_uuid_references(session, replacements)
 
-    assert len(session.statements) == 3
+    assert len(session.statements) == 2
     for statement, values in session.statements:
         assert statement.count("replace(") == 2
         assert "LIKE ANY(%s::text[])" in statement
@@ -62,14 +62,12 @@ def test_payload_identity_rewrites_are_bounded():
 
     identity_linking._rewrite_payload_uuid_references(session, replacements)
 
-    assert len(session.statements) == 6
+    assert len(session.statements) == 4
     assert [
         statement.count("replace(") for statement, _values in session.statements
     ] == [
         identity_linking._PAYLOAD_REWRITE_BATCH_SIZE,
         identity_linking._PAYLOAD_REWRITE_BATCH_SIZE,
-        identity_linking._PAYLOAD_REWRITE_BATCH_SIZE,
-        1,
         1,
         1,
     ]
@@ -122,4 +120,5 @@ def test_relational_identity_rewrite_requests_retry_after_full_row_batch():
 
     statement, values = session.statements[0]
     assert "LIMIT %s" in statement
+    assert "ORDER BY ctid" not in statement
     assert values[1] == identity_linking._REFERENCE_UPDATE_ROW_BATCH_SIZE

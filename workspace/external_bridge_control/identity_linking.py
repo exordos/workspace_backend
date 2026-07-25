@@ -11,13 +11,12 @@ import uuid as sys_uuid
 
 _PROVIDER_IDENTITY_NAMESPACE = sys_uuid.UUID("fda6f96e-c86d-5c94-976d-4e813e3f3655")
 _PAYLOAD_REFERENCE_TABLES = (
-    "m_workspace_events",
     "m_workspace_broadcast_message_events_v1",
     "m_workspace_event_recipient_payloads_v1",
 )
 _PAYLOAD_REWRITE_BATCH_SIZE = 100
 _PAYLOAD_REWRITE_ROW_BATCH_SIZE = 500
-_REFERENCE_UPDATE_ROW_BATCH_SIZE = 500
+_REFERENCE_UPDATE_ROW_BATCH_SIZE = 20_000
 
 
 class IdentityMergePending(RuntimeError):
@@ -39,7 +38,6 @@ def _update_uuid_reference_batch(
             SELECT ctid
             FROM "{table_name}"
             WHERE "{column_name}" = %s
-            ORDER BY ctid
             LIMIT %s
         )
         UPDATE "{table_name}" AS target
@@ -108,6 +106,22 @@ def _rewrite_payload_uuid_references(
             ).fetchall()
             if len(rows) == _PAYLOAD_REWRITE_ROW_BATCH_SIZE:
                 raise IdentityMergePending
+
+
+def _invalidate_direct_event_history(session: typing.Any) -> None:
+    """Force clients to reload canonical state instead of replaying stale UUIDs."""
+    session.execute(
+        """
+        UPDATE m_workspace_event_cursors
+        SET epoch_generation = %s,
+            pruned_through_epoch_version = GREATEST(
+                pruned_through_epoch_version,
+                current_epoch_version
+            ),
+            updated_at = NOW()
+        """,
+        (sys_uuid.uuid4(),),
+    )
 
 
 def canonical_provider_identity_uuid(
@@ -314,7 +328,7 @@ def merge_account_scoped_provider_identities(
         (account_uuid,),
     ).fetchall()
     changed_chat_uuids: set[sys_uuid.UUID] = set()
-    replacements: list[tuple[sys_uuid.UUID, sys_uuid.UUID]] = []
+    resolved_identities = []
     for legacy_identity in legacy_identities:
         legacy_user_uuid = sys_uuid.UUID(str(legacy_identity["uuid"]))
         canonical_user_uuid = resolve_provider_identity(
@@ -325,6 +339,9 @@ def merge_account_scoped_provider_identities(
         )
         if legacy_user_uuid == canonical_user_uuid:
             continue
+        resolved_identities.append((legacy_user_uuid, canonical_user_uuid))
+    replacements: list[tuple[sys_uuid.UUID, sys_uuid.UUID]] = []
+    for legacy_user_uuid, canonical_user_uuid in resolved_identities:
         replacements.append((legacy_user_uuid, canonical_user_uuid))
         merge_workspace_user_identity(
             session,
@@ -350,6 +367,8 @@ def merge_account_scoped_provider_identities(
             (legacy_text, canonical_text, legacy_text),
         ).fetchall()
         changed_chat_uuids.update(sys_uuid.UUID(str(row["uuid"])) for row in rows)
+    if replacements:
+        _invalidate_direct_event_history(session)
     for legacy_user_uuid, _canonical_user_uuid in replacements:
         session.execute(
             "DELETE FROM m_workspace_users WHERE uuid = %s",
@@ -555,22 +574,33 @@ def merge_workspace_user_identity(
     )
     session.execute(
         """
-        DELETE FROM m_workspace_event_cursors AS legacy
-        USING m_workspace_event_cursors AS canonical
-        WHERE legacy.user_uuid = %s
-          AND canonical.user_uuid = %s
-          AND canonical.project_id = legacy.project_id
-        """,
-        (legacy_user_uuid, canonical_user_uuid),
-    )
-    session.execute(
-        """
-        UPDATE m_workspace_event_cursors
-        SET user_uuid = %s,
-            updated_at = NOW()
+        INSERT INTO m_workspace_event_cursors (
+            project_id, user_uuid, current_epoch_version,
+            pruned_through_epoch_version, created_at, updated_at
+        )
+        SELECT project_id, %s, current_epoch_version,
+               pruned_through_epoch_version, created_at, updated_at
+        FROM m_workspace_event_cursors
         WHERE user_uuid = %s
+        ON CONFLICT (project_id, user_uuid) DO UPDATE
+        SET current_epoch_version = GREATEST(
+                m_workspace_event_cursors.current_epoch_version,
+                EXCLUDED.current_epoch_version
+            ),
+            pruned_through_epoch_version = GREATEST(
+                m_workspace_event_cursors.pruned_through_epoch_version,
+                EXCLUDED.pruned_through_epoch_version
+            ),
+            updated_at = GREATEST(
+                m_workspace_event_cursors.updated_at,
+                EXCLUDED.updated_at
+            )
         """,
         (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        "DELETE FROM m_workspace_event_cursors WHERE user_uuid = %s",
+        (legacy_user_uuid,),
     )
     references = session.execute(
         """
@@ -674,6 +704,7 @@ def merge_workspace_user_identity(
         (canonical_user_uuid, canonical_source, legacy_user_uuid),
     )
     if delete_legacy:
+        _invalidate_direct_event_history(session)
         session.execute(
             "DELETE FROM m_workspace_users WHERE uuid = %s",
             (legacy_user_uuid,),
