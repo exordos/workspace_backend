@@ -36,7 +36,7 @@ resource.
 
 ## 2. Non-goals for v1
 
-- Reactions, polls, typing indicators, calls, and presence synchronization.
+- Polls, typing indicators, calls, and presence synchronization.
 - High availability for the bridge element.
 - Providers other than Zulip.
 - A product-level audit log. Operational logs and aggregate health remain in
@@ -107,9 +107,9 @@ continue to use `urn:user:<identity-uuid>`.
 
 ### 3.4 Synchronization semantics
 
-- V1 supports two-way create, edit, delete, read state, mentions, replies,
-  quotes, Markdown, links, images, files, and stream/topic rename where the
-  provider capability allows it.
+- V1 supports two-way create, edit, delete, reactions, read state, mentions,
+  replies, quotes, Markdown, links, images, files, and stream/topic rename where
+  the provider capability allows it.
 - Outbound operations use the owner's personal Zulip account.
 - Provider capabilities are authoritative. Unsupported actions are hidden;
   temporarily unavailable actions are disabled with a safe explanation.

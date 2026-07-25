@@ -777,6 +777,83 @@ def test_provider_message_keeps_native_account_owner_identity(monkeypatch):
     assert created[0][0][1] == owner_uuid
 
 
+def test_provider_reaction_echo_converges_on_native_reaction(monkeypatch):
+    identity = _identity()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    provider_reaction_uuid = sys_uuid.uuid4()
+    placeholder_actor_uuid = sys_uuid.uuid4()
+    canonical_actor_uuid = sys_uuid.uuid4()
+    native_reaction_uuid = sys_uuid.uuid4()
+    external_account_uuid = sys_uuid.uuid4()
+    message = types.SimpleNamespace(stream_uuid=stream_uuid)
+    native_reaction = types.SimpleNamespace(
+        uuid=native_reaction_uuid,
+        user_uuid=canonical_actor_uuid,
+    )
+    original_message_model = models.WorkspaceMessage
+    reaction_model = types.SimpleNamespace(
+        objects=types.SimpleNamespace(
+            get_one_or_none=lambda **_kwargs: native_reaction,
+        )
+    )
+    monkeypatch.setattr(models, "WorkspaceMessageReactions", reaction_model)
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_existing",
+        lambda model, *_args: message if model is original_message_model else None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_upsert_provider_identity",
+        lambda *_args: canonical_actor_uuid,
+    )
+    updates = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "update_workspace_message_reaction",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+    event = {
+        "external_account_uuid": str(external_account_uuid),
+        "kind": "reaction.upsert",
+    }
+    resource = {
+        "uuid": str(provider_reaction_uuid),
+        "message_uuid": str(message_uuid),
+        "user_uuid": str(placeholder_actor_uuid),
+        "emoji_name": "thumbs_up",
+        "provider_external_id": "zulip-reaction-42",
+        "provider_metadata": {},
+        "user_identity": {
+            "provider_external_id": "zulip-user-7",
+            "display_name": "Provider User",
+            "email": None,
+            "avatar_urn": None,
+            "active": True,
+        },
+    }
+
+    resolved_uuid = provider_event_apply._reaction_event(
+        Session([]),
+        event,
+        project_uuid,
+        {"projection_stream_uuid": stream_uuid},
+        resource,
+        identity,
+    )
+
+    assert resolved_uuid == native_reaction_uuid
+    assert resource["user_uuid"] == canonical_actor_uuid
+    assert updates[0][0][:3] == (
+        project_uuid,
+        canonical_actor_uuid,
+        native_reaction_uuid,
+    )
+    assert updates[0][1]["session"].statements == []
+
+
 def test_provider_message_snapshot_applies_owner_read_state(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()

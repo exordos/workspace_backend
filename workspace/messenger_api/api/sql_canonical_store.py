@@ -812,6 +812,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 self.user_uuid,
                 resource_uuid,
             )
+            previous_message_uuid = reaction.message_uuid
+            previous_emoji_name = reaction.emoji_name
             message = helpers.get_workspace_user_message(
                 self.project_uuid,
                 self.user_uuid,
@@ -828,12 +830,19 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 values,
                 compact_events=True,
             )
+            provider_payload = _public_dict(row, resource)
+            provider_payload.update(
+                {
+                    "previous_message_uuid": str(previous_message_uuid),
+                    "previous_emoji_name": previous_emoji_name,
+                }
+            )
             self._queue_provider_operation(
                 operation_kind="reaction.update",
                 target_type="reaction",
                 target_uuid=row.uuid,
                 stream_uuid=message.stream_uuid,
-                payload=_public_dict(row, resource),
+                payload=provider_payload,
                 provider_target=provider_target,
             )
         elif resource == "files":

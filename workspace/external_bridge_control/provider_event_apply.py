@@ -559,19 +559,49 @@ def _reaction_event(
     project_id: sys_uuid.UUID,
     assignment: typing.Mapping[str, typing.Any],
     resource: dict[str, typing.Any],
+    identity: typing.Any,
 ) -> sys_uuid.UUID:
     reaction_uuid = sys_uuid.UUID(str(resource["uuid"]))
     message_uuid = sys_uuid.UUID(str(resource["message_uuid"]))
     message = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
     if message is None or message.stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider reaction message is outside the selected stream")
+    actor_uuid = sys_uuid.UUID(str(resource["user_uuid"]))
+    user_identity = resource.get("user_identity")
+    if isinstance(user_identity, collections.abc.Mapping):
+        actor_uuid = _upsert_provider_identity(
+            session,
+            identity,
+            sys_uuid.UUID(str(event["external_account_uuid"])),
+            actor_uuid,
+            str(user_identity["provider_external_id"]),
+            user_identity,
+        )
+        resource["user_uuid"] = actor_uuid
     existing = _existing(
         models.WorkspaceMessageReactions,
         project_id,
         reaction_uuid,
         session,
     )
-    actor_uuid = sys_uuid.UUID(str(resource.get("user_uuid") or message.user_uuid))
+    matching = models.WorkspaceMessageReactions.objects.get_one_or_none(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "message_uuid": dm_filters.EQ(message_uuid),
+            "user_uuid": dm_filters.EQ(actor_uuid),
+            "emoji_name": dm_filters.EQ(resource["emoji_name"]),
+        },
+        session=session,
+    )
+    if existing is None and matching is not None:
+        existing = matching
+        reaction_uuid = existing.uuid
+    elif (
+        existing is not None
+        and matching is not None
+        and existing.uuid != matching.uuid
+    ):
+        raise ValueError("Provider reaction conflicts with an existing reaction")
     if event["kind"] == "reaction.delete":
         if existing is None:
             return reaction_uuid
@@ -712,4 +742,11 @@ def apply_event(
             resource,
             identity,
         )
-    return _reaction_event(session, event, project_id, assignment, resource)
+    return _reaction_event(
+        session,
+        event,
+        project_id,
+        assignment,
+        resource,
+        identity,
+    )
