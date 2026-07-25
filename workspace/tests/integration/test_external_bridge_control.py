@@ -309,7 +309,7 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             )
 
 
-def test_provider_identity_payload_rewrites_share_a_single_table_pass(
+def test_provider_identity_merge_invalidates_direct_event_history(
     _database,
     db,
     monkeypatch,
@@ -387,6 +387,19 @@ def test_provider_identity_payload_rewrites_share_a_single_table_pass(
                 ),
             ),
         )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid, current_epoch_version
+            )
+            SELECT project_id, user_uuid, epoch_version
+            FROM m_workspace_events
+            WHERE uuid = %s
+            RETURNING epoch_generation, current_epoch_version
+            """,
+            (event_uuid,),
+        )
+        generation_before, event_epoch = cursor.fetchone()
     rewrite_calls = []
     original_rewrite = identity_linking._rewrite_payload_uuid_references
 
@@ -401,12 +414,15 @@ def test_provider_identity_payload_rewrites_share_a_single_table_pass(
     )
     session_factory = engines.engine_factory.get_engine().session_manager
     with session_factory() as session:
-        assert identity_linking.merge_account_scoped_provider_identities(
-            session,
-            provider="zulip",
-            account_uuid=account_uuid,
-            provider_realm_uuid=provider_realm_uuid,
-        ) == []
+        assert (
+            identity_linking.merge_account_scoped_provider_identities(
+                session,
+                provider="zulip",
+                account_uuid=account_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+            )
+            == []
+        )
     assert len(rewrite_calls) == 1
     assert set(rewrite_calls[0]) == {
         (legacy_a_uuid, canonical_a_uuid),
@@ -434,12 +450,25 @@ def test_provider_identity_payload_rewrites_share_a_single_table_pass(
             ),
         )
         user_rows = [row[0] for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT epoch_generation, current_epoch_version,
+                   pruned_through_epoch_version
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, owner_uuid),
+        )
+        generation_after, current_epoch, pruned_through = cursor.fetchone()
     assert payload["participants"] == [
-        {"uuid": str(canonical_a_uuid)},
-        {"uuid": str(canonical_b_uuid)},
+        {"uuid": str(legacy_a_uuid)},
+        {"uuid": str(legacy_b_uuid)},
     ]
-    assert payload["reference"] == f"provider:{canonical_a_uuid}"
+    assert payload["reference"] == f"provider:{legacy_a_uuid}"
     assert user_rows == sorted([canonical_a_uuid, canonical_b_uuid])
+    assert generation_after != generation_before
+    assert current_epoch == event_epoch
+    assert pruned_through == event_epoch
 
 
 def test_provider_identity_merge_resumes_bounded_event_batches(
@@ -494,8 +523,31 @@ def test_provider_identity_merge_resumes_bounded_event_batches(
                     ),
                 ),
             )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid, current_epoch_version
+            )
+            SELECT project_id, user_uuid, MAX(epoch_version)
+            FROM m_workspace_events
+            WHERE project_id = %s AND user_uuid = %s
+            GROUP BY project_id, user_uuid
+            RETURNING epoch_generation, current_epoch_version
+            """,
+            (project_uuid, legacy_user_uuid),
+        )
+        _legacy_generation, event_epoch = cursor.fetchone()
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid
+            ) VALUES (%s, %s)
+            RETURNING epoch_generation
+            """,
+            (project_uuid, canonical_user_uuid),
+        )
+        generation_before = cursor.fetchone()[0]
     monkeypatch.setattr(identity_linking, "_REFERENCE_UPDATE_ROW_BATCH_SIZE", 2)
-    monkeypatch.setattr(identity_linking, "_PAYLOAD_REWRITE_ROW_BATCH_SIZE", 2)
     session_factory = engines.engine_factory.get_engine().session_manager
     pending_attempts = 0
     for _attempt in range(6):
@@ -516,7 +568,7 @@ def test_provider_identity_merge_resumes_bounded_event_batches(
     else:
         pytest.fail("Identity reconciliation did not finish")
 
-    assert pending_attempts == 2
+    assert pending_attempts == 1
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -533,9 +585,22 @@ def test_provider_identity_merge_resumes_bounded_event_batches(
             ([legacy_user_uuid, canonical_user_uuid],),
         )
         user_rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT epoch_generation, current_epoch_version,
+                   pruned_through_epoch_version
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, canonical_user_uuid),
+        )
+        generation_after, current_epoch, pruned_through = cursor.fetchone()
     assert [row[0] for row in rows] == [canonical_user_uuid] * 3
-    assert [row[1]["identity_uuid"] for row in rows] == [str(canonical_user_uuid)] * 3
+    assert [row[1]["identity_uuid"] for row in rows] == [str(legacy_user_uuid)] * 3
     assert user_rows == [(canonical_user_uuid,)]
+    assert generation_after != generation_before
+    assert current_epoch == event_epoch
+    assert pruned_through == event_epoch
 
 
 def test_unreferenced_provider_identity_cleanup_removes_only_stale_rows(
