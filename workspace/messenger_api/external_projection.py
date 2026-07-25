@@ -20,6 +20,7 @@ def _workspace_source(
     provider_chat_id: str,
     chat_type: str,
     account_settings: collections.abc.Mapping[str, typing.Any],
+    external_account_uuid: sys_uuid.UUID,
 ) -> tuple[str, typing.Any]:
     if provider_kind == models.SourceName.ZULIP.value:
         provider_stream_id = provider_chat_id.removeprefix("channel:")
@@ -31,6 +32,7 @@ def _workspace_source(
         return provider_kind, models.ZulipSource(
             stream_id=stream_id,
             server_url=account_settings["server_url"],
+            source_scope=str(external_account_uuid),
         )
     return models.SourceName.NATIVE.value, models.NativeSource()
 
@@ -65,6 +67,7 @@ def ensure_external_chat_stream(
             provider_chat_id,
             chat_type,
             account_settings,
+            external_account_uuid,
         )
         default_topic = next(
             (topic for topic in source["topics"] if topic["is_default"]),

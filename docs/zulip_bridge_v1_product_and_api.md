@@ -100,7 +100,10 @@ conflicting verified owner link is rejected without changing either identity
 and requires explicit administrative resolution. Existing account-scoped
 identities are merged into the canonical identity with their Messenger
 references, assignments, and cached event payloads updated before the duplicate
-row is deleted. Mentions continue to use `urn:user:<identity-uuid>`.
+row is deleted. Linking an identity to IAM does not grant that user access to
+another owner's account-scoped projection; only the projection owned by the
+linked IAM account contributes streams and unread state to that user. Mentions
+continue to use `urn:user:<identity-uuid>`.
 
 ### 3.4 Synchronization semantics
 

@@ -60,6 +60,10 @@ class ZulipSource(types_dynamic.AbstractKindModel):
         types.AllowNone(types.String(max_length=2048)),
         default=None,
     )
+    source_scope = properties.property(
+        types.AllowNone(types.String(max_length=2048)),
+        default=None,
+    )
     topic_name = properties.property(
         types.AllowNone(types.String(max_length=128)),
         default=None,

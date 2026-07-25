@@ -591,7 +591,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 name="Zulip group DM",
                 description="Private group chat",
                 source_name="zulip",
-                source={"kind": "zulip", "stream_id": 20},
+                source={
+                    "kind": "zulip",
+                    "stream_id": 20,
+                    "source_scope": "account-20",
+                },
                 default_topic_name="zulip",
                 session=session,
             )
@@ -621,6 +625,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual("zulip", create_topic.call_args.kwargs["source"].KIND)
         self.assertEqual(20, create_topic.call_args.kwargs["source"].stream_id)
+        self.assertEqual(
+            "account-20",
+            create_topic.call_args.kwargs["source"].source_scope,
+        )
         create_topic_events.assert_called_once_with(
             project_id=project_id,
             topic_uuid=topic_uuid,

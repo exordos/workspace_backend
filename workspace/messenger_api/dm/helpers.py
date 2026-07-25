@@ -1666,6 +1666,12 @@ def _get_source_server_url(source: typing.Any) -> typing.Any:
     return source.get("server_url")
 
 
+def _get_source_scope(source: typing.Any) -> typing.Any:
+    if hasattr(source, "source_scope"):
+        return source.source_scope
+    return source.get("source_scope")
+
+
 def _get_source_topic_name(source: typing.Any) -> typing.Any:
     if hasattr(source, "topic_name"):
         return source.topic_name
@@ -1680,6 +1686,7 @@ def _build_topic_source(
         return models.ZulipSource(
             stream_id=_get_source_stream_id(source),
             server_url=_get_source_server_url(source),
+            source_scope=_get_source_scope(source),
             topic_name=topic_name,
         )
     return models.NativeSource()
@@ -1691,6 +1698,7 @@ def _build_message_source(source_name: typing.Any, source: typing.Any) -> typing
         return models.ZulipSource(
             stream_id=_get_source_stream_id(source),
             server_url=_get_source_server_url(source),
+            source_scope=_get_source_scope(source),
             topic_name=_get_source_topic_name(source),
             message_id=None,
         )

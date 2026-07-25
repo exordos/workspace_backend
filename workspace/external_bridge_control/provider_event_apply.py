@@ -232,6 +232,19 @@ def _provider_values(
     return {name: value for name, value in resource.items() if name in allowed}
 
 
+def _scoped_provider_values(
+    resource: collections.abc.Mapping[str, typing.Any],
+    names: collections.abc.Collection[str],
+    external_account_uuid: sys_uuid.UUID,
+) -> dict[str, typing.Any]:
+    values = _provider_values(resource, names)
+    if values.get("source_name") == models.SourceName.ZULIP.value:
+        source = dict(values["source"])
+        source["source_scope"] = str(external_account_uuid)
+        values["source"] = source
+    return values
+
+
 def _message_payload(value: typing.Any) -> message_payloads.MarkdownPayload:
     if isinstance(value, message_payloads.MarkdownPayload):
         return value
@@ -386,9 +399,10 @@ def _topic_event(
             session=session,
         )
         return topic_uuid
-    values = _provider_values(
+    values = _scoped_provider_values(
         resource,
         {"color", "name", "source", "source_name", "stream_uuid", "uuid"},
+        sys_uuid.UUID(str(event["external_account_uuid"])),
     )
     if existing is None:
         values.update({"uuid": topic_uuid, "stream_uuid": stream_uuid})
@@ -452,7 +466,7 @@ def _message_event(
             str(author_identity["provider_external_id"]),
             author_identity,
         )
-    values = _provider_values(
+    values = _scoped_provider_values(
         resource,
         {
             "payload",
@@ -464,6 +478,7 @@ def _message_event(
             "user_uuid",
             "uuid",
         },
+        sys_uuid.UUID(str(event["external_account_uuid"])),
     )
     if "payload" in values:
         values["payload"] = _message_payload(values["payload"])

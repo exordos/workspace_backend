@@ -1373,6 +1373,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "kind": "zulip",
                 "stream_id": 3,
                 "server_url": "https://zulip.example.com",
+                "source_scope": None,
                 "topic_name": "deploys",
                 "message_id": 12345,
             },
