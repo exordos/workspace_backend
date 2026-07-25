@@ -368,6 +368,89 @@ def test_provider_operation_uses_same_request_transaction(monkeypatch):
     ]
 
 
+def test_reaction_update_queues_previous_provider_state(monkeypatch):
+    reaction_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    reaction = types.SimpleNamespace(
+        uuid=reaction_uuid,
+        message_uuid=message_uuid,
+        emoji_name="thumbs_up",
+    )
+    updated = types.SimpleNamespace(
+        uuid=reaction_uuid,
+        message_uuid=message_uuid,
+        emoji_name="heart",
+    )
+    message = types.SimpleNamespace(stream_uuid=stream_uuid)
+    provider_target = (object(), object())
+    queued = []
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "projection_values",
+        lambda values: values,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda row, _resource, **_kwargs: {
+            "uuid": str(row.uuid),
+            "message_uuid": str(row.message_uuid),
+            "emoji_name": row.emoji_name,
+        },
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "get_workspace_message_reaction",
+        lambda *_args: reaction,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "get_workspace_user_message",
+        lambda *_args: message,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "update_workspace_message_reaction",
+        lambda *_args, **_kwargs: updated,
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda *_args: provider_target,
+    )
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: queued.append(kwargs),
+    )
+
+    result = store.update_resource(
+        "message_reactions",
+        reaction_uuid,
+        {"emoji_name": "heart"},
+    )
+
+    assert result["emoji_name"] == "heart"
+    assert queued == [
+        {
+            "operation_kind": "reaction.update",
+            "target_type": "reaction",
+            "target_uuid": reaction_uuid,
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "uuid": str(reaction_uuid),
+                "message_uuid": str(message_uuid),
+                "emoji_name": "heart",
+                "previous_message_uuid": str(message_uuid),
+                "previous_emoji_name": "thumbs_up",
+            },
+            "provider_target": provider_target,
+        }
+    ]
+
+
 def test_provider_capability_rejection_precedes_canonical_message_mutation(
     monkeypatch,
 ):
