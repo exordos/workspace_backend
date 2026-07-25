@@ -161,11 +161,11 @@ def _upsert_provider_identity(
         """,
         (provider_external_id, account_uuid, identity.provider_kind),
     ).fetchone()
-    if (
-        link is not None
-        and sys_uuid.UUID(str(link["workspace_user_uuid"])) != identity_uuid
-    ):
-        raise ValueError("Provider identity link does not match the event UUID")
+    if link is not None:
+        # Catalog reconciliation owns this realm-scoped provider link. Queued
+        # events may still contain the former account-scoped UUID, but their
+        # untrusted UUID or email must never override the verified link.
+        identity_uuid = sys_uuid.UUID(str(link["workspace_user_uuid"]))
     existing = models.WorkspaceUser.objects.get_one_or_none(
         filters={"uuid": dm_filters.EQ(identity_uuid)},
         session=session,
@@ -442,10 +442,9 @@ def _message_event(
     author_identity = resource.get("author_identity")
     if (
         isinstance(author_identity, collections.abc.Mapping)
-        and sys_uuid.UUID(str(resource["user_uuid"]))
-        != assignment["owner_user_uuid"]
+        and sys_uuid.UUID(str(resource["user_uuid"])) != assignment["owner_user_uuid"]
     ):
-        _upsert_provider_identity(
+        resource["user_uuid"] = _upsert_provider_identity(
             session,
             identity,
             sys_uuid.UUID(str(event["external_account_uuid"])),
