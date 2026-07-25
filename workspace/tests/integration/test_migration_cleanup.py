@@ -27,6 +27,10 @@ IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID = "72f59f53-0bc7-4cda-ae81-79d22c3f
 IDENTITY_RECONCILIATION_INDEX_MIGRATION_FILE = (
     "0116-index-Messenger-event-identity-reconciliation-72f59f.py"
 )
+EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID = "4a927983-57be-43d1-979e-cef820b86b2d"
+EXTERNAL_ACCOUNT_SCOPE_MIGRATION_FILE = (
+    "0117-scope-external-projections-by-account-4a9279.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -43,7 +47,7 @@ LEGACY_TABLES = (
 def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == IDENTITY_RECONCILIATION_INDEX_MIGRATION_FILE
+    assert engine.get_latest_migration() == EXTERNAL_ACCOUNT_SCOPE_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -53,6 +57,7 @@ def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, d
                     EMAIL_INDEX_MIGRATION_UUID,
                     ZULIP_IDENTITY_MIGRATION_UUID,
                     IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID,
+                    EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID,
                 ],
             ),
         )
@@ -61,9 +66,178 @@ def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, d
             (EMAIL_INDEX_MIGRATION_UUID, True),
             (ZULIP_IDENTITY_MIGRATION_UUID, True),
             (IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID, True),
+            (EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
+
+
+def test_external_projection_access_is_scoped_to_account(
+    _database,
+    db,
+):
+    owner_a_uuid = "10000000-0000-4000-8000-000000000101"
+    owner_b_uuid = "10000000-0000-4000-8000-000000000102"
+    project_uuid = "10000000-0000-4000-8000-000000000103"
+    account_a_uuid = "10000000-0000-4000-8000-000000000104"
+    account_b_uuid = "10000000-0000-4000-8000-000000000105"
+    chat_a_uuid = "10000000-0000-4000-8000-000000000106"
+    chat_b_uuid = "10000000-0000-4000-8000-000000000107"
+    conftest.seed_workspace_user(db, owner_a_uuid, "projection-owner-a")
+    conftest.seed_workspace_user(db, owner_b_uuid, "projection-owner-b")
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_a_uuid,
+        "Account A provider projection",
+    )
+    with db.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (
+                %s, %s, 'zulip',
+                '{"server_url":"https://zulip.example.test"}'::jsonb,
+                TRUE, 'live'
+            )
+            """,
+            (
+                (account_a_uuid, owner_a_uuid),
+                (account_b_uuid, owner_b_uuid),
+            ),
+        )
+        cur.execute(
+            """
+            UPDATE m_workspace_streams
+            SET external_account_uuid = %s,
+                provider_external_id = 'channel:7',
+                source_name = 'zulip',
+                source = %s::jsonb
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                account_a_uuid,
+                (
+                    '{"kind":"zulip","stream_id":7,'
+                    '"server_url":"https://zulip.example.test"}'
+                ),
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id
+            ) VALUES (
+                %s, %s, %s, 'zulip', %s,
+                '{"participants":[]}'::jsonb, %s, TRUE, %s
+            )
+            """,
+            (
+                (
+                    chat_a_uuid,
+                    account_a_uuid,
+                    owner_a_uuid,
+                    "channel:7",
+                    "Account A provider projection",
+                    project_uuid,
+                ),
+                (
+                    chat_b_uuid,
+                    account_b_uuid,
+                    owner_b_uuid,
+                    "channel:8",
+                    "Account B provider projection",
+                    project_uuid,
+                ),
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                created_at, updated_at
+            ) VALUES (gen_random_uuid(), %s, %s, %s, %s, 'member', NOW(), NOW())
+            """,
+            (project_uuid, stream_uuid, owner_b_uuid, owner_a_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid, current_epoch_version,
+                pruned_through_epoch_version
+            ) VALUES (%s, %s, 17, 4)
+            ON CONFLICT (project_id, user_uuid) DO UPDATE
+            SET current_epoch_version = 17,
+                pruned_through_epoch_version = 4
+            RETURNING epoch_generation
+            """,
+            (project_uuid, owner_b_uuid),
+        )
+        generation_before = cur.fetchone()[0]
+        cur.execute(
+            'DELETE FROM "ra_migrations" WHERE uuid = %s',
+            (EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID,),
+        )
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.apply_migration(EXTERNAL_ACCOUNT_SCOPE_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+              AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, owner_b_uuid),
+        )
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_streams
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, owner_b_uuid),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT source->>'source_scope'
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, stream_uuid),
+        )
+        assert cur.fetchone()[0] == account_a_uuid
+        cur.execute(
+            """
+            SELECT source_scope
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, owner_b_uuid),
+        )
+        assert cur.fetchone()[0] == account_b_uuid
+        cur.execute(
+            """
+            SELECT epoch_generation, current_epoch_version,
+                   pruned_through_epoch_version
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, owner_b_uuid),
+        )
+        generation_after, current_epoch, pruned_through = cur.fetchone()
+        assert generation_after != generation_before
+        assert current_epoch == 17
+        assert pruned_through == 17
 
 
 def test_email_uniqueness_is_scoped_to_iam_users(_database, db):

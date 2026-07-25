@@ -319,6 +319,10 @@ def test_topic_upsert_repairs_missing_projection_owner_binding(monkeypatch):
         event["payload"]["resource"]["uuid"]
     )
     assert topic_calls[0][0][2]["stream_uuid"] == stream_uuid
+    assert (
+        topic_calls[0][0][2]["source"]["source_scope"]
+        == (event["external_account_uuid"])
+    )
 
 
 def test_missing_external_chat_stream_is_materialized(monkeypatch):
@@ -420,6 +424,7 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
     assert values["create_default_topic"] is False
     assert values["source_name"] == "zulip"
     assert values["source"].stream_id == 7
+    assert values["source"].source_scope == str(account_uuid)
     assert values["provider_uuid"] == bridge_uuid
     assert values["external_account_uuid"] == account_uuid
     assert len(created_users) == 1
@@ -455,12 +460,14 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
     stream_uuid = sys_uuid.uuid4()
     stream = types.SimpleNamespace(user_uuid=owner_uuid)
     member_uuid = sys_uuid.uuid4()
+    linked_iam_member_uuid = sys_uuid.uuid4()
     stale_member_uuid = sys_uuid.uuid4()
     native_member_uuid = sys_uuid.uuid4()
     session = object()
     bound = []
     deleted = []
     stale_binding_uuid = sys_uuid.uuid4()
+    linked_iam_binding_uuid = sys_uuid.uuid4()
     native_binding_uuid = sys_uuid.uuid4()
     monkeypatch.setattr(
         external_projection.models,
@@ -475,11 +482,20 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
         types.SimpleNamespace(
             objects=types.SimpleNamespace(
                 get_all=lambda **kwargs: (
-                    [types.SimpleNamespace(uuid=stale_member_uuid)]
+                    [
+                        types.SimpleNamespace(
+                            uuid=stale_member_uuid,
+                            source="zulip",
+                        )
+                    ]
                     if "source" in kwargs["filters"]
                     else [
-                        types.SimpleNamespace(uuid=owner_uuid),
-                        types.SimpleNamespace(uuid=member_uuid),
+                        types.SimpleNamespace(uuid=owner_uuid, source="iam"),
+                        types.SimpleNamespace(uuid=member_uuid, source="zulip"),
+                        types.SimpleNamespace(
+                            uuid=linked_iam_member_uuid,
+                            source="iam",
+                        ),
                     ]
                 )
             )
@@ -502,6 +518,10 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
                     types.SimpleNamespace(
                         uuid=stale_binding_uuid,
                         user_uuid=stale_member_uuid,
+                    ),
+                    types.SimpleNamespace(
+                        uuid=linked_iam_binding_uuid,
+                        user_uuid=linked_iam_member_uuid,
                     ),
                     types.SimpleNamespace(
                         uuid=native_binding_uuid,
@@ -544,6 +564,10 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
                     "identity_uuid": str(member_uuid),
                     "role": "member",
                 },
+                {
+                    "identity_uuid": str(linked_iam_member_uuid),
+                    "role": "member",
+                },
             ],
         },
         capabilities={},
@@ -559,7 +583,7 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
                 "who_uuid": owner_uuid,
                 "role_user_uuids": {
                     "owner": [owner_uuid],
-                    "member": [member_uuid],
+                    "member": [member_uuid, linked_iam_member_uuid],
                 },
                 "session": session,
             },
@@ -663,6 +687,7 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     assert values["topic_uuid"] == sys_uuid.UUID(
         event["payload"]["resource"]["topic_uuid"]
     )
+    assert values["source"]["source_scope"] == event["external_account_uuid"]
     assert values["created_at"] == datetime.datetime(
         2026, 7, 18, 12, tzinfo=datetime.timezone.utc
     )

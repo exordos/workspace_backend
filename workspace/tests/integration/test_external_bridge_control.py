@@ -55,6 +55,7 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
     conflicting_account_uuid = sys_uuid.uuid4()
     legacy_user_uuid = sys_uuid.uuid4()
     chat_uuid = sys_uuid.uuid4()
+    account_b_chat_uuid = sys_uuid.uuid4()
     file_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.UUID(
         conftest.seed_user_stream(
@@ -70,7 +71,12 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
         conflicting_owner_uuid,
         "conflicting-owner",
     )
-    settings = json.dumps({"default_project_id": str(project_uuid)})
+    settings = json.dumps(
+        {
+            "default_project_id": str(project_uuid),
+            "server_url": "https://zulip.example.test",
+        }
+    )
     with db.cursor() as cursor:
         for account_uuid, owner_uuid in (
             (account_a_uuid, owner_a_uuid),
@@ -80,11 +86,35 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             cursor.execute(
                 """
                 INSERT INTO m_external_accounts_v2 (
-                    uuid, owner_user_uuid, provider, settings
-                ) VALUES (%s, %s, 'zulip', %s::jsonb)
+                    uuid, owner_user_uuid, provider, settings,
+                    credential_present, status
+                ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
                 """,
                 (account_uuid, owner_uuid, settings),
             )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET external_account_uuid = %s,
+                provider_external_id = 'direct:10,20',
+                source_name = 'zulip',
+                source = %s::jsonb
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                account_a_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 0,
+                        "server_url": "https://zulip.example.test",
+                        "source_scope": str(account_a_uuid),
+                    }
+                ),
+                project_uuid,
+                stream_uuid,
+            ),
+        )
         cursor.execute(
             """
             INSERT INTO m_workspace_users (
@@ -131,9 +161,11 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             """
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
-                provider_chat_id, source, display_name
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
             ) VALUES (
-                %s, %s, %s, 'zulip', 'direct:10,20', %s::jsonb, 'Peer'
+                %s, %s, %s, 'zulip', 'direct:10,20', %s::jsonb, 'Peer',
+                TRUE, %s, %s
             )
             """,
             (
@@ -150,6 +182,26 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
                         ]
                     }
                 ),
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:99',
+                '{"participants":[]}'::jsonb, 'Owner B access',
+                TRUE, %s
+            )
+            """,
+            (
+                account_b_chat_uuid,
+                account_b_uuid,
+                owner_b_uuid,
+                project_uuid,
             ),
         )
         cursor.execute(
@@ -257,6 +309,15 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             (stream_uuid, owner_b_uuid),
         )
         assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_streams
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, owner_b_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
         cursor.execute(
             """
             SELECT source#>>'{participants,0,identity_uuid}'
