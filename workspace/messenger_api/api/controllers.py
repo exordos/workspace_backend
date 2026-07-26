@@ -16,7 +16,9 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 import webob
 from restalchemy.api import actions as ra_actions
+from restalchemy.api import constants as ra_constants
 from restalchemy.api import controllers as ra_controllers
+from restalchemy.api import field_permissions as ra_field_permissions
 from restalchemy.api import packers as ra_packers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import contexts
@@ -37,6 +39,7 @@ from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import push_devices
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import sql_state
 
@@ -408,6 +411,135 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
                 action,
                 values or {},
             )
+
+
+PUSH_DEVICE_RESOURCE = ra_resources.ResourceByRAModel(
+    model_class=push_devices.PushDevice,
+    convert_underscore=False,
+    fields_permissions=ra_field_permissions.FieldsPermissions(
+        fields={
+            field: {
+                ra_constants.ALL: ra_field_permissions.Permissions.RO,
+            }
+            for field in (
+                "uuid",
+                "project_id",
+                "user_uuid",
+                "created_at",
+                "updated_at",
+            )
+        },
+    ),
+)
+PUSH_DEVICE_RESPONSE_SCHEMA = (
+    PUSH_DEVICE_RESOURCE.generate_schema_object(
+        ra_constants.GET,
+        oa_c.OPENAPI_SPECIFICATION_3_0_3,
+    )
+)
+PUSH_DEVICE_UPDATE_RESPONSES = {
+    200: {
+        "description": "Existing push device registration replaced.",
+        "content": {
+            "application/json": {
+                "schema": PUSH_DEVICE_RESPONSE_SCHEMA,
+            },
+        },
+    },
+    201: {
+        "description": "Push device registration created.",
+        "content": {
+            "application/json": {
+                "schema": PUSH_DEVICE_RESPONSE_SCHEMA,
+            },
+        },
+    },
+    "default": oa_c.DEFAULT_RESPONSE,
+}
+
+
+class PushDeviceController(ra_controllers.BaseResourceController):
+    __resource__ = PUSH_DEVICE_RESOURCE
+    __generate_location_for__ = ()
+
+    def _owner_scope(self) -> tuple[typing.Any, typing.Any]:
+        context = self.get_context()
+        user_uuid = getattr(context, "user_uuid", None)
+        project_id = getattr(context, "project_id", None)
+        if user_uuid is None or project_id is None:
+            raise ra_exc.ValidationErrorException()
+        return project_id, user_uuid
+
+    def _owner_filters(self, uuid: object) -> dict[str, typing.Any]:
+        project_id, user_uuid = self._owner_scope()
+        return {
+            "uuid": dm_filters.EQ(uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "user_uuid": dm_filters.EQ(user_uuid),
+        }
+
+    def _response(self, device: typing.Any) -> dict[str, typing.Any]:
+        return ra_packers.BaseResourcePacker(
+            PUSH_DEVICE_RESOURCE,
+            self.request,
+        ).pack_resource(device)
+
+    @oa_utils.extend_schema(
+        summary="Register or rotate a push device",
+        responses=PUSH_DEVICE_UPDATE_RESPONSES,
+    )
+    def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        project_id, user_uuid = self._owner_scope()
+        session = contexts.Context().get_session()
+        models.WorkspaceUser.objects.get_one(
+            filters={"uuid": dm_filters.EQ(user_uuid)},
+            session=session,
+            locked=True,
+        )
+        candidate = self.model(
+            uuid=uuid,
+            project_id=project_id,
+            user_uuid=user_uuid,
+            **kwargs,
+        )
+        device = self.model.objects.get_one_or_none(
+            filters={"uuid": dm_filters.EQ(uuid)},
+            session=session,
+        )
+        if device is None:
+            candidate.insert(session=session)
+            device = self.model.objects.get_one(
+                filters={"uuid": dm_filters.EQ(uuid)},
+                session=session,
+            )
+            return self._response(device), 201, {}
+        if device.project_id != project_id or device.user_uuid != user_uuid:
+            raise ra_exc.ResourceNotFoundError(
+                resource="PushDevice",
+                path=str(uuid),
+            )
+        device.update_dm(
+            values={
+                "transport": candidate.transport,
+                "platform": candidate.platform,
+                "registration_token": candidate.registration_token,
+                "encryption": candidate.encryption,
+            },
+        )
+        device.update(session=session)
+        return self._response(device), 200, {}
+
+    @oa_utils.extend_schema(
+        summary="Delete a push device registration",
+    )
+    def delete(self, uuid: object) -> None:
+        session = contexts.Context().get_session()
+        device = self.model.objects.get_one_or_none(
+            filters=self._owner_filters(uuid),
+            session=session,
+        )
+        if device is not None:
+            device.delete(session=session)
 
 
 class FolderController(StoreResourceController):

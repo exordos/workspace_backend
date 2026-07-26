@@ -221,6 +221,44 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     assert not any(path.startswith("/v1/mail/") for path in paths)
     assert not any(path.startswith("/v1/calendar/") for path in paths)
     assert "/v1/providers/" not in paths
+    push_device_path = "/v1/push_devices/{PushDeviceUuid}"
+    assert set(paths[push_device_path]) == {"put", "delete"}
+    push_device_put = paths[push_device_path]["put"]
+    request_reference = push_device_put["requestBody"]["content"]["application/json"][
+        "schema"
+    ]["$ref"]
+    assert request_reference == "#/components/schemas/PushDevice_Update"
+    push_device_request = specification["components"]["schemas"][
+        "PushDevice_Update"
+    ]
+    assert push_device_request["required"] == [
+        "transport",
+        "platform",
+        "registration_token",
+        "encryption",
+    ]
+    request_encryption = push_device_request["properties"]["encryption"]["oneOf"][0]
+    assert request_encryption["properties"]["kind"]["enum"] == ["HPKE"]
+    assert request_encryption["properties"]["algorithm"]["enum"] == [
+        "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+    ]
+    assert "public_key" in request_encryption["properties"]
+    for status in (200, 201):
+        response_schema = push_device_put["responses"][status]["content"][
+            "application/json"
+        ]["schema"]
+        assert {"user_uuid", "project_id"} <= set(
+            response_schema["properties"],
+        )
+        assert "registration_token" in response_schema["properties"]
+        response_encryption = response_schema["properties"]["encryption"]["oneOf"][0][
+            "properties"
+        ]
+        assert "public_key" in response_encryption
+    assert set(paths[push_device_path]["delete"]["responses"]) == {
+        204,
+        "default",
+    }
     assert set(paths["/v1/events/"]) == {"get"}
     assert "/v1/events/ws" not in paths
     assert "/v1/events/ws/" not in paths

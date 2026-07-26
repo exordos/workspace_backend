@@ -4,10 +4,10 @@ This document describes the browser-facing API contract composed by nginx from
 the preserved `workspace-messenger-api`, the common `workspace-api`, and the
 companion `workspace-messenger-events` websocket service. Public Messenger
 requests use the dedicated Messenger process; common users, client service
-settings, and REST events use `workspace-api`. Standalone Mail, Calendar, and
-External Users endpoints are not part of this release. Provider-neutral
-external account, chat, operation, policy, health, and bridge-instance
-resources are part of the Messenger API.
+settings, push-device registrations, and REST events use `workspace-api`.
+Standalone Mail, Calendar, and External Users endpoints are not part of this
+release. Provider-neutral external account, chat, operation, policy, health,
+and bridge-instance resources are part of the Messenger API.
 
 Native Messenger resources, membership, user state, events, provider mappings,
 and client settings are canonical in PostgreSQL. The existing provenance fields
@@ -355,6 +355,8 @@ authoritative snapshots before starting a new cursor.
 | `GET` | `/api/workspace/v1/messenger/files/{file_uuid}/actions/download` | Download visible file bytes. |
 | `GET` | `/api/workspace/v1/services/` | List available Workspace services. |
 | `GET` | `/api/workspace/v1/services/{service_uuid}` | Get one available Workspace service. |
+| `PUT` | `/api/workspace/v1/push_devices/{registration_uuid}` | Idempotently register or rotate the current user's push device. |
+| `DELETE` | `/api/workspace/v1/push_devices/{registration_uuid}` | Idempotently delete the current user's push device registration. |
 | `GET` | `/api/workspace/v1/events/` | List durable realtime events for the current IAM user. |
 | `GET` | `/api/workspace/v1/epoch/` | Return the current user's latest visible event epoch. |
 | `GET` | `/api/workspace/v1/users/` | List workspace users. |
@@ -418,6 +420,57 @@ Example response:
   "realm_uri": "https://workspace.example.com"
 }
 ```
+
+## Push Devices
+
+`PUT /api/workspace/v1/push_devices/{registration_uuid}` is a replacement-style
+upsert. The client generates a stable UUID per application installation. The
+first registration returns `201`; replacing its FCM token or encryption key
+returns `200`. The registration is always scoped to both the authenticated
+`user_uuid` and the IAM `project_id`.
+
+```json
+{
+  "transport": "fcm",
+  "platform": "ios",
+  "registration_token": "<FCM registration token>",
+  "encryption": {
+    "kind": "HPKE",
+    "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+    "key_uuid": "248305f4-ecdf-4206-8e93-95f830ea8ad6",
+    "public_key": "<unpadded base64url X25519 public key>"
+  }
+}
+```
+
+`encryption` is a RESTAlchemy kind model. The only supported kind is `HPKE`,
+using Base mode with X25519, HKDF-SHA256, and AES-256-GCM. `public_key` must be
+the canonical unpadded base64url encoding of exactly 32 bytes. For the initial
+API version, the response mirrors `registration_token` and `public_key` from
+the stored model. The supported platforms are currently `android` and `ios`.
+
+```json
+{
+  "uuid": "7c1af344-95e1-487e-8b51-d1af0370cdb5",
+  "transport": "fcm",
+  "platform": "ios",
+  "encryption": {
+    "kind": "HPKE",
+    "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+    "key_uuid": "248305f4-ecdf-4206-8e93-95f830ea8ad6",
+    "public_key": "<unpadded base64url X25519 public key>"
+  },
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "registration_token": "<FCM registration token>",
+  "created_at": "2026-07-26T05:30:00Z",
+  "updated_at": "2026-07-26T05:40:00Z"
+}
+```
+
+`DELETE` returns `204` both when it removes the owned registration and when that
+registration is already absent. This contract only manages registrations; push
+payload encryption and delivery are outside this API change.
 
 ## Folders
 
