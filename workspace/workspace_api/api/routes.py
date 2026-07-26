@@ -52,4 +52,5 @@ class WorkspaceApiEndpointRoute(routes.Route):
     me = routes.route(messenger_routes.MeRoute)
     events = routes.route(messenger_routes.WorkspaceEventRoute)
     epoch = routes.route(messenger_routes.WorkspaceEpochRoute)
+    push_devices = routes.route(messenger_routes.PushDeviceRoute)
     messenger = routes.route(MessengerRoute)

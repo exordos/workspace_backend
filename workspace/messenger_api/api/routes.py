@@ -142,6 +142,14 @@ class WorkspaceFileRoute(routes.Route):
     download = routes.action(WorkspaceFileDownloadAction)
 
 
+class PushDeviceRoute(routes.Route):
+    __controller__ = controllers.PushDeviceController
+    __allow_methods__ = [
+        routes.UPDATE,
+        routes.DELETE,
+    ]
+
+
 class FolderRoute(routes.Route):
     __controller__ = controllers.FolderController
     __allow_methods__ = [
