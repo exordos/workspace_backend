@@ -58,7 +58,7 @@ resources:
         kind: "disks"
         disks:
           - size: 8
-            image: "{{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace/{{ version }}/images/workspace-backend.raw.zst"
+            image: "{{ images.workspace_backend }}"
             label: root
 
   $core.secret.passwords:
