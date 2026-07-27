@@ -53,6 +53,35 @@ _BACKEND_UNAVAILABLE_REASONS = {
 _WORKSPACE_PROJECTION_NAMESPACE = sys_uuid.UUID("71bdfd0a-35b6-54ac-83d1-54869e3c7e67")
 
 
+def prune_expired_heartbeats(
+    session: Any,
+    now: datetime.datetime,
+    retention: datetime.timedelta,
+    batch_size: int,
+) -> int:
+    """Delete one bounded batch of private heartbeat idempotency rows."""
+    if batch_size < 1:
+        raise ValueError("Heartbeat prune batch size must be positive")
+    return session.execute(
+        """
+        WITH expired AS MATERIALIZED (
+            SELECT "heartbeat_uuid"
+            FROM "m_external_bridge_heartbeats_v1"
+            WHERE "received_at" < %s
+            ORDER BY "received_at", "heartbeat_uuid"
+            LIMIT %s
+        ), deleted AS (
+            DELETE FROM "m_external_bridge_heartbeats_v1" AS heartbeat
+            USING expired
+            WHERE heartbeat."heartbeat_uuid" = expired."heartbeat_uuid"
+            RETURNING 1
+        )
+        SELECT COUNT(*) AS "count" FROM deleted
+        """,
+        (now - retention, batch_size),
+    ).fetchone()["count"]
+
+
 def _projection_uuid(
     scope_uuid: sys_uuid.UUID,
     kind: str,

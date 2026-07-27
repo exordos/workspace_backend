@@ -1417,10 +1417,11 @@ Response example:
 Events are durable PostgreSQL records scoped to their audience. Recipient
 events carry `user_uuid`; compact broadcast events use a stored audience so
 each visible client observes the same public event contract without requiring
-one canonical event row per recipient. Only event records are retained for
-seven days; messages, files, stream/topic state, provider mappings, and other
-canonical resources are never removed by this policy. Pruning advances the
-stored retained floor so the remaining events form a complete visible suffix.
+one canonical event row per recipient. Only event records are retained for the
+configured interval, 72 hours by default; messages, files, stream/topic state,
+provider mappings, and other canonical resources are never removed by this
+policy. Pruning advances the stored retained floor so the remaining events form
+a complete visible suffix.
 `epoch_version` is monotonic within one PostgreSQL-owned
 `epoch_generation`.
 

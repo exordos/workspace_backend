@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import logging
 import sys
 
@@ -23,15 +24,17 @@ from restalchemy.storage.sql import engines
 
 from workspace.common import config
 from workspace.common import log as infra_log
+from workspace.common import messenger_worker_opts
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import agents
 
-DOMAIN = "messenger_worker_agent"
+DOMAIN = messenger_worker_opts.DOMAIN
 
 
 CONF = cfg.CONF
 ra_config_opts.register_posgresql_db_opts(CONF)
+messenger_worker_opts.register_opts(CONF)
 
 
 def main() -> None:
@@ -44,6 +47,14 @@ def main() -> None:
     api_store.configure_store_factory(factory)
     service = agents.MessengerWorkerAgent(
         iter_min_period=3,
+        event_retention=datetime.timedelta(
+            seconds=CONF[DOMAIN].event_retention_seconds,
+        ),
+        event_prune_interval_seconds=(CONF[DOMAIN].event_prune_interval_seconds),
+        event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
+        heartbeat_retention=datetime.timedelta(
+            seconds=CONF[DOMAIN].heartbeat_retention_seconds,
+        ),
     )
 
     service.add_setup(

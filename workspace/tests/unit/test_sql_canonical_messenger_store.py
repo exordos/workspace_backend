@@ -1043,13 +1043,19 @@ def test_event_retention_advances_watermark_before_delete():
 
     assert result == 17
     assert 'INSERT INTO "m_workspace_event_cursors"' in statements[0][0]
-    assert 'UPDATE "m_workspace_event_audience_snapshots_v1"' in statements[1][0]
-    assert 'DELETE FROM "m_workspace_events"' in statements[2][0]
-    assert "WHERE NOT EXISTS" in statements[3][0]
-    assert 'INSERT INTO "m_workspace_event_cursors"' in statements[3][0]
-    assert 'DELETE FROM "m_workspace_event_audience_snapshots_v1"' in statements[4][0]
-    assert "WHERE NOT EXISTS" in statements[4][0]
-    assert statements[0][1] == (now - sql_canonical_store.EVENT_RETENTION,)
+    assert 'UPDATE "m_workspace_event_audience_snapshots_v1"' in statements[0][0]
+    assert 'DELETE FROM "m_workspace_events"' in statements[0][0]
+    assert 'DELETE FROM "m_workspace_broadcast_message_events_v1"' in (statements[0][0])
+    assert "LIMIT %s" in statements[0][0]
+    assert "WHERE NOT EXISTS" in statements[1][0]
+    assert 'INSERT INTO "m_workspace_event_cursors"' in statements[1][0]
+    assert 'DELETE FROM "m_workspace_event_audience_snapshots_v1"' in statements[2][0]
+    assert "WHERE NOT EXISTS" in statements[2][0]
+    assert statements[0][1] == (
+        now - sql_canonical_store.EVENT_RETENTION,
+        now - sql_canonical_store.EVENT_RETENTION,
+        sql_canonical_store.EVENT_PRUNE_BATCH_SIZE,
+    )
 
 
 def test_event_retention_has_created_at_leading_index():

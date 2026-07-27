@@ -3,11 +3,42 @@
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License.
 
+import datetime
 from types import SimpleNamespace
 from unittest import mock
 import uuid as sys_uuid
 
 from workspace.external_bridge_control import sql_state
+
+
+def test_heartbeat_retention_is_bounded_and_uses_cutoff():
+    now = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
+    retention = datetime.timedelta(hours=24)
+    calls = []
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"count": 23}
+
+    session = SimpleNamespace(
+        execute=lambda statement, params: calls.append((statement, params)) or Result()
+    )
+
+    assert (
+        sql_state.prune_expired_heartbeats(
+            session,
+            now,
+            retention=retention,
+            batch_size=100,
+        )
+        == 23
+    )
+    statement, params = calls[0]
+    assert 'DELETE FROM "m_external_bridge_heartbeats_v1"' in statement
+    assert "ORDER BY" in statement
+    assert "LIMIT %s" in statement
+    assert params == (now - retention, 100)
 
 
 def test_projected_capability_events_do_not_fan_out_to_message_history(

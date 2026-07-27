@@ -38,7 +38,8 @@ The server selects `workspace.events.v1`. Do not put the token in the query
 string. Persist and send `epoch_generation` with every non-zero resume cursor;
 omitted `last_epoch_version` means the cold cursor `0`. A cold cursor does not
 require a generation, but it returns the normal typed gap response when the
-seven-day retained suffix cannot provide complete history from epoch `1`.
+configured retained suffix, 72 hours by default, cannot provide complete
+history from epoch `1`.
 Unauthorized handshakes close with `4401` and invalid handshakes close with
 `4400`. Token refresh requires a new connection.
 
@@ -155,8 +156,8 @@ Cursor rules:
 - paginate until the server returns no further page marker.
 - treat HTTP 410 `EventsCursorExpiredError` / `error=epoch_pruned` as a cache
   reset boundary; refresh authoritative snapshots and restart with the returned
-  generation. The server retains events for exactly seven days and this reset
-  never deletes messages, files, or domain state.
+  generation. The server retains events for a configurable interval, 72 hours
+  by default, and this reset never deletes messages, files, or domain state.
 
 ## Websocket delivery
 

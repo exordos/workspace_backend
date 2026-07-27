@@ -174,9 +174,9 @@ reviving historical integration code.
 - Public `provider` and `delivery` fields are reserved but not populated
   consistently in every current serializer. Serializer parity is a prerequisite
   for enabling the feature.
-- Browser event cursors are project- and user-scoped with seven-day retention.
-  They are not bridge queue cursors and must not be reused as provider outbox or
-  backfill positions.
+- Browser event cursors are project- and user-scoped with configurable
+  retention, 72 hours by default. They are not bridge queue cursors and must
+  not be reused as provider outbox or backfill positions.
 - The current `ExternalAccount` residue is project-scoped and permits plaintext
   JSON credentials. It must be replaced by a realm-scoped model; it is not a
   migration target or a compatibility contract.

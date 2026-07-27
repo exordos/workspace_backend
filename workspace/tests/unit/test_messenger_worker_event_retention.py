@@ -16,12 +16,21 @@ def test_worker_prunes_postgresql_events_in_owned_session(monkeypatch):
     monkeypatch.setattr(
         agents.sql_canonical_store,
         "prune_expired_events",
-        lambda target_session, target_now: (
-            calls.append((target_session, target_now)) or 9
+        lambda target_session, target_now, **kwargs: (
+            calls.append((target_session, target_now, kwargs)) or 9
         ),
     )
 
     worker = agents.MessengerWorkerAgent()
 
     assert worker._prune_expired_events(session, now) == 9
-    assert calls == [(session, now)]
+    assert calls == [
+        (
+            session,
+            now,
+            {
+                "retention": agents.sql_canonical_store.EVENT_RETENTION,
+                "batch_size": agents.sql_canonical_store.EVENT_PRUNE_BATCH_SIZE,
+            },
+        )
+    ]

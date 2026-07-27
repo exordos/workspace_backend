@@ -73,6 +73,48 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual([first_project_id, second_project_id], result)
         get_all.assert_called_once_with(order_by={"project_id": "asc"})
 
+    def test_workspace_user_event_recipients_are_project_scoped(self):
+        project_id = sys_uuid.uuid4()
+        first_user_uuid = sys_uuid.uuid4()
+        second_user_uuid = sys_uuid.uuid4()
+        result = types.SimpleNamespace(
+            fetchall=lambda: [
+                {"user_uuid": first_user_uuid},
+                {"user_uuid": second_user_uuid},
+            ]
+        )
+        session = types.SimpleNamespace(execute=mock.Mock(return_value=result))
+
+        recipients = dm_helpers._get_workspace_user_event_recipients(
+            project_id,
+            session=session,
+        )
+
+        self.assertEqual([first_user_uuid, second_user_uuid], recipients)
+        statement, params = session.execute.call_args.args
+        self.assertIn("m_workspace_stream_bindings", statement)
+        self.assertIn("m_folders", statement)
+        self.assertEqual((project_id, project_id), params)
+
+    def test_provider_users_are_not_presence_timeout_candidates(self):
+        get_all = mock.Mock(return_value=[])
+
+        class FakeWorkspaceUser:
+            objects = types.SimpleNamespace(get_all=get_all)
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceUser",
+            FakeWorkspaceUser,
+        ):
+            dm_helpers._get_stale_workspace_users(object())
+
+        filters = get_all.call_args.kwargs["filters"]
+        self.assertEqual(
+            dm_helpers.models.WorkspaceUserSource.IAM.value,
+            filters.clauses[0]["source"].value,
+        )
+
     def test_mark_stale_workspace_users_offline_skips_projects_without_users(self):
         with (
             mock.patch.object(
@@ -3913,6 +3955,97 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
+            session=session,
+        )
+
+    def test_sync_workspace_user_messages_read_state_emits_one_batch_event(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        first_topic_uuid = sys_uuid.uuid4()
+        second_topic_uuid = sys_uuid.uuid4()
+        message_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+        session = object()
+        messages = [
+            types.SimpleNamespace(
+                uuid=message_uuid,
+                stream_uuid=stream_uuid,
+                topic_uuid=topic_uuid,
+                author_uuid=sys_uuid.uuid4(),
+            )
+            for message_uuid, topic_uuid in zip(
+                message_uuids,
+                [first_topic_uuid, second_topic_uuid],
+            )
+        ]
+        returned_messages = [
+            types.SimpleNamespace(uuid=message_uuid, read=True)
+            for message_uuid in message_uuids
+        ]
+        update_sessions = []
+
+        class ExistingFlags:
+            read = False
+
+            def update_dm(self, values):
+                self.read = values["read"]
+
+            def update(self, session=None):
+                update_sessions.append(session)
+
+        class FakeWorkspaceUserMessageFlags:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(
+                    side_effect=[ExistingFlags(), ExistingFlags()],
+                )
+            )
+
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=returned_messages,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_messages_read_event",
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_updated_event",
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers,
+                "_create_unread_updated_events",
+            ) as create_unread_events,
+        ):
+            result = dm_helpers.sync_workspace_user_messages_read_state(
+                project_id,
+                user_uuid,
+                messages,
+                True,
+                session=session,
+            )
+
+        self.assertEqual(returned_messages, result)
+        self.assertEqual([session, session], update_sessions)
+        create_read_event.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuids=message_uuids,
+            session=session,
+        )
+        create_updated_event.assert_not_called()
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=[first_topic_uuid, second_topic_uuid],
             session=session,
         )
 

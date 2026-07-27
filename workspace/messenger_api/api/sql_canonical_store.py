@@ -33,7 +33,8 @@ RESOURCE_MODELS: dict[str, typing.Any] = {
 
 _PROVIDER_TARGET_UNSET = object()
 _PROVIDER_TARGET_EXISTS = object()
-EVENT_RETENTION = datetime.timedelta(days=7)
+EVENT_RETENTION = datetime.timedelta(hours=72)
+EVENT_PRUNE_BATCH_SIZE = 25000
 BOUNDED_VISIBLE_EVENTS_SQL = """
     WITH direct_events AS (
         SELECT
@@ -85,9 +86,12 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
             recipient."user_uuid",
             event."payload"
                 || COALESCE(override."payload", '{}'::jsonb)
-                || jsonb_build_object(
-                    'user_uuid', recipient."user_uuid"
-                ) AS "payload",
+                || CASE
+                    WHEN event."object_type" = 'user' THEN '{}'::jsonb
+                    ELSE jsonb_build_object(
+                        'user_uuid', recipient."user_uuid"
+                    )
+                END AS "payload",
             event."created_at", event."updated_at",
             event."schema_version", event."object_type", event."action"
         FROM "m_workspace_broadcast_message_events_v1" AS event
@@ -168,70 +172,115 @@ def _public_dict(row: typing.Any, resource: str) -> dict[str, typing.Any]:
 def prune_expired_events(
     session: typing.Any,
     now: datetime.datetime,
+    retention: datetime.timedelta = EVENT_RETENTION,
+    batch_size: int = EVENT_PRUNE_BATCH_SIZE,
 ) -> int:
-    """Prune only the seven-day event suffix and advance durable watermarks."""
-    cutoff = now - EVENT_RETENTION
-    session.execute(
-        """
-        INSERT INTO "m_workspace_event_cursors" (
-            "project_id", "user_uuid", "current_epoch_version",
-            "pruned_through_epoch_version"
-        )
-        SELECT
-            "project_id", "user_uuid", MAX("epoch_version"), MAX("epoch_version")
-        FROM "m_workspace_events"
-        WHERE "created_at" < %s
-        GROUP BY "project_id", "user_uuid"
-        ON CONFLICT ("project_id", "user_uuid") DO UPDATE
-        SET
-            "current_epoch_version" = GREATEST(
-                "m_workspace_event_cursors"."current_epoch_version",
-                EXCLUDED."current_epoch_version"
-            ),
-            "pruned_through_epoch_version" = GREATEST(
-                "m_workspace_event_cursors"."pruned_through_epoch_version",
-                EXCLUDED."pruned_through_epoch_version"
-            ),
-            "updated_at" = NOW()
-        """,
-        (cutoff,),
-    )
-    session.execute(
-        """
-        UPDATE "m_workspace_event_audience_snapshots_v1" AS audience
-        SET
-            "current_epoch_version" = GREATEST(
-                audience."current_epoch_version", expired."epoch_version"
-            ),
-            "pruned_through_epoch_version" = GREATEST(
-                audience."pruned_through_epoch_version", expired."epoch_version"
-            )
-        FROM (
-            SELECT "audience_snapshot_uuid", MAX("epoch_version") AS "epoch_version"
-            FROM "m_workspace_broadcast_message_events_v1"
-            WHERE "created_at" < %s
-            GROUP BY "audience_snapshot_uuid"
-        ) AS expired
-        WHERE audience."uuid" = expired."audience_snapshot_uuid"
-        """,
-        (cutoff,),
-    )
+    """Prune one bounded event batch after advancing durable watermarks."""
+    if batch_size < 1:
+        raise ValueError("Event prune batch size must be positive")
+    cutoff = now - retention
     result = session.execute(
         """
-        WITH deleted_recipient_events AS (
-            DELETE FROM "m_workspace_events"
-            WHERE "created_at" < %s
+        WITH candidates AS MATERIALIZED (
+            SELECT expired.*
+            FROM (
+                SELECT
+                    'direct'::text AS "source",
+                    event."epoch_version", event."project_id",
+                    event."user_uuid",
+                    NULL::uuid AS "audience_snapshot_uuid",
+                    event."created_at"
+                FROM "m_workspace_events" AS event
+                WHERE event."created_at" < %s
+                UNION ALL
+                SELECT
+                    'broadcast'::text AS "source",
+                    event."epoch_version", event."project_id",
+                    NULL::uuid AS "user_uuid",
+                    event."audience_snapshot_uuid",
+                    event."created_at"
+                FROM "m_workspace_broadcast_message_events_v1" AS event
+                WHERE event."created_at" < %s
+            ) AS expired
+            ORDER BY expired."created_at", expired."epoch_version"
+            LIMIT %s
+        ), locked_projects AS MATERIALIZED (
+            SELECT
+                projects."project_id",
+                pg_advisory_xact_lock(
+                    hashtextextended(projects."project_id"::text, 0)
+                ) AS "locked"
+            FROM (
+                SELECT DISTINCT "project_id"
+                FROM candidates
+                ORDER BY "project_id"
+            ) AS projects
+        ), advanced_direct_cursors AS (
+            INSERT INTO "m_workspace_event_cursors" (
+                "project_id", "user_uuid", "current_epoch_version",
+                "pruned_through_epoch_version"
+            )
+            SELECT
+                "project_id", "user_uuid",
+                MAX("epoch_version"), MAX("epoch_version")
+            FROM candidates
+            JOIN locked_projects USING ("project_id")
+            WHERE "source" = 'direct'
+            GROUP BY "project_id", "user_uuid"
+            ON CONFLICT ("project_id", "user_uuid") DO UPDATE
+            SET
+                "current_epoch_version" = GREATEST(
+                    "m_workspace_event_cursors"."current_epoch_version",
+                    EXCLUDED."current_epoch_version"
+                ),
+                "pruned_through_epoch_version" = GREATEST(
+                    "m_workspace_event_cursors"."pruned_through_epoch_version",
+                    EXCLUDED."pruned_through_epoch_version"
+                ),
+                "updated_at" = NOW()
+            RETURNING 1
+        ), advanced_broadcast_cursors AS (
+            UPDATE "m_workspace_event_audience_snapshots_v1" AS audience
+            SET
+                "current_epoch_version" = GREATEST(
+                    audience."current_epoch_version",
+                    expired."epoch_version"
+                ),
+                "pruned_through_epoch_version" = GREATEST(
+                    audience."pruned_through_epoch_version",
+                    expired."epoch_version"
+                )
+            FROM (
+                SELECT
+                    candidates."audience_snapshot_uuid",
+                    MAX(candidates."epoch_version") AS "epoch_version"
+                FROM candidates
+                JOIN locked_projects USING ("project_id")
+                WHERE "source" = 'broadcast'
+                GROUP BY candidates."audience_snapshot_uuid"
+            ) AS expired
+            WHERE audience."uuid" = expired."audience_snapshot_uuid"
+            RETURNING 1
+        ), deleted_recipient_events AS (
+            DELETE FROM "m_workspace_events" AS event
+            USING candidates, locked_projects
+            WHERE candidates."source" = 'direct'
+              AND locked_projects."project_id" = candidates."project_id"
+              AND event."epoch_version" = candidates."epoch_version"
             RETURNING 1
         ), deleted_broadcast_events AS (
-            DELETE FROM "m_workspace_broadcast_message_events_v1"
-            WHERE "created_at" < %s
+            DELETE FROM "m_workspace_broadcast_message_events_v1" AS event
+            USING candidates, locked_projects
+            WHERE candidates."source" = 'broadcast'
+              AND locked_projects."project_id" = candidates."project_id"
+              AND event."epoch_version" = candidates."epoch_version"
             RETURNING 1
         )
         SELECT
             (SELECT COUNT(*) FROM deleted_recipient_events)
             + (SELECT COUNT(*) FROM deleted_broadcast_events) AS "count"
         """,
-        (cutoff, cutoff),
+        (cutoff, cutoff, batch_size),
     ).fetchone()["count"]
     # Audience membership is immutable and shared. Remove it only after the
     # last referencing event has been pruned. First fold the final audience

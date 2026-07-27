@@ -173,11 +173,10 @@ def _upsert_provider_identity(
     user_values = {
         "first_name": values["display_name"],
         "email": values.get("email"),
-        "status": (
-            models.WorkspaceUserStatus.ACTIVE.value
-            if values["active"]
-            else models.WorkspaceUserStatus.OFFLINE.value
-        ),
+        # Provider directory "active" means enabled, not currently online.
+        # No provider presence capability exists in v1, so imported identities
+        # must not keep reviving the browser-presence state.
+        "status": models.WorkspaceUserStatus.OFFLINE.value,
     }
     avatar_urn = values.get("avatar_urn")
     if avatar_urn is not None:
@@ -696,7 +695,6 @@ def _read_state_event(
     topic_value = resource.get("topic_uuid")
     topic_uuid = None if topic_value is None else sys_uuid.UUID(str(topic_value))
     messages = []
-    existing_message_uuids = []
     for message_uuid in message_uuids:
         try:
             message = helpers.get_workspace_user_message(
@@ -710,21 +708,19 @@ def _read_state_event(
             # the later history upsert carries the provider's current read flag.
             continue
         messages.append(message)
-        existing_message_uuids.append(message_uuid)
     if any(
         message.stream_uuid != stream_uuid
         or (topic_uuid is not None and message.topic_uuid != topic_uuid)
         for message in messages
     ):
         raise ValueError("Provider read state message is outside the selected chat")
-    for message_uuid in existing_message_uuids:
-        helpers.sync_workspace_user_message_flags(
-            project_id,
-            reader_uuid,
-            message_uuid,
-            {"read": read},
-            session=session,
-        )
+    helpers.sync_workspace_user_messages_read_state(
+        project_id,
+        reader_uuid,
+        messages,
+        read,
+        session=session,
+    )
     return stream_uuid
 
 
