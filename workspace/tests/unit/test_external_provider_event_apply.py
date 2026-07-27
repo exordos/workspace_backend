@@ -851,6 +851,7 @@ def test_provider_reaction_echo_converges_on_native_reaction(monkeypatch):
         canonical_actor_uuid,
         native_reaction_uuid,
     )
+    assert updates[0][0][3]["message_uuid"] == message_uuid
     assert updates[0][1]["session"].statements == []
 
 
