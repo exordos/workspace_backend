@@ -295,8 +295,8 @@ def prune_expired_events(
         )
         SELECT
             audience."project_id", member."user_uuid",
-            audience."current_epoch_version",
-            audience."pruned_through_epoch_version"
+            MAX(audience."current_epoch_version"),
+            MAX(audience."pruned_through_epoch_version")
         FROM "m_workspace_event_audience_snapshots_v1" AS audience
         JOIN "m_workspace_event_audience_members_v1" AS member
           ON member."audience_snapshot_uuid" = audience."uuid"
@@ -305,6 +305,7 @@ def prune_expired_events(
             FROM "m_workspace_broadcast_message_events_v1" AS event
             WHERE event."audience_snapshot_uuid" = audience."uuid"
         )
+        GROUP BY audience."project_id", member."user_uuid"
         ON CONFLICT ("project_id", "user_uuid") DO UPDATE
         SET
             "current_epoch_version" = GREATEST(

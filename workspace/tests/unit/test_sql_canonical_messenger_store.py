@@ -1049,6 +1049,11 @@ def test_event_retention_advances_watermark_before_delete():
     assert "LIMIT %s" in statements[0][0]
     assert "WHERE NOT EXISTS" in statements[1][0]
     assert 'INSERT INTO "m_workspace_event_cursors"' in statements[1][0]
+    assert 'MAX(audience."current_epoch_version")' in statements[1][0]
+    assert 'MAX(audience."pruned_through_epoch_version")' in statements[1][0]
+    assert (
+        'GROUP BY audience."project_id", member."user_uuid"' in statements[1][0]
+    )
     assert 'DELETE FROM "m_workspace_event_audience_snapshots_v1"' in statements[2][0]
     assert "WHERE NOT EXISTS" in statements[2][0]
     assert statements[0][1] == (

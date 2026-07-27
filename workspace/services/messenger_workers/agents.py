@@ -71,27 +71,37 @@ class MessengerWorkerAgent(basic.BasicService):
 
     def _iteration(self) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
+        monotonic_now = time.monotonic()
+        prune_due = (
+            self._last_event_prune is None
+            or monotonic_now - self._last_event_prune
+            >= self._event_prune_interval_seconds
+        )
+        if prune_due:
+            # Pruning takes per-project advisory locks. Commit them before
+            # capability refresh locks external-account rows so concurrent
+            # message/provider writes cannot form a reverse lock-order cycle.
+            try:
+                with database_session_context() as session:
+                    pruned = self._prune_expired_events(session, now)
+            except Exception:
+                LOG.exception("Failed to prune expired Workspace event rows")
+            else:
+                self._last_event_prune = monotonic_now
+                if pruned:
+                    LOG.info("Pruned %d expired Workspace event rows", pruned)
         with database_session_context() as session:
             messenger_dm_helpers.mark_stale_workspace_users_offline(
                 session=session,
             )
             sql_state.refresh_effective_capabilities(session, now=now)
-            monotonic_now = time.monotonic()
-            if (
-                self._last_event_prune is None
-                or monotonic_now - self._last_event_prune
-                >= self._event_prune_interval_seconds
-            ):
-                pruned = self._prune_expired_events(session, now)
+            if prune_due:
                 pruned_heartbeats = sql_state.prune_expired_heartbeats(
                     session,
                     now,
                     retention=self._heartbeat_retention,
                     batch_size=self._event_prune_batch_size,
                 )
-                self._last_event_prune = monotonic_now
-                if pruned:
-                    LOG.info("Pruned %d expired Workspace event rows", pruned)
                 if pruned_heartbeats:
                     LOG.info(
                         "Pruned %d expired bridge heartbeat rows",
