@@ -31,6 +31,12 @@ EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID = "4a927983-57be-43d1-979e-cef820b86b2d"
 EXTERNAL_ACCOUNT_SCOPE_MIGRATION_FILE = (
     "0117-scope-external-projections-by-account-4a9279.py"
 )
+PUSH_DEVICE_MIGRATION_UUID = "5c4ae023-56c1-442c-b45a-8068c0c2fa68"
+PUSH_DEVICE_MIGRATION_FILE = "0118-add-push-devices-5c4ae0.py"
+DIRECTORY_VIEW_MIGRATION_UUID = "52ef9640-de45-456d-807e-4bb972bfcb33"
+DIRECTORY_VIEW_MIGRATION_FILE = (
+    "0119-add-canonical-Workspace-user-directory-view-52ef96.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -44,10 +50,10 @@ LEGACY_TABLES = (
 )
 
 
-def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, db):
+def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == EXTERNAL_ACCOUNT_SCOPE_MIGRATION_FILE
+    assert engine.get_latest_migration() == DIRECTORY_VIEW_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -58,6 +64,8 @@ def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, d
                     ZULIP_IDENTITY_MIGRATION_UUID,
                     IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID,
                     EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID,
+                    PUSH_DEVICE_MIGRATION_UUID,
+                    DIRECTORY_VIEW_MIGRATION_UUID,
                 ],
             ),
         )
@@ -67,9 +75,13 @@ def test_zulip_identity_reconciliation_is_the_single_migration_head(_database, d
             (ZULIP_IDENTITY_MIGRATION_UUID, True),
             (IDENTITY_RECONCILIATION_INDEX_MIGRATION_UUID, True),
             (EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID, True),
+            (PUSH_DEVICE_MIGRATION_UUID, True),
+            (DIRECTORY_VIEW_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
+        cur.execute("SELECT to_regclass('m_workspace_directory_users_v1')")
+        assert cur.fetchone()[0] == "m_workspace_directory_users_v1"
 
 
 def test_external_projection_access_is_scoped_to_account(

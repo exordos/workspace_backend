@@ -336,7 +336,12 @@ class SQLCanonicalReadStore:
         order_by: dict[str, str] | None = None,
         limit: int | None = None,
     ) -> list[dict[str, typing.Any]]:
-        rows = RESOURCE_MODELS[resource].objects.get_all(
+        model = (
+            models.WorkspaceDirectoryUser
+            if resource == "users"
+            else RESOURCE_MODELS[resource]
+        )
+        rows = model.objects.get_all(
             filters=self._scope_filters(resource, filters),
             order_by=order_by,
             limit=limit,

@@ -381,6 +381,12 @@ class WorkspaceUser(
         return workspace_user
 
 
+class WorkspaceDirectoryUser(WorkspaceUser):
+    """IAM users and realm-canonical external identities for directory reads."""
+
+    __tablename__ = "m_workspace_directory_users_v1"
+
+
 class WorkspaceFile(
     models.ModelWithUUID,
     models.ModelWithProject,
