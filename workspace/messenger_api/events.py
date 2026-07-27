@@ -1272,19 +1272,15 @@ def create_user_updated_events(
     recipient_user_uuids: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
-    result = []
     payload = _user_from_event_payload(user)
-    for recipient_user_uuid in recipient_user_uuids:
-        result.append(
-            _create_workspace_event(
-                project_id=project_id,
-                user_uuid=recipient_user_uuid,
-                kind=USER_UPDATED_EVENT,
-                payload=payload,
-                session=session,
-            )
-        )
-    return result
+    return create_broadcast_event(
+        project_id,
+        user.uuid,
+        recipient_user_uuids,
+        USER_UPDATED_EVENT,
+        payload,
+        session=session,
+    )
 
 
 def create_file_events(

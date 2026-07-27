@@ -30,7 +30,8 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.external_bridge_control import sql_state
 
 LOG = logging.getLogger(__name__)
-EVENT_PRUNE_INTERVAL_SECONDS = 3600
+EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
+HEARTBEAT_RETENTION = datetime.timedelta(hours=24)
 PROJECTION_REPAIR_LIMIT = 5
 
 
@@ -43,9 +44,17 @@ def database_session_context() -> typing.ContextManager[typing.Any]:
 class MessengerWorkerAgent(basic.BasicService):
     def __init__(
         self,
+        event_retention: datetime.timedelta = (sql_canonical_store.EVENT_RETENTION),
+        event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
+        event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
+        heartbeat_retention: datetime.timedelta = HEARTBEAT_RETENTION,
         **kwargs: typing.Any,
     ) -> None:
         super().__init__(**kwargs)
+        self._event_retention = event_retention
+        self._event_prune_interval_seconds = event_prune_interval_seconds
+        self._event_prune_batch_size = event_prune_batch_size
+        self._heartbeat_retention = heartbeat_retention
         self._last_event_prune: float | None = None
 
     def _prune_expired_events(
@@ -53,7 +62,12 @@ class MessengerWorkerAgent(basic.BasicService):
         session: typing.Any,
         now: datetime.datetime,
     ) -> int:
-        return sql_canonical_store.prune_expired_events(session, now)
+        return sql_canonical_store.prune_expired_events(
+            session,
+            now,
+            retention=self._event_retention,
+            batch_size=self._event_prune_batch_size,
+        )
 
     def _iteration(self) -> None:
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -66,12 +80,23 @@ class MessengerWorkerAgent(basic.BasicService):
             if (
                 self._last_event_prune is None
                 or monotonic_now - self._last_event_prune
-                >= EVENT_PRUNE_INTERVAL_SECONDS
+                >= self._event_prune_interval_seconds
             ):
                 pruned = self._prune_expired_events(session, now)
+                pruned_heartbeats = sql_state.prune_expired_heartbeats(
+                    session,
+                    now,
+                    retention=self._heartbeat_retention,
+                    batch_size=self._event_prune_batch_size,
+                )
                 self._last_event_prune = monotonic_now
                 if pruned:
                     LOG.info("Pruned %d expired Workspace event rows", pruned)
+                if pruned_heartbeats:
+                    LOG.info(
+                        "Pruned %d expired bridge heartbeat rows",
+                        pruned_heartbeats,
+                    )
             self._repair_external_projection_transitions(session)
 
     def _repair_external_projection_transitions(

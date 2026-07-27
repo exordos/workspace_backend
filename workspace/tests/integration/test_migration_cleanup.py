@@ -37,6 +37,8 @@ DIRECTORY_VIEW_MIGRATION_UUID = "52ef9640-de45-456d-807e-4bb972bfcb33"
 DIRECTORY_VIEW_MIGRATION_FILE = (
     "0119-add-canonical-Workspace-user-directory-view-52ef96.py"
 )
+RETENTION_MIGRATION_UUID = "ae5fdfd7-8767-45f7-8471-8448b5900782"
+RETENTION_MIGRATION_FILE = "0120-index-bounded-retention-cleanup-ae5fdf.py"
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -53,7 +55,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == DIRECTORY_VIEW_MIGRATION_FILE
+    assert engine.get_latest_migration() == RETENTION_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -66,6 +68,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID,
                     PUSH_DEVICE_MIGRATION_UUID,
                     DIRECTORY_VIEW_MIGRATION_UUID,
+                    RETENTION_MIGRATION_UUID,
                 ],
             ),
         )
@@ -77,11 +80,16 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID, True),
             (PUSH_DEVICE_MIGRATION_UUID, True),
             (DIRECTORY_VIEW_MIGRATION_UUID, True),
+            (RETENTION_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
         cur.execute("SELECT to_regclass('m_workspace_directory_users_v1')")
         assert cur.fetchone()[0] == "m_workspace_directory_users_v1"
+        cur.execute(
+            "SELECT to_regclass('m_external_bridge_heartbeats_v1_retention_idx')"
+        )
+        assert cur.fetchone()[0] == "m_external_bridge_heartbeats_v1_retention_idx"
 
 
 def test_external_projection_access_is_scoped_to_account(

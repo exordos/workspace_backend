@@ -21,9 +21,9 @@ also defines rebuild, recovery, scale, and load acceptance.
 - Provider runtimes exchange ordinary Messenger resources and commands through
   the private Workspace Provider API and never connect to the Workspace
   database.
-- Only event records are retained for seven days. Messages, files, streams,
-  topics, settings, and provider mappings remain canonical until their normal
-  lifecycle deletes them.
+- Only event records are retained for the configured interval, 72 hours by
+  default. Messages, files, streams, topics, settings, and provider mappings
+  remain canonical until their normal lifecycle deletes them.
 
 ## Test environment
 
@@ -102,7 +102,7 @@ also defines rebuild, recovery, scale, and load acceptance.
 | MSG-EVENT-004 | Compare REST and websocket representations for each epoch. | Parsed JSON objects are identical. |
 | MSG-EVENT-005 | Wait through idle intervals and protocol pings. | The connection remains healthy without JSON compatibility messages. |
 | MSG-EVENT-006 | Change IAM user or project while retaining an old cursor. | Client state and cursor are partitioned; no event crosses the IAM boundary. |
-| MSG-EVENT-007 | Start with a valid retained cursor and with a cursor older than the seven-day floor. | A retained suffix is returned gap-free; an expired cursor returns typed `epoch_pruned` so the client reloads authoritative PostgreSQL snapshots. |
+| MSG-EVENT-007 | Start with a valid retained cursor and with a cursor older than the configured retention floor. | A retained suffix is returned gap-free; an expired cursor returns typed `epoch_pruned` so the client reloads authoritative PostgreSQL snapshots. |
 
 ## Provider regression
 

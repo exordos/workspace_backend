@@ -53,7 +53,7 @@ TOPIC_NOTIFICATION_MODES = {
 MUTED_STREAM_TOPIC_NOTIFICATION_MODES = TOPIC_NOTIFICATION_MODES | {
     models.WorkspaceTopicNotificationMode.UNMUTE.value,
 }
-WORKSPACE_USER_OFFLINE_TIMEOUT = datetime.timedelta(minutes=1)
+WORKSPACE_USER_OFFLINE_TIMEOUT = datetime.timedelta(minutes=3)
 WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
     "status",
     "status_emoji",
@@ -78,11 +78,29 @@ def _ensure_color(values: dict[str, object]) -> None:
         values["color"] = _random_color()
 
 
-def _get_workspace_user_event_recipients() -> typing.Any:
-    users = models.WorkspaceUser.objects.get_all(
-        order_by={"uuid": "asc"},
-    )
-    return [user.uuid for user in users]
+def _get_workspace_user_event_recipients(
+    project_id: object,
+    session: typing.Any = None,
+) -> typing.Any:
+    """Return users with materialized state in this project."""
+    with _workspace_session(session) as current_session:
+        rows = current_session.execute(
+            """
+            SELECT DISTINCT project_users.user_uuid
+            FROM (
+                SELECT user_uuid
+                FROM m_workspace_stream_bindings
+                WHERE project_id = %s
+                UNION
+                SELECT user_uuid
+                FROM m_folders
+                WHERE project_id = %s
+            ) AS project_users
+            ORDER BY project_users.user_uuid
+            """,
+            (project_id, project_id),
+        ).fetchall()
+    return [row["user_uuid"] for row in rows]
 
 
 def _get_workspace_event_project_ids() -> typing.Any:
@@ -95,7 +113,10 @@ def _get_workspace_event_project_ids() -> typing.Any:
 def _create_workspace_user_updated_events(
     project_id: object, user: typing.Any, session: typing.Any = None
 ) -> typing.Any:
-    recipient_user_uuids = _get_workspace_user_event_recipients()
+    recipient_user_uuids = _get_workspace_user_event_recipients(
+        project_id,
+        session=session,
+    )
     return messenger_events.create_user_updated_events(
         user=user,
         project_id=project_id,
@@ -107,6 +128,7 @@ def _create_workspace_user_updated_events(
 def _get_stale_workspace_users(cutoff: typing.Any) -> typing.Any:
     return models.WorkspaceUser.objects.get_all(
         filters=dm_filters.AND(
+            {"source": dm_filters.EQ(models.WorkspaceUserSource.IAM.value)},
             {"status": dm_filters.NE(models.WorkspaceUserStatus.OFFLINE.value)},
             {"last_ping_at": dm_filters.LE(cutoff)},
         ),
@@ -3589,6 +3611,71 @@ def sync_workspace_user_message_flags(
             session=session,
         )
     return result
+
+
+def sync_workspace_user_messages_read_state(
+    project_id: object,
+    user_uuid: object,
+    messages: typing.Any,
+    read: bool,
+    session: typing.Any = None,
+) -> typing.Any:
+    """Apply one provider read-state batch and emit bounded public events."""
+    changed_messages = []
+    topic_uuids_by_stream: dict[object, list[object]] = {}
+    for current_message in messages:
+        effective_read = (
+            read or getattr(current_message, "author_uuid", None) == user_uuid
+        )
+        flags = models.WorkspaceUserMessageFlags.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(current_message.uuid),
+                "project_id": dm_filters.EQ(project_id),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+            session=session,
+        )
+        if flags.read == effective_read:
+            continue
+        flags.update_dm(values={"read": effective_read})
+        flags.update(session=session)
+        changed_message = get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=current_message.uuid,
+        )
+        changed_messages.append(changed_message)
+        topic_uuids = topic_uuids_by_stream.setdefault(
+            current_message.stream_uuid,
+            [],
+        )
+        if current_message.topic_uuid not in topic_uuids:
+            topic_uuids.append(current_message.topic_uuid)
+
+    if not changed_messages:
+        return changed_messages
+    if read:
+        messenger_events.create_messages_read_event(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuids=[message.uuid for message in changed_messages],
+            session=session,
+        )
+    else:
+        for message in changed_messages:
+            messenger_events.create_message_updated_event(
+                message=message,
+                session=session,
+            )
+    for stream_uuid, topic_uuids in topic_uuids_by_stream.items():
+        _create_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=topic_uuids,
+            session=session,
+        )
+    return changed_messages
 
 
 def delete_workspace_user_message(

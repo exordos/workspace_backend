@@ -42,6 +42,7 @@ from workspace.common import external_bridge_opts
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import controllers as messenger_controllers
+from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
@@ -1104,7 +1105,7 @@ def test_own_message_read_backfill_migration(api, db):
     }
 
 
-def test_user_presence_action_updates_current_user_presence(api, db):
+def test_user_presence_action_updates_current_user_presence(api, workspace_api, db):
     username = f"user-{api.user_uuid}"
     event_recipient_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, api.user_uuid, username)
@@ -1112,6 +1113,18 @@ def test_user_presence_action_updates_current_user_presence(api, db):
         db,
         event_recipient_uuid,
         f"user-{event_recipient_uuid}",
+    )
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "presence-team",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        event_recipient_uuid,
     )
 
     resp = api.post(
@@ -1152,7 +1165,7 @@ def test_user_presence_action_updates_current_user_presence(api, db):
         cur.execute(
             """
             SELECT user_uuid, payload
-            FROM m_workspace_events
+            FROM m_workspace_visible_events
             WHERE project_id = %s
                 AND payload->>'kind' = 'user.updated'
                 AND payload->>'uuid' = %s
@@ -1173,6 +1186,41 @@ def test_user_presence_action_updates_current_user_presence(api, db):
         assert payload["status_emoji"] == "coffee"
         assert payload["status_text"] == "Focusing"
         assert payload["last_ping_at"] is not None
+        assert "user_uuid" not in payload
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM m_workspace_events
+                 WHERE project_id = %s
+                   AND payload->>'kind' = 'user.updated'),
+                (SELECT count(*) FROM m_workspace_broadcast_message_events_v1
+                 WHERE project_id = %s
+                   AND payload->>'kind' = 'user.updated')
+            """,
+            (api.project_id, api.project_id),
+        )
+        direct_count, broadcast_count = cur.fetchone()
+    assert direct_count == 0
+    assert broadcast_count == 1
+
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    events_resp = workspace_api.get(EVENTS, params={"page_limit": 100})
+    assert events_resp.status_code == 200, events_resp.text
+    public_events = [
+        event
+        for event in events_resp.json()
+        if event["payload"]["kind"] == "user.updated"
+    ]
+    assert len(public_events) == 1
+    assert public_events[0]["payload"] == {
+        "kind": "user.updated",
+        "first_name": None,
+        "last_name": None,
+        "email": None,
+        **user,
+    }
 
     resp = api.post(
         f"{USERS}{api.user_uuid}/actions/presence/invoke",
@@ -1238,9 +1286,7 @@ def test_user_directory_keeps_only_canonical_provider_identities(api, db):
                 (
                     str(user_uuid),
                     username,
-                    messenger_models.build_workspace_user_default_avatar(
-                        user_uuid
-                    ),
+                    messenger_models.build_workspace_user_default_avatar(user_uuid),
                     str(account_uuid),
                     provider_user_id,
                 ),
@@ -1422,6 +1468,7 @@ def test_avatar_actions_reject_another_user_uuid(api, db, tmp_path, monkeypatch)
 def test_user_presence_action_skips_event_for_heartbeat(api, db):
     username = f"user-{api.user_uuid}"
     conftest.seed_workspace_user(db, api.user_uuid, username)
+    conftest.seed_user_stream(db, api.project_id, api.user_uuid, "heartbeat-team")
     heartbeat_api = conftest.ApiClient(
         base_url=api.base_url,
         user_uuid=api.user_uuid,
@@ -1437,17 +1484,21 @@ def test_user_presence_action_skips_event_for_heartbeat(api, db):
     with db.cursor() as cur:
         cur.execute(
             """
-            SELECT count(*), max(last_ping_at)
-            FROM m_workspace_events AS events
-            JOIN m_workspace_users AS users
-                ON users.uuid = %s
+            SELECT count(*)
+            FROM m_workspace_visible_events AS events
             WHERE events.project_id = %s
+                AND events.user_uuid = %s
                 AND events.payload->>'kind' = 'user.updated'
                 AND events.payload->>'uuid' = %s
             """,
-            (str(api.user_uuid), api.project_id, str(api.user_uuid)),
+            (api.project_id, str(api.user_uuid), str(api.user_uuid)),
         )
-        first_event_count, first_ping_at = cur.fetchone()
+        first_event_count = cur.fetchone()[0]
+        cur.execute(
+            "SELECT last_ping_at FROM m_workspace_users WHERE uuid = %s",
+            (str(api.user_uuid),),
+        )
+        first_ping_at = cur.fetchone()[0]
 
     resp = heartbeat_api.post(
         f"{USERS}{api.user_uuid}/actions/presence/invoke",
@@ -1458,17 +1509,21 @@ def test_user_presence_action_skips_event_for_heartbeat(api, db):
     with db.cursor() as cur:
         cur.execute(
             """
-            SELECT count(*), max(last_ping_at)
-            FROM m_workspace_events AS events
-            JOIN m_workspace_users AS users
-                ON users.uuid = %s
+            SELECT count(*)
+            FROM m_workspace_visible_events AS events
             WHERE events.project_id = %s
+                AND events.user_uuid = %s
                 AND events.payload->>'kind' = 'user.updated'
                 AND events.payload->>'uuid' = %s
             """,
-            (str(api.user_uuid), api.project_id, str(api.user_uuid)),
+            (api.project_id, str(api.user_uuid), str(api.user_uuid)),
         )
-        second_event_count, second_ping_at = cur.fetchone()
+        second_event_count = cur.fetchone()[0]
+        cur.execute(
+            "SELECT last_ping_at FROM m_workspace_users WHERE uuid = %s",
+            (str(api.user_uuid),),
+        )
+        second_ping_at = cur.fetchone()[0]
 
     assert second_event_count == first_event_count
     assert second_ping_at >= first_ping_at
@@ -1484,14 +1539,25 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
         event_recipient_uuid,
         f"user-{event_recipient_uuid}",
     )
-    conftest.seed_user_stream(db, api.project_id, api.user_uuid, "status-team")
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "status-team",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        event_recipient_uuid,
+    )
 
     with db.cursor() as cur:
         cur.execute(
             """
             UPDATE m_workspace_users
             SET status = 'active',
-                last_ping_at = NOW() - INTERVAL '2 minutes'
+                last_ping_at = NOW() - INTERVAL '4 minutes'
             WHERE uuid = %s
             """,
             (str(user_uuid),),
@@ -1520,7 +1586,7 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
         cur.execute(
             """
             SELECT user_uuid, payload
-            FROM m_workspace_events
+            FROM m_workspace_visible_events
             WHERE project_id = %s
                 AND payload->>'kind' = 'user.updated'
                 AND payload->>'uuid' = %s
@@ -1530,7 +1596,8 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
         )
         event_rows = cur.fetchall()
     event_recipient_uuids = {str(row[0]) for row in event_rows}
-    assert str(user_uuid) in event_recipient_uuids
+    assert str(user_uuid) not in event_recipient_uuids
+    assert str(api.user_uuid) in event_recipient_uuids
     assert str(event_recipient_uuid) in event_recipient_uuids
     for _, payload in event_rows:
         assert payload["username"] == username
@@ -1546,7 +1613,7 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
         cur.execute(
             """
             SELECT count(*)
-            FROM m_workspace_events
+            FROM m_workspace_visible_events
             WHERE project_id = %s
                 AND payload->>'kind' = 'user.updated'
                 AND payload->>'uuid' = %s
@@ -1569,6 +1636,124 @@ def test_user_status_is_offline_when_last_ping_is_stale(api, db):
     resp = api.get(f"{USERS}{user_uuid}")
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "do_not_disturb"
+
+
+def test_event_retention_prunes_one_cross_table_batch_with_watermarks(api, db):
+    conftest.seed_workspace_user(
+        db,
+        api.user_uuid,
+        f"user-{api.user_uuid}",
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    direct_event_uuid = sys_uuid.uuid4()
+    broadcast_event_uuid = sys_uuid.uuid4()
+
+    def seed_and_prune(session):
+        direct_epoch = session.execute(
+            """
+            INSERT INTO m_workspace_events (
+                uuid, project_id, user_uuid, schema_version,
+                object_type, action, payload, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, 1, 'user', 'updated', %s::jsonb, %s, %s
+            )
+            RETURNING epoch_version
+            """,
+            (
+                direct_event_uuid,
+                api.project_id,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "user.updated",
+                        "uuid": str(api.user_uuid),
+                    }
+                ),
+                now - datetime.timedelta(days=4, minutes=1),
+                now - datetime.timedelta(days=4, minutes=1),
+            ),
+        ).fetchone()["epoch_version"]
+        broadcast_epoch = messenger_events.create_broadcast_event(
+            api.project_id,
+            api.user_uuid,
+            [api.user_uuid],
+            messenger_events.USER_UPDATED_EVENT,
+            {"uuid": str(api.user_uuid)},
+            session=session,
+            event_uuid=broadcast_event_uuid,
+            created_at=now - datetime.timedelta(days=4),
+        )[0]
+        pruned = sql_canonical_store.prune_expired_events(
+            session,
+            now,
+            retention=datetime.timedelta(days=3),
+            batch_size=1,
+        )
+        return direct_epoch, broadcast_epoch, pruned
+
+    direct_epoch, broadcast_epoch, first_pruned = _run_database_operation(
+        seed_and_prune
+    )
+    assert first_pruned == 1
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                EXISTS(
+                    SELECT 1 FROM m_workspace_events WHERE uuid = %s
+                ),
+                EXISTS(
+                    SELECT 1
+                    FROM m_workspace_broadcast_message_events_v1
+                    WHERE uuid = %s
+                ),
+                (
+                    SELECT pruned_through_epoch_version
+                    FROM m_workspace_event_cursors
+                    WHERE project_id = %s AND user_uuid = %s
+                )
+            """,
+            (
+                direct_event_uuid,
+                broadcast_event_uuid,
+                api.project_id,
+                api.user_uuid,
+            ),
+        )
+        direct_exists, broadcast_exists, pruned_through = cur.fetchone()
+    assert direct_exists is False
+    assert broadcast_exists is True
+    assert pruned_through >= direct_epoch
+
+    second_pruned = _run_database_operation(
+        lambda session: sql_canonical_store.prune_expired_events(
+            session,
+            now,
+            retention=datetime.timedelta(days=3),
+            batch_size=1,
+        )
+    )
+    assert second_pruned == 1
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                EXISTS(
+                    SELECT 1
+                    FROM m_workspace_broadcast_message_events_v1
+                    WHERE uuid = %s
+                ),
+                (
+                    SELECT pruned_through_epoch_version
+                    FROM m_workspace_event_cursors
+                    WHERE project_id = %s AND user_uuid = %s
+                )
+            """,
+            (broadcast_event_uuid, api.project_id, api.user_uuid),
+        )
+        broadcast_exists, pruned_through = cur.fetchone()
+    assert broadcast_exists is False
+    assert pruned_through >= broadcast_epoch
 
 
 def test_workspace_event_payload_identity_backfill_migration(_database, db):

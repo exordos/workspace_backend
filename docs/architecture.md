@@ -142,10 +142,11 @@ event object. PostgreSQL maintains the generation and monotonic epoch cursor.
 Clients persist `(epoch_generation, epoch_version)`, deduplicate by that cursor,
 and apply both transports through one dispatcher.
 
-Only event rows are subject to the seven-day retention policy. Messages and
-other canonical resources are not removed when old events are pruned. A cursor
-outside the retained suffix receives the typed `epoch_pruned` response and the
-client reloads authoritative snapshots before resuming realtime updates.
+Only event rows are subject to the configurable retention policy, which
+defaults to 72 hours. Messages and other canonical resources are not removed
+when old events are pruned. A cursor outside the retained suffix receives the
+typed `epoch_pruned` response and the client reloads authoritative snapshots
+before resuming realtime updates.
 
 ## Persistence and recovery
 

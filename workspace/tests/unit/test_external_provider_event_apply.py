@@ -151,6 +151,7 @@ def test_identity_upsert_materializes_user_without_stream_binding(monkeypatch):
     )
     assert created[0].provider_external_id == "42"
     assert created[0].first_name == "Former User"
+    assert created[0].status == "offline"
     assert created[0].insert_session is session
 
 
@@ -1178,15 +1179,17 @@ def test_provider_read_state_updates_exact_owner_messages(monkeypatch):
     updates = []
     monkeypatch.setattr(
         provider_event_apply.helpers,
-        "sync_workspace_user_message_flags",
+        "sync_workspace_user_messages_read_state",
         lambda *args, **kwargs: updates.append((args, kwargs)),
     )
 
     assert provider_event_apply.apply_event(event, session, identity) == stream_uuid
-    assert [args[2] for args, _kwargs in updates] == message_uuids
-    assert all(args[0:2] == (project_uuid, owner_uuid) for args, _kwargs in updates)
-    assert all(args[3] == {"read": True} for args, _kwargs in updates)
-    assert all(kwargs == {"session": session} for _args, kwargs in updates)
+    assert updates == [
+        (
+            (project_uuid, owner_uuid, list(messages.values()), True),
+            {"session": session},
+        )
+    ]
     lock_statement, lock_params = session.statements[1]
     assert "pg_advisory_xact_lock" in lock_statement
     assert lock_params == (project_uuid,)
@@ -1287,12 +1290,16 @@ def test_provider_read_state_defers_messages_not_yet_imported(monkeypatch):
     updates = []
     monkeypatch.setattr(
         provider_event_apply.helpers,
-        "sync_workspace_user_message_flags",
+        "sync_workspace_user_messages_read_state",
         lambda *args, **kwargs: updates.append((args, kwargs)),
     )
 
     assert provider_event_apply.apply_event(event, session, identity) == stream_uuid
-    assert [args[2] for args, _kwargs in updates] == [imported_uuid]
+    assert len(updates) == 1
+    assert updates[0][0][0:2] == (project_uuid, owner_uuid)
+    assert [message.uuid for message in updates[0][0][2]] == [imported_uuid]
+    assert updates[0][0][3] is True
+    assert updates[0][1] == {"session": session}
 
 
 def test_message_update_uses_compact_broadcast_path(monkeypatch):

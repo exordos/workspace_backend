@@ -390,6 +390,13 @@ resources:
           poll_interval = 3
 
 
+          [messenger_worker_agent]
+          event_retention_seconds = 259200
+          event_prune_interval_seconds = 300
+          event_prune_batch_size = 25000
+          heartbeat_retention_seconds = 86400
+
+
           [messenger_files]
           default_type = s3
           storage_path = /var/lib/workspace/messenger/files

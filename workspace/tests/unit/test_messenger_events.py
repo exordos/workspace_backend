@@ -1052,6 +1052,37 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_event["payload"]["message_uuids"],
         )
 
+    def test_user_updated_event_uses_one_broadcast_without_payload_change(self):
+        project_id = sys_uuid.uuid4()
+        recipient_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+        user = models.WorkspaceUser(
+            uuid=sys_uuid.uuid4(),
+            username="project-user",
+        )
+        session = object()
+
+        with mock.patch.object(
+            events,
+            "create_broadcast_event",
+            return_value=[71],
+        ) as create:
+            result = events.create_user_updated_events(
+                user,
+                project_id,
+                recipient_uuids,
+                session=session,
+            )
+
+        self.assertEqual([71], result)
+        args = create.call_args.args
+        self.assertEqual(project_id, args[0])
+        self.assertEqual(user.uuid, args[1])
+        self.assertEqual(recipient_uuids, args[2])
+        self.assertEqual(events.USER_UPDATED_EVENT, args[3])
+        self.assertNotIn("user_uuid", args[4])
+        self.assertEqual(str(user.uuid), args[4]["uuid"])
+        self.assertIs(session, create.call_args.kwargs["session"])
+
     def test_create_folder_stream_topic_and_read_events_use_flat_payload(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
