@@ -617,6 +617,7 @@ def _reaction_event(
         resource,
         {"emoji_name", "message_uuid", "uuid"},
     )
+    values["message_uuid"] = message_uuid
     if existing is None:
         values.update({"uuid": reaction_uuid, "message_uuid": message_uuid})
         helpers.create_workspace_message_reaction(
