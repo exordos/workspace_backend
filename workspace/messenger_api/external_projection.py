@@ -15,6 +15,207 @@ from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
 
 
+_DIRECT_PROVIDER_TOPIC_NAMESPACE = sys_uuid.UUID("4d1de6f0-5f93-58ad-9670-6a13754cb7aa")
+
+
+def provider_topic_name(provider_kind: str) -> str:
+    """Return the user-facing topic name for a provider projection."""
+    return provider_kind.replace("_", " ").title()
+
+
+def is_native_direct_projection(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
+) -> bool:
+    """Return whether a projection points at a canonical native direct chat."""
+    row = session.execute(
+        """
+        SELECT private_index
+        FROM m_workspace_streams
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (project_id, stream_uuid),
+    ).fetchone()
+    return row is not None and row["private_index"] is not None
+
+
+def reconcile_personal_chat_projection(
+    session: typing.Any,
+    *,
+    project_id: sys_uuid.UUID,
+    provider_kind: str,
+    source: collections.abc.Mapping[str, typing.Any],
+    projection_stream_uuid: sys_uuid.UUID,
+) -> tuple[sys_uuid.UUID, dict[str, typing.Any], bool]:
+    """Merge a verified provider DM into an existing native direct chat."""
+    normalized_source = dict(source)
+    normalized_source["participants"] = [
+        dict(participant) for participant in source.get("participants", [])
+    ]
+    normalized_source["topics"] = [dict(topic) for topic in source.get("topics", [])]
+    if (
+        source.get("chat_type") != "personal"
+        or len(normalized_source["participants"]) != 2
+        or len(normalized_source["topics"]) != 1
+    ):
+        return projection_stream_uuid, normalized_source, False
+
+    participant_uuids = [
+        sys_uuid.UUID(str(participant["identity_uuid"]))
+        for participant in normalized_source["participants"]
+    ]
+    verified_count = session.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM m_workspace_users
+        WHERE uuid = ANY(%s) AND source = 'iam'
+        """,
+        (participant_uuids,),
+    ).fetchone()["count"]
+    if verified_count != 2:
+        return projection_stream_uuid, normalized_source, False
+
+    private_index = helpers.build_private_stream_index(*participant_uuids)
+    target = session.execute(
+        """
+        SELECT uuid
+        FROM m_workspace_streams
+        WHERE project_id = %s AND private_index = %s
+        FOR UPDATE
+        """,
+        (project_id, private_index),
+    ).fetchone()
+    if target is None:
+        return projection_stream_uuid, normalized_source, False
+
+    target_stream_uuid = sys_uuid.UUID(str(target["uuid"]))
+    topic_name = provider_topic_name(provider_kind)
+    topic = session.execute(
+        """
+        SELECT uuid
+        FROM m_workspace_stream_topics
+        WHERE project_id = %s AND stream_uuid = %s
+          AND LOWER(name) = LOWER(%s)
+        ORDER BY created_at, uuid
+        LIMIT 1
+        FOR UPDATE
+        """,
+        (project_id, target_stream_uuid, topic_name),
+    ).fetchone()
+    target_topic_uuid = (
+        sys_uuid.UUID(str(topic["uuid"]))
+        if topic is not None
+        else sys_uuid.uuid5(
+            _DIRECT_PROVIDER_TOPIC_NAMESPACE,
+            f"{target_stream_uuid}:{provider_kind}",
+        )
+    )
+    session.execute(
+        """
+        INSERT INTO m_workspace_stream_topics (
+            uuid, project_id, name, stream_uuid
+        ) VALUES (%s, %s, %s, %s)
+        ON CONFLICT (uuid) DO UPDATE
+        SET name = EXCLUDED.name,
+            updated_at = NOW()
+        WHERE m_workspace_stream_topics.project_id = EXCLUDED.project_id
+          AND m_workspace_stream_topics.stream_uuid = EXCLUDED.stream_uuid
+        """,
+        (target_topic_uuid, project_id, topic_name, target_stream_uuid),
+    )
+    provider_topic = normalized_source["topics"][0]
+    old_topic_uuid = sys_uuid.UUID(str(provider_topic["topic_uuid"]))
+    provider_topic["topic_uuid"] = str(target_topic_uuid)
+    provider_topic["name"] = topic_name
+
+    changed = target_stream_uuid != projection_stream_uuid
+    if changed:
+        source_stream = session.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            FOR UPDATE
+            """,
+            (project_id, projection_stream_uuid),
+        ).fetchone()
+        if source_stream is not None:
+            session.execute(
+                """
+                UPDATE m_workspace_messages
+                SET stream_uuid = %s, topic_uuid = %s, updated_at = NOW()
+                WHERE project_id = %s AND stream_uuid = %s
+                """,
+                (
+                    target_stream_uuid,
+                    target_topic_uuid,
+                    project_id,
+                    projection_stream_uuid,
+                ),
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_drafts
+                SET stream_uuid = %s, topic_uuid = %s, updated_at = NOW()
+                WHERE project_id = %s AND stream_uuid = %s
+                """,
+                (
+                    target_stream_uuid,
+                    target_topic_uuid,
+                    project_id,
+                    projection_stream_uuid,
+                ),
+            )
+            session.execute(
+                """
+                INSERT INTO m_workspace_user_topic_flags (
+                    uuid, user_uuid, project_id, is_done, notification_mode,
+                    created_at, updated_at
+                )
+                SELECT
+                    %s, user_uuid, project_id, is_done, notification_mode,
+                    created_at, updated_at
+                FROM m_workspace_user_topic_flags
+                WHERE project_id = %s AND uuid = %s
+                ON CONFLICT (uuid, user_uuid) DO UPDATE
+                SET is_done = (
+                        m_workspace_user_topic_flags.is_done
+                        OR EXCLUDED.is_done
+                    ),
+                    notification_mode = CASE
+                        WHEN m_workspace_user_topic_flags.notification_mode = 'default'
+                        THEN EXCLUDED.notification_mode
+                        ELSE m_workspace_user_topic_flags.notification_mode
+                    END,
+                    updated_at = GREATEST(
+                        m_workspace_user_topic_flags.updated_at,
+                        EXCLUDED.updated_at
+                    )
+                """,
+                (target_topic_uuid, project_id, old_topic_uuid),
+            )
+            # Keep the carrier row for provider file sidecars, but remove it
+            # from every chat list after its messages have moved.
+            session.execute(
+                """
+                UPDATE m_workspace_streams
+                SET is_archived = TRUE, updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (project_id, projection_stream_uuid),
+            )
+    session.execute(
+        """
+        UPDATE m_workspace_streams
+        SET is_archived = FALSE, updated_at = NOW()
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (project_id, target_stream_uuid),
+    )
+    return target_stream_uuid, normalized_source, changed
+
+
 def _workspace_source(
     provider_kind: str,
     provider_chat_id: str,
@@ -103,12 +304,22 @@ def ensure_external_chat_stream(
                 "capabilities": dict(capabilities),
             },
         )
-    elif stream.user_uuid != owner_user_uuid:
-        raise ValueError("Provider stream projection owner does not match assignment")
     participants = {
         sys_uuid.UUID(str(participant["identity_uuid"])): participant["role"]
         for participant in source["participants"]
     }
+    if stream is not None and getattr(stream, "private_index", None) is not None:
+        if (
+            len(participants) != 2
+            or stream.private_index
+            != helpers.build_private_stream_index(*participants)
+        ):
+            raise ValueError(
+                "Native direct stream participants do not match assignment"
+            )
+        return
+    if stream is not None and stream.user_uuid != owner_user_uuid:
+        raise ValueError("Provider stream projection owner does not match assignment")
     users = {
         user.uuid: user
         for user in models.WorkspaceUser.objects.get_all(

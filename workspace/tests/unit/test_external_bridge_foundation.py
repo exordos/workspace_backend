@@ -661,6 +661,11 @@ def test_external_account_delete_purges_projection_and_copied_files(monkeypatch)
         lambda *args, **kwargs: journaled.append((args, kwargs)),
     )
     monkeypatch.setattr(
+        controllers.external_projection,
+        "is_native_direct_projection",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
         controllers.sql_state,
         "append_delete",
         lambda *args: desired_deletes.append(args[3:]),

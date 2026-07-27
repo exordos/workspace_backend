@@ -41,6 +41,399 @@ def _request_call(callable_, *args, **kwargs):
         return callable_(*args, **kwargs)
 
 
+def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
+    _database,
+    db,
+):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    peer_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    native_stream_uuid = sys_uuid.uuid4()
+    native_topic_uuid = sys_uuid.uuid4()
+    provider_stream_uuid = sql_state.external_chat_projection_stream_uuid(chat_uuid)
+    provider_topic_uuid = sql_state._projection_uuid(
+        chat_uuid,
+        "topic",
+        "direct:7,8:default",
+    )
+    message_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, "merge-owner")
+    conftest.seed_workspace_user(db, peer_uuid, "merge-peer")
+    settings = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.test",
+        "selection_mode": "all",
+        "history_depth": "30_days",
+        "default_project_id": str(project_uuid),
+    }
+    private_index = ":".join(sorted((str(owner_uuid), str(peer_uuid))))
+    existing_source = {
+        "kind": "zulip",
+        "provider_realm_uuid": str(realm_uuid),
+        "provider_owner_user_id": "7",
+        "chat_type": "personal",
+        "description": "",
+        "participants": [
+            {
+                "identity_uuid": str(owner_uuid),
+                "provider_user_id": "7",
+                "display_name": "Owner",
+                "email": "owner@example.test",
+                "avatar_urn": None,
+                "role": "owner",
+            },
+            {
+                "identity_uuid": str(peer_uuid),
+                "provider_user_id": "8",
+                "display_name": "Peer",
+                "email": "peer@example.test",
+                "avatar_urn": None,
+                "role": "member",
+            },
+        ],
+        "topics": [
+            {
+                "topic_uuid": str(provider_topic_uuid),
+                "provider_topic_id": "direct:7,8:default",
+                "name": "default",
+                "is_default": True,
+            }
+        ],
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2
+                (uuid, provider, identity_generation, status)
+            VALUES (%s, 'zulip', 1, 'active')
+            """,
+            (instance_uuid,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings, desired_generation
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, 1)
+            """,
+            (account_uuid, owner_uuid, sql_state._json(settings)),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_policies_v1
+                (uuid, provider, enabled, limits)
+            VALUES (%s, 'zulip', TRUE,
+                    '{"max_selected_chats_per_account":10}'::jsonb)
+            """,
+            (sys_uuid.uuid4(),),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_identity_links_v1 (
+                provider, provider_realm_uuid, provider_user_id,
+                workspace_user_uuid, link_kind
+            ) VALUES ('zulip', %s, '8', %s, 'provider_identity')
+            """,
+            (realm_uuid, peer_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_streams (
+                uuid, name, description, source_name, source, user_uuid,
+                project_id, private, invite_only, direct_user_uuid,
+                private_index
+            ) VALUES (
+                %s, 'Peer', '', 'native', '{"kind":"native"}'::jsonb, %s,
+                %s, TRUE, TRUE, %s, %s
+            )
+            """,
+            (
+                native_stream_uuid,
+                owner_uuid,
+                project_uuid,
+                peer_uuid,
+                private_index,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, name, stream_uuid
+            ) VALUES (%s, %s, 'General Topic', %s)
+            """,
+            (native_topic_uuid, project_uuid, native_stream_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET default_topic_uuid = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (native_topic_uuid, project_uuid, native_stream_uuid),
+        )
+        for user_uuid in (owner_uuid, peer_uuid):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_stream_bindings (
+                    uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+                ) VALUES (%s, %s, %s, %s, %s, 'owner')
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    native_stream_uuid,
+                    user_uuid,
+                    owner_uuid,
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_streams (
+                uuid, name, description, source_name, source, user_uuid,
+                project_id, private, invite_only, external_account_uuid,
+                provider_external_id
+            ) VALUES (
+                %s, 'Peer', '', 'zulip',
+                %s::jsonb, %s, %s, TRUE, TRUE, %s, 'direct:7,8'
+            )
+            """,
+            (
+                provider_stream_uuid,
+                sql_state._json(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 0,
+                        "server_url": settings["server_url"],
+                        "source_scope": str(account_uuid),
+                    }
+                ),
+                owner_uuid,
+                project_uuid,
+                account_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, name, stream_uuid
+            ) VALUES (%s, %s, 'default', %s)
+            """,
+            (provider_topic_uuid, project_uuid, provider_stream_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET default_topic_uuid = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (provider_topic_uuid, project_uuid, provider_stream_uuid),
+        )
+        for user_uuid in (owner_uuid, peer_uuid):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_stream_bindings (
+                    uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+                ) VALUES (%s, %s, %s, %s, %s, 'member')
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    provider_stream_uuid,
+                    user_uuid,
+                    owner_uuid,
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload,
+                external_account_uuid, provider_external_id
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"provider history"}'::jsonb,
+                %s, '123'
+            )
+            """,
+            (
+                message_uuid,
+                project_uuid,
+                provider_stream_uuid,
+                provider_topic_uuid,
+                peer_uuid,
+                account_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'direct:7,8', %s::jsonb, 'Peer',
+                TRUE, %s, %s, 'syncing'
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                owner_uuid,
+                sql_state._json(existing_source),
+                project_uuid,
+                provider_stream_uuid,
+            ),
+        )
+
+    repository = sql_state.SQLControlState(realm_uuid, b"k" * 32)
+    identity = _identity(instance_uuid, realm_uuid)
+    with engines.engine_factory.get_engine().session_manager() as session:
+        sql_state.append_upsert(
+            session,
+            instance_uuid,
+            "zulip",
+            {
+                "resource_type": "external_account",
+                "uuid": str(account_uuid),
+                "generation": 1,
+            },
+        )
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    report = {
+        "report_uuid": str(sys_uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(chat_uuid),
+        "observed_generation": 1,
+        "status": "ready",
+        "progress": {
+            "phase": "discovery",
+            "completed": 1,
+            "total": 1,
+            "last_progress_at": observed_at,
+        },
+        "safe_error": None,
+        "observed_at": observed_at,
+        "catalog": {
+            "operation": "upsert",
+            "external_account_uuid": str(account_uuid),
+            "owner_user_uuid": str(owner_uuid),
+            "provider_kind": "zulip",
+            "project_id": str(project_uuid),
+            "source": {
+                "kind": "zulip",
+                "chat_type": "direct",
+                "provider_chat_key": "direct:7,8",
+                "provider_realm_uuid": str(realm_uuid),
+                "provider_owner_user_id": "7",
+            },
+            "display_name": "Peer",
+            "description": "",
+            "participants": [
+                {
+                    "provider_user_id": "7",
+                    "display_name": "Owner",
+                    "email": "owner@example.test",
+                    "avatar_urn": None,
+                    "is_owner": True,
+                },
+                {
+                    "provider_user_id": "8",
+                    "display_name": "Peer",
+                    "email": "peer@example.test",
+                    "avatar_urn": None,
+                    "is_owner": False,
+                },
+            ],
+            "topics": [
+                {
+                    "provider_topic_id": "direct:7,8:default",
+                    "name": "default",
+                    "is_default": True,
+                }
+            ],
+            "capabilities": {"messenger.message.send": {"available": True}},
+        },
+    }
+    result = _request_call(repository.observed_reports, identity, [report])
+    assert result["results"][0]["status"] == "applied"
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT projection_stream_uuid, source
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        projection_stream_uuid, source = cursor.fetchone()
+        assert projection_stream_uuid == native_stream_uuid
+        assert source["topics"] == [
+            {
+                "topic_uuid": source["topics"][0]["topic_uuid"],
+                "provider_topic_id": "direct:7,8:default",
+                "name": "Zulip",
+                "is_default": True,
+            }
+        ]
+        zulip_topic_uuid = sys_uuid.UUID(source["topics"][0]["topic_uuid"])
+        cursor.execute(
+            """
+            SELECT stream_uuid, topic_uuid
+            FROM m_workspace_messages WHERE uuid = %s
+            """,
+            (message_uuid,),
+        )
+        assert cursor.fetchone() == (native_stream_uuid, zulip_topic_uuid)
+        cursor.execute(
+            """
+            SELECT is_archived
+            FROM m_workspace_streams WHERE uuid = %s
+            """,
+            (provider_stream_uuid,),
+        )
+        assert cursor.fetchone()[0] is True
+        cursor.execute(
+            """
+            SELECT resource
+            FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assignment = cursor.fetchone()[0]
+        assert assignment["workspace_projection"]["stream"]["uuid"] == str(
+            native_stream_uuid
+        )
+        assert assignment["workspace_projection"]["topics"] == [
+            {
+                "topic_uuid": str(zulip_topic_uuid),
+                "provider_topic_id": "direct:7,8:default",
+                "name": "Zulip",
+                "is_default": True,
+            }
+        ]
+
+    report["report_uuid"] = str(sys_uuid.uuid4())
+    result = _request_call(repository.observed_reports, identity, [report])
+    assert result["results"][0]["status"] == "applied"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_topics
+            WHERE stream_uuid = %s AND name = 'Zulip'
+            """,
+            (native_stream_uuid,),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            "DELETE FROM m_external_provider_policies_v1 WHERE provider = 'zulip'"
+        )
+
+
 def test_verified_provider_identity_replaces_account_scoped_duplicates(
     _database,
     db,

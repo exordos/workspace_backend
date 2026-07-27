@@ -108,7 +108,7 @@ def _rewrite_payload_uuid_references(
                 raise IdentityMergePending
 
 
-def _invalidate_direct_event_history(session: typing.Any) -> None:
+def invalidate_direct_event_history(session: typing.Any) -> None:
     """Force clients to reload canonical state instead of replaying stale UUIDs."""
     session.execute(
         """
@@ -368,7 +368,7 @@ def merge_account_scoped_provider_identities(
         ).fetchall()
         changed_chat_uuids.update(sys_uuid.UUID(str(row["uuid"])) for row in rows)
     if replacements:
-        _invalidate_direct_event_history(session)
+        invalidate_direct_event_history(session)
     for legacy_user_uuid, _canonical_user_uuid in replacements:
         session.execute(
             "DELETE FROM m_workspace_users WHERE uuid = %s",
@@ -704,7 +704,7 @@ def merge_workspace_user_identity(
         (canonical_user_uuid, canonical_source, legacy_user_uuid),
     )
     if delete_legacy:
-        _invalidate_direct_event_history(session)
+        invalidate_direct_event_history(session)
         session.execute(
             "DELETE FROM m_workspace_users WHERE uuid = %s",
             (legacy_user_uuid,),

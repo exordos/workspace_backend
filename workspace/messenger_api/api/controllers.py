@@ -127,6 +127,32 @@ def _move_projection_rows(
     )
 
 
+def _purge_external_account_projection_rows(
+    session: typing.Any,
+    *,
+    project_id: object,
+    stream_uuid: object,
+    external_account_uuid: object,
+) -> None:
+    """Remove one account's content without deleting a shared native DM."""
+    session.execute(
+        """
+        DELETE FROM m_workspace_messages
+        WHERE project_id = %s AND stream_uuid = %s
+          AND external_account_uuid = %s
+        """,
+        (project_id, stream_uuid, external_account_uuid),
+    )
+    session.execute(
+        """
+        DELETE FROM m_workspace_files
+        WHERE project_id = %s AND stream_uuid = %s
+          AND external_account_uuid = %s
+        """,
+        (project_id, stream_uuid, external_account_uuid),
+    )
+
+
 def _normalize_avatar_content_type(value: str) -> str:
     value = value.lower()
     return "image/jpeg" if value == "image/jpg" else value
@@ -1537,7 +1563,14 @@ class ExternalAccountController(ExternalResourceController):
             filters={"external_account_uuid": dm_filters.EQ(account.uuid)},
             session=session,
         )
-        cleanup_files = []
+        cleanup_files = session.execute(
+            """
+            SELECT uuid, storage_type, storage_object_id
+            FROM m_workspace_files
+            WHERE external_account_uuid = %s
+            """,
+            (account.uuid,),
+        ).fetchall()
         removed_streams = set()
         for chat in chats:
             sql_state.append_delete(
@@ -1553,34 +1586,31 @@ class ExternalAccountController(ExternalResourceController):
                 and chat.project_id is not None
                 and chat.projection_stream_uuid not in removed_streams
             ):
-                _journal_projection_move(
-                    chat.uuid,
-                    chat.revision + 1,
-                    chat.owner_user_uuid,
-                    chat.projection_stream_uuid,
+                if external_projection.is_native_direct_projection(
+                    session,
                     chat.project_id,
-                    write_new=False,
-                )
-                cleanup_files.extend(
+                    chat.projection_stream_uuid,
+                ):
+                    _purge_external_account_projection_rows(
+                        session,
+                        project_id=chat.project_id,
+                        stream_uuid=chat.projection_stream_uuid,
+                        external_account_uuid=account.uuid,
+                    )
+                else:
+                    _journal_projection_move(
+                        chat.uuid,
+                        chat.revision + 1,
+                        chat.owner_user_uuid,
+                        chat.projection_stream_uuid,
+                        chat.project_id,
+                        write_new=False,
+                    )
                     session.execute(
-                        """
-                        SELECT uuid, storage_type, storage_object_id
-                        FROM m_workspace_files
-                        WHERE stream_uuid = %s AND project_id = %s
-                          AND external_account_uuid = %s
-                        """,
-                        (
-                            chat.projection_stream_uuid,
-                            chat.project_id,
-                            account.uuid,
-                        ),
-                    ).fetchall()
-                )
-                session.execute(
-                    "DELETE FROM m_workspace_streams "
-                    "WHERE uuid = %s AND project_id = %s",
-                    (chat.projection_stream_uuid, chat.project_id),
-                )
+                        "DELETE FROM m_workspace_streams "
+                        "WHERE uuid = %s AND project_id = %s",
+                        (chat.projection_stream_uuid, chat.project_id),
+                    )
                 removed_streams.add(chat.projection_stream_uuid)
             if chat.project_id is not None:
                 messenger_events.create_external_resource_event(
@@ -1595,6 +1625,14 @@ class ExternalAccountController(ExternalResourceController):
                     ),
                     session=session,
                 )
+        session.execute(
+            "DELETE FROM m_workspace_files WHERE external_account_uuid = %s",
+            (account.uuid,),
+        )
+        session.execute(
+            "DELETE FROM m_workspace_streams WHERE external_account_uuid = %s",
+            (account.uuid,),
+        )
         sql_state.append_delete(
             session,
             bridge_instance_uuid,
@@ -1777,10 +1815,26 @@ class ExternalChatController(ExternalResourceController):
                     "revision": chat.revision + 1,
                 }
             else:
-                session.execute(
-                    "DELETE FROM m_workspace_streams WHERE uuid = %s AND project_id = %s",
-                    (transition["stream_uuid"], transition["old_project_uuid"]),
-                )
+                if external_projection.is_native_direct_projection(
+                    session,
+                    transition["old_project_uuid"],
+                    transition["stream_uuid"],
+                ):
+                    _purge_external_account_projection_rows(
+                        session,
+                        project_id=transition["old_project_uuid"],
+                        stream_uuid=transition["stream_uuid"],
+                        external_account_uuid=chat.external_account_uuid,
+                    )
+                else:
+                    session.execute(
+                        "DELETE FROM m_workspace_streams "
+                        "WHERE uuid = %s AND project_id = %s",
+                        (
+                            transition["stream_uuid"],
+                            transition["old_project_uuid"],
+                        ),
+                    )
                 values = {
                     "selected": False,
                     "project_id": None,
@@ -1880,6 +1934,12 @@ class ExternalChatController(ExternalResourceController):
             if not selected:
                 transition_action = "deselect"
             elif project_id != resource.project_id:
+                if external_projection.is_native_direct_projection(
+                    session,
+                    resource.project_id,
+                    resource.projection_stream_uuid,
+                ):
+                    raise messenger_exc.ExternalResourceForbiddenError()
                 transition_action = "move"
         if resource.transition_pending:
             pending = session.execute(
@@ -1928,9 +1988,21 @@ class ExternalChatController(ExternalResourceController):
             "bridge_instance_uuid"
         ]
         projection_stream_uuid = resource.projection_stream_uuid
-        if selected and projection_stream_uuid is None:
+        projection_source = resource.source
+        if selected and not resource.selected:
             projection_stream_uuid = sql_state.external_chat_projection_stream_uuid(
                 resource.uuid
+            )
+            (
+                projection_stream_uuid,
+                projection_source,
+                _projection_changed,
+            ) = external_projection.reconcile_personal_chat_projection(
+                session,
+                project_id=sys_uuid.UUID(str(project_id)),
+                provider_kind=resource.provider,
+                source=resource.source,
+                projection_stream_uuid=projection_stream_uuid,
             )
         if selected:
             external_projection.ensure_external_chat_stream(
@@ -1943,7 +2015,7 @@ class ExternalChatController(ExternalResourceController):
                 provider_kind=resource.provider,
                 provider_chat_id=resource.provider_chat_id,
                 display_name=resource.display_name,
-                source=resource.source,
+                source=projection_source,
                 capabilities=resource.capabilities,
                 account_settings=account.settings,
             )
@@ -1957,6 +2029,8 @@ class ExternalChatController(ExternalResourceController):
         }
         if selected:
             values["projection_stream_uuid"] = projection_stream_uuid
+            if projection_source != resource.source:
+                values["source"] = projection_source
         _update_internal_fields(resource, values, session=session)
         if selected:
             sql_state.append_upsert(
