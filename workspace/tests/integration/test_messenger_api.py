@@ -1211,6 +1211,71 @@ def test_user_presence_action_updates_current_user_presence(api, db):
     assert resp.status_code == 404, resp.text
 
 
+def test_user_directory_keeps_only_canonical_provider_identities(api, db):
+    iam_user_uuid = sys_uuid.uuid4()
+    canonical_user_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    linked_owner_legacy_uuid = sys_uuid.uuid4()
+    provider_realm_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, iam_user_uuid, "iam-directory-user")
+    with db.cursor() as cursor:
+        for user_uuid, username, provider_user_id in (
+            (canonical_user_uuid, "canonical-provider-user", "25"),
+            (legacy_user_uuid, "legacy-provider-user", "25"),
+            (linked_owner_legacy_uuid, "linked-owner-legacy-user", "9"),
+        ):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_users (
+                    uuid, username, source, status, avatar,
+                    external_account_uuid, provider_external_id,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, %s, 'zulip', 'offline', %s, %s, %s, NOW(), NOW()
+                )
+                """,
+                (
+                    str(user_uuid),
+                    username,
+                    messenger_models.build_workspace_user_default_avatar(
+                        user_uuid
+                    ),
+                    str(account_uuid),
+                    provider_user_id,
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_identity_links_v1 (
+                provider, provider_realm_uuid, provider_user_id,
+                workspace_user_uuid, link_kind
+            ) VALUES
+                ('zulip', %s, '25', %s, 'provider_identity'),
+                ('zulip', %s, '9', %s, 'verified_account_owner')
+            """,
+            (
+                str(provider_realm_uuid),
+                str(canonical_user_uuid),
+                str(provider_realm_uuid),
+                str(iam_user_uuid),
+            ),
+        )
+    db.commit()
+
+    response = api.get(USERS)
+    assert response.status_code == 200, response.text
+    directory_uuids = {row["uuid"] for row in response.json()}
+    assert str(iam_user_uuid) in directory_uuids
+    assert str(canonical_user_uuid) in directory_uuids
+    assert str(legacy_user_uuid) not in directory_uuids
+    assert str(linked_owner_legacy_uuid) not in directory_uuids
+
+    legacy_lookup = api.get(f"{USERS}{legacy_user_uuid}")
+    assert legacy_lookup.status_code == 200, legacy_lookup.text
+    assert legacy_lookup.json()["uuid"] == str(legacy_user_uuid)
+
+
 def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
     api, db, tmp_path, monkeypatch
 ):
