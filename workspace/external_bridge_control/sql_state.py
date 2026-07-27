@@ -90,7 +90,7 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
     if session is not None and chat.projection_stream_uuid is not None:
         stream = session.execute(
             """
-            SELECT name, description, private
+            SELECT name, description, private, private_index
             FROM m_workspace_streams
             WHERE project_id = %s AND uuid = %s
             """,
@@ -107,14 +107,32 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
             existing_by_uuid = {item["topic_uuid"]: item for item in topics}
             topics = []
             materialized_topic_uuids = set()
-            rows = session.execute(
-                """
-                SELECT uuid, name FROM m_workspace_stream_topics
-                WHERE project_id = %s AND stream_uuid = %s
-                ORDER BY created_at, uuid
-                """,
-                (chat.project_id, chat.projection_stream_uuid),
-            ).fetchall()
+            if chat_kind == "personal_dm" and stream["private_index"] is not None:
+                topic_uuids = [
+                    sys_uuid.UUID(str(item["topic_uuid"])) for item in topics
+                ]
+                rows = session.execute(
+                    """
+                    SELECT uuid, name FROM m_workspace_stream_topics
+                    WHERE project_id = %s AND stream_uuid = %s
+                      AND uuid = ANY(%s)
+                    ORDER BY created_at, uuid
+                    """,
+                    (
+                        chat.project_id,
+                        chat.projection_stream_uuid,
+                        topic_uuids,
+                    ),
+                ).fetchall()
+            else:
+                rows = session.execute(
+                    """
+                    SELECT uuid, name FROM m_workspace_stream_topics
+                    WHERE project_id = %s AND stream_uuid = %s
+                    ORDER BY created_at, uuid
+                    """,
+                    (chat.project_id, chat.projection_stream_uuid),
+                ).fetchall()
             stream_id = chat.provider_chat_id.removeprefix("channel:")
             for row in rows:
                 topic_uuid = str(row["uuid"])
@@ -1250,7 +1268,8 @@ class SQLControlState:
             raise ValueError("External chat catalog ownership is invalid")
         existing = session.execute(
             """
-            SELECT uuid, selected, source FROM m_external_chats_v2
+            SELECT uuid, selected, project_id, projection_stream_uuid, source
+            FROM m_external_chats_v2
             WHERE external_account_uuid = %s AND provider_chat_id = %s
             FOR UPDATE
             """,
@@ -1464,7 +1483,45 @@ class SQLControlState:
             source["chat_type"] in {"direct", "group_direct"} and default_count != 1
         ):
             raise ValueError("External chat catalog default topic is invalid")
-        projection_stream_uuid = external_chat_projection_stream_uuid(chat_uuid)
+        normalized_source = {
+            "kind": source["kind"],
+            "provider_realm_uuid": str(provider_realm_uuid),
+            "provider_owner_user_id": source["provider_owner_user_id"],
+            "chat_type": {
+                "channel": "channel",
+                "direct": "personal",
+                "group_direct": "group",
+            }[source["chat_type"]],
+            "original_url": source.get("original_url"),
+            "description": catalog["description"],
+            "participants": normalized_participants,
+            "topics": normalized_topics,
+        }
+        projection_stream_uuid = (
+            existing["projection_stream_uuid"]
+            if existing is not None and existing["projection_stream_uuid"] is not None
+            else external_chat_projection_stream_uuid(chat_uuid)
+        )
+        projection_project_uuid = (
+            existing["project_id"]
+            if existing is not None
+            and existing["selected"]
+            and existing["project_id"] is not None
+            else project_uuid
+        )
+        (
+            projection_stream_uuid,
+            normalized_source,
+            projection_changed,
+        ) = external_projection.reconcile_personal_chat_projection(
+            session,
+            project_id=projection_project_uuid,
+            provider_kind=identity.provider_kind,
+            source=normalized_source,
+            projection_stream_uuid=projection_stream_uuid,
+        )
+        if projection_changed:
+            identity_linking.invalidate_direct_event_history(session)
         selection_all = account["settings"].get("selection_mode") == "all"
         maximum = account["limits"].get("max_selected_chats_per_account")
         if not isinstance(maximum, int):
@@ -1490,10 +1547,7 @@ class SQLControlState:
             ON CONFLICT (uuid) DO UPDATE SET
                 source = EXCLUDED.source,
                 display_name = EXCLUDED.display_name,
-                projection_stream_uuid = COALESCE(
-                    m_external_chats_v2.projection_stream_uuid,
-                    EXCLUDED.projection_stream_uuid
-                ),
+                projection_stream_uuid = EXCLUDED.projection_stream_uuid,
                 catalog_capabilities = EXCLUDED.catalog_capabilities,
                 selected = m_external_chats_v2.selected OR EXCLUDED.selected,
                 project_id = CASE
@@ -1519,22 +1573,7 @@ class SQLControlState:
                 owner_uuid,
                 identity.provider_kind,
                 source["provider_chat_key"],
-                _json(
-                    {
-                        "kind": source["kind"],
-                        "provider_realm_uuid": str(provider_realm_uuid),
-                        "provider_owner_user_id": source["provider_owner_user_id"],
-                        "chat_type": {
-                            "channel": "channel",
-                            "direct": "personal",
-                            "group_direct": "group",
-                        }[source["chat_type"]],
-                        "original_url": source.get("original_url"),
-                        "description": catalog["description"],
-                        "participants": normalized_participants,
-                        "topics": normalized_topics,
-                    }
-                ),
+                _json(normalized_source),
                 catalog["display_name"].strip(),
                 select_discovered,
                 project_uuid if select_discovered else None,
@@ -1575,6 +1614,42 @@ class SQLControlState:
             )
             if changed_chat is None or not changed_chat.selected:
                 continue
+            (
+                changed_projection_stream_uuid,
+                changed_source,
+                changed_projection,
+            ) = external_projection.reconcile_personal_chat_projection(
+                session,
+                project_id=changed_chat.project_id,
+                provider_kind=changed_chat.provider,
+                source=changed_chat.source,
+                projection_stream_uuid=changed_chat.projection_stream_uuid,
+            )
+            if (
+                changed_projection_stream_uuid != changed_chat.projection_stream_uuid
+                or changed_source != changed_chat.source
+            ):
+                session.execute(
+                    """
+                    UPDATE m_external_chats_v2
+                    SET projection_stream_uuid = %s,
+                        source = %s::jsonb,
+                        revision = revision + 1,
+                        updated_at = NOW()
+                    WHERE uuid = %s
+                    """,
+                    (
+                        changed_projection_stream_uuid,
+                        _json(changed_source),
+                        changed_chat.uuid,
+                    ),
+                )
+                changed_chat = external_models.ExternalChat.objects.get_one(
+                    filters={"uuid": dm_filters.EQ(changed_chat_uuid)},
+                    session=session,
+                )
+            if changed_projection:
+                identity_linking.invalidate_direct_event_history(session)
             append_upsert(
                 session,
                 identity.bridge_instance_uuid,

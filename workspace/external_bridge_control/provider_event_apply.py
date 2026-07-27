@@ -344,8 +344,13 @@ def _stream_event(
     if stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider stream does not match the selected projection")
     existing = _existing(models.WorkspaceStream, project_id, stream_uuid, session)
+    native_direct = external_projection.is_native_direct_projection(
+        session,
+        project_id,
+        stream_uuid,
+    )
     if event["kind"] == "stream.delete":
-        if existing is None:
+        if existing is None or native_direct:
             return stream_uuid
         helpers.delete_workspace_user_stream(
             project_id,
@@ -356,6 +361,8 @@ def _stream_event(
         return stream_uuid
     if existing is None:
         raise ValueError("Provider stream projection must be materialized by control")
+    if native_direct:
+        return stream_uuid
     helpers.update_workspace_user_stream(
         project_id,
         assignment["owner_user_uuid"],
@@ -381,6 +388,11 @@ def _topic_event(
     stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
     if stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider topic does not belong to the selected stream")
+    native_direct = external_projection.is_native_direct_projection(
+        session,
+        project_id,
+        stream_uuid,
+    )
     _ensure_projection_owner_stream(
         session,
         project_id,
@@ -390,7 +402,7 @@ def _topic_event(
     )
     existing = _existing(models.WorkspaceStreamTopic, project_id, topic_uuid, session)
     if event["kind"] == "topic.delete":
-        if existing is None:
+        if existing is None or native_direct:
             return topic_uuid
         helpers.delete_workspace_user_stream_topic(
             project_id,
@@ -399,11 +411,19 @@ def _topic_event(
             session=session,
         )
         return topic_uuid
-    values = _scoped_provider_values(
-        resource,
-        {"color", "name", "source", "source_name", "stream_uuid", "uuid"},
-        sys_uuid.UUID(str(event["external_account_uuid"])),
-    )
+    if native_direct:
+        values = {
+            name: resource[name]
+            for name in ("color", "stream_uuid", "uuid")
+            if name in resource
+        }
+        values["name"] = external_projection.provider_topic_name(identity.provider_kind)
+    else:
+        values = _scoped_provider_values(
+            resource,
+            {"color", "name", "source", "source_name", "stream_uuid", "uuid"},
+            sys_uuid.UUID(str(event["external_account_uuid"])),
+        )
     if existing is None:
         values.update({"uuid": topic_uuid, "stream_uuid": stream_uuid})
         helpers.create_workspace_user_stream_topic(

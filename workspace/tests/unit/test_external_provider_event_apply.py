@@ -1440,6 +1440,44 @@ def test_message_delete_uses_compact_broadcast_path(monkeypatch):
     ]
 
 
+def test_provider_stream_delete_preserves_shared_native_direct_chat(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    session = object()
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_existing",
+        lambda *_args: types.SimpleNamespace(uuid=stream_uuid),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "is_native_direct_projection",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "delete_workspace_user_stream",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider deletion must preserve the native direct chat"
+        ),
+    )
+
+    assert (
+        provider_event_apply._stream_event(
+            session,
+            {"kind": "stream.delete"},
+            project_uuid,
+            {
+                "owner_user_uuid": owner_uuid,
+                "projection_stream_uuid": stream_uuid,
+            },
+            {"uuid": str(stream_uuid)},
+        )
+        == stream_uuid
+    )
+
+
 def test_unknown_provider_event_kind_is_rejected_before_database_access():
     event = _message_event(sys_uuid.uuid4())
     event["kind"] = "calendar.upsert"
