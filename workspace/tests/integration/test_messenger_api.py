@@ -1756,6 +1756,71 @@ def test_event_retention_prunes_one_cross_table_batch_with_watermarks(api, db):
     assert pruned_through >= broadcast_epoch
 
 
+def test_event_retention_folds_shared_membership_orphan_watermarks(api, db):
+    second_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        api.user_uuid,
+        f"user-{api.user_uuid}",
+    )
+    conftest.seed_workspace_user(
+        db,
+        second_user_uuid,
+        f"user-{second_user_uuid}",
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    def seed_and_prune(session):
+        first_epoch = messenger_events.create_broadcast_event(
+            api.project_id,
+            sys_uuid.uuid4(),
+            [api.user_uuid],
+            messenger_events.USER_UPDATED_EVENT,
+            {"uuid": str(api.user_uuid)},
+            session=session,
+            created_at=now - datetime.timedelta(days=4, minutes=1),
+        )[0]
+        second_epoch = messenger_events.create_broadcast_event(
+            api.project_id,
+            sys_uuid.uuid4(),
+            [api.user_uuid, second_user_uuid],
+            messenger_events.USER_UPDATED_EVENT,
+            {"uuid": str(api.user_uuid)},
+            session=session,
+            created_at=now - datetime.timedelta(days=4),
+        )[0]
+        pruned = sql_canonical_store.prune_expired_events(
+            session,
+            now,
+            retention=datetime.timedelta(days=3),
+            batch_size=2,
+        )
+        return first_epoch, second_epoch, pruned
+
+    first_epoch, second_epoch, pruned = _run_database_operation(seed_and_prune)
+
+    assert pruned == 2
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, current_epoch_version, pruned_through_epoch_version
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = ANY(%s)
+            ORDER BY user_uuid
+            """,
+            (api.project_id, [api.user_uuid, str(second_user_uuid)]),
+        )
+        cursors = {
+            str(user_uuid): (current_epoch, pruned_through)
+            for user_uuid, current_epoch, pruned_through in cur.fetchall()
+        }
+    assert cursors[str(api.user_uuid)] == (
+        max(first_epoch, second_epoch),
+        max(first_epoch, second_epoch),
+    )
+    assert cursors[str(second_user_uuid)] == (second_epoch, second_epoch)
+
+
 def test_workspace_event_payload_identity_backfill_migration(_database, db):
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
