@@ -53,6 +53,12 @@ EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = (
 EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE = (
     "0123-deduplicate-and-revoke-external-chat-memberships-aadb67.py"
 )
+EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID = (
+    "78c745a8-08a2-4432-a511-9e0875cc35db"
+)
+EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_FILE = (
+    "0124-deduplicate-external-account-access-78c745.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -69,7 +75,10 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE
+    assert (
+        engine.get_latest_migration()
+        == EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_FILE
+    )
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -86,6 +95,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     MEMBER_PROJECTION_ACCESS_MIGRATION_UUID,
                     REVOKED_STREAM_ACCESS_MIGRATION_UUID,
                     EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID,
+                    EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID,
                 ],
             ),
         )
@@ -101,6 +111,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (MEMBER_PROJECTION_ACCESS_MIGRATION_UUID, True),
             (REVOKED_STREAM_ACCESS_MIGRATION_UUID, True),
             (EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID, True),
+            (EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
@@ -301,6 +312,141 @@ def test_external_projection_access_is_scoped_to_account(
         assert generation_after != generation_before
         assert current_epoch == 17
         assert pruned_through == 17
+
+
+def test_external_account_access_deduplicates_multiple_selected_chats(
+    _database,
+    db,
+):
+    owner_uuid = "20000000-0000-4000-8000-000000000101"
+    project_uuid = "20000000-0000-4000-8000-000000000102"
+    account_uuid = "20000000-0000-4000-8000-000000000103"
+    provider_realm_uuid = "20000000-0000-4000-8000-000000000104"
+    first_stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "First selected provider chat",
+    )
+    second_stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "Second selected provider chat",
+    )
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (
+                %s, %s, 'zulip',
+                '{"kind":"zulip","server_url":"https://zulip.example.test"}',
+                TRUE, 'live', TRUE
+            )
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
+            ) VALUES (
+                %s, %s, %s, 'zulip', %s,
+                jsonb_build_object(
+                    'provider_realm_uuid', CAST(%s AS text)
+                ),
+                %s, TRUE, %s, %s
+            )
+            """,
+            (
+                (
+                    "20000000-0000-4000-8000-000000000105",
+                    account_uuid,
+                    owner_uuid,
+                    "channel:1",
+                    provider_realm_uuid,
+                    "First selected provider chat",
+                    project_uuid,
+                    first_stream_uuid,
+                ),
+                (
+                    "20000000-0000-4000-8000-000000000106",
+                    account_uuid,
+                    owner_uuid,
+                    "channel:2",
+                    provider_realm_uuid,
+                    "Second selected provider chat",
+                    project_uuid,
+                    second_stream_uuid,
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = jsonb_build_object(
+                    'kind', 'zulip',
+                    'server_url', 'https://zulip.example.test',
+                    'source_scope', CAST(%s AS text)
+                ),
+                external_account_uuid = %s,
+                provider_external_id = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                (
+                    account_uuid,
+                    account_uuid,
+                    "channel:1",
+                    project_uuid,
+                    first_stream_uuid,
+                ),
+                (
+                    account_uuid,
+                    account_uuid,
+                    "channel:2",
+                    project_uuid,
+                    second_stream_uuid,
+                ),
+            ),
+        )
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, owner_uuid),
+        )
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            """
+            SELECT uuid::text, COUNT(*)
+            FROM m_workspace_user_streams
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            GROUP BY uuid
+            ORDER BY uuid
+            """,
+            (
+                project_uuid,
+                owner_uuid,
+                [first_stream_uuid, second_stream_uuid],
+            ),
+        )
+        assert cur.fetchall() == sorted(
+            [
+                (first_stream_uuid, 1),
+                (second_stream_uuid, 1),
+            ]
+        )
 
 
 def test_email_uniqueness_is_scoped_to_iam_users(_database, db):

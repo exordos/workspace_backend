@@ -282,6 +282,20 @@ def test_external_message_visibility_uses_canonical_projection_access():
     assert 'JOIN "m_confirmed_external_account_access" AS stream_access' in migration
 
 
+def test_external_account_access_is_unique_across_selected_chats():
+    migration = (
+        __import__("pathlib").Path(__file__).parents[3]
+        / "migrations/0124-deduplicate-external-account-access-78c745.py"
+    ).read_text()
+
+    assert "SELECT DISTINCT" in migration
+    assert "project_id," in migration
+    assert "user_uuid," in migration
+    assert "account_type," in migration
+    assert "source_scope" in migration
+    assert "FROM ranked_candidates" in migration
+
+
 def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
     message_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
