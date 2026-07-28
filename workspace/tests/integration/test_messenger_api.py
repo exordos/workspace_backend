@@ -3576,6 +3576,173 @@ def test_stream_binding_delete_notifies_removed_user(api, db):
         assert all(item["stream_uuid"] != stream_uuid for item in event["folder_items"])
 
 
+@pytest.mark.parametrize(
+    "compact_events",
+    [False, True],
+    ids=["direct", "broadcast"],
+)
+def test_stream_binding_delete_revokes_queued_provider_message_events(
+    api,
+    workspace_api,
+    db,
+    compact_events,
+):
+    removed_user_uuid = sys_uuid.uuid4()
+    external_account_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Revoked provider backlog",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        removed_user_uuid,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb, TRUE, 'live', TRUE
+            )
+            """,
+            (
+                str(external_account_uuid),
+                str(removed_user_uuid),
+                '{"kind":"zulip","server_url":"https://zulip.example.test"}',
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', '{}'::jsonb,
+                'Revoked provider backlog', TRUE, %s, %s
+            )
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(external_account_uuid),
+                str(removed_user_uuid),
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.test",
+                        "source_scope": str(external_account_uuid),
+                    }
+                ),
+                str(external_account_uuid),
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+              AND stream_uuid = %s
+              AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, str(removed_user_uuid)),
+        )
+        binding_uuid = cur.fetchone()[0]
+
+    message_uuid = sys_uuid.uuid4()
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.create_workspace_user_message(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content="revoked backlog"),
+            source_name=messenger_models.SourceName.ZULIP.value,
+            source=messenger_models.ZulipSource(
+                stream_id=42,
+                server_url="https://zulip.example.test",
+                source_scope=str(external_account_uuid),
+                topic_name="general",
+                message_id=101,
+            ),
+            session=session,
+            compact_events=compact_events,
+        )
+    )
+
+    workspace_api.user_uuid = str(removed_user_uuid)
+    workspace_api.project_id = api.project_id
+    before_delete = workspace_api.get(EVENTS, params={"page_limit": 100})
+    assert before_delete.status_code == 200, before_delete.text
+    assert "message.created" in [
+        event["payload"]["kind"] for event in before_delete.json()
+    ]
+
+    deleted = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert deleted.status_code in (200, 204), deleted.text
+
+    after_delete = workspace_api.get(EVENTS, params={"page_limit": 100})
+    assert after_delete.status_code == 200, after_delete.text
+    visible_kinds = [event["payload"]["kind"] for event in after_delete.json()]
+    assert "message.created" not in visible_kinds
+    assert "stream.deleted" in visible_kinds
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT source_scope
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == str(external_account_uuid)
+        cur.execute(
+            """
+            SELECT payload->>'kind'
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        visible_view_kinds = [row[0] for row in cur.fetchall()]
+
+    assert "message.created" not in visible_view_kinds
+    assert "stream.deleted" in visible_view_kinds
+
+
 def test_streams_cursor_pagination_with_composite_pk(api, db):
     seeded = {
         conftest.seed_user_stream(db, api.project_id, api.user_uuid, f"s-{i}")

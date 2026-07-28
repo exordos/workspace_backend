@@ -249,6 +249,22 @@ def test_provider_projection_access_includes_bound_members():
     assert "account.uuid::text::varchar(2048) AS source_scope" in migration
 
 
+def test_revoked_stream_messages_require_current_membership():
+    migration = (
+        __import__("pathlib").Path(__file__).parents[3]
+        / (
+            "migrations/"
+            "0122-revoke-external-projection-access-on-stream-removal-640b9d.py"
+        )
+    ).read_text()
+
+    assert "e.\"object_type\" <> 'message'" in migration
+    assert 'FROM "m_workspace_stream_bindings" AS binding' in migration
+    assert 'binding."stream_uuid" =' in migration
+    assert "(e.\"payload\"->>'stream_uuid')::uuid" in migration
+    assert 'binding."user_uuid" = e."user_uuid"' in migration
+
+
 def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
     message_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -870,6 +886,8 @@ def test_canonical_store_events_preserve_cursor_scope_order_and_limit(monkeypatc
     assert statement.count("LIMIT %s") == 3
     assert 'FROM "m_workspace_events"' in statement
     assert 'FROM "m_workspace_broadcast_message_events_v1"' in statement
+    assert statement.count('FROM "m_workspace_stream_bindings" AS binding') == 2
+    assert statement.count("(event.\"payload\"->>'stream_uuid')::uuid") == 2
     assert "UNION ALL" in statement
     assert parameters == (
         PROJECT_UUID,

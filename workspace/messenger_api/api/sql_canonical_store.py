@@ -77,6 +77,18 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                     )
               )
           )
+          AND (
+              event."object_type" <> 'message'
+              OR event."payload"->>'stream_uuid' IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_workspace_stream_bindings" AS binding
+                  WHERE binding."project_id" = event."project_id"
+                    AND binding."stream_uuid" =
+                        (event."payload"->>'stream_uuid')::uuid
+                    AND binding."user_uuid" = event."user_uuid"
+              )
+          )
         ORDER BY event."epoch_version" ASC
         LIMIT %s
     ),
@@ -137,6 +149,18 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                         event."payload"->'old_source'->>'source_scope',
                         event."payload"->'old_source'->>'server_url'
                     )
+              )
+          )
+          AND (
+              event."object_type" <> 'message'
+              OR event."payload"->>'stream_uuid' IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_workspace_stream_bindings" AS binding
+                  WHERE binding."project_id" = event."project_id"
+                    AND binding."stream_uuid" =
+                        (event."payload"->>'stream_uuid')::uuid
+                    AND binding."user_uuid" = event."user_uuid"
               )
           )
         ORDER BY event."epoch_version" ASC
