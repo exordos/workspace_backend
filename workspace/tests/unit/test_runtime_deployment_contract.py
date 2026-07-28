@@ -44,6 +44,28 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
 
 
+def test_manifest_scales_s3_disk_size_by_core_profile():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    expected_profile_sizes = {
+        "develop": 8,
+        "small": 51,
+        "medium": 100,
+        "large": 1024,
+        "legacy": 1024,
+    }
+
+    for profile, size in expected_profile_sizes.items():
+        assert f'link: "$core.vs.profiles.${profile}"' in manifest
+        assert (
+            f"profile: $workspace.imports.$profile_{profile}:uuid\n"
+            f"            value: {size}"
+        ) in manifest
+    assert (
+        "disk_size: $core.vs.variables.$workspace_s3_disk_size:value"
+        in manifest
+    )
+
+
 def test_postgresql_runtime_has_bounded_connection_lifetimes():
     expected = {
         "connection_connect_timeout": 30,
