@@ -485,6 +485,14 @@ def _message_event(
             str(author_identity["provider_external_id"]),
             author_identity,
         )
+    if existing is None:
+        _ensure_projection_owner_stream(
+            session,
+            project_id,
+            assignment,
+            identity,
+            sys_uuid.UUID(str(event["external_account_uuid"])),
+        )
     values = _scoped_provider_values(
         resource,
         {
@@ -499,18 +507,25 @@ def _message_event(
         },
         sys_uuid.UUID(str(event["external_account_uuid"])),
     )
+    if identity.provider_kind != models.SourceName.NATIVE.value and (
+        values.get("source_name") != identity.provider_kind
+        or "source" not in values
+    ):
+        assignment_source = assignment.get("source") or {}
+        source_name, source = external_projection._workspace_source(
+            identity.provider_kind,
+            assignment["provider_chat_id"],
+            assignment_source.get("chat_type", "channel"),
+            assignment.get("account_settings") or {},
+            sys_uuid.UUID(str(event["external_account_uuid"])),
+        )
+        values["source_name"] = source_name
+        values["source"] = source
     if "payload" in values:
         values["payload"] = _message_payload(values["payload"])
     if "created_at" in values:
         values["created_at"] = _message_created_at(values["created_at"])
     if existing is None:
-        _ensure_projection_owner_stream(
-            session,
-            project_id,
-            assignment,
-            identity,
-            sys_uuid.UUID(str(event["external_account_uuid"])),
-        )
         values.update(
             {
                 "uuid": message_uuid,
@@ -538,9 +553,23 @@ def _message_event(
                 "payload",
                 "provider_external_id",
                 "provider_metadata",
+                "source",
+                "source_name",
             },
         )
-        if not _message_projection_is_unchanged(existing, update_values):
+        source_changed = (
+            update_values.get("source_name") is not None
+            and getattr(
+                existing,
+                "source_name",
+                update_values["source_name"],
+            )
+            != update_values["source_name"]
+        )
+        if source_changed or not _message_projection_is_unchanged(
+            existing,
+            update_values,
+        ):
             created_at = update_values.pop("created_at", None)
             existing.update_dm(values=update_values)
             existing.update(session=session)

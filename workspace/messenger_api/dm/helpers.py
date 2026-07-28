@@ -1480,6 +1480,13 @@ def delete_workspace_stream_binding(
                 raise
             folder_targets = []
 
+        if user_stream.source_name != models.SourceName.NATIVE.value:
+            revoke_workspace_external_chat_membership(
+                project_id,
+                binding.stream_uuid,
+                binding.user_uuid,
+                session=s,
+            )
         messenger_events.create_stream_deleted_event(
             project_id=project_id,
             user_uuid=binding.user_uuid,
@@ -1637,6 +1644,123 @@ def _validate_stream_binding_roles_payload(
             raise messenger_exc.StreamBindingUsersPayloadError()
 
 
+def _workspace_external_chat_membership_keys(
+    project_id: object,
+    stream_uuid: object,
+    session: typing.Any = None,
+) -> list[typing.Any]:
+    with _workspace_session(session) as current_session:
+        return current_session.execute(
+            """
+            SELECT DISTINCT
+                chat.provider::varchar(32) AS provider,
+                COALESCE(
+                    NULLIF(chat.source->>'provider_realm_uuid', ''),
+                    NULLIF(account.settings->>'server_url', ''),
+                    account.uuid::text
+                )::varchar(2048) AS provider_realm_id,
+                chat.provider_chat_id
+            FROM m_external_chats_v2 AS chat
+            JOIN m_external_accounts_v2 AS account
+              ON account.uuid = chat.external_account_uuid
+            WHERE chat.project_id = %s
+              AND chat.projection_stream_uuid = %s
+            """,
+            (project_id, stream_uuid),
+        ).fetchall()
+
+
+def revoke_workspace_external_chat_membership(
+    project_id: object,
+    stream_uuid: object,
+    user_uuid: object,
+    session: typing.Any = None,
+) -> None:
+    with _workspace_session(session) as current_session:
+        for key in _workspace_external_chat_membership_keys(
+            project_id,
+            stream_uuid,
+            session=current_session,
+        ):
+            current_session.execute(
+                """
+                INSERT INTO m_workspace_external_chat_membership_revocations (
+                    project_id, user_uuid, provider,
+                    provider_realm_id, provider_chat_id
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (
+                    project_id, user_uuid, provider,
+                    provider_realm_id, provider_chat_id
+                ) DO NOTHING
+                """,
+                (
+                    project_id,
+                    user_uuid,
+                    key["provider"],
+                    key["provider_realm_id"],
+                    key["provider_chat_id"],
+                ),
+            )
+
+
+def restore_workspace_external_chat_membership(
+    project_id: object,
+    stream_uuid: object,
+    user_uuid: object,
+    session: typing.Any = None,
+) -> None:
+    with _workspace_session(session) as current_session:
+        for key in _workspace_external_chat_membership_keys(
+            project_id,
+            stream_uuid,
+            session=current_session,
+        ):
+            current_session.execute(
+                """
+                DELETE FROM m_workspace_external_chat_membership_revocations
+                WHERE project_id = %s
+                  AND user_uuid = %s
+                  AND provider = %s
+                  AND provider_realm_id = %s
+                  AND provider_chat_id = %s
+                """,
+                (
+                    project_id,
+                    user_uuid,
+                    key["provider"],
+                    key["provider_realm_id"],
+                    key["provider_chat_id"],
+                ),
+            )
+
+
+def get_revoked_workspace_external_chat_members(
+    project_id: object,
+    provider: str,
+    provider_realm_id: str,
+    provider_chat_id: str,
+    session: typing.Any = None,
+) -> set[sys_uuid.UUID]:
+    with _workspace_session(session) as current_session:
+        rows = current_session.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_external_chat_membership_revocations
+            WHERE project_id = %s
+              AND provider = %s
+              AND provider_realm_id = %s
+              AND provider_chat_id = %s
+            """,
+            (
+                project_id,
+                provider,
+                provider_realm_id,
+                provider_chat_id,
+            ),
+        ).fetchall()
+    return {sys_uuid.UUID(str(row["user_uuid"])) for row in rows}
+
+
 def get_or_create_workspace_stream_bindings(
     project_id: object,
     stream_uuid: object,
@@ -1644,6 +1768,7 @@ def get_or_create_workspace_stream_bindings(
     role_user_uuids: typing.Any,
     session: typing.Any = None,
     binding_uuids: typing.Any = None,
+    restore_external_membership: bool = False,
 ) -> typing.Any:
     _validate_stream_binding_roles_payload(role_user_uuids)
     result = []
@@ -1651,6 +1776,13 @@ def get_or_create_workspace_stream_bindings(
     for role, user_uuids in role_user_uuids.items():
         for user_uuid in user_uuids:
             user_uuid = sys_uuid.UUID(str(user_uuid))
+            if restore_external_membership:
+                restore_workspace_external_chat_membership(
+                    project_id,
+                    stream_uuid,
+                    user_uuid,
+                    session=session,
+                )
             binding, created = _get_or_create_workspace_stream_binding(
                 project_id=project_id,
                 stream_uuid=stream_uuid,

@@ -48,6 +48,10 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
           AND event."epoch_version" > %s
           AND (
               COALESCE(event."payload"->>'source_name', 'native') = 'native'
+              OR (
+                  event."object_type" = 'stream'
+                  AND event."action" = 'deleted'
+              )
               OR EXISTS (
                   SELECT 1
                   FROM "m_confirmed_external_account_access" AS access
@@ -87,6 +91,35 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                     AND binding."stream_uuid" =
                         (event."payload"->>'stream_uuid')::uuid
                     AND binding."user_uuid" = event."user_uuid"
+              )
+          )
+          AND (
+              event."object_type" <> 'message'
+              OR event."payload"->>'stream_uuid' IS NULL
+              OR NOT EXISTS (
+                  SELECT 1
+                  FROM "m_workspace_streams" AS external_stream
+                  WHERE external_stream."project_id" = event."project_id"
+                    AND external_stream."uuid" =
+                        (event."payload"->>'stream_uuid')::uuid
+                    AND external_stream."source_name" <> 'native'
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_workspace_streams" AS external_stream
+                  JOIN "m_confirmed_external_account_access" AS stream_access
+                    ON stream_access."project_id" =
+                        external_stream."project_id"
+                   AND stream_access."user_uuid" = event."user_uuid"
+                   AND stream_access."account_type" =
+                        external_stream."source_name"
+                   AND stream_access."source_scope" = COALESCE(
+                        external_stream."source"->>'source_scope',
+                        external_stream."source"->>'server_url'
+                   )
+                  WHERE external_stream."project_id" = event."project_id"
+                    AND external_stream."uuid" =
+                        (event."payload"->>'stream_uuid')::uuid
               )
           )
         ORDER BY event."epoch_version" ASC
@@ -122,6 +155,10 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
         FROM broadcast_payloads AS event
         WHERE (
               COALESCE(event."payload"->>'source_name', 'native') = 'native'
+              OR (
+                  event."object_type" = 'stream'
+                  AND event."action" = 'deleted'
+              )
               OR EXISTS (
                   SELECT 1
                   FROM "m_confirmed_external_account_access" AS access
@@ -161,6 +198,35 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                     AND binding."stream_uuid" =
                         (event."payload"->>'stream_uuid')::uuid
                     AND binding."user_uuid" = event."user_uuid"
+              )
+          )
+          AND (
+              event."object_type" <> 'message'
+              OR event."payload"->>'stream_uuid' IS NULL
+              OR NOT EXISTS (
+                  SELECT 1
+                  FROM "m_workspace_streams" AS external_stream
+                  WHERE external_stream."project_id" = event."project_id"
+                    AND external_stream."uuid" =
+                        (event."payload"->>'stream_uuid')::uuid
+                    AND external_stream."source_name" <> 'native'
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM "m_workspace_streams" AS external_stream
+                  JOIN "m_confirmed_external_account_access" AS stream_access
+                    ON stream_access."project_id" =
+                        external_stream."project_id"
+                   AND stream_access."user_uuid" = event."user_uuid"
+                   AND stream_access."account_type" =
+                        external_stream."source_name"
+                   AND stream_access."source_scope" = COALESCE(
+                        external_stream."source"->>'source_scope',
+                        external_stream."source"->>'server_url'
+                   )
+                  WHERE external_stream."project_id" = event."project_id"
+                    AND external_stream."uuid" =
+                        (event."payload"->>'stream_uuid')::uuid
               )
           )
         ORDER BY event."epoch_version" ASC
@@ -1233,6 +1299,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 self.user_uuid,
                 role_user_uuids,
+                restore_external_membership=True,
             )
         elif resource == "stream_topics" and action == "toggle_done":
             row = helpers.toggle_workspace_user_stream_topic_done(
