@@ -47,6 +47,12 @@ REVOKED_STREAM_ACCESS_MIGRATION_UUID = "640b9d0e-f465-4359-abb4-47fdd60b5c40"
 REVOKED_STREAM_ACCESS_MIGRATION_FILE = (
     "0122-revoke-external-projection-access-on-stream-removal-640b9d.py"
 )
+EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = (
+    "aadb67c9-c716-4066-9867-b82079c1c283"
+)
+EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE = (
+    "0123-deduplicate-and-revoke-external-chat-memberships-aadb67.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -63,7 +69,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == REVOKED_STREAM_ACCESS_MIGRATION_FILE
+    assert engine.get_latest_migration() == EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -79,6 +85,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     RETENTION_MIGRATION_UUID,
                     MEMBER_PROJECTION_ACCESS_MIGRATION_UUID,
                     REVOKED_STREAM_ACCESS_MIGRATION_UUID,
+                    EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID,
                 ],
             ),
         )
@@ -93,6 +100,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (RETENTION_MIGRATION_UUID, True),
             (MEMBER_PROJECTION_ACCESS_MIGRATION_UUID, True),
             (REVOKED_STREAM_ACCESS_MIGRATION_UUID, True),
+            (EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"

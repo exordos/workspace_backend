@@ -385,6 +385,11 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
         "delete_workspace_stream_binding",
         lambda *args, **kwargs: deleted.append((args, kwargs)),
     )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_revoked_workspace_external_chat_members",
+        lambda *args, **kwargs: set(),
+    )
 
     external_projection.ensure_external_chat_stream(
         session,
@@ -542,6 +547,11 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
         "delete_workspace_stream_binding",
         lambda *args, **kwargs: deleted.append((args, kwargs)),
     )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_revoked_workspace_external_chat_members",
+        lambda *args, **kwargs: set(),
+    )
 
     external_projection.ensure_external_chat_stream(
         session,
@@ -609,6 +619,8 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
         "owner_user_uuid": owner_uuid,
         "projection_stream_uuid": stream_uuid,
         "provider_chat_id": "zulip-channel-7",
+        "source": {"chat_type": "channel"},
+        "account_settings": {"server_url": "https://zulip.example.test"},
     }
     session = Session(assignment)
     ensured = []
@@ -645,6 +657,8 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
         "active": True,
     }
     event["payload"]["resource"]["author_identity"] = author_identity
+    event["payload"]["resource"].pop("source_name")
+    event["payload"]["resource"].pop("source")
 
     target_uuid = provider_event_apply.apply_event(event, session, identity)
 
@@ -688,7 +702,9 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     assert values["topic_uuid"] == sys_uuid.UUID(
         event["payload"]["resource"]["topic_uuid"]
     )
-    assert values["source"]["source_scope"] == event["external_account_uuid"]
+    assert values["source_name"] == "zulip"
+    assert values["source"].source_scope == event["external_account_uuid"]
+    assert values["source"].server_url == "https://zulip.example.test"
     assert values["created_at"] == datetime.datetime(
         2026, 7, 18, 12, tzinfo=datetime.timezone.utc
     )

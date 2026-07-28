@@ -308,6 +308,23 @@ def ensure_external_chat_stream(
         sys_uuid.UUID(str(participant["identity_uuid"])): participant["role"]
         for participant in source["participants"]
     }
+    provider_realm_id = str(
+        source.get("provider_realm_uuid")
+        or account_settings.get("server_url")
+        or external_account_uuid
+    )
+    revoked_user_uuids = helpers.get_revoked_workspace_external_chat_members(
+        project_id,
+        provider_kind,
+        provider_realm_id,
+        provider_chat_id,
+        session=session,
+    )
+    participants = {
+        user_uuid: role
+        for user_uuid, role in participants.items()
+        if user_uuid == owner_user_uuid or user_uuid not in revoked_user_uuids
+    }
     if stream is not None and getattr(stream, "private_index", None) is not None:
         if (
             len(participants) != 2
@@ -329,6 +346,8 @@ def ensure_external_chat_stream(
     }
     for participant in source["participants"]:
         participant_uuid = sys_uuid.UUID(str(participant["identity_uuid"]))
+        if participant_uuid not in participants:
+            continue
         if participant_uuid in users:
             continue
         if participant_uuid == owner_user_uuid:

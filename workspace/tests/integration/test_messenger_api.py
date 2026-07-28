@@ -35,11 +35,13 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.x509.oid import NameOID
 from restalchemy.common import contexts as ra_contexts
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage.sql import migrations as ra_migrations
 from restalchemy.storage.sql import sessions as ra_sessions
 from oslo_config import cfg
 
 from workspace.common import external_bridge_opts
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import external_projection
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.api import sql_canonical_store
@@ -67,6 +69,12 @@ EXTERNAL_OPERATIONS = f"{V1}/external_operations/"
 EXTERNAL_CHATS = f"{V1}/external_chats/"
 EXTERNAL_PROVIDER_POLICIES = f"{V1}/external_provider_policies/"
 EXTERNAL_PROVIDER_HEALTH = f"{V1}/external_provider_health/"
+EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = (
+    "aadb67c9-c716-4066-9867-b82079c1c283"
+)
+EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE = (
+    "0123-deduplicate-and-revoke-external-chat-memberships-aadb67.py"
+)
 EXTERNAL_ACCOUNT_READ = ("workspace.external_account.read",)
 EXTERNAL_ACCOUNT_CREATE = ("workspace.external_account.create",)
 EXTERNAL_ACCOUNT_UPDATE = ("workspace.external_account.update",)
@@ -3727,7 +3735,7 @@ def test_stream_binding_delete_revokes_queued_provider_message_events(
             """,
             (api.project_id, str(removed_user_uuid)),
         )
-        assert cur.fetchone()[0] == str(external_account_uuid)
+        assert cur.fetchone() is None
         cur.execute(
             """
             SELECT payload->>'kind'
@@ -3741,6 +3749,399 @@ def test_stream_binding_delete_revokes_queued_provider_message_events(
 
     assert "message.created" not in visible_view_kinds
     assert "stream.deleted" in visible_view_kinds
+
+
+def test_external_member_removal_revokes_duplicate_chat_projections(
+    api,
+    workspace_api,
+    db,
+):
+    removed_user_uuid = sys_uuid.uuid4()
+    second_owner_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        removed_user_uuid,
+        f"removed-{removed_user_uuid}",
+    )
+    conftest.seed_workspace_user(
+        db,
+        second_owner_uuid,
+        f"owner-{second_owner_uuid}",
+    )
+    first_stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "First provider projection",
+    )
+    second_stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        second_owner_uuid,
+        "Second provider projection",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        first_stream_uuid,
+        removed_user_uuid,
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        second_stream_uuid,
+        removed_user_uuid,
+    )
+    first_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        first_stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    second_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        second_stream_uuid,
+        second_owner_uuid,
+        "general",
+        is_default=True,
+    )
+    first_account_uuid = sys_uuid.UUID("10000000-0000-4000-8000-000000000001")
+    second_account_uuid = sys_uuid.UUID("20000000-0000-4000-8000-000000000002")
+    provider_realm_uuid = "30000000-0000-4000-8000-000000000003"
+    with db.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (
+                %s, %s, 'zulip',
+                '{"kind":"zulip","server_url":"https://zulip.example.test"}',
+                TRUE, 'live', TRUE
+            )
+            """,
+            (
+                (str(first_account_uuid), str(removed_user_uuid)),
+                (str(second_account_uuid), str(second_owner_uuid)),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
+                %s, TRUE, %s, %s
+            )
+            """,
+            (
+                (
+                    str(sys_uuid.uuid4()),
+                    str(first_account_uuid),
+                    str(removed_user_uuid),
+                    json.dumps({"provider_realm_uuid": provider_realm_uuid}),
+                    "First provider projection",
+                    api.project_id,
+                    first_stream_uuid,
+                ),
+                (
+                    str(sys_uuid.uuid4()),
+                    str(second_account_uuid),
+                    str(second_owner_uuid),
+                    json.dumps({"provider_realm_uuid": provider_realm_uuid}),
+                    "Second provider projection",
+                    api.project_id,
+                    second_stream_uuid,
+                ),
+            ),
+        )
+        for stream_uuid, account_uuid in (
+            (first_stream_uuid, first_account_uuid),
+            (second_stream_uuid, second_account_uuid),
+        ):
+            cur.execute(
+                """
+                UPDATE m_workspace_streams
+                SET source_name = 'zulip',
+                    source = %s::jsonb,
+                    external_account_uuid = %s,
+                    provider_external_id = 'channel:42'
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "stream_id": 42,
+                            "server_url": "https://zulip.example.test",
+                            "source_scope": str(account_uuid),
+                        }
+                    ),
+                    str(account_uuid),
+                    api.project_id,
+                    stream_uuid,
+                ),
+            )
+        cur.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+              AND stream_uuid = %s
+              AND user_uuid = %s
+            """,
+            (api.project_id, first_stream_uuid, str(removed_user_uuid)),
+        )
+        first_binding_uuid = cur.fetchone()[0]
+
+    first_message_uuid = sys_uuid.uuid4()
+    second_message_uuid = sys_uuid.uuid4()
+
+    def create_messages(session):
+        for message_uuid, stream_uuid, topic_uuid, author_uuid in (
+            (
+                first_message_uuid,
+                first_stream_uuid,
+                first_topic_uuid,
+                api.user_uuid,
+            ),
+            (
+                second_message_uuid,
+                second_stream_uuid,
+                second_topic_uuid,
+                second_owner_uuid,
+            ),
+        ):
+            messenger_dm_helpers.create_workspace_user_message(
+                uuid=message_uuid,
+                project_id=sys_uuid.UUID(api.project_id),
+                user_uuid=sys_uuid.UUID(str(author_uuid)),
+                stream_uuid=sys_uuid.UUID(stream_uuid),
+                topic_uuid=sys_uuid.UUID(topic_uuid),
+                payload=message_payloads.MarkdownPayload(
+                    content=f"provider event for {stream_uuid}"
+                ),
+                # Reproduce the legacy provider payload that was mislabeled
+                # as native. Stream-level access must still protect it.
+                source_name=messenger_models.SourceName.NATIVE.value,
+                source=messenger_models.NativeSource(),
+                session=session,
+            )
+
+    _run_database_operation(create_messages)
+
+    workspace_api.user_uuid = str(removed_user_uuid)
+    workspace_api.project_id = api.project_id
+    streams_before = api.get(STREAMS, user=removed_user_uuid)
+    assert streams_before.status_code == 200, streams_before.text
+    visible_projection_uuids = {
+        stream["uuid"]
+        for stream in streams_before.json()
+        if stream["uuid"] in {first_stream_uuid, second_stream_uuid}
+    }
+    assert visible_projection_uuids == {first_stream_uuid}
+
+    events_before = workspace_api.get(EVENTS, params={"page_limit": 100})
+    assert events_before.status_code == 200, events_before.text
+    visible_message_uuids = {
+        event["payload"].get("uuid")
+        for event in events_before.json()
+        if event["payload"]["kind"] == "message.created"
+    }
+    assert str(first_message_uuid) in visible_message_uuids
+    assert str(second_message_uuid) not in visible_message_uuids
+
+    deleted = api.delete(f"{STREAM_BINDINGS}{first_binding_uuid}")
+    assert deleted.status_code in (200, 204), deleted.text
+
+    streams_after = api.get(STREAMS, user=removed_user_uuid)
+    assert streams_after.status_code == 200, streams_after.text
+    assert not {
+        stream["uuid"]
+        for stream in streams_after.json()
+        if stream["uuid"] in {first_stream_uuid, second_stream_uuid}
+    }
+    events_after = workspace_api.get(EVENTS, params={"page_limit": 100})
+    assert events_after.status_code == 200, events_after.text
+    visible_message_uuids = {
+        event["payload"].get("uuid")
+        for event in events_after.json()
+        if event["payload"]["kind"] == "message.created"
+    }
+    assert str(first_message_uuid) not in visible_message_uuids
+    assert str(second_message_uuid) not in visible_message_uuids
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT provider, provider_realm_id, provider_chat_id
+            FROM m_workspace_external_chat_membership_revocations
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone() == ("zulip", provider_realm_uuid, "channel:42")
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+              AND stream_uuid = %s
+              AND user_uuid = %s
+            """,
+            (api.project_id, second_stream_uuid, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+              AND stream_uuid = %s
+              AND user_uuid = %s
+            """,
+            (api.project_id, second_stream_uuid, str(removed_user_uuid)),
+        )
+        cur.execute(
+            """
+            DELETE FROM m_workspace_external_chat_membership_revocations
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        cur.execute(
+            'DELETE FROM "ra_migrations" WHERE uuid = %s',
+            (EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID,),
+        )
+
+    migration_engine = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )
+    migration_engine.apply_migration(EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT provider, provider_realm_id, provider_chat_id
+            FROM m_workspace_external_chat_membership_revocations
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone() == ("zulip", provider_realm_uuid, "channel:42")
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 0
+
+    _run_database_operation(
+        lambda session: external_projection.ensure_external_chat_stream(
+            session,
+            project_id=sys_uuid.UUID(api.project_id),
+            owner_user_uuid=second_owner_uuid,
+            projection_stream_uuid=sys_uuid.UUID(second_stream_uuid),
+            bridge_instance_uuid=sys_uuid.uuid4(),
+            external_account_uuid=second_account_uuid,
+            provider_kind="zulip",
+            provider_chat_id="channel:42",
+            display_name="Second provider projection",
+            source={
+                "chat_type": "channel",
+                "provider_realm_uuid": provider_realm_uuid,
+                "participants": [
+                    {
+                        "identity_uuid": str(second_owner_uuid),
+                        "role": "owner",
+                    },
+                    {
+                        "identity_uuid": str(removed_user_uuid),
+                        "role": "member",
+                    },
+                ],
+            },
+            capabilities={},
+            account_settings={"server_url": "https://zulip.example.test"},
+        )
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+              AND stream_uuid = %s
+              AND user_uuid = %s
+            """,
+            (api.project_id, second_stream_uuid, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 0
+
+    restored = api.post(
+        f"{STREAMS}{first_stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(removed_user_uuid)]},
+    )
+    assert restored.status_code in (200, 201), restored.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_external_chat_membership_revocations
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            'DELETE FROM "ra_migrations" WHERE uuid = %s',
+            (EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID,),
+        )
+
+    migration_engine.apply_migration(EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_external_chat_membership_revocations
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(removed_user_uuid)),
+        )
+        assert cur.fetchone()[0] == 1
 
 
 def test_streams_cursor_pagination_with_composite_pk(api, db):

@@ -265,6 +265,23 @@ def test_revoked_stream_messages_require_current_membership():
     assert 'binding."user_uuid" = e."user_uuid"' in migration
 
 
+def test_external_message_visibility_uses_canonical_projection_access():
+    migration = (
+        __import__("pathlib").Path(__file__).parents[3]
+        / (
+            "migrations/"
+            "0123-deduplicate-and-revoke-external-chat-memberships-aadb67.py"
+        )
+    ).read_text()
+
+    assert "ROW_NUMBER() OVER" in migration
+    assert "candidate.provider_realm_id" in migration
+    assert "candidate.provider_chat_id" in migration
+    assert "m_workspace_external_chat_membership_revocations" in migration
+    assert 'external_stream."source_name" <> \'native\'' in migration
+    assert 'JOIN "m_confirmed_external_account_access" AS stream_access' in migration
+
+
 def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
     message_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -887,7 +904,10 @@ def test_canonical_store_events_preserve_cursor_scope_order_and_limit(monkeypatc
     assert 'FROM "m_workspace_events"' in statement
     assert 'FROM "m_workspace_broadcast_message_events_v1"' in statement
     assert statement.count('FROM "m_workspace_stream_bindings" AS binding') == 2
-    assert statement.count("(event.\"payload\"->>'stream_uuid')::uuid") == 2
+    assert statement.count("(event.\"payload\"->>'stream_uuid')::uuid") == 6
+    assert statement.count(
+        'JOIN "m_confirmed_external_account_access" AS stream_access'
+    ) == 2
     assert "UNION ALL" in statement
     assert parameters == (
         PROJECT_UUID,
