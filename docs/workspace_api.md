@@ -1006,7 +1006,7 @@ syntax. The URL part is a Workspace URN:
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
 | `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. The request fails with code `400001007` when the stream has no default. |
 | `author_uuid` | UUID | no | yes | Message author. |
-| `payload` | object | yes | no | Markdown message payload; trimmed content must be 1..10,000 characters. |
+| `payload` | object | yes | no | Markdown message payload; trimmed content must be 1..40,000 characters. |
 | `user_uuid` | UUID | no | yes | Current user in the user message view. |
 | `read` | boolean | no | yes | Current user's read flag. Authors are created as read. |
 | `pinned` | boolean | no | yes | Current user's pinned flag. |
@@ -1193,7 +1193,7 @@ If-Match: "1"
 
 Create requests require `uuid`, `stream_uuid`, `topic_uuid`, and a Markdown
 payload. Markdown content is trimmed, must remain non-empty, and is limited to
-10,000 characters. Retrying the exact same canonical create UUID returns the
+40,000 characters. Retrying the exact same canonical create UUID returns the
 existing draft without another mutation; reusing the UUID with different fields
 returns `409`.
 

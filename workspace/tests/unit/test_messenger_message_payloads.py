@@ -1,6 +1,24 @@
 import uuid
 
+import pytest
+from restalchemy.common import exceptions as ra_exc
+
 from workspace.messenger_api.dm import message_payloads
+
+
+def test_markdown_payload_accepts_workspace_content_limit():
+    payload = message_payloads.MarkdownPayload(
+        content="x" * message_payloads.MARKDOWN_CONTENT_MAX_LENGTH,
+    )
+
+    assert len(payload.content) == message_payloads.MARKDOWN_CONTENT_MAX_LENGTH
+
+
+def test_markdown_payload_rejects_content_over_workspace_limit():
+    with pytest.raises(ra_exc.TypeError):
+        message_payloads.MarkdownPayload(
+            content="x" * (message_payloads.MARKDOWN_CONTENT_MAX_LENGTH + 1),
+        )
 
 
 def test_markdown_payload_recognizes_canonical_user_urn_mention():

@@ -22,11 +22,14 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
 
+MARKDOWN_CONTENT_MAX_LENGTH = 40_000
+
+
 class MarkdownPayload(types_dynamic.AbstractKindModel):
     KIND = "markdown"
 
     content = properties.property(
-        types.String(min_length=1, max_length=10000),
+        types.String(min_length=1, max_length=MARKDOWN_CONTENT_MAX_LENGTH),
         required=True,
     )
 

@@ -97,7 +97,7 @@ def _assert_draft_contract(paths, collection_path):
     ]["schema"]["properties"]["payload"]
     assert payload_schema["required"] == ["kind", "content"]
     assert payload_schema["properties"]["kind"]["enum"] == ["markdown"]
-    assert payload_schema["properties"]["content"]["maxLength"] == 10000
+    assert payload_schema["properties"]["content"]["maxLength"] == 40000
     error_schema = paths[collection_path]["post"]["responses"][409]["content"][
         "application/json"
     ]["schema"]
@@ -178,6 +178,15 @@ def test_generated_openapi_color_defaults_are_deterministic():
     }
     assert color_schemas
     assert all("default" not in schema for schema in color_schemas.values())
+
+
+def test_generated_openapi_message_payload_uses_markdown_content_limit():
+    specification = _build_openapi(messenger_app)
+    payload_schema = specification["components"]["schemas"][
+        "WorkspaceUserMessage_Create"
+    ]["properties"]["payload"]
+
+    assert payload_schema["oneOf"][0]["properties"]["content"]["maxLength"] == 40000
 
 
 def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
