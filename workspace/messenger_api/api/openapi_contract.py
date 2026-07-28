@@ -6,6 +6,8 @@
 import copy
 import typing
 
+from workspace.messenger_api.dm import message_payloads
+
 
 PAGINATION_LIMIT_PARAMETER = {
     "name": "page_limit",
@@ -106,7 +108,11 @@ DRAFT_PAYLOAD_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "kind": {"type": "string", "enum": ["markdown"]},
-        "content": {"type": "string", "minLength": 1, "maxLength": 10000},
+        "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": message_payloads.MARKDOWN_CONTENT_MAX_LENGTH,
+        },
     },
 }
 

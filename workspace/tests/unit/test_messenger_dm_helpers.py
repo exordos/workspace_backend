@@ -19,8 +19,11 @@ import unittest
 import uuid as sys_uuid
 from unittest import mock
 
+from restalchemy.common import exceptions as ra_exc
+
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.dm import helpers as dm_helpers
+from workspace.messenger_api.dm import message_payloads
 
 
 class MessengerDMHelpersTestCase(unittest.TestCase):
@@ -49,6 +52,23 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 self._dirty = False
 
         return ExistingStream(**kwargs)
+
+    def test_draft_payload_uses_workspace_markdown_limit(self):
+        content = "x" * message_payloads.MARKDOWN_CONTENT_MAX_LENGTH
+
+        payload = dm_helpers._normalize_workspace_draft_payload(
+            {"kind": "markdown", "content": content}
+        )
+
+        self.assertEqual(content, payload.content)
+
+    def test_draft_payload_rejects_content_over_workspace_markdown_limit(self):
+        content = "x" * (message_payloads.MARKDOWN_CONTENT_MAX_LENGTH + 1)
+
+        with self.assertRaises(ra_exc.ValidationErrorException):
+            dm_helpers._normalize_workspace_draft_payload(
+                {"kind": "markdown", "content": content}
+            )
 
     def test_get_workspace_event_project_ids_uses_project_view(self):
         first_project_id = sys_uuid.uuid4()

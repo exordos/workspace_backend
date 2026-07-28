@@ -169,7 +169,7 @@ def _normalize_workspace_draft_payload(payload: typing.Any) -> typing.Any:
             raise ra_exc.ValidationErrorException()
         content = payload.content
     content = content.strip()
-    if not content or len(content) > 10000:
+    if not content or len(content) > message_payloads.MARKDOWN_CONTENT_MAX_LENGTH:
         raise ra_exc.ValidationErrorException()
     return message_payloads.MarkdownPayload(content=content)
 
