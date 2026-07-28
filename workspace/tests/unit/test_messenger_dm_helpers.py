@@ -3903,6 +3903,85 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         create_updated_event.assert_not_called()
         create_unread_events.assert_not_called()
 
+    def test_sync_workspace_user_message_flags_allows_provider_own_unread(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        session = object()
+        current_message = types.SimpleNamespace(
+            author_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            read=True,
+        )
+        returned_message = types.SimpleNamespace(read=False)
+        updated_flag = {}
+
+        class ExistingFlags:
+            read = True
+            starred = False
+            pinned = False
+
+            def update_dm(self, values):
+                updated_flag["values"] = values
+                self.read = values["read"]
+
+            def update(self, session=None):
+                updated_flag["update_session"] = session
+
+        class FakeWorkspaceUserMessageFlags:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingFlags())
+            )
+
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[current_message, returned_message],
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_read_event"
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events, "create_message_updated_event"
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers, "_create_message_unread_updated_events"
+            ) as create_unread_events,
+        ):
+            result = dm_helpers.sync_workspace_user_message_flags(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+                values={"read": False},
+                session=session,
+                allow_author_unread=True,
+            )
+
+        self.assertIs(returned_message, result)
+        self.assertEqual({"read": False}, updated_flag["values"])
+        self.assertIs(session, updated_flag["update_session"])
+        create_read_event.assert_not_called()
+        create_updated_event.assert_called_once_with(
+            message=returned_message,
+            session=session,
+        )
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+        )
+
     def test_sync_workspace_user_message_flags_marks_message_read(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -4066,6 +4145,84 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             topic_uuids=[first_topic_uuid, second_topic_uuid],
+            session=session,
+        )
+
+    def test_sync_workspace_user_messages_read_state_allows_provider_own_unread(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+        message = types.SimpleNamespace(
+            uuid=message_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            author_uuid=user_uuid,
+        )
+        returned_message = types.SimpleNamespace(uuid=message_uuid, read=False)
+        update_sessions = []
+
+        class ExistingFlags:
+            read = True
+
+            def update_dm(self, values):
+                self.read = values["read"]
+
+            def update(self, session=None):
+                update_sessions.append(session)
+
+        class FakeWorkspaceUserMessageFlags:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=ExistingFlags()),
+            )
+
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserMessageFlags",
+                FakeWorkspaceUserMessageFlags,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                return_value=returned_message,
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_messages_read_event",
+            ) as create_read_event,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_updated_event",
+            ) as create_updated_event,
+            mock.patch.object(
+                dm_helpers,
+                "_create_unread_updated_events",
+            ) as create_unread_events,
+        ):
+            result = dm_helpers.sync_workspace_user_messages_read_state(
+                project_id,
+                user_uuid,
+                [message],
+                False,
+                session=session,
+                allow_author_unread=True,
+            )
+
+        self.assertEqual([returned_message], result)
+        self.assertEqual([session], update_sessions)
+        create_read_event.assert_not_called()
+        create_updated_event.assert_called_once_with(
+            message=returned_message,
+            session=session,
+        )
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=[topic_uuid],
             session=session,
         )
 

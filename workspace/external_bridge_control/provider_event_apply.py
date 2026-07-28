@@ -597,6 +597,7 @@ def _message_event(
             message_uuid,
             {"read": read_value},
             session=session,
+            allow_author_unread=True,
         )
     return message_uuid
 
@@ -749,6 +750,7 @@ def _read_state_event(
         messages,
         read,
         session=session,
+        allow_author_unread=True,
     )
     return stream_uuid
 

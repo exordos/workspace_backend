@@ -914,7 +914,7 @@ def test_provider_message_snapshot_applies_owner_read_state(monkeypatch):
                 message_uuid,
                 {"read": False},
             ),
-            {"session": session},
+            {"session": session, "allow_author_unread": True},
         )
     ]
 
@@ -1203,7 +1203,7 @@ def test_provider_read_state_updates_exact_owner_messages(monkeypatch):
     assert updates == [
         (
             (project_uuid, owner_uuid, list(messages.values()), True),
-            {"session": session},
+            {"session": session, "allow_author_unread": True},
         )
     ]
     lock_statement, lock_params = session.statements[1]
@@ -1315,7 +1315,10 @@ def test_provider_read_state_defers_messages_not_yet_imported(monkeypatch):
     assert updates[0][0][0:2] == (project_uuid, owner_uuid)
     assert [message.uuid for message in updates[0][0][2]] == [imported_uuid]
     assert updates[0][0][3] is True
-    assert updates[0][1] == {"session": session}
+    assert updates[0][1] == {
+        "session": session,
+        "allow_author_unread": True,
+    }
 
 
 def test_message_update_uses_compact_broadcast_path(monkeypatch):

@@ -6487,8 +6487,7 @@ def test_projection_helper_does_not_bypass_canonical_event_journal(
     assert events[0]["payload"]["uuid"] == str(message_uuid)
 
 
-def test_zulip_message_flag_sync_keeps_author_read(api, db):
-    other_user = sys_uuid.uuid4()
+def test_zulip_message_flag_sync_can_keep_author_unread(api, db):
     server_url = "https://zulip.example.test"
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "zulip-own-message"
@@ -6501,40 +6500,38 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
         "general",
         is_default=True,
     )
-    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
+    owner_external_account_uuid = sys_uuid.uuid4()
     with db.cursor() as cur:
-        for user_uuid in (api.user_uuid, other_user):
-            external_account_uuid = sys_uuid.uuid4()
-            cur.execute(
-                """
-                INSERT INTO m_external_accounts_v2
-                    (uuid, owner_user_uuid, provider, settings,
-                     credential_present, status, live_ready)
-                VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live', TRUE)
-                """,
-                (
-                    str(external_account_uuid),
-                    str(user_uuid),
-                    f'{{"kind":"zulip","server_url":"{server_url}"}}',
-                ),
-            )
-            cur.execute(
-                """
-                INSERT INTO m_external_chats_v2
-                    (uuid, external_account_uuid, owner_user_uuid, provider,
-                     provider_chat_id, source, display_name, selected,
-                     project_id)
-                VALUES (%s, %s, %s, 'zulip', %s, '{}'::jsonb,
-                        'Zulip test', TRUE, %s)
-                """,
-                (
-                    str(sys_uuid.uuid4()),
-                    str(external_account_uuid),
-                    str(user_uuid),
-                    f"chat-{user_uuid}",
-                    api.project_id,
-                ),
-            )
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2
+                (uuid, owner_user_uuid, provider, settings,
+                 credential_present, status, live_ready)
+            VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live', TRUE)
+            """,
+            (
+                str(owner_external_account_uuid),
+                str(api.user_uuid),
+                f'{{"kind":"zulip","server_url":"{server_url}"}}',
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_chats_v2
+                (uuid, external_account_uuid, owner_user_uuid, provider,
+                 provider_chat_id, source, display_name, selected,
+                 project_id)
+            VALUES (%s, %s, %s, 'zulip', %s, '{}'::jsonb,
+                    'Zulip test', TRUE, %s)
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(owner_external_account_uuid),
+                str(api.user_uuid),
+                f"chat-{api.user_uuid}",
+                api.project_id,
+            ),
+        )
     message_uuid = sys_uuid.uuid4()
 
     def create_and_sync_flags(session):
@@ -6549,6 +6546,7 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
             source=messenger_models.ZulipSource(
                 stream_id=42,
                 server_url=server_url,
+                source_scope=str(owner_external_account_uuid),
                 topic_name="general",
                 message_id=123,
             ),
@@ -6561,16 +6559,13 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
             message_uuid=message_uuid,
             values={"read": False},
             session=session,
+            allow_author_unread=True,
         )
-        assert message.read is True
-        return messenger_dm_helpers.get_workspace_user_message(
-            project_id=sys_uuid.UUID(api.project_id),
-            user_uuid=other_user,
-            message_uuid=message_uuid,
-        )
+        assert message.read is False
+        return message
 
-    other_message = _run_database_operation(create_and_sync_flags)
-    assert other_message.read is False
+    owner_message = _run_database_operation(create_and_sync_flags)
+    assert owner_message.read is False
 
     with db.cursor() as cur:
         cur.execute(
@@ -6585,8 +6580,7 @@ def test_zulip_message_flag_sync_keeps_author_read(api, db):
         flags = {str(row[0]): row[1] for row in cur.fetchall()}
 
     assert flags == {
-        str(api.user_uuid): True,
-        str(other_user): False,
+        str(api.user_uuid): False,
     }
 
 
