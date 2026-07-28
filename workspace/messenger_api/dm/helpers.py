@@ -3687,13 +3687,18 @@ def sync_workspace_user_message_flags(
     message_uuid: object,
     values: typing.Any,
     session: typing.Any = None,
+    allow_author_unread: bool = False,
 ) -> typing.Any:
     current_message = get_workspace_user_message(
         project_id=project_id,
         user_uuid=user_uuid,
         message_uuid=message_uuid,
     )
-    if values.get("read") is False and current_message.author_uuid == user_uuid:
+    if (
+        values.get("read") is False
+        and current_message.author_uuid == user_uuid
+        and not allow_author_unread
+    ):
         values = dict(values)
         values["read"] = True
     flags = models.WorkspaceUserMessageFlags.objects.get_one(
@@ -3751,13 +3756,15 @@ def sync_workspace_user_messages_read_state(
     messages: typing.Any,
     read: bool,
     session: typing.Any = None,
+    allow_author_unread: bool = False,
 ) -> typing.Any:
     """Apply one provider read-state batch and emit bounded public events."""
     changed_messages = []
     topic_uuids_by_stream: dict[object, list[object]] = {}
     for current_message in messages:
-        effective_read = (
-            read or getattr(current_message, "author_uuid", None) == user_uuid
+        effective_read = read or (
+            getattr(current_message, "author_uuid", None) == user_uuid
+            and not allow_author_unread
         )
         flags = models.WorkspaceUserMessageFlags.objects.get_one(
             filters={
