@@ -25,6 +25,26 @@ imports:
     element: "$core"
     kind: "resource"
     link: "$core.dns.domains.$local_domain"
+  profile_develop:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$develop"
+  profile_small:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$small"
+  profile_medium:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$medium"
+  profile_large:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$large"
+  profile_legacy:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$legacy"
   var_default_cores:
     element: "$core"
     kind: "resource"
@@ -47,6 +67,26 @@ imports:
     link: "$core.vs.variables.$iam_default_client_id"
 
 resources:
+
+  $core.vs.variables:
+    workspace_s3_disk_size:
+      name: "workspace_s3_disk_size"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace.imports.$profile_develop:uuid
+            value: 8
+          - profile: $workspace.imports.$profile_small:uuid
+            value: 51
+          - profile: $workspace.imports.$profile_medium:uuid
+            value: 100
+          - profile: $workspace.imports.$profile_large:uuid
+            value: 1024
+          - profile: $workspace.imports.$profile_legacy:uuid
+            value: 1024
 
   # Canonical action permissions for realm-level external-provider operations.
   # The element owns only the permission catalog. Operators grant the required
@@ -250,7 +290,7 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       cpu: $workspace.imports.$var_default_cores:value
       ram: $workspace.imports.$var_default_ram:value
-      disk_size: 51
+      disk_size: $core.vs.variables.$workspace_s3_disk_size:value
       nodes_number: 1
       kind: "single_node"
       version: $workspace.imports.$rustfs_1:uuid
