@@ -39,6 +39,10 @@ DIRECTORY_VIEW_MIGRATION_FILE = (
 )
 RETENTION_MIGRATION_UUID = "ae5fdfd7-8767-45f7-8471-8448b5900782"
 RETENTION_MIGRATION_FILE = "0120-index-bounded-retention-cleanup-ae5fdf.py"
+MEMBER_PROJECTION_ACCESS_MIGRATION_UUID = "35e3d356-9fe8-4dd4-b6db-6c9da527d891"
+MEMBER_PROJECTION_ACCESS_MIGRATION_FILE = (
+    "0121-grant-external-projection-access-to-members-35e3d3.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -55,7 +59,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == RETENTION_MIGRATION_FILE
+    assert engine.get_latest_migration() == MEMBER_PROJECTION_ACCESS_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -69,6 +73,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     PUSH_DEVICE_MIGRATION_UUID,
                     DIRECTORY_VIEW_MIGRATION_UUID,
                     RETENTION_MIGRATION_UUID,
+                    MEMBER_PROJECTION_ACCESS_MIGRATION_UUID,
                 ],
             ),
         )
@@ -81,6 +86,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (PUSH_DEVICE_MIGRATION_UUID, True),
             (DIRECTORY_VIEW_MIGRATION_UUID, True),
             (RETENTION_MIGRATION_UUID, True),
+            (MEMBER_PROJECTION_ACCESS_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
@@ -103,8 +109,10 @@ def test_external_projection_access_is_scoped_to_account(
     account_b_uuid = "10000000-0000-4000-8000-000000000105"
     chat_a_uuid = "10000000-0000-4000-8000-000000000106"
     chat_b_uuid = "10000000-0000-4000-8000-000000000107"
+    unbound_user_uuid = "10000000-0000-4000-8000-000000000108"
     conftest.seed_workspace_user(db, owner_a_uuid, "projection-owner-a")
     conftest.seed_workspace_user(db, owner_b_uuid, "projection-owner-b")
+    conftest.seed_workspace_user(db, unbound_user_uuid, "projection-unbound")
     stream_uuid = conftest.seed_user_stream(
         db,
         project_uuid,
@@ -151,10 +159,11 @@ def test_external_projection_access_is_scoped_to_account(
             """
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
-                provider_chat_id, source, display_name, selected, project_id
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
             ) VALUES (
                 %s, %s, %s, 'zulip', %s,
-                '{"participants":[]}'::jsonb, %s, TRUE, %s
+                '{"participants":[]}'::jsonb, %s, TRUE, %s, %s
             )
             """,
             (
@@ -165,6 +174,7 @@ def test_external_projection_access_is_scoped_to_account(
                     "channel:7",
                     "Account A provider projection",
                     project_uuid,
+                    stream_uuid,
                 ),
                 (
                     chat_b_uuid,
@@ -173,6 +183,7 @@ def test_external_projection_access_is_scoped_to_account(
                     "channel:8",
                     "Account B provider projection",
                     project_uuid,
+                    None,
                 ),
             ),
         )
@@ -203,9 +214,14 @@ def test_external_projection_access_is_scoped_to_account(
             'DELETE FROM "ra_migrations" WHERE uuid = %s',
             (EXTERNAL_ACCOUNT_SCOPE_MIGRATION_UUID,),
         )
+        cur.execute(
+            'DELETE FROM "ra_migrations" WHERE uuid = %s',
+            (MEMBER_PROJECTION_ACCESS_MIGRATION_UUID,),
+        )
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine.apply_migration(EXTERNAL_ACCOUNT_SCOPE_MIGRATION_FILE)
+    engine.apply_migration(MEMBER_PROJECTION_ACCESS_MIGRATION_FILE)
 
     with db.cursor() as cur:
         cur.execute(
@@ -226,6 +242,15 @@ def test_external_projection_access_is_scoped_to_account(
             """,
             (project_uuid, stream_uuid, owner_b_uuid),
         )
+        assert cur.fetchone()[0] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_streams
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, unbound_user_uuid),
+        )
         assert cur.fetchone()[0] == 0
         cur.execute(
             """
@@ -241,10 +266,14 @@ def test_external_projection_access_is_scoped_to_account(
             SELECT source_scope
             FROM m_confirmed_external_account_access
             WHERE project_id = %s AND user_uuid = %s
+            ORDER BY source_scope
             """,
             (project_uuid, owner_b_uuid),
         )
-        assert cur.fetchone()[0] == account_b_uuid
+        assert [row[0] for row in cur.fetchall()] == [
+            account_a_uuid,
+            account_b_uuid,
+        ]
         cur.execute(
             """
             SELECT epoch_generation, current_epoch_version,

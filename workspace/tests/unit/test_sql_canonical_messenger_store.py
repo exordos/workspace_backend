@@ -17,6 +17,7 @@ from workspace.messenger_api.api import sql_canonical_store
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
 USER_UUID = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
+PROJECTION_OWNER_UUID = sys_uuid.UUID("30000000-0000-0000-0000-000000000003")
 
 
 class FakeObjects:
@@ -234,6 +235,20 @@ def test_public_file_view_has_no_users_cross_join():
     assert 'NULL::UUID AS "viewer_user_uuid"' in migration
 
 
+def test_provider_projection_access_includes_bound_members():
+    migration = (
+        __import__("pathlib").Path(__file__).parents[3]
+        / "migrations/0121-grant-external-projection-access-to-members-35e3d3.py"
+    ).read_text()
+
+    assert 'JOIN "m_workspace_stream_bindings" AS binding' in migration
+    assert "binding.stream_uuid = chat.projection_stream_uuid" in migration
+    assert "binding.project_id = chat.project_id" in migration
+    assert "binding.user_uuid" in migration
+    assert "account.owner_user_uuid AS user_uuid" in migration
+    assert "account.uuid::text::varchar(2048) AS source_scope" in migration
+
+
 def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
     message_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
@@ -297,14 +312,21 @@ def test_canonical_store_has_no_mail_replay_or_nested_session_boundary():
     assert "session_manager" not in source
 
 
-def test_provider_operation_uses_same_request_transaction(monkeypatch):
+def test_provider_operation_uses_projection_owner_target_in_request_transaction(
+    monkeypatch,
+):
     stream_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
     bridge_uuid = sys_uuid.uuid4()
     target_uuid = sys_uuid.uuid4()
     session = object()
     stream_objects = FakeObjects(
-        [types.SimpleNamespace(external_account_uuid=account_uuid)]
+        [
+            types.SimpleNamespace(
+                external_account_uuid=account_uuid,
+                user_uuid=PROJECTION_OWNER_UUID,
+            )
+        ]
     )
     account = types.SimpleNamespace(uuid=account_uuid)
     bridge = types.SimpleNamespace(uuid=bridge_uuid)
@@ -359,7 +381,7 @@ def test_provider_operation_uses_same_request_transaction(monkeypatch):
             session,
             {
                 "project_id": PROJECT_UUID,
-                "owner_user_uuid": USER_UUID,
+                "owner_user_uuid": PROJECTION_OWNER_UUID,
                 "external_account_uuid": account_uuid,
                 "stream_uuid": stream_uuid,
                 "capability_name": "messenger.message.send",

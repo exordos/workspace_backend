@@ -645,7 +645,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             account, _chat, bridge = provider_data.resolve_provider_target(
                 session,
                 project_id=self.project_uuid,
-                owner_user_uuid=self.user_uuid,
+                owner_user_uuid=stream.user_uuid,
                 external_account_uuid=stream.external_account_uuid,
                 stream_uuid=stream_uuid,
                 capability_name=required_capability,
