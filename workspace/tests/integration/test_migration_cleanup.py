@@ -47,17 +47,17 @@ REVOKED_STREAM_ACCESS_MIGRATION_UUID = "640b9d0e-f465-4359-abb4-47fdd60b5c40"
 REVOKED_STREAM_ACCESS_MIGRATION_FILE = (
     "0122-revoke-external-projection-access-on-stream-removal-640b9d.py"
 )
-EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = (
-    "aadb67c9-c716-4066-9867-b82079c1c283"
-)
+EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = "aadb67c9-c716-4066-9867-b82079c1c283"
 EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE = (
     "0123-deduplicate-and-revoke-external-chat-memberships-aadb67.py"
 )
-EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID = (
-    "78c745a8-08a2-4432-a511-9e0875cc35db"
-)
+EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID = "78c745a8-08a2-4432-a511-9e0875cc35db"
 EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_FILE = (
     "0124-deduplicate-external-account-access-78c745.py"
+)
+EXTERNAL_STREAM_ACCESS_MIGRATION_UUID = "e82c027f-2481-4447-85fb-8648b335a6cd"
+EXTERNAL_STREAM_ACCESS_MIGRATION_FILE = (
+    "0125-scope-external-visibility-to-canonical-streams-e82c02.py"
 )
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
@@ -75,10 +75,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert (
-        engine.get_latest_migration()
-        == EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_FILE
-    )
+    assert engine.get_latest_migration() == EXTERNAL_STREAM_ACCESS_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -96,6 +93,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     REVOKED_STREAM_ACCESS_MIGRATION_UUID,
                     EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID,
                     EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID,
+                    EXTERNAL_STREAM_ACCESS_MIGRATION_UUID,
                 ],
             ),
         )
@@ -112,6 +110,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (REVOKED_STREAM_ACCESS_MIGRATION_UUID, True),
             (EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID, True),
             (EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID, True),
+            (EXTERNAL_STREAM_ACCESS_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
@@ -445,6 +444,408 @@ def test_external_account_access_deduplicates_multiple_selected_chats(
             [
                 (first_stream_uuid, 1),
                 (second_stream_uuid, 1),
+            ]
+        )
+
+
+def test_external_visibility_uses_the_canonical_stream_per_logical_chat(
+    _database,
+    db,
+):
+    owner_a_uuid = "30000000-0000-4000-8000-000000000101"
+    owner_b_uuid = "30000000-0000-4000-8000-000000000102"
+    project_uuid = "30000000-0000-4000-8000-000000000103"
+    account_a_uuid = "30000000-0000-4000-8000-000000000104"
+    account_b_uuid = "30000000-0000-4000-8000-000000000105"
+    provider_realm_uuid = "30000000-0000-4000-8000-000000000106"
+    stream_a_x_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_a_uuid,
+        "Account A chat X",
+    )
+    stream_b_x_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_b_uuid,
+        "Account B chat X",
+    )
+    stream_b_y_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_b_uuid,
+        "Account B chat Y",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        project_uuid,
+        stream_b_x_uuid,
+        owner_a_uuid,
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        project_uuid,
+        stream_b_y_uuid,
+        owner_a_uuid,
+    )
+    topic_a_x_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_a_x_uuid,
+        owner_a_uuid,
+        "Topic A/X",
+    )
+    topic_b_x_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_b_x_uuid,
+        owner_a_uuid,
+        "Topic B/X",
+    )
+    topic_b_y_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_b_y_uuid,
+        owner_a_uuid,
+        "Topic B/Y",
+    )
+    message_uuids = (
+        "30000000-0000-4000-8000-000000000201",
+        "30000000-0000-4000-8000-000000000202",
+        "30000000-0000-4000-8000-000000000203",
+    )
+    event_uuids = (
+        "30000000-0000-4000-8000-000000000301",
+        "30000000-0000-4000-8000-000000000302",
+        "30000000-0000-4000-8000-000000000303",
+    )
+    reaction_event_uuids = (
+        "30000000-0000-4000-8000-000000000401",
+        "30000000-0000-4000-8000-000000000402",
+        "30000000-0000-4000-8000-000000000403",
+    )
+
+    with db.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (
+                %s, %s, 'zulip',
+                jsonb_build_object(
+                    'kind', 'zulip',
+                    'server_url', 'https://zulip.example.test'
+                ),
+                TRUE, 'live', TRUE
+            )
+            """,
+            (
+                (account_a_uuid, owner_a_uuid),
+                (account_b_uuid, owner_b_uuid),
+            ),
+        )
+        cur.executemany(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = jsonb_build_object(
+                    'kind', 'zulip',
+                    'server_url', 'https://zulip.example.test',
+                    'source_scope', CAST(%s AS text)
+                ),
+                external_account_uuid = %s,
+                provider_external_id = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                (
+                    account_a_uuid,
+                    account_a_uuid,
+                    "channel:x",
+                    project_uuid,
+                    stream_a_x_uuid,
+                ),
+                (
+                    account_b_uuid,
+                    account_b_uuid,
+                    "channel:x",
+                    project_uuid,
+                    stream_b_x_uuid,
+                ),
+                (
+                    account_b_uuid,
+                    account_b_uuid,
+                    "channel:y",
+                    project_uuid,
+                    stream_b_y_uuid,
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
+            ) VALUES (
+                %s, %s, %s, 'zulip', %s,
+                jsonb_build_object(
+                    'provider_realm_uuid', CAST(%s AS text)
+                ),
+                %s, TRUE, %s, %s
+            )
+            """,
+            (
+                (
+                    "30000000-0000-4000-8000-000000000111",
+                    account_a_uuid,
+                    owner_a_uuid,
+                    "channel:x",
+                    provider_realm_uuid,
+                    "Account A chat X",
+                    project_uuid,
+                    stream_a_x_uuid,
+                ),
+                (
+                    "30000000-0000-4000-8000-000000000112",
+                    account_b_uuid,
+                    owner_b_uuid,
+                    "channel:x",
+                    provider_realm_uuid,
+                    "Account B chat X",
+                    project_uuid,
+                    stream_b_x_uuid,
+                ),
+                (
+                    "30000000-0000-4000-8000-000000000113",
+                    account_b_uuid,
+                    owner_b_uuid,
+                    "channel:y",
+                    provider_realm_uuid,
+                    "Account B chat Y",
+                    project_uuid,
+                    stream_b_y_uuid,
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"historical"}',
+                'native', '{"kind":"native"}'
+            )
+            """,
+            (
+                (
+                    message_uuids[0],
+                    project_uuid,
+                    stream_a_x_uuid,
+                    topic_a_x_uuid,
+                    owner_a_uuid,
+                ),
+                (
+                    message_uuids[1],
+                    project_uuid,
+                    stream_b_x_uuid,
+                    topic_b_x_uuid,
+                    owner_b_uuid,
+                ),
+                (
+                    message_uuids[2],
+                    project_uuid,
+                    stream_b_y_uuid,
+                    topic_b_y_uuid,
+                    owner_b_uuid,
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read, pinned, starred
+            ) VALUES (%s, %s, %s, FALSE, FALSE, FALSE)
+            """,
+            (
+                (message_uuid, owner_a_uuid, project_uuid)
+                for message_uuid in message_uuids
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_events (
+                uuid, project_id, user_uuid, schema_version,
+                object_type, action, payload
+            ) VALUES (
+                %s, %s, %s, 1, 'message', 'created',
+                jsonb_build_object(
+                    'kind', 'message.created',
+                    'uuid', CAST(%s AS text),
+                    'stream_uuid', CAST(%s AS text),
+                    'source_name', 'native'
+                )
+            )
+            """,
+            (
+                (
+                    event_uuids[0],
+                    project_uuid,
+                    owner_a_uuid,
+                    message_uuids[0],
+                    stream_a_x_uuid,
+                ),
+                (
+                    event_uuids[1],
+                    project_uuid,
+                    owner_a_uuid,
+                    message_uuids[1],
+                    stream_b_x_uuid,
+                ),
+                (
+                    event_uuids[2],
+                    project_uuid,
+                    owner_a_uuid,
+                    message_uuids[2],
+                    stream_b_y_uuid,
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_events (
+                uuid, project_id, user_uuid, schema_version,
+                object_type, action, payload
+            ) VALUES (
+                %s, %s, %s, 1, 'message_reaction', 'created',
+                jsonb_build_object(
+                    'kind', 'message_reaction.created',
+                    'uuid', CAST(%s AS text),
+                    'message_uuid', CAST(%s AS text),
+                    'source_name', 'native'
+                )
+            )
+            """,
+            (
+                (
+                    reaction_event_uuids[0],
+                    project_uuid,
+                    owner_a_uuid,
+                    reaction_event_uuids[0],
+                    message_uuids[0],
+                ),
+                (
+                    reaction_event_uuids[1],
+                    project_uuid,
+                    owner_a_uuid,
+                    reaction_event_uuids[1],
+                    message_uuids[1],
+                ),
+                (
+                    reaction_event_uuids[2],
+                    project_uuid,
+                    owner_a_uuid,
+                    reaction_event_uuids[2],
+                    message_uuids[2],
+                ),
+            ),
+        )
+
+        cur.execute(
+            """
+            SELECT source_scope
+            FROM m_confirmed_external_account_access
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY source_scope
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert [row[0] for row in cur.fetchall()] == [
+            account_a_uuid,
+            account_b_uuid,
+        ]
+        cur.execute(
+            """
+            SELECT stream_uuid::text
+            FROM m_confirmed_external_stream_access
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY stream_uuid
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert [row[0] for row in cur.fetchall()] == sorted(
+            [stream_a_x_uuid, stream_b_y_uuid]
+        )
+        cur.execute(
+            """
+            SELECT uuid::text
+            FROM m_workspace_user_streams
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert [row[0] for row in cur.fetchall()] == sorted(
+            [stream_a_x_uuid, stream_b_y_uuid]
+        )
+        cur.execute(
+            """
+            SELECT uuid::text
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert [row[0] for row in cur.fetchall()] == sorted(
+            [topic_a_x_uuid, topic_b_y_uuid]
+        )
+        cur.execute(
+            """
+            SELECT uuid::text
+            FROM m_workspace_user_messages_view
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert [row[0] for row in cur.fetchall()] == sorted(
+            [message_uuids[0], message_uuids[2]]
+        )
+        cur.execute(
+            """
+            SELECT uuid::text, unread_count
+            FROM m_unread_user_messages
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert cur.fetchall() == sorted([(stream_a_x_uuid, 1), (stream_b_y_uuid, 1)])
+        cur.execute(
+            """
+            SELECT uuid::text
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            (
+                project_uuid,
+                owner_a_uuid,
+                [*event_uuids, *reaction_event_uuids],
+            ),
+        )
+        assert [row[0] for row in cur.fetchall()] == sorted(
+            [
+                event_uuids[0],
+                event_uuids[2],
+                reaction_event_uuids[0],
+                reaction_event_uuids[2],
             ]
         )
 
