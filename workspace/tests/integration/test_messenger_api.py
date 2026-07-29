@@ -41,7 +41,9 @@ from restalchemy.storage.sql import sessions as ra_sessions
 from oslo_config import cfg
 
 from workspace.common import external_bridge_opts
+from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_event_apply
+from workspace.external_bridge_control import sql_state
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import external_projection
 from workspace.messenger_api import file_storage
@@ -71,9 +73,7 @@ EXTERNAL_OPERATIONS = f"{V1}/external_operations/"
 EXTERNAL_CHATS = f"{V1}/external_chats/"
 EXTERNAL_PROVIDER_POLICIES = f"{V1}/external_provider_policies/"
 EXTERNAL_PROVIDER_HEALTH = f"{V1}/external_provider_health/"
-EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = (
-    "aadb67c9-c716-4066-9867-b82079c1c283"
-)
+EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID = "aadb67c9-c716-4066-9867-b82079c1c283"
 EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_FILE = (
     "0123-deduplicate-and-revoke-external-chat-memberships-aadb67.py"
 )
@@ -712,6 +712,277 @@ def test_external_provider_policy_blocks_account_and_operation_boundaries(
         assert disabled.status_code == 403, disabled.text
     finally:
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
+
+
+def test_provider_operation_resolution_uses_current_administrative_policy(api, db):
+    _enable_zulip_policy(db)
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Current policy gate",
+    )
+    capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (
+                account_uuid,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+                json.dumps(capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities,
+                catalog_capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:current-policy',
+                '{"kind":"zulip","chat_type":"channel"}'::jsonb,
+                'Current policy gate', TRUE, %s, %s, 'live',
+                %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                api.user_uuid,
+                api.project_id,
+                stream_uuid,
+                json.dumps(capability),
+                json.dumps(capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+    db.commit()
+
+    def resolve():
+        return _run_database_operation(
+            lambda session: provider_data.resolve_provider_target(
+                session,
+                project_id=api.project_id,
+                owner_user_uuid=api.user_uuid,
+                external_account_uuid=account_uuid,
+                stream_uuid=stream_uuid,
+                capability_name="messenger.message.read",
+            )
+        )
+
+    assert resolve()[0].uuid == account_uuid
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = '{}'::jsonb
+            WHERE uuid = %s
+            """,
+            (bridge_uuid,),
+        )
+    db.commit()
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET catalog_capabilities = '{}'::jsonb
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+    db.commit()
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET catalog_capabilities = %s::jsonb
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), chat_uuid),
+        )
+    db.commit()
+    assert resolve()[1].uuid == chat_uuid
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET status = 'degraded',
+                last_heartbeat_at = NOW() - INTERVAL '61 seconds'
+            WHERE uuid = %s
+            """,
+            (bridge_uuid,),
+        )
+    db.commit()
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET status = 'active', last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (bridge_uuid,),
+        )
+    db.commit()
+    assert resolve()[2].uuid == bridge_uuid
+
+    replacement_bridge_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET created_at = NOW() - INTERVAL '1 hour'
+            WHERE uuid = %s
+            """,
+            (bridge_uuid,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (
+                uuid, provider, identity_generation, status, capabilities,
+                last_heartbeat_at
+            ) VALUES (%s, 'zulip', 2, 'active', %s::jsonb, NOW())
+            """,
+            (replacement_bridge_uuid, json.dumps(capability)),
+        )
+    db.commit()
+    assert resolve()[2].uuid == bridge_uuid
+    assert (
+        _run_database_operation(
+            lambda session: provider_data.resolve_provider_queue_target(
+                session,
+                project_id=api.project_id,
+                owner_user_uuid=api.user_uuid,
+                external_account_uuid=account_uuid,
+                stream_uuid=stream_uuid,
+            )
+        )[2].uuid
+        == bridge_uuid
+    )
+
+    suspended = api.post(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip/actions/suspend/invoke",
+        permissions=("workspace.external_provider_policy.suspend",),
+    )
+    assert suspended.status_code == 200, suspended.text
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+
+    resumed = api.post(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip/actions/resume/invoke",
+        permissions=("workspace.external_provider_policy.resume",),
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resolve()[1].uuid == chat_uuid
+
+    current = api.get(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip",
+        permissions=("workspace.external_provider_policy.read",),
+    )
+    assert current.status_code == 200, current.text
+    disabled = api.put(
+        f"{EXTERNAL_PROVIDER_POLICIES}zulip",
+        permissions=("workspace.external_provider_policy.update",),
+        headers={"If-Match": current.headers["ETag"]},
+        json={
+            "settings": {
+                "kind": "zulip",
+                "enabled": False,
+                "limits": {
+                    "max_accounts": 100,
+                    "max_selected_chats_per_account": 1000,
+                    "max_file_bytes": 104857600,
+                },
+                "custom_ca_bundle": None,
+            }
+        },
+    )
+    assert disabled.status_code == 200, disabled.text
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT account.capabilities, chat.capabilities
+            FROM m_external_accounts_v2 AS account
+            JOIN m_external_chats_v2 AS chat
+              ON chat.external_account_uuid = account.uuid
+            WHERE account.uuid = %s AND chat.uuid = %s
+            """,
+            (account_uuid, chat_uuid),
+        )
+        account_capabilities, chat_capabilities = cursor.fetchone()
+    assert account_capabilities == capability
+    assert chat_capabilities == capability
 
 
 def test_external_provider_admin_policy_ca_and_health_are_permission_scoped(api, db):
@@ -1400,8 +1671,7 @@ def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
     content_disposition = resp.headers["Content-Disposition"]
     assert 'filename="download.png"' in content_disposition
     assert (
-        "filename*=UTF-8''%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA"
-        in content_disposition
+        "filename*=UTF-8''%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA" in content_disposition
     )
 
     resp = api.post(
@@ -3529,6 +3799,7 @@ def test_stream_binding_create_starts_with_read_history_boundary(api, db):
 
 
 def test_provider_stream_membership_add_remove_duplicate_and_readd_queue(api, db):
+    _enable_zulip_policy(db)
     bridge_instance_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
     account_uuid = sys_uuid.uuid4()
     chat_uuid = sys_uuid.uuid4()
@@ -3579,10 +3850,12 @@ def test_provider_stream_membership_add_remove_duplicate_and_readd_queue(api, db
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
                 provider_chat_id, source, display_name, selected, project_id,
-                projection_stream_uuid, status, capabilities
+                projection_stream_uuid, status, capabilities,
+                catalog_capabilities
             ) VALUES (
                 %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
-                'Provider membership queue', TRUE, %s, %s, 'live', %s::jsonb
+                'Provider membership queue', TRUE, %s, %s, 'live',
+                %s::jsonb, %s::jsonb
             )
             """,
             (
@@ -3600,7 +3873,34 @@ def test_provider_stream_membership_add_remove_duplicate_and_readd_queue(api, db
                 api.project_id,
                 stream_uuid,
                 json.dumps(capability),
+                json.dumps(capability),
             ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_instance_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cur.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_instance_uuid),
         )
         cur.execute(
             """
@@ -3667,6 +3967,106 @@ def test_provider_stream_membership_add_remove_duplicate_and_readd_queue(api, db
         for operation in operations
     } == {(stream_uuid, str(target_user_uuid))}
     assert {operation[2] for operation in operations} == {bridge_instance_uuid}
+
+    blocked_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        blocked_user_uuid,
+        f"user-{blocked_user_uuid}",
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_external_provider_policies_v1
+            SET emergency_suspended = TRUE
+            WHERE provider = 'zulip'
+            """
+        )
+    db.commit()
+
+    blocked = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(blocked_user_uuid)]},
+    )
+    assert blocked.status_code == 403, blocked.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, blocked_user_uuid),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+            """,
+            (account_uuid,),
+        )
+        assert cur.fetchone()[0] == 3
+
+    suspended_remove = api.delete(
+        f"{STREAM_BINDINGS}{readded.json()[0]['uuid']}"
+    )
+    assert suspended_remove.status_code in (200, 204), suspended_remove.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT operation_kind
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+            ORDER BY sequence
+            """,
+            (account_uuid,),
+        )
+        assert [row[0] for row in cur.fetchall()] == [
+            "membership.add",
+            "membership.remove",
+            "membership.add",
+            "membership.remove",
+        ]
+
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_instance_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    blocked_lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=10,
+            lease_seconds=30,
+        )
+    )
+    assert blocked_lease["operations"] == []
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_external_provider_policies_v1
+            SET emergency_suspended = FALSE
+            WHERE provider = 'zulip'
+            """
+        )
+    db.commit()
+    resumed_lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=10,
+            lease_seconds=30,
+        )
+    )
+    assert "membership.remove" in {
+        operation["operation_kind"] for operation in resumed_lease["operations"]
+    }
 
 
 def test_stream_binding_delete_notifies_removed_user(api, db):
@@ -6703,6 +7103,590 @@ def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
         message_uuids[2]: True,
         message_uuids[3]: True,
     }
+
+
+def test_read_mutations_return_the_exact_rows_changed_by_postgres(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Atomic read snapshots",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        reader_uuid,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    other_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "random",
+    )
+    message_uuids = []
+    for topic, content in (
+        (topic_uuid, "first"),
+        (topic_uuid, "second"),
+        (other_topic_uuid, "other topic"),
+    ):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+
+    def set_all_unread():
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_workspace_user_message_flags
+                SET read = FALSE
+                WHERE project_id = %s AND user_uuid = %s
+                  AND uuid = ANY(%s::uuid[])
+                """,
+                (api.project_id, reader_uuid, message_uuids),
+            )
+        db.commit()
+
+    set_all_unread()
+    _message, changed = _run_database_operation(
+        lambda session: messenger_dm_helpers.read_workspace_user_message(
+            project_id=api.project_id,
+            user_uuid=reader_uuid,
+            message_uuid=message_uuids[0],
+            session=session,
+            return_message_uuids=True,
+        )
+    )
+    assert [str(value) for value in changed] == [message_uuids[0]]
+    _message, changed_again = _run_database_operation(
+        lambda session: messenger_dm_helpers.read_workspace_user_message(
+            project_id=api.project_id,
+            user_uuid=reader_uuid,
+            message_uuid=message_uuids[0],
+            session=session,
+            return_message_uuids=True,
+        )
+    )
+    assert changed_again == []
+
+    set_all_unread()
+    _topic, changed = _run_database_operation(
+        lambda session: messenger_dm_helpers.read_workspace_user_stream_topic_messages(
+            project_id=api.project_id,
+            user_uuid=reader_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
+            return_message_uuids=True,
+        )
+    )
+    assert [str(value) for value in changed] == message_uuids[:2]
+
+    set_all_unread()
+    _stream, changed = _run_database_operation(
+        lambda session: messenger_dm_helpers.read_workspace_user_stream_messages(
+            project_id=api.project_id,
+            user_uuid=reader_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+            return_message_uuids=True,
+        )
+    )
+    assert [str(value) for value in changed] == message_uuids
+
+
+def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, reader_uuid, f"user-{reader_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Concurrent provider read state",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        reader_uuid,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = []
+    for index in range(3):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": f"concurrent read {index}",
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    read_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        }
+    }
+    source = {
+        "kind": "zulip",
+        "chat_type": "channel",
+        "participants": [],
+        "topics": [],
+    }
+    stream_source = {
+        "kind": "zulip",
+        "stream_id": 42,
+        "server_url": "https://zulip.example.invalid",
+        "source_scope": str(account_uuid),
+    }
+    fixed_created_at = datetime.datetime(
+        2026,
+        7,
+        18,
+        12,
+        0,
+        tzinfo=datetime.timezone.utc,
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), str(bridge_uuid)),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+                json.dumps(read_capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                str(sys_uuid.uuid4()),
+                str(account_uuid),
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities,
+                catalog_capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
+                'Concurrent provider read state', TRUE, %s, %s, 'live',
+                %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                str(chat_uuid),
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(source),
+                api.project_id,
+                str(stream_uuid),
+                json.dumps(read_capability),
+                json.dumps(read_capability),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip', source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(stream_source),
+                str(account_uuid),
+                api.project_id,
+                str(stream_uuid),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET source_name = 'zulip', source = %s::jsonb,
+                external_account_uuid = %s,
+                created_at = %s
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (
+                json.dumps(stream_source),
+                str(account_uuid),
+                fixed_created_at.replace(tzinfo=None),
+                api.project_id,
+                str(stream_uuid),
+            ),
+        )
+
+    ordered_message_uuids = sorted(message_uuids)
+    boundary_uuid = ordered_message_uuids[1]
+    expected_message_uuids = [str(value) for value in ordered_message_uuids[:2]]
+
+    def run_read(barrier):
+        def operation(_session):
+            barrier.wait(timeout=5)
+            store = sql_canonical_store.SQLCanonicalMessengerStore(
+                api.project_id,
+                reader_uuid,
+            )
+            return store.perform_action(
+                "messages",
+                boundary_uuid,
+                "read_up_to",
+                {},
+            )
+
+        return _run_database_operation(operation)
+
+    def run_refresh(barrier):
+        def operation(session):
+            session.execute("SET LOCAL lock_timeout = '2s'")
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            barrier.wait(timeout=5)
+            session.execute(
+                """
+                SELECT uuid
+                FROM m_external_accounts_v2
+                WHERE uuid = %s
+                FOR UPDATE
+                """,
+                (str(account_uuid),),
+            ).fetchone()
+            return sql_state.refresh_effective_capabilities(
+                session,
+                account_uuid=account_uuid,
+                now=datetime.datetime.now(datetime.timezone.utc),
+            )
+
+        return _run_database_operation(operation)
+
+    for _cycle in range(8):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_workspace_user_message_flags
+                SET read = FALSE
+                WHERE project_id = %s AND user_uuid = %s
+                  AND uuid = ANY(%s::uuid[])
+                """,
+                (
+                    api.project_id,
+                    str(reader_uuid),
+                    [str(value) for value in message_uuids],
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE m_external_accounts_v2
+                SET capabilities = %s::jsonb
+                WHERE uuid = %s
+                """,
+                (json.dumps(read_capability), str(account_uuid)),
+            )
+            cursor.execute(
+                """
+                UPDATE m_external_chats_v2
+                SET capabilities = %s::jsonb
+                WHERE uuid = %s
+                """,
+                (json.dumps(read_capability), str(chat_uuid)),
+            )
+
+        barrier = threading.Barrier(2)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            read_future = executor.submit(run_read, barrier)
+            refresh_future = executor.submit(run_refresh, barrier)
+            read_future.result(timeout=10)
+            assert refresh_future.result(timeout=10) == 1
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT message.uuid, flags.read
+                FROM m_workspace_user_message_flags AS flags
+                JOIN m_workspace_messages AS message
+                  ON message.project_id = flags.project_id
+                 AND message.uuid = flags.uuid
+                WHERE flags.project_id = %s AND flags.user_uuid = %s
+                  AND message.stream_uuid = %s
+                ORDER BY message.created_at, message.uuid
+                """,
+                (api.project_id, str(reader_uuid), str(stream_uuid)),
+            )
+            flags = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT payload
+                FROM m_external_provider_operations_v1
+                WHERE external_account_uuid = %s
+                  AND operation_kind = 'read_state.set'
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (str(account_uuid),),
+            )
+            payload = cursor.fetchone()[0]
+
+        assert [read for _uuid, read in flags] == [True, True, False]
+        assert payload["message_uuids"] == expected_message_uuids
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+              AND operation_kind = 'read_state.set'
+            """,
+            (str(account_uuid),),
+        )
+        assert cursor.fetchone()[0] == 8
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_provider_policies_v1
+            SET emergency_suspended = TRUE
+            WHERE provider = 'zulip'
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = '{}'::jsonb
+            WHERE uuid = %s
+            """,
+            (bridge_uuid,),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET capabilities = '{}'::jsonb
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET capabilities = '{}'::jsonb,
+                catalog_capabilities = '{}'::jsonb
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+    db.commit()
+
+    result = _run_database_operation(
+        lambda _session: sql_canonical_store.SQLCanonicalMessengerStore(
+            api.project_id,
+            reader_uuid,
+        ).perform_action(
+            "messages",
+            boundary_uuid,
+            "read_up_to",
+            {},
+        )
+    )
+    assert result["uuid"] == str(boundary_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+              AND operation_kind = 'read_state.set'
+            """,
+            (str(account_uuid),),
+        )
+        assert cursor.fetchone()[0] == 8
+
+
+def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, reader_uuid, f"user-{reader_uuid}")
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Large read history",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        reader_uuid,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    history_size = 100_000
+    unread_size = 100
+    uuid_seed = str(sys_uuid.uuid4())
+    created_at = datetime.datetime(2026, 7, 29)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, created_at, updated_at
+            )
+            SELECT md5(%s || ':' || series)::uuid, %s, %s, %s, %s,
+                   '{"kind":"markdown","content":"history"}'::jsonb,
+                   %s::timestamp + series * interval '1 microsecond',
+                   %s::timestamp + series * interval '1 microsecond'
+            FROM generate_series(1, %s) AS series
+            """,
+            (
+                uuid_seed,
+                api.project_id,
+                str(stream_uuid),
+                str(topic_uuid),
+                api.user_uuid,
+                created_at,
+                created_at,
+                history_size,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read
+            )
+            SELECT message.uuid, %s, message.project_id,
+                   message.created_at < %s::timestamp
+            FROM m_workspace_messages AS message
+            WHERE message.project_id = %s
+              AND message.stream_uuid = %s
+            """,
+            (
+                str(reader_uuid),
+                created_at
+                + datetime.timedelta(
+                    microseconds=history_size - unread_size + 1,
+                ),
+                api.project_id,
+                str(stream_uuid),
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT uuid, created_at
+            FROM m_workspace_messages
+            WHERE project_id = %s AND stream_uuid = %s
+            ORDER BY created_at DESC, uuid DESC
+            LIMIT 1
+            """,
+            (api.project_id, str(stream_uuid)),
+        )
+        boundary_uuid, boundary_created_at = cursor.fetchone()
+        cursor.execute("ANALYZE m_workspace_messages")
+        cursor.execute("ANALYZE m_workspace_user_message_flags")
+        cursor.execute(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+            + messenger_dm_helpers._READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL,
+            (
+                api.project_id,
+                str(reader_uuid),
+                str(stream_uuid),
+                str(topic_uuid),
+                boundary_created_at,
+                str(boundary_uuid),
+            ),
+        )
+        plan = cursor.fetchone()[0][0]["Plan"]
+
+    def walk(node):
+        yield node
+        for child in node.get("Plans", []):
+            yield from walk(child)
+
+    nodes = list(walk(plan))
+    assert all(node["Node Type"] != "Materialize" for node in nodes)
+    assert any(
+        node.get("Index Name") == "m_workspace_unread_flags_user_message_idx"
+        for node in nodes
+    )
+    assert not any(
+        node["Node Type"] == "Seq Scan"
+        and node.get("Relation Name") == "m_workspace_messages"
+        for node in nodes
+    )
+    assert plan["Actual Rows"] == unread_size
 
 
 def test_unbound_user_cannot_send_message(api, db):

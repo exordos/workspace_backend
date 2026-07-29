@@ -363,7 +363,6 @@ def _update_projected_capabilities(
     for table in (
         "m_workspace_streams",
         "m_workspace_stream_topics",
-        "m_workspace_messages",
     ):
         session.execute(
             f"""
@@ -383,22 +382,80 @@ def _update_projected_capabilities(
     _emit_projected_capability_events(session, chat)
 
 
+def claim_capability_refresh_account(
+    session: Any,
+    after_uuid: object | None = None,
+) -> object | None:
+    """Claim one deterministic account without waiting behind another worker."""
+    cursor_filter = ""
+    params: list[object] = []
+    if after_uuid is not None:
+        cursor_filter = "AND account.uuid > %s"
+        params.append(after_uuid)
+    row = session.execute(
+        f"""
+        SELECT account.uuid
+        FROM m_external_accounts_v2 AS account
+        WHERE EXISTS (
+            SELECT 1
+            FROM m_external_credentials_v2 AS credential
+            WHERE credential.external_account_uuid = account.uuid
+        )
+        {cursor_filter}
+        ORDER BY account.uuid
+        LIMIT 1
+        FOR UPDATE OF account SKIP LOCKED
+        """,
+        tuple(params),
+    ).fetchone()
+    return None if row is None else row["uuid"]
+
+
+def degrade_stale_bridge_instances(
+    session: Any,
+    now: datetime.datetime | None = None,
+) -> int:
+    """Degrade stale bridges without holding external-account row locks."""
+    now = now or _utcnow()
+    return session.execute(
+        """
+        WITH degraded AS (
+            UPDATE m_external_bridge_instances_v2
+            SET status = 'degraded', revision = revision + 1,
+                updated_at = %s
+            WHERE status = 'active'
+              AND last_heartbeat_at IS NOT NULL
+              AND last_heartbeat_at < %s
+            RETURNING 1
+        )
+        SELECT COUNT(*) AS count FROM degraded
+        """,
+        (now, now - _BRIDGE_DEGRADED_AFTER),
+    ).fetchone()["count"]
+
+
 def refresh_effective_capabilities(
     session: Any,
     provider_kind: str | None = None,
+    account_uuid: object | None = None,
     now: datetime.datetime | None = None,
-) -> None:
-    """Converge public account, chat, and projected capability snapshots."""
+) -> int:
+    """Converge bounded account, chat, and projected capability snapshots."""
     now = now or _utcnow()
-    params = []
-    provider_filter = ""
+    params: list[object] = []
+    filters = []
     if provider_kind is not None:
-        provider_filter = "WHERE account.provider = %s"
+        filters.append("account.provider = %s")
         params.append(provider_kind)
+    if account_uuid is not None:
+        filters.append("account.uuid = %s")
+        params.append(account_uuid)
+    account_filter = f"WHERE {' AND '.join(filters)}" if filters else ""
     rows = session.execute(
         f"""
         SELECT account.uuid, account.owner_user_uuid, account.provider,
                account.settings, account.status, account.live_ready,
+               account.revision,
                account.capabilities AS effective_capabilities,
                policy.enabled AS policy_enabled,
                policy.emergency_suspended,
@@ -413,35 +470,18 @@ def refresh_effective_capabilities(
         LEFT JOIN m_external_provider_policies_v1 AS policy
           ON policy.provider = account.provider
         LEFT JOIN m_external_bridge_instances_v2 AS instance
-          ON instance.uuid::text = credential.envelope #>>
+         ON instance.uuid::text = credential.envelope #>>
              '{{associated_data,bridge_instance_uuid}}'
          AND instance.provider = account.provider
-        {provider_filter}
-        FOR UPDATE OF account
+        {account_filter}
+        ORDER BY account.uuid
         """,
         tuple(params),
     ).fetchall()
-    degraded_instances = set()
     for account in rows:
         available = True
         reason = None
         heartbeat_at = account["last_heartbeat_at"]
-        if (
-            account["bridge_status"] == "active"
-            and heartbeat_at is not None
-            and now - heartbeat_at > _BRIDGE_DEGRADED_AFTER
-            and account["bridge_instance_uuid"] not in degraded_instances
-        ):
-            session.execute(
-                """
-                UPDATE m_external_bridge_instances_v2
-                SET status = 'degraded', revision = revision + 1,
-                    updated_at = %s
-                WHERE uuid = %s AND status = 'active'
-                """,
-                (now, account["bridge_instance_uuid"]),
-            )
-            degraded_instances.add(account["bridge_instance_uuid"])
         if account["policy_enabled"] is False:
             available = False
             reason = _unavailable_reason(
@@ -497,15 +537,23 @@ def refresh_effective_capabilities(
             account["policy_limits"],
         )
         if effective != account["effective_capabilities"]:
-            session.execute(
+            updated = session.execute(
                 """
                 UPDATE m_external_accounts_v2
                 SET capabilities = %s::jsonb, revision = revision + 1,
                     updated_at = %s
-                WHERE uuid = %s
+                WHERE uuid = %s AND revision = %s
+                RETURNING uuid
                 """,
-                (_json(effective), now, account["uuid"]),
-            )
+                (
+                    _json(effective),
+                    now,
+                    account["uuid"],
+                    account["revision"],
+                ),
+            ).fetchone()
+            if updated is None:
+                continue
             resource = external_models.ExternalAccount.objects.get_one(
                 filters={"uuid": dm_filters.EQ(account["uuid"])},
                 session=session,
@@ -522,10 +570,10 @@ def refresh_effective_capabilities(
             """
             SELECT uuid, external_account_uuid, owner_user_uuid, source,
                    selected, project_id, projection_stream_uuid, status,
-                   capabilities, catalog_capabilities
+                   capabilities, catalog_capabilities, revision
             FROM m_external_chats_v2
             WHERE external_account_uuid = %s
-            FOR UPDATE
+            ORDER BY uuid
             """,
             (account["uuid"],),
         ).fetchall()
@@ -533,14 +581,27 @@ def refresh_effective_capabilities(
             catalog_capabilities = chat["catalog_capabilities"]
             if catalog_capabilities is None:
                 catalog_capabilities = chat["capabilities"]
-                session.execute(
+                initialized = session.execute(
                     """
                     UPDATE m_external_chats_v2
                     SET catalog_capabilities = %s::jsonb
                     WHERE uuid = %s AND catalog_capabilities IS NULL
+                    RETURNING uuid
                     """,
                     (_json(catalog_capabilities), chat["uuid"]),
-                )
+                ).fetchone()
+                if initialized is None:
+                    latest = session.execute(
+                        """
+                        SELECT catalog_capabilities
+                        FROM m_external_chats_v2
+                        WHERE uuid = %s
+                        """,
+                        (chat["uuid"],),
+                    ).fetchone()
+                    if latest is None:
+                        continue
+                    catalog_capabilities = latest["catalog_capabilities"]
             chat_effective = _effective_chat_capabilities(
                 effective,
                 catalog_capabilities,
@@ -548,15 +609,25 @@ def refresh_effective_capabilities(
             )
             if chat_effective == chat["capabilities"]:
                 continue
-            session.execute(
+            updated = session.execute(
                 """
                 UPDATE m_external_chats_v2
                 SET capabilities = %s::jsonb, revision = revision + 1,
                     updated_at = %s
-                WHERE uuid = %s
+                WHERE uuid = %s AND revision = %s
+                  AND capabilities IS DISTINCT FROM %s::jsonb
+                RETURNING uuid
                 """,
-                (_json(chat_effective), now, chat["uuid"]),
-            )
+                (
+                    _json(chat_effective),
+                    now,
+                    chat["uuid"],
+                    chat["revision"],
+                    _json(chat_effective),
+                ),
+            ).fetchone()
+            if updated is None:
+                continue
             _update_projected_capabilities(session, chat, chat_effective)
             if chat["project_id"] is not None:
                 resource = external_models.ExternalChat.objects.get_one(
@@ -571,6 +642,7 @@ def refresh_effective_capabilities(
                     hidden_fields=("owner_user_uuid", "provider", "provider_chat_id"),
                     session=session,
                 )
+    return len(rows)
 
 
 def _timestamp(value: datetime.datetime) -> str:
@@ -1186,11 +1258,6 @@ class SQLControlState:
                     identity.bridge_instance_uuid,
                     identity.identity_generation,
                 ),
-            )
-            refresh_effective_capabilities(
-                session,
-                provider_kind=identity.provider_kind,
-                now=now,
             )
         return response
 
@@ -1950,10 +2017,6 @@ class SQLControlState:
                     "safe_error": result_safe_error,
                 }
             )
-        refresh_effective_capabilities(
-            session,
-            provider_kind=identity.provider_kind,
-        )
         return {"results": results}
 
     def observed_reports(

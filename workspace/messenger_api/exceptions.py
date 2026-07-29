@@ -89,6 +89,22 @@ class EventsCursorExpiredError(ra_exc.RestAlchemyException):
         }
 
 
+class DatabaseDeadlockRetryExhaustedError(ra_exc.RestAlchemyException):
+    """A retryable read-state transaction could not acquire a safe lock order."""
+
+    message = "The read-state update could not be completed due to concurrent activity"
+    code = 503
+
+    def as_dict(self) -> dict[str, typing.Any]:
+        return {
+            "type": self.__class__.__name__,
+            "code": self.code,
+            "error": "concurrent_update_retry_exhausted",
+            "message": self.msg,
+            "retryable": True,
+        }
+
+
 class DraftConflictError(ra_exc.RestAlchemyException):
     message = "Draft UUID already exists with different canonical fields"
     code = 409

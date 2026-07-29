@@ -101,7 +101,12 @@ def test_lease_is_fifo_idempotent_and_reuses_request_session(monkeypatch):
     assert response["operations"][0]["required_capability"] == (
         "messenger.message.send"
     )
-    assert "FOR UPDATE SKIP LOCKED" in session.statements[3][0]
+    assert "FOR UPDATE OF operation SKIP LOCKED" in session.statements[3][0]
+    assert 'JOIN "m_external_provider_policies_v1" AS policy' in (
+        session.statements[3][0]
+    )
+    assert 'policy."emergency_suspended" = FALSE' in session.statements[3][0]
+    assert "FOR SHARE OF policy" in session.statements[3][0]
     assert session.statements[3][1][3] == 20
     assert "m_external_operations_v2" in session.statements[4][0]
     assert events == [

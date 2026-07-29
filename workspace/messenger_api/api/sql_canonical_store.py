@@ -716,6 +716,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         self,
         stream_uuid: object,
         operation_kind: str | None = None,
+        *,
+        account_locked: bool = False,
     ) -> typing.Any:
         session = contexts.Context().get_session()
         stream = models.WorkspaceStream.objects.get_one(
@@ -729,6 +731,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             return None
         if operation_kind is None:
             return _PROVIDER_TARGET_EXISTS
+        if not account_locked:
+            self._lock_provider_account(stream.external_account_uuid)
         required_capability = provider_data._required_capability(operation_kind)
         if required_capability is None:
             raise ra_exceptions.ValidationErrorException()
@@ -751,13 +755,48 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                             owner_user_uuid=stream.user_uuid,
                             external_account_uuid=stream.external_account_uuid,
                             stream_uuid=stream_uuid,
+                            allow_policy_blocked=operation_kind
+                            == "membership.remove",
                         )
                     )
+                except provider_data.ProviderPolicyBlockedError as policy_exc:
+                    if operation_kind == "membership.add":
+                        raise (
+                            messenger_exceptions.ExternalResourceForbiddenError()
+                        ) from policy_exc
+                    raise ra_exceptions.ValidationErrorException() from policy_exc
                 except provider_data.ProviderUnavailableError:
                     raise ra_exceptions.ValidationErrorException() from exc
                 return account, bridge
             raise ra_exceptions.ValidationErrorException() from exc
         return account, bridge
+
+    def _lock_provider_account(self, account_uuid: object) -> None:
+        """Establish account-before-message/outbox lock ordering."""
+        contexts.Context().get_session().execute(
+            """
+            SELECT uuid
+            FROM m_external_accounts_v2
+            WHERE uuid = %s
+            FOR KEY SHARE
+            """,
+            (account_uuid,),
+        ).fetchone()
+
+    def _lock_provider_account_for_stream(self, stream_uuid: object) -> bool:
+        """Lock a projected account without validating mutable capabilities."""
+        session = contexts.Context().get_session()
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+            session=session,
+        )
+        if stream.external_account_uuid is None:
+            return False
+        self._lock_provider_account(stream.external_account_uuid)
+        return True
 
     def _queue_provider_operation(
         self,
@@ -1297,23 +1336,37 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 values["notification_mode"],
             )
         elif resource == "streams" and action == "read":
-            unread_messages = helpers._get_unread_workspace_user_messages(
-                project_id=self.project_uuid,
-                user_uuid=self.user_uuid,
-                stream_uuid=resource_uuid,
+            session = contexts.Context().get_session()
+            stream = helpers.get_workspace_user_stream(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+                session=session,
+            )
+            provider_account_locked = self._lock_provider_account_for_stream(
+                resource_uuid
+            )
+            row, message_uuids = helpers.read_workspace_user_stream_messages(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+                session=session,
+                current_stream=stream,
+                return_message_uuids=True,
             )
             provider_target = (
-                self._provider_target(resource_uuid, "read_state.set")
-                if unread_messages
+                self._provider_target(
+                    resource_uuid,
+                    "read_state.set",
+                    account_locked=provider_account_locked,
+                )
+                if message_uuids
                 else _PROVIDER_TARGET_UNSET
-            )
-            row = helpers.read_workspace_user_stream_messages(
-                self.project_uuid, self.user_uuid, resource_uuid
             )
             self._queue_provider_read(
                 stream_uuid=resource_uuid,
                 topic_uuid=None,
-                message_uuids=[message.uuid for message in unread_messages],
+                message_uuids=message_uuids,
                 target_type="stream",
                 target_uuid=resource_uuid,
                 provider_target=provider_target,
@@ -1385,81 +1438,113 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 self.project_uuid, self.user_uuid, resource_uuid
             )
         elif resource == "stream_topics" and action == "read":
+            session = contexts.Context().get_session()
             topic = helpers.get_workspace_user_stream_topic(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
+                session=session,
             )
-            unread_messages = helpers._get_unread_workspace_user_messages(
-                project_id=self.project_uuid,
-                user_uuid=self.user_uuid,
-                stream_uuid=topic.stream_uuid,
-                topic_uuid=resource_uuid,
+            provider_account_locked = self._lock_provider_account_for_stream(
+                topic.stream_uuid
+            )
+            row, message_uuids = helpers.read_workspace_user_stream_topic_messages(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+                session=session,
+                current_topic=topic,
+                return_message_uuids=True,
             )
             provider_target = (
-                self._provider_target(topic.stream_uuid, "read_state.set")
-                if unread_messages
+                self._provider_target(
+                    topic.stream_uuid,
+                    "read_state.set",
+                    account_locked=provider_account_locked,
+                )
+                if message_uuids
                 else _PROVIDER_TARGET_UNSET
-            )
-            row = helpers.read_workspace_user_stream_topic_messages(
-                self.project_uuid, self.user_uuid, resource_uuid
             )
             self._queue_provider_read(
                 stream_uuid=topic.stream_uuid,
                 topic_uuid=resource_uuid,
-                message_uuids=[message.uuid for message in unread_messages],
+                message_uuids=message_uuids,
                 target_type="topic",
                 target_uuid=resource_uuid,
                 provider_target=provider_target,
             )
         elif resource == "messages" and action == "read":
+            session = contexts.Context().get_session()
             message = helpers.get_workspace_user_message(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
+                session=session,
+            )
+            provider_account_locked = self._lock_provider_account_for_stream(
+                message.stream_uuid
+            )
+            row, message_uuids = helpers.read_workspace_user_message(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+                session=session,
+                current_message=message,
+                return_message_uuids=True,
             )
             provider_target = (
-                self._provider_target(message.stream_uuid, "read_state.set")
-                if not message.read
+                self._provider_target(
+                    message.stream_uuid,
+                    "read_state.set",
+                    account_locked=provider_account_locked,
+                )
+                if message_uuids
                 else _PROVIDER_TARGET_UNSET
-            )
-            row = helpers.read_workspace_user_message(
-                self.project_uuid, self.user_uuid, resource_uuid
             )
             self._queue_provider_read(
                 stream_uuid=message.stream_uuid,
                 topic_uuid=message.topic_uuid,
-                message_uuids=[] if message.read else [message.uuid],
+                message_uuids=message_uuids,
                 target_type="message",
                 target_uuid=resource_uuid,
                 provider_target=provider_target,
             )
         elif resource == "messages" and action == "read_up_to":
+            session = contexts.Context().get_session()
             message = helpers.get_workspace_user_message(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
+                session=session,
             )
-            unread_messages = helpers._get_unread_workspace_user_messages(
-                project_id=self.project_uuid,
-                user_uuid=self.user_uuid,
-                stream_uuid=message.stream_uuid,
-                topic_uuid=message.topic_uuid,
-                created_at=message.created_at,
-                boundary_uuid=message.uuid,
+            # Lock the provider account before the UPDATE snapshot.
+            # A concurrent provider event can make a boundary row unread after
+            # any separate probe. Capability validation stays after RETURNING
+            # so an idempotent no-op does not depend on provider availability.
+            provider_account_locked = self._lock_provider_account_for_stream(
+                message.stream_uuid
+            )
+            row, message_uuids = helpers.read_workspace_user_topic_messages_to_message(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+                session=session,
+                current_message=message,
+                return_message_uuids=True,
             )
             provider_target = (
-                self._provider_target(message.stream_uuid, "read_state.set")
-                if unread_messages
+                self._provider_target(
+                    message.stream_uuid,
+                    "read_state.set",
+                    account_locked=provider_account_locked,
+                )
+                if message_uuids
                 else _PROVIDER_TARGET_UNSET
-            )
-            row = helpers.read_workspace_user_topic_messages_to_message(
-                self.project_uuid, self.user_uuid, resource_uuid
             )
             self._queue_provider_read(
                 stream_uuid=message.stream_uuid,
                 topic_uuid=message.topic_uuid,
-                message_uuids=[message.uuid for message in unread_messages],
+                message_uuids=message_uuids,
                 target_type="message",
                 target_uuid=resource_uuid,
                 provider_target=provider_target,

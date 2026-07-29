@@ -58,10 +58,15 @@ def test_worker_prunes_postgresql_events_in_owned_session(monkeypatch):
 
 def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
     calls = []
+    account_uuid = "00000000-0000-0000-0000-000000000001"
     sessions = iter(
         [
             types.SimpleNamespace(name="event-prune"),
-            types.SimpleNamespace(name="maintenance"),
+            types.SimpleNamespace(name="presence"),
+            types.SimpleNamespace(name="capability"),
+            types.SimpleNamespace(name="capability-end"),
+            types.SimpleNamespace(name="heartbeats"),
+            types.SimpleNamespace(name="repair"),
         ]
     )
     monkeypatch.setattr(
@@ -77,8 +82,25 @@ def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
     )
     monkeypatch.setattr(
         agents.sql_state,
+        "degrade_stale_bridge_instances",
+        lambda session, *, now: (
+            calls.append(("degrade-bridges", session.name, now)) or 0
+        ),
+    )
+    claim_values = iter((account_uuid, None))
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_refresh_account",
+        lambda session, *, after_uuid: (
+            calls.append(("claim", session.name, after_uuid)) or next(claim_values)
+        ),
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
         "refresh_effective_capabilities",
-        lambda session, *, now: calls.append(("capabilities", session.name, now)),
+        lambda session, *, account_uuid, now: calls.append(
+            ("capabilities", session.name, account_uuid, now)
+        ),
     )
     monkeypatch.setattr(
         agents.sql_state,
@@ -106,10 +128,12 @@ def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
         ("events", "event-prune", calls[1][2]),
         ("exit", "event-prune", None),
     ]
-    assert calls[3] == ("enter", "maintenance")
+    capability_calls = [call for call in calls if call[0] == "capabilities"]
+    assert len(capability_calls) == 1
+    assert capability_calls[0][1:3] == ("capability", account_uuid)
     assert calls[-2:] == [
-        ("repair", "maintenance"),
-        ("exit", "maintenance", None),
+        ("repair", "repair"),
+        ("exit", "repair", None),
     ]
     assert worker._last_event_prune == 17.0
 
@@ -118,10 +142,15 @@ def test_worker_continues_projection_repair_after_event_prune_rollback(
     monkeypatch,
 ):
     calls = []
+    account_uuid = "00000000-0000-0000-0000-000000000001"
     sessions = iter(
         [
             types.SimpleNamespace(name="event-prune"),
-            types.SimpleNamespace(name="maintenance"),
+            types.SimpleNamespace(name="presence"),
+            types.SimpleNamespace(name="capability"),
+            types.SimpleNamespace(name="capability-end"),
+            types.SimpleNamespace(name="heartbeats"),
+            types.SimpleNamespace(name="repair"),
         ]
     )
     monkeypatch.setattr(
@@ -137,8 +166,25 @@ def test_worker_continues_projection_repair_after_event_prune_rollback(
     )
     monkeypatch.setattr(
         agents.sql_state,
+        "degrade_stale_bridge_instances",
+        lambda session, *, now: (
+            calls.append(("degrade-bridges", session.name, now)) or 0
+        ),
+    )
+    claim_values = iter((account_uuid, None))
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_refresh_account",
+        lambda session, *, after_uuid: (
+            calls.append(("claim", session.name, after_uuid)) or next(claim_values)
+        ),
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
         "refresh_effective_capabilities",
-        lambda session, *, now: calls.append(("capabilities", session.name, now)),
+        lambda session, *, account_uuid, now: calls.append(
+            ("capabilities", session.name, account_uuid, now)
+        ),
     )
     monkeypatch.setattr(
         agents.sql_state,
@@ -163,6 +209,155 @@ def test_worker_continues_projection_repair_after_event_prune_rollback(
     worker._iteration()
 
     assert ("exit", "event-prune", "RuntimeError") in calls
-    assert ("repair", "maintenance") in calls
-    assert calls[-1] == ("exit", "maintenance", None)
+    assert ("repair", "repair") in calls
+    assert calls[-1] == ("exit", "repair", None)
     assert worker._last_event_prune is None
+
+
+def test_capability_refresh_retries_deadlock_without_duplicate_commit(monkeypatch):
+    class DeadlockDetected(Exception):
+        sqlstate = "40P01"
+
+    calls = []
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    sessions = iter(
+        [
+            types.SimpleNamespace(name="attempt-1"),
+            types.SimpleNamespace(name="attempt-2"),
+            types.SimpleNamespace(name="attempt-3"),
+            types.SimpleNamespace(name="end"),
+        ]
+    )
+    monkeypatch.setattr(
+        agents,
+        "database_session_context",
+        lambda: _SessionContext(next(sessions), calls),
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_refresh_account",
+        lambda session, *, after_uuid: (
+            calls.append(("claim", session.name, after_uuid))
+            or (account_uuid if after_uuid is None else None)
+        ),
+    )
+    attempts = []
+
+    def refresh(session, *, account_uuid, now):
+        attempts.append((session.name, account_uuid, now))
+        if len(attempts) < 3:
+            raise DeadlockDetected("retry")
+        calls.append(("committed", account_uuid))
+
+    monkeypatch.setattr(
+        agents.sql_state,
+        "refresh_effective_capabilities",
+        refresh,
+    )
+    monkeypatch.setattr(
+        agents.time,
+        "sleep",
+        lambda delay: calls.append(("sleep", delay)),
+    )
+    monkeypatch.setattr(agents.random, "uniform", lambda _start, _end: 1.0)
+
+    worker = agents.MessengerWorkerAgent()
+    now = datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
+    worker._refresh_capabilities(now)
+
+    assert len(attempts) == 3
+    assert calls.count(("committed", account_uuid)) == 1
+    assert ("exit", "attempt-1", "DeadlockDetected") in calls
+    assert ("exit", "attempt-2", "DeadlockDetected") in calls
+    assert ("exit", "attempt-3", None) in calls
+
+
+def test_capability_refresh_cursor_continues_after_bounded_batch(monkeypatch):
+    calls = []
+    first_uuid = "00000000-0000-0000-0000-000000000001"
+    second_uuid = "00000000-0000-0000-0000-000000000002"
+    sessions = iter(
+        [
+            types.SimpleNamespace(name="first"),
+            types.SimpleNamespace(name="second"),
+        ]
+    )
+    monkeypatch.setattr(agents, "CAPABILITY_REFRESH_LIMIT", 1)
+    monkeypatch.setattr(
+        agents,
+        "database_session_context",
+        lambda: _SessionContext(next(sessions), calls),
+    )
+
+    def claim(session, *, after_uuid):
+        calls.append(("claim", session.name, after_uuid))
+        return first_uuid if after_uuid is None else second_uuid
+
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_refresh_account",
+        claim,
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
+        "refresh_effective_capabilities",
+        lambda session, *, account_uuid, now: calls.append(
+            ("refresh", session.name, account_uuid, now)
+        ),
+    )
+
+    worker = agents.MessengerWorkerAgent()
+    now = datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
+    worker._refresh_capabilities(now)
+    worker._refresh_capabilities(now)
+
+    assert ("claim", "first", None) in calls
+    assert ("claim", "second", first_uuid) in calls
+    assert worker._capability_refresh_cursor == second_uuid
+
+
+def test_capability_refresh_failure_is_not_counted_as_success(monkeypatch):
+    calls = []
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    sessions = iter(
+        [
+            types.SimpleNamespace(name="failed"),
+            types.SimpleNamespace(name="end"),
+        ]
+    )
+    monkeypatch.setattr(
+        agents,
+        "database_session_context",
+        lambda: _SessionContext(next(sessions), calls),
+    )
+    claims = []
+
+    def claim(_session, *, after_uuid):
+        claims.append(after_uuid)
+        return account_uuid if after_uuid is None else None
+
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_refresh_account",
+        claim,
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
+        "refresh_effective_capabilities",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed")),
+    )
+    metrics = []
+    monkeypatch.setattr(
+        agents.LOG,
+        "info",
+        lambda message, *args, **kwargs: metrics.append((message, kwargs.get("extra"))),
+    )
+
+    worker = agents.MessengerWorkerAgent()
+    worker._refresh_capabilities(
+        datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
+    )
+
+    assert claims == [None, account_uuid]
+    assert metrics[-1][1]["capability_refresh_batch_size"] == 0
+    assert metrics[-1][1]["capability_refresh_failure_count"] == 1

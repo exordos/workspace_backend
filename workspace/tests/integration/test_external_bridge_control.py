@@ -3,10 +3,13 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import concurrent.futures
+import contextlib
 import datetime
 import hashlib
 import json
 from pathlib import Path
+import threading
 import uuid as sys_uuid
 
 import pytest
@@ -1341,6 +1344,147 @@ def test_bridge_bootstrap_creates_parent_and_authorization_tracks_current_state(
         _request_call(repository.authorize_identity, identity)
 
 
+def test_worker_capability_refresh_does_not_wait_on_heartbeat_bridge_lock(
+    _database,
+    db,
+):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    # The integration database is session-scoped. Use the smallest possible
+    # UUID so the global ordered worker claim deterministically selects this
+    # test account even when earlier tests left credentialed accounts behind.
+    account_uuid = sys_uuid.UUID(int=0)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    conftest.seed_workspace_user(db, owner_uuid, f"worker-heartbeat-{owner_uuid}")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (
+                uuid, provider, identity_generation, status,
+                capabilities, last_heartbeat_at
+            ) VALUES (%s, 'zulip', 1, 'active', '{}'::jsonb, %s)
+            """,
+            (instance_uuid, now - datetime.timedelta(seconds=45)),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_control_instances_v1 (
+                bridge_instance_uuid, provider_kind, identity_generation,
+                encryption_key_uuid, encryption_public_key
+            ) VALUES (%s, 'zulip', 1, %s, 'test-public-key')
+            """,
+            (instance_uuid, sys_uuid.uuid4()),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, '{}'::jsonb
+            )
+            """,
+            (
+                account_uuid,
+                owner_uuid,
+                sql_state._json(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.test",
+                        "default_project_id": str(sys_uuid.uuid4()),
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                sql_state._json(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(instance_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+
+    bridge_locked = threading.Event()
+    release_heartbeat = threading.Event()
+    session_factory = engines.engine_factory.get_engine().session_manager
+
+    class CoordinatedSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            result = self._session.execute(statement, params)
+            if (
+                'UPDATE "m_external_bridge_instances_v2"' in statement
+                and '"last_heartbeat_at" = %s' in statement
+            ):
+                bridge_locked.set()
+                if not release_heartbeat.wait(timeout=5):
+                    raise TimeoutError("heartbeat bridge lock was not released")
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    class CoordinatedRepository(sql_state.SQLControlState):
+        @staticmethod
+        @contextlib.contextmanager
+        def _current_session():
+            with session_factory() as session:
+                yield CoordinatedSession(session)
+
+    repository = CoordinatedRepository(realm_uuid, b"k" * 32)
+    identity = _identity(instance_uuid, realm_uuid)
+    heartbeat_request = {
+        "heartbeat_uuid": str(sys_uuid.uuid4()),
+        "client_timestamp": "2026-07-29T00:00:00Z",
+        "image_version": "test",
+        "provider_kind": "zulip",
+        "capabilities": {},
+        "blocked_batch": None,
+    }
+
+    def heartbeat():
+        return repository.heartbeat(identity, heartbeat_request, now=now)
+
+    def worker_refresh():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '750ms'")
+            session.execute("SET LOCAL statement_timeout = '3s'")
+            claimed_uuid = sql_state.claim_capability_refresh_account(session)
+            assert claimed_uuid == account_uuid
+            return sql_state.refresh_effective_capabilities(
+                session,
+                account_uuid=claimed_uuid,
+                now=now,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        heartbeat_future = executor.submit(heartbeat)
+        assert bridge_locked.wait(timeout=3)
+        refresh_future = executor.submit(worker_refresh)
+        try:
+            assert refresh_future.result(timeout=3) == 1
+        finally:
+            release_heartbeat.set()
+        heartbeat_result = heartbeat_future.result(timeout=3)
+
+    assert heartbeat_result["heartbeat_uuid"] == heartbeat_request["heartbeat_uuid"]
+
+
 def test_observed_account_report_reconciles_snapshot_and_stale_report_cannot_regress(
     _database, db
 ):
@@ -1403,6 +1547,20 @@ def test_observed_account_report_reconciles_snapshot_and_stale_report_cannot_reg
         },
     )
     assert "messenger.chat_catalog" in heartbeat["negotiated_capabilities"]
+    with session_factory() as session:
+        claimed_uuid = session.execute(
+            """
+            SELECT uuid
+            FROM m_external_accounts_v2
+            WHERE uuid = %s
+            FOR UPDATE
+            """,
+            (account_uuid,),
+        ).fetchone()["uuid"]
+        sql_state.refresh_effective_capabilities(
+            session,
+            account_uuid=claimed_uuid,
+        )
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT capabilities FROM m_external_accounts_v2 WHERE uuid = %s",
@@ -1529,7 +1687,9 @@ def test_observed_account_report_reconciles_snapshot_and_stale_report_cannot_reg
             """,
             (project_uuid, owner_uuid),
         )
-        assert cursor.fetchone()[0] == event_count_before_stale_report + 1
+        # Report ingestion stays account-bounded; capability propagation is
+        # deferred to the worker instead of scanning all provider accounts.
+        assert cursor.fetchone()[0] == event_count_before_stale_report
         cursor.execute(
             """
             SELECT payload->'snapshot'->'capabilities'

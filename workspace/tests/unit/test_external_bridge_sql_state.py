@@ -77,6 +77,55 @@ def test_heartbeat_retention_is_bounded_and_uses_cutoff():
     assert params == (now - retention, 100)
 
 
+def test_capability_refresh_claim_is_ordered_and_skips_locked_accounts():
+    account_uuid = sys_uuid.uuid4()
+    calls = []
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"uuid": account_uuid}
+
+    session = SimpleNamespace(
+        execute=lambda statement, params: calls.append((statement, params)) or Result()
+    )
+
+    assert (
+        sql_state.claim_capability_refresh_account(
+            session,
+            after_uuid=account_uuid,
+        )
+        == account_uuid
+    )
+    statement, params = calls[0]
+    assert "ORDER BY account.uuid" in statement
+    assert "LIMIT 1" in statement
+    assert "FOR UPDATE OF account SKIP LOCKED" in statement
+    assert "account.uuid > %s" in statement
+    assert params == (account_uuid,)
+
+
+def test_stale_bridge_degradation_is_an_independent_bridge_only_update():
+    now = datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
+    calls = []
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"count": 2}
+
+    session = SimpleNamespace(
+        execute=lambda statement, params: calls.append((statement, params)) or Result()
+    )
+
+    assert sql_state.degrade_stale_bridge_instances(session, now=now) == 2
+    statement, params = calls[0]
+    assert "UPDATE m_external_bridge_instances_v2" in statement
+    assert "m_external_accounts_v2" not in statement
+    assert "last_heartbeat_at < %s" in statement
+    assert params == (now, now - datetime.timedelta(seconds=30))
+
+
 def test_projected_capability_events_do_not_fan_out_to_message_history(
     monkeypatch,
 ):
@@ -134,3 +183,36 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     topic_updated.assert_called_once_with(topic, session=session)
     message_get_all.assert_not_called()
     message_updated.assert_not_called()
+
+
+def test_projected_capability_updates_do_not_rewrite_message_history(monkeypatch):
+    calls = []
+    session = SimpleNamespace(
+        execute=lambda statement, params: calls.append((statement, params))
+    )
+    chat = {
+        "project_id": sys_uuid.uuid4(),
+        "external_account_uuid": sys_uuid.uuid4(),
+        "projection_stream_uuid": sys_uuid.uuid4(),
+    }
+    monkeypatch.setattr(
+        sql_state,
+        "_emit_projected_capability_events",
+        lambda current_session, current_chat: calls.append(
+            ("events", (current_session, current_chat))
+        ),
+    )
+
+    sql_state._update_projected_capabilities(
+        session,
+        chat,
+        {"messenger.message.read": {"available": True}},
+    )
+
+    statements = [statement for statement, _params in calls if statement != "events"]
+    assert len(statements) == 2
+    assert any("UPDATE m_workspace_streams" in statement for statement in statements)
+    assert any(
+        "UPDATE m_workspace_stream_topics" in statement for statement in statements
+    )
+    assert not any("m_workspace_messages" in statement for statement in statements)

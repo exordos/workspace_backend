@@ -183,6 +183,7 @@ def build_test_wsgi_application(app_module=messenger_app):
         [
             middlewares.configure_middleware(MockedIamAuthMiddleware),
             app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],

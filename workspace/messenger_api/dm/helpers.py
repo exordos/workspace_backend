@@ -73,6 +73,13 @@ def _random_color() -> int:
     return messenger_dm_base.random_color()
 
 
+def _database_timestamp(value: datetime.datetime) -> datetime.datetime:
+    """Normalize UTC model timestamps for PostgreSQL columns without timezone."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def _ensure_color(values: dict[str, object]) -> None:
     if "color" not in values or values["color"] is None:
         values["color"] = _random_color()
@@ -2980,7 +2987,10 @@ def delete_workspace_user_folder(
 
 
 def get_workspace_user_message(
-    project_id: object, user_uuid: object, message_uuid: object
+    project_id: object,
+    user_uuid: object,
+    message_uuid: object,
+    session: typing.Any = None,
 ) -> typing.Any:
     return models.WorkspaceUserMessage.objects.get_one(
         filters={
@@ -2988,6 +2998,7 @@ def get_workspace_user_message(
             "project_id": dm_filters.EQ(project_id),
             "user_uuid": dm_filters.EQ(user_uuid),
         },
+        session=session,
     )
 
 
@@ -3220,39 +3231,6 @@ def _get_workspace_stream_default_topic(
     )
 
 
-def _get_unread_workspace_user_messages(
-    project_id: object,
-    user_uuid: object,
-    stream_uuid: object = None,
-    topic_uuid: object = None,
-    created_at: typing.Any = None,
-    boundary_uuid: object = None,
-) -> typing.Any:
-    filters = {
-        "project_id": dm_filters.EQ(project_id),
-        "user_uuid": dm_filters.EQ(user_uuid),
-        "read": dm_filters.EQ(False),
-    }
-    if stream_uuid is not None:
-        filters["stream_uuid"] = dm_filters.EQ(stream_uuid)
-    if topic_uuid is not None:
-        filters["topic_uuid"] = dm_filters.EQ(topic_uuid)
-    if created_at is not None:
-        filters["created_at"] = dm_filters.LE(created_at)
-    messages = models.WorkspaceUserMessage.objects.get_all(
-        filters=filters,
-        order_by={"created_at": "asc", "uuid": "asc"},
-    )
-    if created_at is None or boundary_uuid is None:
-        return messages
-    boundary = (created_at, sys_uuid.UUID(str(boundary_uuid)))
-    return [
-        message
-        for message in messages
-        if (message.created_at, message.uuid) <= boundary
-    ]
-
-
 def _get_workspace_user_messages(
     project_id: object, message_uuid: object
 ) -> typing.Any:
@@ -3307,33 +3285,6 @@ def create_message_flags(
             read=recipient_uuid == author_uuid,
         )
         flags.insert(session=session)
-
-
-def _read_workspace_user_messages(
-    project_id: object,
-    user_uuid: object,
-    messages: typing.Any,
-    session: typing.Any = None,
-) -> typing.Any:
-    topic_uuids = []
-    message_uuids = []
-    stream_uuid = None
-    for message in messages:
-        flags = models.WorkspaceUserMessageFlags.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(message.uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-            session=session,
-        )
-        flags.update_dm(values={"read": True})
-        flags.update(session=session)
-        message_uuids.append(message.uuid)
-        stream_uuid = message.stream_uuid
-        if message.topic_uuid not in topic_uuids:
-            topic_uuids.append(message.topic_uuid)
-    return stream_uuid, topic_uuids, message_uuids
 
 
 def create_workspace_user_message(
@@ -3504,37 +3455,93 @@ def update_workspace_user_message(
     return result
 
 
+_READ_STREAM_MESSAGES_SQL = """
+    WITH updated AS (
+        UPDATE m_workspace_user_message_flags AS flags
+        SET read = TRUE, updated_at = NOW()
+        FROM m_workspace_messages AS message
+        WHERE flags.project_id = %s
+          AND flags.user_uuid = %s
+          AND flags.read = FALSE
+          AND message.project_id = flags.project_id
+          AND message.uuid = flags.uuid
+          AND message.stream_uuid = %s
+        RETURNING message.uuid, message.topic_uuid, message.created_at
+    )
+    SELECT uuid, topic_uuid, created_at
+    FROM updated
+    ORDER BY created_at, uuid
+"""
+
+_READ_TOPIC_MESSAGES_SQL = """
+    WITH updated AS (
+        UPDATE m_workspace_user_message_flags AS flags
+        SET read = TRUE, updated_at = NOW()
+        FROM m_workspace_messages AS message
+        WHERE flags.project_id = %s
+          AND flags.user_uuid = %s
+          AND flags.read = FALSE
+          AND message.project_id = flags.project_id
+          AND message.uuid = flags.uuid
+          AND message.stream_uuid = %s
+          AND message.topic_uuid = %s
+        RETURNING message.uuid, message.topic_uuid, message.created_at
+    )
+    SELECT uuid, topic_uuid, created_at
+    FROM updated
+    ORDER BY created_at, uuid
+"""
+
+_READ_MESSAGE_SQL = """
+    WITH updated AS (
+        UPDATE m_workspace_user_message_flags AS flags
+        SET read = TRUE, updated_at = NOW()
+        FROM m_workspace_messages AS message
+        WHERE flags.project_id = %s
+          AND flags.user_uuid = %s
+          AND flags.uuid = %s
+          AND flags.read = FALSE
+          AND message.project_id = flags.project_id
+          AND message.uuid = flags.uuid
+        RETURNING message.uuid, message.stream_uuid, message.topic_uuid
+    )
+    SELECT uuid, stream_uuid, topic_uuid
+    FROM updated
+"""
+
+
 def read_workspace_user_stream_messages(
     project_id: object,
     user_uuid: object,
     stream_uuid: object,
     session: typing.Any = None,
+    current_stream: typing.Any = None,
+    return_message_uuids: bool = False,
 ) -> typing.Any:
-    get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-    )
-    unread_messages = _get_unread_workspace_user_messages(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-    )
-    _, topic_uuids, message_uuids = _read_workspace_user_messages(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        messages=unread_messages,
-        session=session,
-    )
-    result = get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=stream_uuid,
-    )
+    with _workspace_session(session) as current_session:
+        current_stream = current_stream or get_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=current_session,
+        )
+        rows = current_session.execute(
+            _READ_STREAM_MESSAGES_SQL,
+            (project_id, user_uuid, stream_uuid),
+        ).fetchall()
+        rows.sort(key=lambda item: (item["created_at"], item["uuid"]))
+        message_uuids = [item["uuid"] for item in rows]
+        topic_uuids = list(dict.fromkeys(item["topic_uuid"] for item in rows))
+        result = get_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=current_session,
+        )
     if message_uuids:
         messenger_events.create_stream_read_event(
             stream=result,
-            session=session,
+            session=current_session,
         )
     if topic_uuids:
         _create_unread_updated_events(
@@ -3542,8 +3549,10 @@ def read_workspace_user_stream_messages(
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             topic_uuids=topic_uuids,
-            session=session,
+            session=current_session,
         )
+    if return_message_uuids:
+        return result, message_uuids
     return result
 
 
@@ -3552,43 +3561,66 @@ def read_workspace_user_stream_topic_messages(
     user_uuid: object,
     topic_uuid: object,
     session: typing.Any = None,
+    current_topic: typing.Any = None,
+    return_message_uuids: bool = False,
 ) -> typing.Any:
-    topic = get_workspace_user_stream_topic(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        topic_uuid=topic_uuid,
-    )
-    unread_messages = _get_unread_workspace_user_messages(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=topic.stream_uuid,
-        topic_uuid=topic_uuid,
-    )
-    _, topic_uuids, message_uuids = _read_workspace_user_messages(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        messages=unread_messages,
-        session=session,
-    )
-    result = get_workspace_user_stream_topic(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        topic_uuid=topic_uuid,
-    )
+    with _workspace_session(session) as current_session:
+        current_topic = current_topic or get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        rows = current_session.execute(
+            _READ_TOPIC_MESSAGES_SQL,
+            (project_id, user_uuid, current_topic.stream_uuid, topic_uuid),
+        ).fetchall()
+        rows.sort(key=lambda item: (item["created_at"], item["uuid"]))
+        message_uuids = [item["uuid"] for item in rows]
+        topic_uuids = [topic_uuid] if rows else []
+        result = get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
     if message_uuids:
         messenger_events.create_topic_read_event(
             topic=result,
-            session=session,
+            session=current_session,
         )
     if topic_uuids:
         _create_unread_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,
-            stream_uuid=topic.stream_uuid,
+            stream_uuid=current_topic.stream_uuid,
             topic_uuids=topic_uuids,
-            session=session,
+            session=current_session,
         )
+    if return_message_uuids:
+        return result, message_uuids
     return result
+
+
+_READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL = """
+    WITH updated AS (
+        UPDATE m_workspace_user_message_flags AS flags
+        SET read = TRUE, updated_at = NOW()
+        FROM m_workspace_messages AS message
+        WHERE flags.project_id = %s
+          AND flags.user_uuid = %s
+          AND flags.read = FALSE
+          AND message.project_id = flags.project_id
+          AND flags.uuid = message.uuid
+          AND message.stream_uuid = %s
+          AND message.topic_uuid = %s
+          AND (message.created_at, message.uuid) <= (%s, %s)
+        RETURNING message.uuid, message.created_at
+    )
+    SELECT uuid, created_at
+    FROM updated
+    ORDER BY created_at, uuid
+"""
 
 
 def read_workspace_user_topic_messages_to_message(
@@ -3596,44 +3628,49 @@ def read_workspace_user_topic_messages_to_message(
     user_uuid: object,
     message_uuid: object,
     session: typing.Any = None,
+    current_message: typing.Any = None,
+    return_message_uuids: bool = False,
 ) -> typing.Any:
-    current_message = get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
-    unread_messages = _get_unread_workspace_user_messages(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=current_message.stream_uuid,
-        topic_uuid=current_message.topic_uuid,
-        created_at=current_message.created_at,
-        boundary_uuid=message_uuid,
-    )
-    stream_uuid, topic_uuids, message_uuids = _read_workspace_user_messages(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        messages=unread_messages,
-        session=session,
-    )
-    result = get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
+    with _workspace_session(session) as current_session:
+        current_message = current_message or get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=current_session,
+        )
+        rows = current_session.execute(
+            _READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL,
+            (
+                project_id,
+                user_uuid,
+                current_message.stream_uuid,
+                current_message.topic_uuid,
+                _database_timestamp(current_message.created_at),
+                message_uuid,
+            ),
+        ).fetchall()
+        rows.sort(key=lambda row: (row["created_at"], row["uuid"]))
+        message_uuids = [row["uuid"] for row in rows]
+        result = get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=current_session,
+        )
     if message_uuids:
         messenger_events.create_message_read_event(
             message=result,
-            session=session,
+            session=current_session,
         )
-    if topic_uuids:
         _create_unread_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,
-            stream_uuid=stream_uuid,
-            topic_uuids=topic_uuids,
-            session=session,
+            stream_uuid=current_message.stream_uuid,
+            topic_uuids=[current_message.topic_uuid],
+            session=current_session,
         )
+    if return_message_uuids:
+        return result, message_uuids
     return result
 
 
@@ -3642,41 +3679,41 @@ def read_workspace_user_message(
     user_uuid: object,
     message_uuid: object,
     session: typing.Any = None,
+    current_message: typing.Any = None,
+    return_message_uuids: bool = False,
 ) -> typing.Any:
-    current_message = get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
-    flags = models.WorkspaceUserMessageFlags.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(message_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-        },
-        session=session,
-    )
-    was_read = flags.read
-    flags.update_dm(values={"read": True})
-    flags.update(session=session)
-
-    result = get_workspace_user_message(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        message_uuid=message_uuid,
-    )
-    if not was_read:
+    with _workspace_session(session) as current_session:
+        current_message = current_message or get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=current_session,
+        )
+        row = current_session.execute(
+            _READ_MESSAGE_SQL,
+            (project_id, user_uuid, message_uuid),
+        ).fetchone()
+        message_uuids = [] if row is None else [row["uuid"]]
+        result = get_workspace_user_message(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            session=current_session,
+        )
+    if message_uuids:
         messenger_events.create_message_read_event(
             message=result,
-            session=session,
+            session=current_session,
         )
         _create_message_unread_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=current_message.stream_uuid,
             topic_uuid=current_message.topic_uuid,
-            session=session,
+            session=current_session,
         )
+    if return_message_uuids:
+        return result, message_uuids
     return result
 
 
