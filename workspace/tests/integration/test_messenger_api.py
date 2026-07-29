@@ -24,6 +24,7 @@ import base64
 import datetime
 import json
 import threading
+import types
 import uuid as sys_uuid
 
 import pytest
@@ -40,6 +41,7 @@ from restalchemy.storage.sql import sessions as ra_sessions
 from oslo_config import cfg
 
 from workspace.common import external_bridge_opts
+from workspace.external_bridge_control import provider_event_apply
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import external_projection
 from workspace.messenger_api import file_storage
@@ -6002,7 +6004,9 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         },
     )
     assert resp.status_code == 201, resp.text
-    message_uuid = resp.json()["uuid"]
+    created_message = resp.json()
+    message_uuid = created_message["uuid"]
+    message_created_at = created_message["created_at"]
 
     with db.cursor() as cur:
         cur.execute(
@@ -6081,11 +6085,17 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         },
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["payload"]["content"] == "edited version"
+    updated_message = resp.json()
+    assert updated_message["payload"]["content"] == "edited version"
+    assert updated_message["created_at"] == message_created_at
+    assert updated_message["updated_at"] != message_created_at
 
     resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["payload"]["content"] == "edited version"
+    reloaded_message = resp.json()
+    assert reloaded_message["payload"]["content"] == "edited version"
+    assert reloaded_message["created_at"] == message_created_at
+    assert reloaded_message["updated_at"] == updated_message["updated_at"]
 
     with db.cursor() as cur:
         cur.execute(
@@ -6109,6 +6119,10 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         "message.updated",
     ]
     assert all(row[1]["payload"]["content"] == "edited version" for row in update_rows)
+    assert all(row[1]["created_at"] == message_created_at for row in update_rows)
+    assert all(
+        row[1]["updated_at"] == updated_message["updated_at"] for row in update_rows
+    )
 
     with db.cursor() as cur:
         cur.execute(
@@ -6178,6 +6192,124 @@ def test_message_update_read_delete_write_realtime_events(api, db):
     assert all(row[1]["uuid"] == message_uuid for row in delete_rows)
     assert all(row[1]["stream_uuid"] == stream_uuid for row in delete_rows)
     assert all(row[1]["topic_uuid"] == topic_uuid for row in delete_rows)
+
+
+def test_provider_message_update_preserves_created_at_in_storage_api_and_event(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "provider-created-at",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    created = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "before provider echo",
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+    message = created.json()
+    message_uuid = sys_uuid.UUID(message["uuid"])
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_update_epoch = cursor.fetchone()[0]
+
+    incoming_created_at = "2099-01-01T00:00:00Z"
+    event = {
+        "kind": "message.upsert",
+        "external_account_uuid": str(sys_uuid.uuid4()),
+    }
+    resource = {
+        "uuid": str(message_uuid),
+        "user_uuid": str(api.user_uuid),
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "payload": {
+            "kind": "markdown",
+            "content": "after provider echo",
+        },
+        "created_at": incoming_created_at,
+    }
+    identity = types.SimpleNamespace(
+        provider_kind=messenger_models.SourceName.NATIVE.value,
+        bridge_instance_uuid=sys_uuid.uuid4(),
+    )
+    assignment = {
+        "owner_user_uuid": api.user_uuid,
+        "projection_stream_uuid": sys_uuid.UUID(stream_uuid),
+    }
+
+    def apply_provider_update(session):
+        return provider_event_apply._message_event(
+            session,
+            event,
+            sys_uuid.UUID(api.project_id),
+            assignment,
+            resource,
+            identity,
+        )
+
+    assert _run_database_operation(apply_provider_update) == message_uuid
+
+    reloaded = api.get(f"{MESSAGES}{message_uuid}")
+    assert reloaded.status_code == 200, reloaded.text
+    updated_message = reloaded.json()
+    assert updated_message["payload"]["content"] == "after provider echo"
+    assert updated_message["created_at"] == message["created_at"]
+    assert updated_message["created_at"] != incoming_created_at
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT created_at, updated_at
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        stored_created_at, stored_updated_at = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND epoch_version > %s
+              AND object_type = 'message'
+              AND action = 'updated'
+            ORDER BY epoch_version
+            """,
+            (api.project_id, api.user_uuid, before_update_epoch),
+        )
+        event_payloads = [row[0] for row in cursor.fetchall()]
+
+    assert stored_created_at.isoformat() + "Z" == message["created_at"]
+    assert stored_updated_at.isoformat() + "Z" == updated_message["updated_at"]
+    assert len(event_payloads) == 1
+    assert event_payloads[0]["kind"] == "message.updated"
+    assert event_payloads[0]["created_at"] == message["created_at"]
+    assert event_payloads[0]["updated_at"] == updated_message["updated_at"]
 
 
 def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db):

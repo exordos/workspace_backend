@@ -264,14 +264,6 @@ def _message_created_at(value: typing.Any) -> datetime.datetime:
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def _normalized_message_created_at(value: typing.Any) -> typing.Any:
-    if not isinstance(value, datetime.datetime):
-        return value
-    if value.tzinfo is None:
-        return value.replace(tzinfo=datetime.timezone.utc)
-    return value.astimezone(datetime.timezone.utc)
-
-
 def _message_projection_is_unchanged(
     existing: typing.Any,
     values: collections.abc.Mapping[str, typing.Any],
@@ -286,15 +278,6 @@ def _message_projection_is_unchanged(
         return False
     if values.get("provider_external_id") != getattr(
         existing, "provider_external_id", None
-    ):
-        return False
-    incoming_created_at = values.get("created_at")
-    if (
-        incoming_created_at is not None
-        and incoming_created_at
-        != _normalized_message_created_at(
-            getattr(existing, "created_at", incoming_created_at)
-        )
     ):
         return False
 
@@ -546,10 +529,11 @@ def _message_event(
     else:
         if existing.stream_uuid != stream_uuid:
             raise ValueError("Provider message UUID belongs to another stream")
+        # A provider replay may report the edit time as created_at. Once the
+        # message exists, its creation timestamp is immutable.
         update_values = _provider_values(
             values,
             {
-                "created_at",
                 "payload",
                 "provider_external_id",
                 "provider_metadata",
@@ -570,20 +554,8 @@ def _message_event(
             existing,
             update_values,
         ):
-            created_at = update_values.pop("created_at", None)
             existing.update_dm(values=update_values)
             existing.update(session=session)
-            if created_at is not None and created_at != _normalized_message_created_at(
-                getattr(existing, "created_at", created_at)
-            ):
-                session.execute(
-                    """
-                    UPDATE "m_workspace_messages"
-                    SET "created_at" = %s
-                    WHERE "project_id" = %s AND "uuid" = %s
-                    """,
-                    (created_at, project_id, message_uuid),
-                )
             helpers._create_workspace_message_updated_events(
                 project_id,
                 message_uuid,
