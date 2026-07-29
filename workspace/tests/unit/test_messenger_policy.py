@@ -660,3 +660,16 @@ def test_file_content_disposition_quotes_and_encodes_name():
 
     assert 'filename="example \\"file\\".txt"' in header
     assert "filename*=UTF-8''example%20%22file%22.txt" in header
+
+
+def test_file_content_disposition_uses_ascii_fallback_for_unicode_name():
+    header = controllers.WorkspaceFileController._content_disposition(
+        {"name": "Снимок экрана.png"}
+    )
+
+    assert 'filename="download.png"' in header
+    assert (
+        "filename*=UTF-8''%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA"
+        "%20%D1%8D%D0%BA%D1%80%D0%B0%D0%BD%D0%B0.png"
+    ) in header
+    header.encode("latin-1")
