@@ -1346,7 +1346,13 @@ def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
 
     resp = api.post(
         f"{USERS}{api.user_uuid}/actions/avatar_upload/invoke",
-        files={"file": ("avatar.png", io.BytesIO(data), "image/png")},
+        files={
+            "file": (
+                "Снимок экрана 2026-06-08 в 08.50.54.png",
+                io.BytesIO(data),
+                "image/png",
+            )
+        },
     )
     assert resp.status_code == 200, resp.text
     user = resp.json()
@@ -1389,6 +1395,12 @@ def test_avatar_upload_is_public_to_authenticated_users_and_reset_removes_it(
     )
     assert resp.status_code == 200, resp.text
     assert resp.content == data
+    content_disposition = resp.headers["Content-Disposition"]
+    assert 'filename="download.png"' in content_disposition
+    assert (
+        "filename*=UTF-8''%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA"
+        in content_disposition
+    )
 
     resp = api.post(
         f"{USERS}{api.user_uuid}/actions/avatar_reset/invoke",
@@ -2225,11 +2237,12 @@ def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch)
     stream_user = sys_uuid.uuid4()
     conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, stream_user)
     data = b"uploaded file data"
+    file_name = "Рабочий документ.txt"
 
     resp = api.post(
         FILES,
         data={"stream_uuid": stream_uuid},
-        files={"file": ("upload.txt", io.BytesIO(data), "text/plain")},
+        files={"file": (file_name, io.BytesIO(data), "text/plain")},
     )
     assert resp.status_code in (200, 201), resp.text
     file = resp.json()
@@ -2239,7 +2252,7 @@ def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch)
         storage_path=tmp_path,
     )
     assert path.read_bytes() == data
-    assert file["name"] == "upload.txt"
+    assert file["name"] == file_name
     assert "storage_type" not in file
     assert "storage_id" not in file
     assert "storage_object_id" not in file
@@ -2247,7 +2260,12 @@ def test_file_multipart_upload_writes_local_file(api, db, tmp_path, monkeypatch)
     assert resp.status_code == 200, resp.text
     assert resp.content == data
     assert resp.headers["Content-Type"].startswith("text/plain")
-    assert 'filename="upload.txt"' in resp.headers["Content-Disposition"]
+    content_disposition = resp.headers["Content-Disposition"]
+    assert 'filename="download.txt"' in content_disposition
+    assert (
+        "filename*=UTF-8''%D0%A0%D0%B0%D0%B1%D0%BE%D1%87%D0%B8%D0%B9"
+        in content_disposition
+    )
 
     resp = api.get(f"{FILES}{file['uuid']}/actions/download", user=stream_user)
     assert resp.status_code == 200, resp.text

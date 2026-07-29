@@ -632,8 +632,19 @@ class WorkspaceFileController(StoreResourceController):
     @staticmethod
     def _content_disposition(file: typing.Any) -> typing.Any:
         name = file["name"]
-        quoted_name = name.replace("\\", "\\\\").replace('"', '\\"')
-        encoded_name = urllib.parse.quote(name)
+        fallback_name = name
+        try:
+            fallback_name.encode("ascii")
+        except UnicodeEncodeError:
+            _stem, separator, extension = name.rpartition(".")
+            suffix = (
+                f".{extension}"
+                if separator and re.fullmatch(r"[A-Za-z0-9]{1,16}", extension)
+                else ""
+            )
+            fallback_name = f"download{suffix}"
+        quoted_name = fallback_name.replace("\\", "\\\\").replace('"', '\\"')
+        encoded_name = urllib.parse.quote(name, safe="")
         return (
             f"attachment; filename=\"{quoted_name}\"; filename*=UTF-8''{encoded_name}"
         )
