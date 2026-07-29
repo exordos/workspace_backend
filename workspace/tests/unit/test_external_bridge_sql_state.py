@@ -11,6 +11,42 @@ import uuid as sys_uuid
 from workspace.external_bridge_control import sql_state
 
 
+def test_membership_write_is_available_only_for_live_channels():
+    assert "messenger.membership.write" in sql_state.state.KNOWN_CAPABILITIES
+    descriptor = {
+        "available": True,
+        "revision": 1,
+        "limits": {},
+    }
+    account_capabilities = {"messenger.membership.write": descriptor}
+    chat_capabilities = {"messenger.membership.write": descriptor}
+
+    channel = sql_state._effective_chat_capabilities(
+        account_capabilities,
+        chat_capabilities,
+        {
+            "selected": True,
+            "status": "live",
+            "source": {"chat_type": "channel"},
+        },
+    )
+    direct = sql_state._effective_chat_capabilities(
+        account_capabilities,
+        chat_capabilities,
+        {
+            "selected": True,
+            "status": "live",
+            "source": {"chat_type": "direct"},
+        },
+    )
+
+    assert channel["messenger.membership.write"]["available"] is True
+    assert direct["messenger.membership.write"]["available"] is False
+    assert direct["messenger.membership.write"]["unavailable_reason"]["code"] == (
+        "chat_type_unsupported"
+    )
+
+
 def test_heartbeat_retention_is_bounded_and_uses_cutoff():
     now = datetime.datetime(2026, 7, 27, tzinfo=datetime.timezone.utc)
     retention = datetime.timedelta(hours=24)

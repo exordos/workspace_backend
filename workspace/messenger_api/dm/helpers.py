@@ -1550,14 +1550,13 @@ def _create_workspace_stream_binding_message_flags(
             m."uuid",
             %s::uuid,
             m."project_id",
-            m."user_uuid" = %s::uuid
+            TRUE
         FROM "m_workspace_messages" AS m
         WHERE m."project_id" = %s::uuid
             AND m."stream_uuid" = %s::uuid
         ON CONFLICT ("uuid", "user_uuid") DO NOTHING;
     """
     values = (
-        str(user_uuid),
         str(user_uuid),
         str(project_id),
         str(stream_uuid),

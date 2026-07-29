@@ -35,6 +35,8 @@ _OPERATION_CAPABILITIES = {
     "reaction.create": "messenger.reaction.write",
     "reaction.update": "messenger.reaction.write",
     "reaction.delete": "messenger.reaction.write",
+    "membership.add": "messenger.membership.write",
+    "membership.remove": "messenger.membership.write",
     "stream.delete": "messenger.stream.delete",
     "topic.create": "messenger.topic.create",
     "stream.update": "messenger.stream.rename",
@@ -195,6 +197,68 @@ def resolve_provider_target(
     if not bridges:
         raise ProviderUnavailableError("External provider bridge is unavailable")
     return account, chat, bridges[0]
+
+
+def resolve_provider_queue_target(
+    session: typing.Any,
+    *,
+    project_id: object,
+    owner_user_uuid: object,
+    external_account_uuid: object,
+    stream_uuid: object,
+) -> tuple[
+    external_models.ExternalAccount,
+    external_models.ExternalChat,
+    external_models.ExternalBridgeInstance,
+]:
+    """Resolve durable routing even while provider capability is unavailable."""
+    account = external_models.ExternalAccount.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(external_account_uuid),
+            "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
+        },
+        session=session,
+    )
+    chats = external_models.ExternalChat.objects.get_all(
+        filters={
+            "external_account_uuid": dm_filters.EQ(account.uuid),
+            "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "projection_stream_uuid": dm_filters.EQ(stream_uuid),
+            "selected": dm_filters.EQ(True),
+            "status": dm_filters.In(
+                (
+                    external_models.ExternalChatStatus.SYNCING.value,
+                    external_models.ExternalChatStatus.LIVE.value,
+                    external_models.ExternalChatStatus.DEGRADED.value,
+                )
+            ),
+            "transition_pending": dm_filters.EQ(False),
+        },
+        session=session,
+        limit=2,
+    )
+    if len(chats) != 1:
+        raise ProviderUnavailableError("External chat routing is unavailable")
+    bridges = external_models.ExternalBridgeInstance.objects.get_all(
+        filters={
+            "provider": dm_filters.EQ(account.provider),
+            "status": dm_filters.In(
+                (
+                    external_models.ExternalBridgeInstanceStatus.ACTIVE.value,
+                    external_models.ExternalBridgeInstanceStatus.DEGRADED.value,
+                    external_models.ExternalBridgeInstanceStatus.INCOMPATIBLE.value,
+                    external_models.ExternalBridgeInstanceStatus.SUSPENDED.value,
+                )
+            ),
+        },
+        order_by={"created_at": "desc", "uuid": "desc"},
+        session=session,
+        limit=1,
+    )
+    if not bridges:
+        raise ProviderUnavailableError("External provider bridge routing is unavailable")
+    return account, chats[0], bridges[0]
 
 
 def _operation_dict(

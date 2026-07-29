@@ -3455,6 +3455,218 @@ def test_stream_binding_create_notifies_added_user(api, db):
     }
 
 
+def test_stream_binding_create_starts_with_read_history_boundary(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Membership history boundary",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    target_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        target_user_uuid,
+        f"user-{target_user_uuid}",
+    )
+    historical = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "before membership"},
+        },
+    )
+    assert historical.status_code == 201, historical.text
+
+    added = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(target_user_uuid)]},
+    )
+    assert added.status_code in (200, 201), added.text
+
+    visible_history = api.get(
+        f"{MESSAGES}{historical.json()['uuid']}",
+        user=target_user_uuid,
+    )
+    assert visible_history.status_code == 200, visible_history.text
+    assert visible_history.json()["read"] is True
+    visible_stream = api.get(f"{STREAMS}{stream_uuid}", user=target_user_uuid)
+    assert visible_stream.status_code == 200, visible_stream.text
+    assert visible_stream.json()["unread_count"] == 0
+    visible_topic = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=target_user_uuid)
+    assert visible_topic.status_code == 200, visible_topic.text
+    assert visible_topic.json()["unread_count"] == 0
+
+    new_message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "after membership"},
+        },
+    )
+    assert new_message.status_code == 201, new_message.text
+    visible_new_message = api.get(
+        f"{MESSAGES}{new_message.json()['uuid']}",
+        user=target_user_uuid,
+    )
+    assert visible_new_message.status_code == 200, visible_new_message.text
+    assert visible_new_message.json()["read"] is False
+    visible_stream = api.get(f"{STREAMS}{stream_uuid}", user=target_user_uuid)
+    assert visible_stream.json()["unread_count"] == 1
+    visible_topic = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=target_user_uuid)
+    assert visible_topic.json()["unread_count"] == 1
+
+
+def test_provider_stream_membership_add_remove_duplicate_and_readd_queue(api, db):
+    bridge_instance_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    target_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(
+        db,
+        target_user_uuid,
+        f"user-{target_user_uuid}",
+    )
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Provider membership queue",
+    )
+    capability = {
+        "messenger.membership.write": {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                    }
+                ),
+                json.dumps(capability),
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
+                'Provider membership queue', TRUE, %s, %s, 'live', %s::jsonb
+            )
+            """,
+            (
+                str(chat_uuid),
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "chat_type": "channel",
+                        "participants": [],
+                        "topics": [],
+                    }
+                ),
+                api.project_id,
+                stream_uuid,
+                json.dumps(capability),
+            ),
+        )
+        cur.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.invalid",
+                        "source_scope": str(account_uuid),
+                    }
+                ),
+                str(account_uuid),
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+
+    added = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(target_user_uuid)]},
+    )
+    assert added.status_code in (200, 201), added.text
+    duplicate = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(target_user_uuid)]},
+    )
+    assert duplicate.status_code in (200, 201), duplicate.text
+    binding_uuid = added.json()[0]["uuid"]
+
+    removed = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert removed.status_code in (200, 204), removed.text
+    readded = api.post(
+        f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
+        json={"member": [str(target_user_uuid)]},
+    )
+    assert readded.status_code in (200, 201), readded.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT operation_kind, payload, bridge_instance_uuid
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+            ORDER BY sequence
+            """,
+            (str(account_uuid),),
+        )
+        operations = cur.fetchall()
+    assert [operation[0] for operation in operations] == [
+        "membership.add",
+        "membership.remove",
+        "membership.add",
+    ]
+    assert {
+        (operation[1]["stream_uuid"], operation[1]["user_uuid"])
+        for operation in operations
+    } == {(stream_uuid, str(target_user_uuid))}
+    assert {operation[2] for operation in operations} == {bridge_instance_uuid}
+
+
 def test_stream_binding_delete_notifies_removed_user(api, db):
     target_user_uuid = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(

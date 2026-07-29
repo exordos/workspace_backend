@@ -734,12 +734,12 @@ identity is administratively suspended or revoked.
 Every heartbeat operates under the API major selected by its `/v1` URL and
 declares the certificate-bound provider kind, named capabilities, and relevant
 limits. There is no separate control-schema negotiation. For v1, capability
-names include chat catalog, message send/edit/delete/read, rename, and file
-transfer. The backend computes the fail-closed intersection and emits only
-desired resources and operations supported by that instance. An assignment
-requiring a missing capability becomes `unsupported_capability` with a safe
-explanation; the backend never attempts optimistic delivery. Image semver
-remains diagnostic and is not used as a substitute for capabilities.
+names include chat catalog, message send/edit/delete/read, membership write,
+rename, and file transfer. The backend computes the fail-closed intersection
+and emits only desired resources and operations supported by that instance. An
+assignment requiring a missing capability becomes `unsupported_capability`
+with a safe explanation; the backend never attempts optimistic delivery. Image
+semver remains diagnostic and is not used as a substitute for capabilities.
 
 The heartbeat wire representation is a JSON object keyed by stable namespaced
 capability names. Each value is a descriptor containing the capability
@@ -803,6 +803,16 @@ mailboxes, and MIME messages are not part of provider synchronization.
 - Canonical message create, update, delete, and unread invalidation events use
   audience snapshots and bounded broadcast rows. Event-row growth is bounded
   by the logical mutation and affected entities rather than stream membership.
+- Workspace binding changes on provider-backed channel streams enqueue
+  capability-gated `membership.add` and `membership.remove` operations. The
+  Zulip bridge resolves the mapped identity and uses the official subscription
+  API. These mutations are ordinary durable, retry-safe chat-lane operations;
+  native bindings never enter the provider queue.
+- A selected channel whose participant projection is `ready` becomes eligible
+  for one bounded participant recheck after 30 seconds. A changed provider
+  subscriber set is reported through the existing catalog/desired-state
+  handshake, which updates Workspace identities and bindings before the row
+  returns to `ready`.
 - Terminal provider results are batched, idempotent by `result_uuid`, and return
   one application status per item. A stale lease cannot complete re-leased work.
 - Operation UUID, provider account UUID, provider entity ID, provider revision,

@@ -1551,9 +1551,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             'ON CONFLICT ("uuid", "user_uuid") DO NOTHING',
             statement,
         )
+        self.assertIn("TRUE", statement)
         self.assertEqual(
             [
-                str(user_uuid),
                 str(user_uuid),
                 str(project_id),
                 str(stream_uuid),

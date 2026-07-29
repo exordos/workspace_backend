@@ -850,7 +850,10 @@ When a new binding is created, the added user receives a `stream.created`
 event for the newly visible stream and `folder.updated` events for `All chats`
 and either `Personal` or `Channels`, depending on the stream privacy. Existing
 stream participants receive one `stream_bindings.created` event containing the
-new binding snapshots for the whole added batch.
+new binding snapshots for the whole added batch. Every message committed before
+the binding is created is visible to the new member with `read=true`, so both
+the stream and topic unread counters start at zero. Messages committed after
+the binding are unread until the new member reads them.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -882,7 +885,10 @@ Deleting a binding removes that user's access to the stream. The removed user
 receives `stream.deleted` and then `folder.updated` for affected system and
 custom folders. Every remaining stream participant receives
 `stream_binding.deleted` with the removed binding `uuid`, `stream_uuid`, and
-`user_uuid`.
+`user_uuid`. For a provider-backed stream, adding and deleting bindings also
+enqueue durable, capability-gated `membership.add` and `membership.remove`
+operations. The provider bridge resolves the mapped provider identity and
+subscribes or unsubscribes it; native streams perform no provider operation.
 
 ## Stream Topics
 

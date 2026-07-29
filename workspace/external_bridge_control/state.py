@@ -36,6 +36,7 @@ KNOWN_CAPABILITIES = {
     "messenger.message.edit",
     "messenger.message.read",
     "messenger.message.send",
+    "messenger.membership.write",
     "messenger.reaction.write",
     "messenger.stream.delete",
     "messenger.stream.rename",
