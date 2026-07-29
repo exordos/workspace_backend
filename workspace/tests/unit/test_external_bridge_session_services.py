@@ -65,18 +65,12 @@ def test_observed_report_reconciliation_reuses_the_caller_session(monkeypatch):
 
     repository = sql_state.SQLControlState(sys_uuid.uuid4(), b"k" * 32)
     reconciled = []
-    refreshed = []
     monkeypatch.setattr(
         repository,
         "_reconcile_observed_report",
         lambda current_session, current_identity, current_report: reconciled.append(
             (current_session, current_identity, current_report)
         ),
-    )
-    monkeypatch.setattr(
-        sql_state,
-        "refresh_effective_capabilities",
-        lambda current_session, **kwargs: refreshed.append((current_session, kwargs)),
     )
 
     result = repository.reconcile_observed_reports(session, identity, [report])
@@ -91,7 +85,9 @@ def test_observed_report_reconciliation_reuses_the_caller_session(monkeypatch):
         ]
     }
     assert reconciled == [(session, identity, report)]
-    assert refreshed == [(session, {"provider_kind": "zulip"})]
+    assert not any(
+        "m_external_accounts_v2" in statement for statement, _params in session.calls
+    )
 
 
 def test_pending_identity_reconciliation_keeps_report_retryable(monkeypatch):
@@ -145,12 +141,6 @@ def test_pending_identity_reconciliation_keeps_report_retryable(monkeypatch):
         "_reconcile_observed_report",
         reconciliation_pending,
     )
-    monkeypatch.setattr(
-        sql_state,
-        "refresh_effective_capabilities",
-        lambda *_args, **_kwargs: None,
-    )
-
     result = repository.reconcile_observed_reports(session, identity, [report])
 
     assert result == {

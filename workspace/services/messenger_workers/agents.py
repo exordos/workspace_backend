@@ -16,6 +16,7 @@
 
 import datetime
 import logging
+import random
 import time
 import typing
 
@@ -33,12 +34,28 @@ LOG = logging.getLogger(__name__)
 EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
 HEARTBEAT_RETENTION = datetime.timedelta(hours=24)
 PROJECTION_REPAIR_LIMIT = 5
+CAPABILITY_REFRESH_LIMIT = 100
+DATABASE_DEADLOCK_MAX_ATTEMPTS = 3
+DATABASE_DEADLOCK_RETRY_BASE_SECONDS = 0.05
 
 
 def database_session_context() -> typing.ContextManager[typing.Any]:
     """Own one transaction at a worker or operator-command boundary."""
     ctx = contexts.Context()
     return ctx.session_manager()
+
+
+def _is_database_deadlock(error: BaseException) -> bool:
+    current: BaseException | None = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) == "40P01":
+            return True
+        if getattr(current, "code", None) == "40P01":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class MessengerWorkerAgent(basic.BasicService):
@@ -56,6 +73,7 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_prune_batch_size = event_prune_batch_size
         self._heartbeat_retention = heartbeat_retention
         self._last_event_prune: float | None = None
+        self._capability_refresh_cursor: object | None = None
 
     def _prune_expired_events(
         self,
@@ -90,24 +108,132 @@ class MessengerWorkerAgent(basic.BasicService):
                 self._last_event_prune = monotonic_now
                 if pruned:
                     LOG.info("Pruned %d expired Workspace event rows", pruned)
-        with database_session_context() as session:
-            messenger_dm_helpers.mark_stale_workspace_users_offline(
-                session=session,
-            )
-            sql_state.refresh_effective_capabilities(session, now=now)
-            if prune_due:
-                pruned_heartbeats = sql_state.prune_expired_heartbeats(
-                    session,
-                    now,
-                    retention=self._heartbeat_retention,
-                    batch_size=self._event_prune_batch_size,
+        try:
+            with database_session_context() as session:
+                messenger_dm_helpers.mark_stale_workspace_users_offline(
+                    session=session,
                 )
+                degraded = sql_state.degrade_stale_bridge_instances(
+                    session,
+                    now=now,
+                )
+        except Exception:
+            LOG.exception(
+                "Failed to refresh stale Workspace presence and bridge rows"
+            )
+        else:
+            if degraded:
+                LOG.info("Degraded %d stale external bridge instances", degraded)
+
+        self._refresh_capabilities(now)
+
+        if prune_due:
+            try:
+                with database_session_context() as session:
+                    pruned_heartbeats = sql_state.prune_expired_heartbeats(
+                        session,
+                        now,
+                        retention=self._heartbeat_retention,
+                        batch_size=self._event_prune_batch_size,
+                    )
+            except Exception:
+                LOG.exception("Failed to prune expired bridge heartbeat rows")
+            else:
                 if pruned_heartbeats:
                     LOG.info(
                         "Pruned %d expired bridge heartbeat rows",
                         pruned_heartbeats,
                     )
-            self._repair_external_projection_transitions(session)
+
+        try:
+            with database_session_context() as session:
+                self._repair_external_projection_transitions(session)
+        except Exception:
+            LOG.exception("Failed to repair external projection transitions")
+
+    def _refresh_capabilities(self, now: datetime.datetime) -> None:
+        """Refresh each account in its own bounded, retryable transaction."""
+        started_at = time.monotonic()
+        after_uuid = self._capability_refresh_cursor
+        batch_size = 0
+        failure_count = 0
+        lock_wait_seconds = 0.0
+        deadlock_retries = 0
+        for _batch_index in range(CAPABILITY_REFRESH_LIMIT):
+            claimed_uuid = None
+            succeeded = False
+            for attempt in range(1, DATABASE_DEADLOCK_MAX_ATTEMPTS + 1):
+                try:
+                    with database_session_context() as session:
+                        claim_started_at = time.monotonic()
+                        claimed_uuid = sql_state.claim_capability_refresh_account(
+                            session,
+                            after_uuid=after_uuid,
+                        )
+                        lock_wait_seconds += time.monotonic() - claim_started_at
+                        if claimed_uuid is None:
+                            if after_uuid is not None:
+                                self._capability_refresh_cursor = None
+                            break
+                        sql_state.refresh_effective_capabilities(
+                            session,
+                            account_uuid=claimed_uuid,
+                            now=now,
+                        )
+                except Exception as error:
+                    if not _is_database_deadlock(error):
+                        LOG.exception(
+                            "Failed to refresh external account capabilities",
+                            extra={
+                                "external_account_uuid": str(claimed_uuid),
+                            },
+                        )
+                        break
+                    deadlock_retries += 1
+                    if attempt == DATABASE_DEADLOCK_MAX_ATTEMPTS:
+                        LOG.exception(
+                            "Capability refresh exhausted PostgreSQL deadlock retries",
+                            extra={
+                                "deadlock_retry_attempt": attempt,
+                                "external_account_uuid": str(claimed_uuid),
+                            },
+                        )
+                        break
+                    delay = DATABASE_DEADLOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                    delay *= random.uniform(0.75, 1.25)
+                    LOG.warning(
+                        "Retrying capability refresh after PostgreSQL deadlock",
+                        extra={
+                            "deadlock_retry_attempt": attempt,
+                            "deadlock_retry_delay_seconds": delay,
+                            "external_account_uuid": str(claimed_uuid),
+                        },
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    succeeded = True
+                    break
+            if claimed_uuid is None:
+                break
+            after_uuid = claimed_uuid
+            self._capability_refresh_cursor = claimed_uuid
+            if succeeded:
+                batch_size += 1
+            else:
+                failure_count += 1
+        LOG.info(
+            "Completed bounded external capability refresh batch",
+            extra={
+                "capability_refresh_batch_size": batch_size,
+                "capability_refresh_failure_count": failure_count,
+                "capability_refresh_duration_seconds": (
+                    time.monotonic() - started_at
+                ),
+                "capability_refresh_lock_wait_seconds": lock_wait_seconds,
+                "capability_refresh_deadlock_retries": deadlock_retries,
+            },
+        )
 
     def _repair_external_projection_transitions(
         self,

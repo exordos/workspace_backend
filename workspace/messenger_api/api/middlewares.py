@@ -15,6 +15,10 @@
 #    under the License.
 
 import json
+import logging
+import random
+import re
+import time
 import typing
 
 import webob
@@ -27,6 +31,15 @@ from workspace.messenger_api.api import versions
 
 
 SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/server_settings"
+DATABASE_DEADLOCK_MAX_ATTEMPTS = 3
+DATABASE_DEADLOCK_RETRY_BASE_SECONDS = 0.05
+LOG = logging.getLogger(__name__)
+_IDEMPOTENT_READ_ACTION_PATH = re.compile(
+    rf"^/{versions.API_VERSION_1_0}/"
+    r"(?:streams|stream_topics)/[^/]+/actions/read/invoke/?$"
+    rf"|^/{versions.API_VERSION_1_0}/messages/[^/]+/"
+    r"actions/(?:read|read_up_to)/invoke/?$"
+)
 
 
 def _normalize_path(path: str) -> str:
@@ -87,6 +100,63 @@ class ServerSettingsMiddleware(middlewares.Middleware):
         return None
 
 
+def _is_database_deadlock(error: BaseException) -> bool:
+    """Recognize both raw psycopg and RESTAlchemy deadlock exceptions."""
+    current: BaseException | None = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) == "40P01":
+            return True
+        if getattr(current, "code", None) == "40P01":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+class DatabaseDeadlockRetryMiddleware(middlewares.Middleware):
+    """Replay only transactionally idempotent read-state requests."""
+
+    @webob.dec.wsgify
+    def __call__(self, req: typing.Any) -> typing.Any:
+        if req.method != "POST" or not _IDEMPOTENT_READ_ACTION_PATH.fullmatch(req.path):
+            return req.get_response(self.application)
+
+        body = req.body
+        for attempt in range(1, DATABASE_DEADLOCK_MAX_ATTEMPTS + 1):
+            try:
+                req.body = body
+                return req.get_response(self.application)
+            except Exception as error:
+                if not _is_database_deadlock(error):
+                    raise
+                if attempt == DATABASE_DEADLOCK_MAX_ATTEMPTS:
+                    LOG.exception(
+                        "Idempotent read-state transaction exhausted PostgreSQL "
+                        "deadlock retries",
+                        extra={
+                            "deadlock_retry_attempt": attempt,
+                            "request_path": req.path,
+                        },
+                    )
+                    raise (
+                        messenger_exceptions.DatabaseDeadlockRetryExhaustedError()
+                    ) from error
+                delay = DATABASE_DEADLOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                delay *= random.uniform(0.75, 1.25)
+                LOG.warning(
+                    "Retrying idempotent read-state transaction after "
+                    "PostgreSQL deadlock",
+                    extra={
+                        "deadlock_retry_attempt": attempt,
+                        "deadlock_retry_delay_seconds": delay,
+                        "request_path": req.path,
+                    },
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")
+
+
 class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
     def _construct_error_response(
         self,
@@ -98,6 +168,15 @@ class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
                 status=410,
                 json=error.as_dict(),
                 headers={"Cache-Control": "no-store"},
+            )
+        if isinstance(
+            error,
+            messenger_exceptions.DatabaseDeadlockRetryExhaustedError,
+        ):
+            return req.ResponseClass(
+                status=503,
+                json=error.as_dict(),
+                headers={"Cache-Control": "no-store", "Retry-After": "1"},
             )
         if isinstance(error, messenger_exceptions.DraftConflictError):
             return req.ResponseClass(status=409, json={"message": error.msg})

@@ -113,6 +113,7 @@ def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
                 context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],

@@ -68,6 +68,10 @@ class ProviderUnavailableError(ProviderDataError):
     error = "provider_bridge_unavailable"
 
 
+class ProviderPolicyBlockedError(ProviderUnavailableError):
+    """Current administrative policy forbids accepting the operation."""
+
+
 class ProviderBatchError(ProviderDataError):
     status = 422
     error = "provider_event_batch_rejected"
@@ -132,6 +136,180 @@ def _effective_capability_available(capabilities: object, name: str) -> bool:
     return isinstance(descriptor, dict) and descriptor.get("available") is True
 
 
+def _require_current_provider_policy(
+    session: typing.Any,
+    provider: object,
+    *,
+    capability_name: str | None = None,
+    capabilities: object = None,
+) -> typing.Mapping[str, typing.Any]:
+    """Serialize provider operations with the current administrative policy."""
+    policy = session.execute(
+        """
+        SELECT enabled, emergency_suspended, limits
+        FROM m_external_provider_policies_v1
+        WHERE provider = %s
+        FOR SHARE
+        """,
+        (provider,),
+    ).fetchone()
+    if policy is None or policy["enabled"] is not True:
+        raise ProviderPolicyBlockedError(
+            "External provider is disabled by realm policy"
+        )
+    if policy["emergency_suspended"]:
+        raise ProviderPolicyBlockedError(
+            "External provider is administratively suspended"
+        )
+    if capability_name == "messenger.file.transfer":
+        policy_limit = policy["limits"].get("max_file_bytes", 0)
+        descriptor = (
+            capabilities.get(capability_name)
+            if isinstance(capabilities, dict)
+            else None
+        )
+        cached_limit = (
+            descriptor.get("limits", {}).get("max_file_bytes")
+            if isinstance(descriptor, dict)
+            else None
+        )
+        if (
+            isinstance(policy_limit, bool)
+            or not isinstance(policy_limit, int)
+            or policy_limit < 1
+            or isinstance(cached_limit, bool)
+            or not isinstance(cached_limit, int)
+            or cached_limit > policy_limit
+        ):
+            raise ProviderPolicyBlockedError(
+                "External provider capability limits require refresh"
+            )
+    return policy
+
+
+def _capability_limit(capabilities: object, name: str, limit_name: str) -> int | None:
+    descriptor = capabilities.get(name) if isinstance(capabilities, dict) else None
+    limits = descriptor.get("limits") if isinstance(descriptor, dict) else None
+    value = limits.get(limit_name) if isinstance(limits, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _require_current_provider_inputs(
+    session: typing.Any,
+    *,
+    chat_uuid: object,
+    bridge_uuid: object,
+    capability_name: str,
+    account_capabilities: object,
+    chat_capabilities: object,
+    now: datetime.datetime | None = None,
+) -> None:
+    """Lock and intersect the current heartbeat and chat-catalog inputs."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    current = session.execute(
+        """
+        SELECT chat.selected, chat.status AS chat_status,
+               chat.transition_pending, chat.catalog_capabilities,
+               bridge.status AS bridge_status,
+               bridge.capabilities AS bridge_capabilities,
+               bridge.last_heartbeat_at
+        FROM m_external_chats_v2 AS chat
+        CROSS JOIN m_external_bridge_instances_v2 AS bridge
+        WHERE chat.uuid = %s AND bridge.uuid = %s
+        FOR SHARE OF chat, bridge
+        """,
+        (chat_uuid, bridge_uuid),
+    ).fetchone()
+    if (
+        current is None
+        or current["selected"] is not True
+        or current["transition_pending"] is True
+        or current["chat_status"] not in {"syncing", "live"}
+        or current["bridge_status"] not in {"active", "degraded"}
+        or current["last_heartbeat_at"] is None
+        or current["last_heartbeat_at"] < now - HEARTBEAT_MAX_AGE
+        or not _advertises_capability(
+            current["bridge_capabilities"], capability_name
+        )
+        or not _advertises_capability(
+            current["catalog_capabilities"], capability_name
+        )
+    ):
+        raise ProviderUnavailableError("External provider capability is unavailable")
+    if capability_name != "messenger.file.transfer":
+        return
+    cached_limits = [
+        value
+        for value in (
+            _capability_limit(
+                account_capabilities,
+                capability_name,
+                "max_file_bytes",
+            ),
+            _capability_limit(
+                chat_capabilities,
+                capability_name,
+                "max_file_bytes",
+            ),
+        )
+        if value is not None
+    ]
+    current_limits = [
+        value
+        for value in (
+            _capability_limit(
+                current["bridge_capabilities"],
+                capability_name,
+                "max_file_bytes",
+            ),
+            _capability_limit(
+                current["catalog_capabilities"],
+                capability_name,
+                "max_file_bytes",
+            ),
+        )
+        if value is not None
+    ]
+    if cached_limits and current_limits and min(cached_limits) > min(current_limits):
+        raise ProviderUnavailableError(
+            "External provider capability limits require refresh"
+        )
+
+
+def _lock_associated_bridge(
+    session: typing.Any,
+    *,
+    account_uuid: object,
+    provider: object,
+    statuses: tuple[str, ...],
+) -> external_models.ExternalBridgeInstance:
+    """Lock the bridge named by the account credential, not a provider peer."""
+    row = session.execute(
+        """
+        SELECT bridge.uuid
+        FROM m_external_credentials_v2 AS credential
+        JOIN m_external_bridge_instances_v2 AS bridge
+          ON bridge.uuid::text = credential.envelope #>>
+             '{associated_data,bridge_instance_uuid}'
+        WHERE credential.external_account_uuid = %s
+          AND bridge.provider = %s
+          AND bridge.status = ANY(%s::text[])
+        FOR SHARE OF credential, bridge
+        """,
+        (account_uuid, provider, list(statuses)),
+    ).fetchone()
+    if row is None:
+        raise ProviderUnavailableError(
+            "External account bridge routing is unavailable"
+        )
+    return external_models.ExternalBridgeInstance.objects.get_one(
+        filters={"uuid": dm_filters.EQ(row["uuid"])},
+        session=session,
+    )
+
+
 def resolve_provider_target(
     session: typing.Any,
     *,
@@ -152,6 +330,12 @@ def resolve_provider_target(
             "owner_user_uuid": dm_filters.EQ(owner_user_uuid),
         },
         session=session,
+    )
+    _require_current_provider_policy(
+        session,
+        account.provider,
+        capability_name=capability_name,
+        capabilities=account.capabilities,
     )
     chats = external_models.ExternalChat.objects.get_all(
         filters={
@@ -180,23 +364,24 @@ def resolve_provider_target(
         or not _effective_capability_available(chat.capabilities, capability_name)
     ):
         raise ProviderUnavailableError("External chat capability is unavailable")
-    bridges = external_models.ExternalBridgeInstance.objects.get_all(
-        filters={
-            "provider": dm_filters.EQ(account.provider),
-            "status": dm_filters.In(
-                (
-                    external_models.ExternalBridgeInstanceStatus.ACTIVE.value,
-                    external_models.ExternalBridgeInstanceStatus.DEGRADED.value,
-                )
-            ),
-        },
-        order_by={"created_at": "desc", "uuid": "desc"},
+    bridge = _lock_associated_bridge(
         session=session,
-        limit=1,
+        account_uuid=account.uuid,
+        provider=account.provider,
+        statuses=(
+            external_models.ExternalBridgeInstanceStatus.ACTIVE.value,
+            external_models.ExternalBridgeInstanceStatus.DEGRADED.value,
+        ),
     )
-    if not bridges:
-        raise ProviderUnavailableError("External provider bridge is unavailable")
-    return account, chat, bridges[0]
+    _require_current_provider_inputs(
+        session,
+        chat_uuid=chat.uuid,
+        bridge_uuid=bridge.uuid,
+        capability_name=capability_name,
+        account_capabilities=account.capabilities,
+        chat_capabilities=chat.capabilities,
+    )
+    return account, chat, bridge
 
 
 def resolve_provider_queue_target(
@@ -206,6 +391,7 @@ def resolve_provider_queue_target(
     owner_user_uuid: object,
     external_account_uuid: object,
     stream_uuid: object,
+    allow_policy_blocked: bool = False,
 ) -> tuple[
     external_models.ExternalAccount,
     external_models.ExternalChat,
@@ -219,6 +405,8 @@ def resolve_provider_queue_target(
         },
         session=session,
     )
+    if not allow_policy_blocked:
+        _require_current_provider_policy(session, account.provider)
     chats = external_models.ExternalChat.objects.get_all(
         filters={
             "external_account_uuid": dm_filters.EQ(account.uuid),
@@ -240,25 +428,18 @@ def resolve_provider_queue_target(
     )
     if len(chats) != 1:
         raise ProviderUnavailableError("External chat routing is unavailable")
-    bridges = external_models.ExternalBridgeInstance.objects.get_all(
-        filters={
-            "provider": dm_filters.EQ(account.provider),
-            "status": dm_filters.In(
-                (
-                    external_models.ExternalBridgeInstanceStatus.ACTIVE.value,
-                    external_models.ExternalBridgeInstanceStatus.DEGRADED.value,
-                    external_models.ExternalBridgeInstanceStatus.INCOMPATIBLE.value,
-                    external_models.ExternalBridgeInstanceStatus.SUSPENDED.value,
-                )
-            ),
-        },
-        order_by={"created_at": "desc", "uuid": "desc"},
+    bridge = _lock_associated_bridge(
         session=session,
-        limit=1,
+        account_uuid=account.uuid,
+        provider=account.provider,
+        statuses=(
+            external_models.ExternalBridgeInstanceStatus.ACTIVE.value,
+            external_models.ExternalBridgeInstanceStatus.DEGRADED.value,
+            external_models.ExternalBridgeInstanceStatus.INCOMPATIBLE.value,
+            external_models.ExternalBridgeInstanceStatus.SUSPENDED.value,
+        ),
     )
-    if not bridges:
-        raise ProviderUnavailableError("External provider bridge routing is unavailable")
-    return account, chats[0], bridges[0]
+    return account, chats[0], bridge
 
 
 def _operation_dict(
@@ -463,14 +644,22 @@ def lease_provider_operations(
     rows = session.execute(
         """
         WITH candidates AS (
-            SELECT "uuid"
-            FROM "m_external_provider_operations_v1"
-            WHERE "bridge_instance_uuid" = %s AND "status" = 'queued'
-              AND "available_at" <= %s
-              AND "operation_kind" = ANY(%s::text[])
-            ORDER BY "sequence"
+            SELECT operation."uuid"
+            FROM "m_external_provider_operations_v1" AS operation
+            JOIN "m_external_accounts_v2" AS account
+              ON account."uuid" = operation."external_account_uuid"
+            JOIN "m_external_provider_policies_v1" AS policy
+              ON policy."provider" = account."provider"
+             AND policy."enabled" = TRUE
+             AND policy."emergency_suspended" = FALSE
+            WHERE operation."bridge_instance_uuid" = %s
+              AND operation."status" = 'queued'
+              AND operation."available_at" <= %s
+              AND operation."operation_kind" = ANY(%s::text[])
+            ORDER BY operation."sequence"
             LIMIT %s
-            FOR UPDATE SKIP LOCKED
+            FOR SHARE OF policy
+            FOR UPDATE OF operation SKIP LOCKED
         )
         UPDATE "m_external_provider_operations_v1" AS operation
         SET "status" = 'leased', "attempt" = operation."attempt" + 1,

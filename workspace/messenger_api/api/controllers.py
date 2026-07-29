@@ -1519,10 +1519,6 @@ class ExternalAccountController(ExternalResourceController):
             session=session,
         )
         self._append_desired(resource, credential, session)
-        sql_state.refresh_effective_capabilities(
-            session,
-            provider_kind=resource.provider,
-        )
         self._emit_event(
             resource,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
@@ -1550,10 +1546,6 @@ class ExternalAccountController(ExternalResourceController):
         )
         credential = self._credential(resource, session)
         self._append_desired(resource, credential, session, enabled=False)
-        sql_state.refresh_effective_capabilities(
-            session,
-            provider_kind=resource.provider,
-        )
         self._emit_event(
             resource,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
@@ -2377,10 +2369,6 @@ class ExternalBridgeInstanceController(
             {"status": status, "revision": resource.revision + 1},
             session=session,
         )
-        sql_state.refresh_effective_capabilities(
-            session,
-            provider_kind=resource.provider,
-        )
         return resource
 
     @ra_actions.post
@@ -2425,10 +2413,6 @@ class ExternalBridgeInstanceController(
                 "revision": resource.revision + 1,
             },
             session=session,
-        )
-        sql_state.refresh_effective_capabilities(
-            session,
-            provider_kind=resource.provider,
         )
         return resource
 
@@ -2651,10 +2635,6 @@ class ExternalProviderPolicyController(ExternalResourceController):
             session=session,
         )
         self._append_desired(policy, session, previous_ca_uuid)
-        sql_state.refresh_effective_capabilities(
-            session,
-            provider_kind=policy.provider,
-        )
         return policy
 
     def _change_status(
@@ -2674,10 +2654,6 @@ class ExternalProviderPolicyController(ExternalResourceController):
             session=session,
         )
         self._append_desired(resource, session)
-        sql_state.refresh_effective_capabilities(
-            session,
-            provider_kind=resource.provider,
-        )
         return resource
 
     @ra_actions.post

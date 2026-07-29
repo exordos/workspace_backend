@@ -59,6 +59,8 @@ EXTERNAL_STREAM_ACCESS_MIGRATION_UUID = "e82c027f-2481-4447-85fb-8648b335a6cd"
 EXTERNAL_STREAM_ACCESS_MIGRATION_FILE = (
     "0125-scope-external-visibility-to-canonical-streams-e82c02.py"
 )
+TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
+TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -75,7 +77,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == EXTERNAL_STREAM_ACCESS_MIGRATION_FILE
+    assert engine.get_latest_migration() == TOPIC_READ_BOUNDARY_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -94,6 +96,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID,
                     EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID,
                     EXTERNAL_STREAM_ACCESS_MIGRATION_UUID,
+                    TOPIC_READ_BOUNDARY_MIGRATION_UUID,
                 ],
             ),
         )
@@ -111,6 +114,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXTERNAL_CHAT_MEMBERSHIP_MIGRATION_UUID, True),
             (EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID, True),
             (EXTERNAL_STREAM_ACCESS_MIGRATION_UUID, True),
+            (TOPIC_READ_BOUNDARY_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
@@ -120,6 +124,26 @@ def test_current_migrations_have_a_single_head(_database, db):
             "SELECT to_regclass('m_external_bridge_heartbeats_v1_retention_idx')"
         )
         assert cur.fetchone()[0] == "m_external_bridge_heartbeats_v1_retention_idx"
+        cur.execute("SELECT to_regclass('m_workspace_messages_topic_boundary_idx')")
+        assert cur.fetchone()[0] == "m_workspace_messages_topic_boundary_idx"
+        cur.execute(
+            "SELECT to_regclass('m_workspace_unread_flags_user_message_idx')"
+        )
+        assert cur.fetchone()[0] == "m_workspace_unread_flags_user_message_idx"
+        cur.execute(
+            """
+            SELECT indexrelid::regclass::text, indisvalid
+            FROM pg_index
+            WHERE indexrelid IN (
+                to_regclass('m_workspace_messages_topic_boundary_idx'),
+                to_regclass('m_workspace_unread_flags_user_message_idx')
+            )
+            """
+        )
+        assert set(cur.fetchall()) == {
+            ("m_workspace_messages_topic_boundary_idx", True),
+            ("m_workspace_unread_flags_user_message_idx", True),
+        }
 
 
 def test_external_projection_access_is_scoped_to_account(
