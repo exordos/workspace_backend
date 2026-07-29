@@ -14,6 +14,7 @@ import uuid as sys_uuid
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.external_bridge_control import provider_data
 from workspace.messenger_api import events as messenger_events
@@ -741,6 +742,20 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 capability_name=required_capability,
             )
         except provider_data.ProviderUnavailableError as exc:
+            if operation_kind in {"membership.add", "membership.remove"}:
+                try:
+                    account, _chat, bridge = (
+                        provider_data.resolve_provider_queue_target(
+                            session,
+                            project_id=self.project_uuid,
+                            owner_user_uuid=stream.user_uuid,
+                            external_account_uuid=stream.external_account_uuid,
+                            stream_uuid=stream_uuid,
+                        )
+                    )
+                except provider_data.ProviderUnavailableError:
+                    raise ra_exceptions.ValidationErrorException() from exc
+                return account, bridge
             raise ra_exceptions.ValidationErrorException() from exc
         return account, bridge
 
@@ -1077,7 +1092,28 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 if participant != binding.user_uuid
             )
             self._validate_stream_participants(binding.stream_uuid, remaining)
+            try:
+                provider_target = self._provider_target(
+                    binding.stream_uuid,
+                    "membership.remove",
+                )
+            except (
+                ra_exceptions.ValidationErrorException,
+                storage_exceptions.RecordNotFound,
+            ):
+                # Local access revocation must still commit for malformed
+                # legacy projections or when no durable provider route exists.
+                provider_target = None
+            provider_payload = _public_dict(binding, resource)
             helpers.delete_workspace_stream_binding(self.project_uuid, resource_uuid)
+            self._queue_provider_operation(
+                operation_kind="membership.remove",
+                target_type="stream_binding",
+                target_uuid=binding.uuid,
+                stream_uuid=binding.stream_uuid,
+                payload=provider_payload,
+                provider_target=provider_target,
+            )
         elif resource == "stream_topics":
             helpers.delete_workspace_user_stream_topic(
                 self.project_uuid, self.user_uuid, resource_uuid
@@ -1287,13 +1323,29 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 role: [sys_uuid.UUID(str(value)) for value in user_uuids]
                 for role, user_uuids in values.items()
             }
-            participants = set(self._stream_participants(resource_uuid))
-            participants.update(
+            current_participants = set(self._stream_participants(resource_uuid))
+            participants = current_participants | {
                 user_uuid
                 for user_uuids in role_user_uuids.values()
                 for user_uuid in user_uuids
-            )
+            }
             self._validate_stream_participants(resource_uuid, tuple(participants))
+            new_participants = participants - current_participants
+            if new_participants:
+                try:
+                    provider_target = self._provider_target(
+                        resource_uuid,
+                        "membership.add",
+                    )
+                except (
+                    ra_exceptions.ValidationErrorException,
+                    storage_exceptions.RecordNotFound,
+                ):
+                    # Preserve canonical membership for malformed legacy
+                    # projections that have no durable provider route.
+                    provider_target = None
+            else:
+                provider_target = _PROVIDER_TARGET_UNSET
             row = helpers.get_or_create_workspace_stream_bindings(
                 self.project_uuid,
                 resource_uuid,
@@ -1301,6 +1353,22 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 role_user_uuids,
                 restore_external_membership=True,
             )
+            queued_binding_uuids = set()
+            for binding in row:
+                if (
+                    binding.user_uuid not in new_participants
+                    or binding.uuid in queued_binding_uuids
+                ):
+                    continue
+                queued_binding_uuids.add(binding.uuid)
+                self._queue_provider_operation(
+                    operation_kind="membership.add",
+                    target_type="stream_binding",
+                    target_uuid=binding.uuid,
+                    stream_uuid=resource_uuid,
+                    payload=_public_dict(binding, resource),
+                    provider_target=provider_target,
+                )
         elif resource == "stream_topics" and action == "toggle_done":
             row = helpers.toggle_workspace_user_stream_topic_done(
                 self.project_uuid, self.user_uuid, resource_uuid

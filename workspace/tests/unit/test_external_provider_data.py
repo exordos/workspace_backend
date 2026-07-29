@@ -90,6 +90,34 @@ def test_read_state_lease_fails_closed_without_advertised_capability(
     )
 
 
+@pytest.mark.parametrize("operation_kind", ["membership.add", "membership.remove"])
+def test_membership_lease_requires_write_capability(operation_kind):
+    now = datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc)
+    session = CapabilityLeaseSession(
+        {"messenger.membership.write": {"revision": 1}},
+        now,
+    )
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    provider_data.lease_provider_operations(
+        session,
+        identity,
+        request_uuid=sys_uuid.uuid4(),
+        limit=10,
+        lease_seconds=30,
+        now=now,
+    )
+
+    assert operation_kind in session.allowed_kinds
+    assert provider_data._required_capability(operation_kind) == (
+        "messenger.membership.write"
+    )
+
+
 def test_enqueue_operation_reuses_caller_transaction(monkeypatch):
     inserted = []
     events = []
@@ -204,6 +232,49 @@ def test_resolve_provider_target_intersects_account_and_chat_capabilities(monkey
             stream_uuid=sys_uuid.uuid4(),
             capability_name="messenger.message.send",
         )
+
+
+def test_resolve_provider_queue_target_preserves_route_without_capability(monkeypatch):
+    account = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        provider="zulip",
+        live_ready=False,
+        capabilities={},
+    )
+    chat = types.SimpleNamespace(capabilities={})
+    bridge = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+
+    class OneObject:
+        def get_one(self, **kwargs):
+            return account
+
+    class ChatObjects:
+        def get_all(self, **kwargs):
+            return [chat]
+
+    class BridgeObjects:
+        def get_all(self, **kwargs):
+            return [bridge]
+
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalAccount, "objects", OneObject()
+    )
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalChat, "objects", ChatObjects()
+    )
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalBridgeInstance,
+        "objects",
+        BridgeObjects(),
+    )
+
+    assert provider_data.resolve_provider_queue_target(
+        object(),
+        project_id=sys_uuid.uuid4(),
+        owner_user_uuid=sys_uuid.uuid4(),
+        external_account_uuid=account.uuid,
+        stream_uuid=sys_uuid.uuid4(),
+    ) == (account, chat, bridge)
 
 
 def test_publish_operation_event_updates_target_delivery_in_same_transaction(

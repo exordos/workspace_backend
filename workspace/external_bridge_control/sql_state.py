@@ -33,6 +33,7 @@ def _json(value: object) -> str:
 _BRIDGE_DEGRADED_AFTER = datetime.timedelta(seconds=30)
 _BRIDGE_OFFLINE_AFTER = datetime.timedelta(seconds=60)
 _CHANNEL_ONLY_CAPABILITIES = {
+    "messenger.membership.write",
     "messenger.stream.rename",
     "messenger.topic.rename",
 }

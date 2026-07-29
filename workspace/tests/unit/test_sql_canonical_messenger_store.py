@@ -437,6 +437,200 @@ def test_provider_operation_uses_projection_owner_target_in_request_transaction(
     ]
 
 
+def test_stream_binding_add_queues_only_new_provider_memberships(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    existing_user_uuid = sys_uuid.uuid4()
+    added_user_uuid = sys_uuid.uuid4()
+    existing_binding_uuid = sys_uuid.uuid4()
+    added_binding_uuid = sys_uuid.uuid4()
+    provider_target = (object(), object())
+    bindings = [
+        types.SimpleNamespace(
+            uuid=existing_binding_uuid,
+            stream_uuid=stream_uuid,
+            user_uuid=existing_user_uuid,
+            who_uuid=USER_UUID,
+            role="member",
+        ),
+        types.SimpleNamespace(
+            uuid=added_binding_uuid,
+            stream_uuid=stream_uuid,
+            user_uuid=added_user_uuid,
+            who_uuid=USER_UUID,
+            role="member",
+        ),
+    ]
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_stream_participants",
+        lambda requested_stream_uuid: (
+            [existing_user_uuid]
+            if requested_stream_uuid == stream_uuid
+            else []
+        ),
+    )
+    validated = []
+    monkeypatch.setattr(
+        store,
+        "_validate_stream_participants",
+        lambda requested_stream_uuid, participants: validated.append(
+            (requested_stream_uuid, set(participants))
+        ),
+    )
+    targets = []
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda requested_stream_uuid, operation_kind=None: (
+            targets.append((requested_stream_uuid, operation_kind))
+            or provider_target
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "get_or_create_workspace_stream_bindings",
+        lambda *args, **kwargs: bindings,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda row, _resource, **_kwargs: {
+            "uuid": str(row.uuid),
+            "stream_uuid": str(row.stream_uuid),
+            "user_uuid": str(row.user_uuid),
+            "who_uuid": str(row.who_uuid),
+            "role": row.role,
+        },
+    )
+    queued = []
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: queued.append(kwargs),
+    )
+
+    result = store.perform_action(
+        "stream_bindings",
+        stream_uuid,
+        "add_users",
+        {"member": [str(existing_user_uuid), str(added_user_uuid)]},
+    )
+
+    assert len(result) == 2
+    assert validated == [
+        (
+            stream_uuid,
+            {existing_user_uuid, added_user_uuid},
+        )
+    ]
+    assert targets == [(stream_uuid, "membership.add")]
+    assert queued == [
+        {
+            "operation_kind": "membership.add",
+            "target_type": "stream_binding",
+            "target_uuid": added_binding_uuid,
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "uuid": str(added_binding_uuid),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(added_user_uuid),
+                "who_uuid": str(USER_UUID),
+                "role": "member",
+            },
+            "provider_target": provider_target,
+        }
+    ]
+
+
+def test_stream_binding_delete_queues_provider_membership_removal(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    binding_uuid = sys_uuid.uuid4()
+    removed_user_uuid = sys_uuid.uuid4()
+    remaining_user_uuid = sys_uuid.uuid4()
+    provider_target = (object(), object())
+    binding = types.SimpleNamespace(
+        uuid=binding_uuid,
+        stream_uuid=stream_uuid,
+        user_uuid=removed_user_uuid,
+        who_uuid=USER_UUID,
+        role="member",
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(store, "_binding_for_update", lambda _uuid: binding)
+    monkeypatch.setattr(
+        store,
+        "_stream_participants",
+        lambda requested_stream_uuid: (
+            [removed_user_uuid, remaining_user_uuid]
+            if requested_stream_uuid == stream_uuid
+            else []
+        ),
+    )
+    validated = []
+    monkeypatch.setattr(
+        store,
+        "_validate_stream_participants",
+        lambda requested_stream_uuid, participants: validated.append(
+            (requested_stream_uuid, tuple(participants))
+        ),
+    )
+    targets = []
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda requested_stream_uuid, operation_kind=None: (
+            targets.append((requested_stream_uuid, operation_kind))
+            or provider_target
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda row, _resource, **_kwargs: {
+            "uuid": str(row.uuid),
+            "stream_uuid": str(row.stream_uuid),
+            "user_uuid": str(row.user_uuid),
+            "who_uuid": str(row.who_uuid),
+            "role": row.role,
+        },
+    )
+    deleted = []
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "delete_workspace_stream_binding",
+        lambda *args: deleted.append(args),
+    )
+    queued = []
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: queued.append(kwargs),
+    )
+
+    assert store.delete_resource("stream_bindings", binding_uuid) is None
+
+    assert validated == [(stream_uuid, (remaining_user_uuid,))]
+    assert targets == [(stream_uuid, "membership.remove")]
+    assert deleted == [(PROJECT_UUID, binding_uuid)]
+    assert queued == [
+        {
+            "operation_kind": "membership.remove",
+            "target_type": "stream_binding",
+            "target_uuid": binding_uuid,
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "uuid": str(binding_uuid),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(removed_user_uuid),
+                "who_uuid": str(USER_UUID),
+                "role": "member",
+            },
+            "provider_target": provider_target,
+        }
+    ]
+
+
 def test_reaction_update_queues_previous_provider_state(monkeypatch):
     reaction_uuid = sys_uuid.uuid4()
     message_uuid = sys_uuid.uuid4()
