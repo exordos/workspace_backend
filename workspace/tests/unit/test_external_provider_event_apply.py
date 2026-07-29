@@ -1321,7 +1321,7 @@ def test_provider_read_state_defers_messages_not_yet_imported(monkeypatch):
     }
 
 
-def test_message_update_uses_compact_broadcast_path(monkeypatch):
+def test_message_update_preserves_created_at_and_uses_compact_broadcast(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
@@ -1359,15 +1359,10 @@ def test_message_update_uses_compact_broadcast_path(monkeypatch):
         message_payloads.MarkdownPayload,
     )
     assert updated_values[0]["payload"].content == "hello"
-    timestamp_updates = [
+    assert "created_at" not in updated_values[0]
+    assert not [
         item for item in session.statements if 'SET "created_at" = %s' in item[0]
     ]
-    assert len(timestamp_updates) == 1
-    assert timestamp_updates[0][1] == (
-        datetime.datetime(2026, 7, 18, 12, tzinfo=datetime.timezone.utc),
-        sys_uuid.UUID(event["project_id"]),
-        message_uuid,
-    )
     assert compact_calls == [
         (
             (sys_uuid.UUID(event["project_id"]), message_uuid),
@@ -1387,7 +1382,7 @@ def test_idempotent_message_replay_skips_unchanged_broadcast(monkeypatch):
         uuid=message_uuid,
         user_uuid=sys_uuid.UUID(resource["user_uuid"]),
         stream_uuid=stream_uuid,
-        created_at=datetime.datetime(2026, 7, 18, 12),
+        created_at=datetime.datetime(2026, 7, 23, 12),
         payload=message_payloads.MarkdownPayload(content="hello"),
         provider_external_id="zulip-message-42",
         provider_metadata={
