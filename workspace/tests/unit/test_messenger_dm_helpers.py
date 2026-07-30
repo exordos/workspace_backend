@@ -3421,6 +3421,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         class FakeWorkspaceMessageReactions:
             def __init__(self, **kwargs):
                 created_reaction.update(kwargs)
+                for name, value in kwargs.items():
+                    setattr(self, name, value)
 
             def insert(self, session=None):
                 created_reaction["insert_session"] = session
@@ -3440,6 +3442,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers,
                 "_create_workspace_message_updated_events",
             ) as create_events,
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "lock_messages",
+            ) as lock_messages,
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "refresh_groups",
+            ) as refresh_groups,
         ):
             with mock.patch.object(
                 dm_helpers.messenger_events,
@@ -3470,6 +3480,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         create_reaction_event.assert_called_once_with(
             reaction=result,
             message=get_user_message.return_value,
+            session=session,
+        )
+        lock_messages.assert_called_once_with(
+            project_id,
+            (message_uuid,),
+            session=session,
+        )
+        refresh_groups.assert_called_once_with(
+            project_id,
+            ((message_uuid, "thumbs_up"),),
             session=session,
         )
         create_events.assert_called_once_with(
@@ -3526,6 +3546,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers.messenger_events,
                 "create_message_reaction_updated_event",
             ) as create_reaction_event,
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "lock_messages",
+            ) as lock_messages,
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "refresh_groups",
+            ) as refresh_groups,
         ):
             result = dm_helpers.update_workspace_message_reaction(
                 project_id=project_id,
@@ -3577,6 +3605,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             old_emoji_name="thumbs_up",
             session=session,
         )
+        lock_messages.assert_called_once_with(
+            project_id,
+            (old_message_uuid, message_uuid),
+            session=session,
+        )
+        refresh_groups.assert_called_once_with(
+            project_id,
+            (
+                (old_message_uuid, "thumbs_up"),
+                (message_uuid, "heart"),
+            ),
+            session=session,
+        )
         create_events.assert_has_calls(
             [
                 mock.call(
@@ -3605,6 +3646,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 self.uuid = reaction_uuid
                 self.message_uuid = message_uuid
                 self.user_uuid = user_uuid
+                self.emoji_name = "thumbs_up"
 
             def delete(self, session=None):
                 deleted_reaction["delete_session"] = session
@@ -3633,6 +3675,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers.messenger_events,
                 "create_message_reaction_deleted_event",
             ) as create_reaction_event,
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "lock_messages",
+            ) as lock_messages,
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "refresh_groups",
+            ) as refresh_groups,
         ):
             result = dm_helpers.delete_workspace_message_reaction(
                 project_id=project_id,
@@ -3657,6 +3707,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         create_reaction_event.assert_called_once_with(
             reaction=mock.ANY,
             message=get_user_message.return_value,
+            session=session,
+        )
+        lock_messages.assert_called_once_with(
+            project_id,
+            (message_uuid,),
+            session=session,
+        )
+        refresh_groups.assert_called_once_with(
+            project_id,
+            ((message_uuid, "thumbs_up"),),
             session=session,
         )
         create_events.assert_called_once_with(

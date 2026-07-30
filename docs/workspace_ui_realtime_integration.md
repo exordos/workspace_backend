@@ -77,6 +77,7 @@ socket additionally sends typed `ready` and cursor-error control messages.
     "starred": false,
     "is_own": true,
     "reactions": {},
+    "reaction_users": {},
     "created_at": "2026-07-02T16:37:49.552044Z",
     "updated_at": "2026-07-02T16:37:49.552047Z"
   }
@@ -100,7 +101,11 @@ events are minimal:
 Reaction changes emit `message_reaction.created`,
 `message_reaction.updated`, or `message_reaction.deleted` for the acting user.
 The backend also emits `message.updated` snapshots with the updated aggregate
-`reactions` map for users who can see the message.
+`reactions` map and persisted bounded `reaction_users` map for users who can see
+the message. Each present `reaction_users` key is a complete user UUID list
+materialized on the reaction write path. The client replaces the entire map on
+every full message snapshot; an empty object or missing key means count-only
+and must remove any previously cached list.
 
 Batch stream binding creation uses `payload.items`. Read actions emit
 `message.read`, `topic.read`, or `stream.read` and continue to emit aggregate

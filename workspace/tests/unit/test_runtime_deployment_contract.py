@@ -87,6 +87,17 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
+def test_reaction_user_lists_have_bounded_runtime_defaults():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        assert "[messenger_reactions]" in config
+        assert "user_list_limit = 4" in config
+        assert "user_list_max_entries_per_message" not in config
+
+
 def test_manifest_provisions_unassigned_external_integration_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     account_permissions = {

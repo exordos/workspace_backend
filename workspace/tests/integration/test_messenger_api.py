@@ -41,6 +41,7 @@ from restalchemy.storage.sql import sessions as ra_sessions
 from oslo_config import cfg
 
 from workspace.common import external_bridge_opts
+from workspace.common import messenger_reaction_opts
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_event_apply
 from workspace.external_bridge_control import sql_state
@@ -6993,6 +6994,7 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     )
     assert message_resp.status_code == 201, message_resp.text
     message_uuid = message_resp.json()["uuid"]
+    assert message_resp.json()["reaction_users"] == {}
 
     with db.cursor() as cur:
         cur.execute(
@@ -7037,6 +7039,9 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     resp = api.get(f"{MESSAGES}{message_uuid}", user=other_user)
     assert resp.status_code == 200, resp.text
     assert resp.json()["reactions"] == {"thumbs_up": 1}
+    assert resp.json()["reaction_users"] == {
+        "thumbs_up": [str(api.user_uuid)],
+    }
 
     duplicate_resp = api.post(
         MESSAGE_REACTIONS,
@@ -7073,6 +7078,10 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     assert resp.json()["reactions"] == {
         "eyes": 1,
         "thumbs_up": 2,
+    }
+    assert resp.json()["reaction_users"] == {
+        "eyes": [str(api.user_uuid)],
+        "thumbs_up": sorted((str(api.user_uuid), str(other_user))),
     }
 
     resp = api.get(MESSAGE_REACTIONS, params={"message_uuid": message_uuid})
@@ -7127,6 +7136,11 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         "heart": 1,
         "thumbs_up": 1,
     }
+    assert resp.json()["reaction_users"] == {
+        "eyes": [str(api.user_uuid)],
+        "heart": [str(api.user_uuid)],
+        "thumbs_up": [str(other_user)],
+    }
 
     resp = api.delete(f"{MESSAGE_REACTIONS}{other_reaction_uuid}")
     assert resp.status_code == 404, resp.text
@@ -7142,6 +7156,10 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     assert resp.json()["reactions"] == {
         "heart": 1,
         "thumbs_up": 1,
+    }
+    assert resp.json()["reaction_users"] == {
+        "heart": [str(api.user_uuid)],
+        "thumbs_up": [str(other_user)],
     }
 
     with db.cursor() as cur:
@@ -7185,6 +7203,26 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         {"eyes": 1, "heart": 1, "thumbs_up": 1},
         {"heart": 1, "thumbs_up": 1},
     ]
+    expected_reaction_user_snapshots = [
+        {"thumbs_up": [str(api.user_uuid)]},
+        {
+            "eyes": [str(api.user_uuid)],
+            "thumbs_up": [str(api.user_uuid)],
+        },
+        {
+            "eyes": [str(api.user_uuid)],
+            "thumbs_up": sorted((str(api.user_uuid), str(other_user))),
+        },
+        {
+            "eyes": [str(api.user_uuid)],
+            "heart": [str(api.user_uuid)],
+            "thumbs_up": [str(other_user)],
+        },
+        {
+            "heart": [str(api.user_uuid)],
+            "thumbs_up": [str(other_user)],
+        },
+    ]
     message_event_rows = [row for row in reaction_event_rows if row[0] == "message"]
     reaction_state_event_rows = [
         row for row in reaction_event_rows if row[0] == "message_reaction"
@@ -7205,6 +7243,10 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         assert {user_uuid for _, _, user_uuid, _ in group} == expected_event_users
         assert all(
             payload["reactions"] == expected_reactions for _, _, _, payload in group
+        )
+        assert all(
+            payload["reaction_users"] == expected_reaction_user_snapshots[index]
+            for _, _, _, payload in group
         )
 
     expected_reaction_events = [
@@ -7238,6 +7280,293 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         else:
             assert "old_message_uuid" not in payload
             assert "old_emoji_name" not in payload
+
+
+def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
+    api,
+    db,
+):
+    users = [sys_uuid.UUID(str(api.user_uuid))] + [
+        sys_uuid.uuid4() for _index in range(4)
+    ]
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "bounded-reaction-users",
+    )
+    for user_uuid in users[1:]:
+        conftest.seed_user_stream_binding(
+            db,
+            api.project_id,
+            stream_uuid,
+            user_uuid,
+        )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "bounded reaction users",
+            },
+        },
+    )
+    assert message_resp.status_code == 201, message_resp.text
+    message_uuid = message_resp.json()["uuid"]
+
+    for user_uuid in users[:4]:
+        response = api.post(
+            MESSAGE_REACTIONS,
+            user=user_uuid,
+            json={
+                "message_uuid": message_uuid,
+                "emoji_name": "heart",
+            },
+        )
+        assert response.status_code == 201, response.text
+    for user_uuid in users:
+        response = api.post(
+            MESSAGE_REACTIONS,
+            user=user_uuid,
+            json={
+                "message_uuid": message_uuid,
+                "emoji_name": "eyes",
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    expected_reaction_users = {
+        "heart": sorted(str(user_uuid) for user_uuid in users[:4]),
+    }
+    response = api.get(f"{MESSAGES}{message_uuid}")
+    assert response.status_code == 200, response.text
+    assert response.json()["reactions"] == {"eyes": 5, "heart": 4}
+    assert response.json()["reaction_users"] == expected_reaction_users
+
+    page_response = api.get(MESSAGES, params={"stream_uuid": str(stream_uuid)})
+    assert page_response.status_code == 200, page_response.text
+    page_message = next(
+        item for item in page_response.json() if item["uuid"] == message_uuid
+    )
+    assert page_message["reaction_users"] == expected_reaction_users
+
+    read_response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=users[-1],
+    )
+    assert read_response.status_code == 200, read_response.text
+    assert read_response.json()["reaction_users"] == expected_reaction_users
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT reaction_users
+            FROM m_workspace_messages
+            WHERE project_id = %s
+              AND uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        stored_reaction_users = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND object_type = 'message'
+              AND action = 'updated'
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (api.project_id, api.user_uuid, message_uuid),
+        )
+        event_payload = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND object_type = 'message'
+              AND action = 'read'
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (api.project_id, users[-1], message_uuid),
+        )
+        read_event_payload = cursor.fetchone()[0]
+    assert stored_reaction_users == expected_reaction_users
+    assert event_payload["reactions"] == {"eyes": 5, "heart": 4}
+    assert event_payload["reaction_users"] == expected_reaction_users
+    assert read_event_payload["reaction_users"] == expected_reaction_users
+
+
+def test_reaction_user_limit_changes_apply_only_on_the_next_group_write(api, db):
+    users = [sys_uuid.UUID(str(api.user_uuid))] + [
+        sys_uuid.uuid4() for _index in range(3)
+    ]
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "lazy-reaction-user-limit",
+    )
+    for user_uuid in users[1:]:
+        conftest.seed_user_stream_binding(
+            db,
+            api.project_id,
+            stream_uuid,
+            user_uuid,
+        )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "lazy reaction limit",
+            },
+        },
+    )
+    assert message_resp.status_code == 201, message_resp.text
+    message_uuid = message_resp.json()["uuid"]
+
+    for user_uuid in users[:3]:
+        response = api.post(
+            MESSAGE_REACTIONS,
+            user=user_uuid,
+            json={
+                "message_uuid": message_uuid,
+                "emoji_name": "heart",
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    expected_before_change = {
+        "heart": sorted(str(user_uuid) for user_uuid in users[:3]),
+    }
+    response = api.get(f"{MESSAGES}{message_uuid}")
+    assert response.status_code == 200, response.text
+    assert response.json()["reaction_users"] == expected_before_change
+
+    cfg.CONF.set_override(
+        "user_list_limit",
+        2,
+        group=messenger_reaction_opts.DOMAIN,
+    )
+    try:
+        response = api.get(f"{MESSAGES}{message_uuid}")
+        assert response.status_code == 200, response.text
+        assert response.json()["reaction_users"] == expected_before_change
+
+        response = api.post(
+            MESSAGE_REACTIONS,
+            user=users[-1],
+            json={
+                "message_uuid": message_uuid,
+                "emoji_name": "heart",
+            },
+        )
+        assert response.status_code == 201, response.text
+        response = api.get(f"{MESSAGES}{message_uuid}")
+        assert response.status_code == 200, response.text
+        assert response.json()["reactions"] == {"heart": 4}
+        assert response.json()["reaction_users"] == {}
+    finally:
+        cfg.CONF.clear_override(
+            "user_list_limit",
+            group=messenger_reaction_opts.DOMAIN,
+        )
+
+
+def test_concurrent_reaction_writes_keep_one_complete_user_snapshot(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "concurrent-reaction-users",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        other_user,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_resp = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "concurrent reaction users",
+            },
+        },
+    )
+    assert message_resp.status_code == 201, message_resp.text
+    message_uuid = sys_uuid.UUID(message_resp.json()["uuid"])
+    barrier = threading.Barrier(2)
+
+    def create_reaction(user_uuid):
+        def operation(session):
+            barrier.wait(timeout=5)
+            return messenger_dm_helpers.create_workspace_message_reaction(
+                project_id=sys_uuid.UUID(api.project_id),
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+                emoji_name="heart",
+                session=session,
+                compact_events=True,
+            )
+
+        return _run_database_operation(operation)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        reactions = list(
+            executor.map(
+                create_reaction,
+                (sys_uuid.UUID(str(api.user_uuid)), other_user),
+            )
+        )
+
+    assert len({reaction.uuid for reaction in reactions}) == 2
+    response = api.get(f"{MESSAGES}{message_uuid}")
+    assert response.status_code == 200, response.text
+    assert response.json()["reactions"] == {"heart": 2}
+    assert response.json()["reaction_users"] == {
+        "heart": sorted((str(api.user_uuid), str(other_user))),
+    }
 
 
 def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):

@@ -52,6 +52,31 @@ def test_all_messenger_http_entrypoints_register_external_bridge_options():
         assert result.returncode == 0, result.stderr
 
 
+def test_all_message_snapshot_writers_register_reaction_options():
+    for module in (
+        "workspace.cmd.external_bridge_api",
+        "workspace.cmd.messenger_api",
+        "workspace.cmd.workspace_api",
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from oslo_config import cfg; "
+                    f"import {module}; "
+                    "options = cfg.CONF['messenger_reactions']; "
+                    "assert options.user_list_limit == 4"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, result.stderr
+
+
 def test_projection_move_is_delegated_to_configured_storage_factory():
     calls = []
 

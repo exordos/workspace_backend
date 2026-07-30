@@ -881,6 +881,29 @@ def add_public_projection_contract(
             properties = schema["properties"]
             properties["provider"] = copy.deepcopy(PROVIDER_SCHEMA)
             properties["delivery"] = copy.deepcopy(DELIVERY_SCHEMA)
+        if name.startswith("WorkspaceUserMessage_"):
+            schema["properties"]["reaction_users"] = {
+                "type": "object",
+                "readOnly": True,
+                "default": {},
+                "description": (
+                    "Complete user UUID lists persisted on reaction writes. "
+                    "An empty object or missing emoji key means count-only; "
+                    "lists are never partial."
+                ),
+                "example": {
+                    "heart": [
+                        "11111111-1111-1111-1111-111111111111",
+                        "33333333-3333-3333-3333-333333333333",
+                    ]
+                },
+                "additionalProperties": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "items": {"type": "string", "format": "uuid"},
+                },
+            }
         if name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
             properties = schema["properties"]
             properties["identity_kind"] = {

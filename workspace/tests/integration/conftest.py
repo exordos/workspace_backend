@@ -48,6 +48,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from oslo_config import cfg
 
 from workspace.common import file_storage_opts
+from workspace.common import messenger_reaction_opts
 from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
@@ -170,6 +171,10 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
 def build_test_wsgi_application(app_module=messenger_app):
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
+    try:
+        messenger_reaction_opts.register_opts()
+    except cfg.DuplicateOptError:
+        pass
     try:
         external_bridge_opts.register_opts()
     except cfg.DuplicateOptError:
