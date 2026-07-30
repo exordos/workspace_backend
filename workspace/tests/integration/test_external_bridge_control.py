@@ -2089,7 +2089,75 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
             "SELECT status, revision FROM m_external_chats_v2 WHERE uuid = %s",
             (selected_uuid,),
         )
-        assert cursor.fetchone() == ("live", 3)
+        assert cursor.fetchone() == ("live", 2)
+
+    with session_factory() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 1
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT operation, generation
+            FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            """,
+            (selected_uuid,),
+        )
+        assert cursor.fetchone() == ("upsert", 2)
+        cursor.execute(
+            """
+            DELETE FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            """,
+            (selected_uuid,),
+        )
+    with session_factory() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 1
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT operation, generation
+            FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            """,
+            (selected_uuid,),
+        )
+        assert cursor.fetchone() == ("upsert", 2)
+
+    current_live = {
+        **live_ready,
+        "report_uuid": str(sys_uuid.uuid4()),
+        "observed_generation": 2,
+    }
+    assert _request_call(
+        repository.observed_reports,
+        identity,
+        [current_live],
+    )["results"][0]["status"] == "applied"
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT status, revision FROM m_external_chats_v2 WHERE uuid = %s",
+            (selected_uuid,),
+        )
+        assert cursor.fetchone() == ("live", 2)
 
 
 def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(

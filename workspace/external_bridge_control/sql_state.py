@@ -222,6 +222,60 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
     }
 
 
+def repair_external_chat_assignments(
+    session: Any,
+    account_uuid: object,
+    bridge_instance_uuid: object,
+    provider_kind: str,
+    limit: int = 100,
+) -> int:
+    """Re-emit selected chat assignments that are absent or behind."""
+    rows = session.execute(
+        """
+        SELECT chat.uuid
+        FROM m_external_chats_v2 AS chat
+        LEFT JOIN m_external_bridge_desired_resources_v1 AS desired
+          ON desired.bridge_instance_uuid = %s
+         AND desired.provider_kind = %s
+         AND desired.resource_type = 'external_chat_assignment'
+         AND desired.resource_uuid = chat.uuid
+        WHERE chat.external_account_uuid = %s
+          AND chat.selected
+          AND chat.project_id IS NOT NULL
+          AND chat.projection_stream_uuid IS NOT NULL
+          AND chat.source->>'chat_type' IN ('channel', 'personal', 'group')
+          AND jsonb_typeof(chat.source->'participants') = 'array'
+          AND jsonb_typeof(chat.source->'topics') = 'array'
+          AND (
+              desired.resource_uuid IS NULL
+              OR desired.generation < chat.revision
+          )
+        ORDER BY chat.uuid
+        LIMIT %s
+        """,
+        (
+            bridge_instance_uuid,
+            provider_kind,
+            account_uuid,
+            limit,
+        ),
+    ).fetchall()
+    repaired = 0
+    for row in rows:
+        chat = external_models.ExternalChat.objects.get_one(
+            filters={"uuid": dm_filters.EQ(row["uuid"])},
+            session=session,
+        )
+        change_uuid = append_upsert(
+            session,
+            sys_uuid.UUID(str(bridge_instance_uuid)),
+            provider_kind,
+            external_chat_assignment_desired(chat, session=session),
+        )
+        repaired += int(change_uuid is not None)
+    return repaired
+
+
 def _unavailable_reason(code: str, message: str) -> dict[str, str]:
     return {"code": code, "message": message}
 
@@ -642,6 +696,13 @@ def refresh_effective_capabilities(
                     hidden_fields=("owner_user_uuid", "provider", "provider_chat_id"),
                     session=session,
                 )
+        if account["bridge_instance_uuid"] is not None:
+            repair_external_chat_assignments(
+                session,
+                account["uuid"],
+                account["bridge_instance_uuid"],
+                account["provider"],
+            )
     return len(rows)
 
 
@@ -1869,6 +1930,8 @@ class SQLControlState:
             }
             status = status_map.get(report["status"])
             if status is None:
+                return
+            if chat.status == status and chat.safe_error == safe_error:
                 return
             chat.properties["status"].set_value_force(status)
             chat.properties["safe_error"].set_value_force(safe_error)
