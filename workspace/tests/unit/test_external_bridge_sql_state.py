@@ -11,6 +11,61 @@ import uuid as sys_uuid
 from workspace.external_bridge_control import sql_state
 
 
+def test_assignment_preserves_provider_topic_ids_after_display_name_collision():
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+    provider_topic_ids = ["42:old-a", "42:old-b"]
+    chat = SimpleNamespace(
+        source={
+            "chat_type": "channel",
+            "topics": [
+                {
+                    "topic_uuid": str(topic_uuid),
+                    "provider_topic_id": provider_topic_id,
+                    "name": provider_topic_id,
+                    "is_default": False,
+                }
+                for topic_uuid, provider_topic_id in zip(
+                    topic_uuids,
+                    provider_topic_ids,
+                    strict=True,
+                )
+            ],
+        },
+        projection_stream_uuid=stream_uuid,
+        project_id=project_uuid,
+        display_name="Engineering",
+        provider_chat_id="channel:42",
+        provider="zulip",
+        uuid=sys_uuid.uuid4(),
+        revision=3,
+        external_account_uuid=sys_uuid.uuid4(),
+        history_depth=100,
+    )
+    stream_result = mock.Mock()
+    stream_result.fetchone.return_value = {
+        "name": "Engineering",
+        "description": "",
+        "private": False,
+        "private_index": None,
+    }
+    topics_result = mock.Mock()
+    topics_result.fetchall.return_value = [
+        {"uuid": topic_uuid, "name": "canonical"}
+        for topic_uuid in topic_uuids
+    ]
+    session = SimpleNamespace(
+        execute=mock.Mock(side_effect=[stream_result, topics_result])
+    )
+
+    assignment = sql_state.external_chat_assignment_desired(chat, session=session)
+    topics = assignment["workspace_projection"]["topics"]
+
+    assert [item["name"] for item in topics] == ["canonical", "canonical"]
+    assert [item["provider_topic_id"] for item in topics] == provider_topic_ids
+
+
 def test_membership_write_is_available_only_for_live_channels():
     assert "messenger.membership.write" in sql_state.state.KNOWN_CAPABILITIES
     descriptor = {
