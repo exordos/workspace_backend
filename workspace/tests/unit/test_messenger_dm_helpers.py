@@ -357,7 +357,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         direct_user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         owner_stream = types.SimpleNamespace(
             uuid=stream_uuid,
             user_uuid=user_uuid,
@@ -471,6 +471,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(expected_index, created_stream["private_index"])
         self.assertEqual(23456, created_stream["color"])
         self.assertIs(session, created_stream["insert_session"])
+        lock_statement, lock_values = session.execute.call_args.args
+        self.assertIn("pg_advisory_xact_lock", lock_statement)
+        self.assertEqual(
+            (f"messenger-direct:{project_id}:{expected_index}",),
+            lock_values,
+        )
         get_all_streams.assert_called_once_with(
             filters={
                 "project_id": mock.ANY,
@@ -735,6 +741,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             description="Old private chat",
             source_name="native",
             source={"kind": "native"},
+            private=True,
         )
         owner_stream = types.SimpleNamespace(
             uuid=existing_stream.uuid,
@@ -744,7 +751,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             uuid=existing_stream.uuid,
             user_uuid=direct_user_uuid,
         )
-        session = object()
+        session = mock.Mock()
         get_all_streams = mock.Mock(return_value=[existing_stream])
 
         class FakeWorkspaceStream:
@@ -783,6 +790,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertIs(owner_stream, result)
         self.assertEqual("Direct", existing_stream.name)
         self.assertEqual("Private chat", existing_stream.description)
+        self.assertEqual("native", existing_stream.source_name)
+        self.assertEqual({"kind": "native"}, existing_stream.source)
+        self.assertTrue(existing_stream.private)
         self.assertIs(session, existing_stream.update_session)
         get_user_streams.assert_called_once_with(
             filters={
@@ -802,6 +812,103 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
         self.assertEqual(2, create_event.call_count)
+
+    def test_get_or_create_workspace_user_stream_rejects_conflicting_identity(
+        self,
+    ):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        direct_user_uuid = sys_uuid.uuid4()
+        existing_stream = self._existing_stream(
+            uuid=sys_uuid.uuid4(),
+            name="Direct",
+            description="Private chat",
+            source_name="native",
+            source={"kind": "native"},
+            private=True,
+        )
+        session = mock.Mock()
+
+        class FakeWorkspaceStream:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(return_value=[existing_stream])
+            )
+
+            def __init__(self, **kwargs):
+                raise AssertionError("existing stream should be returned")
+
+        with mock.patch.object(
+            dm_helpers.models,
+            "WorkspaceStream",
+            FakeWorkspaceStream,
+        ):
+            with self.assertRaises(
+                messenger_exc.StreamIdentityImmutableError
+            ) as error_context:
+                dm_helpers.get_or_create_workspace_user_stream(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    name="Direct",
+                    description="Private chat",
+                    source_name="zulip",
+                    source={
+                        "kind": "zulip",
+                        "stream_id": 17,
+                        "server_url": "https://zulip.example.invalid",
+                    },
+                    direct_user_uuid=direct_user_uuid,
+                    session=session,
+                )
+
+        self.assertIn("source", error_context.exception.msg)
+        self.assertIn("source_name", error_context.exception.msg)
+        self.assertEqual("native", existing_stream.source_name)
+        self.assertEqual({"kind": "native"}, existing_stream.source)
+        self.assertTrue(existing_stream.private)
+        self.assertIsNone(existing_stream.update_session)
+
+    def test_existing_direct_identity_compares_full_source_payload(self):
+        existing_stream = types.SimpleNamespace(
+            source_name="zulip",
+            source={
+                "kind": "zulip",
+                "stream_id": 17,
+                "server_url": "https://zulip.example.invalid",
+            },
+            private=True,
+        )
+        matching_fields = {
+            "source_name": "zulip",
+            "source": {
+                "kind": "zulip",
+                "stream_id": 17,
+                "server_url": "https://zulip.example.invalid",
+            },
+            "private": True,
+        }
+
+        dm_helpers._reject_conflicting_stream_identity(
+            existing_stream,
+            matching_fields,
+        )
+
+        conflicting_fields = {
+            **matching_fields,
+            "source": {
+                **matching_fields["source"],
+                "stream_id": 18,
+            },
+        }
+        with self.assertRaises(
+            messenger_exc.StreamIdentityImmutableError
+        ) as error_context:
+            dm_helpers._reject_conflicting_stream_identity(
+                existing_stream,
+                conflicting_fields,
+            )
+
+        self.assertIn("source", error_context.exception.msg)
+        self.assertNotIn("source_name", error_context.exception.msg)
 
     def test_get_or_create_workspace_user_stream_skips_existing_update_when_clean(self):
         project_id = sys_uuid.uuid4()
@@ -823,7 +930,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             uuid=existing_stream.uuid,
             user_uuid=direct_user_uuid,
         )
-        session = object()
+        session = mock.Mock()
         get_all_streams = mock.Mock(return_value=[existing_stream])
 
         class FakeWorkspaceStream:
@@ -885,23 +992,84 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
         self.assertIn("private_index", error_context.exception.msg)
 
-    def test_get_or_create_workspace_user_stream_rejects_self_direct_user(self):
+    def test_get_or_create_workspace_user_stream_rejects_false_direct_private(self):
+        with self.assertRaises(
+            messenger_exc.StreamIdentityImmutableError
+        ) as error_context:
+            dm_helpers.get_or_create_workspace_user_stream(
+                project_id=sys_uuid.uuid4(),
+                user_uuid=sys_uuid.uuid4(),
+                name="Direct",
+                description="Private chat",
+                source_name="native",
+                source={"kind": "native"},
+                direct_user_uuid=sys_uuid.uuid4(),
+                private=False,
+            )
+
+        self.assertIn("private", error_context.exception.msg)
+
+    def test_self_direct_identity_uses_repeated_pair_values(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
 
-        with self.assertRaises(
-            messenger_exc.DirectStreamSelfChatError
-        ) as error_context:
+        self.assertEqual(
+            f"{user_uuid}:{user_uuid}",
+            dm_helpers.build_private_stream_index(user_uuid, user_uuid),
+        )
+        self.assertEqual(
+            sys_uuid.uuid5(
+                dm_helpers.DIRECT_STREAM_NAMESPACE,
+                f"{project_id}:{user_uuid}:{user_uuid}",
+            ),
+            dm_helpers.deterministic_direct_stream_uuid(
+                project_id,
+                user_uuid,
+                user_uuid,
+            ),
+        )
+
+    def test_get_or_create_workspace_user_stream_rejects_provider_self_chat(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+
+        with self.assertRaises(messenger_exc.SelfChatNativeOnlyError):
+            dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                name="Direct",
+                description="Private chat",
+                source_name="zulip",
+                source={
+                    "kind": "zulip",
+                    "stream_id": None,
+                    "server_url": "https://zulip.example.com",
+                    "topic_name": None,
+                    "message_id": None,
+                },
+                direct_user_uuid=user_uuid,
+            )
+
+    def test_get_or_create_workspace_user_stream_rejects_source_mismatch(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+
+        with self.assertRaises(messenger_exc.StreamSourceMismatchError):
             dm_helpers.get_or_create_workspace_user_stream(
                 project_id=project_id,
                 user_uuid=user_uuid,
                 name="Direct",
                 description="Private chat",
                 source_name="native",
-                source={"kind": "native"},
+                source={
+                    "kind": "zulip",
+                    "stream_id": 1,
+                    "server_url": "https://zulip.example.com",
+                    "topic_name": None,
+                    "message_id": None,
+                },
                 direct_user_uuid=user_uuid,
             )
-        self.assertIn("direct_user_uuid", error_context.exception.msg)
 
     def test_create_workspace_stream_binding_events_for_public_stream(self):
         project_id = sys_uuid.uuid4()
@@ -1643,6 +1811,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             name = "Engineering"
             description = "Engineering chat"
             invite_only = False
+            private_index = None
 
             def update_dm(self, values):
                 updated_stream["values"] = values
@@ -1714,6 +1883,55 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 mock.call(stream=other_stream, session=session),
             ]
         )
+
+    def test_update_workspace_user_stream_rejects_identity_fields(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        existing_stream = types.SimpleNamespace(
+            private_index=f"{user_uuid}:{user_uuid}",
+        )
+
+        class FakeWorkspaceStream:
+            objects = types.SimpleNamespace(
+                get_one=mock.Mock(return_value=existing_stream)
+            )
+
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream",
+                return_value=types.SimpleNamespace(uuid=stream_uuid),
+            ),
+        ):
+            for field, value in (
+                ("source_name", "native"),
+                ("source", {"kind": "native"}),
+                ("direct_user_uuid", user_uuid),
+                ("private_index", f"{user_uuid}:{user_uuid}"),
+                ("private", True),
+            ):
+                existing_stream.private_index = (
+                    None
+                    if field in {"source_name", "source"}
+                    else f"{user_uuid}:{user_uuid}"
+                )
+                with (
+                    self.subTest(field=field),
+                    self.assertRaises(
+                        messenger_exc.StreamIdentityImmutableError
+                    ) as error_context,
+                ):
+                    dm_helpers.update_workspace_user_stream(
+                        project_id=project_id,
+                        user_uuid=user_uuid,
+                        stream_uuid=stream_uuid,
+                        values={field: value},
+                    )
+                self.assertIn(field, error_context.exception.msg)
 
     def test_update_workspace_user_stream_notifications_updates_binding(self):
         project_id = sys_uuid.uuid4()
@@ -1794,6 +2012,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         actor_stream = types.SimpleNamespace(
             uuid=stream_uuid,
             user_uuid=user_uuid,
+            direct_user_uuid=None,
             private=False,
             source_name="native",
             source=dm_helpers.models.NativeSource(),
@@ -1904,6 +2123,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         user_stream = types.SimpleNamespace(
             uuid=stream_uuid,
             user_uuid=user_uuid,
+            direct_user_uuid=None,
             private=False,
             source_name="native",
             source=dm_helpers.models.NativeSource(),

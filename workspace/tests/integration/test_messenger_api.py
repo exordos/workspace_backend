@@ -3493,7 +3493,45 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
     assert second_resp.status_code in (200, 201), second_resp.text
     second_stream = second_resp.json()
 
+    matching_private_resp = api.post(
+        STREAMS,
+        json={**payload, "private": True},
+    )
+    assert matching_private_resp.status_code in (200, 201), matching_private_resp.text
+    assert matching_private_resp.json()["uuid"] == first_stream["uuid"]
+
+    conflicting_private_resp = api.post(
+        STREAMS,
+        json={**payload, "private": False},
+    )
+    assert conflicting_private_resp.status_code == 400, conflicting_private_resp.text
+    assert conflicting_private_resp.json()["code"] == 400001011
+
+    different_source_resp = api.post(
+        STREAMS,
+        json={
+            **payload,
+            "source_name": "zulip",
+            "source": {
+                "kind": "zulip",
+                "stream_id": 17,
+                "server_url": "https://zulip.example.invalid",
+                "topic_name": None,
+                "message_id": None,
+            },
+        },
+    )
+    assert different_source_resp.status_code == 400, different_source_resp.text
+    assert different_source_resp.json()["code"] == 400001011
+
+    unchanged_resp = api.get(f"{STREAMS}{first_stream['uuid']}")
+    assert unchanged_resp.status_code == 200, unchanged_resp.text
+    unchanged_stream = unchanged_resp.json()
+
     assert second_stream["uuid"] == first_stream["uuid"]
+    assert unchanged_stream["source_name"] == "native"
+    assert unchanged_stream["source"] == {"kind": "native"}
+    assert unchanged_stream["private"] is True
     assert first_stream["private"] is True
     assert first_stream["direct_user_uuid"] == str(direct_user_uuid)
     assert "private_index" not in first_stream
@@ -3602,6 +3640,220 @@ def test_direct_stream_create_is_idempotent_and_creates_owner_bindings(api, db):
         (user_uuid, "owner")
         for user_uuid in sorted([str(api.user_uuid), str(direct_user_uuid)])
     ]
+
+
+def test_self_direct_stream_is_stable_private_singleton_with_message_history(api, db):
+    expected_stream_uuid = messenger_dm_helpers.deterministic_direct_stream_uuid(
+        api.project_id,
+        api.user_uuid,
+        api.user_uuid,
+    )
+    expected_index = f"{api.user_uuid}:{api.user_uuid}"
+    payload = {
+        "name": "Personal notes",
+        "description": "",
+        "source_name": "native",
+        "source": {"kind": "native"},
+        "direct_user_uuid": api.user_uuid,
+    }
+
+    mismatched_source_resp = api.post(
+        STREAMS,
+        json={
+            **payload,
+            "source": {
+                "kind": "zulip",
+                "stream_id": 1,
+                "server_url": "https://zulip.example.invalid",
+                "topic_name": None,
+                "message_id": None,
+            },
+        },
+    )
+    assert mismatched_source_resp.status_code == 400, mismatched_source_resp.text
+    assert mismatched_source_resp.json()["code"] == 400001010
+
+    first_resp = api.post(STREAMS, json=payload)
+    assert first_resp.status_code in (200, 201), first_resp.text
+    first_stream = first_resp.json()
+    second_resp = api.post(STREAMS, json=payload)
+    assert second_resp.status_code in (200, 201), second_resp.text
+    second_stream = second_resp.json()
+
+    assert first_stream["uuid"] == str(expected_stream_uuid)
+    assert second_stream["uuid"] == first_stream["uuid"]
+    assert first_stream["private"] is True
+    assert first_stream["direct_user_uuid"] == api.user_uuid
+    assert first_stream["owner"] == api.user_uuid
+    assert first_stream["user_uuid"] == api.user_uuid
+    assert first_stream["role"] == "owner"
+    assert "private_index" not in first_stream
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT private_index, direct_user_uuid, default_topic_uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        stored_index, direct_user_uuid, default_topic_uuid = cur.fetchone()
+        cur.execute(
+            """
+            SELECT uuid, user_uuid, role
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        bindings = cur.fetchall()
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_topics
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, first_stream["uuid"]),
+        )
+        topic_count = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND payload->>'kind' = 'stream.created'
+              AND payload->>'uuid' = %s
+            """,
+            (api.project_id, api.user_uuid, first_stream["uuid"]),
+        )
+        created_event_count = cur.fetchone()[0]
+
+    assert stored_index == expected_index
+    assert str(direct_user_uuid) == api.user_uuid
+    assert str(default_topic_uuid) == first_stream["default_topic_uuid"]
+    assert [(str(user_uuid), role) for _uuid, user_uuid, role in bindings] == [
+        (api.user_uuid, "owner")
+    ]
+    assert topic_count == 1
+    assert created_event_count == 1
+
+    message_resp = api.post(
+        MESSAGES,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "stream_uuid": first_stream["uuid"],
+            "topic_uuid": first_stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "remember this"},
+        },
+    )
+    assert message_resp.status_code == 201, message_resp.text
+    message_uuid = message_resp.json()["uuid"]
+    history_resp = api.get(
+        MESSAGES,
+        params={"stream_uuid": first_stream["uuid"]},
+    )
+    assert history_resp.status_code == 200, history_resp.text
+    assert [message["uuid"] for message in history_resp.json()] == [message_uuid]
+
+    third_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, third_user_uuid, f"user-{third_user_uuid}")
+    for identity_update in (
+        {"source_name": "native"},
+        {"source": {"kind": "native"}},
+        {"direct_user_uuid": str(third_user_uuid)},
+        {"private": False},
+        {"private_index": f"{api.user_uuid}:{third_user_uuid}"},
+    ):
+        identity_update_resp = api.put(
+            f"{STREAMS}{first_stream['uuid']}",
+            json=identity_update,
+        )
+        assert identity_update_resp.status_code == 400, identity_update_resp.text
+
+    add_resp = api.post(
+        f"{STREAMS}{first_stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(third_user_uuid)]},
+    )
+    assert add_resp.status_code == 400, add_resp.text
+    binding_uuid = str(bindings[0][0])
+    role_resp = api.put(
+        f"{STREAM_BINDINGS}{binding_uuid}",
+        json={"role": "member"},
+    )
+    assert role_resp.status_code == 400, role_resp.text
+    binding_delete_resp = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert binding_delete_resp.status_code == 400, binding_delete_resp.text
+    stream_delete_resp = api.delete(f"{STREAMS}{first_stream['uuid']}")
+    assert stream_delete_resp.status_code == 400, stream_delete_resp.text
+
+    reloaded_message = api.get(f"{MESSAGES}{message_uuid}")
+    assert reloaded_message.status_code == 200, reloaded_message.text
+    assert reloaded_message.json()["payload"]["content"] == "remember this"
+
+
+def test_concurrent_self_direct_ensure_creates_one_canonical_stream(api, db):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    conftest.seed_workspace_user(db, user_uuid, f"user-{user_uuid}")
+    stream_uuid = messenger_dm_helpers.deterministic_direct_stream_uuid(
+        project_id,
+        user_uuid,
+        user_uuid,
+    )
+    workers_ready = threading.Barrier(2)
+
+    def ensure_self_stream():
+        workers_ready.wait(timeout=5)
+        return _run_database_operation(
+            lambda session: messenger_dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=stream_uuid,
+                name="Personal notes",
+                description="",
+                source_name="native",
+                source=messenger_models.NativeSource(),
+                direct_user_uuid=user_uuid,
+                session=session,
+            )
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _value: ensure_self_stream(), range(2)))
+
+    assert [str(stream.uuid) for stream in results] == [
+        str(stream_uuid),
+        str(stream_uuid),
+    ]
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM m_workspace_streams
+                 WHERE project_id = %s AND uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_stream_bindings
+                 WHERE project_id = %s AND stream_uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_stream_topics
+                 WHERE project_id = %s AND stream_uuid = %s),
+                (SELECT COUNT(*) FROM m_workspace_events
+                 WHERE project_id = %s
+                   AND payload->>'kind' = 'stream.created'
+                   AND payload->>'uuid' = %s)
+            """,
+            (
+                project_id,
+                stream_uuid,
+                project_id,
+                stream_uuid,
+                project_id,
+                stream_uuid,
+                project_id,
+                str(stream_uuid),
+            ),
+        )
+        assert cur.fetchone() == (1, 1, 1, 1)
 
 
 def test_stream_binding_create_notifies_added_user(api, db):

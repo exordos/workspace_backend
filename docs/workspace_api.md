@@ -695,10 +695,15 @@ snapshots and keep `default_topic_uuid: null` explicitly.
 
 If `direct_user_uuid` is provided, the backend creates an ordinary stream with
 the same bindings, roles, topics, events, and file ACL rules as every other
-chat. Its only additional invariants are `private: true`, exactly two distinct
-IAM participants, a deterministic project-scoped stream UUID for the unordered
-pair, and `owner` bindings for both users. Repeating the same request for the
-same pair returns the existing stream.
+chat. Its only additional invariants are `private: true`, a deterministic
+project-scoped stream UUID for the unordered identity pair, and `owner`
+bindings for the unique users in that pair. An ordinary direct chat has two
+different participants. A self chat uses the repeated pair `(user, user)`,
+contains exactly one binding for the current user, and returns the current user
+UUID in `direct_user_uuid`. Repeating or concurrently sending the same request
+for one pair returns the existing stream. Reusing the pair with conflicting
+source or direct identity fields returns HTTP `400` instead of changing or
+silently ignoring the requested identity.
 
 Supported source payloads:
 
@@ -743,7 +748,7 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
 | `announce` | boolean | no | no | Announcement stream flag. |
-| `direct_user_uuid` | UUID | no | no | Other direct-chat participant. |
+| `direct_user_uuid` | UUID | no | no | Direct-chat counterpart. Equals the current user UUID only for a self chat. |
 | `private` | boolean | no | yes | Private stream flag. |
 | `is_archived` | boolean | no | action-managed | Archived flag. |
 | `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
@@ -783,9 +788,38 @@ Direct chat create request:
 }
 ```
 
-`direct_user_uuid` must identify the other participant. Sending the current IAM
-user UUID, including the token subject UUID, returns HTTP `400` with the generic
-`ValidationErrorException` response shown above.
+Self chat create request:
+
+```json
+{
+  "name": "Personal notes",
+  "description": "",
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  },
+  "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
+}
+```
+
+For a self chat, `direct_user_uuid` must equal the current IAM user UUID,
+including the token subject UUID. Self chats are native-only. The response is
+the standard stream resource with `private: true`, one current-user `owner`
+binding, and the same current-user UUID in `direct_user_uuid`; no separate chat
+type or self-chat flag is exposed. This makes
+`private && direct_user_uuid == current_user_uuid` the stable client-side
+identity check while preserving ordinary private-group streams, whose
+`direct_user_uuid` remains `null`.
+
+Direct membership is immutable. Its bindings must equal the unique users in
+the identity pair: one binding for a self chat and two for an ordinary direct
+chat. Adding or removing participants and updating a binding role returns HTTP
+`400`. Deleting a self-chat stream also returns HTTP `400` so message history
+cannot be replaced by deleting and recreating the deterministic identity.
+`source_name` must match `source.kind` when a stream is created. Both source
+fields are immutable for every stream. For a direct chat, `direct_user_uuid`,
+`private`, and the internal `private_index` are also immutable; attempts to
+change any of these identity fields return HTTP `400`.
 
 Stream notification mode request:
 

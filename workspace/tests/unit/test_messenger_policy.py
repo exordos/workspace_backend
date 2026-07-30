@@ -16,6 +16,7 @@ import pytest
 from gcl_iam.api import controllers as iam_controllers
 from restalchemy.api import routes as ra_routes
 
+from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
 from workspace.messenger_api.api import resource_projection
@@ -315,7 +316,7 @@ def test_actions_use_current_scope_and_store_resource(
     ]
 
 
-def test_direct_stream_uses_project_scoped_pair_uuid_and_rejects_self(store_factory):
+def test_direct_stream_uses_project_scoped_pair_uuid_including_self(store_factory):
     store, _opened_scopes = store_factory
     controller = _controller(controllers.WorkspaceStreamController)
 
@@ -329,8 +330,23 @@ def test_direct_stream_uses_project_scoped_pair_uuid_and_rejects_self(store_fact
     assert result["uuid"] == expected_uuid
     assert result["private"] is True
     assert store.calls[0][0:2] == ("create", "streams")
-    with pytest.raises(Exception):
-        controller.create(name="Self", direct_user_uuid=USER_UUID)
+
+    self_result = controller.create(name="Self", direct_user_uuid=USER_UUID)
+    assert self_result["uuid"] == helpers.deterministic_direct_stream_uuid(
+        PROJECT_UUID,
+        USER_UUID,
+        USER_UUID,
+    )
+    assert self_result["private"] is True
+    assert self_result["direct_user_uuid"] == USER_UUID
+
+    with pytest.raises(messenger_exc.StreamIdentityImmutableError):
+        controller.create(
+            name="Direct",
+            direct_user_uuid=PEER_UUID,
+            private=False,
+        )
+    assert len(store.calls) == 2
 
 
 def test_stream_resource_hides_internal_private_index():

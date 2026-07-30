@@ -680,11 +680,14 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
         )
 
-    def _is_direct_stream(self, stream_uuid: object) -> bool:
+    def _direct_stream_participants(
+        self,
+        stream_uuid: object,
+    ) -> set[object] | None:
         session = contexts.Context().get_session()
         row = session.execute(
             """
-            SELECT "private_index" IS NOT NULL AS "is_direct"
+            SELECT "user_uuid", "direct_user_uuid", "private_index"
             FROM "m_workspace_streams"
             WHERE "project_id" = %s AND "uuid" = %s
             """,
@@ -692,16 +695,22 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         ).fetchone()
         if row is None:
             raise ra_exceptions.ValidationErrorException()
-        return row["is_direct"]
+        if row["private_index"] is None:
+            return None
+        return {row["user_uuid"], row["direct_user_uuid"]}
+
+    def _is_direct_stream(self, stream_uuid: object) -> bool:
+        return self._direct_stream_participants(stream_uuid) is not None
 
     def _validate_stream_participants(
         self,
         stream_uuid: object,
         participants: collections.abc.Iterable[object],
     ) -> None:
-        if not self._is_direct_stream(stream_uuid):
+        expected_participants = self._direct_stream_participants(stream_uuid)
+        if expected_participants is None:
             return
-        if len(set(participants)) != 2:
+        if set(participants) != expected_participants:
             raise ra_exceptions.ValidationErrorException()
 
     def _delete_replaced_avatar_file(self, avatar: str) -> None:

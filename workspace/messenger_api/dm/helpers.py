@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections.abc
 import contextlib
 import datetime
 import json
@@ -60,6 +61,13 @@ WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
     "status_text",
 )
 DIRECT_STREAM_NAMESPACE = sys_uuid.UUID("26f42131-4503-5f59-8aa6-32b20f551751")
+STREAM_SOURCE_IDENTITY_FIELDS = frozenset({"source_name", "source"})
+DIRECT_STREAM_IDENTITY_FIELDS = frozenset(
+    {"direct_user_uuid", "private_index", "private"}
+)
+DIRECT_STREAM_CREATE_IDENTITY_FIELDS = (
+    STREAM_SOURCE_IDENTITY_FIELDS | DIRECT_STREAM_IDENTITY_FIELDS
+)
 
 
 @contextlib.contextmanager
@@ -1085,8 +1093,6 @@ def build_private_stream_index(
     user_uuid: str | sys_uuid.UUID,
     direct_user_uuid: str | sys_uuid.UUID,
 ) -> str:
-    if user_uuid == direct_user_uuid:
-        raise messenger_exc.DirectStreamSelfChatError()
     return ":".join(sorted([str(user_uuid), str(direct_user_uuid)]))
 
 
@@ -1096,12 +1102,23 @@ def deterministic_direct_stream_uuid(
     second_user_uuid: str | sys_uuid.UUID,
 ) -> sys_uuid.UUID:
     """Build the stable project-scoped UUID used by the existing UI contract."""
-    if first_user_uuid == second_user_uuid:
-        raise messenger_exc.DirectStreamSelfChatError()
     user_values = sorted((str(first_user_uuid), str(second_user_uuid)))
     return sys_uuid.uuid5(
         DIRECT_STREAM_NAMESPACE,
         f"{project_uuid}:{user_values[0]}:{user_values[1]}",
+    )
+
+
+def _lock_private_stream_identity(
+    project_id: object,
+    private_index: str,
+    session: typing.Any,
+) -> None:
+    session.execute(
+        """
+        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+        """,
+        (f"messenger-direct:{project_id}:{private_index}",),
     )
 
 
@@ -1372,7 +1389,13 @@ def fetch_existing_private_workspace_user_stream(
     fields: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
-    stream.update_dm(values=fields)
+    _reject_conflicting_stream_identity(stream, fields)
+    mutable_fields = {
+        field_name: value
+        for field_name, value in fields.items()
+        if field_name not in DIRECT_STREAM_CREATE_IDENTITY_FIELDS
+    }
+    stream.update_dm(values=mutable_fields)
     should_send_event = stream.is_dirty()
     stream.update(session=session)
     result = None
@@ -1812,6 +1835,60 @@ def _normalize_source_name(source_name: typing.Any) -> typing.Any:
     if hasattr(source_name, "value"):
         return source_name.value
     return source_name
+
+
+def _normalize_stream_identity_value(
+    field_name: str,
+    value: typing.Any,
+) -> typing.Any:
+    if field_name == "source_name":
+        return _normalize_source_name(value)
+    if field_name == "source":
+        if isinstance(value, collections.abc.Mapping):
+            source_kind = _normalize_source_name(value.get("kind"))
+            source_type = {
+                models.SourceName.NATIVE.value: models.NativeSource,
+                models.SourceName.ZULIP.value: models.ZulipSource,
+            }.get(source_kind)
+            if source_type is not None:
+                value = source_type(**dict(value))
+        if hasattr(value, "as_plain_dict"):
+            return value.as_plain_dict()
+    if field_name.endswith("_uuid") and value is not None:
+        return str(value)
+    return value
+
+
+def _reject_conflicting_stream_identity(
+    stream: typing.Any,
+    fields: typing.Any,
+) -> None:
+    conflicting_fields = {
+        field_name
+        for field_name in DIRECT_STREAM_CREATE_IDENTITY_FIELDS.intersection(fields)
+        if _normalize_stream_identity_value(
+            field_name,
+            getattr(stream, field_name),
+        )
+        != _normalize_stream_identity_value(field_name, fields[field_name])
+    }
+    if conflicting_fields:
+        raise messenger_exc.StreamIdentityImmutableError(
+            fields=", ".join(sorted(conflicting_fields))
+        )
+
+
+def _validate_workspace_source(
+    source_name: typing.Any,
+    source: typing.Any,
+) -> None:
+    normalized_source_name = _normalize_source_name(source_name)
+    if isinstance(source, collections.abc.Mapping):
+        source_kind = source.get("kind")
+    else:
+        source_kind = getattr(source, "KIND", None)
+    if _normalize_source_name(source_kind) != normalized_source_name:
+        raise messenger_exc.StreamSourceMismatchError()
 
 
 def _get_source_stream_id(source: typing.Any) -> typing.Any:
@@ -2364,85 +2441,108 @@ def _get_or_create_private_workspace_user_stream(
 ) -> typing.Any:
     default_topic_name = kwargs.pop("default_topic_name", "General Topic")
     private_index = build_private_stream_index(user_uuid, direct_user_uuid)
-    for existing in models.WorkspaceStream.objects.get_all(
-        filters={
-            "project_id": dm_filters.EQ(project_id),
-            "private_index": dm_filters.EQ(private_index),
-        },
-        limit=1,
-        session=session,
+    source_name = _normalize_source_name(
+        kwargs.get("source_name", models.SourceName.NATIVE.value)
+    )
+    if (
+        str(user_uuid) == str(direct_user_uuid)
+        and source_name != models.SourceName.NATIVE.value
     ):
-        return fetch_existing_private_workspace_user_stream(
+        raise messenger_exc.SelfChatNativeOnlyError()
+
+    with _workspace_session(session) as current_session:
+        _lock_private_stream_identity(
+            project_id,
+            private_index,
+            current_session,
+        )
+
+        for existing in models.WorkspaceStream.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "private_index": dm_filters.EQ(private_index),
+            },
+            limit=1,
+            session=current_session,
+        ):
+            return fetch_existing_private_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                stream=existing,
+                fields=kwargs,
+                session=current_session,
+            )
+
+        _ensure_color(kwargs)
+        if create_default_topic and default_topic_uuid is None:
+            default_topic_uuid = sys_uuid.uuid4()
+        stream = models.WorkspaceStream(
+            uuid=stream_uuid,
             project_id=project_id,
             user_uuid=user_uuid,
-            stream=existing,
-            fields=kwargs,
-            session=session,
-        )
-
-    _ensure_color(kwargs)
-    if create_default_topic and default_topic_uuid is None:
-        default_topic_uuid = sys_uuid.uuid4()
-    stream = models.WorkspaceStream(
-        uuid=stream_uuid,
-        project_id=project_id,
-        user_uuid=user_uuid,
-        private=True,
-        direct_user_uuid=direct_user_uuid,
-        private_index=private_index,
-        default_topic_uuid=default_topic_uuid,
-        **kwargs,
-    )
-    stream.insert(session=session)
-
-    participant_uuids = (user_uuid, direct_user_uuid)
-    for participant_uuid in participant_uuids:
-        _create_owner_binding(
-            project_id=project_id,
-            stream_uuid=stream.uuid,
-            user_uuid=participant_uuid,
-            who_uuid=user_uuid,
-            session=session,
-            uuid=(binding_uuids or {}).get(str(participant_uuid)),
-        )
-
-    default_topic = None
-    if default_topic_uuid is not None:
-        default_topic = create_workspace_stream_topic_with_flags(
-            project_id=project_id,
-            session=session,
-            uuid=default_topic_uuid,
-            stream_uuid=stream.uuid,
-            name=default_topic_name,
-            **_get_default_topic_source_fields(kwargs, default_topic_name),
-        )
-    result = None
-    for user_stream in models.WorkspaceUserStream.objects.get_all(
-        filters={
-            "project_id": dm_filters.EQ(project_id),
-            "private_index": dm_filters.EQ(private_index),
-        },
-        session=session,
-    ):
-        if user_stream.user_uuid == user_uuid:
-            result = user_stream
-        messenger_events.create_stream_event(
-            stream=user_stream,
-            session=session,
-        )
-        _create_stream_folder_updated_events(
-            project_id=project_id,
-            user_uuid=user_stream.user_uuid,
             private=True,
-            session=session,
+            direct_user_uuid=direct_user_uuid,
+            private_index=private_index,
+            default_topic_uuid=default_topic_uuid,
+            **kwargs,
         )
-    if default_topic is not None:
-        _create_workspace_stream_topic_events(
-            project_id=project_id,
-            topic_uuid=default_topic.uuid,
-            session=session,
+        stream.insert(session=current_session)
+
+        participant_uuids = tuple(
+            dict.fromkeys(
+                (
+                    sys_uuid.UUID(str(user_uuid)),
+                    sys_uuid.UUID(str(direct_user_uuid)),
+                )
+            )
         )
-    return result
+        for participant_uuid in participant_uuids:
+            _create_owner_binding(
+                project_id=project_id,
+                stream_uuid=stream.uuid,
+                user_uuid=participant_uuid,
+                who_uuid=user_uuid,
+                session=current_session,
+                uuid=(binding_uuids or {}).get(str(participant_uuid)),
+            )
+
+        default_topic = None
+        if default_topic_uuid is not None:
+            default_topic = create_workspace_stream_topic_with_flags(
+                project_id=project_id,
+                session=current_session,
+                uuid=default_topic_uuid,
+                stream_uuid=stream.uuid,
+                name=default_topic_name,
+                **_get_default_topic_source_fields(kwargs, default_topic_name),
+            )
+        result = None
+        for user_stream in models.WorkspaceUserStream.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "private_index": dm_filters.EQ(private_index),
+            },
+            session=current_session,
+        ):
+            if user_stream.user_uuid == user_uuid:
+                result = user_stream
+            messenger_events.create_stream_event(
+                stream=user_stream,
+                session=current_session,
+            )
+            _create_stream_folder_updated_events(
+                project_id=project_id,
+                user_uuid=user_stream.user_uuid,
+                private=True,
+                session=current_session,
+            )
+        if default_topic is not None:
+            _create_workspace_stream_topic_events(
+                project_id=project_id,
+                topic_uuid=default_topic.uuid,
+                session=current_session,
+            )
+        return result
 
 
 def create_workspace_private_group_stream(
@@ -2453,6 +2553,10 @@ def create_workspace_private_group_stream(
 ) -> typing.Any:
     stream_uuid = kwargs.pop("uuid", None) or sys_uuid.uuid4()
     default_topic_name = kwargs.pop("default_topic_name", "General Topic")
+    _validate_workspace_source(
+        kwargs.get("source_name", models.SourceName.NATIVE.value),
+        kwargs.get("source", models.NativeSource()),
+    )
     kwargs.pop("private", None)
     kwargs.pop("direct_user_uuid", None)
     if kwargs.pop("private_index", None) is not None:
@@ -2529,7 +2633,12 @@ def get_or_create_workspace_user_stream(
     default_topic_uuid = kwargs.pop("canonical_default_topic_uuid", None)
     create_default_topic = kwargs.pop("create_default_topic", True)
     binding_uuids = kwargs.pop("canonical_binding_uuids", None)
+    private_is_supplied = "private" in kwargs
     private = kwargs.pop("private", False)
+    _validate_workspace_source(
+        kwargs.get("source_name", models.SourceName.NATIVE.value),
+        kwargs.get("source", models.NativeSource()),
+    )
     if (
         _normalize_source_name(
             kwargs.get("source_name", models.SourceName.NATIVE.value)
@@ -2540,6 +2649,8 @@ def get_or_create_workspace_user_stream(
     if kwargs.pop("private_index", None) is not None:
         raise messenger_exc.PrivateIndexIsTechnicalFieldError()
     if direct_user_uuid is not None:
+        if private_is_supplied and private is not True:
+            raise messenger_exc.StreamIdentityImmutableError(fields="private")
         return _get_or_create_private_workspace_user_stream(
             project_id=project_id,
             user_uuid=user_uuid,
@@ -2632,6 +2743,13 @@ def update_workspace_user_stream(
         },
         session=session,
     )
+    immutable_fields = STREAM_SOURCE_IDENTITY_FIELDS.intersection(values)
+    if stream.private_index is not None:
+        immutable_fields |= DIRECT_STREAM_IDENTITY_FIELDS.intersection(values)
+    if immutable_fields:
+        raise messenger_exc.StreamIdentityImmutableError(
+            fields=", ".join(sorted(immutable_fields))
+        )
     stream.update_dm(values=values)
     stream.update(session=session)
 
@@ -2690,12 +2808,14 @@ def delete_workspace_user_stream(
 ) -> None:
     with _workspace_session(session=session) as s:
         _lock_workspace_stream(project_id, stream_uuid, s)
-        get_workspace_user_stream(
+        user_stream = get_workspace_user_stream(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             session=s,
         )
+        if user_stream.direct_user_uuid == user_uuid:
+            raise messenger_exc.SelfChatDeleteNotAllowedError()
         stream = models.WorkspaceStream.objects.get_one(
             filters={
                 "uuid": dm_filters.EQ(stream_uuid),

@@ -191,8 +191,14 @@ def test_direct_chat_is_an_ordinary_stream_with_deterministic_pair_uuid(fake_sto
     assert result["direct_user_uuid"] == PEER_UUID
     assert fake_store.calls[0][0:2] == ("create", "streams")
 
-    with pytest.raises(Exception):
-        controller.create(name="Self", direct_user_uuid=USER_UUID)
+    self_result = controller.create(name="Self", direct_user_uuid=USER_UUID)
+    assert self_result["uuid"] == helpers.deterministic_direct_stream_uuid(
+        PROJECT_UUID,
+        USER_UUID,
+        USER_UUID,
+    )
+    assert self_result["private"] is True
+    assert self_result["direct_user_uuid"] == USER_UUID
 
 
 def test_events_and_epoch_are_read_through_store_boundary(fake_store):

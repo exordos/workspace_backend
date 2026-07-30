@@ -129,6 +129,47 @@ def test_provider_collection_serialization_does_not_lookup_each_canonical_row(
     assert all(item["provider"]["kind"] == "zulip" for item in result)
 
 
+def test_direct_stream_participant_validation_uses_identity_pair(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    peer_uuid = sys_uuid.uuid4()
+    rows = {
+        stream_uuid: {
+            "user_uuid": USER_UUID,
+            "direct_user_uuid": USER_UUID,
+            "private_index": f"{USER_UUID}:{USER_UUID}",
+        },
+        peer_uuid: {
+            "user_uuid": USER_UUID,
+            "direct_user_uuid": PROJECTION_OWNER_UUID,
+            "private_index": f"{USER_UUID}:{PROJECTION_OWNER_UUID}",
+        },
+    }
+
+    class Session:
+        def execute(self, _statement, values):
+            return types.SimpleNamespace(fetchone=lambda: rows[values[1]])
+
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: Session()),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    store._validate_stream_participants(stream_uuid, [USER_UUID])
+    store._validate_stream_participants(
+        peer_uuid,
+        [USER_UUID, PROJECTION_OWNER_UUID],
+    )
+    with pytest.raises(Exception):
+        store._validate_stream_participants(
+            stream_uuid,
+            [USER_UUID, PROJECTION_OWNER_UUID],
+        )
+    with pytest.raises(Exception):
+        store._validate_stream_participants(peer_uuid, [USER_UUID])
+
+
 def test_message_page_uses_created_at_uuid_keyset(monkeypatch):
     marker_uuid = sys_uuid.uuid4()
     marker = types.SimpleNamespace(
