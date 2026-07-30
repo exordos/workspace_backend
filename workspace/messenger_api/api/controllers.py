@@ -892,8 +892,8 @@ class WorkspaceStreamController(StoreResourceController):
     def create(self, **kwargs: typing.Any) -> typing.Any:
         peer_uuid = kwargs.get("direct_user_uuid")
         if peer_uuid is not None:
-            if peer_uuid == self._get_user_uuid():
-                raise ra_exc.ValidationErrorException()
+            if "private" in kwargs and kwargs["private"] is not True:
+                raise messenger_exc.StreamIdentityImmutableError(fields="private")
             kwargs["uuid"] = helpers.deterministic_direct_stream_uuid(
                 self._get_project_id(),
                 self._get_user_uuid(),

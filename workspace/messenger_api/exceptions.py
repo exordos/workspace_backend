@@ -56,6 +56,26 @@ class StreamDefaultTopicNotConfiguredError(ra_exc.ValidationErrorException):
     code = 400001007
 
 
+class SelfChatNativeOnlyError(ra_exc.ValidationErrorException):
+    message = "Self chat must use the native source"
+    code = 400001008
+
+
+class SelfChatDeleteNotAllowedError(ra_exc.ValidationErrorException):
+    message = "Self chat cannot be deleted"
+    code = 400001009
+
+
+class StreamSourceMismatchError(ra_exc.ValidationErrorException):
+    message = "'source_name' must match 'source.kind'"
+    code = 400001010
+
+
+class StreamIdentityImmutableError(ra_exc.ValidationErrorException):
+    message = "Stream identity fields cannot be updated: %(fields)s"
+    code = 400001011
+
+
 class EventsCursorExpiredError(ra_exc.RestAlchemyException):
     """The saved events cursor can no longer produce a complete delta."""
 
