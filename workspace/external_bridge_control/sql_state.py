@@ -170,8 +170,6 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
                 existing = existing_by_uuid.get(topic_uuid)
                 if existing is not None:
                     existing["name"] = row["name"]
-                    if chat_kind == "channel":
-                        existing["provider_topic_id"] = f"{stream_id}:{row['name']}"
                     topics.append(existing)
                     continue
                 provider_topic_id = (
