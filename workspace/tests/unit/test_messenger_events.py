@@ -936,6 +936,11 @@ class MessengerEventsTestCase(unittest.TestCase):
             pinned=False,
             starred=False,
             is_own=False,
+            reaction_users={
+                "heart": [
+                    "40000000-0000-0000-0000-000000000001",
+                ],
+            },
             created_at=created_at,
             updated_at=updated_at,
         )
@@ -971,6 +976,14 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual("edited", created_event["payload"]["payload"]["content"])
         self.assertEqual(True, created_event["payload"]["read"])
         self.assertEqual({}, created_event["payload"]["reactions"])
+        self.assertEqual(
+            {
+                "heart": [
+                    "40000000-0000-0000-0000-000000000001",
+                ],
+            },
+            created_event["payload"]["reaction_users"],
+        )
         self.assertEqual(
             "2026-06-24T10:05:00.000000Z",
             created_event["payload"]["updated_at"],

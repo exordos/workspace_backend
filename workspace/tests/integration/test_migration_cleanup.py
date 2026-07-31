@@ -61,6 +61,10 @@ EXTERNAL_STREAM_ACCESS_MIGRATION_FILE = (
 )
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
+REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
+REACTION_USER_SNAPSHOT_MIGRATION_FILE = (
+    "0127-persist-bounded-reaction-user-snapshots-547d74.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -77,7 +81,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == TOPIC_READ_BOUNDARY_MIGRATION_FILE
+    assert engine.get_latest_migration() == REACTION_USER_SNAPSHOT_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -97,6 +101,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID,
                     EXTERNAL_STREAM_ACCESS_MIGRATION_UUID,
                     TOPIC_READ_BOUNDARY_MIGRATION_UUID,
+                    REACTION_USER_SNAPSHOT_MIGRATION_UUID,
                 ],
             ),
         )
@@ -115,9 +120,38 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXTERNAL_ACCOUNT_ACCESS_DEDUP_MIGRATION_UUID, True),
             (EXTERNAL_STREAM_ACCESS_MIGRATION_UUID, True),
             (TOPIC_READ_BOUNDARY_MIGRATION_UUID, True),
+            (REACTION_USER_SNAPSHOT_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
+        cur.execute(
+            "SELECT to_regclass("
+            "'m_workspace_message_reactions_message_uuid_idx'"
+            ")"
+        )
+        assert (
+            cur.fetchone()[0]
+            == "m_workspace_message_reactions_message_uuid_idx"
+        )
+        cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_messages'
+              AND column_name = 'reaction_users'
+            """
+        )
+        data_type, is_nullable, column_default = cur.fetchone()
+        assert data_type == "jsonb"
+        assert is_nullable == "NO"
+        assert "'{}'::jsonb" in column_default
+        cur.execute(
+            """
+            SELECT reaction_users
+            FROM m_workspace_user_messages_view
+            LIMIT 0
+            """
+        )
         cur.execute("SELECT to_regclass('m_workspace_directory_users_v1')")
         assert cur.fetchone()[0] == "m_workspace_directory_users_v1"
         cur.execute(

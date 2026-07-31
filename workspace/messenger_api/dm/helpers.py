@@ -28,6 +28,7 @@ from restalchemy.storage import exceptions as storage_exc
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import reaction_users
 from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
@@ -3211,6 +3212,11 @@ def create_workspace_message_reaction(
             message_uuid=message_uuid,
             session=session,
         )
+    reaction_users.lock_messages(
+        project_id,
+        (message_uuid,),
+        session=session,
+    )
     reaction = models.WorkspaceMessageReactions(
         uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
         project_id=project_id,
@@ -3221,6 +3227,11 @@ def create_workspace_message_reaction(
     messenger_events.create_message_reaction_created_event(
         reaction=reaction,
         message=message,
+        session=session,
+    )
+    reaction_users.refresh_groups(
+        project_id,
+        ((message_uuid, reaction.emoji_name),),
         session=session,
     )
     update_event_kwargs = {"compact_events": True} if compact_events else {}
@@ -3260,17 +3271,31 @@ def update_workspace_message_reaction(
             user_uuid=user_uuid,
             message_uuid=values["message_uuid"],
         )
+    new_message_uuid = values.get("message_uuid", old_message_uuid)
+    new_emoji_name = values.get("emoji_name", old_emoji_name)
+    reaction_users.lock_messages(
+        project_id,
+        (old_message_uuid, new_message_uuid),
+        session=session,
+    )
     values.pop("project_id", None)
     values.pop("user_uuid", None)
     values.pop("uuid", None)
     reaction.update_dm(values=values)
     reaction.update(session=session)
-    new_message_uuid = values.get("message_uuid", old_message_uuid)
     messenger_events.create_message_reaction_updated_event(
         reaction=reaction,
         message=new_message,
         old_message=old_message,
         old_emoji_name=old_emoji_name,
+        session=session,
+    )
+    reaction_users.refresh_groups(
+        project_id,
+        (
+            (old_message_uuid, old_emoji_name),
+            (new_message_uuid, new_emoji_name),
+        ),
         session=session,
     )
     update_event_kwargs = {"compact_events": True} if compact_events else {}
@@ -3316,10 +3341,20 @@ def delete_workspace_message_reaction(
             message_uuid=message_uuid,
             session=session,
         )
+    reaction_users.lock_messages(
+        project_id,
+        (message_uuid,),
+        session=session,
+    )
     reaction.delete(session=session)
     messenger_events.create_message_reaction_deleted_event(
         reaction=reaction,
         message=message,
+        session=session,
+    )
+    reaction_users.refresh_groups(
+        project_id,
+        ((message_uuid, reaction.emoji_name),),
         session=session,
     )
     update_event_kwargs = {"compact_events": True} if compact_events else {}

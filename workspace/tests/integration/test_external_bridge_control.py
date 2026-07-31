@@ -928,6 +928,121 @@ def test_provider_identity_merge_invalidates_direct_event_history(
     assert pruned_through == event_epoch
 
 
+def test_provider_identity_merge_refreshes_persisted_reaction_users(_database, db):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    canonical_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, f"owner-{owner_uuid}")
+    conftest.seed_workspace_user(
+        db,
+        canonical_user_uuid,
+        f"canonical-{canonical_user_uuid}",
+    )
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "identity-reaction-users",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        owner_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_users (
+                uuid, username, source, status, avatar,
+                created_at, updated_at, last_ping_at
+            ) VALUES (
+                %s, %s, 'zulip', 'active', %s, NOW(), NOW(), NOW()
+            )
+            """,
+            (
+                legacy_user_uuid,
+                f"legacy-{legacy_user_uuid}",
+                f"urn:gravatar:{legacy_user_uuid.hex}",
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source, reaction_users
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"identity reaction"}'::jsonb,
+                'native', '{"kind":"native"}'::jsonb,
+                jsonb_build_object(
+                    'heart',
+                    jsonb_build_array(CAST(%s AS text))
+                )
+            )
+            """,
+            (
+                message_uuid,
+                project_uuid,
+                stream_uuid,
+                topic_uuid,
+                owner_uuid,
+                legacy_user_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+                INSERT INTO m_workspace_message_reactions (
+                    uuid, project_id, message_uuid, user_uuid, emoji_name,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, 'heart', NOW(), NOW())
+            """,
+            (
+                sys_uuid.uuid4(),
+                project_uuid,
+                message_uuid,
+                legacy_user_uuid,
+            ),
+        )
+
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        identity_linking.merge_workspace_user_identity(
+            session,
+            legacy_user_uuid,
+            canonical_user_uuid,
+            rewrite_payloads=False,
+            rewrite_chats=False,
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT reaction_users
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        stored_snapshot = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_message_reactions
+            WHERE project_id = %s AND message_uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        stored_reaction_user_uuid = cursor.fetchone()[0]
+
+    assert stored_snapshot == {"heart": [str(canonical_user_uuid)]}
+    assert stored_reaction_user_uuid == canonical_user_uuid
+
+
 def test_provider_identity_merge_resumes_bounded_event_batches(
     _database,
     db,

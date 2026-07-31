@@ -1054,6 +1054,7 @@ syntax. The URL part is a Workspace URN:
 | `is_own` | boolean | no | yes | Whether `author_uuid` equals the current user. |
 | `mentioned` | boolean | no | yes | Whether the markdown payload mentions the current user; defaults to `false`. |
 | `reactions` | object | no | yes | Aggregated reaction counts keyed by `emoji_name`. |
+| `reaction_users` | object | no | yes | Complete persisted user UUID lists for bounded reaction groups, keyed by `emoji_name`. An empty object or missing key means count-only; lists are never partial. |
 | `source_name` | `native`, `zulip` | no | no | Message source name; the public API defaults it to `native` when omitted. |
 | `source` | object | no | no | Message source payload; defaults to `{"kind": "native"}`. Zulip `message_id` can be `null` until outbound sync succeeds. |
 | `provider` | object or `null` | no | yes | Provider badge inherited from the selected provider-backed stream. |
@@ -1098,6 +1099,7 @@ Response example:
   "is_own": true,
   "mentioned": false,
   "reactions": {},
+  "reaction_users": {},
   "provider": null,
   "delivery": null,
   "created_at": "2026-06-22T10:10:00Z",
@@ -1155,7 +1157,7 @@ Realtime side effects:
 | create unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the new message is unread; UI derives folder aggregates from the stream snapshot. |
 | update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
 | create/update/delete reaction | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` | `message_reaction` | Reaction snapshot for the acting user. |
-| create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` for every stream user. |
+| create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` and `reaction_users` for every stream user. |
 | read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
@@ -1254,10 +1256,10 @@ notification side effects.
 
 Message reactions are canonical PostgreSQL resources. Reads are scoped to
 messages visible to the current IAM user.
-Creating, updating, or
-deleting a reaction emits a `message_reaction.*` event for the acting user and
-`message.updated` events for every user that can see the message; the message
-snapshot contains aggregated `reactions`.
+Creating, updating, or deleting a reaction emits a `message_reaction.*` event
+for the acting user and `message.updated` events for every user that can see
+the message; the message snapshot contains aggregated `reactions` and the same
+persisted `reaction_users` projection as REST reads.
 
 | Field | Type | Required on create | Read-only | Description |
 | --- | --- | --- | --- | --- |
@@ -1294,6 +1296,36 @@ The `reactions` field on message views is an aggregate map:
   "eyes": 1
 }
 ```
+
+The `reaction_users` field exposes complete UUID lists only for small groups
+selected by server configuration. The default per-group threshold is four
+users (`[messenger_reactions] user_list_limit`). The client does not send or
+infer the limit:
+
+```json
+{
+  "reactions": {
+    "eyes": 12,
+    "heart": 3
+  },
+  "reaction_users": {
+    "heart": [
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333"
+    ]
+  }
+}
+```
+
+Presence of an emoji key guarantees that the list was complete when the
+reaction group was last mutated. If the current count exceeds the configured
+limit, the write removes that key instead of storing a prefix. Historical
+messages are not backfilled and therefore return `reaction_users: {}` until a
+reaction mutation materializes an affected key. Changing the configured limit
+does not rewrite existing snapshots; the next mutation of a group applies the
+new limit. Clients replace the whole map on every REST or realtime message
+snapshot; they must not merge it with a previous value.
 
 Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
 `user_uuid`, `emoji_name`, `source_name`, and `source`. For
@@ -1498,6 +1530,7 @@ from the current user's visible PostgreSQL event surface.
     "is_own": true,
     "mentioned": false,
     "reactions": {},
+    "reaction_users": {},
     "provider": null,
     "delivery": null,
     "created_at": "2026-07-02T16:37:49.552044Z",

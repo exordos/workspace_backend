@@ -20,6 +20,7 @@ from workspace.common import config
 from workspace.common import external_bridge_control_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
+from workspace.common import messenger_reaction_opts
 from workspace.external_bridge_control import files
 from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import pki
@@ -33,6 +34,7 @@ from workspace.external_bridge_control import sql_state
 CONF = cfg.CONF
 external_bridge_control_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
+messenger_reaction_opts.register_opts(CONF)
 ra_config_opts.register_posgresql_db_opts(CONF)
 
 

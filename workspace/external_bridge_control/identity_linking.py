@@ -8,6 +8,8 @@
 import typing
 import uuid as sys_uuid
 
+from workspace.messenger_api import reaction_users
+
 
 _PROVIDER_IDENTITY_NAMESPACE = sys_uuid.UUID("fda6f96e-c86d-5c94-976d-4e813e3f3655")
 _PAYLOAD_REFERENCE_TABLES = (
@@ -455,6 +457,33 @@ def merge_workspace_user_identity(
                 legacy["provider_external_id"],
             ),
         )
+    reaction_group_rows = session.execute(
+        """
+        SELECT DISTINCT project_id, message_uuid, emoji_name
+        FROM m_workspace_message_reactions
+        WHERE user_uuid = %s
+        ORDER BY project_id, message_uuid, emoji_name
+        """,
+        (legacy_user_uuid,),
+    ).fetchall()
+    reaction_groups_by_project: dict[
+        sys_uuid.UUID,
+        list[tuple[sys_uuid.UUID, str]],
+    ] = {}
+    for row in reaction_group_rows:
+        project_id = sys_uuid.UUID(str(row["project_id"]))
+        reaction_groups_by_project.setdefault(project_id, []).append(
+            (
+                sys_uuid.UUID(str(row["message_uuid"])),
+                str(row["emoji_name"]),
+            )
+        )
+    for project_id, groups in sorted(reaction_groups_by_project.items()):
+        reaction_users.lock_messages(
+            project_id,
+            (message_uuid for message_uuid, _emoji_name in groups),
+            session=session,
+        )
     session.execute(
         """
         INSERT INTO m_workspace_stream_bindings (
@@ -621,13 +650,36 @@ def merge_workspace_user_identity(
     for reference in references:
         table_name = reference["table_name"].replace('"', '""')
         column_name = reference["column_name"].replace('"', '""')
-        _update_uuid_reference_batch(
-            session,
-            table_name=table_name,
-            column_name=column_name,
-            legacy_user_uuid=legacy_user_uuid,
-            canonical_user_uuid=canonical_user_uuid,
+        is_reaction_user_reference = (
+            table_name == "m_workspace_message_reactions"
+            and column_name == "user_uuid"
         )
+        try:
+            _update_uuid_reference_batch(
+                session,
+                table_name=table_name,
+                column_name=column_name,
+                legacy_user_uuid=legacy_user_uuid,
+                canonical_user_uuid=canonical_user_uuid,
+            )
+        except IdentityMergePending:
+            if is_reaction_user_reference:
+                for project_id, groups in sorted(
+                    reaction_groups_by_project.items()
+                ):
+                    reaction_users.refresh_groups(
+                        project_id,
+                        groups,
+                        session=session,
+                    )
+            raise
+        if is_reaction_user_reference:
+            for project_id, groups in sorted(reaction_groups_by_project.items()):
+                reaction_users.refresh_groups(
+                    project_id,
+                    groups,
+                    session=session,
+                )
     session.execute(
         """
         DELETE FROM m_workspace_event_audience_members_v1 AS legacy

@@ -189,6 +189,35 @@ def test_generated_openapi_message_payload_uses_markdown_content_limit():
     assert payload_schema["oneOf"][0]["properties"]["content"]["maxLength"] == 40000
 
 
+def test_generated_openapi_exposes_persisted_complete_reaction_user_lists():
+    specification = _build_openapi(workspace_app)
+
+    for schema_name in (
+        "WorkspaceUserMessage_Filter",
+        "WorkspaceUserMessage_Get",
+        "WorkspaceUserMessage_Create",
+        "WorkspaceUserMessage_Update",
+    ):
+        reaction_users_schema = specification["components"]["schemas"][schema_name][
+            "properties"
+        ]["reaction_users"]
+        assert reaction_users_schema["readOnly"] is True
+        assert reaction_users_schema["default"] == {}
+        assert reaction_users_schema["example"] == {
+            "heart": [
+                "11111111-1111-1111-1111-111111111111",
+                "33333333-3333-3333-3333-333333333333",
+            ]
+        }
+        assert reaction_users_schema["additionalProperties"] == {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": True,
+            "items": {"type": "string", "format": "uuid"},
+        }
+        assert "never partial" in reaction_users_schema["description"]
+
+
 def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     specification = _build_openapi(messenger_app)
     paths = specification["paths"]

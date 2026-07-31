@@ -169,6 +169,11 @@ class WorkspaceUserMessageBase(
         types.Dict(),
         default=dict,
     )
+    reaction_users = properties.property(
+        types.Dict(),
+        default=dict,
+        read_only=True,
+    )
 
 
 class WorkspaceFolderBase(

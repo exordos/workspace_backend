@@ -915,6 +915,10 @@ class WorkspaceMessage(
         types.UUID(),
         required=True,
     )
+    reaction_users = properties.property(
+        types.Dict(),
+        default=dict,
+    )
 
     def validate(self) -> None:
         super().validate()
