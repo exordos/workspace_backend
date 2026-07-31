@@ -1447,11 +1447,19 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 self.project_uuid, self.user_uuid, resource_uuid
             )
         elif resource == "stream_topics" and action == "set_summary_prompt":
+            prompt_values = {}
+            for name in (
+                "summary_system_prompt",
+                "summary_reasoning_effort",
+                "summary_enabled",
+            ):
+                if name in values:
+                    prompt_values[name] = values[name]
             row = helpers.set_workspace_user_stream_topic_summary_prompt(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
-                values["summary_system_prompt"],
+                **prompt_values,
             )
         elif resource == "stream_topics" and action == "read":
             session = contexts.Context().get_session()

@@ -892,7 +892,7 @@ def test_topic_summary_prompt_action_is_canonical_only(monkeypatch):
     monkeypatch.setattr(
         sql_canonical_store.helpers,
         "set_workspace_user_stream_topic_summary_prompt",
-        lambda *args: calls.append(args) or topic,
+        lambda *args, **kwargs: calls.append((args, kwargs)) or topic,
     )
     monkeypatch.setattr(
         sql_canonical_store.resource_projection,
@@ -915,7 +915,10 @@ def test_topic_summary_prompt_action_is_canonical_only(monkeypatch):
 
     assert result == {"uuid": str(topic_uuid)}
     assert calls == [
-        (PROJECT_UUID, USER_UUID, topic_uuid, "Focus on decisions."),
+        (
+            (PROJECT_UUID, USER_UUID, topic_uuid),
+            {"summary_system_prompt": "Focus on decisions."},
+        ),
     ]
 
 

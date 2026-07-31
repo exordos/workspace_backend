@@ -138,9 +138,10 @@ def as_dict(
                 "summary",
                 "summary_last_message_uuid",
                 "summary_has_new_messages",
+                "summary_enabled",
                 "summary_system_prompt",
             ):
-                result.setdefault(name, None)
+                result.setdefault(name, True if name == "summary_enabled" else None)
     elif resource == "users" and result.get("source") == (
         models.WorkspaceUserSource.ZULIP.value
     ):

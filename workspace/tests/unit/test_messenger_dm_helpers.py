@@ -4701,6 +4701,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
+        message_created_at = datetime.datetime.now(datetime.timezone.utc)
         session = object()
         deleted_message = {}
         source = dm_helpers.models.NativeSource()
@@ -4715,6 +4716,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         class ExistingMessage:
             def __init__(self):
+                self.uuid = message_uuid
+                self.created_at = message_created_at
                 self.user_uuid = user_uuid
                 self.stream_uuid = stream_uuid
                 self.topic_uuid = topic_uuid
@@ -4746,6 +4749,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers, "_create_messages_unread_updated_events"
             ) as create_unread_events,
+            mock.patch.object(
+                dm_helpers, "_restore_topic_summary_after_message_deletion"
+            ) as restore_topic_summary,
         ):
             result = dm_helpers.delete_workspace_user_message(
                 project_id=project_id,
@@ -4801,6 +4807,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuids=[other_user_uuid],
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
+            session=session,
+        )
+        restore_topic_summary.assert_called_once_with(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            deleted_message_uuid=message_uuid,
+            deleted_message_created_at=message_created_at,
             session=session,
         )
 

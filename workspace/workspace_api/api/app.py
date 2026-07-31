@@ -65,6 +65,11 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/",
             components,
         )
+        specification = openapi_contract.add_topic_summary_management_contract(
+            specification,
+            "/v1/messenger/",
+            components,
+        )
         specification = openapi_contract.add_external_bridge_public_contract(
             specification,
             "/v1/messenger/",

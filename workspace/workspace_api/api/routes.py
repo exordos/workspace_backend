@@ -33,6 +33,12 @@ class MessengerRoute(routes.Route):
     external_provider_health = routes.route(
         messenger_routes.ExternalProviderHealthRoute,
     )
+    topic_summary_endpoints = routes.route(
+        messenger_routes.TopicSummaryEndpointRoute,
+    )
+    topic_summary_settings = routes.route(
+        messenger_routes.TopicSummarySettingsRoute,
+    )
     message_reactions = routes.route(
         messenger_routes.WorkspaceMessageReactionRoute,
     )

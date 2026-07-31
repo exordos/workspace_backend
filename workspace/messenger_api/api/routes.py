@@ -291,6 +291,22 @@ class ExternalProviderHealthRoute(routes.Route):
     __allow_methods__ = [routes.GET]
 
 
+class TopicSummaryEndpointRoute(routes.Route):
+    __controller__ = controllers.TopicSummaryEndpointController
+    __allow_methods__ = [
+        routes.CREATE,
+        routes.FILTER,
+        routes.GET,
+        routes.UPDATE,
+        routes.DELETE,
+    ]
+
+
+class TopicSummarySettingsRoute(routes.Route):
+    __controller__ = controllers.TopicSummarySettingsController
+    __allow_methods__ = [routes.GET, routes.UPDATE]
+
+
 class WorkspaceMessageReactionRoute(routes.Route):
     __controller__ = controllers.WorkspaceMessageReactionController
     __allow_methods__ = [
@@ -433,6 +449,8 @@ class ApiEndpointRoute(routes.Route):
     external_bridge_instances = routes.route(ExternalBridgeInstanceRoute)
     external_provider_policies = routes.route(ExternalProviderPolicyRoute)
     external_provider_health = routes.route(ExternalProviderHealthRoute)
+    topic_summary_endpoints = routes.route(TopicSummaryEndpointRoute)
+    topic_summary_settings = routes.route(TopicSummarySettingsRoute)
     message_reactions = routes.route(WorkspaceMessageReactionRoute)
     files = routes.route(WorkspaceFileRoute)
     users = routes.route(WorkspaceUserRoute)
