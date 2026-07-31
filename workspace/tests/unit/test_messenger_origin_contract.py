@@ -251,6 +251,10 @@ ACTION_MANIFEST = {
         controllers.WorkspaceStreamTopicController,
         True,
     ),
+    (routes.WorkspaceStreamTopicRoute, "set_summary_prompt"): (
+        controllers.WorkspaceStreamTopicController,
+        True,
+    ),
     (routes.WorkspaceStreamTopicRoute, "read"): (
         controllers.WorkspaceStreamTopicController,
         True,
@@ -439,6 +443,10 @@ def test_messenger_response_model_keeps_original_fields():
             "is_default",
             "is_done",
             "notification_mode",
+            "summary",
+            "summary_last_message_uuid",
+            "summary_has_new_messages",
+            "summary_system_prompt",
         },
         models.WorkspaceUserMessage: {
             "uuid",

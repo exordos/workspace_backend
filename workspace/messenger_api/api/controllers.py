@@ -2804,6 +2804,15 @@ class WorkspaceStreamTopicController(StoreResourceController):
         return self._action(resource, "set_default")
 
     @ra_actions.post
+    def set_summary_prompt(
+        self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        del args
+        if set(kwargs) != {"summary_system_prompt"}:
+            raise ra_exc.ValidationErrorException()
+        return self._action(resource, "set_summary_prompt", kwargs)
+
+    @ra_actions.post
     def read(
         self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
     ) -> typing.Any:

@@ -123,6 +123,13 @@ DRAFT_ERROR_SCHEMA = {
     "properties": {"message": {"type": "string"}},
 }
 
+TOPIC_SUMMARY_ERROR_SCHEMA = {
+    "type": "object",
+    "required": ["message"],
+    "additionalProperties": True,
+    "properties": {"message": {"type": "string"}},
+}
+
 DRAFT_SIDE_EFFECTS_DESCRIPTION = (
     "Drafts are PostgreSQL-only client state. This operation emits no Workspace "
     "events, websocket or desktop notifications, or messages. Other clients "
@@ -1078,6 +1085,88 @@ def add_draft_contract(
         "required": ["payload"],
         "additionalProperties": False,
         "properties": {"payload": copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)},
+    }
+    return specification
+
+
+def add_topic_summary_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    summary_properties = {
+        "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "nullable": True,
+            "readOnly": True,
+            "description": "Latest LLM-generated topic summary.",
+        },
+        "summary_last_message_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": True,
+            "readOnly": True,
+            "description": "Latest topic message included in the summary.",
+        },
+        "summary_has_new_messages": {
+            "type": "boolean",
+            "nullable": True,
+            "readOnly": True,
+            "description": (
+                "Null without a summary; otherwise whether the current latest "
+                "message differs from the stored summary boundary."
+            ),
+        },
+        "summary_system_prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384,
+            "nullable": True,
+            "readOnly": True,
+            "description": (
+                "Topic-specific LLM system prompt, or null for the default."
+            ),
+        },
+    }
+    for name, schema in schemas.items():
+        if name.startswith("WorkspaceUserTopic_"):
+            schema["properties"].update(copy.deepcopy(summary_properties))
+
+    topic_path = f"{root}stream_topics/{{WorkspaceUserTopicUuid}}"
+    response = _external_response(
+        "#/components/schemas/WorkspaceUserTopic_Get",
+    )
+    prompt_action = specification["paths"][
+        f"{topic_path}/actions/set_summary_prompt/invoke"
+    ]["post"]
+    prompt_action["description"] = (
+        "Set the topic-specific LLM system prompt. Null restores the default. "
+        "The caller must be a stream owner or administrator."
+    )
+    prompt_action["requestBody"] = _request_body(
+        _object_schema(
+            {
+                "summary_system_prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16384,
+                    "nullable": True,
+                }
+            },
+            ["summary_system_prompt"],
+        )
+    )
+    prompt_action["responses"][200] = copy.deepcopy(response)
+    prompt_action["responses"][403] = {
+        "description": "The stream role cannot update the summary prompt.",
+        "content": {
+            "application/json": {
+                "schema": copy.deepcopy(TOPIC_SUMMARY_ERROR_SCHEMA),
+            }
+        },
     }
     return specification
 

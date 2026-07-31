@@ -65,6 +65,8 @@ REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
 REACTION_USER_SNAPSHOT_MIGRATION_FILE = (
     "0127-persist-bounded-reaction-user-snapshots-547d74.py"
 )
+TOPIC_SUMMARY_MIGRATION_UUID = "f3cbd414-4eba-4db1-8f1d-fc3c7eeb7f96"
+TOPIC_SUMMARY_MIGRATION_FILE = "0128-add-topic-summary-metadata-f3cbd4.py"
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -81,7 +83,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == REACTION_USER_SNAPSHOT_MIGRATION_FILE
+    assert engine.get_latest_migration() == TOPIC_SUMMARY_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -102,6 +104,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXTERNAL_STREAM_ACCESS_MIGRATION_UUID,
                     TOPIC_READ_BOUNDARY_MIGRATION_UUID,
                     REACTION_USER_SNAPSHOT_MIGRATION_UUID,
+                    TOPIC_SUMMARY_MIGRATION_UUID,
                 ],
             ),
         )
@@ -121,6 +124,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXTERNAL_STREAM_ACCESS_MIGRATION_UUID, True),
             (TOPIC_READ_BOUNDARY_MIGRATION_UUID, True),
             (REACTION_USER_SNAPSHOT_MIGRATION_UUID, True),
+            (TOPIC_SUMMARY_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
@@ -177,6 +181,23 @@ def test_current_migrations_have_a_single_head(_database, db):
         assert set(cur.fetchall()) == {
             ("m_workspace_messages_topic_boundary_idx", True),
             ("m_workspace_unread_flags_user_message_idx", True),
+        }
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_stream_topics'
+              AND column_name IN (
+                  'summary',
+                  'summary_last_message_uuid',
+                  'summary_system_prompt'
+              )
+            """
+        )
+        assert {row[0] for row in cur.fetchall()} == {
+            "summary",
+            "summary_last_message_uuid",
+            "summary_system_prompt",
         }
 
 

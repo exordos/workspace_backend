@@ -781,6 +781,18 @@ class WorkspaceStreamTopic(
         base.Color(),
         default=base.random_color,
     )
+    summary = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=4096)),
+        default=None,
+    )
+    summary_last_message_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    summary_system_prompt = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=16384)),
+        default=None,
+    )
 
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
@@ -867,6 +879,26 @@ class WorkspaceUserTopic(
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceTopicNotificationMode]),
         default=WorkspaceTopicNotificationMode.DEFAULT.value,
+    )
+    summary = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=4096)),
+        default=None,
+        read_only=True,
+    )
+    summary_last_message_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+        read_only=True,
+    )
+    summary_has_new_messages = properties.property(
+        types.AllowNone(types.Boolean()),
+        default=None,
+        read_only=True,
+    )
+    summary_system_prompt = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=16384)),
+        default=None,
+        read_only=True,
     )
 
     def get_flags(self) -> "WorkspaceUserTopicFlags":

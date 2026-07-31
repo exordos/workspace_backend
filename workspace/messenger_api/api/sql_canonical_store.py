@@ -1446,6 +1446,13 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             row = helpers.set_workspace_user_stream_topic_default(
                 self.project_uuid, self.user_uuid, resource_uuid
             )
+        elif resource == "stream_topics" and action == "set_summary_prompt":
+            row = helpers.set_workspace_user_stream_topic_summary_prompt(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+                values["summary_system_prompt"],
+            )
         elif resource == "stream_topics" and action == "read":
             session = contexts.Context().get_session()
             topic = helpers.get_workspace_user_stream_topic(

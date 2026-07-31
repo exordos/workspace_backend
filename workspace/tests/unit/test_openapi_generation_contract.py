@@ -115,6 +115,18 @@ def _assert_draft_contract(paths, collection_path):
         assert response["content"]["application/json"]["schema"] == error_schema
 
 
+def _assert_topic_summary_contract(paths, topic_path):
+    assert f"{topic_path}/actions/set_summary/invoke" not in paths
+
+    prompt = paths[f"{topic_path}/actions/set_summary_prompt/invoke"]["post"]
+    assert "owner or administrator" in prompt["description"]
+    prompt_schema = prompt["requestBody"]["content"]["application/json"]["schema"]
+    assert prompt_schema["required"] == ["summary_system_prompt"]
+    assert prompt_schema["additionalProperties"] is False
+    assert prompt_schema["properties"]["summary_system_prompt"]["maxLength"] == 16384
+    assert 403 in prompt["responses"]
+
+
 def _build_openapi(app_module):
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
@@ -249,6 +261,10 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         {"type": "string", "format": "uuid"},
     )
     _assert_draft_contract(paths, "/v1/drafts/")
+    _assert_topic_summary_contract(
+        paths,
+        "/v1/stream_topics/{WorkspaceUserTopicUuid}",
+    )
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
@@ -326,6 +342,10 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         {"type": "integer", "minimum": 0},
     )
     _assert_draft_contract(paths, "/v1/messenger/drafts/")
+    _assert_topic_summary_contract(
+        paths,
+        "/v1/messenger/stream_topics/{WorkspaceUserTopicUuid}",
+    )
     avatar_upload_path = "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
 
@@ -357,6 +377,11 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         assert {"provider", "delivery"} <= set(projection_properties)
         assert "identity_kind" not in projection_properties
         assert "external_id" in projection_properties["provider"]["properties"]
+    topic_properties = schemas["WorkspaceUserTopic_Get"]["properties"]
+    assert topic_properties["summary"]["maxLength"] == 4096
+    assert topic_properties["summary_last_message_uuid"]["format"] == "uuid"
+    assert topic_properties["summary_has_new_messages"]["readOnly"] is True
+    assert topic_properties["summary_system_prompt"]["maxLength"] == 16384
     assert schemas["WorkspaceEvent_Filter"]["properties"]["object_type"]["enum"] == [
         "external_account",
         "external_chat",

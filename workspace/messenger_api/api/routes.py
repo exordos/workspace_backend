@@ -328,6 +328,10 @@ class WorkspaceStreamTopicSetDefaultAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
 
+class WorkspaceStreamTopicSetSummaryPromptAction(routes.Action):
+    __controller__ = controllers.WorkspaceStreamTopicController
+
+
 class WorkspaceStreamTopicReadAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamTopicController
 
@@ -376,6 +380,10 @@ class WorkspaceStreamTopicRoute(routes.Route):
     )
     set_default = routes.action(
         WorkspaceStreamTopicSetDefaultAction,
+        invoke=True,
+    )
+    set_summary_prompt = routes.action(
+        WorkspaceStreamTopicSetSummaryPromptAction,
         invoke=True,
     )
     read = routes.action(WorkspaceStreamTopicReadAction, invoke=True)

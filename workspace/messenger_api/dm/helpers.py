@@ -2105,15 +2105,21 @@ def _create_workspace_stream_updated_events(
 
 
 def _create_workspace_stream_topic_updated_events(
-    project_id: object, topic_uuid: object
+    project_id: object,
+    topic_uuid: object,
+    session: typing.Any = None,
 ) -> None:
     if topic_uuid is None:
         return
     for user_topic in _get_workspace_user_stream_topics(
         project_id=project_id,
         topic_uuid=topic_uuid,
+        session=session,
     ):
-        messenger_events.create_topic_updated_event(topic=user_topic)
+        messenger_events.create_topic_updated_event(
+            topic=user_topic,
+            session=session,
+        )
 
 
 def _get_workspace_stream_topic_for_user(
@@ -2190,6 +2196,148 @@ def update_workspace_user_stream_topic(
             session=session,
         )
     return result
+
+
+def _get_workspace_topic_message(
+    project_id: object,
+    topic: typing.Any,
+    message_uuid: object,
+    session: typing.Any,
+) -> typing.Any:
+    message = models.WorkspaceMessage.objects.get_one_or_none(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+            "topic_uuid": dm_filters.EQ(topic.uuid),
+        },
+        session=session,
+    )
+    if message is None:
+        raise messenger_exc.InvalidTopicSummaryBoundaryError()
+    return message
+
+
+def set_workspace_user_stream_topic_summary(
+    project_id: object,
+    user_uuid: object,
+    topic_uuid: object,
+    summary: typing.Any,
+    summary_last_message_uuid: object,
+    session: typing.Any = None,
+) -> typing.Any:
+    if summary is None and summary_last_message_uuid is not None:
+        raise messenger_exc.InvalidTopicSummaryStateError()
+
+    with _workspace_session(session=session) as current_session:
+        _lock_workspace_topic(project_id, topic_uuid, current_session)
+        topic = _get_workspace_stream_topic_for_user(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+
+        incoming_boundary = None
+        if summary_last_message_uuid is not None:
+            try:
+                summary_last_message_uuid = sys_uuid.UUID(
+                    str(summary_last_message_uuid)
+                )
+            except (TypeError, ValueError) as exc:
+                raise messenger_exc.InvalidTopicSummaryBoundaryError() from exc
+            incoming_boundary = _get_workspace_topic_message(
+                project_id,
+                topic,
+                summary_last_message_uuid,
+                current_session,
+            )
+
+        if summary is not None and topic.summary_last_message_uuid is not None:
+            if incoming_boundary is None:
+                raise messenger_exc.TopicSummaryConflictError()
+            current_boundary = _get_workspace_topic_message(
+                project_id,
+                topic,
+                topic.summary_last_message_uuid,
+                current_session,
+            )
+            incoming_order = (
+                incoming_boundary.created_at,
+                str(incoming_boundary.uuid),
+            )
+            current_order = (
+                current_boundary.created_at,
+                str(current_boundary.uuid),
+            )
+            if incoming_order < current_order:
+                raise messenger_exc.TopicSummaryConflictError()
+
+        topic.update_dm(
+            values={
+                "summary": summary,
+                "summary_last_message_uuid": summary_last_message_uuid,
+            }
+        )
+        topic.update(session=current_session)
+        _create_workspace_stream_topic_updated_events(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        return get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+
+
+def set_workspace_user_stream_topic_summary_prompt(
+    project_id: object,
+    user_uuid: object,
+    topic_uuid: object,
+    summary_system_prompt: typing.Any,
+    session: typing.Any = None,
+) -> typing.Any:
+    allowed_roles = {
+        models.WorkspaceStreamRole.ADMINISTRATOR.value,
+        models.WorkspaceStreamRole.OWNER.value,
+    }
+    with _workspace_session(session=session) as current_session:
+        _lock_workspace_topic(project_id, topic_uuid, current_session)
+        topic = _get_workspace_stream_topic_for_user(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        binding = models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+            session=current_session,
+        )
+        if binding.role not in allowed_roles:
+            raise messenger_exc.TopicSummaryPromptForbiddenError()
+
+        topic.update_dm(
+            values={"summary_system_prompt": summary_system_prompt},
+        )
+        topic.update(session=current_session)
+        _create_workspace_stream_topic_updated_events(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        return get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
 
 
 def delete_workspace_user_stream_topic(

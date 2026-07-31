@@ -133,6 +133,14 @@ def as_dict(
             }
         result["provider"] = provider
         result["delivery"] = delivery
+        if resource == "stream_topics":
+            for name in (
+                "summary",
+                "summary_last_message_uuid",
+                "summary_has_new_messages",
+                "summary_system_prompt",
+            ):
+                result.setdefault(name, None)
     elif resource == "users" and result.get("source") == (
         models.WorkspaceUserSource.ZULIP.value
     ):

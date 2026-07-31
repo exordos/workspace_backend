@@ -35,6 +35,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.x509.oid import NameOID
 from restalchemy.common import contexts as ra_contexts
+from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import migrations as ra_migrations
 from restalchemy.storage.sql import sessions as ra_sessions
@@ -46,6 +47,7 @@ from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_event_apply
 from workspace.external_bridge_control import sql_state
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import external_projection
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import controllers as messenger_controllers
@@ -5970,6 +5972,10 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert topic["is_default"] is False
     assert topic["is_done"] is False
     assert topic["notification_mode"] == "default"
+    assert topic["summary"] is None
+    assert topic["summary_last_message_uuid"] is None
+    assert topic["summary_has_new_messages"] is None
+    assert topic["summary_system_prompt"] is None
 
     resp = api.get(f"{STREAM_TOPICS}{topic['uuid']}", user=other_user)
     assert resp.status_code == 200, resp.text
@@ -6031,6 +6037,369 @@ def test_stream_topic_create_is_visible_to_stream_users(api, db):
     assert event["payload"]["color"] == topic["color"]
     assert event["payload"].get("last_message_uuid") is None
     assert event["payload"]["notification_mode"] == "default"
+    assert event["payload"]["summary"] is None
+    assert event["payload"]["summary_last_message_uuid"] is None
+    assert event["payload"]["summary_has_new_messages"] is None
+    assert event["payload"]["summary_system_prompt"] is None
+
+
+def test_stream_topic_summary_has_no_public_write_action(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-summary-internal"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "planning"
+    )
+
+    response = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary/invoke",
+        json={"summary": None, "summary_last_message_uuid": None},
+    )
+
+    assert response.status_code == 404, response.text
+
+
+def test_stream_topic_summary_tracks_new_messages_and_emits_snapshots(api, db):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-summary-team"
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        other_user,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "planning"
+    )
+
+    first_message = api.post(
+        MESSAGES,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "first decision"},
+        },
+    )
+    assert first_message.status_code == 201, first_message.text
+    first_message_uuid = first_message.json()["uuid"]
+
+    topic = _run_database_operation(
+        lambda session: messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+            project_id,
+            user_uuid,
+            sys_uuid.UUID(topic_uuid),
+            "The first decision was recorded.",
+            sys_uuid.UUID(first_message_uuid),
+            session=session,
+        )
+    )
+    assert topic.summary == "The first decision was recorded."
+    assert str(topic.summary_last_message_uuid) == first_message_uuid
+    assert topic.summary_has_new_messages is False
+
+    other_topic = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=other_user)
+    assert other_topic.status_code == 200, other_topic.text
+    assert other_topic.json()["summary"] == "The first decision was recorded."
+    assert other_topic.json()["summary_has_new_messages"] is False
+
+    second_message = api.post(
+        MESSAGES,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "new follow-up"},
+        },
+    )
+    assert second_message.status_code == 201, second_message.text
+    refreshed = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["summary_has_new_messages"] is True
+
+    topic = _run_database_operation(
+        lambda session: messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+            project_id,
+            user_uuid,
+            sys_uuid.UUID(topic_uuid),
+            None,
+            None,
+            session=session,
+        )
+    )
+    assert topic.summary is None
+    assert topic.summary_last_message_uuid is None
+    assert topic.summary_has_new_messages is None
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND payload->>'kind' = 'topic.updated'
+              AND payload->>'uuid' = %s
+              AND payload->>'summary' = %s
+            ORDER BY user_uuid
+            """,
+            (
+                api.project_id,
+                topic_uuid,
+                "The first decision was recorded.",
+            ),
+        )
+        event_rows = cur.fetchall()
+    assert {str(row[0]) for row in event_rows} == {
+        str(api.user_uuid),
+        str(other_user),
+    }
+    assert all(
+        payload["summary_last_message_uuid"] == first_message_uuid
+        and payload["summary_has_new_messages"] is False
+        for _, payload in event_rows
+    )
+
+
+def test_stream_topic_summary_rejects_invalid_and_older_boundaries(api, db):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-summary-boundaries"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "planning"
+    )
+    other_topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "other"
+    )
+
+    message_uuids = []
+    for content in ("older", "newer"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "uuid": str(sys_uuid.uuid4()),
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    other_message = api.post(
+        MESSAGES,
+        json={
+            "uuid": str(sys_uuid.uuid4()),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": other_topic_uuid,
+            "payload": {"kind": "markdown", "content": "wrong topic"},
+        },
+    )
+    assert other_message.status_code == 201, other_message.text
+
+    with pytest.raises(messenger_exceptions.InvalidTopicSummaryBoundaryError):
+        _run_database_operation(
+            lambda session: (
+                messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+                    project_id,
+                    user_uuid,
+                    sys_uuid.UUID(topic_uuid),
+                    "Invalid boundary.",
+                    sys_uuid.UUID(other_message.json()["uuid"]),
+                    session=session,
+                )
+            )
+        )
+
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+            project_id,
+            user_uuid,
+            sys_uuid.UUID(topic_uuid),
+            "Current summary.",
+            sys_uuid.UUID(message_uuids[1]),
+            session=session,
+        )
+    )
+
+    with pytest.raises(messenger_exceptions.TopicSummaryConflictError):
+        _run_database_operation(
+            lambda session: (
+                messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+                    project_id,
+                    user_uuid,
+                    sys_uuid.UUID(topic_uuid),
+                    "Stale summary.",
+                    sys_uuid.UUID(message_uuids[0]),
+                    session=session,
+                )
+            )
+        )
+    current = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert current.status_code == 200, current.text
+    assert current.json()["summary"] == "Current summary."
+    assert current.json()["summary_last_message_uuid"] == message_uuids[1]
+
+    with pytest.raises(messenger_exceptions.InvalidTopicSummaryStateError):
+        _run_database_operation(
+            lambda session: (
+                messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+                    project_id,
+                    user_uuid,
+                    sys_uuid.UUID(topic_uuid),
+                    None,
+                    sys_uuid.UUID(message_uuids[1]),
+                    session=session,
+                )
+            )
+        )
+
+    with pytest.raises(ra_exceptions.TypeError):
+        _run_database_operation(
+            lambda session: (
+                messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+                    project_id,
+                    user_uuid,
+                    sys_uuid.UUID(topic_uuid),
+                    "x" * 4097,
+                    sys_uuid.UUID(message_uuids[1]),
+                    session=session,
+                )
+            )
+        )
+
+
+def test_concurrent_topic_summary_jobs_cannot_leave_an_older_boundary(api, db):
+    project_id = sys_uuid.UUID(api.project_id)
+    user_uuid = sys_uuid.UUID(api.user_uuid)
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-summary-race"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "planning"
+    )
+    message_uuids = []
+    for content in ("older snapshot", "newer snapshot"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "uuid": str(sys_uuid.uuid4()),
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    barrier = threading.Barrier(2)
+
+    def update(summary, boundary):
+        barrier.wait()
+        try:
+            _run_database_operation(
+                lambda session: (
+                    messenger_dm_helpers.set_workspace_user_stream_topic_summary(
+                        project_id,
+                        user_uuid,
+                        sys_uuid.UUID(topic_uuid),
+                        summary,
+                        boundary,
+                        session=session,
+                    )
+                )
+            )
+            return "stored"
+        except messenger_exceptions.TopicSummaryConflictError:
+            return "conflict"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        older = executor.submit(update, "Older summary.", message_uuids[0])
+        newer = executor.submit(update, "Newer summary.", message_uuids[1])
+        outcomes = {older.result(timeout=5), newer.result(timeout=5)}
+
+    assert outcomes in ({"stored"}, {"stored", "conflict"})
+    current = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert current.status_code == 200, current.text
+    assert current.json()["summary"] == "Newer summary."
+    assert current.json()["summary_last_message_uuid"] == str(message_uuids[1])
+
+
+def test_stream_topic_summary_prompt_requires_owner_or_administrator(api, db):
+    member_uuid = sys_uuid.uuid4()
+    moderator_uuid = sys_uuid.uuid4()
+    administrator_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "topic-summary-prompt"
+    )
+    for user_uuid, role in (
+        (member_uuid, "member"),
+        (moderator_uuid, "moderator"),
+        (administrator_uuid, "administrator"),
+        (owner_uuid, "owner"),
+    ):
+        conftest.seed_user_stream_binding(
+            db,
+            api.project_id,
+            stream_uuid,
+            user_uuid,
+            role=role,
+        )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "planning"
+    )
+
+    forbidden = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
+        user=member_uuid,
+        json={"summary_system_prompt": "Member prompt."},
+    )
+    assert forbidden.status_code == 403, forbidden.text
+
+    oversized = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
+        json={"summary_system_prompt": "x" * 16385},
+    )
+    assert oversized.status_code == 400, oversized.text
+
+    moderator_forbidden = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
+        user=moderator_uuid,
+        json={"summary_system_prompt": "Focus on decisions."},
+    )
+    assert moderator_forbidden.status_code == 403, moderator_forbidden.text
+
+    response = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
+        user=administrator_uuid,
+        json={"summary_system_prompt": "Focus on decisions and owners."},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["summary_system_prompt"] == "Focus on decisions and owners."
+
+    response = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
+        user=owner_uuid,
+        json={"summary_system_prompt": "Focus on risks."},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["summary_system_prompt"] == "Focus on risks."
+    member_topic = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=member_uuid)
+    assert member_topic.status_code == 200, member_topic.text
+    assert member_topic.json()["summary_system_prompt"] == "Focus on risks."
+
+    reset = api.post(
+        f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
+        user=owner_uuid,
+        json={"summary_system_prompt": None},
+    )
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["summary_system_prompt"] is None
 
 
 def test_stream_topic_rename(api, db):
