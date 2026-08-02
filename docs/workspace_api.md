@@ -302,6 +302,11 @@ authoritative snapshots before starting a new cursor.
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` | Toggle the shared `is_done` flag for all topic users. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/notifications/invoke` | Set current user's topic notification mode. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` | Make the topic its stream's default topic. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_summary_prompt/invoke` | Update owner/administrator-managed per-topic summary configuration, including enable/disable. |
+| `GET` | `/api/workspace/v1/messenger/topic_summary_endpoints/` | List global OpenAI-compatible summary endpoints; requires `workspace.topic_summary_endpoint.manage`. |
+| `POST` | `/api/workspace/v1/messenger/topic_summary_endpoints/` | Create a global summary endpoint with a write-only credential; requires `workspace.topic_summary_endpoint.manage`. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/messenger/topic_summary_endpoints/{endpoint_uuid}` | Read, update, or delete a global summary endpoint; requires `workspace.topic_summary_endpoint.manage`. |
+| `GET`, `PUT` | `/api/workspace/v1/messenger/topic_summary_settings/{project_uuid}` | Read both summary gates or update both with `workspace.topic_summary_settings.manage`. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/read/invoke` | Mark all unread topic messages as read for the current user. |
 | `GET` | `/api/workspace/v1/messenger/messages/` | List messages visible to the current IAM user. |
 | `POST` | `/api/workspace/v1/messenger/messages/` | Create a message. |
@@ -943,6 +948,12 @@ to the current IAM user through current stream membership.
 | `is_default` | boolean | no | yes | Whether this topic UUID equals the stream's `default_topic_uuid`. |
 | `is_done` | boolean | no | action-managed | Current user's done flag. |
 | `notification_mode` | `mute`, `default`, `unmute`, `follow` | no | user-scoped action-managed | Current user's topic notification mode; defaults to `default`. |
+| `summary` | string, max 4096, or `null` | no | yes | Latest LLM-generated summary, written by the server-side summary agent. |
+| `summary_last_message_uuid` | UUID or `null` | no | yes | Latest topic message actually included in `summary`; written by the server-side summary agent, and `null` is valid for an empty topic. |
+| `summary_has_new_messages` | boolean or `null` | no | yes | `null` without a summary; otherwise whether the current latest message differs from `summary_last_message_uuid`. |
+| `summary_enabled` | boolean | no | action-managed | Whether the server-side worker may refresh this topic; defaults to `true`. Disabling preserves the current summary and staleness metadata. |
+| `summary_system_prompt` | string, max 16384, or `null` | no | action-managed | Topic-specific LLM system prompt; `null` selects the application default. |
+| `summary_reasoning_effort` | `minimal`, `low`, `medium`, `high`, or `null` | no | action-managed | Per-summary reasoning choice; used only when the selected endpoint declares reasoning support. |
 | `source_name` | `native`, `zulip` | no | no | Topic source name; defaults to `native` when omitted. |
 | `source` | object | no | no | Topic source payload. |
 | `provider` | object or `null` | no | yes | Provider badge for provider-backed topics; `null` for native topics. |
@@ -972,6 +983,195 @@ topic as its stream's default and returns the current user's updated topic
 view. The operation is idempotent. A changed default emits `stream.updated`
 for every stream user and `topic.updated` for the previous and new default
 topics.
+
+Topic summaries are written only by the server-side summary agent through an
+internal helper; there is no public REST action for writing `summary` or
+`summary_last_message_uuid`. The helper stores both fields atomically,
+validates that a non-null boundary identifies a message in the topic, rejects
+an older boundary when a newer one is already stored, and emits
+`topic.updated` snapshots for the stream participants. Every successful write
+also appends a private server-side journal entry containing the summary,
+boundary UUID and ordering timestamp, and generation timestamp. If a covered
+message is hard-deleted, journal entries at or after that message are
+invalidated, the newest earlier entry is restored (or the summary is cleared),
+the stale worker job is discarded, and the restored snapshot is emitted in the
+same transaction.
+
+`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_summary_prompt/invoke`
+updates the topic-specific summary configuration:
+
+```json
+{
+  "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
+  "summary_reasoning_effort": "medium",
+  "summary_enabled": true
+}
+```
+
+Setting `summary_system_prompt` to `null` restores the application default.
+Every field is optional, but the request must contain at least one field.
+Omitting a field preserves its current value. Sending
+`summary_reasoning_effort` as `null` clears the reasoning request. Reasoning
+effort belongs to the topic request, not to endpoint configuration. Setting
+`summary_enabled` to `false` cancels pending work for this topic and prevents
+new claims while preserving the current summary; setting it back to `true`
+allows the worker to refresh any stale content.
+Only stream owners and administrators may update this configuration; other roles,
+including moderators, receive `403 Forbidden`.
+
+### Topic summary client workflow
+
+The client reads the summary as part of the ordinary topic snapshot:
+
+```http
+GET /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047
+Authorization: Bearer <access_token>
+```
+
+```json
+{
+  "uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "last_message_uuid": "b5ff6f76-bcfe-4fb9-9c28-e0cb790d2e52",
+  "summary": "The team approved the release scope; two follow-ups remain open.",
+  "summary_last_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "summary_has_new_messages": true,
+  "summary_enabled": true,
+  "summary_system_prompt": "Summarize decisions and open questions.",
+  "summary_reasoning_effort": "medium"
+}
+```
+
+The UI displays `summary` and can mark it as stale while
+`summary_has_new_messages` is `true`. It does not send messages to an LLM or
+write summary fields. A `topic.updated` event carries the full updated topic
+snapshot, so connected clients replace their local topic state without
+polling or a dedicated summary endpoint.
+
+An owner or administrator may change the prompt used by the server-side agent:
+
+```http
+POST /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047/actions/set_summary_prompt/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
+  "summary_reasoning_effort": "high",
+  "summary_enabled": true
+}
+```
+
+The action returns the full topic snapshot and emits `topic.updated` to the
+stream participants. Setting `summary_system_prompt` to `null` selects the
+application default again. Scheduling or restarting LLM work remains a
+server-side agent responsibility.
+
+To pause automatic refresh for one topic without removing its existing
+summary, the same action may send only the topic gate:
+
+```http
+POST /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047/actions/set_summary_prompt/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "summary_enabled": false
+}
+```
+
+### Topic summary administration
+
+Topic summarization has two independent database-backed gates. The worker runs
+only when both `global_enabled` and the current project's `project_enabled` are
+true. A settings update supplies both values:
+
+```http
+PUT /api/workspace/v1/messenger/topic_summary_settings/12345678-1234-4234-8234-123456789abc
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "global_enabled": true,
+  "project_enabled": true
+}
+```
+
+The path UUID must equal the IAM project in the request context. Reads are
+available to project users; updates require
+`workspace.topic_summary_settings.manage`.
+
+LLM endpoints are global rather than project- or stream-scoped. Create one with
+`workspace.topic_summary_endpoint.manage`:
+
+```http
+POST /api/workspace/v1/messenger/topic_summary_endpoints/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "uuid": "e4ad6d80-6bc7-4a91-864c-8e97319a82bd",
+  "name": "primary-summary-model",
+  "base_url": "https://llm.example.com/v1",
+  "model": "summary-model",
+  "api_key": "<write-only credential>",
+  "enabled": true,
+  "priority": 10,
+  "supports_vision": true,
+  "supports_reasoning": true,
+  "temperature": 0.2,
+  "max_output_tokens": 512,
+  "top_p": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0
+}
+```
+
+All endpoints implement OpenAI-compatible `POST {base_url}/chat/completions`;
+there are no provider-specific branches. Lower `priority` values run first and
+UUID is the deterministic tie-breaker. Enabled endpoints are claimed with a
+bounded lease. A retryable network, rate-limit, or server failure releases the
+lease and tries the next endpoint in that order, up to three attempts. The
+registry exposes bounded health data (`last_success_at`, `last_failure_at`,
+`failure_count`, and `last_error_code`) but never exposes an active claim token.
+
+`api_key` is accepted only on create or credential replacement. It is encrypted
+with a deployment secret before storage and is never returned by create, list,
+get, or update, written to Workspace events, copied into topic snapshots, or
+included in worker logs. Registry updates and deletes are ordinary
+permission-checked administrative mutations; the registry intentionally has no
+revision, `ETag`, or `If-Match` contract.
+
+Generation settings have these defaults and accepted ranges:
+
+| Field | Default | Range |
+| --- | --- | --- |
+| `temperature` | `0.2` | `0.0..2.0` |
+| `max_output_tokens` | `512` | `1..32768` |
+| `top_p` | `1.0` | `0.0..1.0` |
+| `presence_penalty` | `0.0` | `-2.0..2.0` |
+| `frequency_penalty` | `0.0` | `-2.0..2.0` |
+
+The Messenger worker claims one stale topic and at most 100 new messages in a
+step, snapshots the boundary and effective prompt, commits the claim, performs
+the LLM request outside every database transaction, and persists the result in
+a new transaction through the existing internal summary helper. Failed jobs,
+retry delays, endpoint leases, and claim expiry are stored so retries remain
+bounded and observable.
+
+Long reasoning is a normal provider response, not a worker failure. The default
+connection timeout is 30 seconds, while the response timeout is 25 minutes so a
+model may reason for 20 minutes without racing the client deadline. The default
+endpoint lease is 30 minutes and the topic-job lease is 90 minutes. At runtime,
+the worker also enforces an endpoint lease of at least the response timeout plus
+60 seconds and a topic lease of at least three such request windows, so another
+worker cannot reclaim live work during a slow response or immediate failover.
+
+When the bounded message batch contains a Workspace image and any enabled
+vision endpoint exists, only a vision endpoint may be selected. If every vision
+endpoint is busy, the job waits; it does not fall back to a free text endpoint.
+Text-only summarization is allowed for an image-bearing batch only when no
+enabled vision endpoint exists. Images are encoded only in user message
+content, while the system prompt always remains text-only.
 
 `POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/notifications/invoke` sets the
 current user's topic notification mode:
@@ -1003,6 +1203,8 @@ Realtime side effects:
 | rename topic | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | toggle done | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | set default topic | `stream.updated`, `topic.updated` | `stream`, `topic` | Updated stream snapshot and previous/new default topic snapshots for every stream user. |
+| server summary update | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| set summary prompt | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | change topic notification mode | `topic.updated` | `topic` | Full user topic snapshot for the current user only. |
 | read topic messages | `topic.read` | `topic` | Full user topic snapshot returned by the action. |
 | read topic messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |

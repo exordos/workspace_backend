@@ -76,6 +76,26 @@ class StreamIdentityImmutableError(ra_exc.ValidationErrorException):
     code = 400001011
 
 
+class InvalidTopicSummaryBoundaryError(ra_exc.ValidationErrorException):
+    message = "Summary boundary must identify a message in this topic"
+    code = 400001012
+
+
+class InvalidTopicSummaryStateError(ra_exc.ValidationErrorException):
+    message = "A summary boundary cannot be stored without a summary"
+    code = 400001013
+
+
+class TopicSummaryConflictError(ra_exc.RestAlchemyException):
+    message = "A newer topic summary has already been stored"
+    code = 409
+
+
+class TopicSummaryPromptForbiddenError(ra_exc.RestAlchemyException):
+    message = "Topic summary prompt updates require an owner or administrator role"
+    code = 403
+
+
 class EventsCursorExpiredError(ra_exc.RestAlchemyException):
     """The saved events cursor can no longer produce a complete delta."""
 

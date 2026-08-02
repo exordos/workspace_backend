@@ -24,10 +24,12 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from gcl_looper.services import basic
 
+from workspace.common import topic_summary_opts
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.api import sql_canonical_store
+from workspace.messenger_api import topic_summarization
 from workspace.external_bridge_control import sql_state
 
 LOG = logging.getLogger(__name__)
@@ -65,6 +67,19 @@ class MessengerWorkerAgent(basic.BasicService):
         event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
         event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
         heartbeat_retention: datetime.timedelta = HEARTBEAT_RETENTION,
+        summary_secret_key: str | None = None,
+        summary_connect_timeout_seconds: int = (
+            topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
+        ),
+        summary_request_timeout_seconds: int = (
+            topic_summary_opts.DEFAULT_REQUEST_TIMEOUT_SECONDS
+        ),
+        summary_topic_claim_seconds: int = (
+            topic_summary_opts.DEFAULT_TOPIC_CLAIM_SECONDS
+        ),
+        summary_endpoint_claim_seconds: int = (
+            topic_summary_opts.DEFAULT_ENDPOINT_CLAIM_SECONDS
+        ),
         **kwargs: typing.Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -72,6 +87,22 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_prune_interval_seconds = event_prune_interval_seconds
         self._event_prune_batch_size = event_prune_batch_size
         self._heartbeat_retention = heartbeat_retention
+        self._summary_secret_key = summary_secret_key
+        self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
+        self._summary_request_timeout_seconds = summary_request_timeout_seconds
+        self._summary_topic_claim_seconds = max(
+            summary_topic_claim_seconds,
+            topic_summarization.MAX_PROVIDER_ATTEMPTS
+            * (
+                summary_request_timeout_seconds
+                + topic_summary_opts.CLAIM_GRACE_SECONDS
+            )
+        )
+        self._summary_endpoint_claim_seconds = max(
+            summary_endpoint_claim_seconds,
+            summary_request_timeout_seconds
+            + topic_summary_opts.CLAIM_GRACE_SECONDS,
+        )
         self._last_event_prune: float | None = None
         self._capability_refresh_cursor: object | None = None
 
@@ -150,6 +181,101 @@ class MessengerWorkerAgent(basic.BasicService):
                 self._repair_external_projection_transitions(session)
         except Exception:
             LOG.exception("Failed to repair external projection transitions")
+
+        self._summarize_one_topic()
+
+    def _summarize_one_topic(self) -> bool:
+        if self._summary_secret_key is None:
+            return False
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            with database_session_context() as session:
+                work = topic_summarization.claim_summary_work(
+                    session,
+                    now=now,
+                    key_material=self._summary_secret_key,
+                    topic_claim_seconds=self._summary_topic_claim_seconds,
+                    endpoint_claim_seconds=self._summary_endpoint_claim_seconds,
+                )
+        except Exception:
+            LOG.exception("Failed to claim bounded topic summary work")
+            return False
+        if work is None:
+            return False
+
+        while True:
+            try:
+                summary = topic_summarization.call_openai_compatible_endpoint(
+                    work,
+                    connect_timeout_seconds=(
+                        self._summary_connect_timeout_seconds
+                    ),
+                    timeout_seconds=self._summary_request_timeout_seconds,
+                )
+            except topic_summarization.ProviderCallError as error:
+                try:
+                    with database_session_context() as session:
+                        work = topic_summarization.fail_summary_work(
+                            session,
+                            work,
+                            error,
+                            now=datetime.datetime.now(datetime.timezone.utc),
+                            key_material=self._summary_secret_key,
+                            endpoint_claim_seconds=(
+                                self._summary_endpoint_claim_seconds
+                            ),
+                        )
+                except Exception:
+                    LOG.exception("Failed to persist topic summary provider failure")
+                    return True
+                if work is None:
+                    return True
+                continue
+            except Exception:
+                LOG.exception("Failed to construct topic summary provider request")
+                failure = topic_summarization.ProviderCallError(
+                    "worker_error",
+                    retryable=False,
+                )
+                try:
+                    with database_session_context() as session:
+                        topic_summarization.fail_summary_work(
+                            session,
+                            work,
+                            failure,
+                            now=datetime.datetime.now(datetime.timezone.utc),
+                            key_material=self._summary_secret_key,
+                            endpoint_claim_seconds=(
+                                self._summary_endpoint_claim_seconds
+                            ),
+                        )
+                except Exception:
+                    LOG.exception("Failed to persist topic summary worker failure")
+                return True
+
+            try:
+                with database_session_context() as session:
+                    topic_summarization.complete_summary_work(
+                        session,
+                        work,
+                        summary,
+                        now=datetime.datetime.now(datetime.timezone.utc),
+                    )
+            except Exception:
+                LOG.exception(
+                    "Failed to persist topic summary result",
+                    extra={"topic_uuid": str(work.topic_uuid)},
+                )
+            else:
+                LOG.info(
+                    "Completed bounded topic summary",
+                    extra={
+                        "topic_uuid": str(work.topic_uuid),
+                        "endpoint_uuid": str(work.endpoint.uuid),
+                        "attempt": work.attempt,
+                    },
+                )
+            return True
 
     def _refresh_capabilities(self, now: datetime.datetime) -> None:
         """Refresh each account in its own bounded, retryable transaction."""

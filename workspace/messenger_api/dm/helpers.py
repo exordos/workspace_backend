@@ -34,6 +34,7 @@ from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 
 
+_SUMMARY_REASONING_UNSET = object()
 ALL_CHATS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000000")
 PERSONAL_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000001")
 CHANNELS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000002")
@@ -2105,15 +2106,21 @@ def _create_workspace_stream_updated_events(
 
 
 def _create_workspace_stream_topic_updated_events(
-    project_id: object, topic_uuid: object
+    project_id: object,
+    topic_uuid: object,
+    session: typing.Any = None,
 ) -> None:
     if topic_uuid is None:
         return
     for user_topic in _get_workspace_user_stream_topics(
         project_id=project_id,
         topic_uuid=topic_uuid,
+        session=session,
     ):
-        messenger_events.create_topic_updated_event(topic=user_topic)
+        messenger_events.create_topic_updated_event(
+            topic=user_topic,
+            session=session,
+        )
 
 
 def _get_workspace_stream_topic_for_user(
@@ -2190,6 +2197,198 @@ def update_workspace_user_stream_topic(
             session=session,
         )
     return result
+
+
+def _get_workspace_topic_message(
+    project_id: object,
+    topic: typing.Any,
+    message_uuid: object,
+    session: typing.Any,
+) -> typing.Any:
+    message = models.WorkspaceMessage.objects.get_one_or_none(
+        filters={
+            "uuid": dm_filters.EQ(message_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+            "topic_uuid": dm_filters.EQ(topic.uuid),
+        },
+        session=session,
+    )
+    if message is None:
+        raise messenger_exc.InvalidTopicSummaryBoundaryError()
+    return message
+
+
+def set_workspace_user_stream_topic_summary(
+    project_id: object,
+    user_uuid: object,
+    topic_uuid: object,
+    summary: typing.Any,
+    summary_last_message_uuid: object,
+    session: typing.Any = None,
+) -> typing.Any:
+    if summary is None and summary_last_message_uuid is not None:
+        raise messenger_exc.InvalidTopicSummaryStateError()
+
+    with _workspace_session(session=session) as current_session:
+        _lock_workspace_topic(project_id, topic_uuid, current_session)
+        topic = _get_workspace_stream_topic_for_user(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+
+        incoming_boundary = None
+        if summary_last_message_uuid is not None:
+            try:
+                summary_last_message_uuid = sys_uuid.UUID(
+                    str(summary_last_message_uuid)
+                )
+            except (TypeError, ValueError) as exc:
+                raise messenger_exc.InvalidTopicSummaryBoundaryError() from exc
+            incoming_boundary = _get_workspace_topic_message(
+                project_id,
+                topic,
+                summary_last_message_uuid,
+                current_session,
+            )
+
+        if summary is not None and topic.summary_last_message_uuid is not None:
+            if incoming_boundary is None:
+                raise messenger_exc.TopicSummaryConflictError()
+            current_boundary = _get_workspace_topic_message(
+                project_id,
+                topic,
+                topic.summary_last_message_uuid,
+                current_session,
+            )
+            incoming_order = (
+                incoming_boundary.created_at,
+                str(incoming_boundary.uuid),
+            )
+            current_order = (
+                current_boundary.created_at,
+                str(current_boundary.uuid),
+            )
+            if incoming_order < current_order:
+                raise messenger_exc.TopicSummaryConflictError()
+
+        topic.update_dm(
+            values={
+                "summary": summary,
+                "summary_last_message_uuid": summary_last_message_uuid,
+            }
+        )
+
+        if summary is not None:
+            if incoming_boundary is None:
+                raise messenger_exc.InvalidTopicSummaryBoundaryError()
+            current_session.execute(
+                """
+                INSERT INTO m_workspace_topic_summary_journal (
+                    uuid, topic_uuid, project_id, summary,
+                    boundary_message_uuid, boundary_message_created_at,
+                    generated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    topic_uuid,
+                    project_id,
+                    summary,
+                    incoming_boundary.uuid,
+                    _database_timestamp(incoming_boundary.created_at),
+                ),
+            )
+
+        topic.update(session=current_session)
+        _create_workspace_stream_topic_updated_events(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        return get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+
+
+def set_workspace_user_stream_topic_summary_prompt(
+    project_id: object,
+    user_uuid: object,
+    topic_uuid: object,
+    summary_system_prompt: typing.Any = _SUMMARY_REASONING_UNSET,
+    summary_reasoning_effort: typing.Any = _SUMMARY_REASONING_UNSET,
+    summary_enabled: typing.Any = _SUMMARY_REASONING_UNSET,
+    session: typing.Any = None,
+) -> typing.Any:
+    allowed_roles = {
+        models.WorkspaceStreamRole.ADMINISTRATOR.value,
+        models.WorkspaceStreamRole.OWNER.value,
+    }
+    with _workspace_session(session=session) as current_session:
+        _lock_workspace_topic(project_id, topic_uuid, current_session)
+        topic = _get_workspace_stream_topic_for_user(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        binding = models.WorkspaceStreamBinding.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "stream_uuid": dm_filters.EQ(topic.stream_uuid),
+                "user_uuid": dm_filters.EQ(user_uuid),
+            },
+            session=current_session,
+        )
+        if binding.role not in allowed_roles:
+            raise messenger_exc.TopicSummaryPromptForbiddenError()
+
+        values = {}
+        if summary_system_prompt is not _SUMMARY_REASONING_UNSET:
+            values["summary_system_prompt"] = summary_system_prompt
+        if summary_reasoning_effort is not _SUMMARY_REASONING_UNSET:
+            values["summary_reasoning_effort"] = summary_reasoning_effort
+        if summary_enabled is not _SUMMARY_REASONING_UNSET:
+            values["summary_enabled"] = summary_enabled
+        topic.update_dm(values=values)
+        topic.update(session=current_session)
+        if summary_enabled is False:
+            current_session.execute(
+                """
+                UPDATE m_workspace_llm_endpoints AS endpoint
+                SET claim_token = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                FROM m_workspace_topic_summary_jobs AS job
+                WHERE job.topic_uuid = %s
+                  AND endpoint.uuid = job.endpoint_uuid
+                  AND endpoint.claim_token = job.endpoint_claim_token
+                """,
+                (topic_uuid,),
+            )
+            current_session.execute(
+                """
+                DELETE FROM m_workspace_topic_summary_jobs
+                WHERE topic_uuid = %s
+                """,
+                (topic_uuid,),
+            )
+        _create_workspace_stream_topic_updated_events(
+            project_id=project_id,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
+        return get_workspace_user_stream_topic(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=current_session,
+        )
 
 
 def delete_workspace_user_stream_topic(
@@ -4008,6 +4207,123 @@ def sync_workspace_user_messages_read_state(
     return changed_messages
 
 
+def _restore_topic_summary_after_message_deletion(
+    *,
+    project_id: object,
+    topic_uuid: object,
+    deleted_message_uuid: object,
+    deleted_message_created_at: datetime.datetime,
+    session: typing.Any,
+) -> None:
+    deleted_message_created_at = _database_timestamp(deleted_message_created_at)
+    session.execute(
+        """
+        UPDATE m_workspace_llm_endpoints AS endpoint
+        SET claim_token = NULL,
+            claim_expires_at = NULL,
+            updated_at = NOW()
+        FROM m_workspace_topic_summary_jobs AS job
+        WHERE job.topic_uuid = %s
+          AND endpoint.uuid = job.endpoint_uuid
+          AND endpoint.claim_token = job.endpoint_claim_token
+        """,
+        (topic_uuid,),
+    )
+    session.execute(
+        """
+        DELETE FROM m_workspace_topic_summary_jobs
+        WHERE topic_uuid = %s
+        """,
+        (topic_uuid,),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_topic_summary_journal
+        SET invalidated_at = NOW()
+        WHERE topic_uuid = %s
+          AND invalidated_at IS NULL
+          AND (boundary_message_created_at, boundary_message_uuid) >= (%s, %s)
+        """,
+        (
+            topic_uuid,
+            deleted_message_created_at,
+            deleted_message_uuid,
+        ),
+    )
+    topic = session.execute(
+        """
+        SELECT
+            topic.summary,
+            topic.summary_last_message_uuid,
+            (
+                topic.summary_last_message_uuid IS NULL
+                OR boundary.created_at IS NULL
+                OR (boundary.created_at, boundary.uuid) >= (%s, %s)
+            ) AS summary_covered_deleted_message
+        FROM m_workspace_stream_topics AS topic
+        LEFT JOIN m_workspace_messages AS boundary
+          ON boundary.uuid = topic.summary_last_message_uuid
+        WHERE topic.project_id = %s AND topic.uuid = %s
+        FOR UPDATE OF topic
+        """,
+        (
+            deleted_message_created_at,
+            deleted_message_uuid,
+            project_id,
+            topic_uuid,
+        ),
+    ).fetchone()
+    if topic is None or topic["summary"] is None:
+        return
+    if not topic["summary_covered_deleted_message"]:
+        return
+
+    restored = session.execute(
+        """
+        SELECT summary, boundary_message_uuid
+        FROM m_workspace_topic_summary_journal
+        WHERE topic_uuid = %s
+          AND invalidated_at IS NULL
+          AND (boundary_message_created_at, boundary_message_uuid) < (%s, %s)
+        ORDER BY
+            boundary_message_created_at DESC,
+            boundary_message_uuid DESC,
+            generated_at DESC,
+            uuid DESC
+        LIMIT 1
+        """,
+        (
+            topic_uuid,
+            deleted_message_created_at,
+            deleted_message_uuid,
+        ),
+    ).fetchone()
+    restored_summary = restored["summary"] if restored is not None else None
+    restored_boundary = (
+        restored["boundary_message_uuid"] if restored is not None else None
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_stream_topics
+        SET summary = %s,
+            summary_last_message_uuid = %s,
+            updated_at = NOW()
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (
+            restored_summary,
+            restored_boundary,
+            project_id,
+            topic_uuid,
+        ),
+    )
+    _create_workspace_stream_topic_updated_events(
+        project_id=project_id,
+        topic_uuid=topic_uuid,
+        session=session,
+    )
+
+
 def delete_workspace_user_message(
     project_id: object,
     user_uuid: object,
@@ -4063,7 +4379,16 @@ def delete_workspace_user_message(
                 session=session,
             )
 
-    message.delete(session=session)
+    current_session = session or contexts.Context().get_session()
+    message.delete(session=current_session)
+    if message.topic_uuid is not None:
+        _restore_topic_summary_after_message_deletion(
+            project_id=project_id,
+            topic_uuid=message.topic_uuid,
+            deleted_message_uuid=message.uuid,
+            deleted_message_created_at=message.created_at,
+            session=current_session,
+        )
     if compact_events:
         _create_compact_messages_unread_updated_events(
             project_id=project_id,

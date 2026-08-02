@@ -123,6 +123,13 @@ DRAFT_ERROR_SCHEMA = {
     "properties": {"message": {"type": "string"}},
 }
 
+TOPIC_SUMMARY_ERROR_SCHEMA = {
+    "type": "object",
+    "required": ["message"],
+    "additionalProperties": True,
+    "properties": {"message": {"type": "string"}},
+}
+
 DRAFT_SIDE_EFFECTS_DESCRIPTION = (
     "Drafts are PostgreSQL-only client state. This operation emits no Workspace "
     "events, websocket or desktop notifications, or messages. Other clients "
@@ -1079,6 +1086,253 @@ def add_draft_contract(
         "additionalProperties": False,
         "properties": {"payload": copy.deepcopy(DRAFT_PAYLOAD_SCHEMA)},
     }
+    return specification
+
+
+def add_topic_summary_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    summary_properties = {
+        "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "nullable": True,
+            "readOnly": True,
+            "description": "Latest LLM-generated topic summary.",
+        },
+        "summary_last_message_uuid": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": True,
+            "readOnly": True,
+            "description": "Latest topic message included in the summary.",
+        },
+        "summary_has_new_messages": {
+            "type": "boolean",
+            "nullable": True,
+            "readOnly": True,
+            "description": (
+                "Null without a summary; otherwise whether the current latest "
+                "message differs from the stored summary boundary."
+            ),
+        },
+        "summary_enabled": {
+            "type": "boolean",
+            "readOnly": True,
+            "description": (
+                "Whether the server-side worker may generate summaries for "
+                "this topic. Existing summary text remains readable when false."
+            ),
+        },
+        "summary_system_prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384,
+            "nullable": True,
+            "readOnly": True,
+            "description": (
+                "Topic-specific LLM system prompt, or null for the default."
+            ),
+        },
+        "summary_reasoning_effort": {
+            "type": "string",
+            "enum": ["minimal", "low", "medium", "high"],
+            "nullable": True,
+            "readOnly": True,
+            "description": (
+                "Per-summary reasoning choice, or null for no reasoning option."
+            ),
+        },
+    }
+    for name, schema in schemas.items():
+        if name.startswith("WorkspaceUserTopic_"):
+            schema["properties"].update(copy.deepcopy(summary_properties))
+
+    topic_path = f"{root}stream_topics/{{WorkspaceUserTopicUuid}}"
+    response = _external_response(
+        "#/components/schemas/WorkspaceUserTopic_Get",
+    )
+    prompt_action = specification["paths"][
+        f"{topic_path}/actions/set_summary_prompt/invoke"
+    ]["post"]
+    prompt_action["description"] = (
+        "Update topic-specific summary configuration. A null prompt restores "
+        "the default; summary_enabled controls whether the worker may refresh "
+        "this topic. The caller must be a stream owner or administrator."
+    )
+    prompt_schema = _object_schema(
+        {
+            "summary_system_prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384,
+                "nullable": True,
+            },
+            "summary_reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high"],
+                "nullable": True,
+            },
+            "summary_enabled": {"type": "boolean"},
+        },
+        [],
+    )
+    prompt_schema["minProperties"] = 1
+    prompt_action["requestBody"] = _request_body(prompt_schema)
+    prompt_action["responses"][200] = copy.deepcopy(response)
+    prompt_action["responses"][403] = {
+        "description": "The stream role cannot update summary configuration.",
+        "content": {
+            "application/json": {
+                "schema": copy.deepcopy(TOPIC_SUMMARY_ERROR_SCHEMA),
+            }
+        },
+    }
+    return specification
+
+
+def add_topic_summary_management_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    del components
+    endpoint_properties = {
+        "name": {"type": "string", "minLength": 1, "maxLength": 255},
+        "base_url": {
+            "type": "string",
+            "format": "uri",
+            "maxLength": 2048,
+            "description": "OpenAI-compatible API base URL.",
+        },
+        "model": {"type": "string", "minLength": 1, "maxLength": 255},
+        "enabled": {"type": "boolean", "default": True},
+        "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000,
+            "default": 100,
+            "description": "Lower values are selected first; UUID breaks ties.",
+        },
+        "supports_vision": {"type": "boolean", "default": False},
+        "supports_reasoning": {"type": "boolean", "default": False},
+        "temperature": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 2.0,
+            "default": 0.2,
+        },
+        "max_output_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32768,
+            "default": 512,
+        },
+        "top_p": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "default": 1.0,
+        },
+        "presence_penalty": {
+            "type": "number",
+            "minimum": -2.0,
+            "maximum": 2.0,
+            "default": 0.0,
+        },
+        "frequency_penalty": {
+            "type": "number",
+            "minimum": -2.0,
+            "maximum": 2.0,
+            "default": 0.0,
+        },
+        "api_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192,
+            "writeOnly": True,
+            "description": (
+                "Stored encrypted by the server and never returned by any API."
+            ),
+        },
+    }
+    collection = specification["paths"][f"{root}topic_summary_endpoints/"]
+    collection["get"]["parameters"] = []
+    collection["get"]["description"] = (
+        "List global endpoints in deterministic priority and UUID order. "
+        "Requires workspace.topic_summary_endpoint.manage."
+    )
+    collection["post"]["description"] = (
+        "Create a global OpenAI-compatible LLM endpoint. Requires "
+        "workspace.topic_summary_endpoint.manage."
+    )
+    collection["post"]["requestBody"] = _request_body(
+        _object_schema(
+            {
+                "uuid": {"type": "string", "format": "uuid"},
+                **copy.deepcopy(endpoint_properties),
+            },
+            ["uuid", "name", "base_url", "model", "api_key"],
+        )
+    )
+    endpoint_path = next(
+        path
+        for path in specification["paths"]
+        if path.startswith(f"{root}topic_summary_endpoints/{{")
+    )
+    resource = specification["paths"][endpoint_path]
+    resource["get"]["description"] = (
+        "Read a global endpoint. Requires "
+        "workspace.topic_summary_endpoint.manage."
+    )
+    resource["put"]["description"] = (
+        "Update, enable, disable, or reprioritize a global endpoint. "
+        "Requires workspace.topic_summary_endpoint.manage."
+    )
+    update_schema = _object_schema(copy.deepcopy(endpoint_properties), [])
+    update_schema["minProperties"] = 1
+    resource["put"]["requestBody"] = _request_body(update_schema)
+    resource["delete"]["description"] = (
+        "Delete a global endpoint. Requires "
+        "workspace.topic_summary_endpoint.manage."
+    )
+
+    settings_path = next(
+        path
+        for path in specification["paths"]
+        if path.startswith(f"{root}topic_summary_settings/{{")
+    )
+    settings = specification["paths"][settings_path]
+    settings_parameter_name = settings_path.rsplit("{", 1)[1].removesuffix("}")
+    settings_parameter = {
+        "name": settings_parameter_name,
+        "in": "path",
+        "required": True,
+        "description": "Current Workspace project UUID.",
+        "schema": {"type": "string", "format": "uuid"},
+    }
+    for operation in settings.values():
+        operation["parameters"] = [copy.deepcopy(settings_parameter)]
+    settings["get"]["description"] = (
+        "Read the global and current-project topic summarization gates."
+    )
+    settings["put"]["description"] = (
+        "Set both topic summarization gates. The worker runs only when both "
+        "are enabled. Requires workspace.topic_summary_settings.manage."
+    )
+    settings["put"]["requestBody"] = _request_body(
+        _object_schema(
+            {
+                "global_enabled": {"type": "boolean"},
+                "project_enabled": {"type": "boolean"},
+            },
+            ["global_enabled", "project_enabled"],
+        )
+    )
     return specification
 
 

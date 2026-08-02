@@ -49,6 +49,7 @@ from oslo_config import cfg
 
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
+from workspace.common import topic_summary_opts
 from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
@@ -179,6 +180,15 @@ def build_test_wsgi_application(app_module=messenger_app):
         external_bridge_opts.register_opts()
     except cfg.DuplicateOptError:
         pass
+    try:
+        topic_summary_opts.register_opts()
+    except cfg.DuplicateOptError:
+        pass
+    cfg.CONF.set_override(
+        "secret_encryption_key",
+        "integration-test-topic-summary-key",
+        group=topic_summary_opts.DOMAIN,
+    )
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
         openapi_engine=app_module.get_openapi_engine(),

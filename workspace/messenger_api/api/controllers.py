@@ -34,6 +34,7 @@ from workspace.messenger_api import credential_crypto
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import external_projection
+from workspace.messenger_api import topic_summarization
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
@@ -112,6 +113,16 @@ def _move_projection_rows(
         ("m_workspace_stream_topics", "stream_uuid = %s", (stream_uuid,)),
         ("m_workspace_messages", "stream_uuid = %s", (stream_uuid,)),
         ("m_workspace_files", "stream_uuid = %s", (stream_uuid,)),
+        (
+            "m_workspace_topic_summary_jobs",
+            "topic_uuid = ANY(%s)",
+            (topic_uuids,),
+        ),
+        (
+            "m_workspace_topic_summary_journal",
+            "topic_uuid = ANY(%s)",
+            (topic_uuids,),
+        ),
         ("m_workspace_user_topic_flags", "uuid = ANY(%s)", (topic_uuids,)),
         ("m_workspace_user_message_flags", "uuid = ANY(%s)", (message_uuids,)),
         ("m_workspace_message_reactions", "message_uuid = ANY(%s)", (message_uuids,)),
@@ -265,6 +276,19 @@ class ExternalContractJSONPacker(ContractJSONPacker):
 class ExternalProviderPolicyJSONPacker(ExternalContractJSONPacker):
     def unpack(self, value: typing.Any) -> typing.Any:
         if self._req.method != "PUT":
+            return super().unpack(value)
+        try:
+            result = json.loads(value.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ra_exc.ValidationErrorException() from exc
+        if not isinstance(result, dict):
+            raise ra_exc.ValidationErrorException()
+        return result
+
+
+class TopicSummaryManagementJSONPacker(ContractJSONPacker):
+    def unpack(self, value: typing.Any) -> typing.Any:
+        if self._req.method not in {"POST", "PUT"}:
             return super().unpack(value)
         try:
             result = json.loads(value.decode("utf-8"))
@@ -2774,6 +2798,125 @@ class ExternalProviderHealthController(ra_controllers.BaseResourceController):
         )
 
 
+class TopicSummaryEndpointController(
+    ra_controllers.BaseResourceController,
+):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceLLMEndpoint,
+        hidden_fields=["claim_token"],
+        convert_underscore=False,
+        process_filters=True,
+    )
+
+    def get_packer(
+        self, content_type: typing.Any, resource_type: typing.Any = None
+    ) -> typing.Any:
+        return TopicSummaryManagementJSONPacker(
+            resource_type or self.get_resource(),
+            request=self.request,
+        )
+
+    def _require_permission(self) -> None:
+        permissions = (
+            self.get_context().iam_context.get_introspection_info().permissions
+        )
+        if topic_summarization.ENDPOINT_MANAGE_PERMISSION not in permissions:
+            raise messenger_exc.ExternalResourceForbiddenError()
+
+    def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
+        self._require_permission()
+        if filters or order_by:
+            raise ra_exc.ValidationErrorException()
+        return topic_summarization.list_endpoints(
+            contexts.Context().get_session(),
+        )
+
+    def get(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        del kwargs
+        self._require_permission()
+        return models.WorkspaceLLMEndpoint.objects.get_one(
+            filters={"uuid": dm_filters.EQ(uuid)},
+        )
+
+    def create(self, **kwargs: typing.Any) -> typing.Any:
+        self._require_permission()
+        return topic_summarization.create_endpoint(
+            contexts.Context().get_session(),
+            kwargs,
+            topic_summarization.configured_secret_key(),
+        )
+
+    def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        self._require_permission()
+        endpoint = models.WorkspaceLLMEndpoint.objects.get_one(
+            filters={"uuid": dm_filters.EQ(uuid)},
+        )
+        return topic_summarization.update_endpoint(
+            contexts.Context().get_session(),
+            endpoint,
+            kwargs,
+            topic_summarization.configured_secret_key(),
+        )
+
+    def delete(self, uuid: object) -> None:
+        self._require_permission()
+        endpoint = models.WorkspaceLLMEndpoint.objects.get_one(
+            filters={"uuid": dm_filters.EQ(uuid)},
+        )
+        endpoint.delete(session=contexts.Context().get_session())
+
+
+class TopicSummarySettingsController(ra_controllers.BaseResourceController):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=models.WorkspaceTopicSummarySettings,
+        convert_underscore=False,
+        process_filters=True,
+    )
+
+    def get_packer(
+        self, content_type: typing.Any, resource_type: typing.Any = None
+    ) -> typing.Any:
+        return TopicSummaryManagementJSONPacker(
+            resource_type or self.get_resource(),
+            request=self.request,
+        )
+
+    def _project_id(self, value: object) -> sys_uuid.UUID:
+        project_id = self.get_context().project_id
+        if project_id is None:
+            raise ra_exc.ValidationErrorException()
+        try:
+            resource_project_id = sys_uuid.UUID(str(value))
+            context_project_id = sys_uuid.UUID(str(project_id))
+        except (TypeError, ValueError) as exc:
+            raise ra_exc.ValidationErrorException() from exc
+        if resource_project_id != context_project_id:
+            raise messenger_exc.ExternalResourceForbiddenError()
+        return context_project_id
+
+    def _require_update_permission(self) -> None:
+        permissions = (
+            self.get_context().iam_context.get_introspection_info().permissions
+        )
+        if topic_summarization.SETTINGS_MANAGE_PERMISSION not in permissions:
+            raise messenger_exc.ExternalResourceForbiddenError()
+
+    def get(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        del kwargs
+        return topic_summarization.get_topic_summary_settings(
+            contexts.Context().get_session(),
+            self._project_id(uuid),
+        )
+
+    def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        self._require_update_permission()
+        return topic_summarization.update_topic_summary_settings(
+            contexts.Context().get_session(),
+            self._project_id(uuid),
+            kwargs,
+        )
+
+
 class WorkspaceStreamTopicController(StoreResourceController):
     resource_name = "stream_topics"
     __resource__ = ra_resources.ResourceByRAModel(
@@ -2802,6 +2945,19 @@ class WorkspaceStreamTopicController(StoreResourceController):
     ) -> typing.Any:
         del args, kwargs
         return self._action(resource, "set_default")
+
+    @ra_actions.post
+    def set_summary_prompt(
+        self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        del args
+        if not set(kwargs) or not set(kwargs) <= {
+            "summary_system_prompt",
+            "summary_reasoning_effort",
+            "summary_enabled",
+        }:
+            raise ra_exc.ValidationErrorException()
+        return self._action(resource, "set_summary_prompt", kwargs)
 
     @ra_actions.post
     def read(

@@ -139,6 +139,30 @@ def test_manifest_provisions_unassigned_external_integration_roles():
     ) == len(admin_permissions)
 
 
+def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert 'name: "workspace.topic_summary_endpoint.manage"' in manifest
+    assert 'name: "workspace.topic_summary_settings.manage"' in manifest
+    assert 'name: "workspace-topic-summary-admin"' in manifest
+    bindings = manifest.split("  $core.iam.permissionbinding:\n", 1)[1].split(
+        "\n  $core.compute.nodes:", 1
+    )[0]
+    assert bindings.count(
+        "role: $core.iam.roles.$workspace_topic_summary_admin:uuid"
+    ) == 2
+    assert "workspace_topic_summary_secret_key:" in manifest
+    assert (
+        "secret_encryption_key = "
+        "{$core.secret.passwords.$workspace_topic_summary_secret_key:value}"
+    ) in manifest
+    assert "[topic_summary]" in manifest
+    assert "connect_timeout_seconds = 30" in manifest
+    assert "request_timeout_seconds = 1500" in manifest
+    assert "topic_claim_seconds = 5400" in manifest
+    assert "endpoint_claim_seconds = 1800" in manifest
+
+
 def test_manifest_exposes_only_api_routes_from_the_backend_node():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 

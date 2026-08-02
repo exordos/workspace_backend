@@ -51,6 +51,7 @@ SourceName = base.SourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
+SUMMARY_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 
 class Folder(
@@ -741,6 +742,119 @@ class WorkspaceProject(
         return {"project_id": cls.properties.properties["project_id"]}
 
 
+class WorkspaceTopicSummarySettings(
+    models.ModelWithProject,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_topic_summary_settings_view"
+
+    project_id = properties.property(
+        types.UUID(),
+        required=True,
+        read_only=True,
+        default=sys_uuid.UUID(int=0),
+    )
+    global_enabled = properties.property(types.Boolean(), default=False)
+    project_enabled = properties.property(types.Boolean(), default=False)
+
+    @classmethod
+    def get_id_property(cls) -> dict[str, typing.Any]:
+        return {"project_id": cls.properties.properties["project_id"]}
+
+
+class WorkspaceLLMEndpoint(
+    models.ModelWithUUID,
+    models.ModelWithTimestamp,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_llm_endpoints"
+
+    name = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+    base_url = properties.property(
+        types.String(min_length=1, max_length=2048),
+        required=True,
+    )
+    model = properties.property(
+        types.String(min_length=1, max_length=255),
+        required=True,
+    )
+    enabled = properties.property(types.Boolean(), default=True)
+    priority = properties.property(
+        types.Integer(min_value=0, max_value=1_000_000),
+        default=100,
+    )
+    supports_vision = properties.property(types.Boolean(), default=False)
+    supports_reasoning = properties.property(types.Boolean(), default=False)
+    temperature = properties.property(
+        types.Float(min_value=0.0, max_value=2.0),
+        default=0.2,
+    )
+    max_output_tokens = properties.property(
+        types.Integer(min_value=1, max_value=32768),
+        default=512,
+    )
+    top_p = properties.property(
+        types.Float(min_value=0.0, max_value=1.0),
+        default=1.0,
+    )
+    presence_penalty = properties.property(
+        types.Float(min_value=-2.0, max_value=2.0),
+        default=0.0,
+    )
+    frequency_penalty = properties.property(
+        types.Float(min_value=-2.0, max_value=2.0),
+        default=0.0,
+    )
+    credential_present = properties.property(
+        types.Boolean(),
+        default=False,
+        read_only=True,
+    )
+    claim_token = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+        read_only=True,
+    )
+    claim_expires_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+        read_only=True,
+    )
+    last_success_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+        read_only=True,
+    )
+    last_failure_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+        read_only=True,
+    )
+    failure_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+        read_only=True,
+    )
+    last_error_code = properties.property(
+        types.AllowNone(types.String(max_length=128)),
+        default=None,
+        read_only=True,
+    )
+
+
+class WorkspaceLLMEndpointSecret(
+    models.ModelWithUUID,
+    orm.SQLStorableMixin,
+):
+    __tablename__ = "m_workspace_llm_endpoint_secrets"
+
+    endpoint_uuid = properties.property(types.UUID(), required=True)
+    envelope = properties.property(types.Dict(), required=True)
+
+
 class WorkspaceStreamTopic(
     models.ModelWithUUID,
     models.ModelWithProject,
@@ -780,6 +894,23 @@ class WorkspaceStreamTopic(
     color = properties.property(
         base.Color(),
         default=base.random_color,
+    )
+    summary = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=4096)),
+        default=None,
+    )
+    summary_last_message_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+    )
+    summary_enabled = properties.property(types.Boolean(), default=True)
+    summary_system_prompt = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=16384)),
+        default=None,
+    )
+    summary_reasoning_effort = properties.property(
+        types.AllowNone(types.Enum(SUMMARY_REASONING_EFFORTS)),
+        default=None,
     )
 
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
@@ -867,6 +998,36 @@ class WorkspaceUserTopic(
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceTopicNotificationMode]),
         default=WorkspaceTopicNotificationMode.DEFAULT.value,
+    )
+    summary = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=4096)),
+        default=None,
+        read_only=True,
+    )
+    summary_last_message_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+        read_only=True,
+    )
+    summary_has_new_messages = properties.property(
+        types.AllowNone(types.Boolean()),
+        default=None,
+        read_only=True,
+    )
+    summary_enabled = properties.property(
+        types.Boolean(),
+        default=True,
+        read_only=True,
+    )
+    summary_system_prompt = properties.property(
+        types.AllowNone(types.String(min_length=1, max_length=16384)),
+        default=None,
+        read_only=True,
+    )
+    summary_reasoning_effort = properties.property(
+        types.AllowNone(types.Enum(SUMMARY_REASONING_EFFORTS)),
+        default=None,
+        read_only=True,
     )
 
     def get_flags(self) -> "WorkspaceUserTopicFlags":

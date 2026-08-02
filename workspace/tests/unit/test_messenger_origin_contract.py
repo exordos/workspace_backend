@@ -131,6 +131,22 @@ ROUTE_MANIFEST = {
         controllers.ExternalProviderHealthController,
         {ra_routes.GET},
     ),
+    "topic_summary_endpoints": (
+        routes.TopicSummaryEndpointRoute,
+        controllers.TopicSummaryEndpointController,
+        {
+            ra_routes.CREATE,
+            ra_routes.FILTER,
+            ra_routes.GET,
+            ra_routes.UPDATE,
+            ra_routes.DELETE,
+        },
+    ),
+    "topic_summary_settings": (
+        routes.TopicSummarySettingsRoute,
+        controllers.TopicSummarySettingsController,
+        {ra_routes.GET, ra_routes.UPDATE},
+    ),
     "message_reactions": (
         routes.WorkspaceMessageReactionRoute,
         controllers.WorkspaceMessageReactionController,
@@ -248,6 +264,10 @@ ACTION_MANIFEST = {
         True,
     ),
     (routes.WorkspaceStreamTopicRoute, "set_default"): (
+        controllers.WorkspaceStreamTopicController,
+        True,
+    ),
+    (routes.WorkspaceStreamTopicRoute, "set_summary_prompt"): (
         controllers.WorkspaceStreamTopicController,
         True,
     ),
@@ -439,6 +459,11 @@ def test_messenger_response_model_keeps_original_fields():
             "is_default",
             "is_done",
             "notification_mode",
+            "summary",
+            "summary_last_message_uuid",
+            "summary_has_new_messages",
+            "summary_enabled",
+            "summary_system_prompt",
         },
         models.WorkspaceUserMessage: {
             "uuid",

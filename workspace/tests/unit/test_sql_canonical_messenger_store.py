@@ -881,6 +881,47 @@ def test_provider_topic_move_fails_before_canonical_mutation(monkeypatch):
     assert mutations == []
 
 
+def test_topic_summary_prompt_action_is_canonical_only(monkeypatch):
+    topic_uuid = sys_uuid.uuid4()
+    topic = types.SimpleNamespace(
+        uuid=topic_uuid,
+        project_id=PROJECT_UUID,
+        user_uuid=USER_UUID,
+    )
+    calls = []
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "set_workspace_user_stream_topic_summary_prompt",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or topic,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: {"uuid": str(value.uuid)},
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: pytest.fail("summary metadata must remain canonical-only"),
+    )
+
+    result = store.perform_action(
+        "stream_topics",
+        topic_uuid,
+        "set_summary_prompt",
+        {"summary_system_prompt": "Focus on decisions."},
+    )
+
+    assert result == {"uuid": str(topic_uuid)}
+    assert calls == [
+        (
+            (PROJECT_UUID, USER_UUID, topic_uuid),
+            {"summary_system_prompt": "Focus on decisions."},
+        ),
+    ]
+
+
 def test_provider_read_operation_preserves_exact_workspace_order(monkeypatch):
     stream_uuid = sys_uuid.uuid4()
     topic_uuid = sys_uuid.uuid4()

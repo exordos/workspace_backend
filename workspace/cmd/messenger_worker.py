@@ -25,16 +25,19 @@ from restalchemy.storage.sql import engines
 from workspace.common import config
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
+from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import agents
 
 DOMAIN = messenger_worker_opts.DOMAIN
+TOPIC_SUMMARY_DOMAIN = topic_summary_opts.DOMAIN
 
 
 CONF = cfg.CONF
 ra_config_opts.register_posgresql_db_opts(CONF)
 messenger_worker_opts.register_opts(CONF)
+topic_summary_opts.register_opts(CONF)
 
 
 def main() -> None:
@@ -54,6 +57,17 @@ def main() -> None:
         event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
         heartbeat_retention=datetime.timedelta(
             seconds=CONF[DOMAIN].heartbeat_retention_seconds,
+        ),
+        summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
+        summary_connect_timeout_seconds=(
+            CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds
+        ),
+        summary_request_timeout_seconds=(
+            CONF[TOPIC_SUMMARY_DOMAIN].request_timeout_seconds
+        ),
+        summary_topic_claim_seconds=CONF[TOPIC_SUMMARY_DOMAIN].topic_claim_seconds,
+        summary_endpoint_claim_seconds=(
+            CONF[TOPIC_SUMMARY_DOMAIN].endpoint_claim_seconds
         ),
     )
 

@@ -280,6 +280,12 @@ def test_message_mutations_use_current_scope_and_dedicated_store_operations(
         (
             controllers.WorkspaceStreamTopicController,
             "stream_topics",
+            "set_summary_prompt",
+            {"summary_system_prompt": "Focus on decisions."},
+        ),
+        (
+            controllers.WorkspaceStreamTopicController,
+            "stream_topics",
             "read",
             {},
         ),

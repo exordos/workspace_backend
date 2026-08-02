@@ -138,6 +138,12 @@ resources:
     workspace_external_bridge_instance_revoke:
       name: "workspace.external_bridge_instance.revoke"
       description: "Revoke a Workspace external bridge instance"
+    workspace_topic_summary_endpoint_manage:
+      name: "workspace.topic_summary_endpoint.manage"
+      description: "Manage global Workspace topic summary LLM endpoints"
+    workspace_topic_summary_settings_manage:
+      name: "workspace.topic_summary_settings.manage"
+      description: "Manage global and project Workspace topic summary settings"
 
   # Roles are provisioned with their permission sets but are intentionally not
   # assigned to users. Operators create project-scoped role bindings explicitly.
@@ -149,6 +155,10 @@ resources:
     workspace_external_integration_admin:
       name: "workspace-external-integration-admin"
       description: "Administer Workspace external provider integrations"
+      project_id: null
+    workspace_topic_summary_admin:
+      name: "workspace-topic-summary-admin"
+      description: "Administer Workspace topic summarization"
       project_id: null
 
   $core.iam.permissionbinding:
@@ -212,6 +222,14 @@ resources:
       role: $core.iam.roles.$workspace_external_integration_admin:uuid
       permission: $core.iam.permissions.$workspace_external_bridge_instance_revoke:uuid
       project_id: null
+    workspace_topic_summary_admin_endpoint_manage:
+      role: $core.iam.roles.$workspace_topic_summary_admin:uuid
+      permission: $core.iam.permissions.$workspace_topic_summary_endpoint_manage:uuid
+      project_id: null
+    workspace_topic_summary_admin_settings_manage:
+      role: $core.iam.roles.$workspace_topic_summary_admin:uuid
+      permission: $core.iam.permissions.$workspace_topic_summary_settings_manage:uuid
+      project_id: null
 
   $core.compute.nodes:
     workspace_backend:
@@ -257,6 +275,14 @@ resources:
       name: workspace_s3_secret_key
       description: "Workspace messenger files S3 secret key"
       default_length: 40
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+    workspace_topic_summary_secret_key:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace_topic_summary_secret_key
+      description: "Workspace topic summary endpoint credential encryption key"
+      default_length: 64
       constructor:
         kind: plain
       method: AUTO_HEX
@@ -439,6 +465,14 @@ resources:
           event_prune_interval_seconds = 300
           event_prune_batch_size = 25000
           heartbeat_retention_seconds = 86400
+
+
+          [topic_summary]
+          secret_encryption_key = {$core.secret.passwords.$workspace_topic_summary_secret_key:value}
+          connect_timeout_seconds = 30
+          request_timeout_seconds = 1500
+          topic_claim_seconds = 5400
+          endpoint_claim_seconds = 1800
 
 
           [messenger_files]
