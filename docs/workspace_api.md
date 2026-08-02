@@ -1158,6 +1158,14 @@ a new transaction through the existing internal summary helper. Failed jobs,
 retry delays, endpoint leases, and claim expiry are stored so retries remain
 bounded and observable.
 
+Long reasoning is a normal provider response, not a worker failure. The default
+connection timeout is 30 seconds, while the response timeout is 25 minutes so a
+model may reason for 20 minutes without racing the client deadline. The default
+endpoint lease is 30 minutes and the topic-job lease is 90 minutes. At runtime,
+the worker also enforces an endpoint lease of at least the response timeout plus
+60 seconds and a topic lease of at least three such request windows, so another
+worker cannot reclaim live work during a slow response or immediate failover.
+
 When the bounded message batch contains a Workspace image and any enabled
 vision endpoint exists, only a vision endpoint may be selected. If every vision
 endpoint is busy, the job waits; it does not fall back to a free text endpoint.

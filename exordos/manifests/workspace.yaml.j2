@@ -469,9 +469,10 @@ resources:
 
           [topic_summary]
           secret_encryption_key = {$core.secret.passwords.$workspace_topic_summary_secret_key:value}
-          request_timeout_seconds = 30
-          topic_claim_seconds = 120
-          endpoint_claim_seconds = 120
+          connect_timeout_seconds = 30
+          request_timeout_seconds = 1500
+          topic_claim_seconds = 5400
+          endpoint_claim_seconds = 1800
 
 
           [messenger_files]

@@ -59,6 +59,9 @@ def main() -> None:
             seconds=CONF[DOMAIN].heartbeat_retention_seconds,
         ),
         summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
+        summary_connect_timeout_seconds=(
+            CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds
+        ),
         summary_request_timeout_seconds=(
             CONF[TOPIC_SUMMARY_DOMAIN].request_timeout_seconds
         ),

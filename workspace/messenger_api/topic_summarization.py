@@ -930,6 +930,9 @@ def call_openai_compatible_endpoint(
     work: SummaryWork,
     *,
     timeout_seconds: int,
+    connect_timeout_seconds: int = (
+        topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
+    ),
 ) -> str:
     try:
         response = requests.post(
@@ -939,7 +942,7 @@ def call_openai_compatible_endpoint(
                 "Content-Type": "application/json",
             },
             json=build_openai_request(work),
-            timeout=timeout_seconds,
+            timeout=(connect_timeout_seconds, timeout_seconds),
         )
     except requests.RequestException as exc:
         raise ProviderCallError("network_error", retryable=True) from exc

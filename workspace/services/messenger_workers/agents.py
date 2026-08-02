@@ -24,6 +24,7 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from gcl_looper.services import basic
 
+from workspace.common import topic_summary_opts
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.api import controllers as messenger_controllers
@@ -67,9 +68,18 @@ class MessengerWorkerAgent(basic.BasicService):
         event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
         heartbeat_retention: datetime.timedelta = HEARTBEAT_RETENTION,
         summary_secret_key: str | None = None,
-        summary_request_timeout_seconds: int = 30,
-        summary_topic_claim_seconds: int = 120,
-        summary_endpoint_claim_seconds: int = 120,
+        summary_connect_timeout_seconds: int = (
+            topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
+        ),
+        summary_request_timeout_seconds: int = (
+            topic_summary_opts.DEFAULT_REQUEST_TIMEOUT_SECONDS
+        ),
+        summary_topic_claim_seconds: int = (
+            topic_summary_opts.DEFAULT_TOPIC_CLAIM_SECONDS
+        ),
+        summary_endpoint_claim_seconds: int = (
+            topic_summary_opts.DEFAULT_ENDPOINT_CLAIM_SECONDS
+        ),
         **kwargs: typing.Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -78,18 +88,20 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_prune_batch_size = event_prune_batch_size
         self._heartbeat_retention = heartbeat_retention
         self._summary_secret_key = summary_secret_key
+        self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
         self._summary_request_timeout_seconds = summary_request_timeout_seconds
         self._summary_topic_claim_seconds = max(
             summary_topic_claim_seconds,
-            (
-                topic_summarization.MAX_PROVIDER_ATTEMPTS
-                * summary_request_timeout_seconds
+            topic_summarization.MAX_PROVIDER_ATTEMPTS
+            * (
+                summary_request_timeout_seconds
+                + topic_summary_opts.CLAIM_GRACE_SECONDS
             )
-            + 5,
         )
         self._summary_endpoint_claim_seconds = max(
             summary_endpoint_claim_seconds,
-            summary_request_timeout_seconds + 5,
+            summary_request_timeout_seconds
+            + topic_summary_opts.CLAIM_GRACE_SECONDS,
         )
         self._last_event_prune: float | None = None
         self._capability_refresh_cursor: object | None = None
@@ -195,6 +207,9 @@ class MessengerWorkerAgent(basic.BasicService):
             try:
                 summary = topic_summarization.call_openai_compatible_endpoint(
                     work,
+                    connect_timeout_seconds=(
+                        self._summary_connect_timeout_seconds
+                    ),
                     timeout_seconds=self._summary_request_timeout_seconds,
                 )
             except topic_summarization.ProviderCallError as error:

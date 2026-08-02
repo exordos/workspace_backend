@@ -11,6 +11,7 @@ import uuid as sys_uuid
 import pytest
 from restalchemy.common import exceptions as ra_exc
 
+from workspace.common import topic_summary_opts
 from workspace.messenger_api import topic_summarization
 from workspace.services.messenger_workers import agents
 
@@ -214,7 +215,7 @@ def test_openai_compatible_call_uses_chat_completions_and_validates_response():
     assert post.call_args.args == (
         "https://llm.example.invalid/v1/chat/completions",
     )
-    assert post.call_args.kwargs["timeout"] == 7
+    assert post.call_args.kwargs["timeout"] == (30, 7)
     assert post.call_args.kwargs["headers"]["Authorization"] == (
         "Bearer provider-secret"
     )
@@ -307,6 +308,25 @@ def test_worker_calls_provider_outside_transactions_and_persists_afterward():
     assert len(entered_sessions) == 2
 
 
+def test_worker_defaults_allow_long_reasoning_and_keep_claims_alive():
+    worker = agents.MessengerWorkerAgent(summary_secret_key="secret")
+
+    assert worker._summary_connect_timeout_seconds == 30
+    assert worker._summary_request_timeout_seconds == 25 * 60
+    assert worker._summary_endpoint_claim_seconds == 30 * 60
+    assert worker._summary_topic_claim_seconds == 90 * 60
+
+    normalized = agents.MessengerWorkerAgent(
+        summary_secret_key="secret",
+        summary_request_timeout_seconds=20 * 60,
+        summary_endpoint_claim_seconds=60,
+        summary_topic_claim_seconds=60,
+    )
+    assert normalized._summary_endpoint_claim_seconds == 21 * 60
+    assert normalized._summary_topic_claim_seconds == 63 * 60
+    assert topic_summary_opts.CLAIM_GRACE_SECONDS == 60
+
+
 def test_worker_retries_a_retryable_failure_on_claimed_fallback_endpoint():
     first = _work(endpoint=_endpoint(priority=10), attempt=1)
     fallback = _work(endpoint=_endpoint(priority=20), attempt=2)
@@ -349,8 +369,16 @@ def test_worker_retries_a_retryable_failure_on_claimed_fallback_endpoint():
         assert worker._summarize_one_topic() is True
 
     assert provider.call_args_list == [
-        unittest.mock.call(first, timeout_seconds=30),
-        unittest.mock.call(fallback, timeout_seconds=30),
+        unittest.mock.call(
+            first,
+            connect_timeout_seconds=30,
+            timeout_seconds=25 * 60,
+        ),
+        unittest.mock.call(
+            fallback,
+            connect_timeout_seconds=30,
+            timeout_seconds=25 * 60,
+        ),
     ]
     assert fail.call_args.args[1:3] == (first, provider_error)
     assert complete.call_args.args[1:3] == (fallback, "Fallback summary.")
