@@ -487,7 +487,7 @@ Responses hide `project_id` and `user_uuid`.
 | `uuid` | UUID | no | yes | Folder identifier. |
 | `title` | string, 1..64 | yes | no | Folder title. |
 | `background_color_value` | integer `0..2^32-1` or `null` | no | no | ARGB color value. |
-| `unread_count` | integer | no | yes | Aggregated unread count. |
+| `unread_count` | integer | no | yes | Aggregated active unread count. Muted traffic is excluded. |
 | `system_type` | `all`, `created`, or `null` | no | yes | System folder type; defaults to `created`. |
 | `folder_items` | array | no | yes | Nested folder items from the view. |
 | `created_at` | datetime | no | yes | Creation time. |
@@ -535,6 +535,8 @@ Response example:
       "order_index": 10,
       "pinned_at": null,
       "unread_count": 3,
+      "active_unread_count": 3,
+      "passive_unread_count": 0,
       "created_at": "2026-06-22T09:30:00Z",
       "updated_at": "2026-06-22T09:30:00Z"
     }
@@ -587,7 +589,9 @@ Realtime side effects:
 | `chat_type` | `stream`, `group`, `private` | yes | no | Chat type. |
 | `order_index` | integer or `null` | no | no | Manual sort index. |
 | `pinned_at` | datetime or `null` | no | action-managed | Pin timestamp. |
-| `unread_count` | integer | no | yes | Unread count for this stream and user. |
+| `unread_count` | integer | no | yes | Raw unread count for this stream and user. |
+| `active_unread_count` | integer | no | yes | Unread messages eligible under the effective stream/topic notification modes. |
+| `passive_unread_count` | integer | no | yes | Remaining unread messages from muted notification traffic. |
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
@@ -630,6 +634,8 @@ Response example:
   "order_index": 10,
   "pinned_at": null,
   "unread_count": 0,
+  "active_unread_count": 0,
+  "passive_unread_count": 0,
   "created_at": "2026-06-22T09:30:00Z",
   "updated_at": "2026-06-22T09:30:00Z"
 }
@@ -658,6 +664,8 @@ Pin response example:
   "order_index": 10,
   "pinned_at": "2026-06-22T09:31:00Z",
   "unread_count": 0,
+  "active_unread_count": 0,
+  "passive_unread_count": 0,
   "created_at": "2026-06-22T09:30:00Z",
   "updated_at": "2026-06-22T09:31:00Z"
 }
@@ -748,7 +756,9 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `user_uuid` | UUID | no | yes | Current user in the user stream view. |
 | `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | yes | Current user's role. |
 | `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | user-scoped action-managed | Current user's stream notification mode; defaults to `all_messages`. |
-| `unread_count` | integer | no | yes | Current user's unread count. |
+| `unread_count` | integer | no | yes | Current user's raw unread count. |
+| `active_unread_count` | integer | no | yes | Current user's unread count eligible under the effective stream/topic notification modes. |
+| `passive_unread_count` | integer | no | yes | Current user's remaining unread count from muted notification traffic. |
 | `source_name` | `native`, `zulip` | no | no | Source name; defaults to `native`. |
 | `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
 | `invite_only` | boolean | no | no | Invite-only stream flag. |
@@ -944,7 +954,9 @@ to the current IAM user through current stream membership.
 | `user_uuid` | UUID | no | yes | Current user in the topic view. |
 | `color` | integer `0..0xFFFFFF` | no | no | Topic color; generated randomly when omitted or `null`. |
 | `last_message_uuid` | UUID or `null` | no | yes | Latest message in the topic, or `null` when empty. |
-| `unread_count` | integer | no | yes | Current user's unread count for the topic. |
+| `unread_count` | integer | no | yes | Current user's raw unread count for the topic. |
+| `active_unread_count` | integer | no | yes | Current user's unread mentions for `unmute`, all unread for `follow`, or the inherited active count for `default`. |
+| `passive_unread_count` | integer | no | yes | Current user's remaining unread count after applying the effective notification mode. |
 | `is_default` | boolean | no | yes | Whether this topic UUID equals the stream's `default_topic_uuid`. |
 | `is_done` | boolean | no | action-managed | Current user's done flag. |
 | `notification_mode` | `mute`, `default`, `unmute`, `follow` | no | user-scoped action-managed | Current user's topic notification mode; defaults to `default`. |
@@ -1184,6 +1196,13 @@ current user's topic notification mode:
 
 Allowed topic notification modes are `mute`, `default`, and `follow`. `unmute`
 is allowed only when the current user's stream notification mode is `muted`.
+Unread classification is evaluated from the current settings, so changing a
+mode immediately reclassifies existing unread messages. `follow` makes every
+topic unread active, `unmute` makes only direct mentions of the current user
+active, `mute` makes every topic unread passive, and `default` inherits the
+stream mode. A stream in `mentions_only` likewise places only direct mentions
+in `active_unread_count`; all remaining raw unread messages stay in
+`passive_unread_count`.
 
 Topic read action:
 
@@ -1205,7 +1224,7 @@ Realtime side effects:
 | set default topic | `stream.updated`, `topic.updated` | `stream`, `topic` | Updated stream snapshot and previous/new default topic snapshots for every stream user. |
 | server summary update | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
 | set summary prompt | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
-| change topic notification mode | `topic.updated` | `topic` | Full user topic snapshot for the current user only. |
+| change topic notification mode | `topic.updated`, `stream.updated` | `topic`, `stream` | Reclassified topic and stream unread snapshots for the current user only. |
 | read topic messages | `topic.read` | `topic` | Full user topic snapshot returned by the action. |
 | read topic messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. Deleting the default topic also emits `stream.updated` with `default_topic_uuid: null`. |

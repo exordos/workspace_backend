@@ -130,6 +130,14 @@ class UserFolderItem(
         types.Integer(min_value=0),
         default=0,
     )
+    active_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    passive_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
 
 
 class SystemFolderItemBase(
@@ -159,6 +167,14 @@ class SystemFolderItemBase(
         required=True,
     )
     unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    active_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    passive_unread_count = properties.property(
         types.Integer(min_value=0),
         default=0,
     )
@@ -987,6 +1003,14 @@ class WorkspaceUserTopic(
         types.Integer(min_value=0),
         default=0,
     )
+    active_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    passive_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
     is_default = properties.property(
         types.Boolean(),
         default=False,
@@ -1182,6 +1206,14 @@ class UnreadUserMessages(
         required=True,
     )
     unread_count = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    active_unread_count = properties.property(
+        types.Integer(min_value=0),
+        required=True,
+    )
+    passive_unread_count = properties.property(
         types.Integer(min_value=0),
         required=True,
     )

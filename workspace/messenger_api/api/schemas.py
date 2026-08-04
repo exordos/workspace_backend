@@ -45,6 +45,12 @@ FOLDER_ITEM_SCHEMA = {
         "unread_count": {
             "type": "integer",
         },
+        "active_unread_count": {
+            "type": "integer",
+        },
+        "passive_unread_count": {
+            "type": "integer",
+        },
         "created_at": {
             "type": "string",
             "format": "date-time",

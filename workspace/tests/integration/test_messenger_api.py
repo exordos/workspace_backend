@@ -7267,6 +7267,15 @@ def test_stream_topic_notifications_follow_stream_mute_rules(api, db):
     assert resp.status_code == 200, resp.text
     assert resp.json()["notification_mode"] == "default"
 
+    resp = api.post(
+        f"{STREAMS}{stream_uuid}/actions/notifications/invoke",
+        json={"notification_mode": "all_messages"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = api.get(f"{STREAM_TOPICS}{topic_uuid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notification_mode"] == "default"
+
     with db.cursor() as cur:
         cur.execute(
             """
@@ -7294,13 +7303,446 @@ def test_stream_topic_notifications_follow_stream_mute_rules(api, db):
         event_rows = cur.fetchall()
 
     assert dict((str(user_uuid), mode) for user_uuid, mode in topic_rows) == {
-        str(api.user_uuid): "unmute",
+        str(api.user_uuid): "default",
         str(other_user): "default",
     }
     assert [payload["notification_mode"] for _, payload in event_rows] == [
         "follow",
+        "follow",
         "unmute",
+        "default",
     ]
+
+
+def test_unread_counters_split_active_and_passive_notification_traffic(api, db):
+    target_user = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, target_user, f"user-{target_user}")
+
+    def create_stream(name, notification_mode):
+        stream_uuid = conftest.seed_user_stream(db, api.project_id, api.user_uuid, name)
+        conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, target_user)
+        response = api.post(
+            f"{STREAMS}{stream_uuid}/actions/notifications/invoke",
+            user=target_user,
+            json={"notification_mode": notification_mode},
+        )
+        assert response.status_code == 200, response.text
+        return stream_uuid
+
+    def create_topic(stream_uuid, name):
+        return conftest.seed_stream_topic(
+            db, api.project_id, stream_uuid, api.user_uuid, name
+        )
+
+    def set_topic_mode(topic_uuid, notification_mode):
+        response = api.post(
+            f"{STREAM_TOPICS}{topic_uuid}/actions/notifications/invoke",
+            user=target_user,
+            json={"notification_mode": notification_mode},
+        )
+        assert response.status_code == 200, response.text
+
+    def post_message(stream_uuid, topic_uuid, content):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    muted_stream = create_stream("Muted counter split", "muted")
+    inherited_topic = create_topic(muted_stream, "Inherited mute")
+    unmuted_topic = create_topic(muted_stream, "Mentions override")
+    followed_topic = create_topic(muted_stream, "All messages override")
+    muted_topic = create_topic(muted_stream, "Explicit mute")
+    set_topic_mode(unmuted_topic, "unmute")
+    set_topic_mode(followed_topic, "follow")
+    set_topic_mode(muted_topic, "mute")
+
+    mention = f"[Target](urn:user:{target_user})"
+    post_message(muted_stream, inherited_topic, "inherited and passive")
+    post_message(muted_stream, unmuted_topic, f"active mention {mention}")
+    post_message(muted_stream, unmuted_topic, "passive non-mention")
+    post_message(muted_stream, followed_topic, "active followed message")
+    post_message(muted_stream, muted_topic, f"muted mention {mention}")
+
+    response = api.post(FOLDERS, user=target_user, json={"title": "Counter split"})
+    assert response.status_code in (200, 201), response.text
+    custom_folder_uuid = response.json()["uuid"]
+    response = api.post(
+        FOLDER_ITEMS,
+        user=target_user,
+        json={
+            "folder_uuid": custom_folder_uuid,
+            "stream_uuid": muted_stream,
+            "chat_type": "stream",
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+
+    mentions_stream = create_stream("Mentions counter split", "mentions_only")
+    mentions_topic = create_topic(mentions_stream, "Inherited mentions")
+    post_message(mentions_stream, mentions_topic, f"active mention {mention}")
+    post_message(mentions_stream, mentions_topic, "passive non-mention")
+
+    all_messages_stream = create_stream("All messages counter split", "all_messages")
+    all_messages_topic = create_topic(all_messages_stream, "Inherited all")
+    post_message(all_messages_stream, all_messages_topic, "active message")
+
+    expected_stream_counts = {
+        muted_stream: (5, 2, 3),
+        mentions_stream: (2, 1, 1),
+        all_messages_stream: (1, 1, 0),
+    }
+    for stream_uuid, expected_counts in expected_stream_counts.items():
+        response = api.get(f"{STREAMS}{stream_uuid}", user=target_user)
+        assert response.status_code == 200, response.text
+        stream = response.json()
+        assert (
+            stream["unread_count"],
+            stream["active_unread_count"],
+            stream["passive_unread_count"],
+        ) == expected_counts
+
+    expected_topic_counts = {
+        inherited_topic: (1, 0, 1),
+        unmuted_topic: (2, 1, 1),
+        followed_topic: (1, 1, 0),
+        muted_topic: (1, 0, 1),
+        mentions_topic: (2, 1, 1),
+        all_messages_topic: (1, 1, 0),
+    }
+    for topic_uuid, expected_counts in expected_topic_counts.items():
+        response = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=target_user)
+        assert response.status_code == 200, response.text
+        topic = response.json()
+        assert (
+            topic["unread_count"],
+            topic["active_unread_count"],
+            topic["passive_unread_count"],
+        ) == expected_counts
+
+    response = api.get(f"{FOLDERS}{custom_folder_uuid}", user=target_user)
+    assert response.status_code == 200, response.text
+    custom_folder = response.json()
+    assert custom_folder["unread_count"] == 2
+    assert (
+        custom_folder["folder_items"][0]["unread_count"],
+        custom_folder["folder_items"][0]["active_unread_count"],
+        custom_folder["folder_items"][0]["passive_unread_count"],
+    ) == (5, 2, 3)
+
+    response = api.get(
+        f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}",
+        user=target_user,
+    )
+    assert response.status_code == 200, response.text
+    all_folder = response.json()
+    assert all_folder["unread_count"] == 4
+    items_by_stream = {item["stream_uuid"]: item for item in all_folder["folder_items"]}
+    for stream_uuid, expected_counts in expected_stream_counts.items():
+        item = items_by_stream[stream_uuid]
+        assert (
+            item["unread_count"],
+            item["active_unread_count"],
+            item["passive_unread_count"],
+        ) == expected_counts
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, target_user),
+        )
+        before_topic_mode_epoch = cur.fetchone()[0]
+    set_topic_mode(followed_topic, "mute")
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, target_user, before_topic_mode_epoch),
+        )
+        topic_mode_events = [row[0] for row in cur.fetchall()]
+    assert [event["kind"] for event in topic_mode_events] == [
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    custom_folder_event = next(
+        event
+        for event in topic_mode_events
+        if event["kind"] == "folder.updated" and event["uuid"] == custom_folder_uuid
+    )
+    assert custom_folder_event["unread_count"] == 1
+    assert (
+        custom_folder_event["folder_items"][0]["unread_count"],
+        custom_folder_event["folder_items"][0]["active_unread_count"],
+        custom_folder_event["folder_items"][0]["passive_unread_count"],
+    ) == (5, 1, 4)
+    set_topic_mode(followed_topic, "follow")
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, target_user),
+        )
+        before_stream_mode_epoch = cur.fetchone()[0]
+    response = api.post(
+        f"{STREAMS}{all_messages_stream}/actions/notifications/invoke",
+        user=target_user,
+        json={"notification_mode": "muted"},
+    )
+    assert response.status_code == 200, response.text
+    assert (
+        response.json()["unread_count"],
+        response.json()["active_unread_count"],
+        response.json()["passive_unread_count"],
+    ) == (1, 0, 1)
+    response = api.get(
+        f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}",
+        user=target_user,
+    )
+    assert response.json()["unread_count"] == 3
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, target_user, before_stream_mode_epoch),
+        )
+        stream_mode_events = [row[0] for row in cur.fetchall()]
+    assert [event["kind"] for event in stream_mode_events] == [
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert (
+        stream_mode_events[0]["active_unread_count"],
+        stream_mode_events[0]["passive_unread_count"],
+    ) == (0, 1)
+    assert (
+        stream_mode_events[1]["active_unread_count"],
+        stream_mode_events[1]["passive_unread_count"],
+    ) == (0, 1)
+    assert [event["unread_count"] for event in stream_mode_events[2:]] == [3, 3]
+
+    set_topic_mode(all_messages_topic, "follow")
+    response = api.get(f"{STREAMS}{all_messages_stream}", user=target_user)
+    assert (
+        response.json()["unread_count"],
+        response.json()["active_unread_count"],
+        response.json()["passive_unread_count"],
+    ) == (1, 1, 0)
+    response = api.get(
+        f"{FOLDERS}{messenger_dm_helpers.ALL_CHATS_FOLDER_UUID}",
+        user=target_user,
+    )
+    assert response.json()["unread_count"] == 4
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND payload->>'kind' = 'stream.updated'
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (api.project_id, target_user, muted_stream),
+        )
+        latest_stream_event = cur.fetchone()[0]
+    assert latest_stream_event["unread_count"] == 5
+    assert latest_stream_event["active_unread_count"] == 2
+    assert latest_stream_event["passive_unread_count"] == 3
+
+
+def test_message_mention_edit_refreshes_unread_snapshots(api, db):
+    target_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Mention edit counters"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, target_user)
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "Mention edits"
+    )
+    response = api.post(
+        f"{STREAMS}{stream_uuid}/actions/notifications/invoke",
+        user=target_user,
+        json={"notification_mode": "mentions_only"},
+    )
+    assert response.status_code == 200, response.text
+    response = api.post(
+        FOLDERS,
+        user=target_user,
+        json={"title": "Mention edit folder"},
+    )
+    assert response.status_code in (200, 201), response.text
+    custom_folder_uuid = response.json()["uuid"]
+    response = api.post(
+        FOLDER_ITEMS,
+        user=target_user,
+        json={
+            "folder_uuid": custom_folder_uuid,
+            "stream_uuid": stream_uuid,
+            "chat_type": "stream",
+        },
+    )
+    assert response.status_code in (200, 201), response.text
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "passive before edit"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, target_user),
+        )
+        before_edit_epoch = cur.fetchone()[0]
+
+    mention = f"[Target](urn:user:{target_user})"
+    response = api.put(
+        f"{MESSAGES}{message_uuid}",
+        json={
+            "payload": {
+                "kind": "markdown",
+                "content": f"active after edit {mention}",
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, target_user, before_edit_epoch),
+        )
+        edit_events = [row[0] for row in cur.fetchall()]
+    assert [event["kind"] for event in edit_events] == [
+        "message.updated",
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+    assert edit_events[0]["mentioned"] is True
+    assert (
+        edit_events[1]["active_unread_count"],
+        edit_events[1]["passive_unread_count"],
+    ) == (1, 0)
+    assert (
+        edit_events[2]["active_unread_count"],
+        edit_events[2]["passive_unread_count"],
+    ) == (1, 0)
+    custom_folder_event = next(
+        event
+        for event in edit_events
+        if event["kind"] == "folder.updated" and event["uuid"] == custom_folder_uuid
+    )
+    assert custom_folder_event["unread_count"] == 1
+    assert (
+        custom_folder_event["folder_items"][0]["active_unread_count"],
+        custom_folder_event["folder_items"][0]["passive_unread_count"],
+    ) == (1, 0)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, target_user),
+        )
+        before_remove_epoch = cur.fetchone()[0]
+    response = api.put(
+        f"{MESSAGES}{message_uuid}",
+        json={
+            "payload": {
+                "kind": "markdown",
+                "content": "passive after removing mention",
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, target_user, before_remove_epoch),
+        )
+        remove_events = [row[0] for row in cur.fetchall()]
+    assert remove_events[0]["kind"] == "message.updated"
+    assert remove_events[0]["mentioned"] is False
+    assert (
+        remove_events[1]["active_unread_count"],
+        remove_events[1]["passive_unread_count"],
+    ) == (0, 1)
+    assert (
+        remove_events[2]["active_unread_count"],
+        remove_events[2]["passive_unread_count"],
+    ) == (0, 1)
+    custom_folder_event = next(
+        event
+        for event in remove_events
+        if event["kind"] == "folder.updated" and event["uuid"] == custom_folder_uuid
+    )
+    assert custom_folder_event["unread_count"] == 0
+    assert (
+        custom_folder_event["folder_items"][0]["active_unread_count"],
+        custom_folder_event["folder_items"][0]["passive_unread_count"],
+    ) == (0, 1)
 
 
 def test_stream_topic_delete_cascades_topic_messages(api, db):

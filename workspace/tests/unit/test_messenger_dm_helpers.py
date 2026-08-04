@@ -1943,6 +1943,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             notification_mode="mentions_only",
         )
+        current_stream = types.SimpleNamespace(
+            uuid=stream_uuid,
+            user_uuid=user_uuid,
+            notification_mode="all_messages",
+        )
         updated_binding = {}
 
         class ExistingBinding:
@@ -1967,11 +1972,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 FakeWorkspaceStreamBinding,
             ),
             mock.patch.object(
-                dm_helpers, "get_workspace_user_stream", return_value=returned_stream
+                dm_helpers,
+                "get_workspace_user_stream",
+                side_effect=[current_stream, returned_stream],
             ) as get_user_stream,
             mock.patch.object(
-                dm_helpers.messenger_events, "create_stream_updated_event"
-            ) as create_event,
+                dm_helpers,
+                "_normalize_workspace_user_stream_topic_notification_modes",
+                return_value=[sys_uuid.uuid4(), sys_uuid.uuid4()],
+            ) as normalize_topics,
+            mock.patch.object(
+                dm_helpers,
+                "_create_unread_updated_events",
+            ) as create_unread_events,
         ):
             result = dm_helpers.update_workspace_user_stream_notifications(
                 project_id=project_id,
@@ -1992,14 +2005,100 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
-        get_user_stream.assert_called_once_with(
+        get_user_stream.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    stream_uuid=stream_uuid,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    stream_uuid=stream_uuid,
+                    session=session,
+                ),
+            ]
+        )
+        normalize_topics.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
-        )
-        create_event.assert_called_once_with(
-            stream=returned_stream,
+            notification_mode="mentions_only",
             session=session,
+        )
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=normalize_topics.return_value,
+            session=session,
+        )
+
+    def test_stream_notification_mode_normalizes_stale_unmute_topics(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        unmuted_topic_uuid = sys_uuid.uuid4()
+        session = object()
+        topics = [
+            types.SimpleNamespace(uuid=unmuted_topic_uuid),
+            types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+        ]
+        updated_flags = {}
+
+        class StaleTopicFlags:
+            notification_mode = "unmute"
+
+            def update(self, session=None):
+                updated_flags["notification_mode"] = self.notification_mode
+                updated_flags["session"] = session
+
+        class FakeWorkspaceUserTopicFlags:
+            objects = types.SimpleNamespace(
+                get_all=mock.Mock(return_value=[StaleTopicFlags()])
+            )
+
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_stream_topics",
+                return_value=topics,
+            ) as get_topics,
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceUserTopicFlags",
+                FakeWorkspaceUserTopicFlags,
+            ),
+        ):
+            topic_uuids = (
+                dm_helpers._normalize_workspace_user_stream_topic_notification_modes(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    stream_uuid=stream_uuid,
+                    notification_mode="all_messages",
+                    session=session,
+                )
+            )
+
+        self.assertEqual([topic.uuid for topic in topics], topic_uuids)
+        get_topics.assert_called_once_with(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        FakeWorkspaceUserTopicFlags.objects.get_all.assert_called_once()
+        filters = FakeWorkspaceUserTopicFlags.objects.get_all.call_args.kwargs[
+            "filters"
+        ]
+        self.assertEqual([topic.uuid for topic in topics], filters["uuid"].value)
+        self.assertEqual(project_id, filters["project_id"].value)
+        self.assertEqual(user_uuid, filters["user_uuid"].value)
+        self.assertEqual("unmute", filters["notification_mode"].value)
+        self.assertEqual(
+            {"notification_mode": "default", "session": session},
+            updated_flags,
         )
 
     def test_delete_workspace_user_stream_deletes_stream_and_sends_events(self):
@@ -2735,7 +2834,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             notification_mode="unmute",
         )
-
         with (
             mock.patch.object(
                 dm_helpers,
@@ -2751,8 +2849,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers, "_set_workspace_user_topic_notification_mode"
             ) as set_notification,
             mock.patch.object(
-                dm_helpers.messenger_events, "create_topic_updated_event"
-            ) as create_event,
+                dm_helpers,
+                "_create_unread_updated_events",
+            ) as create_unread_events,
         ):
             result = dm_helpers.update_workspace_user_stream_topic_notifications(
                 project_id=project_id,
@@ -2769,11 +2868,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     topic_uuid=topic_uuid,
+                    session=session,
                 ),
             ]
         )
@@ -2781,6 +2882,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         set_notification.assert_called_once_with(
             project_id=project_id,
@@ -2789,8 +2891,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             notification_mode="unmute",
             session=session,
         )
-        create_event.assert_called_once_with(
-            topic=returned_topic,
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuids=[topic_uuid],
             session=session,
         )
 
@@ -3123,11 +3228,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         message_uuid = sys_uuid.uuid4()
         session = object()
         updated_message = {}
-        returned_message = types.SimpleNamespace(user_uuid=user_uuid)
-        other_message = types.SimpleNamespace(user_uuid=other_user_uuid)
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        returned_message = types.SimpleNamespace(user_uuid=user_uuid, read=True)
+        other_message = types.SimpleNamespace(user_uuid=other_user_uuid, read=False)
 
         class ExistingMessage:
             payload = {"kind": "markdown", "content": "old"}
+
+            def __init__(self):
+                self.stream_uuid = stream_uuid
+                self.topic_uuid = topic_uuid
 
             def update_dm(self, values):
                 updated_message["values"] = values
@@ -3154,6 +3265,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_updated_event"
             ) as create_event,
+            mock.patch.object(
+                dm_helpers,
+                "_create_messages_unread_updated_events",
+            ) as create_unread_events,
         ):
             result = dm_helpers.update_workspace_user_message(
                 project_id=project_id,
@@ -3184,12 +3299,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_user_messages.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
+            session=session,
         )
         create_event.assert_has_calls(
             [
                 mock.call(message=other_message, session=session),
                 mock.call(message=returned_message, session=session),
             ]
+        )
+        create_unread_events.assert_called_once_with(
+            project_id=project_id,
+            user_uuids=[other_user_uuid],
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
         )
 
     def test_update_workspace_user_message_skips_matching_payload(self):
@@ -3303,6 +3426,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_user_messages.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
+            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -3402,6 +3526,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         get_user_messages.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
+            session=session,
         )
         create_event.assert_has_calls(
             [
@@ -4655,6 +4780,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
+        self.assertIs(
+            session,
+            FakeFolderItem.objects.get_all.call_args.kwargs["session"],
+        )
         self.assertEqual(
             [
                 mock.call(

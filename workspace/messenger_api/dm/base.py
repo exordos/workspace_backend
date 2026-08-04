@@ -307,6 +307,14 @@ class WorkspaceUserStreamBase(
         types.Integer(min_value=0),
         default=0,
     )
+    active_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    passive_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
     source_name = properties.property(
         types.Enum([source.value for source in SourceName]),
         required=True,

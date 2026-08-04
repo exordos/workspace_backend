@@ -270,6 +270,14 @@ class TopicEventPayloadBase(
         types.Integer(min_value=0),
         default=0,
     )
+    active_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    passive_unread_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
     is_default = properties.property(
         types.Boolean(),
         default=False,
