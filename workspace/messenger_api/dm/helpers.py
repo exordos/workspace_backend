@@ -1227,6 +1227,7 @@ def _get_user_stream_folder_event_targets(
     user_uuid: typing.Any,
     stream_uuid: object,
     private: typing.Any,
+    session: typing.Any = None,
 ) -> typing.Any:
     targets: list[tuple[typing.Any, typing.Any]] = []
     _add_folder_event_target(targets, user_uuid, ALL_CHATS_FOLDER_UUID)
@@ -1241,6 +1242,7 @@ def _get_user_stream_folder_event_targets(
             "user_uuid": dm_filters.EQ(user_uuid),
             "stream_uuid": dm_filters.EQ(stream_uuid),
         },
+        session=session,
     ):
         _add_folder_event_target(targets, item.user_uuid, item.folder_uuid)
     return targets
@@ -1303,6 +1305,7 @@ def _create_unread_updated_events(
         user_uuid=user_uuid,
         stream_uuid=stream_uuid,
         private=user_stream.private,
+        session=session,
     )
     for target_user_uuid, folder_uuid in folder_targets:
         user_folder = get_workspace_user_folder(
@@ -2539,6 +2542,56 @@ def _set_workspace_user_topic_notification_mode(
     flags.insert(session=session)
 
 
+def _get_workspace_stream_topics(
+    project_id: object,
+    stream_uuid: object,
+    session: typing.Any = None,
+) -> typing.Any:
+    return models.WorkspaceStreamTopic.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        order_by={"created_at": "asc", "uuid": "asc"},
+        session=session,
+    )
+
+
+def _normalize_workspace_user_stream_topic_notification_modes(
+    project_id: object,
+    user_uuid: object,
+    stream_uuid: object,
+    notification_mode: typing.Any,
+    session: typing.Any = None,
+) -> list[sys_uuid.UUID]:
+    topics = _get_workspace_stream_topics(
+        project_id=project_id,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    topic_uuids = [topic.uuid for topic in topics]
+    if (
+        topic_uuids
+        and notification_mode != models.WorkspaceStreamNotificationMode.MUTED.value
+    ):
+        for flags in models.WorkspaceUserTopicFlags.objects.get_all(
+            filters={
+                "uuid": dm_filters.In(topic_uuids),
+                "project_id": dm_filters.EQ(project_id),
+                "user_uuid": dm_filters.EQ(user_uuid),
+                "notification_mode": dm_filters.EQ(
+                    models.WorkspaceTopicNotificationMode.UNMUTE.value
+                ),
+            },
+            session=session,
+        ):
+            flags.notification_mode = (
+                models.WorkspaceTopicNotificationMode.DEFAULT.value
+            )
+            flags.update(session=session)
+    return topic_uuids
+
+
 def _validate_topic_notification_mode(
     stream: typing.Any, notification_mode: typing.Any
 ) -> None:
@@ -2599,11 +2652,13 @@ def update_workspace_user_stream_topic_notifications(
         project_id=project_id,
         user_uuid=user_uuid,
         topic_uuid=topic_uuid,
+        session=session,
     )
     stream = get_workspace_user_stream(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=topic.stream_uuid,
+        session=session,
     )
     _validate_topic_notification_mode(
         stream=stream,
@@ -2620,9 +2675,13 @@ def update_workspace_user_stream_topic_notifications(
         project_id=project_id,
         user_uuid=user_uuid,
         topic_uuid=topic_uuid,
+        session=session,
     )
-    messenger_events.create_topic_updated_event(
-        topic=result,
+    _create_unread_updated_events(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=topic.stream_uuid,
+        topic_uuids=[topic_uuid],
         session=session,
     )
     return result
@@ -2977,10 +3036,11 @@ def update_workspace_user_stream_notifications(
     notification_mode: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
-    stream = get_workspace_user_stream(
+    get_workspace_user_stream(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=stream_uuid,
+        session=session,
     )
     binding = models.WorkspaceStreamBinding.objects.get_one(
         filters={
@@ -2992,9 +3052,24 @@ def update_workspace_user_stream_notifications(
     )
     binding.update_dm(values={"notification_mode": notification_mode})
     binding.update(session=session)
-    stream.notification_mode = notification_mode
-    messenger_events.create_stream_updated_event(
-        stream=stream,
+    topic_uuids = _normalize_workspace_user_stream_topic_notification_modes(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        notification_mode=notification_mode,
+        session=session,
+    )
+    stream = get_workspace_user_stream(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        session=session,
+    )
+    _create_unread_updated_events(
+        project_id=project_id,
+        user_uuid=user_uuid,
+        stream_uuid=stream_uuid,
+        topic_uuids=topic_uuids,
         session=session,
     )
     return stream
@@ -3373,6 +3448,7 @@ def _create_workspace_message_updated_events(
     user_messages = _get_workspace_user_messages(
         project_id=project_id,
         message_uuid=message_uuid,
+        session=session,
     )
     if compact_events:
         messenger_events.create_message_updated_events(
@@ -3586,13 +3662,16 @@ def _get_workspace_stream_default_topic(
 
 
 def _get_workspace_user_messages(
-    project_id: object, message_uuid: object
+    project_id: object,
+    message_uuid: object,
+    session: typing.Any = None,
 ) -> typing.Any:
     return models.WorkspaceUserMessage.objects.get_all(
         filters={
             "uuid": dm_filters.EQ(message_uuid),
             "project_id": dm_filters.EQ(project_id),
         },
+        session=session,
     )
 
 
@@ -3796,14 +3875,28 @@ def update_workspace_user_message(
     message.update_dm(values={"payload": values["payload"]})
     message.update(session=session)
 
-    for user_message in _create_workspace_message_updated_events(
+    user_messages = _create_workspace_message_updated_events(
         project_id=project_id,
         message_uuid=message_uuid,
         session=session,
         compact_events=compact_events,
-    ):
+    )
+    for user_message in user_messages:
         if user_message.user_uuid == user_uuid:
             result = user_message
+    unread_recipients = [
+        user_message.user_uuid
+        for user_message in user_messages
+        if not user_message.read
+    ]
+    if unread_recipients:
+        _create_messages_unread_updated_events(
+            project_id=project_id,
+            user_uuids=unread_recipients,
+            stream_uuid=message.stream_uuid,
+            topic_uuid=message.topic_uuid,
+            session=session,
+        )
     if not enforce_visibility:
         return message
     return result
