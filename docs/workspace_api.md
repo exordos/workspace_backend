@@ -232,6 +232,13 @@ that scope is not accepted. `X-Pagination-Marker` is emitted only when a
 `page_limit + 1` probe proves that another row exists, so a full final page does
 not advertise a nonexistent continuation.
 
+`GET /api/workspace/v1/messenger/activity/reactions/` accepts only
+`page_limit` and `page_marker`. It always orders the current user's own reacted
+messages by `(created_at, uuid)` descending. The marker is resolved in the same
+project, author, and visibility scope even if its last reaction was removed
+between page requests, so pagination can continue from a previously returned
+row.
+
 `GET /api/workspace/v1/messenger/drafts/` uses the same UUID-marker contract,
 ordered by `(updated_at, uuid)`. Set `sort_key=updated_at` and
 `sort_dir=asc|desc`; optional `stream_uuid` and `topic_uuid` filters remain
@@ -309,6 +316,7 @@ authoritative snapshots before starting a new cursor.
 | `GET`, `PUT` | `/api/workspace/v1/messenger/topic_summary_settings/{project_uuid}` | Read both summary gates or update both with `workspace.topic_summary_settings.manage`. |
 | `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/read/invoke` | Mark all unread topic messages as read for the current user. |
 | `GET` | `/api/workspace/v1/messenger/messages/` | List messages visible to the current IAM user. |
+| `GET` | `/api/workspace/v1/messenger/activity/reactions/` | List the current user's messages that have at least one reaction. |
 | `POST` | `/api/workspace/v1/messenger/messages/` | Create a message. |
 | `GET` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Get a message. |
 | `PUT` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Update a message payload. |
@@ -1383,6 +1391,32 @@ Realtime side effects:
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the deleted message was unread; UI derives folder aggregates from the stream snapshot. |
+
+### Reaction Activity
+
+`GET /api/workspace/v1/messenger/activity/reactions/` returns standard message
+snapshots authored by the current IAM user when at least one reaction exists on
+the message. The reacting user may be the author or anyone else with access.
+Messages authored by another user are not included merely because the current
+user reacted to them.
+
+The collection is a live projection: adding the first reaction makes an owned
+message eligible, and deleting the last reaction removes it from a fresh
+query. Eligibility is determined from canonical reaction rows, not from the
+bounded `reaction_users` snapshot. Therefore messages with a large reaction
+group or historical `reaction_users: {}` remain eligible.
+
+```http
+GET /api/workspace/v1/messenger/activity/reactions/?page_limit=50&page_marker=a93dca35-3061-4748-bda4-7f6f8c660ea5
+Authorization: Bearer <access_token>
+```
+
+The response is a JSON array of the same message objects returned by
+`/messages/`, including `reactions` and `reaction_users`. The endpoint has no
+filter or sort parameters: order is fixed to `(created_at, uuid)` descending.
+`X-Pagination-Limit` and, when another row exists, `X-Pagination-Marker` follow
+the standard message pagination contract. Reaction mutations already emit
+`message.updated`; no activity-specific realtime event is introduced.
 
 ## Drafts
 

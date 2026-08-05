@@ -206,6 +206,60 @@ def test_message_page_uses_created_at_uuid_keyset(monkeypatch):
     assert page_query["limit"] == 51
 
 
+def test_reaction_activity_uses_owner_keyset_and_exact_reaction_exists(monkeypatch):
+    marker_uuid = sys_uuid.uuid4()
+    marker = types.SimpleNamespace(
+        uuid=marker_uuid,
+        created_at=datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc),
+    )
+    message_uuid = sys_uuid.uuid4()
+    result = types.SimpleNamespace(fetchall=lambda: [{"uuid": message_uuid}])
+    calls = []
+
+    class Session:
+        def execute(self, statement, params):
+            calls.append((statement, params))
+            return result
+
+    context = types.SimpleNamespace(get_session=lambda: Session())
+    objects = FakeObjects([marker])
+    model = _fake_model(
+        objects,
+        ("uuid", "project_id", "user_uuid", "author_uuid"),
+    )
+    monkeypatch.setattr(sql_canonical_store.contexts, "Context", lambda: context)
+    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceUserMessage", model)
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: value,
+    )
+    store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
+
+    page = store.filter_reaction_activity_page(marker_uuid, 51)
+
+    assert page == [{"uuid": message_uuid}]
+    _operation, marker_query = objects.calls[0]
+    assert marker_query["filters"]["uuid"].value == marker_uuid
+    assert marker_query["filters"]["project_id"].value == PROJECT_UUID
+    assert marker_query["filters"]["user_uuid"].value == USER_UUID
+    assert marker_query["filters"]["author_uuid"].value == USER_UUID
+    statement, params = calls[0]
+    assert "EXISTS (" in statement
+    assert 'FROM "m_workspace_message_reactions" AS reaction' in statement
+    assert 'message."reaction_users"' not in statement
+    assert 'ORDER BY message."created_at" DESC, message."uuid" DESC' in statement
+    assert params == (
+        PROJECT_UUID,
+        USER_UUID,
+        USER_UUID,
+        marker.created_at,
+        marker.created_at,
+        marker.uuid,
+        51,
+    )
+
+
 def test_draft_page_reuses_current_context_session(monkeypatch):
     draft_uuid = sys_uuid.uuid4()
     draft = types.SimpleNamespace(uuid=draft_uuid)

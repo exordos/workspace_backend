@@ -53,6 +53,21 @@ MESSAGE_PAGINATION_HEADERS = {
     },
 }
 
+REACTION_ACTIVITY_PAGINATION_PARAMETERS = (
+    {
+        **PAGINATION_LIMIT_PARAMETER,
+        "description": "Maximum reacted messages returned.",
+    },
+    {
+        "name": "page_marker",
+        "in": "query",
+        "description": (
+            "UUID of the last message from the previous reaction activity page."
+        ),
+        "schema": {"type": "string", "format": "uuid"},
+    },
+)
+
 DRAFT_PAGINATION_PARAMETERS = (
     {**PAGINATION_LIMIT_PARAMETER, "description": "Maximum drafts returned."},
     {
@@ -992,6 +1007,24 @@ def add_message_pagination_contract(
         copy.deepcopy(parameter)
         for parameter in MESSAGE_PAGINATION_PARAMETERS
         if (parameter["in"], parameter["name"]) not in existing
+    )
+    operation["responses"][200]["headers"] = copy.deepcopy(MESSAGE_PAGINATION_HEADERS)
+    return specification
+
+
+def add_reaction_activity_contract(
+    specification: dict[str, typing.Any],
+    path: str,
+) -> dict[str, typing.Any]:
+    operation = specification["paths"][path]["get"]
+    operation["summary"] = "List my messages with reactions"
+    operation["description"] = (
+        "Returns visible messages authored by the current IAM user that have at "
+        "least one reaction from any user. Results use a fixed descending "
+        "(created_at, uuid) order."
+    )
+    operation["parameters"] = copy.deepcopy(
+        REACTION_ACTIVITY_PAGINATION_PARAMETERS,
     )
     operation["responses"][200]["headers"] = copy.deepcopy(MESSAGE_PAGINATION_HEADERS)
     return specification

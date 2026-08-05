@@ -214,6 +214,18 @@ class WorkspaceMessageRoute(routes.Route):
     read_up_to = routes.action(WorkspaceMessageReadUpToAction, invoke=True)
 
 
+class WorkspaceReactionActivityRoute(routes.Route):
+    __controller__ = controllers.WorkspaceReactionActivityController
+    __allow_methods__ = [routes.FILTER]
+
+
+class WorkspaceActivityRoute(routes.Route):
+    __controller__ = controllers.ApiEndpointController
+    __allow_methods__: list[str] = []
+
+    reactions = routes.route(WorkspaceReactionActivityRoute)
+
+
 class WorkspaceDraftRoute(routes.Route):
     __controller__ = controllers.WorkspaceDraftController
     __allow_methods__ = [
@@ -442,6 +454,7 @@ class ApiEndpointRoute(routes.Route):
     stream_bindings = routes.route(WorkspaceStreamBindingRoute)
     stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
+    activity = routes.route(WorkspaceActivityRoute)
     drafts = routes.route(WorkspaceDraftRoute)
     external_accounts = routes.route(ExternalAccountRoute)
     external_chats = routes.route(ExternalChatRoute)

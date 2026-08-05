@@ -84,6 +84,11 @@ ROUTE_MANIFEST = {
             ra_routes.DELETE,
         },
     ),
+    "activity": (
+        routes.WorkspaceActivityRoute,
+        controllers.ApiEndpointController,
+        set(),
+    ),
     "drafts": (
         routes.WorkspaceDraftRoute,
         controllers.WorkspaceDraftController,
@@ -317,6 +322,16 @@ def test_messenger_v1_route_and_method_manifest_is_preserved():
         assert getattr(routes.ApiEndpointRoute, name) is route_class
         assert route_class.__controller__ is controller_class
         assert set(route_class.__allow_methods__) == methods
+
+    assert routes.WorkspaceActivityRoute.reactions is (
+        routes.WorkspaceReactionActivityRoute
+    )
+    assert routes.WorkspaceReactionActivityRoute.__controller__ is (
+        controllers.WorkspaceReactionActivityController
+    )
+    assert set(routes.WorkspaceReactionActivityRoute.__allow_methods__) == {
+        ra_routes.FILTER,
+    }
 
 
 def test_messenger_action_manifest_is_preserved():

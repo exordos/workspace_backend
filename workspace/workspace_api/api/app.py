@@ -55,6 +55,10 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/messenger/messages/",
         )
+        specification = openapi_contract.add_reaction_activity_contract(
+            specification,
+            "/v1/messenger/activity/reactions/",
+        )
         specification = openapi_contract.add_draft_contract(
             specification,
             "/v1/messenger/drafts/",
