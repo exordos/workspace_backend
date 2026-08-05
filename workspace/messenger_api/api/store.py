@@ -39,6 +39,13 @@ class MessengerStore(typing.Protocol):
     ) -> list[dict[str, typing.Any]]:
         """Read one stable ``(created_at, uuid)`` keyset page."""
 
+    def filter_reaction_activity_page(
+        self,
+        marker_uuid: sys_uuid.UUID | None,
+        limit: int | None,
+    ) -> list[dict[str, typing.Any]]:
+        """Read owned reacted messages in latest-reaction keyset order."""
+
     def filter_draft_page(
         self,
         filters: dict[str, typing.Any],

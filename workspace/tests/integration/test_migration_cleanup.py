@@ -73,6 +73,10 @@ UNREAD_COUNTERS_MIGRATION_UUID = "36e14b04-23c3-412c-bc87-34a7ccc79d0e"
 UNREAD_COUNTERS_MIGRATION_FILE = (
     "0130-split-active-and-passive-unread-counters-36e14b.py"
 )
+REACTION_ACTIVITY_MIGRATION_UUID = "4eb5af2b-b607-4753-9302-fd856b4856c0"
+REACTION_ACTIVITY_MIGRATION_FILE = (
+    "0131-add-reaction-activity-projection-4eb5af.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -89,7 +93,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == UNREAD_COUNTERS_MIGRATION_FILE
+    assert engine.get_latest_migration() == REACTION_ACTIVITY_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -112,6 +116,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     REACTION_USER_SNAPSHOT_MIGRATION_UUID,
                     TOPIC_SUMMARY_MIGRATION_UUID,
                     UNREAD_COUNTERS_MIGRATION_UUID,
+                    REACTION_ACTIVITY_MIGRATION_UUID,
                 ],
             ),
         )
@@ -133,6 +138,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (REACTION_USER_SNAPSHOT_MIGRATION_UUID, True),
             (TOPIC_SUMMARY_MIGRATION_UUID, True),
             (UNREAD_COUNTERS_MIGRATION_UUID, True),
+            (REACTION_ACTIVITY_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"

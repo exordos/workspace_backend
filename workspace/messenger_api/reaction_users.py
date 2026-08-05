@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Persist complete bounded reaction-user lists on the reaction write path."""
+"""Persist bounded reaction users and activity keys on the reaction write path."""
 
 import collections.abc
 import json
@@ -69,6 +69,33 @@ UPDATE_SNAPSHOT_SQL = """
       AND "uuid" = %s
 """
 
+UPDATE_ACTIVITY_SQL = """
+    WITH activity AS (
+        SELECT
+            requested."message_uuid",
+            COUNT(reaction."uuid")::INTEGER AS "reaction_count",
+            MAX(GREATEST(
+                reaction."created_at",
+                reaction."updated_at"
+            )) AS "latest_reaction_at"
+        FROM unnest(%s::uuid[]) AS requested("message_uuid")
+        LEFT JOIN "m_workspace_message_reactions" AS reaction
+          ON reaction."project_id" = %s
+         AND reaction."message_uuid" = requested."message_uuid"
+        GROUP BY requested."message_uuid"
+    )
+    UPDATE "m_workspace_messages" AS message
+    SET
+        "reaction_count" = activity."reaction_count",
+        "latest_reaction_at" = GREATEST(
+            message."latest_reaction_at",
+            activity."latest_reaction_at"
+        )
+    FROM activity
+    WHERE message."project_id" = %s
+      AND message."uuid" = activity."message_uuid"
+"""
+
 
 def _session(session: typing.Any) -> typing.Any:
     return session or contexts.Context().get_session()
@@ -121,7 +148,7 @@ def refresh_groups(
     session: typing.Any = None,
     conf: cfg.ConfigOpts = cfg.CONF,
 ) -> None:
-    """Refresh only affected emoji keys after their reaction mutation."""
+    """Refresh affected emoji snapshots and message activity keys."""
     ordered = _groups(groups)
     if not ordered:
         return
@@ -178,3 +205,8 @@ def refresh_groups(
                 message_uuid,
             ),
         )
+
+    current_session.execute(
+        UPDATE_ACTIVITY_SQL,
+        (message_uuids, project_id, project_id),
+    )

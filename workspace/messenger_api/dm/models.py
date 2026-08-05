@@ -1104,6 +1104,14 @@ class WorkspaceMessage(
         types.Dict(),
         default=dict,
     )
+    reaction_count = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+    )
+    latest_reaction_at = properties.property(
+        types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+    )
 
     def validate(self) -> None:
         super().validate()

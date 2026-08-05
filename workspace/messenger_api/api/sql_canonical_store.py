@@ -36,6 +36,27 @@ _PROVIDER_TARGET_UNSET = object()
 _PROVIDER_TARGET_EXISTS = object()
 EVENT_RETENTION = datetime.timedelta(hours=72)
 EVENT_PRUNE_BATCH_SIZE = 25000
+REACTION_ACTIVITY_PAGE_SQL = """
+    SELECT message.*
+    FROM "m_workspace_messages" AS activity
+    JOIN "m_workspace_user_messages_view" AS message
+      ON message."project_id" = activity."project_id"
+     AND message."uuid" = activity."uuid"
+    WHERE activity."project_id" = %s
+      AND activity."user_uuid" = %s
+      AND activity."reaction_count" > 0
+      AND message."user_uuid" = %s
+      AND (
+          %s::timestamptz IS NULL
+          OR activity."latest_reaction_at" < %s::timestamptz
+          OR (
+              activity."latest_reaction_at" = %s::timestamptz
+              AND activity."uuid" < %s::uuid
+          )
+      )
+    ORDER BY activity."latest_reaction_at" DESC, activity."uuid" DESC
+    LIMIT %s
+"""
 BOUNDED_VISIBLE_EVENTS_SQL = """
     WITH direct_events AS (
         SELECT
@@ -523,6 +544,49 @@ class SQLCanonicalReadStore:
             query["limit"] = limit
         rows = models.WorkspaceUserMessage.objects.get_all(**query)
         return [_public_dict(row, "messages") for row in rows]
+
+    def filter_reaction_activity_page(
+        self,
+        marker_uuid: sys_uuid.UUID | None,
+        limit: int | None,
+    ) -> list[dict[str, typing.Any]]:
+        session = contexts.Context().get_session()
+        marker_at = None
+        marker_value = None
+        if marker_uuid is not None:
+            models.WorkspaceUserMessage.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(marker_uuid),
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                    "author_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=session,
+            )
+            marker = models.WorkspaceMessage.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(marker_uuid),
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=session,
+            )
+            marker_at = marker.latest_reaction_at
+            marker_value = marker.uuid
+        result = session.execute(
+            REACTION_ACTIVITY_PAGE_SQL,
+            (
+                self.project_uuid,
+                self.user_uuid,
+                self.user_uuid,
+                marker_at,
+                marker_at,
+                marker_at,
+                marker_value,
+                limit,
+            ),
+        )
+        return [_public_dict(row, "messages") for row in result.fetchall()]
 
     def filter_draft_page(
         self,

@@ -110,7 +110,7 @@ def test_refresh_groups_persists_only_complete_bounded_lists():
         conf=FakeConf(),
     )
 
-    assert len(session.calls) == 3
+    assert len(session.calls) == 4
     lookup_statement, lookup_parameters = session.calls[1]
     assert "LIMIT %s" in lookup_statement
     assert lookup_parameters == (
@@ -126,6 +126,16 @@ def test_refresh_groups_persists_only_complete_bounded_lists():
         "keep": [str(USER_UUIDS[5])],
     }
     assert update_parameters[1:] == (PROJECT_UUID, MESSAGE_UUID_1)
+    activity_statement, activity_parameters = session.calls[3]
+    assert 'SET\n        "reaction_count"' in activity_statement
+    assert "MAX(GREATEST(" in activity_statement
+    assert 'reaction."updated_at"' in activity_statement
+    assert "GREATEST(" in activity_statement
+    assert activity_parameters == (
+        [MESSAGE_UUID_1],
+        PROJECT_UUID,
+        PROJECT_UUID,
+    )
 
 
 def test_refresh_groups_zero_limit_only_removes_affected_keys():
@@ -151,13 +161,14 @@ def test_refresh_groups_zero_limit_only_removes_affected_keys():
         conf=FakeConf(limit=0),
     )
 
-    assert len(session.calls) == 2
+    assert len(session.calls) == 3
     assert reaction_users.REACTION_USERS_SQL not in {
         statement for statement, _parameters in session.calls
     }
     assert json.loads(session.calls[1][1][0]) == {
         "keep": [str(USER_UUIDS[1])],
     }
+    assert session.calls[2][0] == reaction_users.UPDATE_ACTIVITY_SQL
 
 
 def test_refresh_groups_skips_unchanged_message_snapshot():
@@ -188,4 +199,5 @@ def test_refresh_groups_skips_unchanged_message_snapshot():
         conf=FakeConf(),
     )
 
-    assert len(session.calls) == 2
+    assert len(session.calls) == 3
+    assert session.calls[2][0] == reaction_users.UPDATE_ACTIVITY_SQL

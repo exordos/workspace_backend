@@ -58,6 +58,10 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/messages/",
         )
+        specification = openapi_contract.add_reaction_activity_contract(
+            specification,
+            "/v1/activity/reactions/",
+        )
         specification = openapi_contract.add_draft_contract(
             specification,
             "/v1/drafts/",

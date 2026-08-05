@@ -206,6 +206,97 @@ def test_message_page_uses_created_at_uuid_keyset(monkeypatch):
     assert page_query["limit"] == 51
 
 
+def test_reaction_activity_uses_projected_latest_reaction_keyset(monkeypatch):
+    marker_uuid = sys_uuid.uuid4()
+    visible_marker = types.SimpleNamespace(uuid=marker_uuid)
+    marker_at = datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc)
+    canonical_marker = types.SimpleNamespace(
+        uuid=marker_uuid,
+        latest_reaction_at=marker_at,
+    )
+    message_uuid = sys_uuid.uuid4()
+    result = types.SimpleNamespace(fetchall=lambda: [{"uuid": message_uuid}])
+    calls = []
+
+    class Session:
+        def execute(self, statement, params):
+            calls.append((statement, params))
+            return result
+
+    context = types.SimpleNamespace(get_session=lambda: Session())
+    visible_objects = FakeObjects([visible_marker])
+    visible_model = _fake_model(
+        visible_objects,
+        ("uuid", "project_id", "user_uuid", "author_uuid"),
+    )
+    canonical_objects = FakeObjects([canonical_marker])
+    canonical_model = _fake_model(
+        canonical_objects,
+        ("uuid", "project_id", "user_uuid", "latest_reaction_at"),
+    )
+    monkeypatch.setattr(sql_canonical_store.contexts, "Context", lambda: context)
+    monkeypatch.setattr(
+        sql_canonical_store.models,
+        "WorkspaceUserMessage",
+        visible_model,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models,
+        "WorkspaceMessage",
+        canonical_model,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: value,
+    )
+    store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
+
+    page = store.filter_reaction_activity_page(marker_uuid, 51)
+
+    assert page == [{"uuid": message_uuid}]
+    _operation, visible_query = visible_objects.calls[0]
+    assert visible_query["filters"]["uuid"].value == marker_uuid
+    assert visible_query["filters"]["project_id"].value == PROJECT_UUID
+    assert visible_query["filters"]["user_uuid"].value == USER_UUID
+    assert visible_query["filters"]["author_uuid"].value == USER_UUID
+    _operation, marker_query = canonical_objects.calls[0]
+    assert marker_query["filters"]["uuid"].value == marker_uuid
+    assert marker_query["filters"]["project_id"].value == PROJECT_UUID
+    assert marker_query["filters"]["user_uuid"].value == USER_UUID
+    statement, params = calls[0]
+    assert "EXISTS (" not in statement
+    assert 'activity."reaction_count" > 0' in statement
+    assert 'message."reaction_users"' not in statement
+    assert (
+        'ORDER BY activity."latest_reaction_at" DESC, activity."uuid" DESC' in statement
+    )
+    assert params == (
+        PROJECT_UUID,
+        USER_UUID,
+        USER_UUID,
+        marker_at,
+        marker_at,
+        marker_at,
+        marker_uuid,
+        51,
+    )
+
+
+def test_reaction_activity_projection_migration_builds_index_online():
+    migration = next(
+        (__import__("pathlib").Path(__file__).parents[3] / "migrations").glob(
+            "0131-add-reaction-activity-projection-*.py"
+        )
+    ).read_text()
+
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" in migration
+    assert 'WHERE "reaction_count" > 0' in migration
+    assert "MAX(GREATEST(" in migration
+    assert 'reaction."updated_at"' in migration
+    assert "connection.autocommit = True" in migration
+
+
 def test_draft_page_reuses_current_context_session(monkeypatch):
     draft_uuid = sys_uuid.uuid4()
     draft = types.SimpleNamespace(uuid=draft_uuid)
