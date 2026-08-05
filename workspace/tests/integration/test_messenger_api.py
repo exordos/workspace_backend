@@ -69,6 +69,7 @@ FILES = f"{V1}/files/"
 FOLDER_ITEMS = f"{V1}/folder_items/"
 STREAM_TOPICS = f"{V1}/stream_topics/"
 MESSAGES = f"{V1}/messages/"
+REACTION_ACTIVITY = f"{V1}/activity/reactions/"
 DRAFTS = f"{V1}/drafts/"
 MESSAGE_REACTIONS = f"{V1}/message_reactions/"
 EVENTS = f"{V1}/events/"
@@ -5806,6 +5807,165 @@ def test_messages_cursor_pagination_uses_created_at_uuid_keyset(api, db):
             "sort_dir": "asc",
             "stream_uuid": stream_uuid,
         },
+    )
+    assert unsupported_sort.status_code == 400, unsupported_sort.text
+
+
+def test_reaction_activity_returns_only_current_users_reacted_messages(api, db):
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE indexname =
+                'm_workspace_messages_project_user_created_uuid_idx'
+            """
+        )
+        index_definition = cursor.fetchone()[0]
+    assert "(project_id, user_uuid, created_at, uuid)" in index_definition.replace(
+        '"',
+        "",
+    )
+
+    reaction_users = [sys_uuid.UUID(api.user_uuid)] + [
+        sys_uuid.uuid4() for _index in range(4)
+    ]
+    other_author = reaction_users[1]
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "reaction-activity",
+    )
+    for user_uuid in reaction_users[1:]:
+        conftest.seed_user_stream_binding(
+            db,
+            api.project_id,
+            stream_uuid,
+            user_uuid,
+        )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+
+    def create_message(content, user=None):
+        response = api.post(
+            MESSAGES,
+            user=user,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["uuid"]
+
+    older_message = create_message("older reacted message")
+    newer_message = create_message("newer reacted message")
+    no_reaction_message = create_message("no reactions")
+    other_users_message = create_message("reacted to by me", user=other_author)
+
+    reaction_ids = []
+    for user_uuid in reaction_users:
+        response = api.post(
+            MESSAGE_REACTIONS,
+            user=user_uuid,
+            json={
+                "message_uuid": newer_message,
+                "emoji_name": "heart",
+            },
+        )
+        assert response.status_code == 201, response.text
+        reaction_ids.append((user_uuid, response.json()["uuid"]))
+    response = api.post(
+        MESSAGE_REACTIONS,
+        user=other_author,
+        json={
+            "message_uuid": older_message,
+            "emoji_name": "eyes",
+        },
+    )
+    assert response.status_code == 201, response.text
+    response = api.post(
+        MESSAGE_REACTIONS,
+        json={
+            "message_uuid": other_users_message,
+            "emoji_name": "eyes",
+        },
+    )
+    assert response.status_code == 201, response.text
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET created_at = CASE uuid
+                WHEN %s THEN '2026-08-05T11:00:00Z'::timestamptz
+                WHEN %s THEN '2026-08-05T12:00:00Z'::timestamptz
+                WHEN %s THEN '2026-08-05T13:00:00Z'::timestamptz
+                WHEN %s THEN '2026-08-05T14:00:00Z'::timestamptz
+            END
+            WHERE uuid = ANY(%s)
+            """,
+            (
+                older_message,
+                newer_message,
+                no_reaction_message,
+                other_users_message,
+                [
+                    older_message,
+                    newer_message,
+                    no_reaction_message,
+                    other_users_message,
+                ],
+            ),
+        )
+
+    first_page = api.get(REACTION_ACTIVITY, params={"page_limit": 1})
+    assert first_page.status_code == 200, first_page.text
+    assert first_page.headers["X-Pagination-Limit"] == "1"
+    assert first_page.headers["X-Pagination-Marker"] == newer_message
+    assert [message["uuid"] for message in first_page.json()] == [newer_message]
+    assert first_page.json()[0]["reactions"] == {"heart": 5}
+    assert first_page.json()[0]["reaction_users"] == {}
+
+    for user_uuid, reaction_uuid in reaction_ids:
+        response = api.delete(
+            f"{MESSAGE_REACTIONS}{reaction_uuid}",
+            user=user_uuid,
+        )
+        assert response.status_code in (200, 204), response.text
+
+    second_page = api.get(
+        REACTION_ACTIVITY,
+        params={
+            "page_limit": 1,
+            "page_marker": newer_message,
+        },
+    )
+    assert second_page.status_code == 200, second_page.text
+    assert [message["uuid"] for message in second_page.json()] == [older_message]
+    assert second_page.json()[0]["reactions"] == {"eyes": 1}
+    assert second_page.json()[0]["reaction_users"] == {
+        "eyes": [str(other_author)],
+    }
+    assert "X-Pagination-Marker" not in second_page.headers
+
+    unsupported_filter = api.get(
+        REACTION_ACTIVITY,
+        params={"stream_uuid": stream_uuid},
+    )
+    assert unsupported_filter.status_code == 400, unsupported_filter.text
+
+    unsupported_sort = api.get(
+        REACTION_ACTIVITY,
+        params={"sort_key": "created_at", "sort_dir": "asc"},
     )
     assert unsupported_sort.status_code == 400, unsupported_sort.text
 

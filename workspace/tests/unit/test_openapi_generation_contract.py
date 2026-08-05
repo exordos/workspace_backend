@@ -36,6 +36,31 @@ def _assert_message_pagination_contract(operation):
     assert headers["X-Pagination-Marker"]["schema"]["format"] == "uuid"
 
 
+def _assert_reaction_activity_contract(operation):
+    parameters = {
+        (parameter["in"], parameter["name"]): parameter
+        for parameter in operation["parameters"]
+    }
+    assert set(parameters) == {
+        ("query", "page_limit"),
+        ("query", "page_marker"),
+    }
+    assert parameters[("query", "page_limit")]["schema"] == {
+        "type": "integer",
+        "minimum": 0,
+    }
+    assert parameters[("query", "page_marker")]["schema"] == {
+        "type": "string",
+        "format": "uuid",
+    }
+    headers = operation["responses"][200]["headers"]
+    assert headers["X-Pagination-Limit"]["schema"] == {"type": "integer"}
+    assert headers["X-Pagination-Marker"]["schema"] == {
+        "type": "string",
+        "format": "uuid",
+    }
+
+
 def _assert_multipart_object(operation, required):
     content = operation["requestBody"]["content"]
     assert set(content) == {"multipart/form-data"}
@@ -305,11 +330,13 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     paths = specification["paths"]
 
     assert "/v1/messages/" in paths
+    assert "/v1/activity/reactions/" in paths
     assert "/v1/streams/" in paths
     assert "/v1/messenger/messages/" not in paths
     assert "/v1/events/" not in paths
     assert "/v1/epoch/" not in paths
     _assert_message_pagination_contract(paths["/v1/messages/"]["get"])
+    _assert_reaction_activity_contract(paths["/v1/activity/reactions/"]["get"])
 
     add_users_path = "/v1/streams/{WorkspaceUserStreamUuid}/actions/add_users/invoke"
     assert set(paths[add_users_path]) == {"post"}
@@ -343,6 +370,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     paths = specification["paths"]
 
     assert "/v1/messenger/messages/" in paths
+    assert "/v1/messenger/activity/reactions/" in paths
     assert not any(path.startswith("/v1/mail/") for path in paths)
     assert not any(path.startswith("/v1/calendar/") for path in paths)
     assert "/v1/providers/" not in paths
@@ -407,6 +435,9 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "$ref": "#/components/schemas/WorkspaceUser_Get"
     }
     _assert_message_pagination_contract(paths["/v1/messenger/messages/"]["get"])
+    _assert_reaction_activity_contract(
+        paths["/v1/messenger/activity/reactions/"]["get"],
+    )
     _assert_file_upload_contract(paths["/v1/messenger/files/"]["post"])
     _assert_collection_pagination_contract(
         event_operation,

@@ -1048,6 +1048,23 @@ class WorkspaceMessageController(StoreResourceController):
         return self._action(resource, "read_up_to")
 
 
+class WorkspaceReactionActivityController(WorkspaceMessageController):
+    __default_sort__: dict[str, str] = {}
+
+    def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
+        if not set(filters).issubset({"project_id"}) or order_by:
+            raise ra_exc.ValidationErrorException()
+        limit = self._pagination_limit or None
+        fetch_limit = None if limit is None else limit + 1
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            result = db.filter_reaction_activity_page(
+                marker_uuid=getattr(self, "_pagination_marker", None),
+                limit=fetch_limit,
+            )
+        self._message_page_has_more = limit is not None and len(result) > limit
+        return result if limit is None else result[:limit]
+
+
 class WorkspaceDraftController(StoreResourceController):
     resource_name = "drafts"
     __default_sort__ = {"updated_at": "asc"}

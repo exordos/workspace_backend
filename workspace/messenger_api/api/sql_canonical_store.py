@@ -524,6 +524,59 @@ class SQLCanonicalReadStore:
         rows = models.WorkspaceUserMessage.objects.get_all(**query)
         return [_public_dict(row, "messages") for row in rows]
 
+    def filter_reaction_activity_page(
+        self,
+        marker_uuid: sys_uuid.UUID | None,
+        limit: int | None,
+    ) -> list[dict[str, typing.Any]]:
+        session = contexts.Context().get_session()
+        where = [
+            'message."project_id" = %s',
+            'message."user_uuid" = %s',
+            'message."author_uuid" = %s',
+            """
+            EXISTS (
+                SELECT 1
+                FROM "m_workspace_message_reactions" AS reaction
+                WHERE reaction."project_id" = message."project_id"
+                  AND reaction."message_uuid" = message."uuid"
+            )
+            """,
+        ]
+        params: list[object] = [
+            self.project_uuid,
+            self.user_uuid,
+            self.user_uuid,
+        ]
+        if marker_uuid is not None:
+            marker = models.WorkspaceUserMessage.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(marker_uuid),
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                    "author_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=session,
+            )
+            where.append(
+                """
+                (message."created_at" < %s OR
+                 (message."created_at" = %s AND message."uuid" < %s))
+                """
+            )
+            params.extend([marker.created_at, marker.created_at, marker.uuid])
+        statement = (
+            'SELECT message.* FROM "m_workspace_user_messages_view" AS message '
+            "WHERE "
+            + " AND ".join(where)
+            + ' ORDER BY message."created_at" DESC, message."uuid" DESC'
+        )
+        if limit is not None:
+            statement += " LIMIT %s"
+            params.append(limit)
+        result = session.execute(statement, tuple(params))
+        return [_public_dict(row, "messages") for row in result.fetchall()]
+
     def filter_draft_page(
         self,
         filters: dict[str, typing.Any],
