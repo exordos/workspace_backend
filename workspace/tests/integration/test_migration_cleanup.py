@@ -73,6 +73,10 @@ UNREAD_COUNTERS_MIGRATION_UUID = "36e14b04-23c3-412c-bc87-34a7ccc79d0e"
 UNREAD_COUNTERS_MIGRATION_FILE = (
     "0130-split-active-and-passive-unread-counters-36e14b.py"
 )
+UNREAD_VISIBILITY_MIGRATION_UUID = "33fcdfb0-2623-44af-a2e2-06cee208f564"
+UNREAD_VISIBILITY_MIGRATION_FILE = (
+    "0131-optimize-unread-visibility-projections-33fcdf.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -89,7 +93,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == UNREAD_COUNTERS_MIGRATION_FILE
+    assert engine.get_latest_migration() == UNREAD_VISIBILITY_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -112,6 +116,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     REACTION_USER_SNAPSHOT_MIGRATION_UUID,
                     TOPIC_SUMMARY_MIGRATION_UUID,
                     UNREAD_COUNTERS_MIGRATION_UUID,
+                    UNREAD_VISIBILITY_MIGRATION_UUID,
                 ],
             ),
         )
@@ -133,13 +138,13 @@ def test_current_migrations_have_a_single_head(_database, db):
             (REACTION_USER_SNAPSHOT_MIGRATION_UUID, True),
             (TOPIC_SUMMARY_MIGRATION_UUID, True),
             (UNREAD_COUNTERS_MIGRATION_UUID, True),
+            (UNREAD_VISIBILITY_MIGRATION_UUID, True),
         }
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
         cur.execute(
             "SELECT to_regclass("
             "'m_workspace_message_reactions_message_uuid_idx'"
-            ")"
         )
         assert (
             cur.fetchone()[0]
@@ -226,6 +231,30 @@ def test_current_migrations_have_a_single_head(_database, db):
             """
         )
         assert cur.fetchone()[0] == 0
+
+
+def test_list_projections_reuse_outer_stream_visibility(_database, db):
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT relname, pg_get_viewdef(oid)
+            FROM pg_class
+            WHERE relname IN (
+                'm_workspace_user_streams',
+                'm_workspace_user_topics_view'
+            )
+            ORDER BY relname
+            """
+        )
+        definitions = dict(cur.fetchall())
+
+    assert set(definitions) == {
+        "m_workspace_user_streams",
+        "m_workspace_user_topics_view",
+    }
+    for definition in definitions.values():
+        assert "m_workspace_messages" in definition
+        assert "m_workspace_user_messages_view" not in definition
 
 
 def test_external_projection_access_is_scoped_to_account(
@@ -887,27 +916,33 @@ def test_external_visibility_uses_the_canonical_stream_per_logical_chat(
         )
         cur.execute(
             """
-            SELECT uuid::text
+            SELECT uuid::text, last_message_uuid::text, unread_count
             FROM m_workspace_user_streams
             WHERE project_id = %s AND user_uuid = %s
             ORDER BY uuid
             """,
             (project_uuid, owner_a_uuid),
         )
-        assert [row[0] for row in cur.fetchall()] == sorted(
-            [stream_a_x_uuid, stream_b_y_uuid]
+        assert cur.fetchall() == sorted(
+            [
+                (stream_a_x_uuid, message_uuids[0], 1),
+                (stream_b_y_uuid, message_uuids[2], 1),
+            ]
         )
         cur.execute(
             """
-            SELECT uuid::text
+            SELECT uuid::text, last_message_uuid::text, unread_count
             FROM m_workspace_user_topics_view
             WHERE project_id = %s AND user_uuid = %s
             ORDER BY uuid
             """,
             (project_uuid, owner_a_uuid),
         )
-        assert [row[0] for row in cur.fetchall()] == sorted(
-            [topic_a_x_uuid, topic_b_y_uuid]
+        assert cur.fetchall() == sorted(
+            [
+                (topic_a_x_uuid, message_uuids[0], 1),
+                (topic_b_y_uuid, message_uuids[2], 1),
+            ]
         )
         cur.execute(
             """
