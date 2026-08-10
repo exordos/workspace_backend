@@ -973,6 +973,10 @@ to the current IAM user through current stream membership.
 | `created_at` | datetime | no | yes | Creation time. |
 | `updated_at` | datetime | no | yes | Update time. |
 
+When `summary_system_prompt` is `null`, the application default asks for a
+brief summary that preserves decisions, owners, unresolved questions, and
+important constraints, written in the primary language used in the topic.
+
 Create request:
 
 ```json
