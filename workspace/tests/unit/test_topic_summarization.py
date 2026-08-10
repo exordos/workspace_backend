@@ -16,6 +16,13 @@ from workspace.messenger_api import topic_summarization
 from workspace.services.messenger_workers import agents
 
 
+def test_default_system_prompt_uses_the_topics_primary_language():
+    assert (
+        "Write the summary in the primary language used in the topic."
+        in topic_summarization.DEFAULT_SYSTEM_PROMPT
+    )
+
+
 def _endpoint(**overrides):
     values = {
         "uuid": sys_uuid.uuid4(),

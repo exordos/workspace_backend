@@ -29,7 +29,8 @@ from workspace.messenger_api.dm import models
 
 DEFAULT_SYSTEM_PROMPT = (
     "Summarize the topic briefly. Preserve decisions, owners, unresolved "
-    "questions, and important constraints."
+    "questions, and important constraints. Write the summary in the primary "
+    "language used in the topic."
 )
 ENDPOINT_MANAGE_PERMISSION = "workspace.topic_summary_endpoint.manage"
 SETTINGS_MANAGE_PERMISSION = "workspace.topic_summary_settings.manage"
