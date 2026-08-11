@@ -666,7 +666,10 @@ def claim_summary_work(
             job.status AS job_status,
             job.attempt AS job_attempt,
             job.boundary_message_uuid AS job_boundary_message_uuid,
-            job.prompt_fingerprint AS job_prompt_fingerprint
+            job.prompt_fingerprint AS job_prompt_fingerprint,
+            job.claim_token AS job_claim_token,
+            job.endpoint_uuid AS job_endpoint_uuid,
+            job.endpoint_claim_token AS job_endpoint_claim_token
         FROM m_workspace_stream_topics AS topic
         JOIN m_workspace_topic_summary_project_settings AS project_settings
           ON project_settings.project_id = topic.project_id
@@ -753,6 +756,43 @@ def claim_summary_work(
     if not messages:
         return None
     boundary_message_uuid = messages[-1].uuid
+    same_snapshot = (
+        candidate["job_boundary_message_uuid"] == boundary_message_uuid
+        and candidate["job_prompt_fingerprint"] == prompt_fingerprint
+    )
+    if (
+        same_snapshot
+        and candidate["job_status"] == "running"
+        and candidate["job_attempt"] >= MAX_PROVIDER_ATTEMPTS
+    ):
+        session.execute(
+            """
+            UPDATE m_workspace_llm_endpoints
+            SET claim_token = NULL,
+                claim_expires_at = NULL,
+                updated_at = NOW()
+            WHERE uuid = %s AND claim_token = %s
+            """,
+            (
+                candidate["job_endpoint_uuid"],
+                candidate["job_endpoint_claim_token"],
+            ),
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_topic_summary_jobs
+            SET status = 'failed',
+                claim_token = NULL,
+                claim_expires_at = NULL,
+                endpoint_claim_token = NULL,
+                next_attempt_at = NULL,
+                last_error_code = 'claim_expired',
+                updated_at = NOW()
+            WHERE topic_uuid = %s AND claim_token = %s
+            """,
+            (candidate["topic_uuid"], candidate["job_claim_token"]),
+        )
+        return None
     has_image = bool(images)
     vision_exists = session.execute(
         """
@@ -790,10 +830,6 @@ def claim_summary_work(
         return None
 
     endpoint, endpoint_claim_token = claimed_endpoint
-    same_snapshot = (
-        candidate["job_boundary_message_uuid"] == boundary_message_uuid
-        and candidate["job_prompt_fingerprint"] == prompt_fingerprint
-    )
     attempt = (candidate["job_attempt"] or 0) + 1 if same_snapshot else 1
     topic_claim_token = sys_uuid.uuid4()
     session.execute(
