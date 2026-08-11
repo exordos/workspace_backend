@@ -337,6 +337,182 @@ def test_topic_summary_endpoint_registry_and_settings_are_permissioned_and_safe(
         assert cursor.fetchone()[0] == 0
 
 
+def test_topic_summary_expired_attempt_budget_does_not_block_queue(api, db):
+    endpoint_uuid = sys_uuid.uuid4()
+    topic_claim_token = sys_uuid.uuid4()
+    endpoint_claim_token = sys_uuid.uuid4()
+    try:
+        endpoint_response = api.post(
+            TOPIC_SUMMARY_ENDPOINTS,
+            permissions=TOPIC_SUMMARY_ENDPOINT_MANAGE,
+            json={
+                "uuid": str(endpoint_uuid),
+                "name": "attempt-budget",
+                "base_url": "https://llm.example.invalid/v1",
+                "model": "summary-model",
+                "api_key": "endpoint-secret-value",
+            },
+        )
+        assert endpoint_response.status_code == 201, endpoint_response.text
+        settings_response = api.put(
+            f"{TOPIC_SUMMARY_SETTINGS}{api.project_id}",
+            permissions=TOPIC_SUMMARY_SETTINGS_MANAGE,
+            json={"global_enabled": True, "project_enabled": True},
+        )
+        assert settings_response.status_code == 200, settings_response.text
+
+        stream_uuid = conftest.seed_user_stream(
+            db,
+            api.project_id,
+            api.user_uuid,
+            "attempt-budget",
+        )
+        exhausted_topic_uuid = conftest.seed_stream_topic(
+            db,
+            api.project_id,
+            stream_uuid,
+            api.user_uuid,
+            "exhausted",
+        )
+        ready_topic_uuid = conftest.seed_stream_topic(
+            db,
+            api.project_id,
+            stream_uuid,
+            api.user_uuid,
+            "ready",
+        )
+        exhausted_message = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": exhausted_topic_uuid,
+                "payload": {"kind": "markdown", "content": "Old work."},
+            },
+        )
+        assert exhausted_message.status_code == 201, exhausted_message.text
+        ready_message = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": ready_topic_uuid,
+                "payload": {"kind": "markdown", "content": "Ready work."},
+            },
+        )
+        assert ready_message.status_code == 201, ready_message.text
+
+        prompt_fingerprint = topic_summarization._prompt_fingerprint(
+            topic_summarization.DEFAULT_SYSTEM_PROMPT,
+            None,
+        )
+        with db.cursor() as cursor:
+            cursor.execute(
+                "UPDATE m_workspace_llm_endpoints "
+                "SET claim_token = %s, "
+                "claim_expires_at = NOW() - INTERVAL '1 second' "
+                "WHERE uuid = %s",
+                (str(endpoint_claim_token), str(endpoint_uuid)),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_topic_summary_jobs (
+                    topic_uuid, project_id, status, attempt,
+                    boundary_message_uuid, effective_prompt,
+                    prompt_fingerprint, claim_token, claim_expires_at,
+                    endpoint_uuid, endpoint_claim_token,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, %s, 'running', 3, %s, %s, %s, %s,
+                    NOW() - INTERVAL '1 second', %s, %s, NOW(), NOW()
+                )
+                """,
+                (
+                    exhausted_topic_uuid,
+                    api.project_id,
+                    exhausted_message.json()["uuid"],
+                    topic_summarization.DEFAULT_SYSTEM_PROMPT,
+                    prompt_fingerprint,
+                    str(topic_claim_token),
+                    str(endpoint_uuid),
+                    str(endpoint_claim_token),
+                ),
+            )
+            cursor.execute(
+                "UPDATE m_workspace_stream_topics "
+                "SET updated_at = NOW() - INTERVAL '1 hour' "
+                "WHERE uuid = %s",
+                (exhausted_topic_uuid,),
+            )
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        exhausted_claim = _run_database_operation(
+            lambda session: topic_summarization.claim_summary_work(
+                session,
+                now=now,
+                key_material="integration-test-topic-summary-key",
+                topic_claim_seconds=60,
+                endpoint_claim_seconds=60,
+            )
+        )
+        assert exhausted_claim is None
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT status, attempt, claim_token, claim_expires_at, "
+                "endpoint_claim_token, last_error_code "
+                "FROM m_workspace_topic_summary_jobs WHERE topic_uuid = %s",
+                (exhausted_topic_uuid,),
+            )
+            assert cursor.fetchone() == (
+                "failed",
+                3,
+                None,
+                None,
+                None,
+                "claim_expired",
+            )
+            cursor.execute(
+                "SELECT claim_token, claim_expires_at "
+                "FROM m_workspace_llm_endpoints WHERE uuid = %s",
+                (str(endpoint_uuid),),
+            )
+            assert cursor.fetchone() == (None, None)
+
+        ready_claim = _run_database_operation(
+            lambda session: topic_summarization.claim_summary_work(
+                session,
+                now=now,
+                key_material="integration-test-topic-summary-key",
+                topic_claim_seconds=60,
+                endpoint_claim_seconds=60,
+            )
+        )
+        assert ready_claim is not None
+        assert ready_claim.topic_uuid == sys_uuid.UUID(ready_topic_uuid)
+        assert ready_claim.attempt == 1
+        _run_database_operation(
+            lambda session: topic_summarization.complete_summary_work(
+                session,
+                ready_claim,
+                "Ready summary.",
+                now=now,
+            )
+        )
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "UPDATE m_workspace_topic_summary_global_settings "
+                "SET enabled = FALSE WHERE singleton = TRUE"
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_topic_summary_project_settings "
+                "WHERE project_id = %s",
+                (api.project_id,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_llm_endpoints WHERE uuid = %s",
+                (str(endpoint_uuid),),
+            )
+
+
 def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
     api,
     db,
