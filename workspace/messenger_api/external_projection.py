@@ -40,6 +40,89 @@ def is_native_direct_projection(
     return row is not None and row["private_index"] is not None
 
 
+def _merge_topic_flags(
+    session: typing.Any,
+    *,
+    project_id: sys_uuid.UUID,
+    source_topic_uuid: sys_uuid.UUID,
+    target_topic_uuid: sys_uuid.UUID,
+) -> None:
+    if source_topic_uuid == target_topic_uuid:
+        return
+    session.execute(
+        """
+        INSERT INTO m_workspace_user_topic_flags (
+            uuid, user_uuid, project_id, is_done, notification_mode,
+            created_at, updated_at
+        )
+        SELECT
+            %s, user_uuid, project_id, is_done, notification_mode,
+            created_at, updated_at
+        FROM m_workspace_user_topic_flags
+        WHERE project_id = %s AND uuid = %s
+        ON CONFLICT (uuid, user_uuid) DO UPDATE
+        SET is_done = (
+                m_workspace_user_topic_flags.is_done
+                OR EXCLUDED.is_done
+            ),
+            notification_mode = CASE
+                WHEN m_workspace_user_topic_flags.notification_mode = 'default'
+                THEN EXCLUDED.notification_mode
+                ELSE m_workspace_user_topic_flags.notification_mode
+            END,
+            updated_at = GREATEST(
+                m_workspace_user_topic_flags.updated_at,
+                EXCLUDED.updated_at
+            )
+        """,
+        (target_topic_uuid, project_id, source_topic_uuid),
+    )
+
+
+def _invalidate_moved_topic_summaries(
+    session: typing.Any,
+    topic_uuids: list[sys_uuid.UUID],
+) -> None:
+    session.execute(
+        """
+        UPDATE m_workspace_llm_endpoints AS endpoint
+        SET claim_token = NULL,
+            claim_expires_at = NULL,
+            updated_at = NOW()
+        FROM m_workspace_topic_summary_jobs AS job
+        WHERE job.topic_uuid = ANY(%s)
+          AND endpoint.uuid = job.endpoint_uuid
+          AND endpoint.claim_token = job.endpoint_claim_token
+        """,
+        (topic_uuids,),
+    )
+    session.execute(
+        """
+        DELETE FROM m_workspace_topic_summary_jobs
+        WHERE topic_uuid = ANY(%s)
+        """,
+        (topic_uuids,),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_topic_summary_journal
+        SET invalidated_at = NOW()
+        WHERE topic_uuid = ANY(%s) AND invalidated_at IS NULL
+        """,
+        (topic_uuids,),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_stream_topics
+        SET summary = NULL,
+            summary_last_message_uuid = NULL,
+            updated_at = NOW()
+        WHERE uuid = ANY(%s)
+        """,
+        (topic_uuids,),
+    )
+
+
 def reconcile_personal_chat_projection(
     session: typing.Any,
     *,
@@ -79,7 +162,7 @@ def reconcile_personal_chat_projection(
     private_index = helpers.build_private_stream_index(*participant_uuids)
     target = session.execute(
         """
-        SELECT uuid
+        SELECT uuid, default_topic_uuid
         FROM m_workspace_streams
         WHERE project_id = %s AND private_index = %s
         FOR UPDATE
@@ -91,25 +174,47 @@ def reconcile_personal_chat_projection(
 
     target_stream_uuid = sys_uuid.UUID(str(target["uuid"]))
     topic_name = provider_topic_name(provider_kind)
-    topic = session.execute(
+    provider_topic = normalized_source["topics"][0]
+    old_topic_uuid = sys_uuid.UUID(str(provider_topic["topic_uuid"]))
+    canonical_topic = session.execute(
         """
-        SELECT uuid
+        SELECT uuid, name
         FROM m_workspace_stream_topics
-        WHERE project_id = %s AND stream_uuid = %s
-          AND LOWER(name) = LOWER(%s)
-        ORDER BY created_at, uuid
-        LIMIT 1
+        WHERE project_id = %s AND stream_uuid = %s AND uuid = %s
         FOR UPDATE
         """,
-        (project_id, target_stream_uuid, topic_name),
+        (project_id, target_stream_uuid, old_topic_uuid),
     ).fetchone()
-    target_topic_uuid = (
-        sys_uuid.UUID(str(topic["uuid"]))
-        if topic is not None
-        else sys_uuid.uuid5(
+    default_topic_uuid = (
+        None
+        if target["default_topic_uuid"] is None
+        else sys_uuid.UUID(str(target["default_topic_uuid"]))
+    )
+    if canonical_topic is not None:
+        target_topic_uuid = sys_uuid.UUID(str(canonical_topic["uuid"]))
+    elif default_topic_uuid is not None:
+        canonical_topic = session.execute(
+            """
+            SELECT uuid, name
+            FROM m_workspace_stream_topics
+            WHERE project_id = %s AND stream_uuid = %s AND uuid = %s
+            FOR UPDATE
+            """,
+            (project_id, target_stream_uuid, default_topic_uuid),
+        ).fetchone()
+        if canonical_topic is None:
+            raise ValueError("Native direct stream default topic is missing")
+        target_topic_uuid = default_topic_uuid
+    else:
+        canonical_topic = None
+        target_topic_uuid = sys_uuid.uuid5(
             _DIRECT_PROVIDER_TOPIC_NAMESPACE,
             f"{target_stream_uuid}:{provider_kind}",
         )
+    topic_projection_changed = (
+        default_topic_uuid != target_topic_uuid
+        or canonical_topic is None
+        or canonical_topic["name"] != topic_name
     )
     session.execute(
         """
@@ -124,13 +229,43 @@ def reconcile_personal_chat_projection(
         """,
         (target_topic_uuid, project_id, topic_name, target_stream_uuid),
     )
-    provider_topic = normalized_source["topics"][0]
-    old_topic_uuid = sys_uuid.UUID(str(provider_topic["topic_uuid"]))
+    if default_topic_uuid != target_topic_uuid:
+        session.execute(
+            """
+            UPDATE m_workspace_streams
+            SET default_topic_uuid = %s, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (target_topic_uuid, project_id, target_stream_uuid),
+        )
     provider_topic["topic_uuid"] = str(target_topic_uuid)
     provider_topic["name"] = topic_name
 
-    changed = target_stream_uuid != projection_stream_uuid
-    if changed:
+    obsolete_topics = session.execute(
+        """
+        SELECT uuid
+        FROM m_workspace_stream_topics
+        WHERE project_id = %s AND stream_uuid = %s AND uuid <> %s
+          AND (uuid = %s OR uuid = %s)
+        ORDER BY created_at, uuid
+        FOR UPDATE
+        """,
+        (
+            project_id,
+            target_stream_uuid,
+            target_topic_uuid,
+            old_topic_uuid,
+            default_topic_uuid,
+        ),
+    ).fetchall()
+    obsolete_topic_uuids = [
+        sys_uuid.UUID(str(topic["uuid"])) for topic in obsolete_topics
+    ]
+    topic_projection_changed = topic_projection_changed or bool(obsolete_topic_uuids)
+
+    stream_changed = target_stream_uuid != projection_stream_uuid
+    source_stream = None
+    if stream_changed:
         source_stream = session.execute(
             """
             SELECT uuid
@@ -167,44 +302,83 @@ def reconcile_personal_chat_projection(
                     projection_stream_uuid,
                 ),
             )
-            session.execute(
-                """
-                INSERT INTO m_workspace_user_topic_flags (
-                    uuid, user_uuid, project_id, is_done, notification_mode,
-                    created_at, updated_at
-                )
-                SELECT
-                    %s, user_uuid, project_id, is_done, notification_mode,
-                    created_at, updated_at
-                FROM m_workspace_user_topic_flags
-                WHERE project_id = %s AND uuid = %s
-                ON CONFLICT (uuid, user_uuid) DO UPDATE
-                SET is_done = (
-                        m_workspace_user_topic_flags.is_done
-                        OR EXCLUDED.is_done
-                    ),
-                    notification_mode = CASE
-                        WHEN m_workspace_user_topic_flags.notification_mode = 'default'
-                        THEN EXCLUDED.notification_mode
-                        ELSE m_workspace_user_topic_flags.notification_mode
-                    END,
-                    updated_at = GREATEST(
-                        m_workspace_user_topic_flags.updated_at,
-                        EXCLUDED.updated_at
-                    )
-                """,
-                (target_topic_uuid, project_id, old_topic_uuid),
+            _merge_topic_flags(
+                session,
+                project_id=project_id,
+                source_topic_uuid=old_topic_uuid,
+                target_topic_uuid=target_topic_uuid,
             )
-            # Keep the carrier row for provider file sidecars, but remove it
-            # from every chat list after its messages have moved.
-            session.execute(
-                """
-                UPDATE m_workspace_streams
-                SET is_archived = TRUE, updated_at = NOW()
-                WHERE project_id = %s AND uuid = %s
-                """,
-                (project_id, projection_stream_uuid),
+
+    if obsolete_topic_uuids:
+        session.execute(
+            """
+            UPDATE m_workspace_messages
+            SET topic_uuid = %s, updated_at = NOW()
+            WHERE project_id = %s AND stream_uuid = %s
+              AND topic_uuid = ANY(%s)
+            """,
+            (
+                target_topic_uuid,
+                project_id,
+                target_stream_uuid,
+                obsolete_topic_uuids,
+            ),
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_drafts
+            SET topic_uuid = %s, updated_at = NOW()
+            WHERE project_id = %s AND stream_uuid = %s
+              AND topic_uuid = ANY(%s)
+            """,
+            (
+                target_topic_uuid,
+                project_id,
+                target_stream_uuid,
+                obsolete_topic_uuids,
+            ),
+        )
+        for obsolete_topic_uuid in obsolete_topic_uuids:
+            _merge_topic_flags(
+                session,
+                project_id=project_id,
+                source_topic_uuid=obsolete_topic_uuid,
+                target_topic_uuid=target_topic_uuid,
             )
+
+    if source_stream is not None or obsolete_topic_uuids:
+        affected_topic_uuids = list(
+            dict.fromkeys(
+                [
+                    target_topic_uuid,
+                    *obsolete_topic_uuids,
+                    *([old_topic_uuid] if source_stream is not None else []),
+                ]
+            )
+        )
+        _invalidate_moved_topic_summaries(session, affected_topic_uuids)
+
+    if obsolete_topic_uuids:
+        # The canonical default topic now owns all data and user state.
+        session.execute(
+            """
+            DELETE FROM m_workspace_stream_topics
+            WHERE project_id = %s AND stream_uuid = %s AND uuid = ANY(%s)
+            """,
+            (project_id, target_stream_uuid, obsolete_topic_uuids),
+        )
+
+    if source_stream is not None:
+        # Keep the carrier row for provider file sidecars, but remove it
+        # from every chat list after its messages have moved.
+        session.execute(
+            """
+            UPDATE m_workspace_streams
+            SET is_archived = TRUE, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_id, projection_stream_uuid),
+        )
     session.execute(
         """
         UPDATE m_workspace_streams
@@ -213,7 +387,11 @@ def reconcile_personal_chat_projection(
         """,
         (project_id, target_stream_uuid),
     )
-    return target_stream_uuid, normalized_source, changed
+    return (
+        target_stream_uuid,
+        normalized_source,
+        stream_changed or topic_projection_changed,
+    )
 
 
 def _workspace_source(
