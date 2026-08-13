@@ -52,8 +52,7 @@ def test_assignment_preserves_provider_topic_ids_after_display_name_collision():
     }
     topics_result = mock.Mock()
     topics_result.fetchall.return_value = [
-        {"uuid": topic_uuid, "name": "canonical"}
-        for topic_uuid in topic_uuids
+        {"uuid": topic_uuid, "name": "canonical"} for topic_uuid in topic_uuids
     ]
     session = SimpleNamespace(
         execute=mock.Mock(side_effect=[stream_result, topics_result])
@@ -158,6 +157,28 @@ def test_capability_refresh_claim_is_ordered_and_skips_locked_accounts():
     assert "FOR UPDATE OF account SKIP LOCKED" in statement
     assert "account.uuid > %s" in statement
     assert params == (account_uuid,)
+
+
+def test_assignment_repair_locks_chats_and_requires_distinct_verified_users():
+    calls = []
+    result = mock.Mock()
+    result.fetchall.return_value = []
+    session = SimpleNamespace(
+        execute=lambda statement, params: calls.append((statement, params)) or result
+    )
+
+    assert (
+        sql_state.repair_external_chat_assignments(
+            session,
+            sys_uuid.uuid4(),
+            sys_uuid.uuid4(),
+            "zulip",
+        )
+        == 0
+    )
+    statement, _params = calls[0]
+    assert "COUNT(DISTINCT workspace_user.uuid)" in statement
+    assert "FOR UPDATE OF chat SKIP LOCKED" in statement
 
 
 def test_stale_bridge_degradation_is_an_independent_bridge_only_update():

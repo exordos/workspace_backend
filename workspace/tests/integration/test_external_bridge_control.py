@@ -623,9 +623,26 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             ),
         )
 
-    report["report_uuid"] = str(sys_uuid.uuid4())
-    result = _request_call(repository.observed_reports, identity, [report])
-    assert result["results"][0]["status"] == "applied"
+    with engines.engine_factory.get_engine().session_manager() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 1
+        )
+    with engines.engine_factory.get_engine().session_manager() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 0
+        )
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -703,9 +720,7 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             """,
             (chat_uuid,),
         )
-        assert cursor.fetchone()[0]["topics"][0]["topic_uuid"] == str(
-            stale_topic_uuid
-        )
+        assert cursor.fetchone()[0]["topics"][0]["topic_uuid"] == str(stale_topic_uuid)
         cursor.execute(
             """
             SELECT resource
@@ -2554,11 +2569,14 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         "report_uuid": str(sys_uuid.uuid4()),
         "observed_generation": 2,
     }
-    assert _request_call(
-        repository.observed_reports,
-        identity,
-        [current_live],
-    )["results"][0]["status"] == "applied"
+    assert (
+        _request_call(
+            repository.observed_reports,
+            identity,
+            [current_live],
+        )["results"][0]["status"]
+        == "applied"
+    )
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT status, revision FROM m_external_chats_v2 WHERE uuid = %s",
