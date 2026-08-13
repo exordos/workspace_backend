@@ -1605,6 +1605,17 @@ class SQLControlState:
         ):
             raise ValueError("External chat catalog participant topology is invalid")
         provider_topic_ids = set()
+        existing_topics = {
+            topic["provider_topic_id"]: topic["topic_uuid"]
+            for topic in (
+                existing["source"].get("topics", [])
+                if existing is not None and isinstance(existing["source"], dict)
+                else []
+            )
+            if isinstance(topic, dict)
+            and isinstance(topic.get("provider_topic_id"), str)
+            and isinstance(topic.get("topic_uuid"), str)
+        }
         normalized_topics = []
         default_count = 0
         for topic in topics:
@@ -1624,10 +1635,15 @@ class SQLControlState:
             normalized_topics.append(
                 {
                     "topic_uuid": str(
-                        _projection_uuid(
-                            chat_uuid,
-                            "topic",
-                            topic["provider_topic_id"],
+                        sys_uuid.UUID(
+                            existing_topics.get(topic["provider_topic_id"])
+                            or str(
+                                _projection_uuid(
+                                    chat_uuid,
+                                    "topic",
+                                    topic["provider_topic_id"],
+                                )
+                            )
                         )
                     ),
                     "provider_topic_id": topic["provider_topic_id"],
@@ -1665,19 +1681,6 @@ class SQLControlState:
             and existing["project_id"] is not None
             else project_uuid
         )
-        (
-            projection_stream_uuid,
-            normalized_source,
-            projection_changed,
-        ) = external_projection.reconcile_personal_chat_projection(
-            session,
-            project_id=projection_project_uuid,
-            provider_kind=identity.provider_kind,
-            source=normalized_source,
-            projection_stream_uuid=projection_stream_uuid,
-        )
-        if projection_changed:
-            identity_linking.invalidate_direct_event_history(session)
         selection_all = account["settings"].get("selection_mode") == "all"
         maximum = account["limits"].get("max_selected_chats_per_account")
         if not isinstance(maximum, int):
@@ -1690,6 +1693,20 @@ class SQLControlState:
             (account_uuid, chat_uuid),
         ).fetchone()["count"]
         select_discovered = selection_all and selected_count < maximum
+        if (existing is not None and existing["selected"]) or select_discovered:
+            (
+                projection_stream_uuid,
+                normalized_source,
+                projection_changed,
+            ) = external_projection.reconcile_personal_chat_projection(
+                session,
+                project_id=projection_project_uuid,
+                provider_kind=identity.provider_kind,
+                source=normalized_source,
+                projection_stream_uuid=projection_stream_uuid,
+            )
+            if projection_changed:
+                identity_linking.invalidate_direct_event_history(session)
         session.execute(
             """
             INSERT INTO m_external_chats_v2 (

@@ -57,19 +57,23 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
     chat_uuid = sys_uuid.uuid4()
     native_stream_uuid = sys_uuid.uuid4()
     native_topic_uuid = sys_uuid.uuid4()
+    native_named_zulip_topic_uuid = sys_uuid.uuid4()
     provider_stream_uuid = sql_state.external_chat_projection_stream_uuid(chat_uuid)
     provider_topic_uuid = sql_state._projection_uuid(
         chat_uuid,
         "topic",
         "direct:7,8:default",
     )
+    native_message_uuid = sys_uuid.uuid4()
+    native_named_zulip_message_uuid = sys_uuid.uuid4()
     message_uuid = sys_uuid.uuid4()
+    provider_draft_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, owner_uuid, "merge-owner")
     conftest.seed_workspace_user(db, peer_uuid, "merge-peer")
     settings = {
         "kind": "zulip",
         "server_url": "https://zulip.example.test",
-        "selection_mode": "all",
+        "selection_mode": "explicit",
         "history_depth": "30_days",
         "default_project_id": str(project_uuid),
     }
@@ -171,6 +175,14 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
         )
         cursor.execute(
             """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, name, stream_uuid
+            ) VALUES (%s, %s, 'Zulip', %s)
+            """,
+            (native_named_zulip_topic_uuid, project_uuid, native_stream_uuid),
+        )
+        cursor.execute(
+            """
             UPDATE m_workspace_streams
             SET default_topic_uuid = %s
             WHERE project_id = %s AND uuid = %s
@@ -192,6 +204,33 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
                     owner_uuid,
                 ),
             )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload
+            ) VALUES
+            (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"native history"}'::jsonb
+            ),
+            (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"user topic history"}'::jsonb
+            )
+            """,
+            (
+                native_message_uuid,
+                project_uuid,
+                native_stream_uuid,
+                native_topic_uuid,
+                owner_uuid,
+                native_named_zulip_message_uuid,
+                project_uuid,
+                native_stream_uuid,
+                native_named_zulip_topic_uuid,
+                owner_uuid,
+            ),
+        )
         cursor.execute(
             """
             INSERT INTO m_workspace_streams (
@@ -271,13 +310,30 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
         )
         cursor.execute(
             """
+            INSERT INTO m_workspace_drafts (
+                uuid, project_id, user_uuid, stream_uuid, topic_uuid, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"provider draft"}'::jsonb
+            )
+            """,
+            (
+                provider_draft_uuid,
+                project_uuid,
+                owner_uuid,
+                provider_stream_uuid,
+                provider_topic_uuid,
+            ),
+        )
+        cursor.execute(
+            """
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
                 provider_chat_id, source, display_name, selected, project_id,
                 projection_stream_uuid, status
             ) VALUES (
                 %s, %s, %s, 'zulip', 'direct:7,8', %s::jsonb, 'Peer',
-                TRUE, %s, %s, 'syncing'
+                FALSE, NULL, %s, 'available'
             )
             """,
             (
@@ -285,7 +341,6 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
                 account_uuid,
                 owner_uuid,
                 sql_state._json(existing_source),
-                project_uuid,
                 provider_stream_uuid,
             ),
         )
@@ -361,6 +416,46 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
     }
     result = _request_call(repository.observed_reports, identity, [report])
     assert result["results"][0]["status"] == "applied"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT selected, project_id, projection_stream_uuid
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone() == (False, None, provider_stream_uuid)
+        cursor.execute(
+            """
+            SELECT stream.default_topic_uuid, topic.name
+            FROM m_workspace_streams AS stream
+            JOIN m_workspace_stream_topics AS topic
+              ON topic.uuid = stream.default_topic_uuid
+            WHERE stream.project_id = %s AND stream.uuid = %s
+            """,
+            (project_uuid, native_stream_uuid),
+        )
+        assert cursor.fetchone() == (native_topic_uuid, "General Topic")
+        cursor.execute(
+            """
+            SELECT stream_uuid, topic_uuid
+            FROM m_workspace_drafts WHERE uuid = %s
+            """,
+            (provider_draft_uuid,),
+        )
+        assert cursor.fetchone() == (provider_stream_uuid, provider_topic_uuid)
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET settings = jsonb_set(settings, '{selection_mode}', '"all"')
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+
+    report["report_uuid"] = str(sys_uuid.uuid4())
+    result = _request_call(repository.observed_reports, identity, [report])
+    assert result["results"][0]["status"] == "applied"
 
     with db.cursor() as cursor:
         cursor.execute(
@@ -381,14 +476,48 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             }
         ]
         zulip_topic_uuid = sys_uuid.UUID(source["topics"][0]["topic_uuid"])
+        assert zulip_topic_uuid == native_topic_uuid
+        cursor.execute(
+            """
+            SELECT uuid, stream_uuid, topic_uuid
+            FROM m_workspace_messages WHERE uuid = ANY(%s)
+            ORDER BY uuid
+            """,
+            ([message_uuid, native_message_uuid],),
+        )
+        assert cursor.fetchall() == sorted(
+            [
+                (message_uuid, native_stream_uuid, native_topic_uuid),
+                (native_message_uuid, native_stream_uuid, native_topic_uuid),
+            ]
+        )
+        cursor.execute(
+            """
+            SELECT topic_uuid
+            FROM m_workspace_messages WHERE uuid = %s
+            """,
+            (native_named_zulip_message_uuid,),
+        )
+        assert cursor.fetchone()[0] == native_named_zulip_topic_uuid
         cursor.execute(
             """
             SELECT stream_uuid, topic_uuid
-            FROM m_workspace_messages WHERE uuid = %s
+            FROM m_workspace_drafts WHERE uuid = %s
             """,
-            (message_uuid,),
+            (provider_draft_uuid,),
         )
-        assert cursor.fetchone() == (native_stream_uuid, zulip_topic_uuid)
+        assert cursor.fetchone() == (native_stream_uuid, native_topic_uuid)
+        cursor.execute(
+            """
+            SELECT stream.default_topic_uuid, topic.name
+            FROM m_workspace_streams AS stream
+            JOIN m_workspace_stream_topics AS topic
+              ON topic.uuid = stream.default_topic_uuid
+            WHERE stream.project_id = %s AND stream.uuid = %s
+            """,
+            (project_uuid, native_stream_uuid),
+        )
+        assert cursor.fetchone() == (native_topic_uuid, "Zulip")
         cursor.execute(
             """
             SELECT is_archived
@@ -419,6 +548,81 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             }
         ]
 
+    stale_topic_uuid = sys_uuid.uuid4()
+    stale_message_uuid = sys_uuid.uuid4()
+    split_draft_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET source = jsonb_set(
+                    source,
+                    '{topics,0,topic_uuid}',
+                    to_jsonb(%s::text)
+                )
+            WHERE uuid = %s
+            """,
+            (str(stale_topic_uuid), chat_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_stream_topics
+            SET name = 'General Topic'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, native_topic_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, name, stream_uuid
+            ) VALUES (%s, %s, 'Zulip', %s)
+            """,
+            (stale_topic_uuid, project_uuid, native_stream_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"split history"}'::jsonb
+            )
+            """,
+            (
+                stale_message_uuid,
+                project_uuid,
+                native_stream_uuid,
+                stale_topic_uuid,
+                peer_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_topic_flags (
+                uuid, user_uuid, project_id, is_done
+            ) VALUES (%s, %s, %s, TRUE)
+            """,
+            (stale_topic_uuid, peer_uuid, project_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_drafts (
+                uuid, project_id, user_uuid, stream_uuid, topic_uuid, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"split draft"}'::jsonb
+            )
+            """,
+            (
+                split_draft_uuid,
+                project_uuid,
+                owner_uuid,
+                native_stream_uuid,
+                native_topic_uuid,
+            ),
+        )
+
     report["report_uuid"] = str(sys_uuid.uuid4())
     result = _request_call(repository.observed_reports, identity, [report])
     assert result["results"][0]["status"] == "applied"
@@ -431,7 +635,95 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             """,
             (native_stream_uuid,),
         )
+        assert cursor.fetchone()[0] == 2
+        cursor.execute(
+            """
+            SELECT topic_uuid
+            FROM m_workspace_messages WHERE uuid = ANY(%s)
+            """,
+            ([message_uuid, native_message_uuid, stale_message_uuid],),
+        )
+        assert {row[0] for row in cursor.fetchall()} == {stale_topic_uuid}
+        cursor.execute(
+            """
+            SELECT topic_uuid
+            FROM m_workspace_messages WHERE uuid = %s
+            """,
+            (native_named_zulip_message_uuid,),
+        )
+        assert cursor.fetchone()[0] == native_named_zulip_topic_uuid
+        cursor.execute(
+            """
+            SELECT topic_uuid
+            FROM m_workspace_drafts WHERE uuid = ANY(%s)
+            """,
+            ([provider_draft_uuid, split_draft_uuid],),
+        )
+        assert {row[0] for row in cursor.fetchall()} == {stale_topic_uuid}
+        cursor.execute(
+            """
+            SELECT is_done
+            FROM m_workspace_user_topic_flags
+            WHERE uuid = %s AND user_uuid = %s
+            """,
+            (stale_topic_uuid, peer_uuid),
+        )
+        assert cursor.fetchone()[0] is True
+        cursor.execute(
+            """
+            SELECT default_topic_uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, native_stream_uuid),
+        )
+        assert cursor.fetchone()[0] == stale_topic_uuid
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_topics
+            WHERE stream_uuid = %s
+            """,
+            (native_stream_uuid,),
+        )
+        assert cursor.fetchone()[0] == 2
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_topics
+            WHERE stream_uuid = %s AND uuid = %s
+            """,
+            (native_stream_uuid, native_named_zulip_topic_uuid),
+        )
         assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT source
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assert cursor.fetchone()[0]["topics"][0]["topic_uuid"] == str(
+            stale_topic_uuid
+        )
+        cursor.execute(
+            """
+            SELECT resource
+            FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        assignment = cursor.fetchone()[0]
+        assert assignment["workspace_projection"]["topics"] == [
+            {
+                "topic_uuid": str(stale_topic_uuid),
+                "provider_topic_id": "direct:7,8:default",
+                "name": "Zulip",
+                "is_default": True,
+            }
+        ]
         cursor.execute(
             "DELETE FROM m_external_provider_policies_v1 WHERE provider = 'zulip'"
         )
