@@ -117,6 +117,7 @@ def build_runtime(
         control_pki.control_hmac_key(),
         resolve_workspace_file=canonical_files.resolve,
         commit_file_projection=canonical_files.commit_projection,
+        resolve_workspace_content=canonical_files.find_reusable_content,
     )
 
     def enrollment_persist(

@@ -73,6 +73,10 @@ UNREAD_COUNTERS_MIGRATION_UUID = "36e14b04-23c3-412c-bc87-34a7ccc79d0e"
 UNREAD_COUNTERS_MIGRATION_FILE = (
     "0130-split-active-and-passive-unread-counters-36e14b.py"
 )
+EXTERNAL_CONTENT_INDEX_MIGRATION_UUID = "0bb3cac3-2f35-44a1-9cca-b91886bfa0da"
+EXTERNAL_CONTENT_INDEX_MIGRATION_FILE = (
+    "0131-index-reusable-external-file-content-0bb3ca.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -89,7 +93,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == UNREAD_COUNTERS_MIGRATION_FILE
+    assert engine.get_latest_migration() == EXTERNAL_CONTENT_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -112,6 +116,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     REACTION_USER_SNAPSHOT_MIGRATION_UUID,
                     TOPIC_SUMMARY_MIGRATION_UUID,
                     UNREAD_COUNTERS_MIGRATION_UUID,
+                    EXTERNAL_CONTENT_INDEX_MIGRATION_UUID,
                 ],
             ),
         )
@@ -133,18 +138,18 @@ def test_current_migrations_have_a_single_head(_database, db):
             (REACTION_USER_SNAPSHOT_MIGRATION_UUID, True),
             (TOPIC_SUMMARY_MIGRATION_UUID, True),
             (UNREAD_COUNTERS_MIGRATION_UUID, True),
+            (EXTERNAL_CONTENT_INDEX_MIGRATION_UUID, True),
         }
+        cur.execute(
+            "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
+        )
+        assert cur.fetchone()[0] == "m_workspace_files_external_content_hash_size_idx"
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
         cur.execute(
-            "SELECT to_regclass("
-            "'m_workspace_message_reactions_message_uuid_idx'"
-            ")"
+            "SELECT to_regclass('m_workspace_message_reactions_message_uuid_idx')"
         )
-        assert (
-            cur.fetchone()[0]
-            == "m_workspace_message_reactions_message_uuid_idx"
-        )
+        assert cur.fetchone()[0] == "m_workspace_message_reactions_message_uuid_idx"
         cur.execute(
             """
             SELECT data_type, is_nullable, column_default
@@ -172,9 +177,7 @@ def test_current_migrations_have_a_single_head(_database, db):
         assert cur.fetchone()[0] == "m_external_bridge_heartbeats_v1_retention_idx"
         cur.execute("SELECT to_regclass('m_workspace_messages_topic_boundary_idx')")
         assert cur.fetchone()[0] == "m_workspace_messages_topic_boundary_idx"
-        cur.execute(
-            "SELECT to_regclass('m_workspace_unread_flags_user_message_idx')"
-        )
+        cur.execute("SELECT to_regclass('m_workspace_unread_flags_user_message_idx')")
         assert cur.fetchone()[0] == "m_workspace_unread_flags_user_message_idx"
         cur.execute(
             """

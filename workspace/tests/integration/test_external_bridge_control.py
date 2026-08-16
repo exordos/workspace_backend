@@ -703,9 +703,7 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             """,
             (chat_uuid,),
         )
-        assert cursor.fetchone()[0]["topics"][0]["topic_uuid"] == str(
-            stale_topic_uuid
-        )
+        assert cursor.fetchone()[0]["topics"][0]["topic_uuid"] == str(stale_topic_uuid)
         cursor.execute(
             """
             SELECT resource
@@ -2554,11 +2552,14 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         "report_uuid": str(sys_uuid.uuid4()),
         "observed_generation": 2,
     }
-    assert _request_call(
-        repository.observed_reports,
-        identity,
-        [current_live],
-    )["results"][0]["status"] == "applied"
+    assert (
+        _request_call(
+            repository.observed_reports,
+            identity,
+            [current_live],
+        )["results"][0]["status"]
+        == "applied"
+    )
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT status, revision FROM m_external_chats_v2 WHERE uuid = %s",
@@ -2607,8 +2608,12 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
     file_uuid = sys_uuid.uuid4()
     operation_uuid = sys_uuid.uuid4()
     data = b"canonical provider file"
+    sha256 = hashlib.sha256(data).hexdigest()
     storage_info = file_storage.save_workspace_file(
-        file_uuid, data, storage_type="file"
+        file_uuid,
+        data,
+        storage_type="file",
+        storage_object_id=f"external-content/sha256/{sha256[:2]}/{sha256}",
     )
     created_at = datetime.datetime.now(datetime.timezone.utc)
     origin = {
@@ -2627,7 +2632,7 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
         description="",
         content_type="text/plain",
         size_bytes=len(data),
-        sha256=hashlib.sha256(data).hexdigest(),
+        sha256=sha256,
         created_at=created_at,
         origin=origin,
     )
@@ -2651,6 +2656,10 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
 
     _request_call(repository.commit_projection, sidecar, storage_info)
     _request_call(repository.commit_projection, sidecar, storage_info)
+    assert (
+        _request_call(repository.find_reusable_content, sha256, len(data))
+        == storage_info
+    )
 
     with db.cursor() as cursor:
         cursor.execute(

@@ -58,6 +58,25 @@ _DELIVERY_STATUS_BY_OPERATION_STATUS = {
 }
 
 
+def _is_quiet_backfill_event(event: object) -> bool:
+    if not isinstance(event, dict):
+        return False
+    # Only event kinds whose apply path suppresses every Workspace broadcast
+    # may bypass the project event lock. Other backfill operations still need
+    # the normal lock order even when their resource metadata says backfill.
+    if event.get("kind") not in {
+        "message.upsert",
+        "reaction.upsert",
+        "reaction.delete",
+        "topic.upsert",
+    }:
+        return False
+    payload = event.get("payload")
+    resource = payload.get("resource") if isinstance(payload, dict) else None
+    metadata = resource.get("provider_metadata") if isinstance(resource, dict) else None
+    return isinstance(metadata, dict) and metadata.get("delivery_class") == "backfill"
+
+
 class ProviderDataError(RuntimeError):
     status = 400
     error = "provider_request_invalid"
@@ -230,12 +249,8 @@ def _require_current_provider_inputs(
         or current["bridge_status"] not in {"active", "degraded"}
         or current["last_heartbeat_at"] is None
         or current["last_heartbeat_at"] < now - HEARTBEAT_MAX_AGE
-        or not _advertises_capability(
-            current["bridge_capabilities"], capability_name
-        )
-        or not _advertises_capability(
-            current["catalog_capabilities"], capability_name
-        )
+        or not _advertises_capability(current["bridge_capabilities"], capability_name)
+        or not _advertises_capability(current["catalog_capabilities"], capability_name)
     ):
         raise ProviderUnavailableError("External provider capability is unavailable")
     if capability_name != "messenger.file.transfer":
@@ -301,9 +316,7 @@ def _lock_associated_bridge(
         (account_uuid, provider, list(statuses)),
     ).fetchone()
     if row is None:
-        raise ProviderUnavailableError(
-            "External account bridge routing is unavailable"
-        )
+        raise ProviderUnavailableError("External account bridge routing is unavailable")
     return external_models.ExternalBridgeInstance.objects.get_one(
         filters={"uuid": dm_filters.EQ(row["uuid"])},
         session=session,
@@ -936,6 +949,10 @@ def apply_provider_event_batch(
         raise ProviderBatchError("Provider event batch size is invalid")
     now = now or datetime.datetime.now(datetime.timezone.utc)
     _bridge_capabilities(session, identity, now)
+    cache_attribute = "_workspace_provider_event_batch_cache"
+    missing_cache = object()
+    previous_cache = getattr(session, cache_attribute, missing_cache)
+    setattr(session, cache_attribute, {})
     try:
         # A timed-out request can still be committing while the bridge retries
         # an overlapping batch. Serialize all provider-event writers before
@@ -946,6 +963,7 @@ def apply_provider_event_batch(
             {
                 sys_uuid.UUID(str(event["project_id"]))
                 for event in events
+                if not _is_quiet_backfill_event(event)
             },
             key=str,
         )
@@ -956,54 +974,72 @@ def apply_provider_event_batch(
                 """,
                 (project_id,),
             )
+        requested_assignments = sorted(
+            {
+                (
+                    sys_uuid.UUID(str(event["external_account_uuid"])),
+                    sys_uuid.UUID(str(event["external_chat_uuid"])),
+                    sys_uuid.UUID(str(event["project_id"])),
+                )
+                for event in events
+            },
+            key=lambda value: tuple(map(str, value)),
+        )
+        validation = session.execute(
+            """
+            WITH requested(account_uuid, chat_uuid, project_id) AS (
+                SELECT * FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+            )
+            SELECT count(*) AS matched
+            FROM requested
+            JOIN "m_external_accounts_v2" AS account
+              ON account."uuid" = requested.account_uuid
+             AND account."provider" = %s
+            WHERE EXISTS (
+                SELECT 1
+                FROM "m_external_bridge_desired_resources_v1" AS desired
+                WHERE desired."bridge_instance_uuid" = %s
+                  AND desired."provider_kind" = %s
+                  AND desired."resource_type" = 'external_account'
+                  AND desired."resource_uuid" = account."uuid"
+                  AND desired."operation" = 'upsert'
+            )
+              AND EXISTS (
+                SELECT 1
+                FROM "m_external_bridge_desired_resources_v1" AS desired
+                WHERE desired."bridge_instance_uuid" = %s
+                  AND desired."provider_kind" = %s
+                  AND desired."resource_type" = 'external_chat_assignment'
+                  AND desired."resource_uuid" = requested.chat_uuid
+                  AND desired."operation" = 'upsert'
+                  AND desired."resource"->>'external_account_uuid' =
+                      requested.account_uuid::text
+                  AND desired."resource"->>'project_id' =
+                      requested.project_id::text
+                  AND desired."resource"->>'selected' = 'true'
+            )
+            """,
+            (
+                [value[0] for value in requested_assignments],
+                [value[1] for value in requested_assignments],
+                [value[2] for value in requested_assignments],
+                identity.provider_kind,
+                identity.bridge_instance_uuid,
+                identity.provider_kind,
+                identity.bridge_instance_uuid,
+                identity.provider_kind,
+            ),
+        ).fetchone()
+        if validation is None or int(validation["matched"]) != len(
+            requested_assignments
+        ):
+            raise ValueError(
+                "External account and chat are not assigned to this bridge"
+            )
         results = []
         for event in events:
             account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
-            chat_uuid = sys_uuid.UUID(str(event["external_chat_uuid"]))
             project_id = sys_uuid.UUID(str(event["project_id"]))
-            account = session.execute(
-                """
-                SELECT 1
-                FROM "m_external_accounts_v2" AS account
-                WHERE account."uuid" = %s AND account."provider" = %s
-                  AND EXISTS (
-                    SELECT 1
-                    FROM "m_external_bridge_desired_resources_v1" AS desired
-                    WHERE desired."bridge_instance_uuid" = %s
-                      AND desired."provider_kind" = %s
-                      AND desired."resource_type" = 'external_account'
-                      AND desired."resource_uuid" = account."uuid"
-                      AND desired."operation" = 'upsert'
-                  )
-                  AND EXISTS (
-                    SELECT 1
-                    FROM "m_external_bridge_desired_resources_v1" AS desired
-                    WHERE desired."bridge_instance_uuid" = %s
-                      AND desired."provider_kind" = %s
-                      AND desired."resource_type" = 'external_chat_assignment'
-                      AND desired."resource_uuid" = %s
-                      AND desired."operation" = 'upsert'
-                      AND desired."resource"->>'external_account_uuid' = %s
-                      AND desired."resource"->>'project_id' = %s
-                      AND desired."resource"->>'selected' = 'true'
-                  )
-                """,
-                (
-                    account_uuid,
-                    identity.provider_kind,
-                    identity.bridge_instance_uuid,
-                    identity.provider_kind,
-                    identity.bridge_instance_uuid,
-                    identity.provider_kind,
-                    chat_uuid,
-                    str(account_uuid),
-                    str(project_id),
-                ),
-            ).fetchone()
-            if account is None:
-                raise ValueError(
-                    "External account and chat are not assigned to this bridge"
-                )
             results.append(
                 apply_provider_event(
                     session,
@@ -1023,9 +1059,15 @@ def apply_provider_event_batch(
         TypeError,
         ValueError,
         ra_exceptions.ValidationErrorException,
+        storage_exceptions.ConflictRecords,
         storage_exceptions.RecordNotFound,
     ) as error:
         raise ProviderBatchError(str(error)) from error
+    finally:
+        if previous_cache is missing_cache:
+            delattr(session, cache_attribute)
+        else:
+            setattr(session, cache_attribute, previous_cache)
     return {"results": results}
 
 

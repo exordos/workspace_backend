@@ -42,6 +42,7 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import push_devices
 from workspace.external_bridge_control import provider_data
+from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import sql_state
 
 
@@ -481,11 +482,9 @@ PUSH_DEVICE_RESOURCE = ra_resources.ResourceByRAModel(
         },
     ),
 )
-PUSH_DEVICE_RESPONSE_SCHEMA = (
-    PUSH_DEVICE_RESOURCE.generate_schema_object(
-        ra_constants.GET,
-        oa_c.OPENAPI_SPECIFICATION_3_0_3,
-    )
+PUSH_DEVICE_RESPONSE_SCHEMA = PUSH_DEVICE_RESOURCE.generate_schema_object(
+    ra_constants.GET,
+    oa_c.OPENAPI_SPECIFICATION_3_0_3,
 )
 PUSH_DEVICE_UPDATE_RESPONSES = {
     200: {
@@ -797,10 +796,15 @@ class WorkspaceFileController(StoreResourceController):
             resource_uuid = typing.cast(sys_uuid.UUID, uuid)
             file = db.get_resource(self.resource_name, resource_uuid)
             result = db.delete_resource(self.resource_name, resource_uuid)
-        file_storage.delete_workspace_file(
-            file_uuid=resource_uuid,
-            storage_type=file["storage_type"],
-            storage_object_id=file["storage_object_id"],
+        shared_content = file["storage_object_id"].startswith(
+            file_repository.EXTERNAL_CONTENT_OBJECT_PREFIX
+        )
+        file_repository.delete_storage_object_if_unreferenced(
+            contexts.Context().get_session() if shared_content else None,
+            resource_uuid,
+            file["storage_type"],
+            file.get("storage_id", ""),
+            file["storage_object_id"],
         )
         file_storage.delete_workspace_file_metadata(
             file_uuid=resource_uuid,
@@ -1455,9 +1459,7 @@ class ExternalAccountController(ExternalResourceController):
                     "revision": chat.revision + 1,
                 }
                 if chat.selected:
-                    values["status"] = (
-                        external_models.ExternalChatStatus.SYNCING.value
-                    )
+                    values["status"] = external_models.ExternalChatStatus.SYNCING.value
                 _update_internal_fields(chat, values, session=session)
                 if chat.selected:
                     sql_state.append_upsert(
@@ -1592,7 +1594,7 @@ class ExternalAccountController(ExternalResourceController):
         )
         cleanup_files = session.execute(
             """
-            SELECT uuid, storage_type, storage_object_id
+            SELECT uuid, storage_type, storage_id, storage_object_id
             FROM m_workspace_files
             WHERE external_account_uuid = %s
             """,
@@ -1676,10 +1678,12 @@ class ExternalAccountController(ExternalResourceController):
         )
         account.delete(session=session)
         for item in cleanup_files:
-            file_storage.delete_workspace_file(
+            file_repository.delete_storage_object_if_unreferenced(
+                session,
                 item["uuid"],
-                storage_type=item["storage_type"],
-                storage_object_id=item["storage_object_id"],
+                item["storage_type"],
+                item.get("storage_id", ""),
+                item["storage_object_id"],
             )
             file_storage.delete_workspace_file_metadata(
                 item["uuid"],
@@ -1740,7 +1744,7 @@ class ExternalChatController(ExternalResourceController):
         )
         files = session.execute(
             """
-            SELECT uuid, storage_type, storage_object_id
+            SELECT uuid, storage_type, storage_id, storage_object_id
             FROM m_workspace_files
             WHERE stream_uuid = %s AND project_id = %s
               AND external_account_uuid = %s
@@ -1773,6 +1777,7 @@ class ExternalChatController(ExternalResourceController):
                         {
                             "uuid": str(row["uuid"]),
                             "storage_type": row["storage_type"],
+                            "storage_id": row["storage_id"],
                             "storage_object_id": row["storage_object_id"],
                         }
                         for row in files
@@ -1917,10 +1922,12 @@ class ExternalChatController(ExternalResourceController):
         if transition["phase"] == "sql_applied":
             if transition["action"] == "deselect":
                 for item in transition["cleanup_files"]:
-                    file_storage.delete_workspace_file(
+                    file_repository.delete_storage_object_if_unreferenced(
+                        session,
                         item["uuid"],
-                        storage_type=item["storage_type"],
-                        storage_object_id=item["storage_object_id"],
+                        item["storage_type"],
+                        item.get("storage_id", ""),
+                        item["storage_object_id"],
                     )
                     file_storage.delete_workspace_file_metadata(
                         item["uuid"], storage_type=item["storage_type"]
@@ -2734,9 +2741,7 @@ class ExternalProviderHealthController(ra_controllers.BaseResourceController):
         )
         session = contexts.Context().get_session()
         account_uuids = {account.uuid for account in accounts}
-        account_filter = {
-            "external_account_uuid": dm_filters.In(account_uuids)
-        }
+        account_filter = {"external_account_uuid": dm_filters.In(account_uuids)}
         chats = (
             external_models.ExternalChat.objects.get_all(
                 filters=account_filter,

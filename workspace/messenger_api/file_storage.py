@@ -19,6 +19,7 @@ import datetime
 import json
 import os
 import pathlib
+import tempfile
 import typing
 import uuid as sys_uuid
 
@@ -215,6 +216,26 @@ def get_workspace_file_path(
     )
 
 
+def _atomic_local_write(path: pathlib.Path, data: bytes) -> None:
+    """Replace one local object without sharing a temporary pathname."""
+    temporary_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temporary_path = pathlib.Path(file.name)
+            file.write(data)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 class LocalWorkspaceFileStorage:
     storage_type = file_storage_opts.STORAGE_TYPE_FILE
     storage_id = ""
@@ -231,10 +252,7 @@ class LocalWorkspaceFileStorage:
             storage_object_id=object_id,
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_name(f"{path.name}.tmp")
-        with open(temporary_path, "wb") as file:
-            file.write(data)
-        os.replace(temporary_path, path)
+        _atomic_local_write(path, data)
         return WorkspaceFileStorageInfo(
             storage_type=self.storage_type,
             storage_id=self.storage_id,
@@ -273,9 +291,7 @@ class LocalWorkspaceFileStorage:
     ) -> None:
         path = _get_local_file_path(get_workspace_file_metadata_object_id(file_uuid))
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_name(f"{path.name}.tmp")
-        temporary_path.write_bytes(metadata.to_json())
-        os.replace(temporary_path, path)
+        _atomic_local_write(path, metadata.to_json())
 
     def read_metadata(self, file_uuid: sys_uuid.UUID) -> WorkspaceFileMetadata:
         path = _get_local_file_path(get_workspace_file_metadata_object_id(file_uuid))

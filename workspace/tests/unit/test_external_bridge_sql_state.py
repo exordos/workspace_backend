@@ -52,8 +52,7 @@ def test_assignment_preserves_provider_topic_ids_after_display_name_collision():
     }
     topics_result = mock.Mock()
     topics_result.fetchall.return_value = [
-        {"uuid": topic_uuid, "name": "canonical"}
-        for topic_uuid in topic_uuids
+        {"uuid": topic_uuid, "name": "canonical"} for topic_uuid in topic_uuids
     ]
     session = SimpleNamespace(
         execute=mock.Mock(side_effect=[stream_result, topics_result])
@@ -238,6 +237,61 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     topic_updated.assert_called_once_with(topic, session=session)
     message_get_all.assert_not_called()
     message_updated.assert_not_called()
+
+
+def test_initial_sync_completion_emits_latest_message_per_topic(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    first = SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        created_at=datetime.datetime(2026, 8, 17, 10, tzinfo=datetime.timezone.utc),
+    )
+    second = SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        created_at=datetime.datetime(2026, 8, 17, 11, tzinfo=datetime.timezone.utc),
+    )
+    latest_result = mock.Mock()
+    latest_result.fetchall.return_value = [{"uuid": second.uuid}, {"uuid": first.uuid}]
+    session = SimpleNamespace(execute=mock.Mock(return_value=latest_result))
+    projected_events = mock.Mock()
+    created_events = mock.Mock()
+    message_get_all = mock.Mock(return_value=[second, first])
+    monkeypatch.setattr(
+        sql_state,
+        "_emit_projected_capability_events",
+        projected_events,
+    )
+    monkeypatch.setattr(
+        sql_state.models,
+        "WorkspaceMessage",
+        SimpleNamespace(objects=SimpleNamespace(get_all=message_get_all)),
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_events,
+        "create_message_events",
+        created_events,
+    )
+    chat = SimpleNamespace(
+        project_id=project_uuid,
+        projection_stream_uuid=stream_uuid,
+        owner_user_uuid=owner_uuid,
+    )
+
+    sql_state._emit_initial_sync_projection_events(session, chat)
+
+    projected_events.assert_called_once_with(
+        session,
+        {"project_id": project_uuid, "projection_stream_uuid": stream_uuid},
+    )
+    statement, parameters = session.execute.call_args.args
+    assert "DISTINCT ON (message.topic_uuid)" in statement
+    assert parameters == (project_uuid, stream_uuid)
+    assert message_get_all.call_args.kwargs["session"] is session
+    assert created_events.call_args_list == [
+        mock.call(project_uuid, first, [owner_uuid], session=session),
+        mock.call(project_uuid, second, [owner_uuid], session=session),
+    ]
 
 
 def test_projected_capability_updates_do_not_rewrite_message_history(monkeypatch):

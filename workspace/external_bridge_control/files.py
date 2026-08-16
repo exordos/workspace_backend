@@ -107,6 +107,10 @@ class ExternalFileTransferManager:
             [dict[str, Any], file_storage.WorkspaceFileStorageInfo], None
         ]
         | None = None,
+        resolve_workspace_content: Callable[
+            [str, int], file_storage.WorkspaceFileStorageInfo | None
+        ]
+        | None = None,
     ) -> None:
         self.control_state = control_state
         self.public_base_url = public_base_url.rstrip("/")
@@ -115,6 +119,7 @@ class ExternalFileTransferManager:
             resolve_workspace_file or self._resolve_workspace_file_sidecar
         )
         self.commit_file_projection = commit_file_projection or (lambda *_: None)
+        self.resolve_workspace_content = resolve_workspace_content or (lambda *_: None)
 
     def allocate_incoming(
         self,
@@ -144,10 +149,47 @@ class ExternalFileTransferManager:
                 )
             if existing["status"] == "finalized":
                 return existing["response"], False
+            if existing.get("content_reused") is True:
+                return (
+                    self._commit_incoming_projection(
+                        identity,
+                        file_uuid,
+                        existing,
+                        self._authorize_assignment(identity, existing["request"]),
+                        now,
+                    ),
+                    False,
+                )
             generation = existing["allocation_generation"] + 1
             self._delete_object(file_uuid, existing["object_id"])
         else:
             generation = 1
+        reusable = self.resolve_workspace_content(
+            request["sha256"], request["size_bytes"]
+        )
+        if reusable is not None:
+            transfer = {
+                "canonical_request": canonical,
+                "bridge_instance_uuid": str(identity.bridge_instance_uuid),
+                "request": request,
+                "status": "pending",
+                "phase": "final_object_saved",
+                "allocation_generation": generation,
+                "assignment": assignment,
+                "content_reused": True,
+                "storage_info": {
+                    "storage_type": reusable.storage_type,
+                    "storage_id": reusable.storage_id,
+                    "storage_object_id": reusable.storage_object_id,
+                },
+            }
+            self.control_state.file_transfer_put(key, transfer)
+            return (
+                self._commit_incoming_projection(
+                    identity, file_uuid, transfer, assignment, now
+                ),
+                existing is None,
+            )
         object_id = f"external-pending/{file_uuid}/{generation}"
         expires_at = now + URL_LIFETIME
         response = {
@@ -237,14 +279,6 @@ class ExternalFileTransferManager:
             raise FileTransferError(
                 "assignment_changed", "Chat assignment changed before finalization"
             )
-        chat = assignment["chat"]
-        account = assignment["account"]
-        stream_uuid = _projection_stream_uuid(chat)
-        if stream_uuid is None:
-            raise FileTransferError(
-                "operation_state_conflict",
-                "Chat projection is not ready for file finalization",
-            )
         if transfer["phase"] == "pending":
             data = self._read_object(file_uuid, transfer["object_id"])
             digest = hashlib.sha256(data).hexdigest()
@@ -259,7 +293,11 @@ class ExternalFileTransferManager:
             self.control_state.file_transfer_put(key, transfer)
         if transfer["phase"] == "verified":
             data = self._read_object(file_uuid, transfer["object_id"])
-            storage_info = file_storage.save_workspace_file(file_uuid, data)
+            storage_info = file_storage.save_workspace_file(
+                file_uuid,
+                data,
+                storage_object_id=self._content_object_id(expected["sha256"]),
+            )
             transfer["storage_info"] = {
                 "storage_type": storage_info.storage_type,
                 "storage_id": storage_info.storage_id,
@@ -267,7 +305,29 @@ class ExternalFileTransferManager:
             }
             transfer["phase"] = "final_object_saved"
             self.control_state.file_transfer_put(key, transfer)
+        return self._commit_incoming_projection(
+            identity, file_uuid, transfer, assignment, now
+        )
+
+    def _commit_incoming_projection(
+        self,
+        identity: Any,
+        file_uuid: sys_uuid.UUID,
+        transfer: dict[str, Any],
+        assignment: dict[str, Any],
+        now: datetime.datetime,
+    ) -> dict[str, Any]:
+        key = f"incoming:{file_uuid}"
+        expected = transfer["request"]
         storage_info = file_storage.WorkspaceFileStorageInfo(**transfer["storage_info"])
+        chat = assignment["chat"]
+        account = assignment["account"]
+        stream_uuid = _projection_stream_uuid(chat)
+        if stream_uuid is None:
+            raise FileTransferError(
+                "operation_state_conflict",
+                "Chat projection is not ready for file finalization",
+            )
         if "sidecar" not in transfer:
             created_at = _timestamp(now)
             transfer["sidecar"] = {
@@ -294,7 +354,7 @@ class ExternalFileTransferManager:
             self.control_state.file_transfer_put(key, transfer)
         sidecar = transfer["sidecar"]
         if transfer["phase"] == "final_object_saved":
-            self._save_sidecar(file_uuid, sidecar)
+            self._save_sidecar(file_uuid, sidecar, storage_info.storage_type)
             transfer["phase"] = "sidecar_saved"
             self.control_state.file_transfer_put(key, transfer)
         if transfer["phase"] == "sidecar_saved":
@@ -302,7 +362,8 @@ class ExternalFileTransferManager:
             transfer["phase"] = "projection_committed"
             self.control_state.file_transfer_put(key, transfer)
         if transfer["phase"] == "projection_committed":
-            self._delete_object(file_uuid, transfer["object_id"])
+            if "object_id" in transfer:
+                self._delete_object(file_uuid, transfer["object_id"])
             transfer["phase"] = "pending_deleted"
             self.control_state.file_transfer_put(key, transfer)
         file_urn = f"urn:{_urn_kind(expected['content_type'])}:{file_uuid}"
@@ -323,6 +384,10 @@ class ExternalFileTransferManager:
         transfer["response"] = response
         self.control_state.file_transfer_put(key, transfer)
         return response
+
+    @staticmethod
+    def _content_object_id(sha256: str) -> str:
+        return f"external-content/sha256/{sha256[:2]}/{sha256}"
 
     def _invalidate_transfer(
         self,
@@ -656,7 +721,11 @@ class ExternalFileTransferManager:
         file_storage.delete_workspace_file(file_uuid, storage_object_id=object_id)
 
     @staticmethod
-    def _save_sidecar(file_uuid: sys_uuid.UUID, sidecar: dict[str, Any]) -> None:
+    def _save_sidecar(
+        file_uuid: sys_uuid.UUID,
+        sidecar: dict[str, Any],
+        storage_type: str,
+    ) -> None:
         metadata = file_storage.WorkspaceFileMetadata(
             uuid=sys_uuid.UUID(sidecar["uuid"]),
             project_id=sys_uuid.UUID(sidecar["project_id"]),
@@ -671,7 +740,10 @@ class ExternalFileTransferManager:
             acl_mode=sidecar["acl"]["mode"],
             origin=sidecar["origin"],
         )
-        file_storage.save_workspace_file_metadata(metadata)
+        file_storage.save_workspace_file_metadata(
+            metadata,
+            storage_type=storage_type,
+        )
 
     @staticmethod
     def _resolve_workspace_file_sidecar(

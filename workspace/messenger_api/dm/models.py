@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import contextvars
 import datetime
 import enum
 import hashlib
@@ -32,6 +33,11 @@ from restalchemy.storage.sql import orm
 from workspace.common import file_storage_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
+
+
+_PROVIDER_MESSAGE_VALIDATION_CACHE: contextvars.ContextVar[
+    set[tuple[object, ...]] | None
+] = contextvars.ContextVar("provider_message_validation_cache", default=None)
 
 
 class ChatType(str, enum.Enum):
@@ -1107,26 +1113,30 @@ class WorkspaceMessage(
 
     def validate(self) -> None:
         super().validate()
-        binding = WorkspaceStreamBinding.objects.get_one_or_none(
-            filters={
-                "project_id": dm_filters.EQ(self.project_id),
-                "stream_uuid": dm_filters.EQ(self.stream_uuid),
-                "user_uuid": dm_filters.EQ(self.user_uuid),
-            },
-        )
-        if binding is None and (
-            self.provider_uuid is None or self.external_account_uuid is None
-        ):
-            raise ra_exc.ValidationErrorException()
-        topic = WorkspaceStreamTopic.objects.get_one_or_none(
-            filters={
-                "uuid": dm_filters.EQ(self.topic_uuid),
-                "project_id": dm_filters.EQ(self.project_id),
-                "stream_uuid": dm_filters.EQ(self.stream_uuid),
-            },
-        )
-        if topic is None:
-            raise ra_exc.ValidationErrorException()
+        if self.provider_uuid is None or self.external_account_uuid is None:
+            binding = WorkspaceStreamBinding.objects.get_one_or_none(
+                filters={
+                    "project_id": dm_filters.EQ(self.project_id),
+                    "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                },
+            )
+            if binding is None:
+                raise ra_exc.ValidationErrorException()
+        validation_cache = _PROVIDER_MESSAGE_VALIDATION_CACHE.get()
+        topic_key = (self.project_id, self.stream_uuid, self.topic_uuid)
+        if validation_cache is None or topic_key not in validation_cache:
+            topic = WorkspaceStreamTopic.objects.get_one_or_none(
+                filters={
+                    "uuid": dm_filters.EQ(self.topic_uuid),
+                    "project_id": dm_filters.EQ(self.project_id),
+                    "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                },
+            )
+            if topic is None:
+                raise ra_exc.ValidationErrorException()
+            if validation_cache is not None:
+                validation_cache.add(topic_key)
 
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(

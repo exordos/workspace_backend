@@ -430,6 +430,8 @@ def ensure_external_chat_stream(
     source: collections.abc.Mapping[str, typing.Any],
     capabilities: collections.abc.Mapping[str, typing.Any],
     account_settings: collections.abc.Mapping[str, typing.Any],
+    emit_events: bool = True,
+    reconcile_participants: bool = True,
 ) -> None:
     """Create the canonical stream and materialize all participant bindings."""
     stream = models.WorkspaceStream.objects.get_one_or_none(
@@ -481,7 +483,14 @@ def ensure_external_chat_stream(
                 "external_id": provider_chat_id,
                 "capabilities": dict(capabilities),
             },
+            emit_events=emit_events,
         )
+    elif not reconcile_participants:
+        if stream.user_uuid != owner_user_uuid:
+            raise ValueError(
+                "Provider stream projection owner does not match assignment"
+            )
+        return
     participants = {
         sys_uuid.UUID(str(participant["identity_uuid"])): participant["role"]
         for participant in source["participants"]
@@ -504,10 +513,10 @@ def ensure_external_chat_stream(
         if user_uuid == owner_user_uuid or user_uuid not in revoked_user_uuids
     }
     if stream is not None and getattr(stream, "private_index", None) is not None:
-        if (
-            len(participants) != 2
-            or stream.private_index
-            != helpers.build_private_stream_index(*participants)
+        if len(
+            participants
+        ) != 2 or stream.private_index != helpers.build_private_stream_index(
+            *participants
         ):
             raise ValueError(
                 "Native direct stream participants do not match assignment"
@@ -534,7 +543,8 @@ def ensure_external_chat_stream(
             uuid=participant_uuid,
             username=f"{provider_kind}-{participant_uuid}",
             source=models.WorkspaceUserSource.ZULIP.value,
-            status=models.WorkspaceUserStatus.ACTIVE.value,
+            # The provider directory reports account enablement, not presence.
+            status=models.WorkspaceUserStatus.OFFLINE.value,
             first_name=participant["display_name"],
             provider_uuid=bridge_instance_uuid,
             external_account_uuid=external_account_uuid,
@@ -552,6 +562,7 @@ def ensure_external_chat_stream(
         who_uuid=owner_user_uuid,
         role_user_uuids=role_user_uuids,
         session=session,
+        emit_events=emit_events,
     )
     existing_bindings = models.WorkspaceStreamBinding.objects.get_all(
         filters={

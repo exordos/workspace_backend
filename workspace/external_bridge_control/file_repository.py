@@ -15,6 +15,8 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
 
+EXTERNAL_CONTENT_OBJECT_PREFIX = "external-content/sha256/"
+
 
 class CanonicalFileRepository:
     """Canonical SQL projection and current-access resolver for bridge files."""
@@ -89,6 +91,32 @@ class CanonicalFileRepository:
                 **expected,
             )
 
+    def find_reusable_content(
+        self,
+        sha256: str,
+        size_bytes: int,
+    ) -> file_storage.WorkspaceFileStorageInfo | None:
+        with self._current_session() as session:
+            row = session.execute(
+                """
+                SELECT storage_type, storage_id, storage_object_id
+                FROM m_workspace_files
+                WHERE hash = %s AND size_bytes = %s
+                  AND external_account_uuid IS NOT NULL
+                  AND storage_object_id LIKE 'external-content/sha256/%%'
+                LIMIT 1
+                FOR SHARE
+                """,
+                (sha256, size_bytes),
+            ).fetchone()
+            if row is None:
+                return None
+            return file_storage.WorkspaceFileStorageInfo(
+                storage_type=row["storage_type"],
+                storage_id=row["storage_id"],
+                storage_object_id=row["storage_object_id"],
+            )
+
     def resolve(self, file_uuid: sys_uuid.UUID | str) -> dict[str, Any] | None:
         file_uuid = sys_uuid.UUID(str(file_uuid))
         with self._current_session() as session:
@@ -145,3 +173,35 @@ class CanonicalFileRepository:
                 "storage_object_id": canonical.storage_object_id,
                 "origin": metadata.origin,
             }
+
+
+def delete_storage_object_if_unreferenced(
+    session: Any | None,
+    file_uuid: sys_uuid.UUID | str,
+    storage_type: str,
+    storage_id: str,
+    storage_object_id: str,
+) -> None:
+    if not storage_object_id.startswith(EXTERNAL_CONTENT_OBJECT_PREFIX):
+        file_storage.delete_workspace_file(
+            file_uuid=sys_uuid.UUID(str(file_uuid)),
+            storage_type=storage_type,
+            storage_object_id=storage_object_id,
+        )
+        return
+    assert session is not None
+    referenced = session.execute(
+        """
+        SELECT 1
+        FROM m_workspace_files
+        WHERE storage_type = %s AND storage_id = %s AND storage_object_id = %s
+        LIMIT 1
+        """,
+        (storage_type, storage_id, storage_object_id),
+    ).fetchone()
+    if referenced is None:
+        file_storage.delete_workspace_file(
+            file_uuid=sys_uuid.UUID(str(file_uuid)),
+            storage_type=storage_type,
+            storage_object_id=storage_object_id,
+        )

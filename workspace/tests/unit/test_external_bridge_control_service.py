@@ -314,7 +314,8 @@ def test_provider_ingress_is_bound_to_authenticated_bridge_assignment(
         item for item in session.statements if "pg_advisory_xact_lock" not in item[0]
     ]
     assert provider_statements[0][1][0] == other_instance_uuid
-    assert provider_statements[1][1][2] == other_instance_uuid
+    assert provider_statements[1][1][4] == other_instance_uuid
+    assert provider_statements[1][1][6] == other_instance_uuid
 
 
 def test_enrollment_invalid_token_is_401_and_does_not_consume_generation(
