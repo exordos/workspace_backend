@@ -87,6 +87,24 @@ resources:
             value: 1024
           - profile: $workspace.imports.$profile_legacy:uuid
             value: 1024
+    workspace_projection_disk_size:
+      name: "workspace_projection_disk_size"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace.imports.$profile_develop:uuid
+            value: 30
+          - profile: $workspace.imports.$profile_small:uuid
+            value: 30
+          - profile: $workspace.imports.$profile_medium:uuid
+            value: 30
+          - profile: $workspace.imports.$profile_large:uuid
+            value: 512
+          - profile: $workspace.imports.$profile_legacy:uuid
+            value: 512
 
   # Canonical action permissions for realm-level external-provider operations.
   # The element owns only the permission catalog. Operators grant the required
@@ -294,7 +312,7 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       cpu: 8
       ram: 4096
-      disk_size: 30
+      disk_size: $core.vs.variables.$workspace_projection_disk_size:value
       version: $workspace.imports.$pg18:uuid
 
   $dbaas.types.postgres.instances.$workspace_projection_cluster.users:

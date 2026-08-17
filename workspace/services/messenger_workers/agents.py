@@ -37,6 +37,8 @@ EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
 HEARTBEAT_RETENTION = datetime.timedelta(hours=24)
 PROJECTION_REPAIR_LIMIT = 5
 CAPABILITY_REFRESH_LIMIT = 100
+CAPABILITY_PROJECTION_REFRESH_LIMIT = 100
+CAPABILITY_PROJECTION_BATCH_SIZE = 16
 DATABASE_DEADLOCK_MAX_ATTEMPTS = 3
 DATABASE_DEADLOCK_RETRY_BASE_SECONDS = 0.05
 
@@ -94,17 +96,16 @@ class MessengerWorkerAgent(basic.BasicService):
             summary_topic_claim_seconds,
             topic_summarization.MAX_PROVIDER_ATTEMPTS
             * (
-                summary_request_timeout_seconds
-                + topic_summary_opts.CLAIM_GRACE_SECONDS
-            )
+                summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS
+            ),
         )
         self._summary_endpoint_claim_seconds = max(
             summary_endpoint_claim_seconds,
-            summary_request_timeout_seconds
-            + topic_summary_opts.CLAIM_GRACE_SECONDS,
+            summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS,
         )
         self._last_event_prune: float | None = None
         self._capability_refresh_cursor: object | None = None
+        self._capability_projection_refresh_cursor: object | None = None
 
     def _prune_expired_events(
         self,
@@ -149,14 +150,13 @@ class MessengerWorkerAgent(basic.BasicService):
                     now=now,
                 )
         except Exception:
-            LOG.exception(
-                "Failed to refresh stale Workspace presence and bridge rows"
-            )
+            LOG.exception("Failed to refresh stale Workspace presence and bridge rows")
         else:
             if degraded:
                 LOG.info("Degraded %d stale external bridge instances", degraded)
 
         self._refresh_capabilities(now)
+        self._refresh_capability_projections()
 
         if prune_due:
             try:
@@ -207,9 +207,7 @@ class MessengerWorkerAgent(basic.BasicService):
             try:
                 summary = topic_summarization.call_openai_compatible_endpoint(
                     work,
-                    connect_timeout_seconds=(
-                        self._summary_connect_timeout_seconds
-                    ),
+                    connect_timeout_seconds=(self._summary_connect_timeout_seconds),
                     timeout_seconds=self._summary_request_timeout_seconds,
                 )
             except topic_summarization.ProviderCallError as error:
@@ -353,11 +351,79 @@ class MessengerWorkerAgent(basic.BasicService):
             extra={
                 "capability_refresh_batch_size": batch_size,
                 "capability_refresh_failure_count": failure_count,
-                "capability_refresh_duration_seconds": (
-                    time.monotonic() - started_at
-                ),
+                "capability_refresh_duration_seconds": (time.monotonic() - started_at),
                 "capability_refresh_lock_wait_seconds": lock_wait_seconds,
                 "capability_refresh_deadlock_retries": deadlock_retries,
+            },
+        )
+
+    def _refresh_capability_projections(self) -> None:
+        """Drain stale projection metadata in separately committed batches."""
+        started_at = time.monotonic()
+        after_uuid = self._capability_projection_refresh_cursor
+        batch_count = 0
+        entity_count = 0
+        recipient_count = 0
+        event_count = 0
+        failure_count = 0
+        max_batch_duration_seconds = 0.0
+        for _batch_index in range(CAPABILITY_PROJECTION_REFRESH_LIMIT):
+            claimed_uuid = None
+            batch_started_at = time.monotonic()
+            try:
+                with database_session_context() as session:
+                    claimed_uuid = (
+                        sql_state.claim_capability_projection_refresh_account(
+                            session,
+                            after_uuid=after_uuid,
+                        )
+                    )
+                    if claimed_uuid is None:
+                        if after_uuid is not None:
+                            after_uuid = None
+                            self._capability_projection_refresh_cursor = None
+                            continue
+                        break
+                    entities, recipients, events = (
+                        sql_state.refresh_projected_capabilities_batch(
+                            session,
+                            account_uuid=claimed_uuid,
+                            batch_size=CAPABILITY_PROJECTION_BATCH_SIZE,
+                        )
+                    )
+            except Exception:
+                failure_count += 1
+                LOG.exception(
+                    "Failed to refresh external capability projections",
+                    extra={"external_account_uuid": str(claimed_uuid)},
+                )
+                if claimed_uuid is None:
+                    break
+            else:
+                batch_count += 1
+                entity_count += entities
+                recipient_count += recipients
+                event_count += events
+                max_batch_duration_seconds = max(
+                    max_batch_duration_seconds,
+                    time.monotonic() - batch_started_at,
+                )
+            after_uuid = claimed_uuid
+            self._capability_projection_refresh_cursor = claimed_uuid
+        LOG.info(
+            "Completed bounded external capability projection refresh",
+            extra={
+                "capability_projection_batch_count": batch_count,
+                "capability_projection_entity_count": entity_count,
+                "capability_projection_recipient_count": recipient_count,
+                "capability_projection_event_count": event_count,
+                "capability_projection_failure_count": failure_count,
+                "capability_projection_max_batch_duration_seconds": (
+                    max_batch_duration_seconds
+                ),
+                "capability_projection_duration_seconds": (
+                    time.monotonic() - started_at
+                ),
             },
         )
 

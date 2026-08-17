@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import threading
+import time
 import uuid as sys_uuid
 
 import pytest
@@ -21,6 +22,7 @@ from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
 from workspace.external_bridge_control import sql_state
+from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api import file_storage
 from workspace.tests.integration import conftest
@@ -1888,6 +1890,334 @@ def test_worker_capability_refresh_does_not_wait_on_heartbeat_bridge_lock(
         heartbeat_result = heartbeat_future.result(timeout=3)
 
     assert heartbeat_result["heartbeat_uuid"] == heartbeat_request["heartbeat_uuid"]
+
+
+def test_large_capability_projection_refresh_releases_lock_between_topic_batches(
+    _database,
+    db,
+):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            project_uuid,
+            owner_uuid,
+            "Large capability projection",
+        )
+    )
+    recipient_uuids = [owner_uuid]
+    for _index in range(15):
+        recipient_uuid = sys_uuid.uuid4()
+        recipient_uuids.append(recipient_uuid)
+        conftest.seed_user_stream_binding(
+            db,
+            project_uuid,
+            stream_uuid,
+            recipient_uuid,
+        )
+    available_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        }
+    }
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (
+                uuid, provider, identity_generation, status,
+                capabilities, last_heartbeat_at
+            ) VALUES (%s, 'zulip', 1, 'active', %s::jsonb, %s)
+            """,
+            (
+                instance_uuid,
+                json.dumps(available_capability),
+                now - datetime.timedelta(seconds=61),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_control_instances_v1 (
+                bridge_instance_uuid, provider_kind, identity_generation,
+                encryption_key_uuid, encryption_public_key
+            ) VALUES (%s, 'zulip', 1, %s, 'test-public-key')
+            """,
+            (instance_uuid, sys_uuid.uuid4()),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (
+                account_uuid,
+                owner_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.test",
+                        "default_project_id": str(project_uuid),
+                    }
+                ),
+                json.dumps(available_capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(instance_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities,
+                catalog_capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:large', %s::jsonb,
+                'Large capability projection', TRUE, %s, %s, 'live',
+                %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                owner_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "chat_type": "channel",
+                        "participants": [],
+                        "topics": [],
+                    }
+                ),
+                project_uuid,
+                stream_uuid,
+                json.dumps(available_capability),
+                json.dumps(available_capability),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET external_account_uuid = %s,
+                provider_metadata = jsonb_build_object(
+                    'capabilities', %s::jsonb
+                )
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                account_uuid,
+                json.dumps(available_capability),
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, name, stream_uuid, external_account_uuid,
+                provider_metadata, created_at, updated_at
+            )
+            SELECT
+                md5(%s || ':' || sequence.value::text)::uuid,
+                %s,
+                'topic-' || sequence.value::text,
+                %s,
+                %s,
+                jsonb_build_object('capabilities', %s::jsonb),
+                NOW(),
+                NOW()
+            FROM generate_series(1, 1000) AS sequence(value)
+            """,
+            (
+                str(chat_uuid),
+                project_uuid,
+                stream_uuid,
+                account_uuid,
+                json.dumps(available_capability),
+            ),
+        )
+
+    session_factory = engines.engine_factory.get_engine().session_manager
+    repository = sql_state.SQLControlState(realm_uuid, b"k" * 32)
+    identity = _identity(instance_uuid, realm_uuid)
+    heartbeat_request = {
+        "heartbeat_uuid": str(sys_uuid.uuid4()),
+        "client_timestamp": "2026-08-17T00:00:00Z",
+        "image_version": "test",
+        "provider_kind": "zulip",
+        "capabilities": available_capability,
+        "blocked_batch": None,
+    }
+    first_topic_batch_committed = threading.Event()
+    release_projection_batches = threading.Event()
+    batch_stats = []
+
+    def refresh_capabilities_and_projections():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '10s'")
+            sql_state.refresh_effective_capabilities(
+                session,
+                account_uuid=account_uuid,
+                now=now,
+            )
+        while True:
+            with session_factory() as session:
+                claimed = session.execute(
+                    """
+                    SELECT uuid
+                    FROM m_external_accounts_v2
+                    WHERE uuid = %s
+                      AND EXISTS (
+                          SELECT 1
+                          FROM m_external_chats_v2 AS chat
+                          JOIN m_workspace_streams AS stream
+                            ON stream.project_id = chat.project_id
+                           AND stream.uuid = chat.projection_stream_uuid
+                          WHERE chat.external_account_uuid = %s
+                            AND (
+                                stream.provider_metadata->'capabilities'
+                                    IS DISTINCT FROM chat.capabilities
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM m_workspace_stream_topics AS topic
+                                    WHERE topic.project_id = chat.project_id
+                                      AND topic.stream_uuid =
+                                          chat.projection_stream_uuid
+                                      AND topic.provider_metadata->'capabilities'
+                                          IS DISTINCT FROM chat.capabilities
+                                )
+                            )
+                      )
+                    FOR UPDATE
+                    """,
+                    (account_uuid, account_uuid),
+                ).fetchone()
+                if claimed is None:
+                    return
+                stats = sql_state.refresh_projected_capabilities_batch(
+                    session,
+                    account_uuid=account_uuid,
+                    batch_size=16,
+                )
+            batch_stats.append(stats)
+            if len(batch_stats) == 2:
+                first_topic_batch_committed.set()
+                if not release_projection_batches.wait(timeout=5):
+                    raise TimeoutError("projection batches were not released")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        refresh_future = executor.submit(refresh_capabilities_and_projections)
+        assert first_topic_batch_committed.wait(timeout=10)
+        try:
+            heartbeat_started_at = time.monotonic()
+            heartbeat_future = executor.submit(
+                _request_call,
+                repository.heartbeat,
+                identity,
+                heartbeat_request,
+                now=now,
+            )
+            heartbeat_result = heartbeat_future.result(timeout=2)
+            heartbeat_duration = time.monotonic() - heartbeat_started_at
+            project_event_started_at = time.monotonic()
+            with session_factory() as session:
+                session.execute("SET LOCAL lock_timeout = '1s'")
+                messenger_events.create_broadcast_event(
+                    project_uuid,
+                    sys_uuid.uuid4(),
+                    [owner_uuid],
+                    messenger_events.USER_UPDATED_EVENT,
+                    {"uuid": str(owner_uuid)},
+                    session=session,
+                )
+            project_event_duration = time.monotonic() - project_event_started_at
+        finally:
+            release_projection_batches.set()
+        refresh_future.result(timeout=30)
+
+    assert heartbeat_result["heartbeat_uuid"] == heartbeat_request["heartbeat_uuid"]
+    assert heartbeat_duration < 2
+    assert project_event_duration < 2
+    assert batch_stats[0][0] == 1
+    assert batch_stats[1][0] == 16
+    assert all(entities <= 16 for entities, _recipients, _events in batch_stats)
+    assert sum(entities for entities, _recipients, _events in batch_stats) == 1001
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT capabilities
+            FROM m_external_chats_v2
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+        offline_capabilities = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT
+                (SELECT provider_metadata->'capabilities'
+                 FROM m_workspace_streams
+                 WHERE project_id = %s AND uuid = %s),
+                COUNT(*) FILTER (
+                    WHERE provider_metadata->'capabilities'
+                          IS NOT DISTINCT FROM %s::jsonb
+                )
+            FROM m_workspace_stream_topics
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (
+                project_uuid,
+                stream_uuid,
+                json.dumps(offline_capabilities),
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        stream_capabilities, refreshed_topics = cursor.fetchone()
+        assert stream_capabilities == offline_capabilities
+        assert refreshed_topics == 1000
+        cursor.execute(
+            """
+            SELECT object_type, MIN(epoch_version), MAX(epoch_version), COUNT(*)
+            FROM m_workspace_broadcast_message_events_v1
+            WHERE project_id = %s AND object_type IN ('stream', 'topic')
+            GROUP BY object_type
+            ORDER BY object_type
+            """,
+            (project_uuid,),
+        )
+        events_by_type = {row[0]: row[1:] for row in cursor.fetchall()}
+    assert events_by_type["stream"][2] == 1
+    assert events_by_type["topic"][2] == 1000
+    assert events_by_type["stream"][0] < events_by_type["topic"][0]
 
 
 def test_observed_account_report_reconciles_snapshot_and_stale_report_cannot_regress(

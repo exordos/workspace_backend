@@ -120,6 +120,11 @@ def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
         "_repair_external_projection_transitions",
         lambda session: calls.append(("repair", session.name)),
     )
+    monkeypatch.setattr(
+        worker,
+        "_refresh_capability_projections",
+        lambda: calls.append(("capability-projections",)),
+    )
 
     worker._iteration()
 
@@ -204,6 +209,11 @@ def test_worker_continues_projection_repair_after_event_prune_rollback(
         worker,
         "_repair_external_projection_transitions",
         lambda session: calls.append(("repair", session.name)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_refresh_capability_projections",
+        lambda: calls.append(("capability-projections",)),
     )
 
     worker._iteration()
@@ -314,6 +324,53 @@ def test_capability_refresh_cursor_continues_after_bounded_batch(monkeypatch):
     assert ("claim", "first", None) in calls
     assert ("claim", "second", first_uuid) in calls
     assert worker._capability_refresh_cursor == second_uuid
+
+
+def test_capability_projection_refresh_commits_each_bounded_batch(monkeypatch):
+    calls = []
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    sessions = iter(
+        [
+            types.SimpleNamespace(name="first-batch"),
+            types.SimpleNamespace(name="wrap"),
+            types.SimpleNamespace(name="second-batch"),
+        ]
+    )
+    monkeypatch.setattr(agents, "CAPABILITY_PROJECTION_REFRESH_LIMIT", 3)
+    monkeypatch.setattr(
+        agents,
+        "database_session_context",
+        lambda: _SessionContext(next(sessions), calls),
+    )
+    claim_values = iter((account_uuid, None, account_uuid))
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_projection_refresh_account",
+        lambda session, *, after_uuid: (
+            calls.append(("claim-projection", session.name, after_uuid))
+            or next(claim_values)
+        ),
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
+        "refresh_projected_capabilities_batch",
+        lambda session, *, account_uuid, batch_size: (
+            calls.append(("refresh-projection", session.name, account_uuid, batch_size))
+            or (batch_size, 80, batch_size)
+        ),
+    )
+
+    worker = agents.MessengerWorkerAgent()
+    worker._refresh_capability_projections()
+
+    assert ("exit", "first-batch", None) in calls
+    assert ("enter", "second-batch") in calls
+    assert calls.index(("exit", "first-batch", None)) < calls.index(
+        ("enter", "second-batch")
+    )
+    refreshes = [call for call in calls if call[0] == "refresh-projection"]
+    assert len(refreshes) == 2
+    assert all(call[3] == agents.CAPABILITY_PROJECTION_BATCH_SIZE for call in refreshes)
 
 
 def test_capability_refresh_failure_is_not_counted_as_success(monkeypatch):
