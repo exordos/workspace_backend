@@ -1246,6 +1246,102 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_events[4], "topic", "read", "topic.read"
         )
 
+    def test_create_stream_events_compacts_recipient_snapshots(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        streams = [
+            {"uuid": stream_uuid, "user_uuid": sys_uuid.uuid4()},
+            {"uuid": stream_uuid, "user_uuid": sys_uuid.uuid4()},
+        ]
+        session = object()
+
+        with mock.patch.object(
+            events,
+            "create_resource_broadcast_event",
+            return_value=[73],
+        ) as create_broadcast:
+            result = events.create_stream_events(
+                project_id,
+                streams,
+                session=session,
+                compact=True,
+            )
+
+        self.assertEqual([73], result)
+        create_broadcast.assert_called_once_with(
+            project_id,
+            stream_uuid,
+            events.STREAM_CREATED_EVENT,
+            streams,
+            events._stream_from_event_payload,
+            session=session,
+        )
+
+    def test_create_message_updated_events_accepts_mapping_snapshots(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        messages = [
+            {"uuid": message_uuid, "user_uuid": sys_uuid.uuid4()},
+            {"uuid": message_uuid, "user_uuid": sys_uuid.uuid4()},
+        ]
+        session = object()
+
+        with mock.patch.object(
+            events,
+            "create_resource_broadcast_event",
+            return_value=[74],
+        ) as create_broadcast:
+            result = events.create_message_updated_events(
+                project_id,
+                iter(messages),
+                session=session,
+                compact=True,
+            )
+
+        self.assertEqual([74], result)
+        create_broadcast.assert_called_once_with(
+            project_id,
+            message_uuid,
+            events.MESSAGE_UPDATED_EVENT,
+            messages,
+            events._message_from_event_payload,
+            session=session,
+        )
+
+    def test_create_compact_message_events_preserves_persisted_flags(self):
+        project_id = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        snapshot = {
+            "uuid": message_uuid,
+            "user_uuid": sys_uuid.uuid4(),
+            "read": False,
+            "pinned": True,
+            "starred": True,
+            "reactions": {"eyes": 2},
+        }
+        session = object()
+
+        with mock.patch.object(
+            events,
+            "create_resource_broadcast_event",
+            return_value=[75],
+        ) as create_broadcast:
+            result = events.create_compact_message_events(
+                project_id,
+                [snapshot],
+                session=session,
+            )
+
+        self.assertEqual([75], result)
+        create_broadcast.assert_called_once_with(
+            project_id,
+            message_uuid,
+            events.MESSAGE_CREATED_EVENT,
+            [snapshot],
+            events._message_from_event_payload,
+            session=session,
+        )
+
     def test_source_provenance_keeps_nullable_provider_delivery_extensions(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()

@@ -1215,6 +1215,7 @@ def _create_stream_folder_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
+            session=session,
         )
         messenger_events.create_folder_updated_event(
             folder=user_folder,
@@ -1698,18 +1699,25 @@ ORDER BY binding.user_uuid
 
 
 _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL = """
-WITH reactions AS (
-    SELECT COALESCE(
-        jsonb_object_agg(counts.emoji_name, counts.reaction_count),
-        '{}'::jsonb
-    ) AS value
+WITH reaction_counts AS (
+    SELECT
+        reaction.message_uuid,
+        reaction.emoji_name,
+        COUNT(*) AS reaction_count
+    FROM m_workspace_message_reactions AS reaction
+    WHERE reaction.project_id = %s
+      AND reaction.message_uuid = ANY(%s::uuid[])
+    GROUP BY reaction.message_uuid, reaction.emoji_name
+), reactions AS (
+    SELECT
+        counts.message_uuid,
+        jsonb_object_agg(counts.emoji_name, counts.reaction_count) AS value
     FROM (
-        SELECT reaction.emoji_name, COUNT(*) AS reaction_count
-        FROM m_workspace_message_reactions AS reaction
-        WHERE reaction.project_id = %s
-          AND reaction.message_uuid = %s
-        GROUP BY reaction.emoji_name
+        SELECT message_uuid, emoji_name, reaction_count
+        FROM reaction_counts
+        ORDER BY message_uuid, emoji_name
     ) AS counts
+    GROUP BY counts.message_uuid
 )
 SELECT
     message.uuid,
@@ -1725,7 +1733,7 @@ SELECT
     COALESCE(flags.pinned, FALSE) AS pinned,
     COALESCE(flags.starred, FALSE) AS starred,
     message.user_uuid = recipient.user_uuid AS is_own,
-    reactions.value AS reactions,
+    COALESCE(reactions.value, '{}'::jsonb) AS reactions,
     message.source_name,
     message.source,
     POSITION(
@@ -1735,15 +1743,115 @@ SELECT
     message.reaction_users
 FROM m_workspace_messages AS message
 CROSS JOIN unnest(%s::uuid[]) AS recipient(user_uuid)
-CROSS JOIN reactions
+LEFT JOIN reactions ON reactions.message_uuid = message.uuid
 LEFT JOIN m_workspace_user_message_flags AS flags
   ON flags.uuid = message.uuid
  AND flags.project_id = message.project_id
  AND flags.user_uuid = recipient.user_uuid
 WHERE message.project_id = %s
-  AND message.uuid = %s
-ORDER BY recipient.user_uuid
+  AND message.uuid = ANY(%s::uuid[])
+ORDER BY message.created_at, message.uuid, recipient.user_uuid
 """
+
+
+def get_compact_workspace_stream_users(
+    project_id: object,
+    stream_uuid: object,
+    user_uuids: typing.Any,
+    session: typing.Any = None,
+) -> list[object]:
+    """Return the scoped recipients accepted by the compact projections."""
+    recipients = sorted({sys_uuid.UUID(str(value)) for value in user_uuids}, key=str)
+    if not recipients:
+        return []
+    with _workspace_session(session) as current_session:
+        return _compact_message_visible_users(
+            project_id,
+            recipients,
+            stream_uuid,
+            current_session,
+        )
+
+
+def get_compact_workspace_user_stream_snapshots(
+    project_id: object,
+    stream_uuid: object,
+    user_uuids: typing.Any,
+    session: typing.Any = None,
+) -> list[typing.Any]:
+    """Build one stream snapshot per scoped user without a global view scan."""
+    recipients = sorted({sys_uuid.UUID(str(value)) for value in user_uuids}, key=str)
+    if not recipients:
+        return []
+    with _workspace_session(session) as current_session:
+        return list(
+            current_session.execute(
+                _COMPACT_USER_STREAM_SNAPSHOTS_SQL,
+                (
+                    project_id,
+                    recipients,
+                    stream_uuid,
+                    stream_uuid,
+                    project_id,
+                    recipients,
+                ),
+            ).fetchall()
+        )
+
+
+def get_compact_workspace_user_topic_snapshots(
+    project_id: object,
+    topic_uuid: object,
+    user_uuids: typing.Any,
+    session: typing.Any = None,
+) -> list[typing.Any]:
+    """Build one topic snapshot per scoped user without a global view scan."""
+    recipients = sorted({sys_uuid.UUID(str(value)) for value in user_uuids}, key=str)
+    if not recipients:
+        return []
+    with _workspace_session(session) as current_session:
+        return list(
+            current_session.execute(
+                _COMPACT_USER_TOPIC_SNAPSHOTS_SQL,
+                (
+                    project_id,
+                    recipients,
+                    topic_uuid,
+                    topic_uuid,
+                    project_id,
+                    recipients,
+                ),
+            ).fetchall()
+        )
+
+
+def get_compact_workspace_user_message_snapshots(
+    project_id: object,
+    message_uuids: typing.Any,
+    user_uuids: typing.Any,
+    session: typing.Any = None,
+) -> list[typing.Any]:
+    """Build persisted message snapshots without expanding the global view."""
+    messages = sorted(
+        {sys_uuid.UUID(str(value)) for value in message_uuids},
+        key=str,
+    )
+    recipients = sorted({sys_uuid.UUID(str(value)) for value in user_uuids}, key=str)
+    if not messages or not recipients:
+        return []
+    with _workspace_session(session) as current_session:
+        return list(
+            current_session.execute(
+                _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL,
+                (
+                    project_id,
+                    messages,
+                    recipients,
+                    project_id,
+                    messages,
+                ),
+            ).fetchall()
+        )
 
 
 def _compact_message_visible_users(
@@ -1905,16 +2013,12 @@ def create_compact_workspace_message_updated_events(
         )
         if not visible_users:
             return
-        user_messages = current_session.execute(
-            _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL,
-            (
-                project_id,
-                message.uuid,
-                visible_users,
-                project_id,
-                message.uuid,
-            ),
-        ).fetchall()
+        user_messages = get_compact_workspace_user_message_snapshots(
+            project_id,
+            [message.uuid],
+            visible_users,
+            session=current_session,
+        )
         messenger_events.create_message_updated_events(
             project_id,
             user_messages,
@@ -1965,6 +2069,7 @@ def create_workspace_stream_binding_events(
             project_id=binding.project_id,
             user_uuid=binding.user_uuid,
             stream_uuid=binding.stream_uuid,
+            session=session,
         )
     except storage_exc.RecordNotFound:
         stream = models.WorkspaceStream.objects.get_one(
@@ -1987,6 +2092,58 @@ def create_workspace_stream_binding_events(
         private=user_stream.private,
         session=session,
     )
+
+
+def create_compact_workspace_stream_binding_events(
+    bindings: typing.Any, session: typing.Any = None
+) -> None:
+    bindings = list(bindings)
+    if not bindings:
+        return
+    binding = bindings[0]
+    user_uuids = sorted({item.user_uuid for item in bindings}, key=str)
+    with _workspace_session(session) as current_session:
+        visible_users = get_compact_workspace_stream_users(
+            binding.project_id,
+            binding.stream_uuid,
+            user_uuids,
+            session=current_session,
+        )
+        user_streams = get_compact_workspace_user_stream_snapshots(
+            binding.project_id,
+            binding.stream_uuid,
+            visible_users,
+            session=current_session,
+        )
+        if not user_streams:
+            return
+        messenger_events.create_stream_events(
+            binding.project_id,
+            user_streams,
+            session=current_session,
+            compact=True,
+        )
+        private = bool(user_streams[0]["private"])
+        folder_uuids = [
+            ALL_CHATS_FOLDER_UUID,
+            PERSONAL_FOLDER_UUID if private else CHANNELS_FOLDER_UUID,
+        ]
+        user_folders = models.UserFolder.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(binding.project_id),
+                "user_uuid": dm_filters.In(visible_users),
+                "uuid": dm_filters.In(folder_uuids),
+            },
+            session=current_session,
+        )
+        for folder_uuid in folder_uuids:
+            messenger_events.create_folder_updated_events(
+                binding.project_id,
+                [folder for folder in user_folders if folder.uuid == folder_uuid],
+                folder_uuid,
+                session=current_session,
+                compact=True,
+            )
 
 
 def create_workspace_stream_bindings_created_events(
@@ -2364,12 +2521,16 @@ def get_or_create_workspace_stream_bindings(
                 role=role,
                 session=session,
                 uuid=(binding_uuids or {}).get(str(user_uuid)),
-                emit_events=emit_events,
+                emit_events=False,
             )
             result.append(binding)
             if created:
                 created_bindings.append(binding)
     if emit_events:
+        create_compact_workspace_stream_binding_events(
+            bindings=created_bindings,
+            session=session,
+        )
         create_workspace_stream_bindings_created_events(
             bindings=created_bindings,
             session=session,

@@ -1928,7 +1928,7 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
         )
     )
     recipient_uuids = [owner_uuid]
-    for _index in range(15):
+    for _index in range(299):
         recipient_uuid = sys_uuid.uuid4()
         recipient_uuids.append(recipient_uuid)
         conftest.seed_user_stream_binding(
@@ -2043,7 +2043,9 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
         cursor.execute(
             """
             UPDATE m_workspace_streams
-            SET external_account_uuid = %s,
+            SET source_name = 'zulip',
+                source = '{"kind": "zulip", "stream_id": 42}'::jsonb,
+                external_account_uuid = %s,
                 provider_metadata = jsonb_build_object(
                     'capabilities', %s::jsonb
                 )
@@ -2071,7 +2073,7 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
                 jsonb_build_object('capabilities', %s::jsonb),
                 NOW(),
                 NOW()
-            FROM generate_series(1, 1000) AS sequence(value)
+            FROM generate_series(1, 64) AS sequence(value)
             """,
             (
                 str(chat_uuid),
@@ -2217,7 +2219,9 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         refresh_future = executor.submit(refresh_capabilities_and_projections)
-        assert first_topic_batch_committed.wait(timeout=10)
+        if not first_topic_batch_committed.wait(timeout=10):
+            refresh_future.result(timeout=1)
+            pytest.fail("capability projection did not commit two batches")
         try:
             heartbeat_started_at = time.monotonic()
             heartbeat_future = executor.submit(
@@ -2251,7 +2255,7 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
     assert batch_stats[0][0] == 1
     assert batch_stats[1][0] == 16
     assert all(entities <= 16 for entities, _recipients, _events in batch_stats)
-    assert sum(entities for entities, _recipients, _events in batch_stats) == 1001
+    assert sum(entities for entities, _recipients, _events in batch_stats) == 65
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -2285,7 +2289,7 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
         )
         stream_capabilities, refreshed_topics = cursor.fetchone()
         assert stream_capabilities == offline_capabilities
-        assert refreshed_topics == 1000
+        assert refreshed_topics == 64
         cursor.execute(
             """
             SELECT object_type, MIN(epoch_version), MAX(epoch_version), COUNT(*)
@@ -2298,7 +2302,7 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
         )
         events_by_type = {row[0]: row[1:] for row in cursor.fetchall()}
     assert events_by_type["stream"][2] == 1
-    assert events_by_type["topic"][2] == 1000
+    assert events_by_type["topic"][2] == 64
     assert events_by_type["stream"][0] < events_by_type["topic"][0]
 
 

@@ -16,6 +16,7 @@ from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api.dm import helpers as messenger_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
 
@@ -497,6 +498,20 @@ def _emit_target_updated_events(
     target_type: str,
     target_uuid: object,
 ) -> None:
+    if target_type == "message":
+        message = models.WorkspaceMessage.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "uuid": dm_filters.EQ(target_uuid),
+            },
+            session=session,
+        )
+        messenger_helpers.create_compact_workspace_message_updated_events(
+            project_id,
+            message,
+            session=session,
+        )
+        return
     model_and_event = {
         "stream": (
             models.WorkspaceUserStream,
@@ -505,10 +520,6 @@ def _emit_target_updated_events(
         "topic": (
             models.WorkspaceUserTopic,
             messenger_events.create_topic_updated_event,
-        ),
-        "message": (
-            models.WorkspaceUserMessage,
-            messenger_events.create_message_updated_event,
         ),
     }.get(target_type)
     if model_and_event is None:

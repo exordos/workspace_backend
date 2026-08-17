@@ -109,13 +109,15 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
-def test_postgresql_runtime_has_import_scale_work_memory():
+def test_postgresql_runtime_has_import_scale_session_tuning():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
-        assert "?options=-c%20work_mem%3D32MB" in config
+        assert (
+            "?options=-c%20work_mem%3D32MB%20-c%20jit%3Doff" in config
+        )
 
 
 def test_reaction_user_lists_have_bounded_runtime_defaults():

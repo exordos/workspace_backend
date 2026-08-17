@@ -346,21 +346,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=other_user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=other_user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -621,21 +625,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=direct_user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=direct_user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -790,11 +798,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -1202,6 +1212,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         create_stream_event.assert_called_once_with(
             stream=user_stream,
@@ -1213,11 +1224,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -1278,6 +1291,205 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers.PERSONAL_FOLDER_UUID,
             ],
             folder_uuids,
+        )
+
+    def test_create_compact_workspace_stream_binding_events_batches_snapshots(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        first_user_uuid = sys_uuid.uuid4()
+        second_user_uuid = sys_uuid.uuid4()
+        bindings = [
+            types.SimpleNamespace(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=first_user_uuid,
+            ),
+            types.SimpleNamespace(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=second_user_uuid,
+            ),
+        ]
+        user_streams = [
+            {"uuid": stream_uuid, "user_uuid": first_user_uuid, "private": False},
+            {"uuid": stream_uuid, "user_uuid": second_user_uuid, "private": False},
+        ]
+        all_folders = [
+            types.SimpleNamespace(
+                uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                user_uuid=first_user_uuid,
+            ),
+            types.SimpleNamespace(
+                uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                user_uuid=second_user_uuid,
+            ),
+        ]
+        channel_folders = [
+            types.SimpleNamespace(
+                uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                user_uuid=first_user_uuid,
+            ),
+            types.SimpleNamespace(
+                uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                user_uuid=second_user_uuid,
+            ),
+        ]
+        session = object()
+        get_folders = mock.Mock(return_value=all_folders + channel_folders)
+        visible_users = sorted([first_user_uuid, second_user_uuid], key=str)
+
+        class FakeUserFolder:
+            objects = types.SimpleNamespace(get_all=get_folders)
+
+        with (
+            mock.patch.object(dm_helpers.models, "UserFolder", FakeUserFolder),
+            mock.patch.object(
+                dm_helpers,
+                "get_compact_workspace_stream_users",
+                return_value=visible_users,
+            ) as get_visible_users,
+            mock.patch.object(
+                dm_helpers,
+                "get_compact_workspace_user_stream_snapshots",
+                return_value=user_streams,
+            ) as get_stream_snapshots,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_stream_events",
+            ) as create_stream_events,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_folder_updated_events",
+            ) as create_folder_events,
+        ):
+            dm_helpers.create_compact_workspace_stream_binding_events(
+                bindings,
+                session=session,
+            )
+
+        get_visible_users.assert_called_once_with(
+            project_id,
+            stream_uuid,
+            mock.ANY,
+            session=session,
+        )
+        self.assertEqual(
+            {first_user_uuid, second_user_uuid},
+            set(get_visible_users.call_args.args[2]),
+        )
+        get_stream_snapshots.assert_called_once_with(
+            project_id,
+            stream_uuid,
+            visible_users,
+            session=session,
+        )
+        create_stream_events.assert_called_once_with(
+            project_id,
+            user_streams,
+            session=session,
+            compact=True,
+        )
+        get_folders.assert_called_once()
+        self.assertIs(session, get_folders.call_args.kwargs["session"])
+        create_folder_events.assert_has_calls(
+            [
+                mock.call(
+                    project_id,
+                    all_folders,
+                    dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
+                    compact=True,
+                ),
+                mock.call(
+                    project_id,
+                    channel_folders,
+                    dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
+                    compact=True,
+                ),
+            ]
+        )
+
+    def test_compact_projection_snapshots_use_scoped_sql(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        first_user_uuid = sys_uuid.uuid4()
+        second_user_uuid = sys_uuid.uuid4()
+        users = [second_user_uuid, first_user_uuid, second_user_uuid]
+        stream_rows = [{"uuid": stream_uuid, "user_uuid": first_user_uuid}]
+        topic_rows = [{"uuid": topic_uuid, "user_uuid": first_user_uuid}]
+        message_uuid = sys_uuid.uuid4()
+        message_rows = [
+            {
+                "uuid": message_uuid,
+                "user_uuid": first_user_uuid,
+                "read": True,
+                "pinned": True,
+                "starred": False,
+                "reactions": {"eyes": 2},
+            }
+        ]
+        session = types.SimpleNamespace(
+            execute=mock.Mock(
+                side_effect=[
+                    types.SimpleNamespace(fetchall=mock.Mock(return_value=stream_rows)),
+                    types.SimpleNamespace(fetchall=mock.Mock(return_value=topic_rows)),
+                    types.SimpleNamespace(
+                        fetchall=mock.Mock(return_value=message_rows)
+                    ),
+                ]
+            )
+        )
+
+        self.assertEqual(
+            stream_rows,
+            dm_helpers.get_compact_workspace_user_stream_snapshots(
+                project_id,
+                stream_uuid,
+                users,
+                session=session,
+            ),
+        )
+        self.assertEqual(
+            topic_rows,
+            dm_helpers.get_compact_workspace_user_topic_snapshots(
+                project_id,
+                topic_uuid,
+                users,
+                session=session,
+            ),
+        )
+        self.assertEqual(
+            message_rows,
+            dm_helpers.get_compact_workspace_user_message_snapshots(
+                project_id,
+                [message_uuid],
+                users,
+                session=session,
+            ),
+        )
+
+        stream_statement, stream_values = session.execute.call_args_list[0].args
+        topic_statement, topic_values = session.execute.call_args_list[1].args
+        message_statement, message_values = session.execute.call_args_list[2].args
+        self.assertEqual(
+            dm_helpers._COMPACT_USER_STREAM_SNAPSHOTS_SQL, stream_statement
+        )
+        self.assertEqual(dm_helpers._COMPACT_USER_TOPIC_SNAPSHOTS_SQL, topic_statement)
+        self.assertNotIn("m_workspace_user_streams", stream_statement)
+        self.assertNotIn("m_workspace_user_topics", topic_statement)
+        self.assertNotIn("m_workspace_user_messages_view", message_statement)
+        self.assertIn("m_workspace_user_message_flags", message_statement)
+        self.assertIn("m_workspace_message_reactions", message_statement)
+        expected_users = sorted([first_user_uuid, second_user_uuid], key=str)
+        self.assertEqual(expected_users, stream_values[1])
+        self.assertEqual(expected_users, stream_values[5])
+        self.assertEqual(expected_users, topic_values[1])
+        self.assertEqual(expected_users, topic_values[5])
+        self.assertEqual(
+            (project_id, [message_uuid], expected_users, project_id, [message_uuid]),
+            message_values,
         )
 
     def test_create_workspace_stream_binding_events_skips_hidden_zulip_stream(
@@ -1716,6 +1928,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers,
                 "create_workspace_stream_bindings_created_events",
             ) as create_batch_events,
+            mock.patch.object(
+                dm_helpers,
+                "create_compact_workspace_stream_binding_events",
+            ) as create_compact_events,
         ):
             result = dm_helpers.get_or_create_workspace_stream_bindings(
                 project_id=project_id,
@@ -1770,6 +1986,64 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
         create_batch_events.assert_not_called()
+        create_compact_events.assert_not_called()
+
+    def test_get_or_create_workspace_stream_bindings_batches_created_events(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        who_uuid = sys_uuid.uuid4()
+        first_user_uuid = sys_uuid.uuid4()
+        second_user_uuid = sys_uuid.uuid4()
+        session = object()
+        first_binding = types.SimpleNamespace(user_uuid=first_user_uuid)
+        second_binding = types.SimpleNamespace(user_uuid=second_user_uuid)
+
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_or_create_workspace_stream_binding",
+                side_effect=[
+                    (first_binding, True),
+                    (second_binding, True),
+                ],
+            ) as get_or_create_binding,
+            mock.patch.object(
+                dm_helpers,
+                "create_compact_workspace_stream_binding_events",
+            ) as create_compact_events,
+            mock.patch.object(
+                dm_helpers,
+                "create_workspace_stream_bindings_created_events",
+            ) as create_binding_events,
+        ):
+            result = dm_helpers.get_or_create_workspace_stream_bindings(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                who_uuid=who_uuid,
+                role_user_uuids={
+                    dm_helpers.models.WorkspaceStreamRole.MEMBER.value: [
+                        first_user_uuid,
+                        second_user_uuid,
+                    ]
+                },
+                session=session,
+            )
+
+        self.assertEqual([first_binding, second_binding], result)
+        self.assertTrue(
+            all(
+                call.kwargs["emit_events"] is False
+                for call in get_or_create_binding.call_args_list
+            )
+        )
+        create_compact_events.assert_called_once_with(
+            bindings=[first_binding, second_binding],
+            session=session,
+        )
+        create_binding_events.assert_called_once_with(
+            bindings=[first_binding, second_binding],
+            session=session,
+        )
 
     def test_create_workspace_stream_binding_message_flags_inserts_missing(self):
         project_id = sys_uuid.uuid4()
