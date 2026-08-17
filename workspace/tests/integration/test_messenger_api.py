@@ -7759,6 +7759,46 @@ def test_unread_counters_split_active_and_passive_notification_traffic(api, db):
     assert latest_stream_event["passive_unread_count"] == 3
 
 
+def test_compact_topic_unread_event_serializes_non_default_as_false(api, db):
+    target_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact topic boolean"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, target_user)
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "Imported topic"
+    )
+
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "new message"},
+        },
+    )
+    assert response.status_code == 201, response.text
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND payload->>'kind' = 'topic.updated'
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (api.project_id, target_user, topic_uuid),
+        )
+        payload = cursor.fetchone()[0]
+
+    assert payload["unread_count"] == 1
+    assert payload["is_default"] is False
+
+
 def test_message_mention_edit_refreshes_unread_snapshots(api, db):
     target_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(

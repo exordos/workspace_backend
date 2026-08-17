@@ -1647,7 +1647,7 @@ SELECT
     topic.project_id,
     topic.created_at,
     topic.updated_at,
-    (topic.uuid = stream.default_topic_uuid) AS is_default,
+    COALESCE(topic.uuid = stream.default_topic_uuid, FALSE) AS is_default,
     binding.user_uuid,
     COALESCE(unread.unread_count, 0) AS unread_count,
     COALESCE(unread.active_unread_count, 0) AS active_unread_count,
