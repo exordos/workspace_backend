@@ -503,7 +503,14 @@ def _message_event(
     stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
     if stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider message does not belong to the selected stream")
-    existing = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
+    validation_token = models._PROVIDER_MESSAGE_VALIDATION_CACHE.set(set())
+    try:
+        # A provider echo can arrive after the native author's stream binding
+        # was removed. Load the persisted message in this trusted reconciliation
+        # scope, then attach provider identity before the updated model is saved.
+        existing = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
+    finally:
+        models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
     if existing is not None and _is_stale_provider_message(existing, resource):
         # A live record may overtake an older history record by design. Once the
         # newer provider sequence is stored, the delayed snapshot must not
@@ -579,7 +586,13 @@ def _message_event(
         },
         sys_uuid.UUID(str(event["external_account_uuid"])),
     )
-    if identity.provider_kind != models.SourceName.NATIVE.value and (
+    if (
+        existing is not None
+        and getattr(existing, "source_name", None) == models.SourceName.NATIVE.value
+    ):
+        values.pop("source_name", None)
+        values.pop("source", None)
+    elif identity.provider_kind != models.SourceName.NATIVE.value and (
         values.get("source_name") != identity.provider_kind or "source" not in values
     ):
         assignment_source = assignment.get("source") or {}
@@ -686,7 +699,6 @@ def _message_event(
                 message_uuid,
                 {"read": read_value},
                 session=session,
-                allow_author_unread=True,
                 emit_events=False,
             )
         else:
@@ -834,40 +846,55 @@ def _sync_provider_read_state(
         """,
         (reader_uuid, project_id, message_uuids),
     ).fetchall()
-    if any(
-        message["stream_uuid"] != stream_uuid
-        or (topic_uuid is not None and message["topic_uuid"] != topic_uuid)
-        for message in messages
-    ):
+    if any(message["stream_uuid"] != stream_uuid for message in messages):
         raise ValueError("Provider read state message is outside the selected chat")
-    changed_message_uuids = [
-        message["uuid"] for message in messages if message["read"] != read
-    ]
-    if not changed_message_uuids:
+    changed_message_uuids_by_read = {True: [], False: []}
+    message_by_uuid = {message["uuid"]: message for message in messages}
+    for message in messages:
+        effective_read = read or message["author_uuid"] == reader_uuid
+        if message["read"] != effective_read:
+            changed_message_uuids_by_read[effective_read].append(message["uuid"])
+    if not any(changed_message_uuids_by_read.values()):
         return
-    updated_rows = session.execute(
-        """
-        UPDATE m_workspace_user_message_flags
-        SET read = %s, updated_at = NOW()
-        WHERE project_id = %s
-          AND user_uuid = %s
-          AND uuid = ANY(%s::uuid[])
-          AND read IS DISTINCT FROM %s
-        RETURNING uuid
-        """,
-        (read, project_id, reader_uuid, changed_message_uuids, read),
-    ).fetchall()
-    updated_message_uuids = [row["uuid"] for row in updated_rows]
+    updated_message_uuids_by_read = {True: [], False: []}
+    for effective_read, changed_message_uuids in changed_message_uuids_by_read.items():
+        if not changed_message_uuids:
+            continue
+        updated_rows = session.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = %s, updated_at = NOW()
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+              AND read IS DISTINCT FROM %s
+            RETURNING uuid
+            """,
+            (
+                effective_read,
+                project_id,
+                reader_uuid,
+                changed_message_uuids,
+                effective_read,
+            ),
+        ).fetchall()
+        updated_message_uuids_by_read[effective_read] = [
+            row["uuid"] for row in updated_rows
+        ]
+    updated_message_uuids = [
+        *updated_message_uuids_by_read[True],
+        *updated_message_uuids_by_read[False],
+    ]
     if not updated_message_uuids:
         return
-    if read:
+    if updated_message_uuids_by_read[True]:
         helpers.messenger_events.create_messages_read_event(
             project_id,
             reader_uuid,
-            updated_message_uuids,
+            updated_message_uuids_by_read[True],
             session=session,
         )
-    else:
+    if updated_message_uuids_by_read[False]:
         # Aggregates alone cannot update the read flag of an already-open
         # message. Emit the same exact per-user snapshots as the single-message
         # flag path, but fetch the changed set in one query.
@@ -875,7 +902,7 @@ def _sync_provider_read_state(
             filters={
                 "project_id": dm_filters.EQ(project_id),
                 "user_uuid": dm_filters.EQ(reader_uuid),
-                "uuid": dm_filters.In(updated_message_uuids),
+                "uuid": dm_filters.In(updated_message_uuids_by_read[False]),
             },
             order_by={"uuid": "asc"},
             session=session,
@@ -887,9 +914,8 @@ def _sync_provider_read_state(
             )
     changed_topic_uuids = sorted(
         {
-            message["topic_uuid"]
-            for message in messages
-            if message["uuid"] in updated_message_uuids
+            message_by_uuid[message_uuid]["topic_uuid"]
+            for message_uuid in updated_message_uuids
         },
         key=str,
     )

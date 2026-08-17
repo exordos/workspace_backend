@@ -486,7 +486,21 @@ def ensure_external_chat_stream(
             emit_events=emit_events,
         )
     elif not reconcile_participants:
-        if stream.user_uuid != owner_user_uuid:
+        if getattr(stream, "private_index", None) is not None:
+            participant_uuids = {
+                sys_uuid.UUID(str(participant["identity_uuid"]))
+                for participant in source["participants"]
+            }
+            if (
+                len(participant_uuids) != 2
+                or owner_user_uuid not in participant_uuids
+                or stream.private_index
+                != helpers.build_private_stream_index(*participant_uuids)
+            ):
+                raise ValueError(
+                    "Native direct stream participants do not match assignment"
+                )
+        elif stream.user_uuid != owner_user_uuid:
             raise ValueError(
                 "Provider stream projection owner does not match assignment"
             )

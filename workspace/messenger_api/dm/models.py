@@ -1113,7 +1113,10 @@ class WorkspaceMessage(
 
     def validate(self) -> None:
         super().validate()
-        if self.provider_uuid is None or self.external_account_uuid is None:
+        validation_cache = _PROVIDER_MESSAGE_VALIDATION_CACHE.get()
+        if validation_cache is None and (
+            self.provider_uuid is None or self.external_account_uuid is None
+        ):
             binding = WorkspaceStreamBinding.objects.get_one_or_none(
                 filters={
                     "project_id": dm_filters.EQ(self.project_id),
@@ -1123,7 +1126,6 @@ class WorkspaceMessage(
             )
             if binding is None:
                 raise ra_exc.ValidationErrorException()
-        validation_cache = _PROVIDER_MESSAGE_VALIDATION_CACHE.get()
         topic_key = (self.project_id, self.stream_uuid, self.topic_uuid)
         if validation_cache is None or topic_key not in validation_cache:
             topic = WorkspaceStreamTopic.objects.get_one_or_none(
