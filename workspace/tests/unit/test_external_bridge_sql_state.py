@@ -159,6 +159,28 @@ def test_capability_refresh_claim_is_ordered_and_skips_locked_accounts():
     assert params == (account_uuid,)
 
 
+def test_assignment_repair_locks_chats_and_requires_distinct_verified_users():
+    calls = []
+    result = mock.Mock()
+    result.fetchall.return_value = []
+    session = SimpleNamespace(
+        execute=lambda statement, params: calls.append((statement, params)) or result
+    )
+
+    assert (
+        sql_state.repair_external_chat_assignments(
+            session,
+            sys_uuid.uuid4(),
+            sys_uuid.uuid4(),
+            "zulip",
+        )
+        == 0
+    )
+    statement, _params = calls[0]
+    assert "COUNT(DISTINCT workspace_user.uuid)" in statement
+    assert "FOR UPDATE OF chat SKIP LOCKED" in statement
+
+
 def test_stale_bridge_degradation_is_an_independent_bridge_only_update():
     now = datetime.datetime(2026, 7, 29, tzinfo=datetime.timezone.utc)
     calls = []

@@ -235,13 +235,61 @@ def repair_external_chat_assignments(
     """Re-emit selected chat assignments that are absent or behind."""
     rows = session.execute(
         """
-        SELECT chat.uuid
+        SELECT chat.uuid, projection_repair.required AS repair_projection
         FROM m_external_chats_v2 AS chat
         LEFT JOIN m_external_bridge_desired_resources_v1 AS desired
           ON desired.bridge_instance_uuid = %s
          AND desired.provider_kind = %s
          AND desired.resource_type = 'external_chat_assignment'
          AND desired.resource_uuid = chat.uuid
+        LEFT JOIN LATERAL (
+            SELECT
+                STRING_AGG(
+                    participant->>'identity_uuid',
+                    ':' ORDER BY participant->>'identity_uuid'
+                ) AS private_index,
+                COUNT(*) AS participant_count,
+                COUNT(DISTINCT workspace_user.uuid) AS verified_count
+            FROM jsonb_array_elements(
+                CASE
+                    WHEN jsonb_typeof(chat.source->'participants') = 'array'
+                    THEN chat.source->'participants'
+                    ELSE '[]'::jsonb
+                END
+            ) AS participant
+            LEFT JOIN m_workspace_users AS workspace_user
+              ON workspace_user.uuid::text = participant->>'identity_uuid'
+             AND workspace_user.source = 'iam'
+        ) AS participant_index ON TRUE
+        LEFT JOIN m_workspace_streams AS native_stream
+          ON native_stream.project_id = chat.project_id
+         AND native_stream.private_index = participant_index.private_index
+        LEFT JOIN m_workspace_stream_topics AS default_topic
+          ON default_topic.project_id = native_stream.project_id
+         AND default_topic.uuid = native_stream.default_topic_uuid
+        LEFT JOIN LATERAL (
+            SELECT (
+                chat.source->>'chat_type' = 'personal'
+                AND participant_index.participant_count = 2
+                AND participant_index.verified_count = 2
+                AND jsonb_array_length(
+                    CASE
+                        WHEN jsonb_typeof(chat.source->'topics') = 'array'
+                        THEN chat.source->'topics'
+                        ELSE '[]'::jsonb
+                    END
+                ) = 1
+                AND native_stream.uuid IS NOT NULL
+                AND (
+                    chat.projection_stream_uuid IS DISTINCT FROM native_stream.uuid
+                    OR native_stream.default_topic_uuid IS NULL
+                    OR default_topic.name IS DISTINCT FROM
+                       INITCAP(REPLACE(chat.provider, '_', ' '))
+                    OR chat.source#>>'{topics,0,topic_uuid}'
+                       IS DISTINCT FROM native_stream.default_topic_uuid::text
+                )
+            ) AS required
+        ) AS projection_repair ON TRUE
         WHERE chat.external_account_uuid = %s
           AND chat.selected
           AND chat.project_id IS NOT NULL
@@ -252,9 +300,11 @@ def repair_external_chat_assignments(
           AND (
               desired.resource_uuid IS NULL
               OR desired.generation < chat.revision
+              OR projection_repair.required
           )
         ORDER BY chat.uuid
         LIMIT %s
+        FOR UPDATE OF chat SKIP LOCKED
         """,
         (
             bridge_instance_uuid,
@@ -269,6 +319,46 @@ def repair_external_chat_assignments(
             filters={"uuid": dm_filters.EQ(row["uuid"])},
             session=session,
         )
+        projection_repaired = False
+        if row["repair_projection"]:
+            (
+                projection_stream_uuid,
+                source,
+                projection_changed,
+            ) = external_projection.reconcile_personal_chat_projection(
+                session,
+                project_id=chat.project_id,
+                provider_kind=chat.provider,
+                source=chat.source,
+                projection_stream_uuid=chat.projection_stream_uuid,
+            )
+            projection_repaired = (
+                projection_changed
+                or projection_stream_uuid != chat.projection_stream_uuid
+                or source != chat.source
+            )
+            if projection_repaired:
+                session.execute(
+                    """
+                    UPDATE m_external_chats_v2
+                    SET projection_stream_uuid = %s,
+                        source = %s::jsonb,
+                        revision = revision + 1,
+                        updated_at = NOW()
+                    WHERE uuid = %s
+                    """,
+                    (
+                        projection_stream_uuid,
+                        _json(source),
+                        chat.uuid,
+                    ),
+                )
+                chat = external_models.ExternalChat.objects.get_one(
+                    filters={"uuid": dm_filters.EQ(row["uuid"])},
+                    session=session,
+                )
+                if projection_changed:
+                    identity_linking.invalidate_direct_event_history(session)
         change_uuid = append_upsert(
             session,
             sys_uuid.UUID(str(bridge_instance_uuid)),
@@ -276,6 +366,19 @@ def repair_external_chat_assignments(
             external_chat_assignment_desired(chat, session=session),
         )
         repaired += int(change_uuid is not None)
+        if projection_repaired:
+            messenger_events.create_external_resource_event(
+                chat.project_id,
+                chat.owner_user_uuid,
+                chat,
+                messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
+                hidden_fields=(
+                    "owner_user_uuid",
+                    "provider",
+                    "provider_chat_id",
+                ),
+                session=session,
+            )
     return repaired
 
 

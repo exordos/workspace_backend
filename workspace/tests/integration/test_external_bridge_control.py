@@ -625,9 +625,26 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
             ),
         )
 
-    report["report_uuid"] = str(sys_uuid.uuid4())
-    result = _request_call(repository.observed_reports, identity, [report])
-    assert result["results"][0]["status"] == "applied"
+    with engines.engine_factory.get_engine().session_manager() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 1
+        )
+    with engines.engine_factory.get_engine().session_manager() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 0
+        )
     with db.cursor() as cursor:
         cursor.execute(
             """
