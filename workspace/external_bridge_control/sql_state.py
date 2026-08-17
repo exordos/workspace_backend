@@ -24,6 +24,7 @@ from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import external_projection
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
 
@@ -33,6 +34,12 @@ LOG = logging.getLogger(__name__)
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _row_value(row: Any, name: str) -> Any:
+    if hasattr(row, "get"):
+        return row.get(name)
+    return getattr(row, name)
 
 
 _BRIDGE_DEGRADED_AFTER = datetime.timedelta(seconds=30)
@@ -394,15 +401,21 @@ def _emit_projected_capability_events(
 ) -> tuple[int, int, int]:
     if chat["project_id"] is None or chat["projection_stream_uuid"] is None:
         return 0, 0, 0
-    filters = {
-        "project_id": dm_filters.EQ(chat["project_id"]),
-        "uuid": dm_filters.EQ(chat["projection_stream_uuid"]),
-    }
-    streams = list(
-        models.WorkspaceUserStream.objects.get_all(
-            filters=filters,
+    recipients = messenger_dm_helpers.get_compact_workspace_stream_users(
+        chat["project_id"],
+        chat["projection_stream_uuid"],
+        models.get_stream_recipients(
+            chat["project_id"],
+            chat["projection_stream_uuid"],
             session=session,
-        )
+        ),
+        session=session,
+    )
+    streams = messenger_dm_helpers.get_compact_workspace_user_stream_snapshots(
+        chat["project_id"],
+        chat["projection_stream_uuid"],
+        recipients,
+        session=session,
     )
     prepared = []
     stream_event = messenger_events.prepare_stream_updated_broadcast(
@@ -412,23 +425,38 @@ def _emit_projected_capability_events(
     )
     if stream_event is not None:
         prepared.append(stream_event)
-    topics = list(
-        models.WorkspaceUserTopic.objects.get_all(
-            filters={
-                "project_id": dm_filters.EQ(chat["project_id"]),
-                "stream_uuid": dm_filters.EQ(chat["projection_stream_uuid"]),
-            },
-            session=session,
+    topic_rows = session.execute(
+        """
+        SELECT uuid
+        FROM m_workspace_stream_topics
+        WHERE project_id = %s AND stream_uuid = %s
+        ORDER BY uuid
+        """,
+        (chat["project_id"], chat["projection_stream_uuid"]),
+    ).fetchall()
+    topics = []
+    for topic_row in topic_rows:
+        topics.extend(
+            messenger_dm_helpers.get_compact_workspace_user_topic_snapshots(
+                chat["project_id"],
+                topic_row["uuid"],
+                recipients,
+                session=session,
+            )
         )
-    )
     # Serialize every recipient-specific view before the first broadcast takes
     # the transaction-scoped project lock. Sorting keeps stream-before-topic
     # and topic UUID order deterministic once the prepared events are written.
-    topics.sort(key=lambda topic: (str(topic.uuid), str(topic.user_uuid)))
+    topics.sort(
+        key=lambda topic: (
+            str(_row_value(topic, "uuid")),
+            str(_row_value(topic, "user_uuid")),
+        )
+    )
     topic_broadcasts = 0
     for _topic_uuid, group in itertools.groupby(
         topics,
-        key=lambda topic: topic.uuid,
+        key=lambda topic: _row_value(topic, "uuid"),
     ):
         topic_event = messenger_events.prepare_topic_updated_broadcast(
             chat["project_id"],
@@ -527,11 +555,19 @@ def refresh_projected_capabilities_batch(
             ),
         )
         streams = list(
-            models.WorkspaceUserStream.objects.get_all(
-                filters={
-                    "project_id": dm_filters.EQ(stream["project_id"]),
-                    "uuid": dm_filters.EQ(stream["projection_stream_uuid"]),
-                },
+            messenger_dm_helpers.get_compact_workspace_user_stream_snapshots(
+                stream["project_id"],
+                stream["projection_stream_uuid"],
+                messenger_dm_helpers.get_compact_workspace_stream_users(
+                    stream["project_id"],
+                    stream["projection_stream_uuid"],
+                    models.get_stream_recipients(
+                        stream["project_id"],
+                        stream["projection_stream_uuid"],
+                        session=session,
+                    ),
+                    session=session,
+                ),
                 session=session,
             )
         )
@@ -609,20 +645,49 @@ def refresh_projected_capabilities_batch(
             (_json(topic["capabilities"]), topic["project_id"], topic["uuid"]),
         )
     topic_uuids = [topic["uuid"] for topic in topics]
-    user_topics = list(
-        models.WorkspaceUserTopic.objects.get_all(
-            filters={
-                "project_id": dm_filters.EQ(topic_project["project_id"]),
-                "uuid": dm_filters.In(topic_uuids),
-            },
-            session=session,
+    topic_streams = session.execute(
+        """
+        SELECT uuid, stream_uuid
+        FROM m_workspace_stream_topics
+        WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+        ORDER BY uuid
+        """,
+        (topic_project["project_id"], topic_uuids),
+    ).fetchall()
+    recipients_by_stream: dict[object, list[object]] = {}
+    user_topics = []
+    for topic in topic_streams:
+        recipients = recipients_by_stream.get(topic["stream_uuid"])
+        if recipients is None:
+            recipients = messenger_dm_helpers.get_compact_workspace_stream_users(
+                topic_project["project_id"],
+                topic["stream_uuid"],
+                models.get_stream_recipients(
+                    topic_project["project_id"],
+                    topic["stream_uuid"],
+                    session=session,
+                ),
+                session=session,
+            )
+            recipients_by_stream[topic["stream_uuid"]] = recipients
+        user_topics.extend(
+            messenger_dm_helpers.get_compact_workspace_user_topic_snapshots(
+                topic_project["project_id"],
+                topic["uuid"],
+                recipients,
+                session=session,
+            )
+        )
+    user_topics.sort(
+        key=lambda topic: (
+            str(_row_value(topic, "uuid")),
+            str(_row_value(topic, "user_uuid")),
         )
     )
-    user_topics.sort(key=lambda topic: (str(topic.uuid), str(topic.user_uuid)))
     prepared_events = []
     for _topic_uuid, group in itertools.groupby(
         user_topics,
-        key=lambda topic: topic.uuid,
+        key=lambda topic: _row_value(topic, "uuid"),
     ):
         prepared = messenger_events.prepare_topic_updated_broadcast(
             topic_project["project_id"],

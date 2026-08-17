@@ -189,8 +189,6 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     topic_uuid = sys_uuid.uuid4()
     stream = SimpleNamespace(uuid=stream_uuid, user_uuid=user_uuid)
     topic = SimpleNamespace(uuid=topic_uuid, user_uuid=user_uuid)
-    stream_get_all = mock.Mock(return_value=[stream])
-    topic_get_all = mock.Mock(return_value=[topic])
     message_get_all = mock.Mock(
         side_effect=AssertionError("historical messages must not be loaded")
     )
@@ -207,13 +205,23 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     message_updated = mock.Mock()
     monkeypatch.setattr(
         sql_state.models,
-        "WorkspaceUserStream",
-        SimpleNamespace(objects=SimpleNamespace(get_all=stream_get_all)),
+        "get_stream_recipients",
+        mock.Mock(return_value=[user_uuid]),
     )
     monkeypatch.setattr(
-        sql_state.models,
-        "WorkspaceUserTopic",
-        SimpleNamespace(objects=SimpleNamespace(get_all=topic_get_all)),
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_stream_users",
+        mock.Mock(return_value=[user_uuid]),
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_user_stream_snapshots",
+        mock.Mock(return_value=[stream]),
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_user_topic_snapshots",
+        mock.Mock(return_value=[topic]),
     )
     monkeypatch.setattr(
         sql_state.models,
@@ -241,7 +249,8 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
         "create_message_updated_event",
         message_updated,
     )
-    session = object()
+    topic_result = SimpleNamespace(fetchall=mock.Mock(return_value=[{"uuid": topic_uuid}]))
+    session = SimpleNamespace(execute=mock.Mock(return_value=topic_result))
 
     result = sql_state._emit_projected_capability_events(
         session,
@@ -283,13 +292,25 @@ def test_large_projected_capability_stream_prepares_before_broadcast_lock(monkey
     ]
     monkeypatch.setattr(
         sql_state.models,
-        "WorkspaceUserStream",
-        SimpleNamespace(objects=SimpleNamespace(get_all=lambda **_kwargs: streams)),
+        "get_stream_recipients",
+        mock.Mock(return_value=user_uuids),
     )
     monkeypatch.setattr(
-        sql_state.models,
-        "WorkspaceUserTopic",
-        SimpleNamespace(objects=SimpleNamespace(get_all=lambda **_kwargs: topics)),
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_stream_users",
+        mock.Mock(return_value=user_uuids),
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_user_stream_snapshots",
+        mock.Mock(return_value=streams),
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_user_topic_snapshots",
+        lambda _project_id, topic_uuid, _users, **_kwargs: [
+            topic for topic in topics if topic.uuid == topic_uuid
+        ],
     )
     calls = []
 
@@ -322,8 +343,14 @@ def test_large_projected_capability_stream_prepares_before_broadcast_lock(monkey
         emit,
     )
 
+    topic_result = SimpleNamespace(
+        fetchall=mock.Mock(
+            return_value=[{"uuid": topic_uuid} for topic_uuid in topic_uuids]
+        )
+    )
+    session = SimpleNamespace(execute=mock.Mock(return_value=topic_result))
     result = sql_state._emit_projected_capability_events(
-        object(),
+        session,
         {
             "project_id": project_uuid,
             "projection_stream_uuid": stream_uuid,

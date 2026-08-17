@@ -983,6 +983,27 @@ def create_stream_updated_events(
     )
 
 
+def create_stream_events(
+    project_id: object,
+    streams: typing.Any,
+    session: typing.Any = None,
+    compact: typing.Any = False,
+) -> typing.Any:
+    if not compact:
+        return [create_stream_event(stream, session=session) for stream in streams]
+    streams = list(streams)
+    if not streams:
+        return []
+    return create_resource_broadcast_event(
+        project_id,
+        _event_payload_get(streams[0], "uuid"),
+        STREAM_CREATED_EVENT,
+        streams,
+        _stream_from_event_payload,
+        session=session,
+    )
+
+
 def create_topic_events(
     project_id: object,
     topics: typing.Any,

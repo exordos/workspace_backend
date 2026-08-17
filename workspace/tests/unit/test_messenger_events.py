@@ -1246,6 +1246,37 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_events[4], "topic", "read", "topic.read"
         )
 
+    def test_create_stream_events_compacts_recipient_snapshots(self):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        streams = [
+            {"uuid": stream_uuid, "user_uuid": sys_uuid.uuid4()},
+            {"uuid": stream_uuid, "user_uuid": sys_uuid.uuid4()},
+        ]
+        session = object()
+
+        with mock.patch.object(
+            events,
+            "create_resource_broadcast_event",
+            return_value=[73],
+        ) as create_broadcast:
+            result = events.create_stream_events(
+                project_id,
+                streams,
+                session=session,
+                compact=True,
+            )
+
+        self.assertEqual([73], result)
+        create_broadcast.assert_called_once_with(
+            project_id,
+            stream_uuid,
+            events.STREAM_CREATED_EVENT,
+            streams,
+            events._stream_from_event_payload,
+            session=session,
+        )
+
     def test_source_provenance_keeps_nullable_provider_delivery_extensions(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
