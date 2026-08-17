@@ -6,6 +6,7 @@
 import datetime
 import types
 
+from workspace.messenger_api import events as messenger_events
 from workspace.services.messenger_workers import agents
 
 
@@ -371,6 +372,93 @@ def test_capability_projection_refresh_commits_each_bounded_batch(monkeypatch):
     refreshes = [call for call in calls if call[0] == "refresh-projection"]
     assert len(refreshes) == 2
     assert all(call[3] == agents.CAPABILITY_PROJECTION_BATCH_SIZE for call in refreshes)
+
+
+def test_capability_projection_refresh_defers_busy_project_without_starving_next(
+    monkeypatch,
+):
+    calls = []
+    metrics = []
+    first_uuid = "00000000-0000-0000-0000-000000000001"
+    second_uuid = "00000000-0000-0000-0000-000000000002"
+    sessions = iter(
+        [
+            types.SimpleNamespace(name="first-attempt"),
+            types.SimpleNamespace(name="second-attempt"),
+        ]
+    )
+    monkeypatch.setattr(
+        agents,
+        "CAPABILITY_PROJECTION_REFRESH_LIMIT",
+        1,
+    )
+    monkeypatch.setattr(
+        agents,
+        "database_session_context",
+        lambda: _SessionContext(next(sessions), calls),
+    )
+    claims = []
+
+    def claim(_session, *, after_uuid):
+        claims.append(after_uuid)
+        return first_uuid if after_uuid is None else second_uuid
+
+    monkeypatch.setattr(
+        agents.sql_state,
+        "claim_capability_projection_refresh_account",
+        claim,
+    )
+    refreshes = []
+
+    def refresh(_session, *, account_uuid, batch_size):
+        refreshes.append((account_uuid, batch_size))
+        if account_uuid == first_uuid:
+            raise messenger_events.ProjectEventLockUnavailableError(first_uuid)
+        return 1, 5, 1
+
+    monkeypatch.setattr(
+        agents.sql_state,
+        "refresh_projected_capabilities_batch",
+        refresh,
+    )
+    monkeypatch.setattr(
+        agents.LOG,
+        "info",
+        lambda message, *args, **kwargs: metrics.append((message, kwargs.get("extra"))),
+    )
+
+    worker = agents.MessengerWorkerAgent()
+    worker._refresh_capability_projections()
+    worker._refresh_capability_projections()
+
+    assert claims == [None, first_uuid]
+    assert refreshes == [
+        (first_uuid, agents.CAPABILITY_PROJECTION_BATCH_SIZE),
+        (second_uuid, agents.CAPABILITY_PROJECTION_BATCH_SIZE),
+    ]
+    assert worker._capability_projection_refresh_cursor == second_uuid
+    assert calls == [
+        ("enter", "first-attempt"),
+        (
+            "exit",
+            "first-attempt",
+            "ProjectEventLockUnavailableError",
+        ),
+        ("enter", "second-attempt"),
+        ("exit", "second-attempt", None),
+    ]
+    completed = [
+        extra
+        for message, extra in metrics
+        if message == "Completed bounded external capability projection refresh"
+    ]
+    assert [
+        extra["capability_projection_lock_contention_count"] for extra in completed
+    ] == [
+        1,
+        0,
+    ]
+    assert all(extra["capability_projection_failure_count"] == 0 for extra in completed)
 
 
 def test_capability_refresh_failure_is_not_counted_as_success(monkeypatch):

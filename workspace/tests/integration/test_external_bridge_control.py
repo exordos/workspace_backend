@@ -2076,18 +2076,83 @@ def test_large_capability_projection_refresh_releases_lock_between_topic_batches
         "capabilities": available_capability,
         "blocked_batch": None,
     }
+    with session_factory() as session:
+        session.execute("SET LOCAL statement_timeout = '10s'")
+        sql_state.refresh_effective_capabilities(
+            session,
+            account_uuid=account_uuid,
+            now=now,
+        )
+
+    project_lock_acquired = threading.Event()
+    release_project_lock = threading.Event()
+
+    def hold_project_event_lock():
+        with session_factory() as session:
+            session.execute(
+                """
+                SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+                """,
+                (project_uuid,),
+            )
+            project_lock_acquired.set()
+            if not release_project_lock.wait(timeout=5):
+                raise TimeoutError("project event lock was not released")
+
+    lock_heartbeat_request = {
+        **heartbeat_request,
+        "heartbeat_uuid": str(sys_uuid.uuid4()),
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        lock_future = executor.submit(hold_project_event_lock)
+        assert project_lock_acquired.wait(timeout=3)
+        try:
+            deferred_started_at = time.monotonic()
+            with pytest.raises(messenger_events.ProjectEventLockUnavailableError):
+                with session_factory() as session:
+                    session.execute("SET LOCAL statement_timeout = '2s'")
+                    sql_state.refresh_projected_capabilities_batch(
+                        session,
+                        account_uuid=account_uuid,
+                        batch_size=16,
+                    )
+            deferred_duration = time.monotonic() - deferred_started_at
+            heartbeat_started_at = time.monotonic()
+            heartbeat_future = executor.submit(
+                _request_call,
+                repository.heartbeat,
+                identity,
+                lock_heartbeat_request,
+                now=now,
+            )
+            lock_heartbeat_result = heartbeat_future.result(timeout=2)
+            lock_heartbeat_duration = time.monotonic() - heartbeat_started_at
+        finally:
+            release_project_lock.set()
+        lock_future.result(timeout=3)
+
+    assert deferred_duration < 1
+    assert lock_heartbeat_duration < 2
+    assert (
+        lock_heartbeat_result["heartbeat_uuid"]
+        == lock_heartbeat_request["heartbeat_uuid"]
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT provider_metadata->'capabilities'
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, stream_uuid),
+        )
+        assert cursor.fetchone()[0] == available_capability
+
     first_topic_batch_committed = threading.Event()
     release_projection_batches = threading.Event()
     batch_stats = []
 
     def refresh_capabilities_and_projections():
-        with session_factory() as session:
-            session.execute("SET LOCAL statement_timeout = '10s'")
-            sql_state.refresh_effective_capabilities(
-                session,
-                account_uuid=account_uuid,
-                now=now,
-            )
         while True:
             with session_factory() as session:
                 claimed = session.execute(

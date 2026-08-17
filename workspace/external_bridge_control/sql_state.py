@@ -544,6 +544,7 @@ def refresh_projected_capabilities_batch(
             messenger_events.create_prepared_resource_broadcast_events(
                 [prepared],
                 session=session,
+                wait_for_project_lock=False,
             )
         return 1, len(streams), int(prepared is not None)
 
@@ -633,6 +634,7 @@ def refresh_projected_capabilities_batch(
     messenger_events.create_prepared_resource_broadcast_events(
         prepared_events,
         session=session,
+        wait_for_project_lock=False,
     )
     return len(topics), len(user_topics), len(prepared_events)
 

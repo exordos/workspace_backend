@@ -182,6 +182,52 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertGreater(broadcast_insert, 0)
 
+    def test_broadcast_event_can_acquire_project_lock_without_waiting(self):
+        project_id = sys_uuid.uuid4()
+        entity_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        session = mock.MagicMock()
+        session.execute.return_value.fetchone.side_effect = [
+            {"locked": True},
+            {"epoch_version": 71},
+        ]
+
+        result = events.create_broadcast_event(
+            project_id,
+            entity_uuid,
+            [recipient_uuid],
+            "message.created",
+            {"uuid": str(entity_uuid)},
+            session=session,
+            wait_for_project_lock=False,
+        )
+
+        self.assertEqual([71], result)
+        lock_statement, lock_params = session.execute.call_args_list[0].args
+        self.assertIn("pg_try_advisory_xact_lock", lock_statement)
+        self.assertEqual((project_id,), lock_params)
+
+    def test_broadcast_event_defers_when_nonblocking_project_lock_is_busy(self):
+        project_id = sys_uuid.uuid4()
+        session = mock.MagicMock()
+        session.execute.return_value.fetchone.return_value = {"locked": False}
+
+        with self.assertRaises(events.ProjectEventLockUnavailableError):
+            events.create_broadcast_event(
+                project_id,
+                sys_uuid.uuid4(),
+                [sys_uuid.uuid4()],
+                "message.created",
+                {"uuid": str(sys_uuid.uuid4())},
+                session=session,
+                wait_for_project_lock=False,
+            )
+
+        self.assertEqual(1, session.execute.call_count)
+        lock_statement, lock_params = session.execute.call_args.args
+        self.assertIn("pg_try_advisory_xact_lock", lock_statement)
+        self.assertEqual((project_id,), lock_params)
+
     def test_websocket_event_reads_use_canonical_store_boundary(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
