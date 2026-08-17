@@ -1215,6 +1215,7 @@ def _create_stream_folder_updated_events(
             project_id=project_id,
             user_uuid=user_uuid,
             folder_uuid=folder_uuid,
+            session=session,
         )
         messenger_events.create_folder_updated_event(
             folder=user_folder,
@@ -1965,6 +1966,7 @@ def create_workspace_stream_binding_events(
             project_id=binding.project_id,
             user_uuid=binding.user_uuid,
             stream_uuid=binding.stream_uuid,
+            session=session,
         )
     except storage_exc.RecordNotFound:
         stream = models.WorkspaceStream.objects.get_one(

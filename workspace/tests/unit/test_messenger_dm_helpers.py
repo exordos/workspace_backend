@@ -346,21 +346,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=other_user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=other_user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -621,21 +625,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=direct_user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=direct_user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -790,11 +798,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.PERSONAL_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
@@ -1202,6 +1212,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         create_stream_event.assert_called_once_with(
             stream=user_stream,
@@ -1213,11 +1224,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.ALL_CHATS_FOLDER_UUID,
+                    session=session,
                 ),
                 mock.call(
                     project_id=project_id,
                     user_uuid=user_uuid,
                     folder_uuid=dm_helpers.CHANNELS_FOLDER_UUID,
+                    session=session,
                 ),
             ]
         )
