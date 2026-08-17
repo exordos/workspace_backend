@@ -30,6 +30,7 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
+from workspace.messenger_api import events as messenger_events
 from workspace.external_bridge_control import sql_state
 
 LOG = logging.getLogger(__name__)
@@ -366,6 +367,7 @@ class MessengerWorkerAgent(basic.BasicService):
         recipient_count = 0
         event_count = 0
         failure_count = 0
+        lock_contention_count = 0
         max_batch_duration_seconds = 0.0
         for _batch_index in range(CAPABILITY_PROJECTION_REFRESH_LIMIT):
             claimed_uuid = None
@@ -391,6 +393,28 @@ class MessengerWorkerAgent(basic.BasicService):
                             batch_size=CAPABILITY_PROJECTION_BATCH_SIZE,
                         )
                     )
+            except messenger_events.ProjectEventLockUnavailableError as error:
+                contention_duration_seconds = time.monotonic() - batch_started_at
+                lock_contention_count += 1
+                # Resume after the contended account so it cannot starve later
+                # accounts while the cursor still wraps back for a future retry.
+                self._capability_projection_refresh_cursor = claimed_uuid
+                max_batch_duration_seconds = max(
+                    max_batch_duration_seconds,
+                    contention_duration_seconds,
+                )
+                LOG.info(
+                    "Deferred external capability projection refresh because "
+                    "the project event lock is busy",
+                    extra={
+                        "external_account_uuid": str(claimed_uuid),
+                        "project_id": str(error),
+                        "capability_projection_lock_contention_duration_seconds": (
+                            contention_duration_seconds
+                        ),
+                    },
+                )
+                break
             except Exception:
                 failure_count += 1
                 LOG.exception(
@@ -418,6 +442,7 @@ class MessengerWorkerAgent(basic.BasicService):
                 "capability_projection_recipient_count": recipient_count,
                 "capability_projection_event_count": event_count,
                 "capability_projection_failure_count": failure_count,
+                "capability_projection_lock_contention_count": (lock_contention_count),
                 "capability_projection_max_batch_duration_seconds": (
                     max_batch_duration_seconds
                 ),

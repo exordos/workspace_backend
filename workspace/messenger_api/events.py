@@ -53,6 +53,10 @@ _FIXTURE_EVENTS_SUPPRESSED = contextvars.ContextVar(
 )
 
 
+class ProjectEventLockUnavailableError(RuntimeError):
+    """Raised when a nonblocking event writer cannot serialize a project."""
+
+
 @contextlib.contextmanager
 def suppress_unplanned_fixture_events() -> collections.abc.Iterator[None]:
     """Suppress runtime broadcasts while isolated fixture state is materialized."""
@@ -730,6 +734,7 @@ def prepare_resource_broadcast_event(
 def create_prepared_resource_broadcast_events(
     prepared_events: typing.Iterable[dict[str, typing.Any]],
     session: typing.Any = None,
+    wait_for_project_lock: bool = True,
 ) -> list[int]:
     """Persist an already-serialized bounded event batch in causal order."""
     epochs = []
@@ -743,6 +748,7 @@ def create_prepared_resource_broadcast_events(
                 event["payload"],
                 recipient_payloads=event["recipient_payloads"],
                 session=session,
+                wait_for_project_lock=wait_for_project_lock,
             )
         )
     return epochs
@@ -794,6 +800,7 @@ def create_broadcast_event(
     session: typing.Any = None,
     event_uuid: object = None,
     created_at: typing.Any = None,
+    wait_for_project_lock: bool = True,
 ) -> typing.Any:
     if _FIXTURE_EVENTS_SUPPRESSED.get():
         return []
@@ -804,12 +811,24 @@ def create_broadcast_event(
     # WebSocket cursors assume that lower epoch versions become visible before
     # higher versions. Serialize broadcast and direct event writers with the
     # same per-project transaction lock so commit order preserves that invariant.
-    session.execute(
-        """
-        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
-        """,
-        (project_id,),
-    )
+    if wait_for_project_lock:
+        session.execute(
+            """
+            SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+            """,
+            (project_id,),
+        )
+    else:
+        lock_acquired = session.execute(
+            """
+            SELECT pg_try_advisory_xact_lock(
+                hashtextextended(%s::text, 0)
+            ) AS locked
+            """,
+            (project_id,),
+        ).fetchone()["locked"]
+        if not lock_acquired:
+            raise ProjectEventLockUnavailableError(str(project_id))
     membership_digest = hashlib.sha256(
         "\n".join(str(value) for value in recipients).encode("ascii")
     ).hexdigest()
