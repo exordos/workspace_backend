@@ -60,8 +60,30 @@ def test_manifest_scales_s3_disk_size_by_core_profile():
             f"profile: $workspace.imports.$profile_{profile}:uuid\n"
             f"            value: {size}"
         ) in manifest
+    assert "disk_size: $core.vs.variables.$workspace_s3_disk_size:value" in manifest
+
+
+def test_manifest_scales_projection_disk_only_for_high_storage_profiles():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    variable = manifest.split("workspace_projection_disk_size:", 1)[1].split(
+        "$core.iam.permissions:",
+        1,
+    )[0]
+    expected_profile_sizes = {
+        "develop": 30,
+        "small": 30,
+        "medium": 30,
+        "large": 512,
+        "legacy": 512,
+    }
+
+    for profile, size in expected_profile_sizes.items():
+        assert (
+            f"profile: $workspace.imports.$profile_{profile}:uuid\n"
+            f"            value: {size}"
+        ) in variable
     assert (
-        "disk_size: $core.vs.variables.$workspace_s3_disk_size:value"
+        "disk_size: $core.vs.variables.$workspace_projection_disk_size:value"
         in manifest
     )
 
@@ -157,9 +179,9 @@ def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
     bindings = manifest.split("  $core.iam.permissionbinding:\n", 1)[1].split(
         "\n  $core.compute.nodes:", 1
     )[0]
-    assert bindings.count(
-        "role: $core.iam.roles.$workspace_topic_summary_admin:uuid"
-    ) == 2
+    assert (
+        bindings.count("role: $core.iam.roles.$workspace_topic_summary_admin:uuid") == 2
+    )
     assert "workspace_topic_summary_secret_key:" in manifest
     assert (
         "secret_encryption_key = "

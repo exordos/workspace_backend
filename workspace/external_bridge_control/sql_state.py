@@ -9,7 +9,9 @@ import contextlib
 import datetime
 import hashlib
 import hmac
+import itertools
 import json
+import logging
 import secrets
 import uuid as sys_uuid
 from typing import Any
@@ -24,6 +26,9 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
+
+
+LOG = logging.getLogger(__name__)
 
 
 def _json(value: object) -> str:
@@ -383,26 +388,61 @@ def _effective_chat_capabilities(
     return result
 
 
-def _emit_projected_capability_events(session: Any, chat: dict[str, Any]) -> None:
+def _emit_projected_capability_events(
+    session: Any,
+    chat: dict[str, Any],
+) -> tuple[int, int, int]:
     if chat["project_id"] is None or chat["projection_stream_uuid"] is None:
-        return
+        return 0, 0, 0
     filters = {
         "project_id": dm_filters.EQ(chat["project_id"]),
         "uuid": dm_filters.EQ(chat["projection_stream_uuid"]),
     }
-    for stream in models.WorkspaceUserStream.objects.get_all(
-        filters=filters,
+    streams = list(
+        models.WorkspaceUserStream.objects.get_all(
+            filters=filters,
+            session=session,
+        )
+    )
+    prepared = []
+    stream_event = messenger_events.prepare_stream_updated_broadcast(
+        chat["project_id"],
+        streams,
         session=session,
+    )
+    if stream_event is not None:
+        prepared.append(stream_event)
+    topics = list(
+        models.WorkspaceUserTopic.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(chat["project_id"]),
+                "stream_uuid": dm_filters.EQ(chat["projection_stream_uuid"]),
+            },
+            session=session,
+        )
+    )
+    # Serialize every recipient-specific view before the first broadcast takes
+    # the transaction-scoped project lock. Sorting keeps stream-before-topic
+    # and topic UUID order deterministic once the prepared events are written.
+    topics.sort(key=lambda topic: (str(topic.uuid), str(topic.user_uuid)))
+    topic_broadcasts = 0
+    for _topic_uuid, group in itertools.groupby(
+        topics,
+        key=lambda topic: topic.uuid,
     ):
-        messenger_events.create_stream_updated_event(stream, session=session)
-    for topic in models.WorkspaceUserTopic.objects.get_all(
-        filters={
-            "project_id": dm_filters.EQ(chat["project_id"]),
-            "stream_uuid": dm_filters.EQ(chat["projection_stream_uuid"]),
-        },
+        topic_event = messenger_events.prepare_topic_updated_broadcast(
+            chat["project_id"],
+            group,
+            session=session,
+        )
+        if topic_event is not None:
+            prepared.append(topic_event)
+            topic_broadcasts += 1
+    messenger_events.create_prepared_resource_broadcast_events(
+        prepared,
         session=session,
-    ):
-        messenger_events.create_topic_updated_event(topic, session=session)
+    )
+    return len(streams), len(topics), int(bool(streams)) + topic_broadcasts
 
 
 def _emit_initial_sync_projection_events(session: Any, chat: Any) -> None:
@@ -444,33 +484,203 @@ def _emit_initial_sync_projection_events(session: Any, chat: Any) -> None:
         )
 
 
-def _update_projected_capabilities(
+def refresh_projected_capabilities_batch(
     session: Any,
-    chat: dict[str, Any],
-    capabilities: dict[str, Any],
-) -> None:
-    if chat["project_id"] is None or chat["projection_stream_uuid"] is None:
-        return
-    for table in (
-        "m_workspace_streams",
-        "m_workspace_stream_topics",
-    ):
+    account_uuid: object,
+    batch_size: int,
+) -> tuple[int, int, int]:
+    """Refresh one stream or a bounded topic batch in one short transaction."""
+    if batch_size < 1:
+        raise ValueError("Capability projection batch size must be positive")
+    stream = session.execute(
+        """
+        SELECT chat.project_id, chat.projection_stream_uuid, chat.capabilities
+        FROM m_external_chats_v2 AS chat
+        JOIN m_workspace_streams AS stream
+          ON stream.project_id = chat.project_id
+         AND stream.uuid = chat.projection_stream_uuid
+         AND stream.external_account_uuid = chat.external_account_uuid
+        WHERE chat.external_account_uuid = %s
+          AND chat.project_id IS NOT NULL
+          AND chat.projection_stream_uuid IS NOT NULL
+          AND stream.provider_metadata->'capabilities'
+              IS DISTINCT FROM chat.capabilities
+        ORDER BY chat.project_id, chat.uuid
+        LIMIT 1
+        FOR UPDATE OF stream SKIP LOCKED
+        """,
+        (account_uuid,),
+    ).fetchone()
+    if stream is not None:
         session.execute(
-            f"""
-            UPDATE {table}
-            SET provider_metadata = COALESCE(provider_metadata, '{{}}'::jsonb) ||
+            """
+            UPDATE m_workspace_streams
+            SET provider_metadata = COALESCE(provider_metadata, '{}'::jsonb) ||
                 jsonb_build_object('capabilities', %s::jsonb)
-            WHERE project_id = %s AND external_account_uuid = %s
-              AND {"uuid" if table == "m_workspace_streams" else "stream_uuid"} = %s
+            WHERE project_id = %s AND external_account_uuid = %s AND uuid = %s
             """,
             (
-                _json(capabilities),
-                chat["project_id"],
-                chat["external_account_uuid"],
-                chat["projection_stream_uuid"],
+                _json(stream["capabilities"]),
+                stream["project_id"],
+                account_uuid,
+                stream["projection_stream_uuid"],
             ),
         )
-    _emit_projected_capability_events(session, chat)
+        streams = list(
+            models.WorkspaceUserStream.objects.get_all(
+                filters={
+                    "project_id": dm_filters.EQ(stream["project_id"]),
+                    "uuid": dm_filters.EQ(stream["projection_stream_uuid"]),
+                },
+                session=session,
+            )
+        )
+        prepared = messenger_events.prepare_stream_updated_broadcast(
+            stream["project_id"],
+            streams,
+            session=session,
+        )
+        if prepared is not None:
+            messenger_events.create_prepared_resource_broadcast_events(
+                [prepared],
+                session=session,
+            )
+        return 1, len(streams), int(prepared is not None)
+
+    topic_project = session.execute(
+        """
+        SELECT chat.project_id
+        FROM m_external_chats_v2 AS chat
+        JOIN m_workspace_streams AS stream
+          ON stream.project_id = chat.project_id
+         AND stream.uuid = chat.projection_stream_uuid
+         AND stream.external_account_uuid = chat.external_account_uuid
+        JOIN m_workspace_stream_topics AS topic
+          ON topic.project_id = chat.project_id
+         AND topic.stream_uuid = chat.projection_stream_uuid
+         AND topic.external_account_uuid = chat.external_account_uuid
+        WHERE chat.external_account_uuid = %s
+          AND stream.provider_metadata->'capabilities'
+              IS NOT DISTINCT FROM chat.capabilities
+          AND topic.provider_metadata->'capabilities'
+              IS DISTINCT FROM chat.capabilities
+        ORDER BY chat.project_id, chat.uuid, topic.uuid
+        LIMIT 1
+        """,
+        (account_uuid,),
+    ).fetchone()
+    if topic_project is None:
+        return 0, 0, 0
+    topics = session.execute(
+        """
+        SELECT topic.uuid, chat.project_id, chat.capabilities
+        FROM m_external_chats_v2 AS chat
+        JOIN m_workspace_streams AS stream
+          ON stream.project_id = chat.project_id
+         AND stream.uuid = chat.projection_stream_uuid
+         AND stream.external_account_uuid = chat.external_account_uuid
+        JOIN m_workspace_stream_topics AS topic
+          ON topic.project_id = chat.project_id
+         AND topic.stream_uuid = chat.projection_stream_uuid
+         AND topic.external_account_uuid = chat.external_account_uuid
+        WHERE chat.external_account_uuid = %s
+          AND chat.project_id = %s
+          AND stream.provider_metadata->'capabilities'
+              IS NOT DISTINCT FROM chat.capabilities
+          AND topic.provider_metadata->'capabilities'
+              IS DISTINCT FROM chat.capabilities
+        ORDER BY chat.uuid, topic.uuid
+        LIMIT %s
+        FOR UPDATE OF topic SKIP LOCKED
+        """,
+        (account_uuid, topic_project["project_id"], batch_size),
+    ).fetchall()
+    if not topics:
+        return 0, 0, 0
+    for topic in topics:
+        session.execute(
+            """
+            UPDATE m_workspace_stream_topics
+            SET provider_metadata = COALESCE(provider_metadata, '{}'::jsonb) ||
+                jsonb_build_object('capabilities', %s::jsonb)
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (_json(topic["capabilities"]), topic["project_id"], topic["uuid"]),
+        )
+    topic_uuids = [topic["uuid"] for topic in topics]
+    user_topics = list(
+        models.WorkspaceUserTopic.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(topic_project["project_id"]),
+                "uuid": dm_filters.In(topic_uuids),
+            },
+            session=session,
+        )
+    )
+    user_topics.sort(key=lambda topic: (str(topic.uuid), str(topic.user_uuid)))
+    prepared_events = []
+    for _topic_uuid, group in itertools.groupby(
+        user_topics,
+        key=lambda topic: topic.uuid,
+    ):
+        prepared = messenger_events.prepare_topic_updated_broadcast(
+            topic_project["project_id"],
+            group,
+            session=session,
+        )
+        if prepared is not None:
+            prepared_events.append(prepared)
+    messenger_events.create_prepared_resource_broadcast_events(
+        prepared_events,
+        session=session,
+    )
+    return len(topics), len(user_topics), len(prepared_events)
+
+
+def claim_capability_projection_refresh_account(
+    session: Any,
+    after_uuid: object | None = None,
+) -> object | None:
+    """Claim an account with stale projected capability metadata."""
+    cursor_filter = ""
+    params: list[object] = []
+    if after_uuid is not None:
+        cursor_filter = "AND account.uuid > %s"
+        params.append(after_uuid)
+    row = session.execute(
+        f"""
+        SELECT account.uuid
+        FROM m_external_accounts_v2 AS account
+        WHERE EXISTS (
+            SELECT 1
+            FROM m_external_chats_v2 AS chat
+            JOIN m_workspace_streams AS stream
+              ON stream.project_id = chat.project_id
+             AND stream.uuid = chat.projection_stream_uuid
+             AND stream.external_account_uuid = chat.external_account_uuid
+            WHERE chat.external_account_uuid = account.uuid
+              AND (
+                  stream.provider_metadata->'capabilities'
+                      IS DISTINCT FROM chat.capabilities
+                  OR EXISTS (
+                      SELECT 1
+                      FROM m_workspace_stream_topics AS topic
+                      WHERE topic.project_id = chat.project_id
+                        AND topic.stream_uuid = chat.projection_stream_uuid
+                        AND topic.external_account_uuid = chat.external_account_uuid
+                        AND topic.provider_metadata->'capabilities'
+                            IS DISTINCT FROM chat.capabilities
+                  )
+              )
+        )
+        {cursor_filter}
+        ORDER BY account.uuid
+        LIMIT 1
+        FOR UPDATE OF account SKIP LOCKED
+        """,
+        tuple(params),
+    ).fetchone()
+    return None if row is None else row["uuid"]
 
 
 def claim_capability_refresh_account(
@@ -531,7 +741,7 @@ def refresh_effective_capabilities(
     account_uuid: object | None = None,
     now: datetime.datetime | None = None,
 ) -> int:
-    """Converge bounded account, chat, and projected capability snapshots."""
+    """Converge bounded account and chat capability snapshots."""
     now = now or _utcnow()
     params: list[object] = []
     filters = []
@@ -719,7 +929,6 @@ def refresh_effective_capabilities(
             ).fetchone()
             if updated is None:
                 continue
-            _update_projected_capabilities(session, chat, chat_effective)
             if chat["project_id"] is not None:
                 resource = external_models.ExternalChat.objects.get_one(
                     filters={"uuid": dm_filters.EQ(chat["uuid"])},

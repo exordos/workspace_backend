@@ -669,8 +669,33 @@ def create_resource_broadcast_event(
     payload_factory: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
+    prepared = prepare_resource_broadcast_event(
+        project_id,
+        entity_uuid,
+        kind,
+        resources,
+        payload_factory,
+        session=session,
+    )
+    return create_prepared_resource_broadcast_events(
+        [prepared] if prepared is not None else [],
+        session=session,
+    )
+
+
+def prepare_resource_broadcast_event(
+    project_id: object,
+    entity_uuid: object,
+    kind: typing.Any,
+    resources: typing.Any,
+    payload_factory: typing.Any,
+    session: typing.Any = None,
+) -> dict[str, typing.Any] | None:
+    """Serialize recipient views before the project event lock is acquired."""
     resources = list(resources)
     session = session or contexts.Context().get_session()
+    if not resources:
+        return None
     missing_cache = object()
     previous_cache = getattr(
         session,
@@ -690,13 +715,71 @@ def create_resource_broadcast_event(
             delattr(session, "_workspace_event_metadata_cache")
         else:
             session._workspace_event_metadata_cache = previous_cache
-    return create_broadcast_event(
+    return {
+        "project_id": project_id,
+        "entity_uuid": entity_uuid,
+        "recipients": [
+            _event_payload_get(resource, "user_uuid") for resource in resources
+        ],
+        "kind": kind,
+        "payload": common,
+        "recipient_payloads": recipient_payloads,
+    }
+
+
+def create_prepared_resource_broadcast_events(
+    prepared_events: typing.Iterable[dict[str, typing.Any]],
+    session: typing.Any = None,
+) -> list[int]:
+    """Persist an already-serialized bounded event batch in causal order."""
+    epochs = []
+    for event in prepared_events:
+        epochs.extend(
+            create_broadcast_event(
+                event["project_id"],
+                event["entity_uuid"],
+                event["recipients"],
+                event["kind"],
+                event["payload"],
+                recipient_payloads=event["recipient_payloads"],
+                session=session,
+            )
+        )
+    return epochs
+
+
+def prepare_stream_updated_broadcast(
+    project_id: object,
+    streams: typing.Any,
+    session: typing.Any = None,
+) -> dict[str, typing.Any] | None:
+    streams = list(streams)
+    if not streams:
+        return None
+    return prepare_resource_broadcast_event(
         project_id,
-        entity_uuid,
-        [_event_payload_get(resource, "user_uuid") for resource in resources],
-        kind,
-        common,
-        recipient_payloads=recipient_payloads,
+        _event_payload_get(streams[0], "uuid"),
+        STREAM_UPDATED_EVENT,
+        streams,
+        _stream_from_event_payload,
+        session=session,
+    )
+
+
+def prepare_topic_updated_broadcast(
+    project_id: object,
+    topics: typing.Any,
+    session: typing.Any = None,
+) -> dict[str, typing.Any] | None:
+    topics = list(topics)
+    if not topics:
+        return None
+    return prepare_resource_broadcast_event(
+        project_id,
+        _event_payload_get(topics[0], "uuid"),
+        TOPIC_UPDATED_EVENT,
+        topics,
+        _topic_from_event_payload,
         session=session,
     )
 

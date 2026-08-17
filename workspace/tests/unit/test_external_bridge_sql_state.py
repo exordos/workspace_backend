@@ -183,15 +183,27 @@ def test_stale_bridge_degradation_is_an_independent_bridge_only_update():
 def test_projected_capability_events_do_not_fan_out_to_message_history(
     monkeypatch,
 ):
-    stream = object()
-    topic = object()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    stream = SimpleNamespace(uuid=stream_uuid, user_uuid=user_uuid)
+    topic = SimpleNamespace(uuid=topic_uuid, user_uuid=user_uuid)
     stream_get_all = mock.Mock(return_value=[stream])
     topic_get_all = mock.Mock(return_value=[topic])
     message_get_all = mock.Mock(
         side_effect=AssertionError("historical messages must not be loaded")
     )
-    stream_updated = mock.Mock()
-    topic_updated = mock.Mock()
+    stream_event = object()
+    topic_event = object()
+    stream_updated = mock.Mock(return_value=stream_event)
+    topic_values = []
+
+    def capture_topics(_project, values, **_kwargs):
+        topic_values.extend(values)
+        return topic_event
+
+    topic_updated = mock.Mock(side_effect=capture_topics)
     message_updated = mock.Mock()
     monkeypatch.setattr(
         sql_state.models,
@@ -210,13 +222,19 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     )
     monkeypatch.setattr(
         sql_state.messenger_events,
-        "create_stream_updated_event",
+        "prepare_stream_updated_broadcast",
         stream_updated,
     )
     monkeypatch.setattr(
         sql_state.messenger_events,
-        "create_topic_updated_event",
+        "prepare_topic_updated_broadcast",
         topic_updated,
+    )
+    emitted = mock.Mock()
+    monkeypatch.setattr(
+        sql_state.messenger_events,
+        "create_prepared_resource_broadcast_events",
+        emitted,
     )
     monkeypatch.setattr(
         sql_state.messenger_events,
@@ -225,18 +243,108 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     )
     session = object()
 
-    sql_state._emit_projected_capability_events(
+    result = sql_state._emit_projected_capability_events(
         session,
         {
-            "project_id": sys_uuid.uuid4(),
-            "projection_stream_uuid": sys_uuid.uuid4(),
+            "project_id": project_uuid,
+            "projection_stream_uuid": stream_uuid,
         },
     )
 
-    stream_updated.assert_called_once_with(stream, session=session)
-    topic_updated.assert_called_once_with(topic, session=session)
+    stream_updated.assert_called_once_with(
+        project_uuid,
+        [stream],
+        session=session,
+    )
+    assert topic_updated.call_count == 1
+    topic_call = topic_updated.call_args
+    assert topic_call.args[0] == project_uuid
+    assert topic_values == [topic]
+    assert topic_call.kwargs == {"session": session}
+    emitted.assert_called_once_with([stream_event, topic_event], session=session)
+    assert result == (1, 1, 2)
     message_get_all.assert_not_called()
     message_updated.assert_not_called()
+
+
+def test_large_projected_capability_stream_prepares_before_broadcast_lock(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuids = sorted((sys_uuid.uuid4() for _index in range(3)), key=str)
+    user_uuids = [sys_uuid.uuid4() for _index in range(4_000)]
+    streams = [
+        SimpleNamespace(uuid=stream_uuid, user_uuid=user_uuid)
+        for user_uuid in user_uuids
+    ]
+    topics = [
+        SimpleNamespace(uuid=topic_uuid, user_uuid=user_uuid)
+        for topic_uuid in reversed(topic_uuids)
+        for user_uuid in reversed(user_uuids)
+    ]
+    monkeypatch.setattr(
+        sql_state.models,
+        "WorkspaceUserStream",
+        SimpleNamespace(objects=SimpleNamespace(get_all=lambda **_kwargs: streams)),
+    )
+    monkeypatch.setattr(
+        sql_state.models,
+        "WorkspaceUserTopic",
+        SimpleNamespace(objects=SimpleNamespace(get_all=lambda **_kwargs: topics)),
+    )
+    calls = []
+
+    def record_streams(project_id, values, **kwargs):
+        event = ("stream", project_id, list(values), kwargs)
+        calls.append(("prepare", event))
+        return event
+
+    def record_topics(project_id, values, **kwargs):
+        event = ("topic", project_id, list(values), kwargs)
+        calls.append(("prepare", event))
+        return event
+
+    def emit(events, **kwargs):
+        calls.append(("emit", list(events), kwargs))
+
+    monkeypatch.setattr(
+        sql_state.messenger_events,
+        "prepare_stream_updated_broadcast",
+        record_streams,
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_events,
+        "prepare_topic_updated_broadcast",
+        record_topics,
+    )
+    monkeypatch.setattr(
+        sql_state.messenger_events,
+        "create_prepared_resource_broadcast_events",
+        emit,
+    )
+
+    result = sql_state._emit_projected_capability_events(
+        object(),
+        {
+            "project_id": project_uuid,
+            "projection_stream_uuid": stream_uuid,
+        },
+    )
+
+    assert result == (4_000, 12_000, 4)
+    prepared = [call[1] for call in calls if call[0] == "prepare"]
+    assert [kind for kind, _project, _values, _kwargs in prepared] == [
+        "stream",
+        "topic",
+        "topic",
+        "topic",
+    ]
+    assert [values[0].uuid for _kind, _project, values, _kwargs in prepared[1:]] == (
+        topic_uuids
+    )
+    assert all(len(values) == 4_000 for _kind, _project, values, _kwargs in prepared)
+    assert calls[-1][0] == "emit"
+    assert calls[-1][1] == prepared
+    assert all(kwargs == {"session": mock.ANY} for *_values, kwargs in prepared)
 
 
 def test_initial_sync_completion_emits_latest_message_per_topic(monkeypatch):
@@ -294,34 +402,29 @@ def test_initial_sync_completion_emits_latest_message_per_topic(monkeypatch):
     ]
 
 
-def test_projected_capability_updates_do_not_rewrite_message_history(monkeypatch):
+def test_capability_projection_claim_is_bounded_and_skips_locked_accounts():
     calls = []
+    account_uuid = sys_uuid.uuid4()
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"uuid": account_uuid}
+
     session = SimpleNamespace(
-        execute=lambda statement, params: calls.append((statement, params))
-    )
-    chat = {
-        "project_id": sys_uuid.uuid4(),
-        "external_account_uuid": sys_uuid.uuid4(),
-        "projection_stream_uuid": sys_uuid.uuid4(),
-    }
-    monkeypatch.setattr(
-        sql_state,
-        "_emit_projected_capability_events",
-        lambda current_session, current_chat: calls.append(
-            ("events", (current_session, current_chat))
-        ),
+        execute=lambda statement, params: calls.append((statement, params)) or Result()
     )
 
-    sql_state._update_projected_capabilities(
-        session,
-        chat,
-        {"messenger.message.read": {"available": True}},
+    assert (
+        sql_state.claim_capability_projection_refresh_account(
+            session,
+            after_uuid=account_uuid,
+        )
+        == account_uuid
     )
-
-    statements = [statement for statement, _params in calls if statement != "events"]
-    assert len(statements) == 2
-    assert any("UPDATE m_workspace_streams" in statement for statement in statements)
-    assert any(
-        "UPDATE m_workspace_stream_topics" in statement for statement in statements
-    )
-    assert not any("m_workspace_messages" in statement for statement in statements)
+    statement, params = calls[0]
+    assert "m_workspace_stream_topics" in statement
+    assert "IS DISTINCT FROM chat.capabilities" in statement
+    assert "FOR UPDATE OF account SKIP LOCKED" in statement
+    assert "account.uuid > %s" in statement
+    assert params == (account_uuid,)
