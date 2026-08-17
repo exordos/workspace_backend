@@ -12,6 +12,27 @@ import pytest
 from workspace.external_bridge_control import provider_data
 
 
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("message.upsert", True),
+        ("reaction.upsert", True),
+        ("reaction.delete", True),
+        ("topic.upsert", True),
+        ("identity.upsert", False),
+        ("stream.upsert", False),
+        ("read_state.set", False),
+    ],
+)
+def test_only_fully_suppressed_backfill_events_bypass_project_lock(kind, expected):
+    event = {
+        "kind": kind,
+        "payload": {"resource": {"provider_metadata": {"delivery_class": "backfill"}}},
+    }
+
+    assert provider_data._is_quiet_backfill_event(event) is expected
+
+
 class LeaseResponse:
     def __init__(self, *, one=None, all_rows=()):
         self.one = one
@@ -271,8 +292,9 @@ def test_resolve_provider_queue_target_preserves_route_without_capability(monkey
     monkeypatch.setattr(
         provider_data,
         "_lock_associated_bridge",
-        lambda *args, **kwargs: associated_bridge_calls.append((args, kwargs))
-        or bridge,
+        lambda *args, **kwargs: (
+            associated_bridge_calls.append((args, kwargs)) or bridge
+        ),
     )
     policy_checks = []
     monkeypatch.setattr(

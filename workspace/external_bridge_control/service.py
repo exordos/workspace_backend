@@ -231,7 +231,11 @@ class PrivateBridgeService:
         if method == "POST" and path == "/v1/observed-state/reports":
             return Response.json(
                 200,
-                self.control_state.observed_reports(identity, payload["reports"]),
+                self.control_state.observed_reports(
+                    identity,
+                    payload["reports"],
+                    session=request_session,
+                ),
             )
         match = re.fullmatch(r"/v1/file-transfers/incoming/([0-9a-f-]{36})", path)
         if method == "PUT" and match is not None:

@@ -271,6 +271,10 @@ def _external_metadata_from_canonical(
     project_id = _event_payload_get(event_payload, "project_id")
     if resource_uuid is None or project_id is None:
         return None, None
+    metadata_cache = getattr(session, "_workspace_event_metadata_cache", None)
+    cache_key = (model.__tablename__, str(resource_uuid), str(project_id))
+    if metadata_cache is not None and cache_key in metadata_cache:
+        return metadata_cache[cache_key]
     try:
         canonical = model.objects.get_one_or_none(
             filters={
@@ -302,7 +306,10 @@ def _external_metadata_from_canonical(
             (resource_uuid, project_id),
         ).fetchone()
     if canonical is None:
-        return None, None
+        result: tuple[typing.Any, typing.Any] = (None, None)
+        if metadata_cache is not None:
+            metadata_cache[cache_key] = result
+        return result
     provider = _event_payload_get(canonical, "provider_metadata")
     external_account_uuid = _event_payload_get(canonical, "external_account_uuid")
     if provider is None and external_account_uuid is not None:
@@ -320,10 +327,13 @@ def _external_metadata_from_canonical(
             "safe_error": _event_payload_get(canonical, "delivery_error"),
             "updated_at": _event_payload_get(canonical, "delivery_updated_at"),
         }
-    return (
+    result = (
         _event_payload_value("provider", provider),
         _event_payload_value("delivery", delivery),
     )
+    if metadata_cache is not None:
+        metadata_cache[cache_key] = result
+    return result
 
 
 def _message_from_event_payload(
@@ -570,15 +580,38 @@ def create_message_events(
             )
             for user_message in user_messages
         )
-    user_messages = models.WorkspaceUserMessage.objects.get_all(
-        filters={
-            "uuid": dm_filters.EQ(message.uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.In(recipients),
-        },
-        order_by={"user_uuid": "asc"},
-        session=session,
-    )
+    recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
+    author_uuid = sys_uuid.UUID(str(message.user_uuid))
+    content = _event_payload_get(message.payload, "content")
+    normalized_content = str(content or "").lower()
+    shared = {
+        "uuid": message.uuid,
+        "stream_uuid": message.stream_uuid,
+        "author_uuid": author_uuid,
+        "topic_uuid": message.topic_uuid,
+        "payload": message.payload,
+        "created_at": message.created_at,
+        "updated_at": message.updated_at,
+        "project_id": project_id,
+        "pinned": False,
+        "starred": False,
+        "reactions": {},
+        "source_name": message.source_name,
+        "source": message.source,
+        "reaction_users": getattr(message, "reaction_users", {}) or {},
+    }
+    user_messages = [
+        {
+            **shared,
+            "user_uuid": recipient_uuid,
+            "read": recipient_uuid == author_uuid,
+            "is_own": recipient_uuid == author_uuid,
+            "mentioned": (
+                f"](urn:user:{str(recipient_uuid).lower()})" in normalized_content
+            ),
+        }
+        for recipient_uuid in recipients
+    ]
     return create_resource_broadcast_event(
         project_id,
         message.uuid,
@@ -594,7 +627,10 @@ def _split_common_recipient_payloads(
 ) -> typing.Any:
     """Deduplicate identical resource fields without changing event payloads."""
     payloads = {
-        str(resource.user_uuid): payload_factory(resource, session=session)
+        str(_event_payload_get(resource, "user_uuid")): payload_factory(
+            resource,
+            session=session,
+        )
         for resource in resources
     }
     for payload in payloads.values():
@@ -634,15 +670,30 @@ def create_resource_broadcast_event(
     session: typing.Any = None,
 ) -> typing.Any:
     resources = list(resources)
-    common, recipient_payloads = _split_common_recipient_payloads(
-        resources,
-        payload_factory,
-        session=session,
+    session = session or contexts.Context().get_session()
+    missing_cache = object()
+    previous_cache = getattr(
+        session,
+        "_workspace_event_metadata_cache",
+        missing_cache,
     )
+    if previous_cache is missing_cache:
+        session._workspace_event_metadata_cache = {}
+    try:
+        common, recipient_payloads = _split_common_recipient_payloads(
+            resources,
+            payload_factory,
+            session=session,
+        )
+    finally:
+        if previous_cache is missing_cache:
+            delattr(session, "_workspace_event_metadata_cache")
+        else:
+            session._workspace_event_metadata_cache = previous_cache
     return create_broadcast_event(
         project_id,
         entity_uuid,
-        [resource.user_uuid for resource in resources],
+        [_event_payload_get(resource, "user_uuid") for resource in resources],
         kind,
         common,
         recipient_payloads=recipient_payloads,
@@ -822,10 +873,31 @@ def create_stream_updated_events(
         return []
     return create_resource_broadcast_event(
         project_id,
-        streams[0].uuid,
+        _event_payload_get(streams[0], "uuid"),
         STREAM_UPDATED_EVENT,
         streams,
         _stream_from_event_payload,
+        session=session,
+    )
+
+
+def create_topic_events(
+    project_id: object,
+    topics: typing.Any,
+    session: typing.Any = None,
+    compact: typing.Any = False,
+) -> typing.Any:
+    if not compact:
+        return [create_topic_event(topic, session=session) for topic in topics]
+    topics = list(topics)
+    if not topics:
+        return []
+    return create_resource_broadcast_event(
+        project_id,
+        _event_payload_get(topics[0], "uuid"),
+        TOPIC_CREATED_EVENT,
+        topics,
+        _topic_from_event_payload,
         session=session,
     )
 
@@ -843,7 +915,7 @@ def create_topic_updated_events(
         return []
     return create_resource_broadcast_event(
         project_id,
-        topics[0].uuid,
+        _event_payload_get(topics[0], "uuid"),
         TOPIC_UPDATED_EVENT,
         topics,
         _topic_from_event_payload,

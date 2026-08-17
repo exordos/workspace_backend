@@ -16,7 +16,9 @@
 
 import datetime
 import dataclasses
+import concurrent.futures
 import io
+import threading
 import types
 import uuid as sys_uuid
 from unittest import mock
@@ -139,6 +141,35 @@ def test_local_storage_lists_stable_object_ids_without_temporary_files(
     temporary.write_bytes(b"partial")
 
     assert storage.list_object_ids() == sorted((first, second))
+
+
+def test_local_storage_concurrent_replay_uses_distinct_temporary_files(
+    tmp_path,
+    monkeypatch,
+):
+    _patch_conf(monkeypatch, tmp_path)
+    storage = file_storage.LocalWorkspaceFileStorage()
+    file_uuid = sys_uuid.uuid4()
+    original_replace = file_storage.os.replace
+    writers_ready = threading.Barrier(2)
+    temporary_paths = []
+
+    def coordinated_replace(source, target):
+        temporary_paths.append(source)
+        writers_ready.wait(timeout=5)
+        original_replace(source, target)
+
+    monkeypatch.setattr(file_storage.os, "replace", coordinated_replace)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(storage.save, file_uuid, payload)
+            for payload in (b"first", b"second")
+        ]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert len(set(temporary_paths)) == 2
+    assert storage.read(file_uuid) in {b"first", b"second"}
 
 
 def test_local_storage_reads_external_provider_sidecar_v2(tmp_path, monkeypatch):

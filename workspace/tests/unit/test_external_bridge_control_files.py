@@ -44,7 +44,7 @@ def _patch_storage(monkeypatch, path):
     monkeypatch.setattr(file_storage, "CONF", conf)
 
 
-def _manager(tmp_path, monkeypatch):
+def _manager(tmp_path, monkeypatch, resolve_workspace_content=None):
     storage_path = tmp_path / "objects"
     _patch_storage(monkeypatch, storage_path)
     repository = state.PersistentControlState(tmp_path / "state", REALM_UUID)
@@ -116,6 +116,7 @@ def _manager(tmp_path, monkeypatch):
         "https://workspace-bridge-control.example.test:21443",
         repository.signing_key(),
         commit_file_projection=commit,
+        resolve_workspace_content=resolve_workspace_content,
     )
     return manager, commit, account_uuid, chat_uuid, storage_path
 
@@ -168,7 +169,20 @@ def test_local_incoming_transfer_is_single_object_and_commits_v2_sidecar(
     )
 
     assert result["file_urn"] == f"urn:image:{file_uuid}"
-    assert file_storage.read_workspace_file(file_uuid) == data
+    storage_info = commit.call_args.args[1]
+    assert (
+        file_storage.read_workspace_file(
+            file_uuid,
+            storage_object_id=storage_info.storage_object_id,
+        )
+        == data
+    )
+    assert (
+        storage_info.storage_object_id
+        == files.ExternalFileTransferManager._content_object_id(
+            hashlib.sha256(data).hexdigest()
+        )
+    )
     sidecar_path = storage_path / file_storage.get_workspace_file_metadata_object_id(
         file_uuid
     )
@@ -276,8 +290,59 @@ def test_finalize_recovers_after_each_durable_side_effect(
         _identity(), file_uuid, _finalize_request(request, allocation)
     )
     assert result["file_urn"] == f"urn:image:{file_uuid}"
-    assert file_storage.read_workspace_file(file_uuid) == data
+    storage_info = commit.call_args.args[1]
+    assert (
+        file_storage.read_workspace_file(
+            file_uuid,
+            storage_object_id=storage_info.storage_object_id,
+        )
+        == data
+    )
     assert commit.call_count in (1, 2)
+
+
+def test_incoming_transfer_reuses_content_for_a_distinct_logical_file(
+    tmp_path, monkeypatch
+):
+    data = b"shared provider bytes"
+    sha256 = hashlib.sha256(data).hexdigest()
+    content_uuid = sys_uuid.uuid4()
+    content_object_id = files.ExternalFileTransferManager._content_object_id(sha256)
+    storage_info = file_storage.WorkspaceFileStorageInfo(
+        storage_type=file_storage_opts.STORAGE_TYPE_FILE,
+        storage_id="",
+        storage_object_id=content_object_id,
+    )
+    manager, commit, account_uuid, chat_uuid, _ = _manager(
+        tmp_path,
+        monkeypatch,
+        resolve_workspace_content=lambda digest, size: (
+            storage_info if (digest, size) == (sha256, len(data)) else None
+        ),
+    )
+    file_storage.save_workspace_file(
+        content_uuid,
+        data,
+        storage_object_id=content_object_id,
+    )
+    file_uuid = sys_uuid.uuid4()
+    request = _allocation_request(account_uuid, chat_uuid, data)
+
+    result, created = manager.allocate_incoming(_identity(), file_uuid, request)
+
+    assert created is True
+    assert result["status"] == "finalized"
+    assert result["file_urn"] == f"urn:image:{file_uuid}"
+    assert "upload" not in result
+    commit.assert_called_once()
+    assert commit.call_args.args[1] == storage_info
+    assert (
+        file_storage.read_workspace_file(
+            file_uuid,
+            storage_object_id=content_object_id,
+        )
+        == data
+    )
 
 
 def test_outgoing_authorization_is_assignment_scoped_and_method_bound(

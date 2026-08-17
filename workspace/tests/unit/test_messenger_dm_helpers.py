@@ -27,6 +27,31 @@ from workspace.messenger_api.dm import helpers as dm_helpers
 from workspace.messenger_api.dm import message_payloads
 
 
+def test_create_message_flags_bulk_uses_one_insert_for_all_recipients():
+    project_id = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    author_uuid = sys_uuid.uuid4()
+    other_uuid = sys_uuid.uuid4()
+    session = mock.Mock()
+
+    dm_helpers.create_message_flags_bulk(
+        project_id,
+        message_uuid,
+        author_uuid,
+        [other_uuid, author_uuid, other_uuid],
+        session,
+    )
+
+    statement, values = session.execute.call_args.args
+    assert "unnest(%s::uuid[])" in statement
+    assert values == (
+        message_uuid,
+        project_id,
+        author_uuid,
+        sorted({author_uuid, other_uuid}, key=str),
+    )
+
+
 class MessengerDMHelpersTestCase(unittest.TestCase):
     def _existing_stream(self, **kwargs):
         class ExistingStream:
@@ -348,6 +373,58 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ]
         )
         self.assertEqual(4, create_folder_event.call_count)
+
+    def test_get_or_create_workspace_user_stream_quietly_skips_view(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        session = object()
+
+        class FakeWorkspaceStream:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+            def insert(self, session=None):
+                self.insert_session = session
+
+        class FakeWorkspaceStreamBinding:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+            def insert(self, session=None):
+                self.insert_session = session
+
+        get_user_streams = mock.Mock(side_effect=AssertionError("view queried"))
+        fake_user_streams = types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_all=get_user_streams)
+        )
+        with (
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceStreamBinding",
+                FakeWorkspaceStreamBinding,
+            ),
+            mock.patch.object(
+                dm_helpers.models, "WorkspaceUserStream", fake_user_streams
+            ),
+        ):
+            result = dm_helpers.get_or_create_workspace_user_stream(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                uuid=stream_uuid,
+                name="Quiet import",
+                description="",
+                create_default_topic=False,
+                emit_events=False,
+                session=session,
+            )
+
+        self.assertEqual(stream_uuid, result.uuid)
+        self.assertIs(session, result.insert_session)
+        get_user_streams.assert_not_called()
 
     def test_get_or_create_workspace_user_stream_with_direct_user_creates_private_pair(
         self,
@@ -1593,7 +1670,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=None,
         )
 
-    def test_get_or_create_workspace_stream_bindings_creates_grouped_roles(self):
+    def test_get_or_create_workspace_stream_bindings_can_suppress_events(self):
         project_id = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         who_uuid = sys_uuid.uuid4()
@@ -1648,6 +1725,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     dm_helpers.models.WorkspaceStreamRole.MEMBER.value: [member_uuid],
                     dm_helpers.models.WorkspaceStreamRole.OWNER.value: [owner_uuid],
                 },
+                emit_events=False,
             )
 
         self.assertEqual(created_bindings, result)
@@ -1658,7 +1736,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ],
             [(binding.user_uuid, binding.role) for binding in created_bindings],
         )
-        self.assertEqual(2, create_user_events.call_count)
+        create_user_events.assert_not_called()
         create_flags.assert_has_calls(
             [
                 mock.call(
@@ -1691,10 +1769,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 ),
             ]
         )
-        create_batch_events.assert_called_once_with(
-            bindings=created_bindings,
-            session=None,
-        )
+        create_batch_events.assert_not_called()
 
     def test_create_workspace_stream_binding_message_flags_inserts_missing(self):
         project_id = sys_uuid.uuid4()
@@ -3009,6 +3084,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 FakeWorkspaceUserMessageFlags,
             ),
             mock.patch.object(
+                dm_helpers,
+                "create_message_flags_bulk",
+            ) as create_flags_bulk,
+            mock.patch.object(
                 dm_helpers.messenger_events, "create_message_events"
             ) as create_message_events,
             mock.patch.object(
@@ -3043,24 +3122,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertIs(source_fields["source"], created_message["source"])
         self.assertIs(session, created_message["insert_session"])
         self.assertIs(session, created_message["recipients_session"])
-        self.assertEqual(
-            [
-                {
-                    "uuid": message_uuid,
-                    "user_uuid": user_uuid,
-                    "project_id": project_id,
-                    "read": True,
-                    "insert_session": session,
-                },
-                {
-                    "uuid": message_uuid,
-                    "user_uuid": other_user_uuid,
-                    "project_id": project_id,
-                    "read": False,
-                    "insert_session": session,
-                },
-            ],
-            created_flags,
+        self.assertEqual([], created_flags)
+        create_flags_bulk.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            author_uuid=user_uuid,
+            recipients=[user_uuid, other_user_uuid],
+            session=session,
         )
         create_message_events.assert_called_once()
         get_topic_source_fields.assert_called_once_with(
@@ -3079,6 +3147,72 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
+        )
+
+    def test_compact_external_message_flags_only_canonical_recipients(self):
+        project_id = sys_uuid.uuid4()
+        author_uuid = sys_uuid.uuid4()
+        owner_uuid = sys_uuid.uuid4()
+        duplicate_recipient_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+
+        class FakeWorkspaceMessage:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+            def insert(self, session=None):
+                self.insert_session = session
+
+            def get_recipients(self, session=None):
+                return [owner_uuid, duplicate_recipient_uuid]
+
+        with (
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceMessage",
+                FakeWorkspaceMessage,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_compact_message_visible_users",
+                return_value=[owner_uuid],
+            ) as visible_users,
+            mock.patch.object(
+                dm_helpers,
+                "create_message_flags_bulk",
+            ) as create_flags_bulk,
+        ):
+            result = dm_helpers.create_workspace_user_message(
+                project_id=project_id,
+                user_uuid=author_uuid,
+                uuid=message_uuid,
+                stream_uuid=stream_uuid,
+                topic_uuid=topic_uuid,
+                payload={"kind": "markdown", "content": "hello"},
+                source_name="zulip",
+                source={"kind": "zulip"},
+                session=session,
+                compact_events=True,
+                emit_events=False,
+                return_visible=False,
+            )
+
+        self.assertIsInstance(result, FakeWorkspaceMessage)
+        visible_users.assert_called_once_with(
+            project_id,
+            [owner_uuid, duplicate_recipient_uuid],
+            stream_uuid,
+            session,
+        )
+        create_flags_bulk.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            author_uuid=author_uuid,
+            recipients=[owner_uuid],
+            session=session,
         )
 
     def test_create_workspace_user_message_uses_stream_default_topic(self):
@@ -3152,6 +3286,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 FakeWorkspaceUserMessageFlags,
             ),
             mock.patch.object(
+                dm_helpers,
+                "create_message_flags_bulk",
+            ) as create_flags_bulk,
+            mock.patch.object(
                 dm_helpers.messenger_events, "create_message_events"
             ) as create_message_events,
             mock.patch.object(
@@ -3195,17 +3333,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         source_filters = get_default_topic.call_args_list[1].kwargs["filters"]
         self.assertEqual(project_id, source_filters["project_id"].value)
         self.assertEqual(topic_uuid, source_filters["uuid"].value)
-        self.assertEqual(
-            [
-                {
-                    "uuid": message_uuid,
-                    "user_uuid": user_uuid,
-                    "project_id": project_id,
-                    "read": True,
-                    "insert_session": session,
-                },
-            ],
-            created_flags,
+        self.assertEqual([], created_flags)
+        create_flags_bulk.assert_called_once_with(
+            project_id=project_id,
+            message_uuid=message_uuid,
+            author_uuid=user_uuid,
+            recipients=[user_uuid],
+            session=session,
         )
         create_message_events.assert_called_once()
         create_unread_events.assert_called_once_with(
@@ -3620,6 +3754,64 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         create_events.assert_called_once_with(
             project_id=project_id,
             message_uuid=message_uuid,
+            session=session,
+        )
+
+    def test_create_workspace_message_reaction_can_suppress_events(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = object()
+
+        class FakeWorkspaceMessageReactions:
+            def __init__(self, **kwargs):
+                for name, value in kwargs.items():
+                    setattr(self, name, value)
+
+            def insert(self, session=None):
+                self.insert_session = session
+
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "_get_workspace_message",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                dm_helpers.models,
+                "WorkspaceMessageReactions",
+                FakeWorkspaceMessageReactions,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_create_workspace_message_updated_events",
+            ) as create_events,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_reaction_created_event",
+            ) as create_reaction_event,
+            mock.patch.object(dm_helpers.reaction_users, "lock_messages"),
+            mock.patch.object(
+                dm_helpers.reaction_users,
+                "refresh_groups",
+            ) as refresh_groups,
+        ):
+            result = dm_helpers.create_workspace_message_reaction(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+                emoji_name="thumbs_up",
+                session=session,
+                enforce_visibility=False,
+                emit_events=False,
+            )
+
+        self.assertIs(session, result.insert_session)
+        create_reaction_event.assert_not_called()
+        create_events.assert_not_called()
+        refresh_groups.assert_called_once_with(
+            project_id,
+            ((message_uuid, "thumbs_up"),),
             session=session,
         )
 

@@ -405,6 +405,45 @@ def _emit_projected_capability_events(session: Any, chat: dict[str, Any]) -> Non
         messenger_events.create_topic_updated_event(topic, session=session)
 
 
+def _emit_initial_sync_projection_events(session: Any, chat: Any) -> None:
+    """Publish the bounded snapshots hidden during quiet initial history."""
+    projection = {
+        "project_id": chat.project_id,
+        "projection_stream_uuid": chat.projection_stream_uuid,
+    }
+    _emit_projected_capability_events(session, projection)
+    if chat.project_id is None or chat.projection_stream_uuid is None:
+        return
+    latest_rows = session.execute(
+        """
+        SELECT DISTINCT ON (message.topic_uuid) message.uuid
+        FROM m_workspace_messages AS message
+        WHERE message.project_id = %s AND message.stream_uuid = %s
+        ORDER BY
+            message.topic_uuid,
+            message.created_at DESC,
+            message.uuid DESC
+        """,
+        (chat.project_id, chat.projection_stream_uuid),
+    ).fetchall()
+    if not latest_rows:
+        return
+    messages = models.WorkspaceMessage.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(chat.project_id),
+            "uuid": dm_filters.In([row["uuid"] for row in latest_rows]),
+        },
+        session=session,
+    )
+    for message in sorted(messages, key=lambda item: (item.created_at, str(item.uuid))):
+        messenger_events.create_message_events(
+            chat.project_id,
+            message,
+            [chat.owner_user_uuid],
+            session=session,
+        )
+
+
 def _update_projected_capabilities(
     session: Any,
     chat: dict[str, Any],
@@ -1404,6 +1443,7 @@ class SQLControlState:
         account = session.execute(
             """
             SELECT account.owner_user_uuid, account.provider, account.settings,
+                   account.live_ready,
                    account.desired_generation, account.provider_realm_uuid,
                    policy.limits
             FROM m_external_accounts_v2 AS account
@@ -1773,6 +1813,7 @@ class SQLControlState:
                 source=chat.source,
                 capabilities=chat.capabilities,
                 account_settings=account["settings"],
+                emit_events=bool(account["live_ready"]),
             )
             append_upsert(
                 session,
@@ -1832,27 +1873,34 @@ class SQLControlState:
                     session=session,
                 ),
             )
+            if account["live_ready"]:
+                messenger_events.create_external_resource_event(
+                    changed_chat.project_id,
+                    changed_chat.owner_user_uuid,
+                    changed_chat,
+                    messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
+                    hidden_fields=(
+                        "owner_user_uuid",
+                        "provider",
+                        "provider_chat_id",
+                    ),
+                    session=session,
+                )
+        if account["live_ready"]:
             messenger_events.create_external_resource_event(
-                changed_chat.project_id,
-                changed_chat.owner_user_uuid,
-                changed_chat,
+                project_uuid,
+                owner_uuid,
+                chat,
                 messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
-                hidden_fields=(
-                    "owner_user_uuid",
-                    "provider",
-                    "provider_chat_id",
-                ),
+                hidden_fields=("owner_user_uuid", "provider", "provider_chat_id"),
                 session=session,
             )
-        messenger_events.create_external_resource_event(
-            project_uuid,
-            owner_uuid,
-            chat,
-            messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
-            hidden_fields=("owner_user_uuid", "provider", "provider_chat_id"),
-            session=session,
-        )
-        identity_linking.delete_unreferenced_provider_identities(session)
+        if changed_chat_uuids:
+            # Cleanup is only relevant after an identity merge displaced a
+            # legacy Workspace user. Scanning every foreign-key consumer for
+            # every ordinary catalog row makes large initial catalogs scale
+            # with users x chats x referencing tables.
+            identity_linking.delete_unreferenced_provider_identities(session)
 
     def _reconcile_observed_report(
         self,
@@ -1946,6 +1994,10 @@ class SQLControlState:
             status = status_map.get(report["status"])
             if status is None:
                 return
+            became_live = (
+                status == external_models.ExternalChatStatus.LIVE.value
+                and chat.status != external_models.ExternalChatStatus.LIVE.value
+            )
             if chat.status == status and chat.safe_error == safe_error:
                 return
             chat.properties["status"].set_value_force(status)
@@ -1965,6 +2017,8 @@ class SQLControlState:
                     ),
                     session=session,
                 )
+                if became_live:
+                    _emit_initial_sync_projection_events(session, chat)
 
     def reconcile_observed_reports(
         self,
@@ -2041,13 +2095,15 @@ class SQLControlState:
                     status = "rejected"
                 else:
                     status = "applied"
-                session.execute(
+                inserted = session.execute(
                     """
                         INSERT INTO "m_external_bridge_observed_reports_v1" (
                             "report_uuid", "bridge_instance_uuid",
                             "canonical_sha256", "resource_type", "resource_uuid",
                             "observed_generation", "payload", "observed_at"
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                        ON CONFLICT ("report_uuid") DO NOTHING
+                        RETURNING "canonical_sha256"
                         """,
                     (
                         report_uuid,
@@ -2059,8 +2115,21 @@ class SQLControlState:
                         _json(report),
                         report["observed_at"],
                     ),
-                )
-                if status == "applied":
+                ).fetchone()
+                if inserted is None:
+                    existing = session.execute(
+                        'SELECT "canonical_sha256" '
+                        'FROM "m_external_bridge_observed_reports_v1" '
+                        'WHERE "report_uuid" = %s',
+                        (report_uuid,),
+                    ).fetchone()
+                    status = (
+                        "duplicate"
+                        if existing is not None
+                        and existing["canonical_sha256"] == canonical
+                        else "rejected"
+                    )
+                elif status == "applied":
                     try:
                         self._reconcile_observed_report(session, identity, report)
                     except identity_linking.IdentityMergePending:
@@ -2101,9 +2170,18 @@ class SQLControlState:
         self,
         identity: pki.BridgeIdentity,
         reports: list[dict[str, Any]],
+        session: Any = None,
     ) -> dict[str, Any]:
-        with self._current_session() as session:
-            return self.reconcile_observed_reports(session, identity, reports)
+        if not 1 <= len(reports) <= 500:
+            raise ValueError("Observed report batch size is invalid")
+        if session is None:
+            with self._current_session() as current_session:
+                return self.reconcile_observed_reports(
+                    current_session,
+                    identity,
+                    reports,
+                )
+        return self.reconcile_observed_reports(session, identity, reports)
 
     def assignment(
         self,

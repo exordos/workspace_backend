@@ -11,7 +11,6 @@ import typing
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
-from restalchemy.storage import exceptions as storage_exc
 
 from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import helpers
@@ -52,6 +51,17 @@ def _assignment(
     chat_uuid = sys_uuid.UUID(str(event["external_chat_uuid"]))
     account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
     project_id = sys_uuid.UUID(str(event["project_id"]))
+    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+    cache_key = (
+        "assignment",
+        identity.bridge_instance_uuid,
+        identity.provider_kind,
+        account_uuid,
+        chat_uuid,
+        project_id,
+    )
+    if batch_cache is not None and cache_key in batch_cache:
+        return batch_cache[cache_key]
     row = session.execute(
         """
         SELECT chat."owner_user_uuid", chat."projection_stream_uuid",
@@ -91,7 +101,10 @@ def _assignment(
     ).fetchone()
     if row is None:
         raise ValueError("Provider event chat assignment is not active")
-    return account_uuid, project_id, row
+    result = (account_uuid, project_id, row)
+    if batch_cache is not None:
+        batch_cache[cache_key] = result
+    return result
 
 
 def _resource(
@@ -270,10 +283,14 @@ def _message_projection_is_unchanged(
 ) -> bool:
     incoming_payload = values.get("payload")
     current_payload = getattr(existing, "payload", None)
+    current_content = (
+        current_payload.get("content")
+        if isinstance(current_payload, collections.abc.Mapping)
+        else getattr(current_payload, "content", None)
+    )
     if (
         not isinstance(incoming_payload, message_payloads.MarkdownPayload)
-        or not isinstance(current_payload, message_payloads.MarkdownPayload)
-        or incoming_payload.content != current_payload.content
+        or incoming_payload.content != current_content
     ):
         return False
     if values.get("provider_external_id") != getattr(
@@ -292,13 +309,48 @@ def _message_projection_is_unchanged(
     )
 
 
+def _provider_sequence(value: typing.Any) -> int | None:
+    if not isinstance(value, collections.abc.Mapping):
+        return None
+    sequence = value.get("provider_sequence")
+    if sequence is None or isinstance(sequence, bool):
+        return None
+    try:
+        parsed = int(sequence)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _is_stale_provider_message(existing: typing.Any, resource: typing.Any) -> bool:
+    current_sequence = _provider_sequence(getattr(existing, "provider_metadata", None))
+    incoming_sequence = _provider_sequence(resource.get("provider_metadata"))
+    return (
+        current_sequence is not None
+        and incoming_sequence is not None
+        and incoming_sequence < current_sequence
+    )
+
+
 def _ensure_projection_owner_stream(
     session: typing.Any,
     project_id: sys_uuid.UUID,
     assignment: typing.Mapping[str, typing.Any],
     identity: typing.Any,
     account_uuid: sys_uuid.UUID,
+    emit_events: bool = True,
 ) -> None:
+    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+    cache_key = (
+        "projection",
+        identity.bridge_instance_uuid,
+        identity.provider_kind,
+        account_uuid,
+        project_id,
+        assignment["projection_stream_uuid"],
+    )
+    if batch_cache is not None and cache_key in batch_cache:
+        return
     external_projection.ensure_external_chat_stream(
         session=session,
         project_id=project_id,
@@ -312,7 +364,11 @@ def _ensure_projection_owner_stream(
         source=assignment["source"],
         capabilities=assignment["capabilities"],
         account_settings=assignment["account_settings"],
+        emit_events=emit_events,
+        reconcile_participants=False,
     )
+    if batch_cache is not None:
+        batch_cache[cache_key] = True
 
 
 def _stream_event(
@@ -375,12 +431,18 @@ def _topic_event(
         project_id,
         stream_uuid,
     )
+    provider_metadata = resource.get("provider_metadata")
+    quiet_backfill = (
+        isinstance(provider_metadata, collections.abc.Mapping)
+        and provider_metadata.get("delivery_class") == "backfill"
+    )
     _ensure_projection_owner_stream(
         session,
         project_id,
         assignment,
         identity,
         sys_uuid.UUID(str(event["external_account_uuid"])),
+        emit_events=not quiet_backfill,
     )
     existing = _existing(models.WorkspaceStreamTopic, project_id, topic_uuid, session)
     if event["kind"] == "topic.delete":
@@ -408,20 +470,22 @@ def _topic_event(
         )
     if existing is None:
         values.update({"uuid": topic_uuid, "stream_uuid": stream_uuid})
-        helpers.create_workspace_user_stream_topic(
-            project_id,
-            assignment["owner_user_uuid"],
-            values,
+        helpers.create_workspace_stream_topic_with_flags(
+            project_id=project_id,
             session=session,
+            **values,
         )
     else:
         values.pop("uuid", None)
         values.pop("stream_uuid", None)
-        helpers.update_workspace_user_stream_topic(
+        existing.update_dm(values=values)
+        existing.update(session=session)
+    if not quiet_backfill:
+        helpers.create_compact_workspace_stream_topic_events(
             project_id,
-            assignment["owner_user_uuid"],
+            stream_uuid,
             topic_uuid,
-            values,
+            created=existing is None,
             session=session,
         )
     return topic_uuid
@@ -440,6 +504,11 @@ def _message_event(
     if stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider message does not belong to the selected stream")
     existing = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
+    if existing is not None and _is_stale_provider_message(existing, resource):
+        # A live record may overtake an older history record by design. Once the
+        # newer provider sequence is stored, the delayed snapshot must not
+        # regress content, reactions, or read state.
+        return message_uuid
     if event["kind"] == "message.delete":
         if existing is None:
             return message_uuid
@@ -455,19 +524,38 @@ def _message_event(
     read_value = resource.get("read")
     if read_value is not None and not isinstance(read_value, bool):
         raise ValueError("Provider message read state is invalid")
+    provider_metadata = resource.get("provider_metadata")
+    quiet_backfill = (
+        isinstance(provider_metadata, collections.abc.Mapping)
+        and provider_metadata.get("delivery_class") == "backfill"
+    )
     author_identity = resource.get("author_identity")
     if (
         isinstance(author_identity, collections.abc.Mapping)
         and sys_uuid.UUID(str(resource["user_uuid"])) != assignment["owner_user_uuid"]
     ):
-        resource["user_uuid"] = _upsert_provider_identity(
-            session,
-            identity,
-            sys_uuid.UUID(str(event["external_account_uuid"])),
-            sys_uuid.UUID(str(resource["user_uuid"])),
+        account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
+        batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+        author_key = (
+            "author_identity",
+            identity.bridge_instance_uuid,
+            identity.provider_kind,
+            account_uuid,
             str(author_identity["provider_external_id"]),
-            author_identity,
         )
+        author_uuid = batch_cache.get(author_key) if batch_cache is not None else None
+        if author_uuid is None:
+            author_uuid = _upsert_provider_identity(
+                session,
+                identity,
+                account_uuid,
+                sys_uuid.UUID(str(resource["user_uuid"])),
+                str(author_identity["provider_external_id"]),
+                author_identity,
+            )
+            if batch_cache is not None and quiet_backfill:
+                batch_cache[author_key] = author_uuid
+        resource["user_uuid"] = author_uuid
     if existing is None:
         _ensure_projection_owner_stream(
             session,
@@ -475,6 +563,7 @@ def _message_event(
             assignment,
             identity,
             sys_uuid.UUID(str(event["external_account_uuid"])),
+            emit_events=not quiet_backfill,
         )
     values = _scoped_provider_values(
         resource,
@@ -491,8 +580,7 @@ def _message_event(
         sys_uuid.UUID(str(event["external_account_uuid"])),
     )
     if identity.provider_kind != models.SourceName.NATIVE.value and (
-        values.get("source_name") != identity.provider_kind
-        or "source" not in values
+        values.get("source_name") != identity.provider_kind or "source" not in values
     ):
         assignment_source = assignment.get("source") or {}
         source_name, source = external_projection._workspace_source(
@@ -517,15 +605,33 @@ def _message_event(
                 "user_uuid": sys_uuid.UUID(str(resource["user_uuid"])),
             }
         )
-        helpers.create_workspace_user_message(
-            project_id,
-            values.pop("user_uuid"),
-            session=session,
-            enforce_visibility=False,
-            return_visible=False,
-            compact_events=True,
-            **values,
-        )
+        create_options = {"emit_events": False} if quiet_backfill else {}
+        validation_token = None
+        if quiet_backfill:
+            batch_cache = getattr(
+                session, "_workspace_provider_event_batch_cache", None
+            )
+            if batch_cache is not None:
+                validation_cache = batch_cache.setdefault(
+                    ("message_validation",), set()
+                )
+                validation_token = models._PROVIDER_MESSAGE_VALIDATION_CACHE.set(
+                    validation_cache
+                )
+        try:
+            helpers.create_workspace_user_message(
+                project_id,
+                values.pop("user_uuid"),
+                session=session,
+                enforce_visibility=False,
+                return_visible=False,
+                compact_events=True,
+                **create_options,
+                **values,
+            )
+        finally:
+            if validation_token is not None:
+                models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
     else:
         if existing.stream_uuid != stream_uuid:
             raise ValueError("Provider message UUID belongs to another stream")
@@ -550,27 +656,49 @@ def _message_event(
             )
             != update_values["source_name"]
         )
-        if source_changed or not _message_projection_is_unchanged(
+        projection_changed = not _message_projection_is_unchanged(
             existing,
             update_values,
-        ):
+        )
+        if source_changed or projection_changed:
             existing.update_dm(values=update_values)
             existing.update(session=session)
-            helpers._create_workspace_message_updated_events(
-                project_id,
-                message_uuid,
-                session=session,
-                compact_events=True,
+            if not quiet_backfill:
+                helpers.create_compact_workspace_message_updated_events(
+                    project_id,
+                    existing,
+                    session=session,
+                )
+        elif _provider_sequence(update_values.get("provider_metadata")) != (
+            _provider_sequence(getattr(existing, "provider_metadata", None))
+        ):
+            # Advance the freshness watermark without broadcasting an
+            # unchanged message snapshot.
+            existing.update_dm(
+                values={"provider_metadata": update_values["provider_metadata"]}
             )
+            existing.update(session=session)
     if read_value is not None:
-        helpers.sync_workspace_user_message_flags(
-            project_id,
-            assignment["owner_user_uuid"],
-            message_uuid,
-            {"read": read_value},
-            session=session,
-            allow_author_unread=True,
-        )
+        if quiet_backfill:
+            helpers.sync_workspace_user_message_flags(
+                project_id,
+                assignment["owner_user_uuid"],
+                message_uuid,
+                {"read": read_value},
+                session=session,
+                allow_author_unread=True,
+                emit_events=False,
+            )
+        else:
+            _sync_provider_read_state(
+                session,
+                project_id,
+                assignment["owner_user_uuid"],
+                stream_uuid,
+                sys_uuid.UUID(str(resource["topic_uuid"])),
+                [message_uuid],
+                read_value,
+            )
     return message_uuid
 
 
@@ -584,6 +712,16 @@ def _reaction_event(
 ) -> sys_uuid.UUID:
     reaction_uuid = sys_uuid.UUID(str(resource["uuid"]))
     message_uuid = sys_uuid.UUID(str(resource["message_uuid"]))
+    provider_metadata = resource.get("provider_metadata")
+    quiet_backfill = (
+        isinstance(provider_metadata, collections.abc.Mapping)
+        and provider_metadata.get("delivery_class") == "backfill"
+    )
+    event_options = {
+        "compact_events": True,
+        "enforce_visibility": False,
+        **({"emit_events": False} if quiet_backfill else {}),
+    }
     message = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
     if message is None or message.stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider reaction message is outside the selected stream")
@@ -618,9 +756,7 @@ def _reaction_event(
         existing = matching
         reaction_uuid = existing.uuid
     elif (
-        existing is not None
-        and matching is not None
-        and existing.uuid != matching.uuid
+        existing is not None and matching is not None and existing.uuid != matching.uuid
     ):
         raise ValueError("Provider reaction conflicts with an existing reaction")
     if event["kind"] == "reaction.delete":
@@ -631,7 +767,7 @@ def _reaction_event(
             existing.user_uuid,
             reaction_uuid,
             session=session,
-            enforce_visibility=False,
+            **event_options,
         )
         return reaction_uuid
     values = _provider_values(
@@ -645,7 +781,7 @@ def _reaction_event(
             project_id,
             actor_uuid,
             session=session,
-            enforce_visibility=False,
+            **event_options,
             **values,
         )
     else:
@@ -656,8 +792,115 @@ def _reaction_event(
             reaction_uuid,
             values,
             session=session,
+            **event_options,
         )
     return reaction_uuid
+
+
+def _sync_provider_read_state(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    reader_uuid: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
+    topic_uuid: sys_uuid.UUID | None,
+    message_uuids: list[sys_uuid.UUID],
+    read: bool,
+) -> None:
+    # Workspace events acquire this project-scoped lock after mutating message
+    # flags. Take it first for imported read-state batches so a concurrent
+    # writer cannot hold the event lock while waiting for one of those rows.
+    session.execute(
+        """
+        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+        """,
+        (project_id,),
+    )
+    messages = session.execute(
+        """
+        SELECT
+            message.uuid,
+            message.user_uuid AS author_uuid,
+            message.stream_uuid,
+            message.topic_uuid,
+            flags.read
+        FROM m_workspace_messages AS message
+        JOIN m_workspace_user_message_flags AS flags
+          ON flags.uuid = message.uuid
+         AND flags.project_id = message.project_id
+         AND flags.user_uuid = %s
+        WHERE message.project_id = %s
+          AND message.uuid = ANY(%s::uuid[])
+        ORDER BY message.uuid
+        """,
+        (reader_uuid, project_id, message_uuids),
+    ).fetchall()
+    if any(
+        message["stream_uuid"] != stream_uuid
+        or (topic_uuid is not None and message["topic_uuid"] != topic_uuid)
+        for message in messages
+    ):
+        raise ValueError("Provider read state message is outside the selected chat")
+    changed_message_uuids = [
+        message["uuid"] for message in messages if message["read"] != read
+    ]
+    if not changed_message_uuids:
+        return
+    updated_rows = session.execute(
+        """
+        UPDATE m_workspace_user_message_flags
+        SET read = %s, updated_at = NOW()
+        WHERE project_id = %s
+          AND user_uuid = %s
+          AND uuid = ANY(%s::uuid[])
+          AND read IS DISTINCT FROM %s
+        RETURNING uuid
+        """,
+        (read, project_id, reader_uuid, changed_message_uuids, read),
+    ).fetchall()
+    updated_message_uuids = [row["uuid"] for row in updated_rows]
+    if not updated_message_uuids:
+        return
+    if read:
+        helpers.messenger_events.create_messages_read_event(
+            project_id,
+            reader_uuid,
+            updated_message_uuids,
+            session=session,
+        )
+    else:
+        # Aggregates alone cannot update the read flag of an already-open
+        # message. Emit the same exact per-user snapshots as the single-message
+        # flag path, but fetch the changed set in one query.
+        changed_messages = models.WorkspaceUserMessage.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(project_id),
+                "user_uuid": dm_filters.EQ(reader_uuid),
+                "uuid": dm_filters.In(updated_message_uuids),
+            },
+            order_by={"uuid": "asc"},
+            session=session,
+        )
+        for changed_message in changed_messages:
+            helpers.messenger_events.create_message_updated_event(
+                message=changed_message,
+                session=session,
+            )
+    changed_topic_uuids = sorted(
+        {
+            message["topic_uuid"]
+            for message in messages
+            if message["uuid"] in updated_message_uuids
+        },
+        key=str,
+    )
+    for changed_topic_uuid in changed_topic_uuids:
+        helpers._create_compact_messages_unread_updated_events(
+            project_id,
+            [reader_uuid],
+            stream_uuid,
+            changed_topic_uuid,
+            session=session,
+        )
 
 
 def _read_state_event(
@@ -685,44 +928,16 @@ def _read_state_event(
     message_uuids = [sys_uuid.UUID(str(value)) for value in message_values]
     if len(set(message_uuids)) != len(message_uuids):
         raise ValueError("Provider read state message list contains duplicates")
-    # Workspace events acquire this project-scoped lock after mutating message
-    # flags. Take it first for imported read-state batches so a concurrent
-    # writer cannot hold the event lock while waiting for one of those rows.
-    session.execute(
-        """
-        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
-        """,
-        (project_id,),
-    )
     topic_value = resource.get("topic_uuid")
     topic_uuid = None if topic_value is None else sys_uuid.UUID(str(topic_value))
-    messages = []
-    for message_uuid in message_uuids:
-        try:
-            message = helpers.get_workspace_user_message(
-                project_id,
-                reader_uuid,
-                message_uuid,
-            )
-        except storage_exc.RecordNotFound:
-            # Queue catch-up is deliberately started before background history
-            # import. A live flag event can therefore arrive before its message;
-            # the later history upsert carries the provider's current read flag.
-            continue
-        messages.append(message)
-    if any(
-        message.stream_uuid != stream_uuid
-        or (topic_uuid is not None and message.topic_uuid != topic_uuid)
-        for message in messages
-    ):
-        raise ValueError("Provider read state message is outside the selected chat")
-    helpers.sync_workspace_user_messages_read_state(
+    _sync_provider_read_state(
+        session,
         project_id,
         reader_uuid,
-        messages,
+        stream_uuid,
+        topic_uuid,
+        message_uuids,
         read,
-        session=session,
-        allow_author_unread=True,
     )
     return stream_uuid
 

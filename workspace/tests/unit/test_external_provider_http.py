@@ -8,6 +8,7 @@ import types
 import uuid as sys_uuid
 
 import pytest
+from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_service
@@ -102,8 +103,8 @@ def test_lease_is_fifo_idempotent_and_reuses_request_session(monkeypatch):
         "messenger.message.send"
     )
     assert "FOR UPDATE OF operation SKIP LOCKED" in session.statements[3][0]
-    assert 'JOIN "m_external_provider_policies_v1" AS policy' in (
-        session.statements[3][0]
+    assert (
+        'JOIN "m_external_provider_policies_v1" AS policy' in (session.statements[3][0])
     )
     assert 'policy."emergency_suspended" = FALSE' in session.statements[3][0]
     assert "FOR SHARE OF policy" in session.statements[3][0]
@@ -350,7 +351,7 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     session = Session(
         [
             _healthy_bridge(),
-            {"exists": 1},
+            {"matched": 1},
             {"provider_event_uuid": event_uuid},
             None,
         ]
@@ -373,9 +374,48 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     assert "pg_advisory_xact_lock" in session.statements[1][0]
     assert session.statements[1][1] == (project_uuid,)
     assert "m_external_bridge_desired_resources_v1" in session.statements[2][0]
-    assert session.statements[2][1][2] == identity.bridge_instance_uuid
     assert session.statements[2][1][4] == identity.bridge_instance_uuid
+    assert session.statements[2][1][6] == identity.bridge_instance_uuid
     assert "m_external_provider_events_v1" in session.statements[3][0]
+    assert not hasattr(session, "_workspace_provider_event_batch_cache")
+
+
+def test_inbound_quiet_backfill_batch_does_not_take_project_event_lock():
+    identity = _identity()
+    event_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    event = {
+        "provider_event_uuid": str(event_uuid),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(project_uuid),
+        "kind": "message.upsert",
+        "payload": {"resource": {"provider_metadata": {"delivery_class": "backfill"}}},
+    }
+    session = Session(
+        [
+            _healthy_bridge(),
+            {"matched": 1},
+            {"provider_event_uuid": event_uuid},
+            None,
+        ]
+    )
+
+    response = provider_data.apply_provider_event_batch(
+        session,
+        identity,
+        [event],
+        lambda *_args: target_uuid,
+        now=NOW,
+    )
+
+    assert response["results"][0]["status"] == "applied"
+    assert not any(
+        "pg_advisory_xact_lock" in statement
+        for statement, _params in session.statements
+    )
 
 
 def test_inbound_event_batch_requires_current_heartbeat_before_account_access():
@@ -418,7 +458,7 @@ def test_inbound_event_batch_rejects_another_bridge_assignment():
         "kind": "message.upsert",
         "payload": {"resource": {}},
     }
-    session = Session([_healthy_bridge(), None])
+    session = Session([_healthy_bridge(), {"matched": 0}])
 
     with pytest.raises(provider_data.ProviderBatchError, match="not assigned"):
         provider_data.apply_provider_event_batch(
@@ -429,8 +469,46 @@ def test_inbound_event_batch_rejects_another_bridge_assignment():
             now=NOW,
         )
 
-    assert session.statements[2][1][2] == requesting_bridge.bridge_instance_uuid
-    assert session.statements[2][1][2] != assigned_bridge.bridge_instance_uuid
+    assert session.statements[2][1][4] == requesting_bridge.bridge_instance_uuid
+    assert session.statements[2][1][4] != assigned_bridge.bridge_instance_uuid
+
+
+def test_inbound_event_batch_reports_storage_conflicts_as_batch_rejections():
+    identity = _identity()
+    event_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    event = {
+        "provider_event_uuid": str(event_uuid),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(project_uuid),
+        "kind": "message.create",
+        "payload": {"content": "hello"},
+    }
+    session = Session(
+        [
+            _healthy_bridge(),
+            {"matched": 1},
+            {"provider_event_uuid": event_uuid},
+        ]
+    )
+
+    with pytest.raises(provider_data.ProviderBatchError, match="stale identity"):
+        provider_data.apply_provider_event_batch(
+            session,
+            identity,
+            [event],
+            lambda *_args: (_ for _ in ()).throw(
+                storage_exceptions.ConflictRecords(
+                    model="WorkspaceMessage",
+                    msg="stale identity",
+                )
+            ),
+            now=NOW,
+        )
+
+    assert not hasattr(session, "_workspace_provider_event_batch_cache")
 
 
 def test_provider_http_service_dispatches_only_private_provider_routes():

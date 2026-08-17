@@ -1191,9 +1191,11 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             values["stream_uuid"],
             "message.create",
         )
+        session = contexts.Context().get_session()
         row = helpers.create_workspace_user_message(
             project_id=self.project_uuid,
             user_uuid=self.user_uuid,
+            session=session,
             enforce_visibility=True,
             compact_events=True,
             **values,

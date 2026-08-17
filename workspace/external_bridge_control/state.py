@@ -456,6 +456,7 @@ class PersistentControlState:
         self,
         identity: pki.BridgeIdentity,
         reports: list[dict[str, Any]],
+        session: Any = None,
     ) -> dict[str, Any]:
         if not 1 <= len(reports) <= 500:
             raise ValueError("Observed report batch size is invalid")

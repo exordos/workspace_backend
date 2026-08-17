@@ -344,6 +344,12 @@ def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
         uuid=message_uuid,
         stream_uuid=stream_uuid,
     )
+    session = object()
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
     monkeypatch.setattr(
         sql_canonical_store.helpers,
         "create_workspace_user_message",
@@ -378,6 +384,7 @@ def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
         {
             "project_id": PROJECT_UUID,
             "user_uuid": USER_UUID,
+            "session": session,
             "enforce_visibility": True,
             "compact_events": True,
             "uuid": message_uuid,
