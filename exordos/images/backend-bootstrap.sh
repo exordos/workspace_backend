@@ -54,7 +54,7 @@ import shlex
 import sys
 import urllib.parse
 
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(interpolation=None)
 config.read(sys.argv[1])
 url = urllib.parse.urlsplit(config["db"]["connection_url"])
 values = {

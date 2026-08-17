@@ -87,6 +87,15 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
+def test_postgresql_runtime_has_import_scale_work_memory():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        assert "?options=-c%20work_mem%3D32MB" in config
+
+
 def test_reaction_user_lists_have_bounded_runtime_defaults():
     for config_path in (
         "etc/workspace/workspace.conf",
@@ -183,6 +192,7 @@ def test_backend_bootstrap_has_no_secondary_storage_gate():
     assert "writer-gate" not in bootstrap
     assert "workspace-mail" not in install
     assert "mail" not in reload_config.lower()
+    assert "ConfigParser(interpolation=None)" in bootstrap
     assert '"$WORKSPACE_BOOTSTRAP"' in reload_config
     assert '"$RESTART_SERVICES"' in reload_config
 
