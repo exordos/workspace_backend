@@ -608,10 +608,10 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
     target_resource = object()
     target_queries = []
     monkeypatch.setattr(
-        provider_data.models.WorkspaceUserMessage,
+        provider_data.models.WorkspaceMessage,
         "objects",
         types.SimpleNamespace(
-            get_all=lambda **kwargs: target_queries.append(kwargs) or [target_resource]
+            get_one=lambda **kwargs: target_queries.append(kwargs) or target_resource
         ),
     )
     external_events = []
@@ -622,8 +622,8 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
         lambda *args, **kwargs: external_events.append((args, kwargs)),
     )
     monkeypatch.setattr(
-        provider_data.messenger_events,
-        "create_message_updated_event",
+        provider_data.messenger_helpers,
+        "create_compact_workspace_message_updated_events",
         lambda *args, **kwargs: target_events.append((args, kwargs)),
     )
 
@@ -638,7 +638,9 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
     assert "UPDATE m_workspace_messages" in statements[0][0]
     assert statements[0][1][1:4] == ("delivered", None, updated_at)
     assert target_queries[0]["session"] is session
-    assert target_events == [((target_resource,), {"session": session})]
+    assert target_events == [
+        ((project_uuid, target_resource), {"session": session})
+    ]
 
 
 def test_retry_operation_requeues_existing_provider_row():

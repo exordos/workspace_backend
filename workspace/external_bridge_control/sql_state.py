@@ -37,8 +37,8 @@ def _json(value: object) -> str:
 
 
 def _row_value(row: Any, name: str) -> Any:
-    if hasattr(row, "get"):
-        return row.get(name)
+    if isinstance(row, collections.abc.Mapping):
+        return row[name]
     return getattr(row, name)
 
 
@@ -503,11 +503,21 @@ def _emit_initial_sync_projection_events(session: Any, chat: Any) -> None:
         },
         session=session,
     )
+    snapshots = messenger_dm_helpers.get_compact_workspace_user_message_snapshots(
+        chat.project_id,
+        [message.uuid for message in messages],
+        [chat.owner_user_uuid],
+        session=session,
+    )
+    snapshots_by_message: dict[sys_uuid.UUID, list[Any]] = collections.defaultdict(list)
+    for snapshot in snapshots:
+        snapshots_by_message[sys_uuid.UUID(str(_row_value(snapshot, "uuid")))].append(
+            snapshot
+        )
     for message in sorted(messages, key=lambda item: (item.created_at, str(item.uuid))):
-        messenger_events.create_message_events(
+        messenger_events.create_compact_message_events(
             chat.project_id,
-            message,
-            [chat.owner_user_uuid],
+            snapshots_by_message[message.uuid],
             session=session,
         )
 

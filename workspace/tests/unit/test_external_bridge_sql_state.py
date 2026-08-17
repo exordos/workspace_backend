@@ -8,7 +8,15 @@ from types import SimpleNamespace
 from unittest import mock
 import uuid as sys_uuid
 
+import pytest
+
 from workspace.external_bridge_control import sql_state
+
+
+def test_row_value_requires_mapping_columns():
+    assert sql_state._row_value({"uuid": "present"}, "uuid") == "present"
+    with pytest.raises(KeyError):
+        sql_state._row_value({}, "uuid")
 
 
 def test_assignment_preserves_provider_topic_ids_after_display_name_collision():
@@ -249,7 +257,9 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
         "create_message_updated_event",
         message_updated,
     )
-    topic_result = SimpleNamespace(fetchall=mock.Mock(return_value=[{"uuid": topic_uuid}]))
+    topic_result = SimpleNamespace(
+        fetchall=mock.Mock(return_value=[{"uuid": topic_uuid}])
+    )
     session = SimpleNamespace(execute=mock.Mock(return_value=topic_result))
 
     result = sql_state._emit_projected_capability_events(
@@ -390,6 +400,23 @@ def test_initial_sync_completion_emits_latest_message_per_topic(monkeypatch):
     latest_result.fetchall.return_value = [{"uuid": second.uuid}, {"uuid": first.uuid}]
     session = SimpleNamespace(execute=mock.Mock(return_value=latest_result))
     projected_events = mock.Mock()
+    first_snapshot = {
+        "uuid": first.uuid,
+        "user_uuid": owner_uuid,
+        "read": False,
+        "pinned": True,
+        "starred": False,
+        "reactions": {"eyes": 2},
+    }
+    second_snapshot = {
+        "uuid": second.uuid,
+        "user_uuid": owner_uuid,
+        "read": True,
+        "pinned": False,
+        "starred": True,
+        "reactions": {"heart": 1},
+    }
+    compact_snapshots = mock.Mock(return_value=[second_snapshot, first_snapshot])
     created_events = mock.Mock()
     message_get_all = mock.Mock(return_value=[second, first])
     monkeypatch.setattr(
@@ -403,8 +430,13 @@ def test_initial_sync_completion_emits_latest_message_per_topic(monkeypatch):
         SimpleNamespace(objects=SimpleNamespace(get_all=message_get_all)),
     )
     monkeypatch.setattr(
+        sql_state.messenger_dm_helpers,
+        "get_compact_workspace_user_message_snapshots",
+        compact_snapshots,
+    )
+    monkeypatch.setattr(
         sql_state.messenger_events,
-        "create_message_events",
+        "create_compact_message_events",
         created_events,
     )
     chat = SimpleNamespace(
@@ -423,9 +455,15 @@ def test_initial_sync_completion_emits_latest_message_per_topic(monkeypatch):
     assert "DISTINCT ON (message.topic_uuid)" in statement
     assert parameters == (project_uuid, stream_uuid)
     assert message_get_all.call_args.kwargs["session"] is session
+    compact_snapshots.assert_called_once_with(
+        project_uuid,
+        [second.uuid, first.uuid],
+        [owner_uuid],
+        session=session,
+    )
     assert created_events.call_args_list == [
-        mock.call(project_uuid, first, [owner_uuid], session=session),
-        mock.call(project_uuid, second, [owner_uuid], session=session),
+        mock.call(project_uuid, [first_snapshot], session=session),
+        mock.call(project_uuid, [second_snapshot], session=session),
     ]
 
 

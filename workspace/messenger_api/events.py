@@ -616,9 +616,25 @@ def create_message_events(
         }
         for recipient_uuid in recipients
     ]
+    return create_compact_message_events(
+        project_id,
+        user_messages,
+        session=session,
+    )
+
+
+def create_compact_message_events(
+    project_id: object,
+    user_messages: typing.Any,
+    session: typing.Any = None,
+) -> typing.Any:
+    """Publish persisted recipient message snapshots as one broadcast event."""
+    user_messages = list(user_messages)
+    if not user_messages:
+        return []
     return create_resource_broadcast_event(
         project_id,
-        message.uuid,
+        _event_payload_get(user_messages[0], "uuid"),
         MESSAGE_CREATED_EVENT,
         user_messages,
         _message_from_event_payload,
@@ -948,11 +964,12 @@ def create_message_updated_events(
             create_message_updated_event(message, session=session)
             for message in user_messages
         ]
+    user_messages = list(user_messages)
     if not user_messages:
         return []
     return create_resource_broadcast_event(
         project_id,
-        user_messages[0].uuid,
+        _event_payload_get(user_messages[0], "uuid"),
         MESSAGE_UPDATED_EVENT,
         user_messages,
         _message_from_event_payload,

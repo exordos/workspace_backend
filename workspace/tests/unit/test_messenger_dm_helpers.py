@@ -1419,11 +1419,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         users = [second_user_uuid, first_user_uuid, second_user_uuid]
         stream_rows = [{"uuid": stream_uuid, "user_uuid": first_user_uuid}]
         topic_rows = [{"uuid": topic_uuid, "user_uuid": first_user_uuid}]
+        message_uuid = sys_uuid.uuid4()
+        message_rows = [
+            {
+                "uuid": message_uuid,
+                "user_uuid": first_user_uuid,
+                "read": True,
+                "pinned": True,
+                "starred": False,
+                "reactions": {"eyes": 2},
+            }
+        ]
         session = types.SimpleNamespace(
             execute=mock.Mock(
                 side_effect=[
                     types.SimpleNamespace(fetchall=mock.Mock(return_value=stream_rows)),
                     types.SimpleNamespace(fetchall=mock.Mock(return_value=topic_rows)),
+                    types.SimpleNamespace(
+                        fetchall=mock.Mock(return_value=message_rows)
+                    ),
                 ]
             )
         )
@@ -1446,18 +1460,37 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 session=session,
             ),
         )
+        self.assertEqual(
+            message_rows,
+            dm_helpers.get_compact_workspace_user_message_snapshots(
+                project_id,
+                [message_uuid],
+                users,
+                session=session,
+            ),
+        )
 
         stream_statement, stream_values = session.execute.call_args_list[0].args
         topic_statement, topic_values = session.execute.call_args_list[1].args
-        self.assertEqual(dm_helpers._COMPACT_USER_STREAM_SNAPSHOTS_SQL, stream_statement)
+        message_statement, message_values = session.execute.call_args_list[2].args
+        self.assertEqual(
+            dm_helpers._COMPACT_USER_STREAM_SNAPSHOTS_SQL, stream_statement
+        )
         self.assertEqual(dm_helpers._COMPACT_USER_TOPIC_SNAPSHOTS_SQL, topic_statement)
         self.assertNotIn("m_workspace_user_streams", stream_statement)
         self.assertNotIn("m_workspace_user_topics", topic_statement)
+        self.assertNotIn("m_workspace_user_messages_view", message_statement)
+        self.assertIn("m_workspace_user_message_flags", message_statement)
+        self.assertIn("m_workspace_message_reactions", message_statement)
         expected_users = sorted([first_user_uuid, second_user_uuid], key=str)
         self.assertEqual(expected_users, stream_values[1])
         self.assertEqual(expected_users, stream_values[5])
         self.assertEqual(expected_users, topic_values[1])
         self.assertEqual(expected_users, topic_values[5])
+        self.assertEqual(
+            (project_id, [message_uuid], expected_users, project_id, [message_uuid]),
+            message_values,
+        )
 
     def test_create_workspace_stream_binding_events_skips_hidden_zulip_stream(
         self,

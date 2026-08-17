@@ -1699,18 +1699,25 @@ ORDER BY binding.user_uuid
 
 
 _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL = """
-WITH reactions AS (
-    SELECT COALESCE(
-        jsonb_object_agg(counts.emoji_name, counts.reaction_count),
-        '{}'::jsonb
-    ) AS value
+WITH reaction_counts AS (
+    SELECT
+        reaction.message_uuid,
+        reaction.emoji_name,
+        COUNT(*) AS reaction_count
+    FROM m_workspace_message_reactions AS reaction
+    WHERE reaction.project_id = %s
+      AND reaction.message_uuid = ANY(%s::uuid[])
+    GROUP BY reaction.message_uuid, reaction.emoji_name
+), reactions AS (
+    SELECT
+        counts.message_uuid,
+        jsonb_object_agg(counts.emoji_name, counts.reaction_count) AS value
     FROM (
-        SELECT reaction.emoji_name, COUNT(*) AS reaction_count
-        FROM m_workspace_message_reactions AS reaction
-        WHERE reaction.project_id = %s
-          AND reaction.message_uuid = %s
-        GROUP BY reaction.emoji_name
+        SELECT message_uuid, emoji_name, reaction_count
+        FROM reaction_counts
+        ORDER BY message_uuid, emoji_name
     ) AS counts
+    GROUP BY counts.message_uuid
 )
 SELECT
     message.uuid,
@@ -1726,7 +1733,7 @@ SELECT
     COALESCE(flags.pinned, FALSE) AS pinned,
     COALESCE(flags.starred, FALSE) AS starred,
     message.user_uuid = recipient.user_uuid AS is_own,
-    reactions.value AS reactions,
+    COALESCE(reactions.value, '{}'::jsonb) AS reactions,
     message.source_name,
     message.source,
     POSITION(
@@ -1736,14 +1743,14 @@ SELECT
     message.reaction_users
 FROM m_workspace_messages AS message
 CROSS JOIN unnest(%s::uuid[]) AS recipient(user_uuid)
-CROSS JOIN reactions
+LEFT JOIN reactions ON reactions.message_uuid = message.uuid
 LEFT JOIN m_workspace_user_message_flags AS flags
   ON flags.uuid = message.uuid
  AND flags.project_id = message.project_id
  AND flags.user_uuid = recipient.user_uuid
 WHERE message.project_id = %s
-  AND message.uuid = %s
-ORDER BY recipient.user_uuid
+  AND message.uuid = ANY(%s::uuid[])
+ORDER BY message.created_at, message.uuid, recipient.user_uuid
 """
 
 
@@ -1813,6 +1820,35 @@ def get_compact_workspace_user_topic_snapshots(
                     topic_uuid,
                     project_id,
                     recipients,
+                ),
+            ).fetchall()
+        )
+
+
+def get_compact_workspace_user_message_snapshots(
+    project_id: object,
+    message_uuids: typing.Any,
+    user_uuids: typing.Any,
+    session: typing.Any = None,
+) -> list[typing.Any]:
+    """Build persisted message snapshots without expanding the global view."""
+    messages = sorted(
+        {sys_uuid.UUID(str(value)) for value in message_uuids},
+        key=str,
+    )
+    recipients = sorted({sys_uuid.UUID(str(value)) for value in user_uuids}, key=str)
+    if not messages or not recipients:
+        return []
+    with _workspace_session(session) as current_session:
+        return list(
+            current_session.execute(
+                _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL,
+                (
+                    project_id,
+                    messages,
+                    recipients,
+                    project_id,
+                    messages,
                 ),
             ).fetchall()
         )
@@ -1977,16 +2013,12 @@ def create_compact_workspace_message_updated_events(
         )
         if not visible_users:
             return
-        user_messages = current_session.execute(
-            _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL,
-            (
-                project_id,
-                message.uuid,
-                visible_users,
-                project_id,
-                message.uuid,
-            ),
-        ).fetchall()
+        user_messages = get_compact_workspace_user_message_snapshots(
+            project_id,
+            [message.uuid],
+            visible_users,
+            session=current_session,
+        )
         messenger_events.create_message_updated_events(
             project_id,
             user_messages,
