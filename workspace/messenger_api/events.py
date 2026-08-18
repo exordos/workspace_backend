@@ -657,6 +657,13 @@ def _split_common_recipient_payloads(
         # The visibility view injects the scoped recipient and must not retain
         # one copy of the same UUID in every override.
         payload.pop("user_uuid", None)
+    return _compress_recipient_payloads(payloads)
+
+
+def _compress_recipient_payloads(
+    payloads: dict[str, dict[str, typing.Any]],
+) -> tuple[dict[str, typing.Any], dict[str, dict[str, typing.Any]]]:
+    """Split complete per-recipient payloads into a common body and overrides."""
     if not payloads:
         return {}, {}
     values = list(payloads.values())
@@ -679,6 +686,83 @@ def _split_common_recipient_payloads(
         for user_uuid, payload in payloads.items()
     }
     return common, {key: value for key, value in overrides.items() if value}
+
+
+_PROVIDER_BATCH_BROADCAST_EVENTS_KEY = ("prepared_broadcast_events",)
+
+
+def _coalesce_prepared_resource_broadcast_events(
+    prepared_events: typing.Iterable[dict[str, typing.Any]],
+) -> list[dict[str, typing.Any]]:
+    """Merge equivalent recipient snapshots without collapsing causal updates.
+
+    Provider batches commonly project one provider message once per external
+    account. Those projections describe the same Workspace entity, but each
+    prepared event initially contains only that account owner. Events can share
+    one broadcast row while their recipient sets are disjoint. Seeing the same
+    recipient again starts a new group, because that represents a later causal
+    update that must remain separately ordered for that recipient.
+    """
+    groups: list[dict[str, typing.Any]] = []
+    latest_by_key: dict[tuple[str, str, str], dict[str, typing.Any]] = {}
+    last_group_index_by_recipient: dict[str, int] = {}
+    for event in prepared_events:
+        recipients = sorted(
+            {sys_uuid.UUID(str(value)) for value in event["recipients"]},
+            key=str,
+        )
+        if not recipients:
+            continue
+        key = (
+            str(event["project_id"]),
+            str(event["entity_uuid"]),
+            str(event["kind"]),
+        )
+        group = latest_by_key.get(key)
+        group_index = -1 if group is None else int(group["index"])
+        if group is None or any(
+            str(recipient) in group["payloads"]
+            or last_group_index_by_recipient.get(str(recipient), -1) >= group_index
+            for recipient in recipients
+        ):
+            group = {
+                "index": len(groups),
+                "project_id": event["project_id"],
+                "entity_uuid": event["entity_uuid"],
+                "kind": event["kind"],
+                "payloads": {},
+            }
+            groups.append(group)
+            latest_by_key[key] = group
+            group_index = int(group["index"])
+        overrides = {
+            str(user_uuid): payload
+            for user_uuid, payload in (event.get("recipient_payloads") or {}).items()
+        }
+        for recipient in recipients:
+            recipient_uuid = str(recipient)
+            payload = dict(event["payload"])
+            payload.update(overrides.get(recipient_uuid, {}))
+            group["payloads"][recipient_uuid] = payload
+            last_group_index_by_recipient[recipient_uuid] = group_index
+
+    coalesced = []
+    for group in groups:
+        payload, recipient_payloads = _compress_recipient_payloads(group["payloads"])
+        coalesced.append(
+            {
+                "project_id": group["project_id"],
+                "entity_uuid": group["entity_uuid"],
+                "recipients": sorted(
+                    (sys_uuid.UUID(value) for value in group["payloads"]),
+                    key=str,
+                ),
+                "kind": group["kind"],
+                "payload": payload,
+                "recipient_payloads": recipient_payloads,
+            }
+        )
+    return coalesced
 
 
 def create_resource_broadcast_event(
@@ -753,6 +837,28 @@ def create_prepared_resource_broadcast_events(
     wait_for_project_lock: bool = True,
 ) -> list[int]:
     """Persist an already-serialized bounded event batch in causal order."""
+    prepared_events = list(prepared_events)
+    if _FIXTURE_EVENTS_SUPPRESSED.get() or not prepared_events:
+        return []
+    session = session or contexts.Context().get_session()
+    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+    if batch_cache is not None:
+        batch_cache.setdefault(_PROVIDER_BATCH_BROADCAST_EVENTS_KEY, []).extend(
+            prepared_events
+        )
+        return []
+    return _persist_prepared_resource_broadcast_events(
+        prepared_events,
+        session=session,
+        wait_for_project_lock=wait_for_project_lock,
+    )
+
+
+def _persist_prepared_resource_broadcast_events(
+    prepared_events: typing.Iterable[dict[str, typing.Any]],
+    session: typing.Any,
+    wait_for_project_lock: bool = True,
+) -> list[int]:
     epochs = []
     for event in prepared_events:
         epochs.extend(
@@ -768,6 +874,204 @@ def create_prepared_resource_broadcast_events(
             )
         )
     return epochs
+
+
+def flush_buffered_resource_broadcast_events(session: typing.Any) -> list[int]:
+    """Persist a provider batch's coalesced broadcasts in causal order."""
+    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+    if batch_cache is None:
+        return []
+    prepared_events = batch_cache.pop(_PROVIDER_BATCH_BROADCAST_EVENTS_KEY, [])
+    if not prepared_events:
+        return []
+    return _persist_prepared_resource_broadcast_events_bulk(
+        _coalesce_prepared_resource_broadcast_events(prepared_events), session
+    )
+
+
+def _persist_prepared_resource_broadcast_events_bulk(
+    prepared_events: typing.Iterable[dict[str, typing.Any]],
+    session: typing.Any,
+) -> list[int]:
+    """Persist a provider batch with bounded SQL round trips.
+
+    ``apply_provider_event_batch`` already holds every affected project lock,
+    so the ordered insert below cannot race a direct writer for the same
+    project. The event UUID mapping makes the returned epoch list independent
+    of PostgreSQL's ``RETURNING`` row order.
+    """
+    event_rows = []
+    snapshots: dict[sys_uuid.UUID, tuple[object, str]] = {}
+    members: set[tuple[sys_uuid.UUID, sys_uuid.UUID]] = set()
+    recipient_payload_rows = []
+    for event in prepared_events:
+        recipients = sorted(
+            {sys_uuid.UUID(str(value)) for value in event["recipients"]},
+            key=str,
+        )
+        if not recipients:
+            continue
+        membership_digest = hashlib.sha256(
+            "\n".join(str(value) for value in recipients).encode("ascii")
+        ).hexdigest()
+        audience_snapshot_uuid = sys_uuid.uuid5(
+            sys_uuid.UUID(str(event["project_id"])),
+            membership_digest,
+        )
+        snapshots[audience_snapshot_uuid] = (
+            event["project_id"],
+            membership_digest,
+        )
+        members.update(
+            (audience_snapshot_uuid, recipient_uuid) for recipient_uuid in recipients
+        )
+        object_type, action = _event_metadata_for_kind(event["kind"])
+        event_uuid = sys_uuid.uuid4()
+        event_rows.append(
+            {
+                "uuid": event_uuid,
+                "project_id": event["project_id"],
+                "entity_uuid": event["entity_uuid"],
+                "audience_snapshot_uuid": audience_snapshot_uuid,
+                "object_type": object_type,
+                "action": action,
+                "payload": json.dumps(
+                    _payload_with_kind(event["kind"], event["payload"]),
+                    sort_keys=True,
+                ),
+            }
+        )
+        recipient_payload_rows.extend(
+            (
+                event_uuid,
+                sys_uuid.UUID(str(user_uuid)),
+                json.dumps(payload, sort_keys=True),
+            )
+            for user_uuid, payload in (event.get("recipient_payloads") or {}).items()
+        )
+    if not event_rows:
+        return []
+
+    snapshot_rows = sorted(snapshots.items(), key=lambda item: str(item[0]))
+    session.execute(
+        """
+        INSERT INTO m_workspace_event_audience_snapshots_v1 (
+            uuid, project_id, membership_digest
+        )
+        SELECT input.uuid, input.project_id, input.membership_digest
+        FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) AS input(
+            uuid, project_id, membership_digest
+        )
+        ON CONFLICT (project_id, membership_digest) DO NOTHING
+        """,
+        (
+            [row[0] for row in snapshot_rows],
+            [row[1][0] for row in snapshot_rows],
+            [row[1][1] for row in snapshot_rows],
+        ),
+    )
+    member_rows = sorted(members, key=lambda item: (str(item[0]), str(item[1])))
+    session.execute(
+        """
+        INSERT INTO m_workspace_event_audience_members_v1 (
+            audience_snapshot_uuid, user_uuid
+        )
+        SELECT input.audience_snapshot_uuid, input.user_uuid
+        FROM unnest(%s::uuid[], %s::uuid[]) AS input(
+            audience_snapshot_uuid, user_uuid
+        )
+        ON CONFLICT (audience_snapshot_uuid, user_uuid) DO NOTHING
+        """,
+        (
+            [row[0] for row in member_rows],
+            [row[1] for row in member_rows],
+        ),
+    )
+    inserted_rows = session.execute(
+        """
+        WITH input AS (
+            SELECT *
+            FROM unnest(
+                %s::uuid[], %s::uuid[], %s::uuid[], %s::uuid[],
+                %s::integer[], %s::text[], %s::text[], %s::jsonb[]
+            ) WITH ORDINALITY AS event(
+                uuid, project_id, entity_uuid, audience_snapshot_uuid,
+                schema_version, object_type, action, payload, ordinal
+            )
+        )
+        INSERT INTO m_workspace_broadcast_message_events_v1 (
+            uuid, project_id, entity_uuid, audience_snapshot_uuid,
+            schema_version, object_type, action, payload
+        )
+        SELECT uuid, project_id, entity_uuid, audience_snapshot_uuid,
+               schema_version, object_type, action, payload
+        FROM input
+        ORDER BY ordinal
+        RETURNING uuid, epoch_version
+        """,
+        (
+            [row["uuid"] for row in event_rows],
+            [row["project_id"] for row in event_rows],
+            [row["entity_uuid"] for row in event_rows],
+            [row["audience_snapshot_uuid"] for row in event_rows],
+            [models.WORKSPACE_EVENT_SCHEMA_VERSION] * len(event_rows),
+            [row["object_type"] for row in event_rows],
+            [row["action"] for row in event_rows],
+            [row["payload"] for row in event_rows],
+        ),
+    ).fetchall()
+    epochs_by_uuid = {
+        sys_uuid.UUID(str(row["uuid"])): int(row["epoch_version"])
+        for row in inserted_rows
+    }
+    if set(epochs_by_uuid) != {row["uuid"] for row in event_rows}:
+        raise RuntimeError("Broadcast event batch insert returned incomplete results")
+    if recipient_payload_rows:
+        session.execute(
+            """
+            INSERT INTO m_workspace_event_recipient_payloads_v1 (
+                event_uuid, user_uuid, payload
+            )
+            SELECT input.event_uuid, input.user_uuid, input.payload
+            FROM unnest(%s::uuid[], %s::uuid[], %s::jsonb[]) AS input(
+                event_uuid, user_uuid, payload
+            )
+            """,
+            (
+                [row[0] for row in recipient_payload_rows],
+                [row[1] for row in recipient_payload_rows],
+                [row[2] for row in recipient_payload_rows],
+            ),
+        )
+    snapshot_epochs: dict[sys_uuid.UUID, int] = {}
+    for row in event_rows:
+        snapshot_uuid = row["audience_snapshot_uuid"]
+        snapshot_epochs[snapshot_uuid] = max(
+            snapshot_epochs.get(snapshot_uuid, 0),
+            epochs_by_uuid[row["uuid"]],
+        )
+    ordered_snapshot_epochs = sorted(
+        snapshot_epochs.items(), key=lambda item: str(item[0])
+    )
+    session.execute(
+        """
+        WITH current(audience_snapshot_uuid, epoch_version) AS (
+            SELECT * FROM unnest(%s::uuid[], %s::bigint[])
+        )
+        UPDATE m_workspace_event_audience_snapshots_v1 AS audience
+        SET current_epoch_version = GREATEST(
+            audience.current_epoch_version,
+            current.epoch_version
+        )
+        FROM current
+        WHERE audience.uuid = current.audience_snapshot_uuid
+        """,
+        (
+            [row[0] for row in ordered_snapshot_epochs],
+            [row[1] for row in ordered_snapshot_epochs],
+        ),
+    )
+    return [epochs_by_uuid[row["uuid"]] for row in event_rows]
 
 
 def prepare_stream_updated_broadcast(
