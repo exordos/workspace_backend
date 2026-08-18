@@ -64,6 +64,46 @@ def test_assignment_is_reused_within_provider_event_batch():
     assert len(session.statements) == 1
 
 
+def test_assignment_gate_primes_provider_batch_cache_without_second_query():
+    identity = _identity()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    assignment = {
+        "account_uuid": str(account_uuid),
+        "chat_uuid": str(chat_uuid),
+        "project_id": str(project_uuid),
+        "owner_user_uuid": str(sys_uuid.uuid4()),
+        "projection_stream_uuid": str(sys_uuid.uuid4()),
+        "provider_chat_id": "channel:7",
+        "display_name": "General",
+        "source": {"chat_type": "channel"},
+        "capabilities": {},
+        "account_settings": {"server_url": "https://zulip.example.test"},
+        "provider_realm_uuid": str(sys_uuid.uuid4()),
+    }
+    event = {
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(chat_uuid),
+        "project_id": str(project_uuid),
+    }
+    session = Session([])
+    session._workspace_provider_event_batch_cache = {}
+
+    provider_event_apply.prime_assignment_cache(
+        session,
+        identity,
+        [assignment],
+    )
+    cached = provider_event_apply._assignment(session, identity, event)
+
+    assert cached[0] == account_uuid
+    assert cached[1] == project_uuid
+    assert cached[2]["provider_chat_id"] == "channel:7"
+    assert isinstance(cached[2]["projection_stream_uuid"], sys_uuid.UUID)
+    assert session.statements == []
+
+
 def test_projection_materialization_is_reused_within_provider_event_batch(
     monkeypatch,
 ):
@@ -997,7 +1037,53 @@ def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metad
     assert isinstance(values["payload"], message_payloads.MarkdownPayload)
     assert values["payload"].content == "hello"
     assert values["compact_events"] is True
+    assert values["scoped_recipient_uuids"] == [owner_uuid]
     assert created[0][0][1] == canonical_author_uuid
+
+
+def test_live_message_author_identity_is_cached_per_provider_realm(monkeypatch):
+    identity = _identity()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    canonical_author_uuid = sys_uuid.uuid4()
+    assignment = {
+        "owner_user_uuid": owner_uuid,
+        "projection_stream_uuid": stream_uuid,
+        "provider_chat_id": "zulip-channel-7",
+        "source": {"chat_type": "channel"},
+        "provider_realm_uuid": sys_uuid.uuid4(),
+    }
+    session = Session([assignment, assignment])
+    session._workspace_provider_event_batch_cache = {}
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_ensure_projection_owner_stream",
+        lambda *_args, **_kwargs: None,
+    )
+    identities = []
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_upsert_provider_identity",
+        lambda *args: identities.append(args) or canonical_author_uuid,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_workspace_user_message",
+        lambda *_args, **_kwargs: None,
+    )
+
+    for event in (_message_event(stream_uuid), _message_event(stream_uuid)):
+        event["payload"]["resource"]["author_identity"] = {
+            "provider_external_id": "provider-user-42",
+            "display_name": "Provider User",
+            "email": None,
+            "avatar_urn": None,
+            "active": True,
+        }
+        provider_event_apply.apply_event(event, session, identity)
+
+    assert len(identities) == 1
 
 
 def test_provider_message_accepts_former_author_without_stream_binding(monkeypatch):
@@ -1369,7 +1455,7 @@ def test_provider_reconciliation_loads_native_message_without_current_binding(
     assert message.source_name == models.SourceName.NATIVE.value
 
 
-def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
+def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
@@ -1380,14 +1466,10 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
     user_topics = [
         types.SimpleNamespace(
             uuid=sys_uuid.UUID(event_resource["topic_uuid"]),
-            user_uuid=member_uuid,
+            user_uuid=owner_uuid,
         )
-        for member_uuid in member_uuids
     ]
-    user_streams = [
-        types.SimpleNamespace(uuid=stream_uuid, user_uuid=member_uuid)
-        for member_uuid in member_uuids
-    ]
+    user_streams = [types.SimpleNamespace(uuid=stream_uuid, user_uuid=owner_uuid)]
     session = Session(
         [
             {
@@ -1395,28 +1477,12 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
                 "projection_stream_uuid": stream_uuid,
                 "provider_chat_id": "zulip-channel-7",
             },
-            {"source_name": "native"},
             None,
-            None,
-            None,
-            None,
-            {"epoch_version": 81},
-            None,
-            {"source_name": "native"},
             user_topics,
             user_streams,
-            None,
-            None,
-            None,
-            {"epoch_version": 82},
-            None,
-            None,
-            None,
-            None,
-            {"epoch_version": 83},
-            None,
         ]
     )
+    session._workspace_provider_event_batch_cache = {}
     created_flags = []
 
     class FakeWorkspaceMessage:
@@ -1436,8 +1502,7 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
             assert session is not None
 
         def get_recipients(self, session=None):
-            assert session is not None
-            return member_uuids
+            pytest.fail("provider projection must use its scoped account owner")
 
     FakeWorkspaceMessage.objects = types.SimpleNamespace(
         get_one_or_none=lambda **_kwargs: FakeWorkspaceMessage.created,
@@ -1540,48 +1605,21 @@ def test_message_upsert_compacts_300_recipients_to_three_ui_events(monkeypatch):
         if 'INSERT INTO "m_workspace_user_message_flags"' in statement
     ]
     assert len(flag_inserts) == 1
-    assert flag_inserts[0][3] == sorted(member_uuids, key=str)
-    broadcast_inserts = [
-        item
-        for item in session.statements
-        if "INSERT INTO m_workspace_broadcast_message_events_v1" in item[0]
+    assert flag_inserts[0][3] == [owner_uuid]
+    prepared = session._workspace_provider_event_batch_cache[
+        ("prepared_broadcast_events",)
     ]
-    assert len(broadcast_inserts) == 3
-    payloads = [params[7] for _statement, params in broadcast_inserts]
-    assert {
-        kind
-        for kind in ("message.created", "topic.updated", "stream.updated")
-        if any(f'"kind": "{kind}"' in payload for payload in payloads)
-    } == {"message.created", "topic.updated", "stream.updated"}
-    event_payload = next(
-        payload for payload in payloads if '"kind": "message.created"' in payload
-    )
-    assert '"kind": "message.created"' in event_payload
-    assert str(message_uuid) in event_payload
-    assert '"kind": "zulip"' in event_payload
-    assert f'"account_uuid": "{event["external_account_uuid"]}"' in (event_payload)
-    assert '"external_id": "zulip-message-42"' in event_payload
-    audience_members = [
-        params[1]
-        for statement, params in session.statements
-        if "INSERT INTO m_workspace_event_audience_members_v1" in statement
+    assert [item["kind"] for item in prepared] == [
+        "message.created",
+        "topic.updated",
+        "stream.updated",
     ]
-    assert audience_members == [sorted(member_uuids, key=str)] * 3
-    assert (
-        sum(
-            "pg_advisory_xact_lock" in statement
-            for statement, _params in session.statements
-        )
-        == 3
-    )
-    assert (
-        sum(
-            "m_workspace_broadcast_message_events_v1" in statement
-            and statement.lstrip().startswith("INSERT INTO")
-            for statement, _params in session.statements
-        )
-        == 3
-    )
+    assert [item["recipients"] for item in prepared] == [[owner_uuid]] * 3
+    message_payload = prepared[0]["payload"]
+    assert str(message_uuid) in str(message_payload)
+    assert message_payload["source"]["kind"] == "zulip"
+    assert event["external_account_uuid"] in str(message_payload["source"])
+    assert "zulip-message-42" in str(message_payload)
     assert all(
         'INSERT INTO "m_workspace_events"' not in statement
         for statement, _params in session.statements
@@ -2013,6 +2051,12 @@ def test_message_update_preserves_created_at_and_uses_compact_broadcast(monkeypa
         }
     )
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: existing)
+    ensured_recipients = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *args, **kwargs: ensured_recipients.append((args, kwargs)),
+    )
     compact_calls = []
     monkeypatch.setattr(
         provider_event_apply.helpers,
@@ -2035,6 +2079,12 @@ def test_message_update_preserves_created_at_and_uses_compact_broadcast(monkeypa
         (
             (sys_uuid.UUID(event["project_id"]), existing),
             {"session": session},
+        )
+    ]
+    assert ensured_recipients == [
+        (
+            (sys_uuid.UUID(event["project_id"]), existing, [owner_uuid], session),
+            {"emit_events": True},
         )
     ]
 

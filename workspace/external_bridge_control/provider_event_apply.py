@@ -43,6 +43,65 @@ _PROVIDER_FIELDS = {
 }
 
 
+def _assignment_cache_key(
+    identity: typing.Any,
+    account_uuid: object,
+    chat_uuid: object,
+    project_id: object,
+) -> tuple[object, ...]:
+    return (
+        "assignment",
+        identity.bridge_instance_uuid,
+        identity.provider_kind,
+        sys_uuid.UUID(str(account_uuid)),
+        sys_uuid.UUID(str(chat_uuid)),
+        sys_uuid.UUID(str(project_id)),
+    )
+
+
+def prime_assignment_cache(
+    session: typing.Any,
+    identity: typing.Any,
+    assignments: collections.abc.Iterable[collections.abc.Mapping[str, typing.Any]],
+) -> None:
+    """Reuse assignment rows already authorized by the provider batch gate."""
+    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+    if batch_cache is None:
+        return
+    for assignment in assignments:
+        account_uuid = sys_uuid.UUID(str(assignment["account_uuid"]))
+        chat_uuid = sys_uuid.UUID(str(assignment["chat_uuid"]))
+        project_id = sys_uuid.UUID(str(assignment["project_id"]))
+        row = {
+            name: assignment[name]
+            for name in (
+                "owner_user_uuid",
+                "projection_stream_uuid",
+                "provider_chat_id",
+                "display_name",
+                "source",
+                "capabilities",
+                "account_settings",
+                "provider_realm_uuid",
+            )
+        }
+        for name in (
+            "owner_user_uuid",
+            "projection_stream_uuid",
+            "provider_realm_uuid",
+        ):
+            if row[name] is not None:
+                row[name] = sys_uuid.UUID(str(row[name]))
+        batch_cache[
+            _assignment_cache_key(
+                identity,
+                account_uuid,
+                chat_uuid,
+                project_id,
+            )
+        ] = (account_uuid, project_id, row)
+
+
 def _assignment(
     session: typing.Any,
     identity: typing.Any,
@@ -52,10 +111,8 @@ def _assignment(
     account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
     project_id = sys_uuid.UUID(str(event["project_id"]))
     batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
-    cache_key = (
-        "assignment",
-        identity.bridge_instance_uuid,
-        identity.provider_kind,
+    cache_key = _assignment_cache_key(
+        identity,
         account_uuid,
         chat_uuid,
         project_id,
@@ -66,7 +123,8 @@ def _assignment(
         """
         SELECT chat."owner_user_uuid", chat."projection_stream_uuid",
                chat."provider_chat_id", chat."display_name", chat."source",
-               chat."capabilities", account."settings" AS account_settings
+               chat."capabilities", account."settings" AS account_settings,
+               account."provider_realm_uuid"
         FROM "m_external_chats_v2" AS chat
         JOIN "m_external_accounts_v2" AS account
           ON account."uuid" = chat."external_account_uuid"
@@ -543,11 +601,14 @@ def _message_event(
     ):
         account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
         batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+        provider_realm_key = assignment.get("provider_realm_uuid") or (
+            assignment.get("account_settings") or {}
+        ).get("server_url")
         author_key = (
             "author_identity",
             identity.bridge_instance_uuid,
             identity.provider_kind,
-            account_uuid,
+            provider_realm_key or account_uuid,
             str(author_identity["provider_external_id"]),
         )
         author_uuid = batch_cache.get(author_key) if batch_cache is not None else None
@@ -560,7 +621,7 @@ def _message_event(
                 str(author_identity["provider_external_id"]),
                 author_identity,
             )
-            if batch_cache is not None and quiet_backfill:
+            if batch_cache is not None:
                 batch_cache[author_key] = author_uuid
         resource["user_uuid"] = author_uuid
     if existing is None:
@@ -639,6 +700,7 @@ def _message_event(
                 enforce_visibility=False,
                 return_visible=False,
                 compact_events=True,
+                scoped_recipient_uuids=[assignment["owner_user_uuid"]],
                 **create_options,
                 **values,
             )
@@ -648,6 +710,13 @@ def _message_event(
     else:
         if existing.stream_uuid != stream_uuid:
             raise ValueError("Provider message UUID belongs to another stream")
+        helpers.ensure_workspace_message_recipients(
+            project_id,
+            existing,
+            [assignment["owner_user_uuid"]],
+            session,
+            emit_events=not quiet_backfill,
+        )
         # A provider replay may report the edit time as created_at. Once the
         # message exists, its creation timestamp is immutable.
         update_values = _provider_values(

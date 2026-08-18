@@ -351,8 +351,8 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     session = Session(
         [
             _healthy_bridge(),
-            {"matched": 1},
-            {"provider_event_uuid": event_uuid},
+            {"matched": 1, "assignments": []},
+            [{"provider_event_uuid": event_uuid}],
             None,
         ]
     )
@@ -380,6 +380,162 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     assert not hasattr(session, "_workspace_provider_event_batch_cache")
 
 
+def test_inbound_event_batch_writes_provider_ledger_in_bulk():
+    identity = _identity()
+    project_uuid = sys_uuid.uuid4()
+    events = [
+        {
+            "provider_event_uuid": str(sys_uuid.uuid4()),
+            "external_account_uuid": str(sys_uuid.uuid4()),
+            "external_chat_uuid": str(sys_uuid.uuid4()),
+            "project_id": str(project_uuid),
+            "kind": "message.create",
+            "payload": {"content": f"message-{index}"},
+        }
+        for index in range(2)
+    ]
+    events[0]["provider_sequence"] = "evt-42"
+    events[1]["provider_sequence"] = "001"
+    inserted = [
+        {"provider_event_uuid": sys_uuid.UUID(event["provider_event_uuid"])}
+        for event in events
+    ]
+    session = Session(
+        [_healthy_bridge(), {"matched": 2, "assignments": []}, inserted, None]
+    )
+    targets = {event["provider_event_uuid"]: sys_uuid.uuid4() for event in events}
+
+    response = provider_data.apply_provider_event_batch(
+        session,
+        identity,
+        events,
+        lambda event, *_args: targets[event["provider_event_uuid"]],
+        now=NOW,
+    )
+
+    assert [result["status"] for result in response["results"]] == [
+        "applied",
+        "applied",
+    ]
+    ledger_statements = [
+        statement
+        for statement, _params in session.statements
+        if "m_external_provider_events_v1" in statement
+    ]
+    assert len(ledger_statements) == 2
+    assert "FROM unnest(" in ledger_statements[0]
+    assert "%s::text[]" in ledger_statements[0]
+    assert "%s::bigint[]" not in ledger_statements[0]
+    assert "WITH applied" in ledger_statements[1]
+    ledger_params = next(
+        params
+        for statement, params in session.statements
+        if 'INSERT INTO "m_external_provider_events_v1"' in statement
+    )
+    assert ledger_params[4] == ["evt-42", "001"]
+
+
+def test_inbound_event_batch_flushes_broadcasts_before_completing_ledger(monkeypatch):
+    identity = _identity()
+    event_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    event = {
+        "provider_event_uuid": str(event_uuid),
+        "external_account_uuid": str(sys_uuid.uuid4()),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(project_uuid),
+        "kind": "message.create",
+        "payload": {"content": "hello"},
+    }
+    session = Session(
+        [
+            _healthy_bridge(),
+            {"matched": 1, "assignments": []},
+            [{"provider_event_uuid": event_uuid}],
+            None,
+        ]
+    )
+
+    def flush(request_session):
+        request_session.statements.append(("FLUSH BROADCAST EVENTS", None))
+        return [71]
+
+    monkeypatch.setattr(
+        provider_data.messenger_events,
+        "flush_buffered_resource_broadcast_events",
+        flush,
+    )
+
+    provider_data.apply_provider_event_batch(
+        session,
+        identity,
+        [event],
+        lambda *_args: sys_uuid.uuid4(),
+        now=NOW,
+    )
+
+    statements = [statement for statement, _params in session.statements]
+    flush_index = statements.index("FLUSH BROADCAST EVENTS")
+    ledger_update_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if "WITH applied" in statement
+    )
+    assert flush_index < ledger_update_index
+
+
+def test_inbound_event_batch_primes_authorized_assignments(monkeypatch):
+    identity = _identity()
+    event_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    assignment = {
+        "account_uuid": str(account_uuid),
+        "chat_uuid": str(chat_uuid),
+        "project_id": str(project_uuid),
+    }
+    event = {
+        "provider_event_uuid": str(event_uuid),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(chat_uuid),
+        "project_id": str(project_uuid),
+        "kind": "message.create",
+        "payload": {"content": "hello"},
+    }
+    session = Session(
+        [
+            _healthy_bridge(),
+            {"matched": 1, "assignments": [assignment]},
+            [{"provider_event_uuid": event_uuid}],
+            None,
+        ]
+    )
+    primed = []
+    monkeypatch.setattr(
+        provider_data.provider_event_apply,
+        "prime_assignment_cache",
+        lambda *args: primed.append(args),
+    )
+
+    provider_data.apply_provider_event_batch(
+        session,
+        identity,
+        [event],
+        lambda *_args: sys_uuid.uuid4(),
+        now=NOW,
+    )
+
+    assert primed == [(session, identity, [assignment])]
+    assignment_gate = next(
+        statement
+        for statement, _params in session.statements
+        if "WITH requested(account_uuid, chat_uuid, project_id)" in statement
+    )
+    assert "workspace_projection,stream,uuid" in assignment_gate
+    assert 'chat."projection_stream_uuid"::text' in assignment_gate
+
+
 def test_inbound_quiet_backfill_batch_does_not_take_project_event_lock():
     identity = _identity()
     event_uuid = sys_uuid.uuid4()
@@ -397,8 +553,8 @@ def test_inbound_quiet_backfill_batch_does_not_take_project_event_lock():
     session = Session(
         [
             _healthy_bridge(),
-            {"matched": 1},
-            {"provider_event_uuid": event_uuid},
+            {"matched": 1, "assignments": []},
+            [{"provider_event_uuid": event_uuid}],
             None,
         ]
     )
@@ -489,8 +645,8 @@ def test_inbound_event_batch_reports_storage_conflicts_as_batch_rejections():
     session = Session(
         [
             _healthy_bridge(),
-            {"matched": 1},
-            {"provider_event_uuid": event_uuid},
+            {"matched": 1, "assignments": []},
+            [{"provider_event_uuid": event_uuid}],
         ]
     )
 

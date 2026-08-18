@@ -8,6 +8,8 @@
 import datetime
 import hashlib
 import json
+import logging
+import time
 import typing
 import uuid as sys_uuid
 
@@ -15,6 +17,7 @@ from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exceptions
 
+from workspace.external_bridge_control import provider_event_apply
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import helpers as messenger_helpers
 from workspace.messenger_api.dm import external_models
@@ -27,6 +30,7 @@ LEASE_MAX_ITEMS = 100
 RESULT_MAX_ITEMS = 500
 EVENT_MAX_ITEMS = 500
 HEARTBEAT_MAX_AGE = datetime.timedelta(seconds=60)
+LOG = logging.getLogger(__name__)
 
 _OPERATION_CAPABILITIES = {
     "message.create": "messenger.message.send",
@@ -956,6 +960,7 @@ def apply_provider_event_batch(
     now: datetime.datetime | None = None,
 ) -> dict[str, list[dict[str, typing.Any]]]:
     """Apply an inbound batch atomically; any rejected event rolls it back."""
+    started_at = time.monotonic()
     if not isinstance(events, list) or not 1 <= len(events) <= EVENT_MAX_ITEMS:
         raise ProviderBatchError("Provider event batch size is invalid")
     now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -1001,11 +1006,35 @@ def apply_provider_event_batch(
             WITH requested(account_uuid, chat_uuid, project_id) AS (
                 SELECT * FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
             )
-            SELECT count(*) AS matched
+            SELECT count(*) AS matched,
+                   COALESCE(
+                       jsonb_agg(jsonb_build_object(
+                           'account_uuid', requested.account_uuid,
+                           'chat_uuid', requested.chat_uuid,
+                           'project_id', requested.project_id,
+                           'owner_user_uuid', chat.owner_user_uuid,
+                           'projection_stream_uuid', chat.projection_stream_uuid,
+                           'provider_chat_id', chat.provider_chat_id,
+                           'display_name', chat.display_name,
+                           'source', chat.source,
+                           'capabilities', chat.capabilities,
+                           'account_settings', account.settings,
+                           'provider_realm_uuid', account.provider_realm_uuid
+                       )),
+                       '[]'::jsonb
+                   ) AS assignments
             FROM requested
             JOIN "m_external_accounts_v2" AS account
               ON account."uuid" = requested.account_uuid
              AND account."provider" = %s
+            JOIN "m_external_chats_v2" AS chat
+              ON chat."uuid" = requested.chat_uuid
+             AND chat."external_account_uuid" = requested.account_uuid
+             AND chat."project_id" = requested.project_id
+             AND chat."provider" = account."provider"
+             AND chat."selected"
+             AND chat."status" IN ('syncing', 'live', 'degraded')
+             AND chat."projection_stream_uuid" IS NOT NULL
             WHERE EXISTS (
                 SELECT 1
                 FROM "m_external_bridge_desired_resources_v1" AS desired
@@ -1021,13 +1050,15 @@ def apply_provider_event_batch(
                 WHERE desired."bridge_instance_uuid" = %s
                   AND desired."provider_kind" = %s
                   AND desired."resource_type" = 'external_chat_assignment'
-                  AND desired."resource_uuid" = requested.chat_uuid
+                  AND desired."resource_uuid" = chat."uuid"
                   AND desired."operation" = 'upsert'
                   AND desired."resource"->>'external_account_uuid' =
                       requested.account_uuid::text
                   AND desired."resource"->>'project_id' =
                       requested.project_id::text
                   AND desired."resource"->>'selected' = 'true'
+                  AND desired."resource"#>>'{workspace_projection,stream,uuid}' =
+                      chat."projection_stream_uuid"::text
             )
             """,
             (
@@ -1047,23 +1078,146 @@ def apply_provider_event_batch(
             raise ValueError(
                 "External account and chat are not assigned to this bridge"
             )
+        provider_event_apply.prime_assignment_cache(
+            session,
+            identity,
+            validation["assignments"] or (),
+        )
+        event_inputs: dict[sys_uuid.UUID, dict[str, typing.Any]] = {}
+        for event in events:
+            event_uuid = sys_uuid.UUID(str(event["provider_event_uuid"]))
+            payload_hash = _sha256(event)
+            previous = event_inputs.get(event_uuid)
+            if previous is not None:
+                if previous["payload_hash"] != payload_hash:
+                    raise ValueError(
+                        "Provider event UUID was reused with different input"
+                    )
+                continue
+            event_inputs[event_uuid] = {
+                "event": event,
+                "account_uuid": sys_uuid.UUID(str(event["external_account_uuid"])),
+                "project_id": sys_uuid.UUID(str(event["project_id"])),
+                "payload_hash": payload_hash,
+            }
+        inserted_rows = session.execute(
+            """
+            INSERT INTO "m_external_provider_events_v1" (
+                "bridge_instance_uuid", "provider_event_uuid",
+                "external_account_uuid", "project_id", "provider_sequence",
+                "event_kind", "payload_sha256", "status"
+            )
+            SELECT %s, input.provider_event_uuid, input.external_account_uuid,
+                   input.project_id, input.provider_sequence, input.event_kind,
+                   input.payload_sha256, 'processing'
+            FROM unnest(
+                %s::uuid[], %s::uuid[], %s::uuid[], %s::text[],
+                %s::text[], %s::text[]
+            ) AS input(
+                provider_event_uuid, external_account_uuid, project_id,
+                provider_sequence, event_kind, payload_sha256
+            )
+            ON CONFLICT ("bridge_instance_uuid", "provider_event_uuid")
+            DO NOTHING
+            RETURNING "provider_event_uuid"
+            """,
+            (
+                identity.bridge_instance_uuid,
+                list(event_inputs),
+                [value["account_uuid"] for value in event_inputs.values()],
+                [value["project_id"] for value in event_inputs.values()],
+                [
+                    value["event"].get("provider_sequence")
+                    for value in event_inputs.values()
+                ],
+                [value["event"]["kind"] for value in event_inputs.values()],
+                [value["payload_hash"] for value in event_inputs.values()],
+            ),
+        ).fetchall()
+        inserted_event_uuids = {
+            sys_uuid.UUID(str(row["provider_event_uuid"])) for row in inserted_rows
+        }
+        existing_event_uuids = set(event_inputs) - inserted_event_uuids
+        existing_events: dict[sys_uuid.UUID, typing.Mapping[str, typing.Any]] = {}
+        if existing_event_uuids:
+            existing_rows = session.execute(
+                """
+                SELECT "provider_event_uuid", "payload_sha256", "status",
+                       "target_uuid", "safe_error"
+                FROM "m_external_provider_events_v1"
+                WHERE "bridge_instance_uuid" = %s
+                  AND "provider_event_uuid" = ANY(%s::uuid[])
+                """,
+                (identity.bridge_instance_uuid, sorted(existing_event_uuids, key=str)),
+            ).fetchall()
+            existing_events = {
+                sys_uuid.UUID(str(row["provider_event_uuid"])): row
+                for row in existing_rows
+            }
+            if set(existing_events) != existing_event_uuids:
+                raise ValueError("Provider event ledger is incomplete")
+            for event_uuid, row in existing_events.items():
+                if row["payload_sha256"] != event_inputs[event_uuid]["payload_hash"]:
+                    raise ValueError(
+                        "Provider event UUID was reused with different input"
+                    )
+
+        results_by_uuid: dict[sys_uuid.UUID, dict[str, typing.Any]] = {}
+        applied_event_uuids: list[sys_uuid.UUID] = []
+        applied_target_uuids: list[sys_uuid.UUID | None] = []
         results = []
         for event in events:
-            account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
-            project_id = sys_uuid.UUID(str(event["project_id"]))
-            results.append(
-                apply_provider_event(
-                    session,
-                    bridge_instance_uuid=identity.bridge_instance_uuid,
-                    external_account_uuid=account_uuid,
-                    project_id=project_id,
-                    event=event,
-                    apply=lambda item, current_session: apply(
-                        item,
-                        current_session,
-                        identity,
-                    ),
+            event_uuid = sys_uuid.UUID(str(event["provider_event_uuid"]))
+            if event_uuid in results_by_uuid:
+                results.append({**results_by_uuid[event_uuid], "duplicate": True})
+                continue
+            if event_uuid in existing_events:
+                existing = existing_events[event_uuid]
+                result = {
+                    "provider_event_uuid": str(event_uuid),
+                    "status": existing["status"],
+                    "target_uuid": _uuid_string(existing["target_uuid"]),
+                    "safe_error": existing["safe_error"],
+                    "duplicate": True,
+                }
+                results_by_uuid[event_uuid] = result
+                results.append(result)
+                continue
+            target_uuid = apply(event, session, identity)
+            normalized_target_uuid = (
+                None if target_uuid is None else sys_uuid.UUID(str(target_uuid))
+            )
+            result = {
+                "provider_event_uuid": str(event_uuid),
+                "status": "applied",
+                "target_uuid": _uuid_string(normalized_target_uuid),
+                "safe_error": None,
+                "duplicate": False,
+            }
+            results_by_uuid[event_uuid] = result
+            results.append(result)
+            applied_event_uuids.append(event_uuid)
+            applied_target_uuids.append(normalized_target_uuid)
+        broadcast_epochs = messenger_events.flush_buffered_resource_broadcast_events(
+            session
+        )
+        if applied_event_uuids:
+            session.execute(
+                """
+                WITH applied(provider_event_uuid, target_uuid) AS (
+                    SELECT * FROM unnest(%s::uuid[], %s::uuid[])
                 )
+                UPDATE "m_external_provider_events_v1" AS event
+                SET "status" = 'applied', "target_uuid" = applied.target_uuid
+                FROM applied
+                WHERE event."bridge_instance_uuid" = %s
+                  AND event."provider_event_uuid" = applied.provider_event_uuid
+                """,
+                (
+                    applied_event_uuids,
+                    applied_target_uuids,
+                    identity.bridge_instance_uuid,
+                ),
             )
     except (
         KeyError,
@@ -1079,6 +1233,12 @@ def apply_provider_event_batch(
             delattr(session, cache_attribute)
         else:
             setattr(session, cache_attribute, previous_cache)
+    LOG.info(
+        "Applied provider event batch: events=%d broadcasts=%d duration_seconds=%.3f",
+        len(events),
+        len(broadcast_epochs),
+        time.monotonic() - started_at,
+    )
     return {"results": results}
 
 

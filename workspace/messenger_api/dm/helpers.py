@@ -1893,18 +1893,21 @@ def _create_compact_messages_unread_updated_events(
     stream_uuid: object,
     topic_uuid: object,
     session: typing.Any = None,
+    recipients_are_scoped: bool = False,
 ) -> None:
     """Emit unread snapshots without expanding the global access-gate views."""
     recipients = sorted(set(user_uuids), key=str)
     if not recipients:
         return
     with _workspace_session(session) as current_session:
-        visible_users = _compact_message_visible_users(
-            project_id,
-            recipients,
-            stream_uuid,
-            current_session,
-        )
+        visible_users = recipients
+        if not recipients_are_scoped:
+            visible_users = _compact_message_visible_users(
+                project_id,
+                recipients,
+                stream_uuid,
+                current_session,
+            )
         if not visible_users:
             return
         user_topics = current_session.execute(
@@ -4483,6 +4486,64 @@ def create_message_flags_bulk(
         )
 
 
+def ensure_workspace_message_recipients(
+    project_id: object,
+    message: typing.Any,
+    recipients: typing.Any,
+    session: typing.Any,
+    emit_events: bool = True,
+) -> list[sys_uuid.UUID]:
+    """Add only missing per-user message projections for scoped recipients."""
+    recipient_uuids = sorted(
+        {sys_uuid.UUID(str(recipient)) for recipient in recipients},
+        key=str,
+    )
+    if not recipient_uuids:
+        return []
+    inserted_rows = session.execute(
+        """
+        INSERT INTO "m_workspace_user_message_flags" (
+            "uuid", "user_uuid", "project_id", "read"
+        )
+        SELECT %s, recipient_uuid, %s, recipient_uuid = %s
+        FROM unnest(%s::uuid[]) AS recipient_uuid
+        ON CONFLICT ("uuid", "user_uuid") DO NOTHING
+        RETURNING "user_uuid"
+        """,
+        (
+            message.uuid,
+            project_id,
+            message.user_uuid,
+            recipient_uuids,
+        ),
+    ).fetchall()
+    inserted_recipients = sorted(
+        (sys_uuid.UUID(str(row["user_uuid"])) for row in inserted_rows),
+        key=str,
+    )
+    if not emit_events or not inserted_recipients:
+        return inserted_recipients
+    messenger_events.create_message_events(
+        project_id=project_id,
+        message=message,
+        recipients=inserted_recipients,
+        session=session,
+        compact=True,
+    )
+    unread_recipients = [
+        recipient for recipient in inserted_recipients if recipient != message.user_uuid
+    ]
+    _create_compact_messages_unread_updated_events(
+        project_id=project_id,
+        user_uuids=unread_recipients,
+        stream_uuid=message.stream_uuid,
+        topic_uuid=message.topic_uuid,
+        session=session,
+        recipients_are_scoped=True,
+    )
+    return inserted_recipients
+
+
 def create_workspace_user_message(
     project_id: object,
     user_uuid: object,
@@ -4491,6 +4552,7 @@ def create_workspace_user_message(
     return_visible: typing.Any = True,
     compact_events: typing.Any = False,
     emit_events: bool = True,
+    scoped_recipient_uuids: typing.Any = None,
     **kwargs: typing.Any,
 ) -> typing.Any:
     if enforce_visibility:
@@ -4531,18 +4593,25 @@ def create_workspace_user_message(
     )
     message.insert(session=session)
     batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
-    recipients_key = ("recipients", project_id, message.stream_uuid)
-    recipients = (
-        batch_cache.get(recipients_key)
-        if not emit_events and batch_cache is not None
-        else None
-    )
-    if recipients is None:
-        recipients = message.get_recipients(session=session)
-        if not emit_events and batch_cache is not None:
-            batch_cache[recipients_key] = recipients
+    recipients_are_scoped = scoped_recipient_uuids is not None
+    if recipients_are_scoped:
+        recipients = sorted(
+            {sys_uuid.UUID(str(value)) for value in scoped_recipient_uuids},
+            key=str,
+        )
+    else:
+        recipients_key = ("recipients", project_id, message.stream_uuid)
+        recipients = (
+            batch_cache.get(recipients_key)
+            if not emit_events and batch_cache is not None
+            else None
+        )
+        if recipients is None:
+            recipients = message.get_recipients(session=session)
+            if not emit_events and batch_cache is not None:
+                batch_cache[recipients_key] = recipients
     event_recipients = recipients
-    if compact_events:
+    if compact_events and not recipients_are_scoped:
         visible_recipients_key = (
             "visible_recipients",
             project_id,
@@ -4583,12 +4652,16 @@ def create_workspace_user_message(
     ]
     if emit_events:
         if compact_events:
+            unread_event_options = (
+                {"recipients_are_scoped": True} if recipients_are_scoped else {}
+            )
             _create_compact_messages_unread_updated_events(
                 project_id=project_id,
                 user_uuids=unread_user_uuids,
                 stream_uuid=message.stream_uuid,
                 topic_uuid=message.topic_uuid,
                 session=session,
+                **unread_event_options,
             )
         else:
             _create_messages_unread_updated_events(
@@ -5013,7 +5086,8 @@ def sync_workspace_user_message_flags(
     if (
         values.get("read") is False
         and not allow_author_unread
-        and current_message.author_uuid == user_uuid
+        and (current_message.author_uuid if emit_events else current_message.user_uuid)
+        == user_uuid
     ):
         values = dict(values)
         values["read"] = True

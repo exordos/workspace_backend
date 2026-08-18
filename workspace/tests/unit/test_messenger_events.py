@@ -228,6 +228,161 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertIn("pg_try_advisory_xact_lock", lock_statement)
         self.assertEqual((project_id,), lock_params)
 
+    def test_provider_batch_coalesces_disjoint_recipient_broadcasts(self):
+        project_id = sys_uuid.uuid4()
+        entity_uuid = sys_uuid.uuid4()
+        first_recipient = sys_uuid.uuid4()
+        second_recipient = sys_uuid.uuid4()
+        prepared_events = [
+            {
+                "project_id": project_id,
+                "entity_uuid": entity_uuid,
+                "recipients": [first_recipient],
+                "kind": events.MESSAGE_CREATED_EVENT,
+                "payload": {"uuid": str(entity_uuid), "read": True},
+                "recipient_payloads": {},
+            },
+            {
+                "project_id": project_id,
+                "entity_uuid": entity_uuid,
+                "recipients": [second_recipient],
+                "kind": events.MESSAGE_CREATED_EVENT,
+                "payload": {"uuid": str(entity_uuid), "read": False},
+                "recipient_payloads": {},
+            },
+        ]
+
+        result = events._coalesce_prepared_resource_broadcast_events(prepared_events)
+
+        self.assertEqual(1, len(result))
+        self.assertEqual(project_id, result[0]["project_id"])
+        self.assertEqual(entity_uuid, result[0]["entity_uuid"])
+        self.assertEqual(
+            sorted([first_recipient, second_recipient], key=str),
+            result[0]["recipients"],
+        )
+        self.assertEqual({"uuid": str(entity_uuid), "read": True}, result[0]["payload"])
+        self.assertEqual(
+            {str(second_recipient): {"read": False}},
+            result[0]["recipient_payloads"],
+        )
+
+    def test_provider_batch_keeps_repeated_recipient_updates_ordered(self):
+        project_id = sys_uuid.uuid4()
+        entity_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        prepared_events = [
+            {
+                "project_id": project_id,
+                "entity_uuid": entity_uuid,
+                "recipients": [recipient_uuid],
+                "kind": events.MESSAGE_UPDATED_EVENT,
+                "payload": {"uuid": str(entity_uuid), "content": content},
+                "recipient_payloads": {},
+            }
+            for content in ("first", "second")
+        ]
+
+        result = events._coalesce_prepared_resource_broadcast_events(prepared_events)
+
+        self.assertEqual(2, len(result))
+        self.assertEqual("first", result[0]["payload"]["content"])
+        self.assertEqual("second", result[1]["payload"]["content"])
+
+    def test_provider_batch_does_not_move_event_before_recipient_predecessor(self):
+        project_id = sys_uuid.uuid4()
+        topic_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        first_recipient = sys_uuid.uuid4()
+        second_recipient = sys_uuid.uuid4()
+        prepared_events = [
+            {
+                "project_id": project_id,
+                "entity_uuid": topic_uuid,
+                "recipients": [first_recipient],
+                "kind": events.TOPIC_UPDATED_EVENT,
+                "payload": {"uuid": str(topic_uuid), "unread_count": 1},
+                "recipient_payloads": {},
+            },
+            {
+                "project_id": project_id,
+                "entity_uuid": stream_uuid,
+                "recipients": [second_recipient],
+                "kind": events.STREAM_UPDATED_EVENT,
+                "payload": {"uuid": str(stream_uuid), "unread_count": 1},
+                "recipient_payloads": {},
+            },
+            {
+                "project_id": project_id,
+                "entity_uuid": topic_uuid,
+                "recipients": [second_recipient],
+                "kind": events.TOPIC_UPDATED_EVENT,
+                "payload": {"uuid": str(topic_uuid), "unread_count": 1},
+                "recipient_payloads": {},
+            },
+        ]
+
+        result = events._coalesce_prepared_resource_broadcast_events(prepared_events)
+
+        self.assertEqual(3, len(result))
+        self.assertEqual(stream_uuid, result[1]["entity_uuid"])
+        self.assertEqual(topic_uuid, result[2]["entity_uuid"])
+        self.assertEqual([second_recipient], result[2]["recipients"])
+
+    def test_provider_batch_flush_persists_many_broadcasts_in_bounded_queries(self):
+        project_id = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        prepared_events = [
+            {
+                "project_id": project_id,
+                "entity_uuid": sys_uuid.uuid4(),
+                "recipients": [recipient_uuid],
+                "kind": events.MESSAGE_CREATED_EVENT,
+                "payload": {"uuid": str(sys_uuid.uuid4()), "index": index},
+                "recipient_payloads": {},
+            }
+            for index in range(200)
+        ]
+
+        class Result:
+            def __init__(self, rows=None):
+                self.rows = rows or []
+
+            def fetchall(self):
+                return self.rows
+
+        class Session:
+            def __init__(self):
+                self._workspace_provider_event_batch_cache = {
+                    events._PROVIDER_BATCH_BROADCAST_EVENTS_KEY: prepared_events
+                }
+                self.statements = []
+
+            def execute(self, statement, params=None):
+                self.statements.append((statement, params))
+                if "RETURNING uuid, epoch_version" in statement:
+                    return Result(
+                        [
+                            {"uuid": event_uuid, "epoch_version": index + 1}
+                            for index, event_uuid in enumerate(params[0])
+                        ]
+                    )
+                return Result()
+
+        session = Session()
+
+        result = events.flush_buffered_resource_broadcast_events(session)
+
+        self.assertEqual(list(range(1, 201)), result)
+        self.assertEqual(4, len(session.statements))
+        self.assertEqual(
+            1,
+            sum(
+                "INSERT INTO m_workspace_broadcast_message_events_v1" in statement
+                for statement, _params in session.statements
+            ),
+        )
+
     def test_websocket_event_reads_use_canonical_store_boundary(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
