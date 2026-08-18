@@ -58,6 +58,10 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/messages/",
         )
+        specification = openapi_contract.add_message_delete_many_contract(
+            specification,
+            "/v1/",
+        )
         specification = openapi_contract.add_draft_contract(
             specification,
             "/v1/drafts/",

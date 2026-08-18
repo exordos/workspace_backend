@@ -313,6 +313,7 @@ authoritative snapshots before starting a new cursor.
 | `GET` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Get a message. |
 | `PUT` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Update a message payload. |
 | `DELETE` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Delete a message. |
+| `POST` | `/api/workspace/v1/messenger/messages/actions/delete_many/invoke` | Atomically delete up to 50 selected messages authored by the current user. |
 | `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read/invoke` | Mark message as read for the current user. |
 | `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read_up_to/invoke` | Mark unread messages in the same topic up to this message as read. |
 | `GET` | `/api/workspace/v1/messenger/drafts/` | List the current user's drafts, optionally filtered by stream or topic. |
@@ -1349,6 +1350,28 @@ message. `DELETE /api/workspace/v1/messenger/messages/{message_uuid}` performs
 an immediate hard delete of the canonical message and its per-user state. The
 same transaction emits a minimal `message.deleted` event for the original
 audience that preserves the required message identity and provenance fields.
+
+Bulk delete request:
+
+```http
+POST /api/workspace/v1/messenger/messages/actions/delete_many/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "message_uuids": [
+    "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+    "b04edb46-4172-5859-ceb5-8f7f9d771fb6"
+  ]
+}
+```
+
+The request accepts 1 to 50 message UUID values and returns `204 No Content`.
+Duplicate UUIDs are ignored, so each distinct message is deleted once. Every
+message must be visible to and authored by the current user. Validation or
+authorization failure for any message rolls back all message deletes, realtime
+events, and queued provider operations in the request. Successful deletion emits
+the existing `message.deleted` event independently for each message.
 
 Read action:
 

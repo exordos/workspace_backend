@@ -36,6 +36,23 @@ def _assert_message_pagination_contract(operation):
     assert headers["X-Pagination-Marker"]["schema"]["format"] == "uuid"
 
 
+def _assert_message_delete_many_contract(paths, path, *, secured):
+    assert set(paths[path]) == {"post"}
+    operation = paths[path]["post"]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["required"] == ["message_uuids"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["message_uuids"] == {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 50,
+        "description": "Duplicate UUIDs are ignored.",
+        "items": {"type": "string", "format": "uuid"},
+    }
+    assert set(operation["responses"]) == {204, "default"}
+    assert (operation.get("security") == [{"bearerAuth": []}]) is secured
+
+
 def _assert_multipart_object(operation, required):
     content = operation["requestBody"]["content"]
     assert set(content) == {"multipart/form-data"}
@@ -310,6 +327,11 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     assert "/v1/events/" not in paths
     assert "/v1/epoch/" not in paths
     _assert_message_pagination_contract(paths["/v1/messages/"]["get"])
+    _assert_message_delete_many_contract(
+        paths,
+        "/v1/messages/actions/delete_many/invoke",
+        secured=False,
+    )
 
     add_users_path = "/v1/streams/{WorkspaceUserStreamUuid}/actions/add_users/invoke"
     assert set(paths[add_users_path]) == {"post"}
@@ -407,6 +429,11 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "$ref": "#/components/schemas/WorkspaceUser_Get"
     }
     _assert_message_pagination_contract(paths["/v1/messenger/messages/"]["get"])
+    _assert_message_delete_many_contract(
+        paths,
+        "/v1/messenger/messages/actions/delete_many/invoke",
+        secured=True,
+    )
     _assert_file_upload_contract(paths["/v1/messenger/files/"]["post"])
     _assert_collection_pagination_contract(
         event_operation,

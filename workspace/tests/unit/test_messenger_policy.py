@@ -76,6 +76,9 @@ class RecordingStore:
         self.calls.append(("delete_message", message_uuid))
         return {"uuid": message_uuid}
 
+    def delete_messages(self, message_uuids):
+        self.calls.append(("delete_messages", message_uuids))
+
     def events_after(self, filters, order_by=None):
         self.calls.append(("events", filters, order_by))
         return []
@@ -403,10 +406,14 @@ def test_route_permissions_and_action_owners_are_preserved():
         ),
         routes.WorkspaceMessageReadAction: controllers.WorkspaceMessageController,
         routes.WorkspaceMessageReadUpToAction: (controllers.WorkspaceMessageController),
+        routes.WorkspaceMessageDeleteManyAction: (
+            controllers.WorkspaceMessageController
+        ),
         routes.WorkspaceFileDownloadAction: controllers.WorkspaceFileController,
     }
     for action_route, owner in expected_action_owners.items():
         assert action_route.__controller__ is owner
+    assert routes.WorkspaceMessageRoute.actions is routes.WorkspaceMessageActionsRoute
     assert not routes.WorkspaceFileDownloadAction.is_invoke()
 
 
