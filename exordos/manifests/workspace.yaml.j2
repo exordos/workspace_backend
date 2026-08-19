@@ -545,7 +545,7 @@ resources:
               client_max_body_size 50m;
 
               location /api/core/ {
-                  proxy_pass http://workspace_core_api/api/core/;
+                  proxy_pass https://workspace_core_api/api/core/;
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -599,7 +599,7 @@ resources:
       body:
         kind: text
         content: |
-          f"server {$workspace.imports.$var_core_ip_address:value}:80;"
+          f"server {$workspace.imports.$var_core_ip_address:value}:443;"
 
   $core.em.services:
     workspace_bootstrap:
