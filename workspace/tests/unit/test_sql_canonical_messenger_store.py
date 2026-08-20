@@ -206,6 +206,18 @@ def test_message_page_uses_created_at_uuid_keyset(monkeypatch):
     assert page_query["limit"] == 51
 
 
+def test_delete_messages_delegates_in_deterministic_order():
+    first_uuid = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
+    second_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
+    calls = []
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    store.delete_message = calls.append
+
+    store.delete_messages([second_uuid, first_uuid])
+
+    assert calls == [first_uuid, second_uuid]
+
+
 def test_draft_page_reuses_current_context_session(monkeypatch):
     draft_uuid = sys_uuid.uuid4()
     draft = types.SimpleNamespace(uuid=draft_uuid)

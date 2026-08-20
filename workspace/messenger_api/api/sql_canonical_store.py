@@ -1268,6 +1268,13 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         )
         return None
 
+    def delete_messages(
+        self,
+        message_uuids: typing.Sequence[sys_uuid.UUID],
+    ) -> None:
+        for message_uuid in sorted(message_uuids, key=str):
+            self.delete_message(message_uuid)
+
     def create_draft(
         self,
         values: dict[str, typing.Any],

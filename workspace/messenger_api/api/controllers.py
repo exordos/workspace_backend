@@ -1038,6 +1038,25 @@ class WorkspaceMessageController(StoreResourceController):
             return db.delete_message(typing.cast(sys_uuid.UUID, uuid))
 
     @ra_actions.post
+    def delete_many(
+        self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        del resource, args
+        if set(kwargs) != {"message_uuids"}:
+            raise ra_exc.ValidationErrorException()
+        values = kwargs["message_uuids"]
+        if not isinstance(values, list) or not 1 <= len(values) <= 50:
+            raise ra_exc.ValidationErrorException()
+        try:
+            message_uuids = [sys_uuid.UUID(str(value)) for value in values]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ra_exc.ValidationErrorException() from exc
+        message_uuids = list(dict.fromkeys(message_uuids))
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            db.delete_messages(message_uuids)
+        return None, 204, {}
+
+    @ra_actions.post
     def read(
         self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
     ) -> typing.Any:

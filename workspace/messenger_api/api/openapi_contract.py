@@ -997,6 +997,45 @@ def add_message_pagination_contract(
     return specification
 
 
+def add_message_delete_many_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+) -> dict[str, typing.Any]:
+    path = f"{root}messages/actions/delete_many/invoke"
+    specification["paths"][path] = {
+        "post": {
+            "summary": "Delete multiple messages",
+            "description": (
+                "Atomically hard-delete up to 50 messages authored by the current "
+                "user. A failure for any message rolls back the entire request."
+            ),
+            "tags": ["WorkspaceUserMessage"],
+            "operationId": "Delete_many_messages",
+            "requestBody": _request_body(
+                _object_schema(
+                    {
+                        "message_uuids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 50,
+                            "description": "Duplicate UUIDs are ignored.",
+                            "items": {"type": "string", "format": "uuid"},
+                        }
+                    },
+                    ["message_uuids"],
+                )
+            ),
+            "responses": {
+                204: {"description": "Messages deleted"},
+                "default": {"$ref": "#/components/responses/Error"},
+            },
+        }
+    }
+    if root.startswith("/v1/messenger/"):
+        specification["paths"][path]["post"]["security"] = [{"bearerAuth": []}]
+    return specification
+
+
 def add_draft_contract(
     specification: dict[str, typing.Any],
     path: str,

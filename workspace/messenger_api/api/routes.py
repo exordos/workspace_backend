@@ -18,6 +18,7 @@ import typing
 
 from restalchemy.api import constants
 from restalchemy.api import routes
+from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api.api import controllers
 
@@ -40,6 +41,16 @@ class WorkspaceMessageReadAction(routes.Action):
 
 class WorkspaceMessageReadUpToAction(routes.Action):
     __controller__ = controllers.WorkspaceMessageController
+
+
+class WorkspaceMessageDeleteManyAction(routes.Action):
+    __controller__ = controllers.WorkspaceMessageController
+
+
+WorkspaceMessageDeleteManyActionRoute = routes.action(
+    WorkspaceMessageDeleteManyAction,
+    invoke=True,
+)
 
 
 class ExternalAccountReconnectAction(routes.Action):
@@ -200,6 +211,27 @@ class WorkspaceStreamBindingRoute(routes.Route):
     ]
 
 
+class WorkspaceMessageActionsRoute(routes.Route):
+    __controller__ = controllers.WorkspaceMessageController
+    __allow_methods__: list[str] = []
+
+    def do(
+        self,
+        parent_resource: typing.Any = None,
+        **kwargs: typing.Any,
+    ) -> typing.Any:
+        del parent_resource, kwargs
+        content_type = self._req.headers.get("Content-Type")
+        if content_type == constants.DEFAULT_CONTENT_TYPE and self._req.body:
+            try:
+                payload = self._req.json_body
+            except ValueError as exc:
+                raise ra_exc.ParseBodyError() from exc
+            if not isinstance(payload, dict):
+                raise ra_exc.ValidationErrorException()
+        return WorkspaceMessageDeleteManyActionRoute(self._req).do(resource=None)
+
+
 class WorkspaceMessageRoute(routes.Route):
     __controller__ = controllers.WorkspaceMessageController
     __allow_methods__ = [
@@ -212,6 +244,7 @@ class WorkspaceMessageRoute(routes.Route):
 
     read = routes.action(WorkspaceMessageReadAction, invoke=True)
     read_up_to = routes.action(WorkspaceMessageReadUpToAction, invoke=True)
+    actions = routes.route(WorkspaceMessageActionsRoute)
 
 
 class WorkspaceDraftRoute(routes.Route):

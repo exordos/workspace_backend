@@ -9,6 +9,10 @@ import types
 import uuid as sys_uuid
 
 import pytest
+import webob
+from restalchemy.api import constants as ra_constants
+from restalchemy.api import contexts as ra_contexts
+from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
@@ -65,6 +69,9 @@ class FakeStore:
     def delete_message(self, message_uuid):
         self.calls.append(("delete_message", message_uuid))
         return {"uuid": message_uuid}
+
+    def delete_messages(self, message_uuids):
+        self.calls.append(("delete_messages", message_uuids))
 
     def filter_draft_page(
         self,
@@ -170,6 +177,74 @@ def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
         "update_message",
         "delete_message",
     ]
+
+
+def test_message_delete_many_normalizes_and_delegates_once(fake_store):
+    controller = _controller(controllers.WorkspaceMessageController)
+    first_uuid = sys_uuid.uuid4()
+    second_uuid = sys_uuid.uuid4()
+
+    result = type(controller).delete_many._post(
+        self=controller,
+        resource=None,
+        message_uuids=[str(first_uuid), second_uuid, first_uuid, str(second_uuid)],
+    )
+
+    assert result == (None, 204, {})
+    assert fake_store.calls == [
+        ("delete_messages", [first_uuid, second_uuid]),
+    ]
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {},
+        {"message_uuids": "not-a-list"},
+        {"message_uuids": []},
+        {"message_uuids": ["not-a-uuid"]},
+        {"message_uuids": [str(sys_uuid.uuid4())] * 51},
+        {"message_uuids": [str(MESSAGE_UUID)], "unexpected": True},
+    ),
+)
+def test_message_delete_many_rejects_invalid_requests(fake_store, values):
+    controller = _controller(controllers.WorkspaceMessageController)
+
+    with pytest.raises(ra_exc.ValidationErrorException):
+        type(controller).delete_many._post(
+            self=controller,
+            resource=None,
+            **values,
+        )
+
+    assert fake_store.calls == []
+
+
+@pytest.mark.parametrize("body", (b"[]", b"null"))
+def test_message_delete_many_route_rejects_non_object_json(body):
+    request = webob.Request.blank(
+        "/delete_many/invoke",
+        method="POST",
+        content_type=ra_constants.DEFAULT_CONTENT_TYPE,
+        body=body,
+    )
+    request.api_context = ra_contexts.RequestContext(request)
+
+    with pytest.raises(ra_exc.ValidationErrorException):
+        routes.WorkspaceMessageActionsRoute(request).do()
+
+
+def test_message_delete_many_route_preserves_invalid_json_error():
+    request = webob.Request.blank(
+        "/delete_many/invoke",
+        method="POST",
+        content_type=ra_constants.DEFAULT_CONTENT_TYPE,
+        body=b"{",
+    )
+    request.api_context = ra_contexts.RequestContext(request)
+
+    with pytest.raises(ra_exc.ParseBodyError):
+        routes.WorkspaceMessageActionsRoute(request).do()
 
 
 def test_direct_chat_is_an_ordinary_stream_with_deterministic_pair_uuid(fake_store):

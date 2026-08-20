@@ -104,6 +104,12 @@ class MessengerStore(typing.Protocol):
     ) -> dict[str, typing.Any] | None:
         """Delete one canonical message and emit recipient invalidations."""
 
+    def delete_messages(
+        self,
+        message_uuids: typing.Sequence[sys_uuid.UUID],
+    ) -> None:
+        """Delete a bounded message set in the current request transaction."""
+
     def create_draft(
         self,
         values: dict[str, typing.Any],

@@ -8644,6 +8644,255 @@ def test_message_update_read_delete_write_realtime_events(api, db):
     assert all(row[1]["topic_uuid"] == topic_uuid for row in delete_rows)
 
 
+def test_message_delete_many_is_atomic_and_emits_per_message_events(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "message-delete-many"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    deleted_uuids = [
+        "10000000-0000-0000-0000-000000000001",
+        "20000000-0000-0000-0000-000000000002",
+    ]
+    rollback_uuid = "30000000-0000-0000-0000-000000000003"
+    other_uuid = "f0000000-0000-0000-0000-000000000004"
+
+    for message_uuid in [*deleted_uuids, rollback_uuid]:
+        response = api.post(
+            MESSAGES,
+            json={
+                "uuid": message_uuid,
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": message_uuid},
+            },
+        )
+        assert response.status_code == 201, response.text
+    other_response = api.post(
+        MESSAGES,
+        user=other_user,
+        json={
+            "uuid": other_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "other author"},
+        },
+    )
+    assert other_response.status_code == 201, other_response.text
+
+    _enable_zulip_policy(db)
+    bridge_instance_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    capability = {
+        "messenger.message.delete": {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                    }
+                ),
+                json.dumps(capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities,
+                catalog_capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
+                'Message delete queue', TRUE, %s, %s, 'live',
+                %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                str(chat_uuid),
+                str(account_uuid),
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "chat_type": "channel",
+                        "participants": [],
+                        "topics": [],
+                    }
+                ),
+                api.project_id,
+                stream_uuid,
+                json.dumps(capability),
+                json.dumps(capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_instance_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_instance_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.invalid",
+                        "source_scope": str(account_uuid),
+                    }
+                ),
+                str(account_uuid),
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_delete_epoch = cursor.fetchone()[0]
+
+    response = api.post(
+        f"{MESSAGES}actions/delete_many/invoke",
+        json={"message_uuids": [deleted_uuids[0], *deleted_uuids]},
+    )
+    assert response.status_code == 204, response.text
+    for message_uuid in deleted_uuids:
+        assert api.get(f"{MESSAGES}{message_uuid}").status_code == 404
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+                AND user_uuid = %s
+                AND epoch_version > %s
+                AND payload->>'kind' = 'message.deleted'
+            ORDER BY epoch_version
+            """,
+            (api.project_id, api.user_uuid, before_delete_epoch),
+        )
+        deleted_events = [row[0] for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+                AND operation_kind = 'message.delete'
+            """,
+            (account_uuid,),
+        )
+        successful_operation_count = cursor.fetchone()[0]
+    assert [event["uuid"] for event in deleted_events] == deleted_uuids
+    assert successful_operation_count == len(deleted_uuids)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_rollback_epoch = cursor.fetchone()[0]
+
+    response = api.post(
+        f"{MESSAGES}actions/delete_many/invoke",
+        json={"message_uuids": [rollback_uuid, other_uuid]},
+    )
+    assert response.status_code == 404, response.text
+    assert api.get(f"{MESSAGES}{rollback_uuid}").status_code == 200
+    assert api.get(f"{MESSAGES}{other_uuid}").status_code == 200
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+                AND epoch_version > %s
+                AND payload->>'kind' = 'message.deleted'
+                AND payload->>'uuid' = %s
+            """,
+            (api.project_id, before_rollback_epoch, rollback_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+                AND operation_kind = 'message.delete'
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == successful_operation_count
+
+
 def test_provider_message_update_preserves_created_at_in_storage_api_and_event(api, db):
     stream_uuid = conftest.seed_user_stream(
         db,
