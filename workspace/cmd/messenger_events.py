@@ -53,6 +53,11 @@ events_cli_opts = [
         help="Seconds between websocket heartbeat frames",
     ),
     cfg.IntOpt(
+        "heartbeat-timeout",
+        default=60,
+        help="Seconds to wait for a websocket heartbeat response",
+    ),
+    cfg.IntOpt(
         "client-timeout",
         default=60,
         help="Seconds to wait while sending a frame to a client",
@@ -108,6 +113,7 @@ def main() -> None:
         db_url=CONF.db.connection_url,
         iam_engine_driver=iam_driver,
         heartbeat_interval=CONF[DOMAIN].heartbeat_interval,
+        heartbeat_timeout=CONF[DOMAIN].heartbeat_timeout,
         client_timeout=CONF[DOMAIN].client_timeout,
         catchup_limit=CONF[DOMAIN].catchup_limit,
         send_queue_limit=CONF[DOMAIN].send_queue_limit,
