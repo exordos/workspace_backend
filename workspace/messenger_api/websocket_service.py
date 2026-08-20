@@ -18,6 +18,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
+import time
 import typing
 import uuid as sys_uuid
 
@@ -34,9 +36,15 @@ from workspace.services.messenger_workers import agents as messenger_worker_agen
 
 
 LOG = logging.getLogger(__name__)
+_STORAGE_RETRY_INITIAL_SECONDS = 0.5
+_STORAGE_RETRY_MAX_SECONDS = 30.0
 
 
 class WebsocketAuthError(Exception):
+    pass
+
+
+class _WebsocketCatchupStorageError(Exception):
     pass
 
 
@@ -83,6 +91,8 @@ class ClientConnection:
         self.epoch_generation = epoch_generation
         self.ready = False
         self.send_lock = asyncio.Lock()
+        self.catchup_task: asyncio.Task[None] | None = None
+        self.pending_catchup_wakeups = 0
 
 
 def _json_dumps(payload: dict[str, typing.Any]) -> str:
@@ -108,6 +118,7 @@ class MessengerEventsWebsocketServer:
         client_timeout: float,
         catchup_limit: int,
         send_queue_limit: int,
+        heartbeat_timeout: float = 60,
         poll_interval: float = 3,
     ) -> None:
         self._db_url = db_url
@@ -116,12 +127,19 @@ class MessengerEventsWebsocketServer:
         self._client_timeout = client_timeout
         self._catchup_limit = catchup_limit
         self._send_queue_limit = send_queue_limit
+        self._heartbeat_timeout = heartbeat_timeout
         self._poll_interval = poll_interval
         self._connections: dict[tuple[str, str], set[ClientConnection]] = {}
         self._stop_event: asyncio.Event | None = None
+        self._catchup_wakeup: asyncio.Event | None = None
+        self._pending_catchup_wakeups = 0
+        self._last_storage_retry_log_at: float | None = None
 
     async def serve(self, host: str, port: int) -> None:
         self._stop_event = asyncio.Event()
+        self._catchup_wakeup = asyncio.Event()
+        self._pending_catchup_wakeups = 0
+        self._last_storage_retry_log_at = None
         async with websockets.serve(
             self._handle,
             host,
@@ -135,20 +153,26 @@ class MessengerEventsWebsocketServer:
                 websocket_protocol.select_subprotocol,
             ),
             ping_interval=self._heartbeat_interval,
+            ping_timeout=self._heartbeat_timeout,
             max_queue=self._send_queue_limit,
         ):
             LOG.info("Workspace events websocket listening on %s:%s", host, port)
             listener_task = asyncio.create_task(self._listen_notifications())
             poll_task = asyncio.create_task(self._poll_connections())
+            catchup_task = asyncio.create_task(self._dispatch_catchups())
             try:
                 await self._stop_event.wait()
             finally:
                 listener_task.cancel()
                 poll_task.cancel()
+                catchup_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await listener_task
                 with contextlib.suppress(asyncio.CancelledError):
                     await poll_task
+                with contextlib.suppress(asyncio.CancelledError):
+                    await catchup_task
+        self._catchup_wakeup = None
 
     def stop(self) -> None:
         if self._stop_event is not None:
@@ -197,6 +221,10 @@ class MessengerEventsWebsocketServer:
         self._connections.setdefault(key, set()).add(connection)
 
     def _remove_connection(self, connection: ClientConnection) -> None:
+        connection.ready = False
+        connection.pending_catchup_wakeups = 0
+        if connection.catchup_task is not None:
+            connection.catchup_task.cancel()
         key = self._connection_key(connection)
         bucket = self._connections.get(key)
         if not bucket:
@@ -242,6 +270,10 @@ class MessengerEventsWebsocketServer:
             await self._send_json(connection, error.as_dict())
             await connection.websocket.close(code=4410, reason="epoch_pruned")
             return False
+        except Exception as error:
+            raise _WebsocketCatchupStorageError(
+                "Workspace event storage read failed"
+            ) from error
         for event in events:
             await self._send_event(connection, event)
         return len(events)
@@ -294,36 +326,176 @@ class MessengerEventsWebsocketServer:
             )
             connection.epoch_generation = cursor["epoch_generation"]
             connection.ready = True
+            self._request_catch_up(connection)
         return True
 
-    async def _broadcast_epoch(self, epoch_version: int) -> None:
-        del epoch_version
-        # PostgreSQL epochs only wake the service; each connection catches up
-        # from its own per-user event cursor.
-        tasks = []
-        for bucket in list(self._connections.values()):
-            for connection in list(bucket):
-                if not connection.ready:
+    def _schedule_connection_catch_up(
+        self,
+        connection: ClientConnection,
+    ) -> bool:
+        if not connection.ready:
+            return False
+        connection.pending_catchup_wakeups += 1
+        task = connection.catchup_task
+        if task is not None and not task.done():
+            return False
+        connection.catchup_task = asyncio.create_task(
+            self._dispatch_connection_catchups(connection)
+        )
+        return True
+
+    def _request_catch_up(
+        self,
+        connection: ClientConnection | None = None,
+    ) -> None:
+        if connection is not None:
+            self._schedule_connection_catch_up(connection)
+            return
+        if self._catchup_wakeup is None:
+            return
+        self._pending_catchup_wakeups += 1
+        self._catchup_wakeup.set()
+
+    async def _dispatch_connection_catchups(
+        self,
+        connection: ClientConnection,
+    ) -> None:
+        task = asyncio.current_task()
+        storage_failure_count = 0
+        try:
+            while connection.ready:
+                wakeup_count = connection.pending_catchup_wakeups
+                connection.pending_catchup_wakeups = 0
+                started_at = time.monotonic()
+                try:
+                    count = await self._catch_up(connection)
+                except asyncio.CancelledError:
+                    raise
+                except _WebsocketCatchupStorageError:
+                    storage_failure_count += 1
+                    retry_seconds = self._storage_retry_delay(
+                        storage_failure_count
+                    )
+                    self._log_storage_retry(
+                        storage_failure_count,
+                        retry_seconds,
+                    )
+                    await asyncio.sleep(retry_seconds)
                     continue
-                tasks.append(self._catch_up(connection))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                except Exception:
+                    connection.ready = False
+                    LOG.exception(
+                        "Websocket connection catch-up failed",
+                        extra={
+                            "websocket_catchup_wakeup_count": wakeup_count,
+                            "websocket_catchup_duration_seconds": (
+                                time.monotonic() - started_at
+                            ),
+                        },
+                    )
+                    with contextlib.suppress(Exception):
+                        await connection.websocket.close(
+                            code=1011,
+                            reason="catch_up_failed",
+                        )
+                    return
+                storage_failure_count = 0
+                duration_seconds = time.monotonic() - started_at
+                if count is False:
+                    connection.ready = False
+                    return
+                if (
+                    wakeup_count > 1
+                    or duration_seconds >= self._heartbeat_interval
+                ):
+                    LOG.info(
+                        "Completed coalesced websocket connection catch-up",
+                        extra={
+                            "websocket_catchup_wakeup_count": wakeup_count,
+                            "websocket_catchup_duration_seconds": duration_seconds,
+                        },
+                    )
+                if count == self._catchup_limit:
+                    connection.pending_catchup_wakeups += 1
+                if connection.pending_catchup_wakeups == 0:
+                    return
+        finally:
+            if connection.catchup_task is task:
+                connection.catchup_task = None
+
+    @staticmethod
+    def _storage_retry_delay(failure_count: int) -> float:
+        exponent = min(failure_count - 1, 10)
+        ceiling = min(
+            _STORAGE_RETRY_INITIAL_SECONDS * (2**exponent),
+            _STORAGE_RETRY_MAX_SECONDS,
+        )
+        return random.uniform(ceiling / 2, ceiling)
+
+    def _log_storage_retry(
+        self,
+        failure_count: int,
+        retry_seconds: float,
+    ) -> None:
+        now = time.monotonic()
+        if (
+            self._last_storage_retry_log_at is not None
+            and now - self._last_storage_retry_log_at
+            < max(1.0, self._heartbeat_interval)
+        ):
+            return
+        self._last_storage_retry_log_at = now
+        LOG.warning(
+            "Workspace websocket catch-up storage read failed; retrying",
+            exc_info=True,
+            extra={
+                "websocket_catchup_storage_failure_count": failure_count,
+                "websocket_catchup_storage_retry_seconds": retry_seconds,
+            },
+        )
+
+    async def _dispatch_catchups(self) -> None:
+        if self._catchup_wakeup is None:
+            return
+        while True:
+            await self._catchup_wakeup.wait()
+            self._catchup_wakeup.clear()
+            wakeup_count = self._pending_catchup_wakeups
+            self._pending_catchup_wakeups = 0
+            connection_count = 0
+            for bucket in list(self._connections.values()):
+                for connection in list(bucket):
+                    if self._schedule_connection_catch_up(connection):
+                        connection_count += 1
+            if wakeup_count > 1:
+                LOG.info(
+                    "Scheduled coalesced websocket catch-up",
+                    extra={
+                        "websocket_catchup_wakeup_count": wakeup_count,
+                        "websocket_catchup_connection_count": connection_count,
+                    },
+                )
 
     async def _consume_client_frames(self, connection: ClientConnection) -> None:
         async for _raw_frame in connection.websocket:
             continue
 
     async def _poll_connections(self) -> None:
+        loop = asyncio.get_running_loop()
         while True:
+            expected_wakeup_at = loop.time() + self._poll_interval
             await asyncio.sleep(self._poll_interval)
-            tasks = [
-                self._catch_up(connection)
-                for bucket in list(self._connections.values())
-                for connection in list(bucket)
-                if connection.ready
-            ]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            event_loop_lag_seconds = max(0.0, loop.time() - expected_wakeup_at)
+            if event_loop_lag_seconds >= self._heartbeat_interval:
+                LOG.warning(
+                    "Workspace websocket event loop is delayed",
+                    extra={
+                        "websocket_event_loop_lag_seconds": (
+                            event_loop_lag_seconds
+                        ),
+                    },
+                )
+            self._request_catch_up()
 
     def _connect_listener(self) -> typing.Any:
         conn = psycopg.connect(self._db_url, autocommit=True)
@@ -344,10 +516,13 @@ class MessengerEventsWebsocketServer:
                 if payload is None:
                     continue
                 try:
-                    epoch_version = int(payload)
+                    int(payload)
                 except (TypeError, ValueError):
                     LOG.warning("Ignore invalid workspace event payload %r", payload)
                     continue
-                await self._broadcast_epoch(epoch_version)
+                # PostgreSQL epochs only wake the service; each connection
+                # catches up from its own per-user event cursor. The dispatcher
+                # coalesces repeated wakeups while a catch-up round is active.
+                self._request_catch_up()
         finally:
             conn.close()

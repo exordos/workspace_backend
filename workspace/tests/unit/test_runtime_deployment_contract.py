@@ -196,6 +196,17 @@ def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
     assert "endpoint_claim_seconds = 1800" in manifest
 
 
+def test_manifest_bounds_websocket_heartbeat_timeout():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    events_config = manifest.split("[messenger_events]", 1)[1].split(
+        "[messenger_worker_agent]",
+        1,
+    )[0]
+
+    assert "heartbeat_interval = 25" in events_config
+    assert "heartbeat_timeout = 60" in events_config
+
+
 def test_manifest_exposes_only_api_routes_from_the_backend_node():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 

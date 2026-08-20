@@ -142,6 +142,16 @@ event object. PostgreSQL maintains the generation and monotonic epoch cursor.
 Clients persist `(epoch_generation, epoch_version)`, deduplicate by that cursor,
 and apply both transports through one dispatcher.
 
+The websocket worker coalesces PostgreSQL notification bursts and fallback
+polls into independent per-connection catch-up tasks. Each connection has at
+most one active task, so a slow client cannot delay delivery to healthy clients.
+A transient storage read failure keeps established sockets ready and retries
+with bounded jittered backoff; send or protocol failures close only the affected
+socket.
+A notification is only a wake-up hint; the durable per-user cursor remains the
+source of truth, so coalescing does not change event payloads, ordering, or
+recovery semantics.
+
 Only event rows are subject to the configurable retention policy, which
 defaults to 72 hours. Messages and other canonical resources are not removed
 when old events are pruned. A cursor outside the retained suffix receives the

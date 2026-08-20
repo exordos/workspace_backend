@@ -1864,6 +1864,20 @@ class MessengerEventsTestCase(unittest.TestCase):
             "payload": {"kind": "message.created"},
         }
 
+        async def dispatch_notification():
+            server._catchup_wakeup = asyncio.Event()
+            dispatcher = asyncio.create_task(server._dispatch_catchups())
+            try:
+                server._request_catch_up()
+                for _index in range(10):
+                    if sent_messages:
+                        break
+                    await asyncio.sleep(0)
+            finally:
+                dispatcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dispatcher
+
         with (
             mock.patch.object(
                 websocket_service,
@@ -1876,7 +1890,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 return_value=[event],
             ) as get_events,
         ):
-            asyncio.run(server._broadcast_epoch(900))
+            asyncio.run(dispatch_notification())
 
         get_events.assert_called_once_with(
             project_id=connection.project_id,
@@ -1887,6 +1901,309 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual([event], sent_messages)
         self.assertEqual(8, connection.last_epoch_version)
+
+    def test_websocket_catchup_wakeups_coalesce_while_round_is_running(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+        connection.ready = True
+        server._add_connection(connection)
+        first_round_started = asyncio.Event()
+        second_round_started = asyncio.Event()
+        release_first_round = asyncio.Event()
+        round_count = 0
+        active_rounds = 0
+        max_active_rounds = 0
+
+        async def catch_up(_connection):
+            nonlocal round_count, active_rounds, max_active_rounds
+            self.assertIs(connection, _connection)
+            round_count += 1
+            active_rounds += 1
+            max_active_rounds = max(max_active_rounds, active_rounds)
+            try:
+                if round_count == 1:
+                    first_round_started.set()
+                    await release_first_round.wait()
+                else:
+                    second_round_started.set()
+                return 0
+            finally:
+                active_rounds -= 1
+
+        async def run_burst():
+            with mock.patch.object(
+                server,
+                "_catch_up",
+                side_effect=catch_up,
+            ):
+                server._request_catch_up(connection)
+                await asyncio.wait_for(first_round_started.wait(), timeout=1)
+                for _index in range(50):
+                    server._request_catch_up(connection)
+                release_first_round.set()
+                await asyncio.wait_for(second_round_started.wait(), timeout=1)
+                if connection.catchup_task is not None:
+                    await connection.catchup_task
+
+        asyncio.run(run_burst())
+
+        self.assertEqual(2, round_count)
+        self.assertEqual(1, max_active_rounds)
+        self.assertEqual(0, connection.pending_catchup_wakeups)
+
+    def test_websocket_slow_connection_does_not_block_healthy_connection(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        slow_connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+        healthy_connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+        slow_connection.ready = True
+        healthy_connection.ready = True
+        server._add_connection(slow_connection)
+        server._add_connection(healthy_connection)
+        slow_started = asyncio.Event()
+        release_slow = asyncio.Event()
+        healthy_finished = asyncio.Event()
+
+        async def catch_up(connection):
+            if connection is slow_connection:
+                slow_started.set()
+                await release_slow.wait()
+            else:
+                healthy_finished.set()
+            return 0
+
+        async def dispatch_once():
+            server._catchup_wakeup = asyncio.Event()
+            with mock.patch.object(server, "_catch_up", side_effect=catch_up):
+                dispatcher = asyncio.create_task(server._dispatch_catchups())
+                try:
+                    server._request_catch_up()
+                    await asyncio.wait_for(slow_started.wait(), timeout=1)
+                    await asyncio.wait_for(healthy_finished.wait(), timeout=1)
+                    self.assertFalse(release_slow.is_set())
+                    release_slow.set()
+                    tasks = [
+                        task
+                        for task in (
+                            slow_connection.catchup_task,
+                            healthy_connection.catchup_task,
+                        )
+                        if task is not None
+                    ]
+                    await asyncio.gather(*tasks)
+                finally:
+                    dispatcher.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await dispatcher
+
+        asyncio.run(dispatch_once())
+
+    def test_websocket_storage_failure_retries_without_closing_connections(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        closed = []
+
+        class RetryWebsocket(FakeWebsocket):
+            async def close(self, code, reason):
+                closed.append((code, reason))
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connections = []
+        for _index in range(2):
+            connection = websocket_service.ClientConnection(
+                websocket=RetryWebsocket([]),
+                project_id=sys_uuid.uuid4(),
+                user_uuid=sys_uuid.uuid4(),
+                last_epoch_version=7,
+                epoch_generation="91",
+            )
+            connection.ready = True
+            server._add_connection(connection)
+            connections.append(connection)
+
+        async def retry_storage_reads():
+            with (
+                mock.patch.object(
+                    server,
+                    "_storage_retry_delay",
+                    return_value=0,
+                ),
+                mock.patch.object(websocket_service.LOG, "warning") as warning,
+            ):
+                for connection in connections:
+                    server._request_catch_up(connection)
+                tasks = [
+                    connection.catchup_task
+                    for connection in connections
+                    if connection.catchup_task is not None
+                ]
+                await asyncio.gather(*tasks)
+                return warning.call_count
+
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_events_after",
+                side_effect=[
+                    RuntimeError("storage unavailable"),
+                    RuntimeError("storage unavailable"),
+                    [],
+                    [],
+                ],
+            ) as get_events,
+        ):
+            warning_count = asyncio.run(retry_storage_reads())
+
+        self.assertEqual(4, get_events.call_count)
+        self.assertEqual(1, warning_count)
+        self.assertEqual([], closed)
+        self.assertTrue(all(connection.ready for connection in connections))
+
+    def test_websocket_storage_retry_delay_is_bounded(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+
+        with mock.patch.object(
+            websocket_service.random,
+            "uniform",
+            return_value=22.5,
+        ) as uniform:
+            result = websocket_service.MessengerEventsWebsocketServer(
+                db_url="postgresql://example",
+                iam_engine_driver=None,
+                heartbeat_interval=30,
+                client_timeout=30,
+                catchup_limit=500,
+                send_queue_limit=100,
+            )._storage_retry_delay(100)
+
+        self.assertEqual(22.5, result)
+        uniform.assert_called_once_with(15.0, 30.0)
+
+    def test_websocket_send_failure_closes_only_affected_connection(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        closed = []
+
+        class FailingSendWebsocket(FakeWebsocket):
+            async def send(self, message):
+                del message
+                raise ConnectionError("socket unavailable")
+
+            async def close(self, code, reason):
+                closed.append((code, reason))
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connection = websocket_service.ClientConnection(
+            websocket=FailingSendWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+        connection.ready = True
+        server._add_connection(connection)
+        event = {
+            "epoch_version": 8,
+            "payload": {"kind": "message.created"},
+        }
+
+        async def fail_send():
+            with mock.patch.object(websocket_service.LOG, "exception"):
+                server._request_catch_up(connection)
+                if connection.catchup_task is not None:
+                    await connection.catchup_task
+
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_events_after",
+                return_value=[event],
+            ),
+        ):
+            asyncio.run(fail_send())
+
+        self.assertFalse(connection.ready)
+        self.assertEqual([(1011, "catch_up_failed")], closed)
 
     def test_websocket_catchup_owns_standalone_database_session(self):
         websockets_stub = types.ModuleType("websockets")
@@ -1957,7 +2274,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             transitions,
         )
 
-    def test_websocket_multi_connection_poll_uses_event_store_only(self):
+    def test_websocket_multi_connection_catchup_uses_event_store_only(self):
         websockets_stub = types.ModuleType("websockets")
         websockets_stub.serve = None
         sys.modules.setdefault("websockets", websockets_stub)
@@ -2009,6 +2326,48 @@ class MessengerEventsTestCase(unittest.TestCase):
             server._add_connection(connection)
             connections.append(connection)
 
+        api_store.configure_store_factory(Factory())
+        try:
+            with mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ):
+                async def catch_up_connections():
+                    for connection in connections:
+                        server._request_catch_up(connection)
+                    tasks = [
+                        connection.catchup_task
+                        for connection in connections
+                        if connection.catchup_task is not None
+                    ]
+                    await asyncio.gather(*tasks)
+
+                asyncio.run(catch_up_connections())
+        finally:
+            api_store.reset_store_factory()
+
+        self.assertEqual([], full_store_opens)
+        self.assertCountEqual(
+            [(project_id, connection.user_uuid) for connection in connections],
+            event_store_opens,
+        )
+
+    def test_websocket_poll_schedules_one_catchup_wakeup(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
         sleep_calls = 0
 
         async def run_one_poll():
@@ -2020,29 +2379,24 @@ class MessengerEventsTestCase(unittest.TestCase):
                 if sleep_calls > 1:
                     raise asyncio.CancelledError
 
-            with mock.patch.object(websocket_service.asyncio, "sleep", new=sleep_once):
+            with (
+                mock.patch.object(
+                    websocket_service.asyncio,
+                    "sleep",
+                    new=sleep_once,
+                ),
+                mock.patch.object(server, "_request_catch_up") as request,
+            ):
                 try:
                     await server._poll_connections()
                 except asyncio.CancelledError:
                     pass
+                return request.call_count
 
-        api_store.configure_store_factory(Factory())
-        try:
-            with mock.patch.object(
-                websocket_service,
-                "_call_with_database_session",
-                new=_call_without_database_session,
-            ):
-                asyncio.run(run_one_poll())
-        finally:
-            api_store.reset_store_factory()
+        request_count = asyncio.run(run_one_poll())
 
         self.assertEqual(2, sleep_calls)
-        self.assertEqual([], full_store_opens)
-        self.assertCountEqual(
-            [(project_id, connection.user_uuid) for connection in connections],
-            event_store_opens,
-        )
+        self.assertEqual(1, request_count)
 
     def test_websocket_cursor_gap_is_typed_and_closes_with_4410(self):
         websockets_stub = types.ModuleType("websockets")
@@ -2101,7 +2455,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(10, sent_messages[0]["minimum_epoch_version"])
         self.assertEqual([(4410, "epoch_pruned")], closed)
 
-    def test_websocket_ready_frame_opens_live_delivery_gate_after_catchup(self):
+    def test_websocket_ready_frame_queues_only_new_connection(self):
         websockets_stub = types.ModuleType("websockets")
         websockets_stub.serve = None
         sys.modules.setdefault("websockets", websockets_stub)
@@ -2130,6 +2484,15 @@ class MessengerEventsTestCase(unittest.TestCase):
             epoch_generation="91",
         )
         server._add_connection(connection)
+        other_connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+        other_connection.ready = True
+        server._add_connection(other_connection)
         with (
             mock.patch.object(
                 websocket_service,
@@ -2145,12 +2508,16 @@ class MessengerEventsTestCase(unittest.TestCase):
                     "minimum_epoch_version": 1,
                 },
             ),
+            mock.patch.object(
+                server,
+                "_schedule_connection_catch_up",
+            ) as schedule_catch_up,
         ):
-            asyncio.run(server._broadcast_epoch(8))
-            self.assertEqual([], sent_messages)
-            asyncio.run(server._send_ready(connection))
+            result = asyncio.run(server._send_ready(connection))
 
+        self.assertTrue(result)
         self.assertTrue(connection.ready)
+        schedule_catch_up.assert_called_once_with(connection)
         self.assertEqual(
             {
                 "type": "ready",
@@ -2159,6 +2526,73 @@ class MessengerEventsTestCase(unittest.TestCase):
             },
             sent_messages[0],
         )
+
+    def test_websocket_ready_frame_precedes_dispatched_live_event(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        sent_messages = []
+
+        class ReadyWebsocket(FakeWebsocket):
+            async def send(self, message):
+                sent_messages.append(json.loads(message))
+
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+        connection = websocket_service.ClientConnection(
+            websocket=ReadyWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            last_epoch_version=7,
+            epoch_generation="91",
+        )
+        server._add_connection(connection)
+        event = {
+            "epoch_version": 8,
+            "payload": {"kind": "message.created"},
+        }
+
+        async def send_ready_and_dispatch():
+            with (
+                mock.patch.object(
+                    websocket_service,
+                    "_call_with_database_session",
+                    new=_call_without_database_session,
+                ),
+                mock.patch.object(
+                    websocket_service.messenger_events,
+                    "get_event_cursor",
+                    return_value={
+                        "epoch_generation": "91",
+                        "current_epoch_version": 8,
+                        "minimum_epoch_version": 1,
+                    },
+                ),
+                mock.patch.object(
+                    websocket_service.messenger_events,
+                    "get_events_after",
+                    return_value=[event],
+                ),
+            ):
+                ready = await server._send_ready(connection)
+                if connection.catchup_task is not None:
+                    await connection.catchup_task
+                return ready
+
+        ready = asyncio.run(send_ready_and_dispatch())
+
+        self.assertTrue(ready)
+        self.assertEqual("ready", sent_messages[0]["type"])
+        self.assertEqual(event, sent_messages[1])
 
     def test_websocket_initial_multibatch_catchup_pins_epoch_generation(self):
         websockets_stub = types.ModuleType("websockets")
@@ -2300,6 +2734,7 @@ class MessengerEventsTestCase(unittest.TestCase):
             asyncio.run(server.serve("127.0.0.1", 21082))
 
         self.assertEqual(25, serve_kwargs["ping_interval"])
+        self.assertEqual(60, serve_kwargs["ping_timeout"])
 
     def test_websocket_consumer_ignores_client_frames(self):
         websockets_stub = types.ModuleType("websockets")
