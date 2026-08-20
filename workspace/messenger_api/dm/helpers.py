@@ -4594,6 +4594,7 @@ def create_workspace_user_message(
     message.insert(session=session)
     batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
     recipients_are_scoped = scoped_recipient_uuids is not None
+    recipients: collections.abc.Sequence[object] | None
     if recipients_are_scoped:
         recipients = sorted(
             {sys_uuid.UUID(str(value)) for value in scoped_recipient_uuids},
@@ -4610,7 +4611,7 @@ def create_workspace_user_message(
             recipients = message.get_recipients(session=session)
             if not emit_events and batch_cache is not None:
                 batch_cache[recipients_key] = recipients
-    event_recipients = recipients
+    event_recipients: collections.abc.Sequence[object] | None = recipients
     if compact_events and not recipients_are_scoped:
         visible_recipients_key = (
             "visible_recipients",
@@ -4629,6 +4630,7 @@ def create_workspace_user_message(
             )
             if batch_cache is not None:
                 batch_cache[visible_recipients_key] = event_recipients
+    event_recipients = typing.cast(collections.abc.Sequence[object], event_recipients)
     with _workspace_session(session) as current_session:
         create_message_flags_bulk(
             project_id=project_id,
