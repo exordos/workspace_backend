@@ -77,6 +77,10 @@ EXTERNAL_CONTENT_INDEX_MIGRATION_UUID = "0bb3cac3-2f35-44a1-9cca-b91886bfa0da"
 EXTERNAL_CONTENT_INDEX_MIGRATION_FILE = (
     "0131-index-reusable-external-file-content-0bb3ca.py"
 )
+UNREAD_FOLDER_PROJECTION_MIGRATION_UUID = "93849688-bd14-40b1-8703-12e5ebe13e6b"
+UNREAD_FOLDER_PROJECTION_MIGRATION_FILE = (
+    "0132-optimize-unread-folder-projections-938496.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -93,7 +97,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == EXTERNAL_CONTENT_INDEX_MIGRATION_FILE
+    assert engine.get_latest_migration() == UNREAD_FOLDER_PROJECTION_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -117,6 +121,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     TOPIC_SUMMARY_MIGRATION_UUID,
                     UNREAD_COUNTERS_MIGRATION_UUID,
                     EXTERNAL_CONTENT_INDEX_MIGRATION_UUID,
+                    UNREAD_FOLDER_PROJECTION_MIGRATION_UUID,
                 ],
             ),
         )
@@ -139,11 +144,14 @@ def test_current_migrations_have_a_single_head(_database, db):
             (TOPIC_SUMMARY_MIGRATION_UUID, True),
             (UNREAD_COUNTERS_MIGRATION_UUID, True),
             (EXTERNAL_CONTENT_INDEX_MIGRATION_UUID, True),
+            (UNREAD_FOLDER_PROJECTION_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
         )
         assert cur.fetchone()[0] == "m_workspace_files_external_content_hash_size_idx"
+        cur.execute("SELECT to_regclass('m_external_chats_v2_selected_projection_idx')")
+        assert cur.fetchone()[0] == "m_external_chats_v2_selected_projection_idx"
         cur.execute("SELECT to_regclass('m_workspace_events_user_identity_idx')")
         assert cur.fetchone()[0] == "m_workspace_events_user_identity_idx"
         cur.execute(
@@ -229,6 +237,46 @@ def test_current_migrations_have_a_single_head(_database, db):
             """
         )
         assert cur.fetchone()[0] == 0
+
+
+def test_list_and_folder_projections_reuse_outer_visibility(_database, db):
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT relname, pg_get_viewdef(oid)
+            FROM pg_class
+            WHERE relname IN (
+                'm_workspace_user_unread_messages_base_v1',
+                'm_workspace_user_unread_messages_view',
+                'm_workspace_user_streams',
+                'm_workspace_user_topics_view',
+                'm_folders_view'
+            )
+            ORDER BY relname
+            """
+        )
+        definitions = dict(cur.fetchall())
+
+    assert set(definitions) == {
+        "m_workspace_user_unread_messages_base_v1",
+        "m_workspace_user_unread_messages_view",
+        "m_workspace_user_streams",
+        "m_workspace_user_topics_view",
+        "m_folders_view",
+    }
+    unread_base = definitions["m_workspace_user_unread_messages_base_v1"]
+    protected_unread = definitions["m_workspace_user_unread_messages_view"]
+    assert "m_confirmed_external_stream_access" not in unread_base
+    assert "m_confirmed_external_stream_access" in protected_unread
+    for name in ("m_workspace_user_streams", "m_workspace_user_topics_view"):
+        definition = definitions[name]
+        assert "m_workspace_messages" in definition
+        assert "m_workspace_user_messages_view" not in definition
+        assert "m_workspace_user_unread_messages_base_v1" in definition
+        assert definition.count("m_confirmed_external_stream_access") == 1
+    folders = definitions["m_folders_view"]
+    assert "system_folder_templates" in folders
+    assert folders.count("FROM m_workspace_user_streams") == 1
 
 
 def test_external_projection_access_is_scoped_to_account(
@@ -890,27 +938,46 @@ def test_external_visibility_uses_the_canonical_stream_per_logical_chat(
         )
         cur.execute(
             """
-            SELECT uuid::text
+            SELECT uuid::text, last_message_uuid::text, unread_count
             FROM m_workspace_user_streams
             WHERE project_id = %s AND user_uuid = %s
             ORDER BY uuid
             """,
             (project_uuid, owner_a_uuid),
         )
-        assert [row[0] for row in cur.fetchall()] == sorted(
-            [stream_a_x_uuid, stream_b_y_uuid]
+        assert cur.fetchall() == sorted(
+            [
+                (stream_a_x_uuid, message_uuids[0], 1),
+                (stream_b_y_uuid, message_uuids[2], 1),
+            ]
         )
         cur.execute(
             """
-            SELECT uuid::text
+            SELECT uuid::text, last_message_uuid::text, unread_count
             FROM m_workspace_user_topics_view
             WHERE project_id = %s AND user_uuid = %s
             ORDER BY uuid
             """,
             (project_uuid, owner_a_uuid),
         )
-        assert [row[0] for row in cur.fetchall()] == sorted(
-            [topic_a_x_uuid, topic_b_y_uuid]
+        assert cur.fetchall() == sorted(
+            [
+                (topic_a_x_uuid, message_uuids[0], 1),
+                (topic_b_y_uuid, message_uuids[2], 1),
+            ]
+        )
+        cur.execute(
+            """
+            SELECT uuid::text, json_array_length(folder_items)
+            FROM m_folders_view
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+            """,
+            (project_uuid, owner_a_uuid),
+        )
+        assert cur.fetchall()[0] == (
+            "00000000-0000-0000-0000-000000000000",
+            2,
         )
         cur.execute(
             """
