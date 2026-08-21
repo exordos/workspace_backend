@@ -5986,6 +5986,91 @@ def test_messages_cursor_pagination_uses_created_at_uuid_keyset(api, db):
     assert unsupported_sort.status_code == 400, unsupported_sort.text
 
 
+def test_mentioned_unread_messages_use_scoped_keyset_page(api, db):
+    target_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "mentioned-unread-keyset",
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, target_user)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    mention = f"[Target](urn:user:{target_user})"
+    message_uuids = []
+    for content in (f"first {mention}", "not a mention", f"second {mention}"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+
+    common_params = {
+        "page_limit": 1,
+        "sort_key": "created_at",
+        "sort_dir": "desc",
+        "mentioned": "true",
+        "read": "false",
+    }
+    first_page = api.get(MESSAGES, user=target_user, params=common_params)
+    assert first_page.status_code == 200, first_page.text
+    assert [item["uuid"] for item in first_page.json()] == [message_uuids[2]]
+    assert first_page.json()[0]["mentioned"] is True
+    assert first_page.json()[0]["read"] is False
+    marker = first_page.headers["X-Pagination-Marker"]
+
+    second_page = api.get(
+        MESSAGES,
+        user=target_user,
+        params={**common_params, "page_marker": marker},
+    )
+    assert second_page.status_code == 200, second_page.text
+    assert [item["uuid"] for item in second_page.json()] == [message_uuids[0]]
+    assert "X-Pagination-Marker" not in second_page.headers
+
+    response = api.post(
+        f"{MESSAGES}{message_uuids[2]}/actions/read/invoke",
+        user=target_user,
+    )
+    assert response.status_code == 200, response.text
+    unread_mentions = api.get(
+        MESSAGES,
+        user=target_user,
+        params={**common_params, "page_limit": 10},
+    )
+    assert unread_mentions.status_code == 200, unread_mentions.text
+    assert [item["uuid"] for item in unread_mentions.json()] == [message_uuids[0]]
+
+    all_mentions = api.get(
+        MESSAGES,
+        user=target_user,
+        params={
+            "page_limit": 10,
+            "sort_key": "created_at",
+            "sort_dir": "desc",
+            "mentioned": "true",
+        },
+    )
+    assert all_mentions.status_code == 200, all_mentions.text
+    assert [item["uuid"] for item in all_mentions.json()] == [
+        message_uuids[2],
+        message_uuids[0],
+    ]
+    assert [item["read"] for item in all_mentions.json()] == [True, False]
+
+
 def test_draft_crud_idempotency_etags_owner_scope_and_no_events(api, db):
     other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(

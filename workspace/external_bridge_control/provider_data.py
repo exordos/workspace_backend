@@ -82,6 +82,15 @@ def _is_quiet_backfill_event(event: object) -> bool:
     return isinstance(metadata, dict) and metadata.get("delivery_class") == "backfill"
 
 
+def _is_account_global_identity_event(event: object) -> bool:
+    if not isinstance(event, dict) or event.get("kind") != "identity.upsert":
+        return False
+    payload = event.get("payload")
+    resource = payload.get("resource") if isinstance(payload, dict) else None
+    metadata = resource.get("provider_metadata") if isinstance(resource, dict) else None
+    return isinstance(metadata, dict) and metadata.get("chat_key") == "account"
+
+
 class ProviderDataError(RuntimeError):
     status = 400
     error = "provider_request_invalid"
@@ -990,12 +999,13 @@ def apply_provider_event_batch(
                 """,
                 (project_id,),
             )
-        requested_assignments = sorted(
+        requested_routes = sorted(
             {
                 (
                     sys_uuid.UUID(str(event["external_account_uuid"])),
                     sys_uuid.UUID(str(event["external_chat_uuid"])),
                     sys_uuid.UUID(str(event["project_id"])),
+                    _is_account_global_identity_event(event),
                 )
                 for event in events
             },
@@ -1003,68 +1013,124 @@ def apply_provider_event_batch(
         )
         validation = session.execute(
             """
-            WITH requested(account_uuid, chat_uuid, project_id) AS (
-                SELECT * FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+            WITH requested(
+                account_uuid, chat_uuid, project_id, account_global
+            ) AS (
+                SELECT * FROM unnest(
+                    %s::uuid[], %s::uuid[], %s::uuid[], %s::boolean[]
+                )
+            ), authorized AS (
+                SELECT
+                    requested.account_uuid,
+                    NULL::uuid AS chat_uuid,
+                    requested.project_id,
+                    NULL::uuid AS owner_user_uuid,
+                    NULL::uuid AS projection_stream_uuid,
+                    NULL::text AS provider_chat_id,
+                    NULL::text AS display_name,
+                    NULL::jsonb AS source,
+                    NULL::jsonb AS capabilities,
+                    account.settings AS account_settings,
+                    account.provider_realm_uuid
+                FROM requested
+                JOIN "m_external_accounts_v2" AS account
+                  ON account."uuid" = requested.account_uuid
+                 AND account."provider" = %s
+                 AND account."settings"->>'default_project_id' =
+                     requested.project_id::text
+                WHERE requested.account_global
+                  AND EXISTS (
+                    SELECT 1
+                    FROM "m_external_bridge_desired_resources_v1" AS desired
+                    WHERE desired."bridge_instance_uuid" = %s
+                      AND desired."provider_kind" = %s
+                      AND desired."resource_type" = 'external_account'
+                      AND desired."resource_uuid" = account."uuid"
+                      AND desired."operation" = 'upsert'
+                      AND desired."resource"#>>'{settings,default_project_id}' =
+                          requested.project_id::text
+                  )
+                UNION ALL
+                SELECT
+                    requested.account_uuid,
+                    requested.chat_uuid,
+                    requested.project_id,
+                    chat.owner_user_uuid,
+                    chat.projection_stream_uuid,
+                    chat.provider_chat_id,
+                    chat.display_name,
+                    chat.source,
+                    chat.capabilities,
+                    account.settings AS account_settings,
+                    account.provider_realm_uuid
+                FROM requested
+                JOIN "m_external_accounts_v2" AS account
+                  ON account."uuid" = requested.account_uuid
+                 AND account."provider" = %s
+                JOIN "m_external_chats_v2" AS chat
+                  ON chat."uuid" = requested.chat_uuid
+                 AND chat."external_account_uuid" = requested.account_uuid
+                 AND chat."project_id" = requested.project_id
+                 AND chat."provider" = account."provider"
+                 AND chat."selected"
+                 AND chat."status" IN ('syncing', 'live', 'degraded')
+                 AND chat."projection_stream_uuid" IS NOT NULL
+                WHERE NOT requested.account_global
+                  AND EXISTS (
+                    SELECT 1
+                    FROM "m_external_bridge_desired_resources_v1" AS desired
+                    WHERE desired."bridge_instance_uuid" = %s
+                      AND desired."provider_kind" = %s
+                      AND desired."resource_type" = 'external_account'
+                      AND desired."resource_uuid" = account."uuid"
+                      AND desired."operation" = 'upsert'
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM "m_external_bridge_desired_resources_v1" AS desired
+                    WHERE desired."bridge_instance_uuid" = %s
+                      AND desired."provider_kind" = %s
+                      AND desired."resource_type" = 'external_chat_assignment'
+                      AND desired."resource_uuid" = chat."uuid"
+                      AND desired."operation" = 'upsert'
+                      AND desired."resource"->>'external_account_uuid' =
+                          requested.account_uuid::text
+                      AND desired."resource"->>'project_id' =
+                          requested.project_id::text
+                      AND desired."resource"->>'selected' = 'true'
+                      AND desired."resource"#>>'{workspace_projection,stream,uuid}' =
+                          chat."projection_stream_uuid"::text
+                  )
             )
             SELECT count(*) AS matched,
                    COALESCE(
                        jsonb_agg(jsonb_build_object(
-                           'account_uuid', requested.account_uuid,
-                           'chat_uuid', requested.chat_uuid,
-                           'project_id', requested.project_id,
-                           'owner_user_uuid', chat.owner_user_uuid,
-                           'projection_stream_uuid', chat.projection_stream_uuid,
-                           'provider_chat_id', chat.provider_chat_id,
-                           'display_name', chat.display_name,
-                           'source', chat.source,
-                           'capabilities', chat.capabilities,
-                           'account_settings', account.settings,
-                           'provider_realm_uuid', account.provider_realm_uuid
-                       )),
+                           'account_uuid', authorized.account_uuid,
+                           'chat_uuid', authorized.chat_uuid,
+                           'project_id', authorized.project_id,
+                           'owner_user_uuid', authorized.owner_user_uuid,
+                           'projection_stream_uuid',
+                               authorized.projection_stream_uuid,
+                           'provider_chat_id', authorized.provider_chat_id,
+                           'display_name', authorized.display_name,
+                           'source', authorized.source,
+                           'capabilities', authorized.capabilities,
+                           'account_settings', authorized.account_settings,
+                           'provider_realm_uuid',
+                               authorized.provider_realm_uuid
+                       )) FILTER (WHERE authorized.chat_uuid IS NOT NULL),
                        '[]'::jsonb
                    ) AS assignments
-            FROM requested
-            JOIN "m_external_accounts_v2" AS account
-              ON account."uuid" = requested.account_uuid
-             AND account."provider" = %s
-            JOIN "m_external_chats_v2" AS chat
-              ON chat."uuid" = requested.chat_uuid
-             AND chat."external_account_uuid" = requested.account_uuid
-             AND chat."project_id" = requested.project_id
-             AND chat."provider" = account."provider"
-             AND chat."selected"
-             AND chat."status" IN ('syncing', 'live', 'degraded')
-             AND chat."projection_stream_uuid" IS NOT NULL
-            WHERE EXISTS (
-                SELECT 1
-                FROM "m_external_bridge_desired_resources_v1" AS desired
-                WHERE desired."bridge_instance_uuid" = %s
-                  AND desired."provider_kind" = %s
-                  AND desired."resource_type" = 'external_account'
-                  AND desired."resource_uuid" = account."uuid"
-                  AND desired."operation" = 'upsert'
-            )
-              AND EXISTS (
-                SELECT 1
-                FROM "m_external_bridge_desired_resources_v1" AS desired
-                WHERE desired."bridge_instance_uuid" = %s
-                  AND desired."provider_kind" = %s
-                  AND desired."resource_type" = 'external_chat_assignment'
-                  AND desired."resource_uuid" = chat."uuid"
-                  AND desired."operation" = 'upsert'
-                  AND desired."resource"->>'external_account_uuid' =
-                      requested.account_uuid::text
-                  AND desired."resource"->>'project_id' =
-                      requested.project_id::text
-                  AND desired."resource"->>'selected' = 'true'
-                  AND desired."resource"#>>'{workspace_projection,stream,uuid}' =
-                      chat."projection_stream_uuid"::text
-            )
+            FROM authorized
             """,
             (
-                [value[0] for value in requested_assignments],
-                [value[1] for value in requested_assignments],
-                [value[2] for value in requested_assignments],
+                [value[0] for value in requested_routes],
+                [value[1] for value in requested_routes],
+                [value[2] for value in requested_routes],
+                [value[3] for value in requested_routes],
+                identity.provider_kind,
+                identity.bridge_instance_uuid,
+                identity.provider_kind,
                 identity.provider_kind,
                 identity.bridge_instance_uuid,
                 identity.provider_kind,
@@ -1072,9 +1138,7 @@ def apply_provider_event_batch(
                 identity.provider_kind,
             ),
         ).fetchone()
-        if validation is None or int(validation["matched"]) != len(
-            requested_assignments
-        ):
+        if validation is None or int(validation["matched"]) != len(requested_routes):
             raise ValueError(
                 "External account and chat are not assigned to this bridge"
             )

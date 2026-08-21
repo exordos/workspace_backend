@@ -8,6 +8,8 @@
 import contextlib
 import collections.abc
 import datetime
+import logging
+import time
 import typing
 import uuid as sys_uuid
 
@@ -36,6 +38,46 @@ _PROVIDER_TARGET_UNSET = object()
 _PROVIDER_TARGET_EXISTS = object()
 EVENT_RETENTION = datetime.timedelta(hours=72)
 EVENT_PRUNE_BATCH_SIZE = 25000
+SLOW_LIST_PROJECTION_SECONDS = 1.0
+LOG = logging.getLogger(__name__)
+MENTIONED_MESSAGE_UUIDS_SQL = """
+    WITH authorized_streams AS MATERIALIZED (
+        SELECT binding.stream_uuid
+        FROM m_workspace_stream_bindings AS binding
+        JOIN m_workspace_streams AS stream
+          ON stream.project_id = binding.project_id
+         AND stream.uuid = binding.stream_uuid
+        LEFT JOIN m_confirmed_external_stream_access AS access
+          ON access.project_id = binding.project_id
+         AND access.user_uuid = binding.user_uuid
+         AND access.stream_uuid = binding.stream_uuid
+        WHERE binding.project_id = %s
+          AND binding.user_uuid = %s
+          AND (
+              stream.source_name = 'native'
+              OR access.user_uuid IS NOT NULL
+          )
+    )
+    SELECT candidate.uuid
+    FROM authorized_streams
+    JOIN LATERAL (
+        SELECT message.uuid, message.created_at
+        FROM m_workspace_messages AS message
+        {flags_join}
+        WHERE message.project_id = %s
+          AND message.stream_uuid = authorized_streams.stream_uuid
+          {read_clause}
+          AND POSITION(
+              '](' || 'urn:user:' || LOWER(%s::text) || ')'
+              IN LOWER(COALESCE(message.payload->>'content', ''))
+          ) > 0
+          {marker_clause}
+        ORDER BY message.created_at {direction}, message.uuid {direction}
+        LIMIT %s
+    ) AS candidate ON TRUE
+    ORDER BY candidate.created_at {direction}, candidate.uuid {direction}
+    LIMIT %s
+"""
 BOUNDED_VISIBLE_EVENTS_SQL = """
     WITH direct_events AS (
         SELECT
@@ -260,6 +302,35 @@ def _public_dict(row: typing.Any, resource: str) -> dict[str, typing.Any]:
     return result
 
 
+def _eq_filter_matches(
+    filters: typing.Mapping[str, typing.Any],
+    name: str,
+    expected: object,
+) -> bool:
+    clause = filters.get(name)
+    return isinstance(clause, dm_filters.EQ) and clause.value == expected
+
+
+def _is_mentioned_page(filters: typing.Mapping[str, typing.Any]) -> bool:
+    names = set(filters)
+    return (
+        names
+        in (
+            {"project_id", "user_uuid", "mentioned"},
+            {"project_id", "user_uuid", "mentioned", "read"},
+        )
+        and _eq_filter_matches(filters, "mentioned", True)
+        and ("read" not in filters or _eq_filter_matches(filters, "read", False))
+    )
+
+
+def _database_timestamp(value: datetime.datetime) -> datetime.datetime:
+    """Normalize UTC models for PostgreSQL columns without time zone."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def prune_expired_events(
     session: typing.Any,
     now: datetime.datetime,
@@ -482,12 +553,89 @@ class SQLCanonicalReadStore:
             if resource == "users"
             else RESOURCE_MODELS[resource]
         )
-        rows = model.objects.get_all(
-            filters=self._scope_filters(resource, filters),
-            order_by=order_by,
-            limit=limit,
-        )
+        started_at = time.monotonic()
+        try:
+            rows = model.objects.get_all(
+                filters=self._scope_filters(resource, filters),
+                order_by=order_by,
+                limit=limit,
+            )
+        finally:
+            duration = time.monotonic() - started_at
+            if duration >= SLOW_LIST_PROJECTION_SECONDS:
+                LOG.warning(
+                    "Slow Messenger list projection",
+                    extra={
+                        "projection_resource": resource,
+                        "projection_duration_seconds": duration,
+                    },
+                )
         return [_public_dict(row, resource) for row in rows]
+
+    def _filter_mentioned_message_page(
+        self,
+        marker: typing.Any,
+        sort_direction: str,
+        limit: int | None,
+        unread_only: bool,
+    ) -> list[dict[str, typing.Any]]:
+        if sort_direction not in {"asc", "desc"}:
+            raise ra_exceptions.ValidationErrorException()
+        direction = sort_direction.upper()
+        marker_clause = ""
+        marker_params: tuple[object, ...] = ()
+        if marker is not None:
+            operator = ">" if sort_direction == "asc" else "<"
+            marker_clause = (
+                f"AND (message.created_at {operator} %s OR "
+                f"(message.created_at = %s AND message.uuid {operator} %s))"
+            )
+            marker_created_at = _database_timestamp(marker.created_at)
+            marker_params = (marker_created_at, marker_created_at, marker.uuid)
+        flags_join = ""
+        read_clause = ""
+        read_params: tuple[object, ...] = ()
+        if unread_only:
+            flags_join = """
+                LEFT JOIN m_workspace_user_message_flags AS flags
+                  ON flags.project_id = message.project_id
+                 AND flags.uuid = message.uuid
+                 AND flags.user_uuid = %s
+            """
+            read_clause = "AND COALESCE(flags.read, FALSE) = FALSE"
+            read_params = (self.user_uuid,)
+        statement = MENTIONED_MESSAGE_UUIDS_SQL.format(
+            flags_join=flags_join,
+            read_clause=read_clause,
+            marker_clause=marker_clause,
+            direction=direction,
+        )
+        session = contexts.Context().get_session()
+        candidate_rows = session.execute(
+            statement,
+            (
+                self.project_uuid,
+                self.user_uuid,
+                *read_params,
+                self.project_uuid,
+                self.user_uuid,
+                *marker_params,
+                limit,
+                limit,
+            ),
+        ).fetchall()
+        message_uuids = [row["uuid"] for row in candidate_rows]
+        snapshots = helpers.get_compact_workspace_user_message_snapshots(
+            self.project_uuid,
+            message_uuids,
+            [self.user_uuid],
+            session=session,
+        )
+        snapshots_by_uuid = {row["uuid"]: row for row in snapshots}
+        return [
+            _public_dict(snapshots_by_uuid[message_uuid], "messages")
+            for message_uuid in message_uuids
+        ]
 
     def filter_message_page(
         self,
@@ -496,33 +644,54 @@ class SQLCanonicalReadStore:
         sort_direction: str,
         limit: int | None,
     ) -> list[dict[str, typing.Any]]:
+        started_at = time.monotonic()
         scoped_filters = self._scope_filters("messages", filters)
-        if marker_uuid is not None:
-            marker_filters = scoped_filters.copy()
-            marker_filters["uuid"] = dm_filters.EQ(marker_uuid)
-            marker = models.WorkspaceUserMessage.objects.get_one(
-                filters=marker_filters,
-            )
-            compare = dm_filters.GT if sort_direction == "asc" else dm_filters.LT
-            keyset = dm_filters.OR(
-                {"created_at": compare(marker.created_at)},
-                dm_filters.AND(
-                    {"created_at": dm_filters.EQ(marker.created_at)},
-                    {"uuid": compare(marker.uuid)},
-                ),
-            )
-            scoped_filters = dm_filters.AND(scoped_filters, keyset)
-        query = {
-            "filters": scoped_filters,
-            "order_by": {
-                "created_at": sort_direction,
-                "uuid": sort_direction,
-            },
-        }
-        if limit is not None:
-            query["limit"] = limit
-        rows = models.WorkspaceUserMessage.objects.get_all(**query)
-        return [_public_dict(row, "messages") for row in rows]
+        try:
+            marker = None
+            if marker_uuid is not None:
+                marker_filters = scoped_filters.copy()
+                marker_filters["uuid"] = dm_filters.EQ(marker_uuid)
+                marker = models.WorkspaceUserMessage.objects.get_one(
+                    filters=marker_filters,
+                )
+            if _is_mentioned_page(scoped_filters):
+                return self._filter_mentioned_message_page(
+                    marker,
+                    sort_direction,
+                    limit,
+                    "read" in scoped_filters,
+                )
+            if marker is not None:
+                compare = dm_filters.GT if sort_direction == "asc" else dm_filters.LT
+                keyset = dm_filters.OR(
+                    {"created_at": compare(marker.created_at)},
+                    dm_filters.AND(
+                        {"created_at": dm_filters.EQ(marker.created_at)},
+                        {"uuid": compare(marker.uuid)},
+                    ),
+                )
+                scoped_filters = dm_filters.AND(scoped_filters, keyset)
+            query = {
+                "filters": scoped_filters,
+                "order_by": {
+                    "created_at": sort_direction,
+                    "uuid": sort_direction,
+                },
+            }
+            if limit is not None:
+                query["limit"] = limit
+            rows = models.WorkspaceUserMessage.objects.get_all(**query)
+            return [_public_dict(row, "messages") for row in rows]
+        finally:
+            duration = time.monotonic() - started_at
+            if duration >= SLOW_LIST_PROJECTION_SECONDS:
+                LOG.warning(
+                    "Slow Messenger list projection",
+                    extra={
+                        "projection_resource": "messages",
+                        "projection_duration_seconds": duration,
+                    },
+                )
 
     def filter_draft_page(
         self,
@@ -764,8 +933,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                             owner_user_uuid=stream.user_uuid,
                             external_account_uuid=stream.external_account_uuid,
                             stream_uuid=stream_uuid,
-                            allow_policy_blocked=operation_kind
-                            == "membership.remove",
+                            allow_policy_blocked=operation_kind == "membership.remove",
                         )
                     )
                 except provider_data.ProviderPolicyBlockedError as policy_exc:
@@ -1746,8 +1914,7 @@ class PostgresEventStore:
                 ),
             ).fetchall()
             result = [
-                messenger_events.event_row_to_messenger_event(event)
-                for event in events
+                messenger_events.event_row_to_messenger_event(event) for event in events
             ]
         else:
             scoped_filters = {
@@ -1767,9 +1934,7 @@ class PostgresEventStore:
                 order_by=order_by or {"epoch_version": "asc"},
                 limit=limit,
             )
-            result = [
-                messenger_events.pack_workspace_event(event) for event in events
-            ]
+            result = [messenger_events.pack_workspace_event(event) for event in events]
         for item in clauses:
             value = int(item.value)
             if isinstance(item, dm_filters.GT):

@@ -6,6 +6,7 @@
 """Apply the supported Provider API v1 projection events to Messenger state."""
 
 import collections.abc
+import contextvars
 import datetime
 import typing
 import uuid as sys_uuid
@@ -680,7 +681,9 @@ def _message_event(
             }
         )
         create_options = {"emit_events": False} if quiet_backfill else {}
-        validation_token = None
+        batch_validation_token: (
+            contextvars.Token[set[tuple[object, ...]] | None] | None
+        ) = None
         if quiet_backfill:
             batch_cache = getattr(
                 session, "_workspace_provider_event_batch_cache", None
@@ -689,7 +692,7 @@ def _message_event(
                 validation_cache = batch_cache.setdefault(
                     ("message_validation",), set()
                 )
-                validation_token = models._PROVIDER_MESSAGE_VALIDATION_CACHE.set(
+                batch_validation_token = models._PROVIDER_MESSAGE_VALIDATION_CACHE.set(
                     validation_cache
                 )
         try:
@@ -705,8 +708,8 @@ def _message_event(
                 **values,
             )
         finally:
-            if validation_token is not None:
-                models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
+            if batch_validation_token is not None:
+                models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(batch_validation_token)
     else:
         if existing.stream_uuid != stream_uuid:
             raise ValueError("Provider message UUID belongs to another stream")
@@ -917,7 +920,10 @@ def _sync_provider_read_state(
     ).fetchall()
     if any(message["stream_uuid"] != stream_uuid for message in messages):
         raise ValueError("Provider read state message is outside the selected chat")
-    changed_message_uuids_by_read = {True: [], False: []}
+    changed_message_uuids_by_read: dict[bool, list[sys_uuid.UUID]] = {
+        True: [],
+        False: [],
+    }
     message_by_uuid = {message["uuid"]: message for message in messages}
     for message in messages:
         effective_read = read or message["author_uuid"] == reader_uuid
@@ -925,7 +931,10 @@ def _sync_provider_read_state(
             changed_message_uuids_by_read[effective_read].append(message["uuid"])
     if not any(changed_message_uuids_by_read.values()):
         return
-    updated_message_uuids_by_read = {True: [], False: []}
+    updated_message_uuids_by_read: dict[bool, list[sys_uuid.UUID]] = {
+        True: [],
+        False: [],
+    }
     for effective_read, changed_message_uuids in changed_message_uuids_by_read.items():
         if not changed_message_uuids:
             continue
@@ -1045,10 +1054,17 @@ def apply_event(
     """Apply one validated inbound event inside the HTTP request transaction."""
     if event["kind"] not in SUPPORTED_EVENT_KINDS:
         raise ValueError("Provider event kind is not supported")
+    account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
+    if event["kind"] == "identity.upsert":
+        # Identity directory updates belong to the external account, not to an
+        # individual selected chat. The batch authorization gate has already
+        # proven that this bridge owns the account in the target project, so a
+        # synthetic account-level external_chat_uuid must not force a chat
+        # assignment lookup here.
+        resource = _resource(event, identity, account_uuid)
+        return _identity_event(session, event, identity, resource)
     account_uuid, project_id, assignment = _assignment(session, identity, event)
     resource = _resource(event, identity, account_uuid)
-    if event["kind"] == "identity.upsert":
-        return _identity_event(session, event, identity, resource)
     if event["kind"] == "read_state.set":
         return _read_state_event(session, project_id, assignment, resource)
     resource_type = event["kind"].split(".", 1)[0]

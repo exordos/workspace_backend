@@ -21,6 +21,8 @@ from restalchemy.storage.sql import engines
 from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
+from workspace.external_bridge_control import provider_data
+from workspace.external_bridge_control import provider_event_apply
 from workspace.external_bridge_control import sql_state
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import external_models
@@ -44,6 +46,120 @@ def _identity(instance_uuid, realm_uuid):
 def _request_call(callable_, *args, **kwargs):
     with contexts.Context().session_manager():
         return callable_(*args, **kwargs)
+
+
+def test_account_global_identity_event_uses_account_authorization(_database, db):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    identity_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, "identity-owner")
+    settings = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.test",
+        "selection_mode": "explicit",
+        "history_depth": "30_days",
+        "default_project_id": str(project_uuid),
+    }
+    desired = {
+        "resource_type": "external_account",
+        "uuid": str(account_uuid),
+        "generation": 1,
+        "owner_user_uuid": str(owner_uuid),
+        "settings": settings,
+        "synchronization_enabled": True,
+        "credential_envelope": None,
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (
+                uuid, provider, identity_generation, status, last_heartbeat_at
+            ) VALUES (%s, 'zulip', 1, 'active', NOW())
+            """,
+            (instance_uuid,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+            """,
+            (account_uuid, owner_uuid, sql_state._json(settings)),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_desired_resources_v1 (
+                bridge_instance_uuid, provider_kind, resource_type,
+                resource_uuid, operation, generation, resource
+            ) VALUES (%s, 'zulip', 'external_account', %s, 'upsert', 1, %s::jsonb)
+            """,
+            (instance_uuid, account_uuid, sql_state._json(desired)),
+        )
+    event = {
+        "provider_event_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(project_uuid),
+        "provider_sequence": "1",
+        "kind": "identity.upsert",
+        "payload": {
+            "resource": {
+                "uuid": str(identity_uuid),
+                "display_name": "Provider identity",
+                "email": "identity@example.test",
+                "avatar_urn": None,
+                "active": True,
+                "provider_external_id": "42",
+                "provider_metadata": {"chat_key": "account"},
+            }
+        },
+    }
+    identity = _identity(instance_uuid, realm_uuid)
+    session_factory = engines.engine_factory.get_engine().session_manager
+
+    with session_factory() as session:
+        response = provider_data.apply_provider_event_batch(
+            session,
+            identity,
+            [event],
+            provider_event_apply.apply_event,
+        )
+
+    assert response["results"][0]["status"] == "applied"
+    assert response["results"][0]["target_uuid"] == str(identity_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT source, external_account_uuid, provider_external_id
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (identity_uuid,),
+        )
+        assert cursor.fetchone() == ("zulip", account_uuid, "42")
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_external_chats_v2 WHERE external_account_uuid = %s",
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+    foreign_project_event = {
+        **event,
+        "provider_event_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(sys_uuid.uuid4()),
+    }
+    with session_factory() as session:
+        with pytest.raises(provider_data.ProviderBatchError, match="not assigned"):
+            provider_data.apply_provider_event_batch(
+                session,
+                identity,
+                [foreign_project_event],
+                provider_event_apply.apply_event,
+            )
 
 
 def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
@@ -1016,13 +1132,22 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
         assert cursor.fetchone()[0] == 1
         cursor.execute(
             """
+            SELECT source_scope
+            FROM m_confirmed_external_stream_access
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, owner_b_uuid),
+        )
+        assert cursor.fetchone()[0] == str(account_a_uuid)
+        cursor.execute(
+            """
             SELECT COUNT(*)
             FROM m_workspace_user_streams
             WHERE project_id = %s AND uuid = %s AND user_uuid = %s
             """,
             (project_uuid, stream_uuid, owner_b_uuid),
         )
-        assert cursor.fetchone()[0] == 0
+        assert cursor.fetchone()[0] == 1
         cursor.execute(
             """
             SELECT source#>>'{participants,0,identity_uuid}'

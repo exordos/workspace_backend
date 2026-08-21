@@ -903,7 +903,7 @@ def _persist_prepared_resource_broadcast_events_bulk(
     event_rows = []
     snapshots: dict[sys_uuid.UUID, tuple[object, str]] = {}
     members: set[tuple[sys_uuid.UUID, sys_uuid.UUID]] = set()
-    recipient_payload_rows = []
+    recipient_payload_rows: list[tuple[sys_uuid.UUID, sys_uuid.UUID, str]] = []
     for event in prepared_events:
         recipients = sorted(
             {sys_uuid.UUID(str(value)) for value in event["recipients"]},
