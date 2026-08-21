@@ -1132,13 +1132,22 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
         assert cursor.fetchone()[0] == 1
         cursor.execute(
             """
+            SELECT source_scope
+            FROM m_confirmed_external_stream_access
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, owner_b_uuid),
+        )
+        assert cursor.fetchone()[0] == str(account_a_uuid)
+        cursor.execute(
+            """
             SELECT COUNT(*)
             FROM m_workspace_user_streams
             WHERE project_id = %s AND uuid = %s AND user_uuid = %s
             """,
             (project_uuid, stream_uuid, owner_b_uuid),
         )
-        assert cursor.fetchone()[0] == 0
+        assert cursor.fetchone()[0] == 1
         cursor.execute(
             """
             SELECT source#>>'{participants,0,identity_uuid}'
