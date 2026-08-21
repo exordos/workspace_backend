@@ -384,14 +384,7 @@ def _identity_event():
 def test_identity_upsert_materializes_user_without_stream_binding(monkeypatch):
     identity = _identity()
     event = _identity_event()
-    stream_uuid = sys_uuid.uuid4()
-    session = Session(
-        {
-            "owner_user_uuid": sys_uuid.uuid4(),
-            "projection_stream_uuid": stream_uuid,
-            "provider_chat_id": "zulip-channel-7",
-        }
-    )
+    session = Session(None)
     created = []
 
     class FakeWorkspaceUser:
@@ -423,6 +416,10 @@ def test_identity_upsert_materializes_user_without_stream_binding(monkeypatch):
     assert created[0].first_name == "Former User"
     assert created[0].status == "offline"
     assert created[0].insert_session is session
+    assert not any(
+        'FROM "m_external_chats_v2" AS chat' in statement
+        for statement, _params in session.statements
+    )
 
 
 def test_identity_upsert_preserves_verified_iam_user(monkeypatch):

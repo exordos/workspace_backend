@@ -374,10 +374,68 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     assert "pg_advisory_xact_lock" in session.statements[1][0]
     assert session.statements[1][1] == (project_uuid,)
     assert "m_external_bridge_desired_resources_v1" in session.statements[2][0]
-    assert session.statements[2][1][4] == identity.bridge_instance_uuid
-    assert session.statements[2][1][6] == identity.bridge_instance_uuid
+    assert session.statements[2][1][5] == identity.bridge_instance_uuid
+    assert session.statements[2][1][8] == identity.bridge_instance_uuid
+    assert session.statements[2][1][10] == identity.bridge_instance_uuid
     assert "m_external_provider_events_v1" in session.statements[3][0]
     assert not hasattr(session, "_workspace_provider_event_batch_cache")
+
+
+def test_inbound_account_identity_event_does_not_require_chat_assignment():
+    identity = _identity()
+    event_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    event = {
+        "provider_event_uuid": str(event_uuid),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(project_uuid),
+        "kind": "identity.upsert",
+        "payload": {
+            "resource": {
+                "uuid": str(target_uuid),
+                "provider_metadata": {"chat_key": "account"},
+            }
+        },
+    }
+    session = Session(
+        [
+            _healthy_bridge(),
+            {"matched": 1, "assignments": []},
+            [{"provider_event_uuid": event_uuid}],
+            None,
+        ]
+    )
+
+    response = provider_data.apply_provider_event_batch(
+        session,
+        identity,
+        [event],
+        lambda *_args: target_uuid,
+        now=NOW,
+    )
+
+    assert response["results"][0]["status"] == "applied"
+    route_gate, params = session.statements[2]
+    assert "requested.account_global" in route_gate
+    assert "settings,default_project_id" in route_gate
+    assert params[3] == [True]
+    assert params[5] == identity.bridge_instance_uuid
+
+
+@pytest.mark.parametrize("chat_key", [None, "channel:42"])
+def test_chat_scoped_identity_event_still_requires_chat_assignment(chat_key):
+    resource = {"uuid": str(sys_uuid.uuid4())}
+    if chat_key is not None:
+        resource["provider_metadata"] = {"chat_key": chat_key}
+    event = {
+        "kind": "identity.upsert",
+        "payload": {"resource": resource},
+    }
+
+    assert provider_data._is_account_global_identity_event(event) is False
 
 
 def test_inbound_event_batch_writes_provider_ledger_in_bulk():
@@ -530,7 +588,7 @@ def test_inbound_event_batch_primes_authorized_assignments(monkeypatch):
     assignment_gate = next(
         statement
         for statement, _params in session.statements
-        if "WITH requested(account_uuid, chat_uuid, project_id)" in statement
+        if "account_uuid, chat_uuid, project_id, account_global" in statement
     )
     assert "workspace_projection,stream,uuid" in assignment_gate
     assert 'chat."projection_stream_uuid"::text' in assignment_gate
@@ -625,8 +683,8 @@ def test_inbound_event_batch_rejects_another_bridge_assignment():
             now=NOW,
         )
 
-    assert session.statements[2][1][4] == requesting_bridge.bridge_instance_uuid
-    assert session.statements[2][1][4] != assigned_bridge.bridge_instance_uuid
+    assert session.statements[2][1][5] == requesting_bridge.bridge_instance_uuid
+    assert session.statements[2][1][5] != assigned_bridge.bridge_instance_uuid
 
 
 def test_inbound_event_batch_reports_storage_conflicts_as_batch_rejections():
