@@ -2036,6 +2036,7 @@ def test_message_update_preserves_created_at_and_uses_compact_broadcast(monkeypa
         uuid=message_uuid,
         user_uuid=sys_uuid.UUID(resource["user_uuid"]),
         stream_uuid=stream_uuid,
+        topic_uuid=sys_uuid.UUID(resource["topic_uuid"]),
         created_at=datetime.datetime(2026, 7, 23, 12),
         update_dm=lambda values: updated_values.append(values),
         update=lambda session=None: None,
@@ -2086,6 +2087,361 @@ def test_message_update_preserves_created_at_and_uses_compact_broadcast(monkeypa
     ]
 
 
+def test_message_update_moves_existing_provider_message_to_reported_topic(
+    monkeypatch,
+):
+    identity = _identity()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    old_topic_uuid = sys_uuid.uuid4()
+    new_topic_uuid = sys_uuid.uuid4()
+    event = _message_event(stream_uuid)
+    resource = event["payload"]["resource"]
+    resource["topic_uuid"] = str(new_topic_uuid)
+    resource.pop("payload")
+    message_uuid = sys_uuid.UUID(resource["uuid"])
+    updated_values = []
+    existing = types.SimpleNamespace(
+        uuid=message_uuid,
+        user_uuid=sys_uuid.UUID(resource["user_uuid"]),
+        stream_uuid=stream_uuid,
+        topic_uuid=old_topic_uuid,
+        update_dm=lambda values: updated_values.append(values),
+        update=lambda session=None: None,
+    )
+    session = Session(
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+            "provider_chat_id": "zulip-channel-7",
+        }
+    )
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: existing)
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceUserMessage",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_all=lambda **_kwargs: [
+                    types.SimpleNamespace(user_uuid=owner_uuid, read=False)
+                ]
+            )
+        ),
+    )
+    compact_calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_compact_workspace_message_updated_events",
+        lambda *args, **kwargs: compact_calls.append((args, kwargs)),
+    )
+    summary_invalidations = []
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "_invalidate_moved_topic_summaries",
+        lambda *args, **kwargs: summary_invalidations.append((args, kwargs)),
+    )
+    unread_calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "_create_compact_messages_unread_updated_events",
+        lambda *args, **kwargs: unread_calls.append((args, kwargs)),
+    )
+
+    assert provider_event_apply.apply_event(event, session, identity) == message_uuid
+    assert len(updated_values) == 1
+    assert updated_values[0]["topic_uuid"] == new_topic_uuid
+    assert "payload" not in updated_values[0]
+    assert compact_calls == [
+        (
+            (sys_uuid.UUID(event["project_id"]), existing),
+            {"session": session},
+        )
+    ]
+    assert summary_invalidations == [
+        ((session, [old_topic_uuid, new_topic_uuid]), {})
+    ]
+    assert unread_calls == [
+        (
+            (
+                sys_uuid.UUID(event["project_id"]),
+                [owner_uuid],
+                stream_uuid,
+                topic_uuid,
+            ),
+            {"session": session, "recipients_are_scoped": True},
+        )
+        for topic_uuid in (old_topic_uuid, new_topic_uuid)
+    ]
+
+
+def test_message_update_moves_existing_provider_message_to_reported_stream(
+    monkeypatch,
+):
+    identity = _identity()
+    old_stream_uuid = sys_uuid.uuid4()
+    new_stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    old_topic_uuid = sys_uuid.uuid4()
+    new_topic_uuid = sys_uuid.uuid4()
+    event = _message_event(new_stream_uuid)
+    resource = event["payload"]["resource"]
+    resource["topic_uuid"] = str(new_topic_uuid)
+    resource.pop("payload")
+    message_uuid = sys_uuid.UUID(resource["uuid"])
+    updated_values = []
+    existing = types.SimpleNamespace(
+        uuid=message_uuid,
+        user_uuid=sys_uuid.UUID(resource["user_uuid"]),
+        stream_uuid=old_stream_uuid,
+        topic_uuid=old_topic_uuid,
+        update_dm=lambda values: updated_values.append(values),
+        update=lambda session=None: None,
+    )
+    session = Session(
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": new_stream_uuid,
+            "provider_chat_id": "zulip-channel-8",
+        }
+    )
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: existing)
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceUserMessage",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_all=lambda **_kwargs: [
+                    types.SimpleNamespace(user_uuid=owner_uuid, read=False)
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_compact_workspace_message_updated_events",
+        lambda *_args, **_kwargs: None,
+    )
+    summary_invalidations = []
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "_invalidate_moved_topic_summaries",
+        lambda *args, **kwargs: summary_invalidations.append((args, kwargs)),
+    )
+    unread_calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "_create_compact_messages_unread_updated_events",
+        lambda *args, **kwargs: unread_calls.append((args, kwargs)),
+    )
+
+    assert provider_event_apply.apply_event(event, session, identity) == message_uuid
+    assert updated_values[0]["stream_uuid"] == new_stream_uuid
+    assert updated_values[0]["topic_uuid"] == new_topic_uuid
+    assert summary_invalidations == [
+        ((session, [old_topic_uuid, new_topic_uuid]), {})
+    ]
+    assert unread_calls == [
+        (
+            (
+                sys_uuid.UUID(event["project_id"]),
+                [owner_uuid],
+                stream_uuid,
+                topic_uuid,
+            ),
+            {"session": session, "recipients_are_scoped": True},
+        )
+        for stream_uuid, topic_uuid in (
+            (old_stream_uuid, old_topic_uuid),
+            (new_stream_uuid, new_topic_uuid),
+        )
+    ]
+
+
+def test_message_update_atomically_moves_provider_projection_between_projects(
+    monkeypatch,
+):
+    identity = _identity()
+    source_project_uuid = sys_uuid.uuid4()
+    destination_project_uuid = sys_uuid.uuid4()
+    old_stream_uuid = sys_uuid.uuid4()
+    new_stream_uuid = sys_uuid.uuid4()
+    old_topic_uuid = sys_uuid.uuid4()
+    new_topic_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    event = _message_event(new_stream_uuid)
+    event["project_id"] = str(destination_project_uuid)
+    resource = event["payload"]["resource"]
+    resource["topic_uuid"] = str(new_topic_uuid)
+    resource.pop("payload")
+    message_uuid = sys_uuid.UUID(resource["uuid"])
+    updated_values = []
+
+    existing = types.SimpleNamespace(
+        uuid=message_uuid,
+        project_id=source_project_uuid,
+        user_uuid=sys_uuid.UUID(resource["user_uuid"]),
+        stream_uuid=old_stream_uuid,
+        topic_uuid=old_topic_uuid,
+        source_name="zulip",
+        source={"kind": "zulip"},
+        external_account_uuid=sys_uuid.UUID(event["external_account_uuid"]),
+        provider_uuid=identity.bridge_instance_uuid,
+    )
+
+    def update_dm(values):
+        updated_values.append(values)
+        for name, value in values.items():
+            setattr(existing, name, value)
+
+    existing.update_dm = update_dm
+    existing.update = lambda session=None: None
+    session = Session(
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": new_stream_uuid,
+            "provider_chat_id": "zulip-channel-8",
+        }
+    )
+    destination_lookups = 0
+
+    def existing_lookup(_model, project_id, _message_uuid, _session):
+        nonlocal destination_lookups
+        if project_id == destination_project_uuid:
+            destination_lookups += 1
+            return None if destination_lookups == 1 else existing
+        return existing
+
+    monkeypatch.setattr(provider_event_apply, "_existing", existing_lookup)
+    projection_calls = []
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_ensure_projection_owner_stream",
+        lambda *args, **kwargs: projection_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_message_recipients",
+        lambda *_args: [owner_uuid],
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_message_unread_recipients",
+        lambda *_args: [owner_uuid],
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *_args, **_kwargs: None,
+    )
+    deleted_events = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers.messenger_events,
+        "create_message_deleted_events",
+        lambda **kwargs: deleted_events.append(kwargs),
+    )
+    created_events = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers.messenger_events,
+        "create_message_events",
+        lambda **kwargs: created_events.append(kwargs),
+    )
+    summary_invalidations = []
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "_invalidate_moved_topic_summaries",
+        lambda *args, **kwargs: summary_invalidations.append((args, kwargs)),
+    )
+    unread_calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "_create_compact_messages_unread_updated_events",
+        lambda *args, **kwargs: unread_calls.append((args, kwargs)),
+    )
+
+    assert provider_event_apply.apply_event(event, session, identity) == message_uuid
+
+    assert updated_values[0]["stream_uuid"] == new_stream_uuid
+    assert updated_values[0]["topic_uuid"] == new_topic_uuid
+    assert len(projection_calls) == 1
+    dependent_updates = [
+        (statement, params)
+        for statement, params in session.statements
+        if statement.lstrip().startswith("UPDATE m_workspace_")
+    ]
+    assert [params for _statement, params in dependent_updates] == [
+        (
+            destination_project_uuid,
+            new_stream_uuid,
+            new_topic_uuid,
+            message_uuid,
+            source_project_uuid,
+        ),
+        (destination_project_uuid, message_uuid, source_project_uuid),
+        (destination_project_uuid, message_uuid, source_project_uuid),
+    ]
+    assert deleted_events[0]["project_id"] == source_project_uuid
+    assert deleted_events[0]["stream_uuid"] == old_stream_uuid
+    assert created_events[0]["project_id"] == destination_project_uuid
+    assert created_events[0]["recipients"] == [owner_uuid]
+    assert summary_invalidations == [
+        ((session, [old_topic_uuid, new_topic_uuid]), {})
+    ]
+    assert [call[0][0] for call in unread_calls] == [
+        source_project_uuid,
+        destination_project_uuid,
+    ]
+
+
+def test_cross_project_payload_keeps_destination_scoped_file_urn(monkeypatch):
+    account_uuid = sys_uuid.uuid4()
+    source_project_uuid = sys_uuid.uuid4()
+    source_stream_uuid = sys_uuid.uuid4()
+    destination_project_uuid = sys_uuid.uuid4()
+    destination_stream_uuid = sys_uuid.uuid4()
+    destination_file_uuid = sys_uuid.uuid4()
+    destination_file = types.SimpleNamespace(
+        uuid=destination_file_uuid,
+        project_id=destination_project_uuid,
+        stream_uuid=destination_stream_uuid,
+        acl_mode="stream",
+        external_account_uuid=account_uuid,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceFile",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_one_or_none=lambda **_kwargs: destination_file
+            )
+        ),
+    )
+    file_urn = f"urn:image:{destination_file_uuid}?preview=1"
+
+    payload = provider_event_apply._reproject_message_payload_files(
+        Session({}),
+        message_payloads.MarkdownPayload(content=f"![preview]({file_urn})"),
+        source_project_uuid,
+        source_stream_uuid,
+        destination_project_uuid,
+        destination_stream_uuid,
+        sys_uuid.uuid4(),
+        account_uuid,
+        False,
+    )
+
+    assert payload.content == f"![preview]({file_urn})"
+
+
 def test_provider_message_update_preserves_native_source(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()
@@ -2099,6 +2455,7 @@ def test_provider_message_update_preserves_native_source(monkeypatch):
         uuid=message_uuid,
         user_uuid=sys_uuid.uuid4(),
         stream_uuid=stream_uuid,
+        topic_uuid=sys_uuid.UUID(resource["topic_uuid"]),
         source_name=models.SourceName.NATIVE.value,
         payload=message_payloads.MarkdownPayload(content="native message"),
         provider_external_id=None,
@@ -2140,6 +2497,7 @@ def test_idempotent_message_replay_skips_unchanged_broadcast(monkeypatch):
         uuid=message_uuid,
         user_uuid=sys_uuid.UUID(resource["user_uuid"]),
         stream_uuid=stream_uuid,
+        topic_uuid=sys_uuid.UUID(resource["topic_uuid"]),
         created_at=datetime.datetime(2026, 7, 23, 12),
         payload=message_payloads.MarkdownPayload(content="hello"),
         provider_external_id="zulip-message-42",
@@ -2189,6 +2547,7 @@ def test_message_replay_accepts_plain_stored_markdown_payload(monkeypatch):
         uuid=message_uuid,
         user_uuid=sys_uuid.UUID(resource["user_uuid"]),
         stream_uuid=stream_uuid,
+        topic_uuid=sys_uuid.UUID(resource["topic_uuid"]),
         created_at=datetime.datetime(2026, 7, 23, 12),
         payload={"kind": "markdown", "content": "hello"},
         provider_external_id="zulip-message-42",

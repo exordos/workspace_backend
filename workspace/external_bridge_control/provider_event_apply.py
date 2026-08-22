@@ -8,16 +8,15 @@
 import collections.abc
 import contextvars
 import datetime
+import re
 import typing
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 
-from workspace.messenger_api import external_projection
-from workspace.messenger_api.dm import helpers
-from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import models
-
+from workspace.external_bridge_control import file_repository
+from workspace.messenger_api import external_projection, file_storage
+from workspace.messenger_api.dm import helpers, message_payloads, models
 
 SUPPORTED_EVENT_KINDS = {
     "identity.upsert",
@@ -42,6 +41,12 @@ _PROVIDER_FIELDS = {
     "provider_metadata",
     "provider_uuid",
 }
+
+_MESSAGE_FILE_URN_RE = re.compile(
+    r"urn:(?P<kind>file|image|video):"
+    r"(?P<uuid>[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+    r"(?P<suffix>\?[^\s\)\]\}>\"']*)?"
+)
 
 
 def _assignment_cache_key(
@@ -199,15 +204,15 @@ def _resource(
 
 def _existing(
     model: typing.Any,
-    project_id: sys_uuid.UUID,
+    project_id: sys_uuid.UUID | None,
     resource_uuid: sys_uuid.UUID,
     session: typing.Any,
 ) -> typing.Any:
+    filters = {"uuid": dm_filters.EQ(resource_uuid)}
+    if project_id is not None:
+        filters["project_id"] = dm_filters.EQ(project_id)
     return model.objects.get_one_or_none(
-        filters={
-            "project_id": dm_filters.EQ(project_id),
-            "uuid": dm_filters.EQ(resource_uuid),
-        },
+        filters=filters,
         session=session,
     )
 
@@ -340,6 +345,10 @@ def _message_projection_is_unchanged(
     existing: typing.Any,
     values: collections.abc.Mapping[str, typing.Any],
 ) -> bool:
+    if values.get("stream_uuid") != getattr(existing, "stream_uuid", None):
+        return False
+    if values.get("topic_uuid") != getattr(existing, "topic_uuid", None):
+        return False
     incoming_payload = values.get("payload")
     current_payload = getattr(existing, "payload", None)
     current_content = (
@@ -365,6 +374,428 @@ def _message_projection_is_unchanged(
 
     return stable_metadata(values.get("provider_metadata")) == stable_metadata(
         getattr(existing, "provider_metadata", None)
+    )
+
+
+def _message_unread_recipients(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    message_uuid: sys_uuid.UUID,
+) -> list[sys_uuid.UUID]:
+    user_messages = models.WorkspaceUserMessage.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "uuid": dm_filters.EQ(message_uuid),
+        },
+        session=session,
+    )
+    return sorted(
+        {
+            sys_uuid.UUID(str(user_message.user_uuid))
+            for user_message in user_messages
+            if not user_message.read
+        },
+        key=str,
+    )
+
+
+def _message_recipients(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    message_uuid: sys_uuid.UUID,
+) -> list[sys_uuid.UUID]:
+    user_messages = models.WorkspaceUserMessage.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(project_id),
+            "uuid": dm_filters.EQ(message_uuid),
+        },
+        session=session,
+    )
+    return sorted(
+        {sys_uuid.UUID(str(user_message.user_uuid)) for user_message in user_messages},
+        key=str,
+    )
+
+
+def _file_projection_matches(
+    candidate: typing.Any,
+    source: typing.Any,
+    destination_project_id: sys_uuid.UUID,
+    destination_stream_uuid: sys_uuid.UUID,
+) -> bool:
+    shared_content = source.storage_object_id.startswith(
+        file_repository.EXTERNAL_CONTENT_OBJECT_PREFIX
+    )
+    expected_storage_object_id = (
+        source.storage_object_id
+        if shared_content
+        else file_storage.get_workspace_file_object_id(candidate.uuid)
+    )
+    return (
+        candidate.project_id == destination_project_id
+        and candidate.stream_uuid == destination_stream_uuid
+        and candidate.user_uuid == source.user_uuid
+        and candidate.acl_mode == "stream"
+        and candidate.provider_uuid == source.provider_uuid
+        and candidate.external_account_uuid == source.external_account_uuid
+        and candidate.name == source.name
+        and candidate.description == source.description
+        and candidate.content_type == source.content_type
+        and candidate.size_bytes == source.size_bytes
+        and candidate.hash == source.hash
+        and candidate.storage_type == source.storage_type
+        and candidate.storage_id == source.storage_id
+        and candidate.storage_object_id == expected_storage_object_id
+    )
+
+
+def _destination_file_projection(
+    session: typing.Any,
+    source: typing.Any,
+    source_metadata: file_storage.WorkspaceFileMetadata,
+    destination_project_id: sys_uuid.UUID,
+    destination_stream_uuid: sys_uuid.UUID,
+    destination_chat_uuid: sys_uuid.UUID,
+) -> typing.Any | None:
+    candidates = models.WorkspaceFile.objects.get_all(
+        filters={
+            "project_id": dm_filters.EQ(destination_project_id),
+            "stream_uuid": dm_filters.EQ(destination_stream_uuid),
+            "external_account_uuid": dm_filters.EQ(source.external_account_uuid),
+            "hash": dm_filters.EQ(source.hash),
+            "size_bytes": dm_filters.EQ(source.size_bytes),
+        },
+        session=session,
+    )
+    expected_origin = dict(source_metadata.origin or {})
+    if expected_origin:
+        expected_origin["external_chat_uuid"] = str(destination_chat_uuid)
+    for candidate in sorted(candidates, key=lambda item: str(item.uuid)):
+        if not _file_projection_matches(
+            candidate,
+            source,
+            destination_project_id,
+            destination_stream_uuid,
+        ):
+            continue
+        if _file_projection_metadata_matches(
+            candidate,
+            source_metadata,
+            destination_project_id,
+            destination_stream_uuid,
+            expected_origin or None,
+        ):
+            return candidate
+    return None
+
+
+def _file_projection_metadata_matches(
+    candidate: typing.Any,
+    source_metadata: file_storage.WorkspaceFileMetadata,
+    destination_project_id: sys_uuid.UUID,
+    destination_stream_uuid: sys_uuid.UUID,
+    expected_origin: dict[str, typing.Any] | None,
+) -> bool:
+    metadata = file_storage.read_workspace_file_metadata(
+        candidate.uuid,
+        storage_type=candidate.storage_type,
+    )
+    return (
+        metadata.uuid == candidate.uuid
+        and metadata.project_id == destination_project_id
+        and metadata.stream_uuid == destination_stream_uuid
+        and metadata.owner_uuid == source_metadata.owner_uuid
+        and metadata.name == source_metadata.name
+        and metadata.description == source_metadata.description
+        and metadata.content_type == source_metadata.content_type
+        and metadata.size_bytes == source_metadata.size_bytes
+        and metadata.sha256 == source_metadata.sha256
+        and metadata.created_at == source_metadata.created_at
+        and metadata.acl_mode == "stream_members"
+        and metadata.origin == expected_origin
+    )
+
+
+def _copy_file_projection(
+    session: typing.Any,
+    source: typing.Any,
+    source_metadata: file_storage.WorkspaceFileMetadata,
+    destination_project_id: sys_uuid.UUID,
+    destination_stream_uuid: sys_uuid.UUID,
+    destination_chat_uuid: sys_uuid.UUID,
+    emit_events: bool,
+) -> typing.Any:
+    destination_uuid = sys_uuid.uuid5(
+        source.uuid,
+        f"provider-message-move:{destination_project_id}:{destination_stream_uuid}",
+    )
+    existing = models.WorkspaceFile.objects.get_one_or_none(
+        filters={"uuid": dm_filters.EQ(destination_uuid)},
+        session=session,
+    )
+    if existing is not None:
+        if not _file_projection_matches(
+            existing,
+            source,
+            destination_project_id,
+            destination_stream_uuid,
+        ):
+            raise ValueError("Provider message file projection UUID conflicts")
+        expected_origin = dict(source_metadata.origin or {})
+        if expected_origin:
+            expected_origin["external_chat_uuid"] = str(destination_chat_uuid)
+        if not _file_projection_metadata_matches(
+            existing,
+            source_metadata,
+            destination_project_id,
+            destination_stream_uuid,
+            expected_origin or None,
+        ):
+            raise ValueError("Provider message file projection is incomplete")
+        return existing
+
+    shared_content = source.storage_object_id.startswith(
+        file_repository.EXTERNAL_CONTENT_OBJECT_PREFIX
+    )
+    if shared_content:
+        storage_info = file_storage.WorkspaceFileStorageInfo(
+            storage_type=source.storage_type,
+            storage_id=source.storage_id,
+            storage_object_id=source.storage_object_id,
+        )
+    else:
+        data = file_storage.read_workspace_file(
+            source.uuid,
+            storage_type=source.storage_type,
+            storage_object_id=source.storage_object_id,
+        )
+        storage_info = file_storage.save_workspace_file(
+            destination_uuid,
+            data,
+            storage_type=source.storage_type,
+        )
+    origin = dict(source_metadata.origin or {})
+    if origin:
+        origin["external_chat_uuid"] = str(destination_chat_uuid)
+    destination_metadata = file_storage.WorkspaceFileMetadata(
+        uuid=destination_uuid,
+        project_id=destination_project_id,
+        stream_uuid=destination_stream_uuid,
+        owner_uuid=source_metadata.owner_uuid,
+        name=source_metadata.name,
+        description=source_metadata.description,
+        content_type=source_metadata.content_type,
+        size_bytes=source_metadata.size_bytes,
+        sha256=source_metadata.sha256,
+        created_at=source_metadata.created_at,
+        acl_mode="stream_members",
+        origin=origin or None,
+    )
+    try:
+        file_storage.save_workspace_file_metadata(
+            destination_metadata,
+            storage_type=storage_info.storage_type,
+        )
+        return helpers.create_workspace_file(
+            project_id=destination_project_id,
+            user_uuid=source.user_uuid,
+            uuid=destination_uuid,
+            stream_uuid=destination_stream_uuid,
+            acl_mode="stream",
+            provider_uuid=source.provider_uuid,
+            external_account_uuid=source.external_account_uuid,
+            name=source.name,
+            description=source.description,
+            content_type=source.content_type,
+            size_bytes=source.size_bytes,
+            hash=source.hash,
+            storage_type=storage_info.storage_type,
+            storage_id=storage_info.storage_id,
+            storage_object_id=storage_info.storage_object_id,
+            emit_events=emit_events,
+            session=session,
+        )
+    except Exception:
+        file_storage.delete_workspace_file_metadata(
+            destination_uuid,
+            storage_type=storage_info.storage_type,
+        )
+        if not shared_content:
+            file_storage.delete_workspace_file(
+                destination_uuid,
+                storage_type=storage_info.storage_type,
+                storage_object_id=storage_info.storage_object_id,
+            )
+        raise
+
+
+def _reproject_message_payload_files(
+    session: typing.Any,
+    payload: typing.Any,
+    source_project_id: sys_uuid.UUID,
+    source_stream_uuid: sys_uuid.UUID,
+    destination_project_id: sys_uuid.UUID,
+    destination_stream_uuid: sys_uuid.UUID,
+    destination_chat_uuid: sys_uuid.UUID,
+    external_account_uuid: sys_uuid.UUID,
+    emit_events: bool,
+    native_source_payload: typing.Any | None = None,
+) -> message_payloads.MarkdownPayload:
+    markdown = _message_payload(payload)
+    native_source_file_uuids = (
+        {
+            sys_uuid.UUID(match.group("uuid"))
+            for match in _MESSAGE_FILE_URN_RE.finditer(
+                _message_payload(native_source_payload).content
+            )
+        }
+        if native_source_payload is not None
+        else set()
+    )
+    replacements: dict[sys_uuid.UUID, sys_uuid.UUID] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        source_uuid = sys_uuid.UUID(match.group("uuid"))
+        destination_uuid = replacements.get(source_uuid)
+        if destination_uuid is None:
+            source = models.WorkspaceFile.objects.get_one_or_none(
+                filters={"uuid": dm_filters.EQ(source_uuid)},
+                session=session,
+            )
+            if source is None:
+                raise ValueError("Provider message references an unknown file")
+            if source.external_account_uuid not in (None, external_account_uuid):
+                raise ValueError("Provider message file belongs to another account")
+            if (
+                source.project_id == destination_project_id
+                and source.stream_uuid == destination_stream_uuid
+                and source.acl_mode == "stream"
+            ):
+                replacements[source_uuid] = source_uuid
+                return match.group(0)
+            public_native = (
+                source.external_account_uuid is None
+                and source.stream_uuid is None
+                and source.acl_mode == "public"
+            )
+            if public_native:
+                source_metadata = file_storage.read_workspace_file_metadata(
+                    source.uuid,
+                    storage_type=source.storage_type,
+                )
+                if source_uuid not in native_source_file_uuids:
+                    raise ValueError("Native message file is not attached to the source")
+                if (
+                    source_metadata.project_id != source.project_id
+                    or source_metadata.stream_uuid is not None
+                    or source_metadata.owner_uuid != source.user_uuid
+                    or source_metadata.name != source.name
+                    or source_metadata.description != source.description
+                    or source_metadata.content_type != source.content_type
+                    or source_metadata.size_bytes != source.size_bytes
+                    or source_metadata.sha256 != source.hash
+                    or source_metadata.acl_mode != "public"
+                    or source_metadata.origin is not None
+                ):
+                    raise ValueError("Public native message file is not canonical")
+                replacements[source_uuid] = source_uuid
+                return match.group(0)
+            if (
+                source.project_id != source_project_id
+                or source.stream_uuid != source_stream_uuid
+                or source.acl_mode != "stream"
+            ):
+                raise ValueError(
+                    "Provider message file is outside the source projection"
+                )
+            source_metadata = file_storage.read_workspace_file_metadata(
+                source.uuid,
+                storage_type=source.storage_type,
+            )
+            origin = source_metadata.origin
+            native_origin = source.external_account_uuid is None and origin is None
+            if native_origin and source_uuid not in native_source_file_uuids:
+                raise ValueError("Native message file is not attached to the source")
+            provider_origin = (
+                source.external_account_uuid == external_account_uuid
+                and isinstance(origin, dict)
+                and origin["external_account_uuid"] == str(external_account_uuid)
+            )
+            if (
+                source_metadata.project_id != source_project_id
+                or source_metadata.stream_uuid != source_stream_uuid
+                or source_metadata.owner_uuid != source.user_uuid
+                or source_metadata.name != source.name
+                or source_metadata.description != source.description
+                or source_metadata.content_type != source.content_type
+                or source_metadata.size_bytes != source.size_bytes
+                or source_metadata.sha256 != source.hash
+                or not (native_origin or provider_origin)
+            ):
+                raise ValueError("Provider message file metadata is not canonical")
+            destination = _destination_file_projection(
+                session,
+                source,
+                source_metadata,
+                destination_project_id,
+                destination_stream_uuid,
+                destination_chat_uuid,
+            ) or _copy_file_projection(
+                session,
+                source,
+                source_metadata,
+                destination_project_id,
+                destination_stream_uuid,
+                destination_chat_uuid,
+                emit_events,
+            )
+            destination_uuid = sys_uuid.UUID(str(destination.uuid))
+            replacements[source_uuid] = destination_uuid
+        suffix = match.group("suffix") or ""
+        return f"urn:{match.group('kind')}:{destination_uuid}{suffix}"
+
+    content = _MESSAGE_FILE_URN_RE.sub(replace, markdown.content)
+    return message_payloads.MarkdownPayload(content=content)
+
+
+def _move_message_dependents_between_projects(
+    session: typing.Any,
+    message_uuid: sys_uuid.UUID,
+    source_project_id: sys_uuid.UUID,
+    destination_project_id: sys_uuid.UUID,
+    destination_stream_uuid: sys_uuid.UUID,
+    destination_topic_uuid: sys_uuid.UUID,
+) -> None:
+    session.execute(
+        """
+        UPDATE m_workspace_messages
+        SET project_id = %s, stream_uuid = %s, topic_uuid = %s,
+            updated_at = NOW()
+        WHERE uuid = %s AND project_id = %s
+        """,
+        (
+            destination_project_id,
+            destination_stream_uuid,
+            destination_topic_uuid,
+            message_uuid,
+            source_project_id,
+        ),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_user_message_flags
+        SET project_id = %s, updated_at = NOW()
+        WHERE uuid = %s AND project_id = %s
+        """,
+        (destination_project_id, message_uuid, source_project_id),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_message_reactions
+        SET project_id = %s, updated_at = NOW()
+        WHERE message_uuid = %s AND project_id = %s
+        """,
+        (destination_project_id, message_uuid, source_project_id),
     )
 
 
@@ -568,8 +999,20 @@ def _message_event(
         # was removed. Load the persisted message in this trusted reconciliation
         # scope, then attach provider identity before the updated model is saved.
         existing = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
+        if existing is None:
+            existing = _existing(models.WorkspaceMessage, None, message_uuid, session)
     finally:
         models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
+    source_project_id = sys_uuid.UUID(
+        str(getattr(existing, "project_id", project_id))
+    )
+    cross_project_move = existing is not None and source_project_id != project_id
+    if cross_project_move and (
+        getattr(existing, "external_account_uuid", None)
+        != sys_uuid.UUID(str(event["external_account_uuid"]))
+        or getattr(existing, "provider_uuid", None) != identity.bridge_instance_uuid
+    ):
+        raise ValueError("Provider message UUID belongs to another projection")
     if existing is not None and _is_stale_provider_message(existing, resource):
         # A live record may overtake an older history record by design. Once the
         # newer provider sequence is stored, the delayed snapshot must not
@@ -625,7 +1068,7 @@ def _message_event(
             if batch_cache is not None:
                 batch_cache[author_key] = author_uuid
         resource["user_uuid"] = author_uuid
-    if existing is None:
+    if existing is None or cross_project_move:
         _ensure_projection_owner_stream(
             session,
             project_id,
@@ -671,6 +1114,10 @@ def _message_event(
         values["payload"] = _message_payload(values["payload"])
     if "created_at" in values:
         values["created_at"] = _message_created_at(values["created_at"])
+    if "topic_uuid" in values:
+        values["topic_uuid"] = sys_uuid.UUID(str(values["topic_uuid"]))
+    if "stream_uuid" in values:
+        values["stream_uuid"] = sys_uuid.UUID(str(values["stream_uuid"]))
     if existing is None:
         values.update(
             {
@@ -711,15 +1158,14 @@ def _message_event(
             if batch_validation_token is not None:
                 models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(batch_validation_token)
     else:
-        if existing.stream_uuid != stream_uuid:
-            raise ValueError("Provider message UUID belongs to another stream")
-        helpers.ensure_workspace_message_recipients(
-            project_id,
-            existing,
-            [assignment["owner_user_uuid"]],
-            session,
-            emit_events=not quiet_backfill,
-        )
+        if not cross_project_move:
+            helpers.ensure_workspace_message_recipients(
+                project_id,
+                existing,
+                [assignment["owner_user_uuid"]],
+                session,
+                emit_events=not quiet_backfill,
+            )
         # A provider replay may report the edit time as created_at. Once the
         # message exists, its creation timestamp is immutable.
         update_values = _provider_values(
@@ -730,7 +1176,46 @@ def _message_event(
                 "provider_metadata",
                 "source",
                 "source_name",
+                "stream_uuid",
+                "topic_uuid",
             },
+        )
+        previous_stream_uuid = existing.stream_uuid
+        previous_topic_uuid = existing.topic_uuid
+        reported_topic_uuid = update_values.get(
+            "topic_uuid", previous_topic_uuid
+        )
+        if cross_project_move:
+            payload = update_values.get("payload", getattr(existing, "payload", None))
+            if payload is not None:
+                reprojected_payload = _reproject_message_payload_files(
+                    session,
+                    payload,
+                    source_project_id,
+                    previous_stream_uuid,
+                    project_id,
+                    stream_uuid,
+                    sys_uuid.UUID(str(event["external_chat_uuid"])),
+                    sys_uuid.UUID(str(event["external_account_uuid"])),
+                    not quiet_backfill,
+                    native_source_payload=getattr(existing, "payload", None),
+                )
+                current_payload = _message_payload(payload)
+                if reprojected_payload.content != current_payload.content:
+                    update_values["payload"] = reprojected_payload
+        moved = (
+            previous_stream_uuid != stream_uuid
+            or previous_topic_uuid != reported_topic_uuid
+        )
+        unread_recipients = (
+            _message_unread_recipients(session, source_project_id, message_uuid)
+            if moved and not quiet_backfill
+            else []
+        )
+        source_recipients = (
+            _message_recipients(session, source_project_id, message_uuid)
+            if cross_project_move and not quiet_backfill
+            else []
         )
         source_changed = (
             update_values.get("source_name") is not None
@@ -746,14 +1231,98 @@ def _message_event(
             update_values,
         )
         if source_changed or projection_changed:
+            if cross_project_move:
+                if not quiet_backfill and source_recipients:
+                    helpers.messenger_events.create_message_deleted_events(
+                        project_id=source_project_id,
+                        recipients=source_recipients,
+                        message_uuid=message_uuid,
+                        stream_uuid=previous_stream_uuid,
+                        topic_uuid=previous_topic_uuid,
+                        author_uuid=existing.user_uuid,
+                        source_name=existing.source_name,
+                        source=existing.source,
+                        session=session,
+                        compact=True,
+                    )
+                _move_message_dependents_between_projects(
+                    session,
+                    message_uuid,
+                    source_project_id,
+                    project_id,
+                    stream_uuid,
+                    reported_topic_uuid,
+                )
+                validation_token = models._PROVIDER_MESSAGE_VALIDATION_CACHE.set(set())
+                try:
+                    existing = _existing(
+                        models.WorkspaceMessage,
+                        project_id,
+                        message_uuid,
+                        session,
+                    )
+                finally:
+                    models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
+                if existing is None:
+                    raise ValueError("Provider message project move was not persisted")
             existing.update_dm(values=update_values)
             existing.update(session=session)
-            if not quiet_backfill:
-                helpers.create_compact_workspace_message_updated_events(
+            if cross_project_move:
+                helpers.ensure_workspace_message_recipients(
                     project_id,
                     existing,
-                    session=session,
+                    [assignment["owner_user_uuid"]],
+                    session,
+                    emit_events=False,
                 )
+            if moved:
+                external_projection._invalidate_moved_topic_summaries(
+                    session,
+                    list(
+                        dict.fromkeys(
+                            [previous_topic_uuid, reported_topic_uuid]
+                        )
+                    ),
+                )
+            if not quiet_backfill:
+                if cross_project_move:
+                    helpers.messenger_events.create_message_events(
+                        project_id=project_id,
+                        message=existing,
+                        recipients=[assignment["owner_user_uuid"]],
+                        session=session,
+                        compact=True,
+                    )
+                else:
+                    helpers.create_compact_workspace_message_updated_events(
+                        project_id,
+                        existing,
+                        session=session,
+                    )
+                if unread_recipients:
+                    affected_projections = [
+                        (
+                            source_project_id,
+                            previous_stream_uuid,
+                            previous_topic_uuid,
+                        ),
+                        (project_id, stream_uuid, reported_topic_uuid),
+                    ]
+                    for (
+                        affected_project_id,
+                        affected_stream_uuid,
+                        affected_topic_uuid,
+                    ) in dict.fromkeys(
+                        affected_projections
+                    ):
+                        helpers._create_compact_messages_unread_updated_events(
+                            affected_project_id,
+                            unread_recipients,
+                            affected_stream_uuid,
+                            affected_topic_uuid,
+                            session=session,
+                            recipients_are_scoped=True,
+                        )
         elif _provider_sequence(update_values.get("provider_metadata")) != (
             _provider_sequence(getattr(existing, "provider_metadata", None))
         ):
