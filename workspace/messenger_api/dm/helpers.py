@@ -3225,8 +3225,12 @@ def _set_workspace_user_topic_notification_mode(
     user_uuid: object,
     topic_uuid: object,
     notification_mode: typing.Any,
+    notification_updated_at: datetime.datetime | None = None,
     session: typing.Any = None,
 ) -> None:
+    notification_updated_at = notification_updated_at or datetime.datetime.now(
+        datetime.timezone.utc
+    )
     for flags in models.WorkspaceUserTopicFlags.objects.get_all(
         filters={
             "uuid": dm_filters.EQ(topic_uuid),
@@ -3237,6 +3241,7 @@ def _set_workspace_user_topic_notification_mode(
         session=session,
     ):
         flags.notification_mode = notification_mode
+        flags.notification_updated_at = notification_updated_at
         flags.update(session=session)
         return
 
@@ -3245,6 +3250,7 @@ def _set_workspace_user_topic_notification_mode(
         project_id=project_id,
         user_uuid=user_uuid,
         notification_mode=notification_mode,
+        notification_updated_at=notification_updated_at,
     )
     flags.insert(session=session)
 
@@ -3269,34 +3275,51 @@ def _normalize_workspace_user_stream_topic_notification_modes(
     user_uuid: object,
     stream_uuid: object,
     notification_mode: typing.Any,
+    notification_updated_at: datetime.datetime | None = None,
     session: typing.Any = None,
 ) -> list[sys_uuid.UUID]:
-    topics = _get_workspace_stream_topics(
-        project_id=project_id,
-        stream_uuid=stream_uuid,
-        session=session,
+    notification_updated_at = notification_updated_at or datetime.datetime.now(
+        datetime.timezone.utc
     )
-    topic_uuids = [topic.uuid for topic in topics]
-    if (
-        topic_uuids
-        and notification_mode != models.WorkspaceStreamNotificationMode.MUTED.value
-    ):
-        for flags in models.WorkspaceUserTopicFlags.objects.get_all(
-            filters={
-                "uuid": dm_filters.In(topic_uuids),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-                "notification_mode": dm_filters.EQ(
-                    models.WorkspaceTopicNotificationMode.UNMUTE.value
-                ),
-            },
-            session=session,
+    with _workspace_session(session=session) as current_session:
+        topics = _get_workspace_stream_topics(
+            project_id=project_id,
+            stream_uuid=stream_uuid,
+            session=current_session,
+        )
+        topic_uuids = [topic.uuid for topic in topics]
+        if (
+            topic_uuids
+            and notification_mode
+            != models.WorkspaceStreamNotificationMode.MUTED.value
         ):
-            flags.notification_mode = (
-                models.WorkspaceTopicNotificationMode.DEFAULT.value
+            # UPDATE owns the topic-flag row lock, serializing normalization
+            # with a concurrent topic notification update. A delayed stream
+            # event may change the effective mode, but it must never move the
+            # topic's LWW clock behind newer user intent.
+            current_session.execute(
+                """
+                UPDATE m_workspace_user_topic_flags
+                SET notification_mode = %s,
+                    notification_updated_at = GREATEST(
+                        notification_updated_at, %s
+                    ),
+                    updated_at = NOW()
+                WHERE uuid = ANY(%s)
+                  AND project_id = %s
+                  AND user_uuid = %s
+                  AND notification_mode = %s
+                """,
+                (
+                    models.WorkspaceTopicNotificationMode.DEFAULT.value,
+                    notification_updated_at,
+                    topic_uuids,
+                    project_id,
+                    user_uuid,
+                    models.WorkspaceTopicNotificationMode.UNMUTE.value,
+                ),
             )
-            flags.update(session=session)
-    return topic_uuids
+        return topic_uuids
 
 
 def _validate_topic_notification_mode(
@@ -3353,8 +3376,12 @@ def update_workspace_user_stream_topic_notifications(
     user_uuid: object,
     topic_uuid: object,
     notification_mode: typing.Any,
+    notification_updated_at: datetime.datetime | None = None,
     session: typing.Any = None,
 ) -> typing.Any:
+    notification_updated_at = notification_updated_at or datetime.datetime.now(
+        datetime.timezone.utc
+    )
     topic = get_workspace_user_stream_topic(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -3376,6 +3403,7 @@ def update_workspace_user_stream_topic_notifications(
         user_uuid=user_uuid,
         topic_uuid=topic_uuid,
         notification_mode=notification_mode,
+        notification_updated_at=notification_updated_at,
         session=session,
     )
     result = get_workspace_user_stream_topic(
@@ -3750,8 +3778,12 @@ def update_workspace_user_stream_notifications(
     user_uuid: object,
     stream_uuid: object,
     notification_mode: typing.Any,
+    notification_updated_at: datetime.datetime | None = None,
     session: typing.Any = None,
 ) -> typing.Any:
+    notification_updated_at = notification_updated_at or datetime.datetime.now(
+        datetime.timezone.utc
+    )
     get_workspace_user_stream(
         project_id=project_id,
         user_uuid=user_uuid,
@@ -3766,13 +3798,19 @@ def update_workspace_user_stream_notifications(
         },
         session=session,
     )
-    binding.update_dm(values={"notification_mode": notification_mode})
+    binding.update_dm(
+        values={
+            "notification_mode": notification_mode,
+            "notification_updated_at": notification_updated_at,
+        }
+    )
     binding.update(session=session)
     topic_uuids = _normalize_workspace_user_stream_topic_notification_modes(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=stream_uuid,
         notification_mode=notification_mode,
+        notification_updated_at=notification_updated_at,
         session=session,
     )
     stream = get_workspace_user_stream(

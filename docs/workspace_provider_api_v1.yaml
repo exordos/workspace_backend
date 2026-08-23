@@ -196,7 +196,10 @@ components:
           description: |
             Stable provider-neutral operation name. Membership projection uses
             `membership.add` and `membership.remove`; both require
-            `messenger.membership.write`.
+            `messenger.membership.write`. Stream/topic notification projection
+            uses `stream.notification.update` and `topic.notification.update`;
+            both require `messenger.notification.write` and carry the source
+            `notification_updated_at` timestamp for last-write-wins ordering.
         required_capability: {type: [string, 'null']}
         attempt: {type: integer, minimum: 1}
         payload:
@@ -272,8 +275,10 @@ components:
           enum:
             - stream.upsert
             - stream.delete
+            - stream.notification.update
             - topic.upsert
             - topic.delete
+            - topic.notification.update
             - message.upsert
             - message.delete
             - reaction.upsert
@@ -292,6 +297,8 @@ components:
                 provider_external_id: {type: string, minLength: 1}
                 provider_metadata: {type: object}
                 created_at: {type: string, format: date-time}
+                notification_updated_at: {type: string, format: date-time}
+                notification_mode: {type: string}
                 stream_uuid: {type: string, format: uuid}
                 topic_uuid: {type: string, format: uuid}
                 message_uuid: {type: string, format: uuid}

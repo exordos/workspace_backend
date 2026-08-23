@@ -139,6 +139,37 @@ def test_membership_lease_requires_write_capability(operation_kind):
     )
 
 
+@pytest.mark.parametrize(
+    "operation_kind",
+    ["stream.notification.update", "topic.notification.update"],
+)
+def test_notification_lease_requires_write_capability(operation_kind):
+    now = datetime.datetime(2026, 8, 23, tzinfo=datetime.timezone.utc)
+    session = CapabilityLeaseSession(
+        {"messenger.notification.write": {"revision": 1}},
+        now,
+    )
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    provider_data.lease_provider_operations(
+        session,
+        identity,
+        request_uuid=sys_uuid.uuid4(),
+        limit=10,
+        lease_seconds=30,
+        now=now,
+    )
+
+    assert operation_kind in session.allowed_kinds
+    assert provider_data._required_capability(operation_kind) == (
+        "messenger.notification.write"
+    )
+
+
 def test_enqueue_operation_reuses_caller_transaction(monkeypatch):
     inserted = []
     events = []
@@ -696,9 +727,7 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
     assert "UPDATE m_workspace_messages" in statements[0][0]
     assert statements[0][1][1:4] == ("delivered", None, updated_at)
     assert target_queries[0]["session"] is session
-    assert target_events == [
-        ((project_uuid, target_resource), {"session": session})
-    ]
+    assert target_events == [((project_uuid, target_resource), {"session": session})]
 
 
 def test_retry_operation_requeues_existing_provider_row():

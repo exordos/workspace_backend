@@ -3,11 +3,21 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import inspect
 import uuid as sys_uuid
 
 import pytest
 
 from workspace.external_bridge_control import identity_linking
+
+
+def test_identity_merge_preserves_latest_notification_timestamps():
+    source = inspect.getsource(identity_linking.merge_workspace_user_identity)
+
+    assert "role, notification_mode, notification_updated_at" in source
+    assert "is_done, notification_mode," in source
+    assert "m_workspace_stream_bindings.notification_updated_at" in source
+    assert "m_workspace_user_topic_flags.notification_updated_at" in source
 
 
 class Result:

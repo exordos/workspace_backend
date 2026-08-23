@@ -25,8 +25,10 @@ SUPPORTED_EVENT_KINDS = {
     "read_state.set",
     "reaction.delete",
     "reaction.upsert",
+    "stream.notification.update",
     "stream.delete",
     "stream.upsert",
+    "topic.notification.update",
     "topic.delete",
     "topic.upsert",
 }
@@ -338,6 +340,15 @@ def _message_created_at(value: typing.Any) -> datetime.datetime:
     parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("Provider message creation time is invalid")
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _notification_updated_at(value: typing.Any) -> datetime.datetime:
+    if not isinstance(value, str):
+        raise ValueError("Provider notification timestamp is invalid")
+    parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("Provider notification timestamp is invalid")
     return parsed.astimezone(datetime.timezone.utc)
 
 
@@ -904,6 +915,47 @@ def _stream_event(
     return stream_uuid
 
 
+def _stream_notification_event(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    assignment: typing.Mapping[str, typing.Any],
+    resource: dict[str, typing.Any],
+) -> sys_uuid.UUID:
+    stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
+    if (
+        stream_uuid != assignment["projection_stream_uuid"]
+        or sys_uuid.UUID(str(resource["uuid"])) != stream_uuid
+    ):
+        raise ValueError("Provider notification stream does not match the projection")
+    if sys_uuid.UUID(str(resource["user_uuid"])) != assignment["owner_user_uuid"]:
+        raise ValueError("Provider notification owner does not match the account")
+    notification_updated_at = _notification_updated_at(
+        resource["notification_updated_at"]
+    )
+    current = session.execute(
+        """
+        SELECT notification_updated_at
+        FROM m_workspace_stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+        FOR UPDATE
+        """,
+        (project_id, stream_uuid, assignment["owner_user_uuid"]),
+    ).fetchone()
+    if current is None:
+        raise ValueError("Provider notification stream binding does not exist")
+    if current["notification_updated_at"] >= notification_updated_at:
+        return stream_uuid
+    helpers.update_workspace_user_stream_notifications(
+        project_id,
+        assignment["owner_user_uuid"],
+        stream_uuid,
+        resource["notification_mode"],
+        notification_updated_at=notification_updated_at,
+        session=session,
+    )
+    return stream_uuid
+
+
 def _topic_event(
     session: typing.Any,
     event: dict[str, typing.Any],
@@ -978,6 +1030,69 @@ def _topic_event(
             created=existing is None,
             session=session,
         )
+    return topic_uuid
+
+
+def _topic_notification_event(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    assignment: typing.Mapping[str, typing.Any],
+    resource: dict[str, typing.Any],
+) -> sys_uuid.UUID:
+    topic_uuid = sys_uuid.UUID(str(resource["uuid"]))
+    stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
+    if stream_uuid != assignment["projection_stream_uuid"]:
+        raise ValueError("Provider notification topic is outside the projection")
+    if sys_uuid.UUID(str(resource["user_uuid"])) != assignment["owner_user_uuid"]:
+        raise ValueError("Provider notification owner does not match the account")
+    topic = models.WorkspaceStreamTopic.objects.get_one_or_none(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+        },
+        session=session,
+    )
+    if topic is None:
+        raise ValueError("Provider notification topic does not exist")
+    notification_updated_at = _notification_updated_at(
+        resource["notification_updated_at"]
+    )
+    current = session.execute(
+        """
+        SELECT notification_updated_at
+        FROM m_workspace_user_topic_flags
+        WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+        FOR UPDATE
+        """,
+        (project_id, topic_uuid, assignment["owner_user_uuid"]),
+    ).fetchone()
+    if (
+        current is not None
+        and current["notification_updated_at"] >= notification_updated_at
+    ):
+        return topic_uuid
+    notification_mode = resource["notification_mode"]
+    if notification_mode == models.WorkspaceTopicNotificationMode.UNMUTE.value:
+        stream = helpers.get_workspace_user_stream(
+            project_id=project_id,
+            user_uuid=assignment["owner_user_uuid"],
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        if (
+            stream.notification_mode
+            != models.WorkspaceStreamNotificationMode.MUTED.value
+        ):
+            notification_mode = models.WorkspaceTopicNotificationMode.DEFAULT.value
+    helpers.update_workspace_user_stream_topic_notifications(
+        project_id,
+        assignment["owner_user_uuid"],
+        topic_uuid,
+        notification_mode,
+        notification_updated_at=notification_updated_at,
+        session=session,
+    )
     return topic_uuid
 
 
@@ -1636,6 +1751,20 @@ def apply_event(
     resource = _resource(event, identity, account_uuid)
     if event["kind"] == "read_state.set":
         return _read_state_event(session, project_id, assignment, resource)
+    if event["kind"] == "stream.notification.update":
+        return _stream_notification_event(
+            session,
+            project_id,
+            assignment,
+            resource,
+        )
+    if event["kind"] == "topic.notification.update":
+        return _topic_notification_event(
+            session,
+            project_id,
+            assignment,
+            resource,
+        )
     resource_type = event["kind"].split(".", 1)[0]
     if resource_type == "stream":
         return _stream_event(session, event, project_id, assignment, resource)

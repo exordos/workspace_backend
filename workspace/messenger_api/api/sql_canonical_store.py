@@ -909,6 +909,17 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             return None
         if operation_kind is None:
             return _PROVIDER_TARGET_EXISTS
+        if operation_kind in {
+            "stream.notification.update",
+            "topic.notification.update",
+        } and (
+            getattr(stream, "private_index", None) is not None
+            or self.user_uuid != stream.user_uuid
+        ):
+            # Zulip exposes these settings only for channels and their topics.
+            # Preserve Workspace-local notification controls for projected DMs
+            # and members who do not own the selected provider account.
+            return None
         if not account_locked:
             self._lock_provider_account(stream.external_account_uuid)
         required_capability = provider_data._required_capability(operation_kind)
@@ -924,7 +935,12 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 capability_name=required_capability,
             )
         except provider_data.ProviderUnavailableError as exc:
-            if operation_kind in {"membership.add", "membership.remove"}:
+            if operation_kind in {
+                "membership.add",
+                "membership.remove",
+                "stream.notification.update",
+                "topic.notification.update",
+            }:
                 try:
                     account, _chat, bridge = (
                         provider_data.resolve_provider_queue_target(
@@ -1508,11 +1524,37 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 {"is_archived": action == "archive"},
             )
         elif resource == "streams" and action == "notifications":
+            provider_target = self._provider_target(
+                resource_uuid,
+                "stream.notification.update",
+            )
             row = helpers.update_workspace_user_stream_notifications(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
                 values["notification_mode"],
+            )
+            binding = models.WorkspaceStreamBinding.objects.get_one(
+                filters={
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "stream_uuid": dm_filters.EQ(resource_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=contexts.Context().get_session(),
+            )
+            self._queue_provider_operation(
+                operation_kind="stream.notification.update",
+                target_type="stream",
+                target_uuid=resource_uuid,
+                stream_uuid=resource_uuid,
+                payload={
+                    "uuid": str(resource_uuid),
+                    "stream_uuid": str(resource_uuid),
+                    "user_uuid": str(self.user_uuid),
+                    "notification_mode": binding.notification_mode,
+                    "notification_updated_at": binding.notification_updated_at,
+                },
+                provider_target=provider_target,
             )
         elif resource == "streams" and action == "read":
             session = contexts.Context().get_session()
@@ -1606,11 +1648,42 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 self.project_uuid, self.user_uuid, resource_uuid
             )
         elif resource == "stream_topics" and action == "notifications":
+            topic = helpers.get_workspace_user_stream_topic(
+                self.project_uuid,
+                self.user_uuid,
+                resource_uuid,
+            )
+            provider_target = self._provider_target(
+                topic.stream_uuid,
+                "topic.notification.update",
+            )
             row = helpers.update_workspace_user_stream_topic_notifications(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
                 values["notification_mode"],
+            )
+            flags = models.WorkspaceUserTopicFlags.objects.get_one(
+                filters={
+                    "uuid": dm_filters.EQ(resource_uuid),
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "user_uuid": dm_filters.EQ(self.user_uuid),
+                },
+                session=contexts.Context().get_session(),
+            )
+            self._queue_provider_operation(
+                operation_kind="topic.notification.update",
+                target_type="topic",
+                target_uuid=resource_uuid,
+                stream_uuid=topic.stream_uuid,
+                payload={
+                    "uuid": str(resource_uuid),
+                    "stream_uuid": str(topic.stream_uuid),
+                    "user_uuid": str(self.user_uuid),
+                    "notification_mode": flags.notification_mode,
+                    "notification_updated_at": flags.notification_updated_at,
+                },
+                provider_target=provider_target,
             )
         elif resource == "stream_topics" and action == "set_default":
             row = helpers.set_workspace_user_stream_topic_default(
