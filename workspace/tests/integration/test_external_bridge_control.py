@@ -8,27 +8,28 @@ import contextlib
 import datetime
 import hashlib
 import json
-from pathlib import Path
 import threading
 import time
 import uuid as sys_uuid
+from pathlib import Path
 
 import pytest
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import engines
 
-from workspace.external_bridge_control import file_repository
-from workspace.external_bridge_control import identity_linking
-from workspace.external_bridge_control import pki
-from workspace.external_bridge_control import provider_data
-from workspace.external_bridge_control import provider_event_apply
-from workspace.external_bridge_control import sql_state
+from workspace.external_bridge_control import (
+    file_repository,
+    identity_linking,
+    pki,
+    provider_data,
+    provider_event_apply,
+    sql_state,
+)
 from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api.dm import external_models
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.dm import external_models, message_payloads
 from workspace.tests.integration import conftest
-
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 
@@ -46,6 +47,456 @@ def _identity(instance_uuid, realm_uuid):
 def _request_call(callable_, *args, **kwargs):
     with contexts.Context().session_manager():
         return callable_(*args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "attachment_kind",
+    ["provider", "native-stream", "native-public"],
+)
+def test_provider_message_move_migrates_canonical_row_and_dependents_between_projects(
+    _database,
+    db,
+    monkeypatch,
+    tmp_path,
+    attachment_kind,
+):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    identity = _identity(sys_uuid.uuid4(), sys_uuid.uuid4())
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    source_project_uuid = sys_uuid.uuid4()
+    destination_project_uuid = sys_uuid.uuid4()
+    source_stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db, source_project_uuid, owner_uuid, "Provider source"
+        )
+    )
+    source_topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            source_project_uuid,
+            source_stream_uuid,
+            owner_uuid,
+            "Source topic",
+            is_default=True,
+        )
+    )
+    destination_stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db, destination_project_uuid, owner_uuid, "Provider destination"
+        )
+    )
+    destination_topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            destination_project_uuid,
+            destination_stream_uuid,
+            owner_uuid,
+            "Destination topic",
+            is_default=True,
+        )
+    )
+    message_uuid = sys_uuid.uuid4()
+    reaction_uuid = sys_uuid.uuid4()
+    source_chat_uuid = sys_uuid.uuid4()
+    destination_chat_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    file_operation_uuid = sys_uuid.uuid4()
+    provider_attachment = attachment_kind == "provider"
+    native_attachment = not provider_attachment
+    public_attachment = attachment_kind == "native-public"
+    file_data = b"cross-project provider attachment"
+    file_sha256 = hashlib.sha256(file_data).hexdigest()
+    storage_info = file_storage.save_workspace_file(
+        file_uuid,
+        file_data,
+        storage_type="file",
+        storage_object_id=(
+            f"external-content/sha256/{file_sha256[:2]}/{file_sha256}"
+            if provider_attachment
+            else None
+        ),
+    )
+    source_file_metadata = file_storage.WorkspaceFileMetadata(
+        uuid=file_uuid,
+        project_id=source_project_uuid,
+        stream_uuid=None if public_attachment else source_stream_uuid,
+        owner_uuid=owner_uuid,
+        name="attachment.txt",
+        description="",
+        content_type="text/plain",
+        size_bytes=len(file_data),
+        sha256=file_sha256,
+        created_at=datetime.datetime.now(datetime.timezone.utc),
+        acl_mode="public" if public_attachment else "stream_members",
+        origin=(
+            None
+            if native_attachment
+            else {
+                "kind": "external_provider",
+                "provider_kind": "zulip",
+                "external_account_uuid": str(account_uuid),
+                "external_chat_uuid": str(source_chat_uuid),
+                "operation_uuid": str(file_operation_uuid),
+            }
+        ),
+    )
+    file_storage.save_workspace_file_metadata(
+        source_file_metadata,
+        storage_type="file",
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_files (
+                uuid, project_id, name, description, user_uuid, stream_uuid,
+                acl_mode, external_account_uuid, content_type, size_bytes,
+                hash, storage_type, storage_id, storage_object_id
+            ) VALUES (
+                %s, %s, 'attachment.txt', '', %s, %s, %s, %s,
+                'text/plain', %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                file_uuid,
+                source_project_uuid,
+                owner_uuid,
+                None if public_attachment else source_stream_uuid,
+                "public" if public_attachment else "stream",
+                None if native_attachment else account_uuid,
+                len(file_data),
+                file_sha256,
+                storage_info.storage_type,
+                storage_info.storage_id,
+                storage_info.storage_object_id,
+            ),
+        )
+        if not public_attachment:
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_file_accesses (
+                    uuid, project_id, file_uuid, user_uuid
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    source_project_uuid,
+                    file_uuid,
+                    owner_uuid,
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload,
+                source_name, source, provider_uuid, external_account_uuid,
+                provider_external_id, provider_metadata
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s::jsonb,
+                'native', '{"kind":"native"}'::jsonb, %s, %s, '601',
+                '{"provider_sequence":"10"}'::jsonb
+            )
+            """,
+            (
+                message_uuid,
+                source_project_uuid,
+                source_stream_uuid,
+                source_topic_uuid,
+                owner_uuid,
+                json.dumps(
+                    {
+                        "kind": "markdown",
+                        "content": f"attachment urn:file:{file_uuid}",
+                    }
+                ),
+                identity.bridge_instance_uuid,
+                account_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read
+            ) VALUES (%s, %s, %s, false)
+            """,
+            (message_uuid, owner_uuid, source_project_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_message_reactions (
+                uuid, project_id, message_uuid, user_uuid, emoji_name,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, 'heart', NOW(), NOW())
+            """,
+            (
+                reaction_uuid,
+                source_project_uuid,
+                message_uuid,
+                owner_uuid,
+            ),
+        )
+
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_ensure_projection_owner_stream",
+        lambda *_args, **_kwargs: None,
+    )
+    event = {
+        "provider_event_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(account_uuid),
+        "external_chat_uuid": str(destination_chat_uuid),
+        "project_id": str(destination_project_uuid),
+        "provider_sequence": "11",
+        "kind": "message.upsert",
+        "payload": {
+            "resource": {
+                "uuid": str(message_uuid),
+                "stream_uuid": str(destination_stream_uuid),
+                "topic_uuid": str(destination_topic_uuid),
+                "user_uuid": str(owner_uuid),
+                "provider_external_id": "601",
+                "provider_metadata": {"delivery_class": "backfill"},
+            }
+        },
+    }
+    assignment = {
+        "owner_user_uuid": owner_uuid,
+        "projection_stream_uuid": destination_stream_uuid,
+        "provider_chat_id": "channel:43",
+        "source": {"chat_type": "channel"},
+        "account_settings": {"server_url": "https://zulip.example.test"},
+    }
+    resource = provider_event_apply._resource(event, identity, account_uuid)
+    session_factory = engines.engine_factory.get_engine().session_manager
+    source_payload = message_payloads.MarkdownPayload(
+        content=f"attachment urn:file:{file_uuid}"
+    )
+    if native_attachment:
+        with session_factory() as session:
+            with pytest.raises(
+                ValueError,
+                match="Native message file is not attached to the source",
+            ):
+                provider_event_apply._reproject_message_payload_files(
+                    session,
+                    source_payload,
+                    source_project_uuid,
+                    source_stream_uuid,
+                    destination_project_uuid,
+                    destination_stream_uuid,
+                    destination_chat_uuid,
+                    account_uuid,
+                    False,
+                    native_source_payload=message_payloads.MarkdownPayload(
+                        content="no attachment"
+                    ),
+                )
+    with session_factory() as session:
+        first_projection = provider_event_apply._reproject_message_payload_files(
+            session,
+            source_payload,
+            source_project_uuid,
+            source_stream_uuid,
+            destination_project_uuid,
+            destination_stream_uuid,
+            destination_chat_uuid,
+            account_uuid,
+            False,
+            native_source_payload=source_payload,
+        )
+    with session_factory() as session:
+        repeated_projection = provider_event_apply._reproject_message_payload_files(
+            session,
+            source_payload,
+            source_project_uuid,
+            source_stream_uuid,
+            destination_project_uuid,
+            destination_stream_uuid,
+            destination_chat_uuid,
+            account_uuid,
+            False,
+            native_source_payload=source_payload,
+        )
+    assert repeated_projection == first_projection
+
+    with session_factory() as session:
+        provider_event_apply._message_event(
+            session,
+            event,
+            destination_project_uuid,
+            assignment,
+            resource,
+            identity,
+        )
+    with session_factory() as session:
+        provider_event_apply._message_event(
+            session,
+            event,
+            destination_project_uuid,
+            assignment,
+            resource,
+            identity,
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT project_id, stream_uuid, topic_uuid, payload
+            FROM m_workspace_messages WHERE uuid = %s
+            """,
+            (message_uuid,),
+        )
+        moved_message = cursor.fetchone()
+        assert moved_message[:3] == (
+            destination_project_uuid,
+            destination_stream_uuid,
+            destination_topic_uuid,
+        )
+        moved_content = moved_message[3]["content"]
+        destination_file_uuid = sys_uuid.UUID(
+            moved_content.removeprefix("attachment urn:file:")
+        )
+        if public_attachment:
+            assert destination_file_uuid == file_uuid
+        else:
+            assert destination_file_uuid != file_uuid
+        destination_storage_object_id = (
+            storage_info.storage_object_id
+            if public_attachment or provider_attachment
+            else file_storage.get_workspace_file_object_id(destination_file_uuid)
+        )
+        cursor.execute(
+            """
+            SELECT project_id FROM m_workspace_user_message_flags
+            WHERE uuid = %s AND user_uuid = %s
+            """,
+            (message_uuid, owner_uuid),
+        )
+        assert cursor.fetchone() == (destination_project_uuid,)
+        cursor.execute(
+            """
+            SELECT project_id, stream_uuid, storage_type, storage_id,
+                   storage_object_id
+            FROM m_workspace_files WHERE uuid = %s
+            """,
+            (file_uuid,),
+        )
+        assert cursor.fetchone() == (
+            source_project_uuid,
+            None if public_attachment else source_stream_uuid,
+            storage_info.storage_type,
+            storage_info.storage_id,
+            storage_info.storage_object_id,
+        )
+        cursor.execute(
+            """
+            SELECT project_id, stream_uuid
+            FROM m_workspace_visible_files_v1
+            WHERE uuid = %s AND (
+                viewer_user_uuid = %s
+                OR (%s AND viewer_user_uuid IS NULL)
+            )
+            """,
+            (file_uuid, owner_uuid, public_attachment),
+        )
+        assert cursor.fetchone() == (
+            source_project_uuid,
+            None if public_attachment else source_stream_uuid,
+        )
+        cursor.execute(
+            """
+            SELECT project_id, stream_uuid, storage_type, storage_id,
+                   storage_object_id
+            FROM m_workspace_files WHERE uuid = %s
+            """,
+            (destination_file_uuid,),
+        )
+        assert cursor.fetchone() == (
+            (
+                source_project_uuid,
+                None,
+                storage_info.storage_type,
+                storage_info.storage_id,
+                destination_storage_object_id,
+            )
+            if public_attachment
+            else (
+                destination_project_uuid,
+                destination_stream_uuid,
+                storage_info.storage_type,
+                storage_info.storage_id,
+                destination_storage_object_id,
+            )
+        )
+        cursor.execute(
+            """
+            SELECT count(*) FROM m_workspace_files
+            WHERE project_id = %s AND hash = %s
+            """,
+            (destination_project_uuid, file_sha256),
+        )
+        assert cursor.fetchone() == ((0,) if public_attachment else (1,))
+        cursor.execute(
+            """
+            SELECT project_id, user_uuid
+            FROM m_workspace_file_accesses WHERE file_uuid = %s
+            """,
+            (destination_file_uuid,),
+        )
+        assert cursor.fetchall() == (
+            [] if public_attachment else [(destination_project_uuid, owner_uuid)]
+        )
+        cursor.execute(
+            """
+            SELECT project_id, stream_uuid
+            FROM m_workspace_visible_files_v1
+            WHERE uuid = %s AND (
+                viewer_user_uuid = %s
+                OR (%s AND viewer_user_uuid IS NULL)
+            )
+            """,
+            (destination_file_uuid, owner_uuid, public_attachment),
+        )
+        assert cursor.fetchone() == (
+            (source_project_uuid, None)
+            if public_attachment
+            else (destination_project_uuid, destination_stream_uuid)
+        )
+        cursor.execute(
+            """
+            SELECT project_id FROM m_workspace_message_reactions
+            WHERE uuid = %s
+            """,
+            (reaction_uuid,),
+        )
+        assert cursor.fetchone() == (destination_project_uuid,)
+
+    destination_file_metadata = file_storage.read_workspace_file_metadata(
+        destination_file_uuid,
+        storage_type="file",
+    )
+    assert destination_file_metadata.project_id == (
+        source_project_uuid if public_attachment else destination_project_uuid
+    )
+    assert destination_file_metadata.stream_uuid == (
+        None if public_attachment else destination_stream_uuid
+    )
+    assert destination_file_metadata.origin == (
+        None
+        if native_attachment
+        else {
+            **source_file_metadata.origin,
+            "external_chat_uuid": str(destination_chat_uuid),
+        }
+    )
+    assert (
+        file_storage.read_workspace_file(
+            destination_file_uuid,
+            storage_type="file",
+            storage_object_id=destination_storage_object_id,
+        )
+        == file_data
+    )
 
 
 def test_account_global_identity_event_uses_account_authorization(_database, db):

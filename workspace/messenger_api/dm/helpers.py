@@ -906,6 +906,7 @@ def create_workspace_file(
     user_uuid: sys_uuid.UUID,
     uuid: sys_uuid.UUID,
     session: typing.Any = None,
+    emit_events: bool = True,
     **values: typing.Any,
 ) -> typing.Any:
     if (
@@ -942,11 +943,12 @@ def create_workspace_file(
                 user_uuid=recipient_user_uuid,
                 session=session,
             )
-    messenger_events.create_file_created_events(
-        file,
-        recipient_user_uuids,
-        session=session,
-    )
+    if emit_events:
+        messenger_events.create_file_created_events(
+            file,
+            recipient_user_uuids,
+            session=session,
+        )
     return file
 
 

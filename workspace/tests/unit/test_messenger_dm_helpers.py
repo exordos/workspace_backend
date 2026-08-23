@@ -6152,6 +6152,45 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_create_workspace_file_can_suppress_backfill_event(self):
+        class FakeWorkspaceFile:
+            def __init__(self, **kwargs):
+                for name, value in kwargs.items():
+                    setattr(self, name, value)
+
+            def insert(self, session=None):
+                pass
+
+        with (
+            mock.patch.object(dm_helpers.models, "WorkspaceFile", FakeWorkspaceFile),
+            mock.patch.object(
+                dm_helpers.models,
+                "get_stream_recipients",
+                return_value=[],
+            ),
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_file_created_events",
+            ) as create_events,
+        ):
+            dm_helpers.create_workspace_file(
+                project_id=sys_uuid.uuid4(),
+                user_uuid=sys_uuid.uuid4(),
+                uuid=sys_uuid.uuid4(),
+                stream_uuid=sys_uuid.uuid4(),
+                name="history.txt",
+                description="",
+                content_type="text/plain",
+                size_bytes=7,
+                hash="history",
+                storage_type="file",
+                storage_id="",
+                storage_object_id="external-content/sha256/hi/history",
+                emit_events=False,
+            )
+
+        create_events.assert_not_called()
+
     def test_create_workspace_stream_binding_file_accesses_grants_stream_files(self):
         project_id = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
