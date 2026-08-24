@@ -1517,7 +1517,10 @@ def test_external_provider_policy_blocks_account_and_operation_boundaries(
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
-def test_provider_operation_resolution_uses_current_administrative_policy(api, db):
+def test_provider_operation_resolution_allows_backfill_and_uses_current_policy(
+    api,
+    db,
+):
     _enable_zulip_policy(db)
     bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
     account_uuid = sys_uuid.uuid4()
@@ -1528,8 +1531,16 @@ def test_provider_operation_resolution_uses_current_administrative_policy(api, d
         api.user_uuid,
         "Current policy gate",
     )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
     capability = {
-        "messenger.message.read": {
+        "messenger.message.send": {
             "available": True,
             "revision": 1,
             "limits": {},
@@ -1609,6 +1620,29 @@ def test_provider_operation_resolution_uses_current_administrative_policy(api, d
             """,
             (json.dumps(capability), bridge_uuid),
         )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:current-policy'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.invalid",
+                        "source_scope": str(account_uuid),
+                    }
+                ),
+                account_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
     db.commit()
 
     def resolve():
@@ -1619,11 +1653,99 @@ def test_provider_operation_resolution_uses_current_administrative_policy(api, d
                 owner_user_uuid=api.user_uuid,
                 external_account_uuid=account_uuid,
                 stream_uuid=stream_uuid,
-                capability_name="messenger.message.read",
+                capability_name="messenger.message.send",
             )
         )
 
     assert resolve()[0].uuid == account_uuid
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'backfill', live_ready = FALSE
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET status = 'syncing'
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+    db.commit()
+    assert resolve()[0].uuid == account_uuid
+    preflight = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "stream", "uuid": str(stream_uuid)},
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["allowed"] is True
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "payload": {"kind": "markdown", "content": "during backfill"},
+        },
+    )
+    assert message.status_code == 201, message.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT queue.operation_kind, operation.target_uuid
+            FROM m_external_provider_operations_v1 AS queue
+            JOIN m_external_operations_v2 AS operation
+              ON operation.uuid = queue.external_operation_uuid
+            WHERE queue.external_account_uuid = %s
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone() == (
+            "message.create",
+            sys_uuid.UUID(message.json()["uuid"]),
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'connecting'
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+    db.commit()
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+    preflight = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "stream", "uuid": str(stream_uuid)},
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["allowed"] is False
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'backfill'
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+    db.commit()
 
     with db.cursor() as cursor:
         cursor.execute(
