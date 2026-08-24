@@ -2346,7 +2346,12 @@ class ExternalOperationController(ExternalResourceController):
         ):
             raise ra_exc.ValidationErrorException()
         return {
-            "allowed": account.live_ready and available,
+            "allowed": available
+            and (
+                account.live_ready
+                or account.status
+                == external_models.ExternalAccountStatus.BACKFILL.value
+            ),
             "action": action,
             "target": target,
             "losses": losses,

@@ -213,6 +213,7 @@ def test_resolve_provider_target_intersects_account_and_chat_capabilities(monkey
     account = types.SimpleNamespace(
         uuid=sys_uuid.uuid4(),
         provider="zulip",
+        status="live",
         live_ready=True,
         capabilities={"messenger.message.send": {"available": True}},
     )
@@ -262,6 +263,63 @@ def test_resolve_provider_target_intersects_account_and_chat_capabilities(monkey
     assert policy_checks[0][0][1] == "zulip"
     assert policy_checks[0][1]["capability_name"] == "messenger.message.send"
     assert policy_checks[0][1]["capabilities"] is account.capabilities
+
+
+def test_resolve_provider_target_allows_capable_chat_during_backfill(monkeypatch):
+    account = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        provider="zulip",
+        status="backfill",
+        live_ready=False,
+        capabilities={"messenger.message.send": {"available": True}},
+    )
+    chat = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        capabilities={"messenger.message.send": {"available": True}},
+    )
+    bridge = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalAccount,
+        "objects",
+        types.SimpleNamespace(get_one=lambda **kwargs: account),
+    )
+    chat_calls = []
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalChat,
+        "objects",
+        types.SimpleNamespace(
+            get_all=lambda **kwargs: chat_calls.append(kwargs) or [chat]
+        ),
+    )
+    monkeypatch.setattr(
+        provider_data,
+        "_require_current_provider_policy",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        provider_data,
+        "_lock_associated_bridge",
+        lambda *args, **kwargs: bridge,
+    )
+    input_checks = []
+    monkeypatch.setattr(
+        provider_data,
+        "_require_current_provider_inputs",
+        lambda *args, **kwargs: input_checks.append((args, kwargs)),
+    )
+
+    assert provider_data.resolve_provider_target(
+        object(),
+        project_id=sys_uuid.uuid4(),
+        owner_user_uuid=sys_uuid.uuid4(),
+        external_account_uuid=account.uuid,
+        stream_uuid=sys_uuid.uuid4(),
+        capability_name="messenger.message.send",
+    ) == (account, chat, bridge)
+    statuses = chat_calls[0]["filters"]["status"].value
+    assert set(statuses) == {"syncing", "live"}
+    assert input_checks[0][1]["chat_uuid"] == chat.uuid
 
 
 def test_resolve_provider_queue_target_preserves_route_without_capability(monkeypatch):

@@ -409,7 +409,28 @@ def test_external_operation_discard_uses_provider_queue_transaction(monkeypatch)
     assert emitted[0][3] is request_session
 
 
-def test_external_operation_preflight_uses_effective_chat_capability(monkeypatch):
+@pytest.mark.parametrize(
+    (
+        "account_status",
+        "live_ready",
+        "chat_status",
+        "chat_available",
+        "expected",
+    ),
+    [
+        ("live", True, "live", False, False),
+        ("backfill", False, "syncing", True, True),
+        ("connecting", False, "syncing", True, False),
+    ],
+)
+def test_external_operation_preflight_uses_effective_chat_capability(
+    monkeypatch,
+    account_status,
+    live_ready,
+    chat_status,
+    chat_available,
+    expected,
+):
     project_uuid = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
@@ -438,14 +459,17 @@ def test_external_operation_preflight_uses_effective_chat_capability(monkeypatch
     account = types.SimpleNamespace(
         uuid=account_uuid,
         provider="zulip",
-        live_ready=True,
+        status=account_status,
+        live_ready=live_ready,
         capabilities={"messenger.message.send": {"available": True}},
     )
     chat = types.SimpleNamespace(
         selected=True,
-        status="live",
+        status=chat_status,
         transition_pending=False,
-        capabilities={"messenger.message.send": {"available": False}},
+        capabilities={
+            "messenger.message.send": {"available": chat_available}
+        },
     )
     monkeypatch.setattr(
         controllers.external_models.ExternalAccount,
@@ -479,7 +503,7 @@ def test_external_operation_preflight_uses_effective_chat_capability(monkeypatch
         target={"type": "stream", "uuid": str(stream_uuid)},
     )
 
-    assert result["allowed"] is False
+    assert result["allowed"] is expected
     assert result["losses"] == []
     assert account_calls[0]["session"] is session
     assert provider_calls == [("zulip", session)]
