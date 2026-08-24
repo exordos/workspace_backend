@@ -548,6 +548,10 @@ class WorkspaceStreamBinding(
         types.Enum([mode.value for mode in WorkspaceStreamNotificationMode]),
         default=WorkspaceStreamNotificationMode.ALL_MESSAGES.value,
     )
+    notification_updated_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=lambda: datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+    )
 
     def get_stream(self) -> WorkspaceStream:
         return WorkspaceStream.objects.get_one(
@@ -1199,6 +1203,10 @@ class WorkspaceUserTopicFlags(
     notification_mode = properties.property(
         types.Enum([mode.value for mode in WorkspaceTopicNotificationMode]),
         default=WorkspaceTopicNotificationMode.DEFAULT.value,
+    )
+    notification_updated_at = properties.property(
+        types.UTCDateTimeZ(),
+        default=lambda: datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
     )
 
 

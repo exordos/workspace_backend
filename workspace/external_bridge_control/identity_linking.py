@@ -488,14 +488,26 @@ def merge_workspace_user_identity(
         """
         INSERT INTO m_workspace_stream_bindings (
             uuid, project_id, stream_uuid, user_uuid, who_uuid,
-            role, notification_mode, created_at, updated_at
+            role, notification_mode, notification_updated_at,
+            created_at, updated_at
         )
         SELECT
             gen_random_uuid(), project_id, stream_uuid, %s, who_uuid,
-            role, notification_mode, created_at, updated_at
+            role, notification_mode, notification_updated_at,
+            created_at, updated_at
         FROM m_workspace_stream_bindings
         WHERE user_uuid = %s
-        ON CONFLICT (project_id, stream_uuid, user_uuid) DO NOTHING
+        ON CONFLICT (project_id, stream_uuid, user_uuid) DO UPDATE
+        SET notification_mode = CASE
+                WHEN m_workspace_stream_bindings.notification_updated_at
+                    >= EXCLUDED.notification_updated_at
+                THEN m_workspace_stream_bindings.notification_mode
+                ELSE EXCLUDED.notification_mode
+            END,
+            notification_updated_at = GREATEST(
+                m_workspace_stream_bindings.notification_updated_at,
+                EXCLUDED.notification_updated_at
+            )
         """,
         (canonical_user_uuid, legacy_user_uuid),
     )
@@ -549,16 +561,28 @@ def merge_workspace_user_identity(
     session.execute(
         """
         INSERT INTO m_workspace_user_topic_flags (
-            uuid, user_uuid, project_id, is_done, created_at, updated_at
+            uuid, user_uuid, project_id, is_done, notification_mode,
+            notification_updated_at, created_at, updated_at
         )
         SELECT
-            uuid, %s, project_id, is_done, created_at, updated_at
+            uuid, %s, project_id, is_done, notification_mode,
+            notification_updated_at, created_at, updated_at
         FROM m_workspace_user_topic_flags
         WHERE user_uuid = %s
         ON CONFLICT (uuid, user_uuid) DO UPDATE
         SET is_done = (
                 m_workspace_user_topic_flags.is_done
                 OR EXCLUDED.is_done
+            ),
+            notification_mode = CASE
+                WHEN m_workspace_user_topic_flags.notification_updated_at
+                    >= EXCLUDED.notification_updated_at
+                THEN m_workspace_user_topic_flags.notification_mode
+                ELSE EXCLUDED.notification_mode
+            END,
+            notification_updated_at = GREATEST(
+                m_workspace_user_topic_flags.notification_updated_at,
+                EXCLUDED.notification_updated_at
             ),
             updated_at = GREATEST(
                 m_workspace_user_topic_flags.updated_at,

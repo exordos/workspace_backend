@@ -697,6 +697,149 @@ def test_provider_operation_uses_projection_owner_target_in_request_transaction(
     ]
 
 
+def test_provider_dm_notification_setting_remains_workspace_local(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    session = object()
+    stream_objects = FakeObjects(
+        [
+            types.SimpleNamespace(
+                external_account_uuid=sys_uuid.uuid4(),
+                private_index="provider-direct-chat",
+                user_uuid=PROJECTION_OWNER_UUID,
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        stream_objects,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "resolve_provider_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("direct chats have no Zulip notification target")
+        ),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    assert store._provider_target(stream_uuid, "stream.notification.update") is None
+
+
+@pytest.mark.parametrize(
+    "operation_kind",
+    ["stream.notification.update", "topic.notification.update"],
+)
+def test_provider_notification_setting_for_non_owner_remains_workspace_local(
+    monkeypatch,
+    operation_kind,
+):
+    stream_uuid = sys_uuid.uuid4()
+    session = object()
+    stream_objects = FakeObjects(
+        [
+            types.SimpleNamespace(
+                external_account_uuid=sys_uuid.uuid4(),
+                private_index=None,
+                user_uuid=PROJECTION_OWNER_UUID,
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        stream_objects,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "resolve_provider_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-owners have no Zulip notification target")
+        ),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    assert store._provider_target(stream_uuid, operation_kind) is None
+
+
+@pytest.mark.parametrize(
+    "operation_kind",
+    ["stream.notification.update", "topic.notification.update"],
+)
+def test_provider_notification_setting_queues_until_capability_is_available(
+    monkeypatch,
+    operation_kind,
+):
+    stream_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    account = types.SimpleNamespace(uuid=account_uuid)
+    bridge = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(fetchone=lambda: None)
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        FakeObjects(
+            [
+                types.SimpleNamespace(
+                    external_account_uuid=account_uuid,
+                    private_index=None,
+                    user_uuid=USER_UUID,
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "resolve_provider_target",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sql_canonical_store.provider_data.ProviderUnavailableError(
+                "capability unavailable"
+            )
+        ),
+    )
+    queue_targets = []
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "resolve_provider_queue_target",
+        lambda current_session, **kwargs: (
+            queue_targets.append((current_session, kwargs))
+            or (account, object(), bridge)
+        ),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    assert store._provider_target(stream_uuid, operation_kind) == (account, bridge)
+    assert queue_targets == [
+        (
+            session,
+            {
+                "project_id": PROJECT_UUID,
+                "owner_user_uuid": USER_UUID,
+                "external_account_uuid": account_uuid,
+                "stream_uuid": stream_uuid,
+                "allow_policy_blocked": False,
+            },
+        )
+    ]
+
+
 def test_stream_binding_add_queues_only_new_provider_memberships(monkeypatch):
     stream_uuid = sys_uuid.uuid4()
     existing_user_uuid = sys_uuid.uuid4()
@@ -794,6 +937,162 @@ def test_stream_binding_add_queues_only_new_provider_memberships(monkeypatch):
                 "user_uuid": str(added_user_uuid),
                 "who_uuid": str(USER_UUID),
                 "role": "member",
+            },
+            "provider_target": provider_target,
+        }
+    ]
+
+
+def test_stream_notification_action_queues_timestamped_provider_operation(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    notification_updated_at = datetime.datetime(
+        2026, 8, 23, 12, 30, tzinfo=datetime.timezone.utc
+    )
+    provider_target = (object(), object())
+    row = types.SimpleNamespace(uuid=stream_uuid)
+    binding = types.SimpleNamespace(
+        notification_mode="mentions_only",
+        notification_updated_at=notification_updated_at,
+    )
+    session = object()
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    targets = []
+    queued = []
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda requested_stream_uuid, operation_kind=None: (
+            targets.append((requested_stream_uuid, operation_kind)) or provider_target
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "update_workspace_user_stream_notifications",
+        lambda *args: row,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStreamBinding,
+        "objects",
+        FakeObjects([binding]),
+    )
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: queued.append(kwargs),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store,
+        "_public_dict",
+        lambda value, resource: {"uuid": str(value.uuid), "resource": resource},
+    )
+
+    result = store.perform_action(
+        "streams",
+        stream_uuid,
+        "notifications",
+        {"notification_mode": "mentions_only"},
+    )
+
+    assert result == {"uuid": str(stream_uuid), "resource": "streams"}
+    assert targets == [(stream_uuid, "stream.notification.update")]
+    assert queued == [
+        {
+            "operation_kind": "stream.notification.update",
+            "target_type": "stream",
+            "target_uuid": stream_uuid,
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "uuid": str(stream_uuid),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(USER_UUID),
+                "notification_mode": "mentions_only",
+                "notification_updated_at": notification_updated_at,
+            },
+            "provider_target": provider_target,
+        }
+    ]
+
+
+def test_topic_notification_action_queues_timestamped_provider_operation(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    notification_updated_at = datetime.datetime(
+        2026, 8, 23, 12, 31, tzinfo=datetime.timezone.utc
+    )
+    provider_target = (object(), object())
+    topic = types.SimpleNamespace(uuid=topic_uuid, stream_uuid=stream_uuid)
+    flags = types.SimpleNamespace(
+        notification_mode="follow",
+        notification_updated_at=notification_updated_at,
+    )
+    session = object()
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    targets = []
+    queued = []
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "get_workspace_user_stream_topic",
+        lambda *args: topic,
+    )
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda requested_stream_uuid, operation_kind=None: (
+            targets.append((requested_stream_uuid, operation_kind)) or provider_target
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "update_workspace_user_stream_topic_notifications",
+        lambda *args: topic,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceUserTopicFlags,
+        "objects",
+        FakeObjects([flags]),
+    )
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: queued.append(kwargs),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store,
+        "_public_dict",
+        lambda value, resource: {"uuid": str(value.uuid), "resource": resource},
+    )
+
+    result = store.perform_action(
+        "stream_topics",
+        topic_uuid,
+        "notifications",
+        {"notification_mode": "follow"},
+    )
+
+    assert result == {"uuid": str(topic_uuid), "resource": "stream_topics"}
+    assert targets == [(stream_uuid, "topic.notification.update")]
+    assert queued == [
+        {
+            "operation_kind": "topic.notification.update",
+            "target_type": "topic",
+            "target_uuid": topic_uuid,
+            "stream_uuid": stream_uuid,
+            "payload": {
+                "uuid": str(topic_uuid),
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(USER_UUID),
+                "notification_mode": "follow",
+                "notification_updated_at": notification_updated_at,
             },
             "provider_target": provider_target,
         }

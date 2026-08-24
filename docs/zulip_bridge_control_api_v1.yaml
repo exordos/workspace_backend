@@ -1585,6 +1585,7 @@ components:
         - messenger.message.edit
         - messenger.message.delete
         - messenger.message.read
+        - messenger.notification.write
         - messenger.stream.rename
         - messenger.topic.rename
         - messenger.file.transfer

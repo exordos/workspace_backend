@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import datetime
+import inspect
 import types
 import uuid as sys_uuid
 
@@ -14,6 +15,13 @@ from workspace.external_bridge_control import provider_event_apply
 from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
+
+
+def test_topic_merge_uses_notification_timestamp_not_generic_updated_at():
+    source = inspect.getsource(external_projection._merge_topic_flags)
+
+    assert "notification_updated_at" in source
+    assert "m_workspace_user_topic_flags.notification_updated_at" in source
 
 
 class Result:
@@ -37,6 +45,115 @@ class Session:
     def execute(self, statement, params):
         self.statements.append((statement, params))
         return Result(next(self.rows, None))
+
+
+def test_stream_notification_event_applies_only_newer_provider_value(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    previous = datetime.datetime(2026, 8, 23, 12, 0, tzinfo=datetime.timezone.utc)
+    incoming = previous + datetime.timedelta(minutes=1)
+    session = Session({"notification_updated_at": previous})
+    calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "update_workspace_user_stream_notifications",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = provider_event_apply._stream_notification_event(
+        session,
+        project_uuid,
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+        },
+        {
+            "uuid": str(stream_uuid),
+            "stream_uuid": str(stream_uuid),
+            "user_uuid": str(owner_uuid),
+            "notification_mode": "muted",
+            "notification_updated_at": incoming.isoformat(),
+        },
+    )
+
+    assert result == stream_uuid
+    assert calls == [
+        (
+            (project_uuid, owner_uuid, stream_uuid, "muted"),
+            {"notification_updated_at": incoming, "session": session},
+        )
+    ]
+    assert "FOR UPDATE" in session.statements[0][0]
+
+    stale_session = Session({"notification_updated_at": incoming})
+    calls.clear()
+    provider_event_apply._stream_notification_event(
+        stale_session,
+        project_uuid,
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+        },
+        {
+            "uuid": str(stream_uuid),
+            "stream_uuid": str(stream_uuid),
+            "user_uuid": str(owner_uuid),
+            "notification_mode": "all_messages",
+            "notification_updated_at": previous.isoformat(),
+        },
+    )
+    assert calls == []
+
+
+def test_topic_notification_event_uses_canonical_stream_for_unmute(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    incoming = datetime.datetime(2026, 8, 23, 12, 1, tzinfo=datetime.timezone.utc)
+    session = Session(None)
+    topic = types.SimpleNamespace(uuid=topic_uuid, stream_uuid=stream_uuid)
+    monkeypatch.setattr(
+        provider_event_apply.models.WorkspaceStreamTopic,
+        "objects",
+        types.SimpleNamespace(get_one_or_none=lambda **kwargs: topic),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "get_workspace_user_stream",
+        lambda **kwargs: types.SimpleNamespace(notification_mode="all_messages"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "update_workspace_user_stream_topic_notifications",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = provider_event_apply._topic_notification_event(
+        session,
+        project_uuid,
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+        },
+        {
+            "uuid": str(topic_uuid),
+            "stream_uuid": str(stream_uuid),
+            "user_uuid": str(owner_uuid),
+            "notification_mode": "unmute",
+            "notification_updated_at": incoming.isoformat(),
+        },
+    )
+
+    assert result == topic_uuid
+    assert calls == [
+        (
+            (project_uuid, owner_uuid, topic_uuid, "default"),
+            {"notification_updated_at": incoming, "session": session},
+        )
+    ]
 
 
 def _identity():

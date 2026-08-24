@@ -2337,6 +2337,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         session = object()
+        notification_updated_at = datetime.datetime(
+            2026, 8, 23, 12, 0, tzinfo=datetime.timezone.utc
+        )
         returned_stream = types.SimpleNamespace(
             uuid=stream_uuid,
             user_uuid=user_uuid,
@@ -2390,12 +2393,16 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 user_uuid=user_uuid,
                 stream_uuid=stream_uuid,
                 notification_mode="mentions_only",
+                notification_updated_at=notification_updated_at,
                 session=session,
             )
 
         self.assertIs(returned_stream, result)
         self.assertEqual(
-            {"notification_mode": "mentions_only"},
+            {
+                "notification_mode": "mentions_only",
+                "notification_updated_at": notification_updated_at,
+            },
             updated_binding["values"],
         )
         self.assertIs(session, updated_binding["update_session"])
@@ -2425,6 +2432,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             notification_mode="mentions_only",
+            notification_updated_at=notification_updated_at,
             session=session,
         )
         create_unread_events.assert_called_once_with(
@@ -2440,24 +2448,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         user_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         unmuted_topic_uuid = sys_uuid.uuid4()
-        session = object()
         topics = [
             types.SimpleNamespace(uuid=unmuted_topic_uuid),
             types.SimpleNamespace(uuid=sys_uuid.uuid4()),
         ]
-        updated_flags = {}
-
-        class StaleTopicFlags:
-            notification_mode = "unmute"
-
-            def update(self, session=None):
-                updated_flags["notification_mode"] = self.notification_mode
-                updated_flags["session"] = session
-
-        class FakeWorkspaceUserTopicFlags:
-            objects = types.SimpleNamespace(
-                get_all=mock.Mock(return_value=[StaleTopicFlags()])
-            )
+        session = mock.Mock()
+        notification_updated_at = datetime.datetime(
+            2026, 8, 23, 12, 0, tzinfo=datetime.timezone.utc
+        )
 
         with (
             mock.patch.object(
@@ -2465,11 +2463,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 "_get_workspace_stream_topics",
                 return_value=topics,
             ) as get_topics,
-            mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserTopicFlags",
-                FakeWorkspaceUserTopicFlags,
-            ),
         ):
             topic_uuids = (
                 dm_helpers._normalize_workspace_user_stream_topic_notification_modes(
@@ -2477,6 +2470,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                     user_uuid=user_uuid,
                     stream_uuid=stream_uuid,
                     notification_mode="all_messages",
+                    notification_updated_at=notification_updated_at,
                     session=session,
                 )
             )
@@ -2487,17 +2481,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             stream_uuid=stream_uuid,
             session=session,
         )
-        FakeWorkspaceUserTopicFlags.objects.get_all.assert_called_once()
-        filters = FakeWorkspaceUserTopicFlags.objects.get_all.call_args.kwargs[
-            "filters"
-        ]
-        self.assertEqual([topic.uuid for topic in topics], filters["uuid"].value)
-        self.assertEqual(project_id, filters["project_id"].value)
-        self.assertEqual(user_uuid, filters["user_uuid"].value)
-        self.assertEqual("unmute", filters["notification_mode"].value)
+        statement, parameters = session.execute.call_args.args
+        self.assertIn("UPDATE m_workspace_user_topic_flags", statement)
+        self.assertIn("GREATEST", statement)
         self.assertEqual(
-            {"notification_mode": "default", "session": session},
-            updated_flags,
+            (
+                "default",
+                notification_updated_at,
+                [topic.uuid for topic in topics],
+                project_id,
+                user_uuid,
+                "unmute",
+            ),
+            parameters,
         )
 
     def test_delete_workspace_user_stream_deletes_stream_and_sends_events(self):
@@ -3226,6 +3222,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
         session = object()
+        notification_updated_at = datetime.datetime(
+            2026, 8, 23, 12, 0, tzinfo=datetime.timezone.utc
+        )
         current_topic = types.SimpleNamespace(stream_uuid=stream_uuid)
         current_stream = types.SimpleNamespace(notification_mode="muted")
         returned_topic = types.SimpleNamespace(
@@ -3257,6 +3256,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 user_uuid=user_uuid,
                 topic_uuid=topic_uuid,
                 notification_mode="unmute",
+                notification_updated_at=notification_updated_at,
                 session=session,
             )
 
@@ -3288,6 +3288,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
             notification_mode="unmute",
+            notification_updated_at=notification_updated_at,
             session=session,
         )
         create_unread_events.assert_called_once_with(

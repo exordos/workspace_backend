@@ -42,6 +42,8 @@ _OPERATION_CAPABILITIES = {
     "reaction.delete": "messenger.reaction.write",
     "membership.add": "messenger.membership.write",
     "membership.remove": "messenger.membership.write",
+    "stream.notification.update": "messenger.notification.write",
+    "topic.notification.update": "messenger.notification.write",
     "stream.delete": "messenger.stream.delete",
     "topic.create": "messenger.topic.create",
     "stream.update": "messenger.stream.rename",
