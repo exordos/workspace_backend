@@ -18,10 +18,31 @@ from workspace.workspace_api.api import app as workspace_app
 OPENAPI_VERSION = "3.0.3"
 
 
-def _assert_message_pagination_contract(operation):
+def _component_schema(specification, name):
+    schemas = specification["components"]["schemas"]
+    schema = schemas[name]
+    reference = schema.get("$ref")
+    if reference is None:
+        return schema
+    return schemas[reference.removeprefix("#/components/schemas/")]
+
+
+def _component_parameter(specification, parameter):
+    reference = parameter.get("$ref")
+    if reference is None:
+        return parameter
+    name = reference.removeprefix("#/components/parameters/")
+    return specification["components"]["parameters"][name]
+
+
+def _assert_message_pagination_contract(specification, operation):
+    resolved_parameters = (
+        _component_parameter(specification, parameter)
+        for parameter in operation["parameters"]
+    )
     parameters = {
         (parameter["in"], parameter["name"]): parameter
-        for parameter in operation["parameters"]
+        for parameter in resolved_parameters
     }
     assert parameters[("query", "page_marker")]["schema"] == {
         "type": "string",
@@ -75,10 +96,18 @@ def _assert_file_upload_contract(operation):
     assert "storage_type" not in multipart_schema["properties"]
 
 
-def _assert_collection_pagination_contract(operation, marker_schema):
+def _assert_collection_pagination_contract(
+    specification,
+    operation,
+    marker_schema,
+):
+    resolved_parameters = (
+        _component_parameter(specification, parameter)
+        for parameter in operation["parameters"]
+    )
     parameters = {
         (parameter["in"], parameter["name"]): parameter
-        for parameter in operation["parameters"]
+        for parameter in resolved_parameters
     }
     assert parameters[("query", "page_limit")]["schema"] == {
         "type": "integer",
@@ -141,9 +170,9 @@ def _assert_topic_summary_management_contract(specification, root):
     collection_path = f"{root}topic_summary_endpoints/"
     collection = paths[collection_path]
     assert set(collection) == {"get", "post"}
-    create_schema = collection["post"]["requestBody"]["content"][
-        "application/json"
-    ]["schema"]
+    create_schema = collection["post"]["requestBody"]["content"]["application/json"][
+        "schema"
+    ]
     assert create_schema["required"] == [
         "uuid",
         "name",
@@ -156,9 +185,7 @@ def _assert_topic_summary_management_contract(specification, root):
     assert create_schema["properties"]["max_output_tokens"]["maximum"] == 32768
 
     endpoint_path = next(
-        path
-        for path in paths
-        if path.startswith(f"{collection_path}{{")
+        path for path in paths if path.startswith(f"{collection_path}{{")
     )
     assert set(paths[endpoint_path]) == {"get", "put", "delete"}
     update_schema = paths[endpoint_path]["put"]["requestBody"]["content"][
@@ -172,7 +199,7 @@ def _assert_topic_summary_management_contract(specification, root):
         "WorkspaceLLMEndpoint_Create",
         "WorkspaceLLMEndpoint_Update",
     ):
-        response_properties = specification["components"]["schemas"][schema_name][
+        response_properties = _component_schema(specification, schema_name)[
             "properties"
         ]
         assert "api_key" not in response_properties
@@ -181,9 +208,7 @@ def _assert_topic_summary_management_contract(specification, root):
         assert "supports_vision" in response_properties
 
     settings_path = next(
-        path
-        for path in paths
-        if path.startswith(f"{root}topic_summary_settings/{{")
+        path for path in paths if path.startswith(f"{root}topic_summary_settings/{{")
     )
     for operation in paths[settings_path].values():
         assert operation["parameters"][0]["in"] == "path"
@@ -264,9 +289,10 @@ def test_generated_openapi_color_defaults_are_deterministic():
 
 def test_generated_openapi_message_payload_uses_markdown_content_limit():
     specification = _build_openapi(messenger_app)
-    payload_schema = specification["components"]["schemas"][
-        "WorkspaceUserMessage_Create"
-    ]["properties"]["payload"]
+    payload_schema = _component_schema(
+        specification,
+        "WorkspaceUserMessage_Create",
+    )["properties"]["payload"]
 
     assert payload_schema["oneOf"][0]["properties"]["content"]["maxLength"] == 40000
 
@@ -280,7 +306,7 @@ def test_generated_openapi_exposes_persisted_complete_reaction_user_lists():
         "WorkspaceUserMessage_Create",
         "WorkspaceUserMessage_Update",
     ):
-        reaction_users_schema = specification["components"]["schemas"][schema_name][
+        reaction_users_schema = _component_schema(specification, schema_name)[
             "properties"
         ]["reaction_users"]
         assert reaction_users_schema["readOnly"] is True
@@ -309,7 +335,10 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     assert "/v1/messenger/messages/" not in paths
     assert "/v1/events/" not in paths
     assert "/v1/epoch/" not in paths
-    _assert_message_pagination_contract(paths["/v1/messages/"]["get"])
+    _assert_message_pagination_contract(
+        specification,
+        paths["/v1/messages/"]["get"],
+    )
 
     add_users_path = "/v1/streams/{WorkspaceUserStreamUuid}/actions/add_users/invoke"
     assert set(paths[add_users_path]) == {"post"}
@@ -327,6 +356,7 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
     _assert_file_upload_contract(paths["/v1/files/"]["post"])
     _assert_collection_pagination_contract(
+        specification,
         paths["/v1/folders/"]["get"],
         {"type": "string", "format": "uuid"},
     )
@@ -353,9 +383,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "schema"
     ]["$ref"]
     assert request_reference == "#/components/schemas/PushDevice_Update"
-    push_device_request = specification["components"]["schemas"][
-        "PushDevice_Update"
-    ]
+    push_device_request = _component_schema(specification, "PushDevice_Update")
     assert push_device_request["required"] == [
         "transport",
         "platform",
@@ -389,7 +417,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     assert "/v1/events/ws/" not in paths
     event_operation = paths["/v1/events/"]["get"]
     assert any(
-        parameter["name"] == "epoch_generation"
+        _component_parameter(specification, parameter)["name"] == "epoch_generation"
         for parameter in event_operation["parameters"]
     )
     assert event_operation["responses"][410]["content"]["application/json"]["schema"][
@@ -406,9 +434,13 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     assert me_operation["responses"][200]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/WorkspaceUser_Get"
     }
-    _assert_message_pagination_contract(paths["/v1/messenger/messages/"]["get"])
+    _assert_message_pagination_contract(
+        specification,
+        paths["/v1/messenger/messages/"]["get"],
+    )
     _assert_file_upload_contract(paths["/v1/messenger/files/"]["post"])
     _assert_collection_pagination_contract(
+        specification,
         event_operation,
         {"type": "integer", "minimum": 0},
     )
@@ -421,13 +453,14 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     avatar_upload_path = "/v1/users/{WorkspaceUserUuid}/actions/avatar_upload/invoke"
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
 
-    schemas = specification["components"]["schemas"]
     raw_provider_fields = {
         "provider_uuid",
         "external_account_uuid",
         "provider_external_id",
     }
-    user_properties = schemas["WorkspaceUser_Get"]["properties"]
+    user_properties = _component_schema(specification, "WorkspaceUser_Get")[
+        "properties"
+    ]
     assert raw_provider_fields.isdisjoint(user_properties)
     assert user_properties["identity_kind"]["enum"] == ["external"]
     assert user_properties["display_name"]["readOnly"] is True
@@ -436,7 +469,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "account_uuid",
     }
     assert raw_provider_fields.isdisjoint(
-        schemas["WorkspaceFile_Filter"]["properties"],
+        _component_schema(specification, "WorkspaceFile_Filter")["properties"],
     )
     for schema_name in (
         "WorkspaceUserStream_Filter",
@@ -444,18 +477,27 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "WorkspaceUserMessage_Filter",
         "WorkspaceMessageReactions_Filter",
     ):
-        projection_properties = schemas[schema_name]["properties"]
+        projection_properties = _component_schema(specification, schema_name)[
+            "properties"
+        ]
         assert raw_provider_fields.isdisjoint(projection_properties)
         assert {"provider", "delivery"} <= set(projection_properties)
         assert "identity_kind" not in projection_properties
         assert "external_id" in projection_properties["provider"]["properties"]
-    topic_properties = schemas["WorkspaceUserTopic_Get"]["properties"]
+    topic_properties = _component_schema(
+        specification,
+        "WorkspaceUserTopic_Get",
+    )["properties"]
     assert topic_properties["summary"]["maxLength"] == 4096
     assert topic_properties["summary_last_message_uuid"]["format"] == "uuid"
     assert topic_properties["summary_has_new_messages"]["readOnly"] is True
     assert topic_properties["summary_enabled"]["readOnly"] is True
     assert topic_properties["summary_system_prompt"]["maxLength"] == 16384
-    assert schemas["WorkspaceEvent_Filter"]["properties"]["object_type"]["enum"] == [
+    event_properties = _component_schema(
+        specification,
+        "WorkspaceEvent_Filter",
+    )["properties"]
+    assert event_properties["object_type"]["enum"] == [
         "external_account",
         "external_chat",
         "external_operation",

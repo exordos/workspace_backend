@@ -53,10 +53,12 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
         specification = super().build(request, components)
         specification = openapi_contract.add_collection_pagination_contract(
             specification,
+            components,
         )
         specification = openapi_contract.add_message_pagination_contract(
             specification,
             "/v1/messages/",
+            components,
         )
         specification = openapi_contract.add_draft_contract(
             specification,

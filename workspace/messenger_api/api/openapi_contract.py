@@ -316,6 +316,28 @@ EXTERNAL_ACCOUNT_SETTINGS_PROPERTIES = {
 }
 
 
+def _component_schema(
+    schemas: dict[str, typing.Any],
+    name: str,
+) -> dict[str, typing.Any]:
+    schema = schemas[name]
+    reference = schema.get("$ref")
+    if reference is None:
+        return schema
+    return schemas[reference.removeprefix("#/components/schemas/")]
+
+
+def _component_parameter(
+    components: dict[str, typing.Any],
+    parameter: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    reference = parameter.get("$ref")
+    if reference is None:
+        return parameter
+    name = reference.removeprefix("#/components/parameters/")
+    return components["components"]["parameters"][name]
+
+
 def _object_schema(
     properties: dict[str, typing.Any],
     required: list[str],
@@ -367,7 +389,7 @@ def add_external_bridge_public_contract(
         ],
     )
     for name in ("ExternalAccount_Filter", "ExternalAccount_Get"):
-        properties = schemas[name]["properties"]
+        properties = _component_schema(schemas, name)["properties"]
         properties["settings"] = copy.deepcopy(account_settings)
         properties["status"] = {
             "type": "string",
@@ -444,7 +466,8 @@ def add_external_bridge_public_contract(
     account_collection["get"]["parameters"] = [
         parameter
         for parameter in account_collection["get"]["parameters"]
-        if parameter["name"] in {"status", "page_limit", "page_marker"}
+        if _component_parameter(components, parameter)["name"]
+        in {"status", "page_limit", "page_marker"}
     ]
     account_collection["post"]["requestBody"] = _request_body(create_schema)
     account_collection["post"]["responses"][201] = _external_response(
@@ -494,7 +517,7 @@ def add_external_bridge_public_contract(
         ["kind", "chat_type"],
     )
     for name in ("ExternalChat_Filter", "ExternalChat_Get"):
-        properties = schemas[name]["properties"]
+        properties = _component_schema(schemas, name)["properties"]
         properties["source"] = copy.deepcopy(chat_source)
         properties["capabilities"] = copy.deepcopy(EXTERNAL_CAPABILITIES_SCHEMA)
         properties["history_depth"] = copy.deepcopy(EXTERNAL_HISTORY_DEPTH_SCHEMA)
@@ -511,7 +534,8 @@ def add_external_bridge_public_contract(
         *[
             parameter
             for parameter in chat_collection["parameters"]
-            if parameter["name"] in {"page_limit", "page_marker"}
+            if _component_parameter(components, parameter)["name"]
+            in {"page_limit", "page_marker"}
         ],
     ]
     chat_path = f"{root}external_chats/{{ExternalChatUuid}}"
@@ -560,7 +584,7 @@ def add_external_bridge_public_contract(
         "unsafe_provider_state",
     ]
     for name in ("ExternalOperation_Filter", "ExternalOperation_Get"):
-        properties = schemas[name]["properties"]
+        properties = _component_schema(schemas, name)["properties"]
         properties["status"] = {
             "type": "string",
             "enum": copy.deepcopy(operation_statuses),
@@ -641,7 +665,8 @@ def add_external_bridge_public_contract(
         *[
             parameter
             for parameter in operation_collection["parameters"]
-            if parameter["name"] in {"page_limit", "page_marker"}
+            if _component_parameter(components, parameter)["name"]
+            in {"page_limit", "page_marker"}
         ],
     ]
     operation_path = f"{root}external_operations/{{ExternalOperationUuid}}"
@@ -818,7 +843,7 @@ def add_external_bridge_public_contract(
     policy_resource["put"]["requestBody"] = _request_body(
         _object_schema({"settings": policy_settings}, ["settings"])
     )
-    policy_schema = schemas["ExternalProviderPolicy_Get"]
+    policy_schema = _component_schema(schemas, "ExternalProviderPolicy_Get")
     policy_schema["properties"]["provider"] = {
         "type": "string",
         "enum": ["zulip"],
@@ -883,7 +908,8 @@ def add_public_projection_contract(
         "WorkspaceUserMessage_",
         "WorkspaceMessageReactions_",
     )
-    for name, schema in schemas.items():
+    for name in schemas:
+        schema = _component_schema(schemas, name)
         if name.startswith(projection_schema_prefixes):
             properties = schema["properties"]
             properties["provider"] = copy.deepcopy(PROVIDER_SCHEMA)
@@ -941,6 +967,7 @@ def _pagination_marker_schema(path: str) -> dict[str, typing.Any]:
 
 def add_collection_pagination_contract(
     specification: dict[str, typing.Any],
+    components: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
     for path, path_item in specification["paths"].items():
         operation = path_item.get("get")
@@ -954,7 +981,12 @@ def add_collection_pagination_contract(
             continue
         marker_schema = _pagination_marker_schema(path)
         parameters = operation.setdefault("parameters", [])
-        existing = {(parameter["in"], parameter["name"]) for parameter in parameters}
+        resolved_parameters = (
+            _component_parameter(components, parameter) for parameter in parameters
+        )
+        existing = {
+            (parameter["in"], parameter["name"]) for parameter in resolved_parameters
+        }
         for parameter in (
             PAGINATION_LIMIT_PARAMETER,
             {
@@ -984,10 +1016,16 @@ def add_collection_pagination_contract(
 def add_message_pagination_contract(
     specification: dict[str, typing.Any],
     path: str,
+    components: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
     operation = specification["paths"][path]["get"]
     parameters = operation.setdefault("parameters", [])
-    existing = {(parameter["in"], parameter["name"]) for parameter in parameters}
+    resolved_parameters = (
+        _component_parameter(components, parameter) for parameter in parameters
+    )
+    existing = {
+        (parameter["in"], parameter["name"]) for parameter in resolved_parameters
+    }
     parameters.extend(
         copy.deepcopy(parameter)
         for parameter in MESSAGE_PAGINATION_PARAMETERS
@@ -1011,7 +1049,7 @@ def add_draft_contract(
 
     create = collection["post"]
     create["description"] = DRAFT_SIDE_EFFECTS_DESCRIPTION
-    create_schema = schemas["WorkspaceDraft_Create"]
+    create_schema = _component_schema(schemas, "WorkspaceDraft_Create")
     create["requestBody"]["content"]["application/json"]["schema"] = {
         "type": "object",
         "required": ["uuid", "stream_uuid", "topic_uuid", "payload"],
@@ -1148,8 +1186,9 @@ def add_topic_summary_contract(
             ),
         },
     }
-    for name, schema in schemas.items():
+    for name in schemas:
         if name.startswith("WorkspaceUserTopic_"):
+            schema = _component_schema(schemas, name)
             schema["properties"].update(copy.deepcopy(summary_properties))
 
     topic_path = f"{root}stream_topics/{{WorkspaceUserTopicUuid}}"
@@ -1286,8 +1325,7 @@ def add_topic_summary_management_contract(
     )
     resource = specification["paths"][endpoint_path]
     resource["get"]["description"] = (
-        "Read a global endpoint. Requires "
-        "workspace.topic_summary_endpoint.manage."
+        "Read a global endpoint. Requires workspace.topic_summary_endpoint.manage."
     )
     resource["put"]["description"] = (
         "Update, enable, disable, or reprioritize a global endpoint. "
@@ -1297,8 +1335,7 @@ def add_topic_summary_management_contract(
     update_schema["minProperties"] = 1
     resource["put"]["requestBody"] = _request_body(update_schema)
     resource["delete"]["description"] = (
-        "Delete a global endpoint. Requires "
-        "workspace.topic_summary_endpoint.manage."
+        "Delete a global endpoint. Requires workspace.topic_summary_endpoint.manage."
     )
 
     settings_path = next(
@@ -1359,10 +1396,14 @@ def add_events_cursor_contract(
     specification: dict[str, typing.Any],
     events_path: str,
     epoch_path: str,
+    components: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
     operation = specification["paths"][events_path]["get"]
     parameters = operation.setdefault("parameters", [])
-    if not any(parameter["name"] == "epoch_generation" for parameter in parameters):
+    if not any(
+        _component_parameter(components, parameter)["name"] == "epoch_generation"
+        for parameter in parameters
+    ):
         parameters.append(
             {
                 "name": "epoch_generation",

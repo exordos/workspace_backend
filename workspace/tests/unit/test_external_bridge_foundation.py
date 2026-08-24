@@ -23,6 +23,14 @@ from workspace.messenger_api.dm import external_models
 from workspace.workspace_api.api import app as workspace_app
 
 
+def _component_parameter(specification, parameter):
+    reference = parameter.get("$ref")
+    if reference is None:
+        return parameter
+    name = reference.removeprefix("#/components/parameters/")
+    return specification["components"]["parameters"][name]
+
+
 def test_projected_external_metadata_round_trips_as_public_nested_contract():
     account_uuid = sys_uuid.uuid4()
     operation_uuid = sys_uuid.uuid4()
@@ -192,7 +200,10 @@ def test_zb_contract_001_public_openapi_exposes_exact_ui_boundary():
     reconnect = paths[
         "/v1/messenger/external_accounts/{ExternalAccountUuid}/actions/reconnect/invoke"
     ]["post"]
-    assert {parameter["name"] for parameter in reconnect["parameters"]} >= {
+    assert {
+        _component_parameter(specification, parameter)["name"]
+        for parameter in reconnect["parameters"]
+    } >= {
         "ExternalAccountUuid",
         "If-Match",
     }
@@ -221,10 +232,12 @@ def test_zb_contract_001_public_openapi_exposes_exact_ui_boundary():
     assert "/v1/messenger/external_operations/actions/preflight/invoke" in paths
     provider_policy = paths["/v1/messenger/external_provider_policies/{kind}"]
     assert {
-        parameter["name"] for parameter in provider_policy["get"]["parameters"]
+        _component_parameter(specification, parameter)["name"]
+        for parameter in provider_policy["get"]["parameters"]
     } == {"kind"}
     assert {
-        parameter["name"] for parameter in provider_policy["put"]["parameters"]
+        _component_parameter(specification, parameter)["name"]
+        for parameter in provider_policy["put"]["parameters"]
     } == {"kind", "If-Match"}
     assert provider_policy["put"]["parameters"][1]["required"] is True
     for method in ("get", "put"):
@@ -467,9 +480,7 @@ def test_external_operation_preflight_uses_effective_chat_capability(
         selected=True,
         status=chat_status,
         transition_pending=False,
-        capabilities={
-            "messenger.message.send": {"available": chat_available}
-        },
+        capabilities={"messenger.message.send": {"available": chat_available}},
     )
     monkeypatch.setattr(
         controllers.external_models.ExternalAccount,
