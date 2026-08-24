@@ -239,11 +239,18 @@ def repair_external_chat_assignments(
     provider_kind: str,
     limit: int = 100,
 ) -> int:
-    """Re-emit selected chat assignments that are absent or behind."""
+    """Repair and re-emit selected chat assignments that are absent or behind."""
     rows = session.execute(
         """
-        SELECT chat.uuid, projection_repair.required AS repair_projection
+        SELECT chat.uuid,
+               projection_repair.required AS repair_projection,
+               COALESCE(
+                   account.settings->>'history_depth',
+                   chat.history_depth
+               ) AS account_history_depth
         FROM m_external_chats_v2 AS chat
+        JOIN m_external_accounts_v2 AS account
+          ON account.uuid = chat.external_account_uuid
         LEFT JOIN m_external_bridge_desired_resources_v1 AS desired
           ON desired.bridge_instance_uuid = %s
          AND desired.provider_kind = %s
@@ -308,6 +315,11 @@ def repair_external_chat_assignments(
               desired.resource_uuid IS NULL
               OR desired.generation < chat.revision
               OR projection_repair.required
+              OR chat.history_depth IS DISTINCT FROM
+                 COALESCE(
+                     account.settings->>'history_depth',
+                     chat.history_depth
+                 )
           )
         ORDER BY chat.uuid
         LIMIT %s
@@ -326,6 +338,10 @@ def repair_external_chat_assignments(
             filters={"uuid": dm_filters.EQ(row["uuid"])},
             session=session,
         )
+        history_depth_repaired = chat.history_depth != row["account_history_depth"]
+        projection_stream_uuid = chat.projection_stream_uuid
+        source = chat.source
+        projection_changed = False
         projection_repaired = False
         if row["repair_projection"]:
             (
@@ -344,28 +360,33 @@ def repair_external_chat_assignments(
                 or projection_stream_uuid != chat.projection_stream_uuid
                 or source != chat.source
             )
-            if projection_repaired:
-                session.execute(
-                    """
-                    UPDATE m_external_chats_v2
-                    SET projection_stream_uuid = %s,
-                        source = %s::jsonb,
-                        revision = revision + 1,
-                        updated_at = NOW()
-                    WHERE uuid = %s
-                    """,
-                    (
-                        projection_stream_uuid,
-                        _json(source),
-                        chat.uuid,
-                    ),
-                )
-                chat = external_models.ExternalChat.objects.get_one(
-                    filters={"uuid": dm_filters.EQ(row["uuid"])},
-                    session=session,
-                )
-                if projection_changed:
-                    identity_linking.invalidate_direct_event_history(session)
+        if projection_repaired or history_depth_repaired:
+            session.execute(
+                """
+                UPDATE m_external_chats_v2
+                SET projection_stream_uuid = %s,
+                    source = %s::jsonb,
+                    history_depth = %s,
+                    status = CASE WHEN %s THEN %s ELSE status END,
+                    revision = revision + 1,
+                    updated_at = NOW()
+                WHERE uuid = %s
+                """,
+                (
+                    projection_stream_uuid,
+                    _json(source),
+                    row["account_history_depth"],
+                    history_depth_repaired,
+                    external_models.ExternalChatStatus.SYNCING.value,
+                    chat.uuid,
+                ),
+            )
+            chat = external_models.ExternalChat.objects.get_one(
+                filters={"uuid": dm_filters.EQ(row["uuid"])},
+                session=session,
+            )
+            if projection_changed:
+                identity_linking.invalidate_direct_event_history(session)
         change_uuid = append_upsert(
             session,
             sys_uuid.UUID(str(bridge_instance_uuid)),
@@ -373,7 +394,7 @@ def repair_external_chat_assignments(
             external_chat_assignment_desired(chat, session=session),
         )
         repaired += int(change_uuid is not None)
-        if projection_repaired:
+        if projection_repaired or history_depth_repaired:
             messenger_events.create_external_resource_event(
                 chat.project_id,
                 chat.owner_user_uuid,
@@ -1853,7 +1874,8 @@ class SQLControlState:
             raise ValueError("External chat catalog ownership is invalid")
         existing = session.execute(
             """
-            SELECT uuid, selected, project_id, projection_stream_uuid, source
+            SELECT uuid, selected, project_id, history_depth,
+                   projection_stream_uuid, source
             FROM m_external_chats_v2
             WHERE external_account_uuid = %s AND provider_chat_id = %s
             FOR UPDATE
@@ -2111,6 +2133,14 @@ class SQLControlState:
             else project_uuid
         )
         selection_all = account["settings"].get("selection_mode") == "all"
+        history_depth = account["settings"].get(
+            "history_depth",
+            (
+                existing["history_depth"]
+                if existing is not None
+                else external_models.DEFAULT_EXTERNAL_HISTORY_DEPTH
+            ),
+        )
         maximum = account["limits"].get("max_selected_chats_per_account")
         if not isinstance(maximum, int):
             maximum = 0
@@ -2141,16 +2171,18 @@ class SQLControlState:
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
                 provider_chat_id, source, display_name, selected, project_id,
-                projection_stream_uuid, status, capabilities, catalog_capabilities
+                history_depth, projection_stream_uuid, status, capabilities,
+                catalog_capabilities
             ) VALUES (
                 %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
-                %s::jsonb, %s::jsonb
+                %s, %s::jsonb, %s::jsonb
             )
             ON CONFLICT (uuid) DO UPDATE SET
                 source = EXCLUDED.source,
                 display_name = EXCLUDED.display_name,
                 projection_stream_uuid = EXCLUDED.projection_stream_uuid,
                 catalog_capabilities = EXCLUDED.catalog_capabilities,
+                history_depth = EXCLUDED.history_depth,
                 selected = m_external_chats_v2.selected OR EXCLUDED.selected,
                 project_id = CASE
                     WHEN m_external_chats_v2.selected
@@ -2158,6 +2190,10 @@ class SQLControlState:
                     ELSE EXCLUDED.project_id
                 END,
                 status = CASE
+                    WHEN m_external_chats_v2.selected
+                     AND m_external_chats_v2.history_depth IS DISTINCT FROM
+                         EXCLUDED.history_depth
+                    THEN 'syncing'
                     WHEN m_external_chats_v2.selected
                     THEN m_external_chats_v2.status
                     ELSE EXCLUDED.status
@@ -2179,6 +2215,7 @@ class SQLControlState:
                 catalog["display_name"].strip(),
                 select_discovered,
                 project_uuid if select_discovered else None,
+                history_depth,
                 projection_stream_uuid,
                 "syncing" if select_discovered else "available",
                 _json(catalog["capabilities"]),

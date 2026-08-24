@@ -249,6 +249,10 @@ class ExternalChatApplicationService:
         for name, value in {
             "selected": True,
             "project_id": actor.project_id,
+            "history_depth": account.settings.get(
+                "history_depth",
+                chat.history_depth,
+            ),
             "status": external_models.ExternalChatStatus.SYNCING.value,
             "revision": chat.revision + 1,
         }.items():

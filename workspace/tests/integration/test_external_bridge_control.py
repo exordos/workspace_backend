@@ -3116,7 +3116,6 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         "kind": "zulip",
         "server_url": "https://zulip.example.test",
         "selection_mode": "explicit",
-        "history_depth": "30_days",
         "default_project_id": str(project_uuid),
     }
     with db.cursor() as cursor:
@@ -3215,6 +3214,26 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
     assert _request_call(repository.observed_reports, identity, [upsert])["results"][0][
         "status"
     ] == ("applied")
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT history_depth FROM m_external_chats_v2 WHERE uuid = %s",
+            (chat_uuid,),
+        )
+        assert cursor.fetchone()[0] == "30_days"
+        cursor.execute(
+            "UPDATE m_external_chats_v2 SET history_depth = '90_days' WHERE uuid = %s",
+            (chat_uuid,),
+        )
+    repeated = catalog_report(chat_uuid, 1)
+    assert _request_call(repository.observed_reports, identity, [repeated])["results"][
+        0
+    ]["status"] == "applied"
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT history_depth FROM m_external_chats_v2 WHERE uuid = %s",
+            (chat_uuid,),
+        )
+        assert cursor.fetchone()[0] == "90_days"
 
     invalid_direct_uuid = sys_uuid.uuid4()
     invalid_direct = catalog_report(invalid_direct_uuid, 1)
@@ -3351,7 +3370,10 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         cursor.execute(
             """
             UPDATE m_external_accounts_v2
-            SET settings = jsonb_set(settings, '{selection_mode}', '"all"'),
+            SET settings = jsonb_set(
+                    jsonb_set(settings, '{selection_mode}', '"all"'),
+                    '{history_depth}', '"all"'
+                ),
                 desired_generation = 2
             WHERE uuid = %s
             """,
@@ -3369,12 +3391,12 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
     with db.cursor() as cursor:
         cursor.execute(
             """
-            SELECT selected, project_id, status
+            SELECT selected, project_id, status, history_depth
             FROM m_external_chats_v2 WHERE uuid = %s
             """,
             (selected_uuid,),
         )
-        assert cursor.fetchone() == (True, project_uuid, "syncing")
+        assert cursor.fetchone() == (True, project_uuid, "syncing", "all")
         cursor.execute(
             """
             SELECT operation, generation, resource
@@ -3385,6 +3407,7 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         )
         operation, generation, assignment = cursor.fetchone()
         assert (operation, generation) == ("upsert", 1)
+        assert assignment["history_depth"] == "all"
         projection = assignment["workspace_projection"]
         assert projection["stream"] == {
             "uuid": str(
@@ -3558,6 +3581,45 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
             (selected_uuid,),
         )
         assert cursor.fetchone() == ("live", 2)
+
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET history_depth = '30_days'
+            WHERE uuid = %s
+            """,
+            (selected_uuid,),
+        )
+    with session_factory() as session:
+        assert (
+            sql_state.repair_external_chat_assignments(
+                session,
+                account_uuid,
+                instance_uuid,
+                "zulip",
+            )
+            == 1
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT history_depth, status, revision
+            FROM m_external_chats_v2
+            WHERE uuid = %s
+            """,
+            (selected_uuid,),
+        )
+        assert cursor.fetchone() == ("all", "syncing", 3)
+        cursor.execute(
+            """
+            SELECT generation, resource->>'history_depth'
+            FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            """,
+            (selected_uuid,),
+        )
+        assert cursor.fetchone() == (3, "all")
 
 
 def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
