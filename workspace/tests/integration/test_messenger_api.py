@@ -1145,7 +1145,12 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
-def test_external_account_history_depth_requeues_selected_chat_assignments(api, db):
+@pytest.mark.parametrize("account_history_depth", ["30_days", "all"])
+def test_external_account_history_depth_requeues_selected_chat_assignments(
+    api,
+    db,
+    account_history_depth,
+):
     _enable_zulip_policy(db)
     realm_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
@@ -1167,7 +1172,7 @@ def test_external_account_history_depth_requeues_selected_chat_assignments(api, 
                     "email": "owner@example.invalid",
                     "api_key": "provider-secret",
                     "selection_mode": "explicit",
-                    "history_depth": "30_days",
+                    "history_depth": account_history_depth,
                     "default_project_id": api.project_id,
                 },
             },
@@ -1274,7 +1279,16 @@ def test_external_account_history_depth_requeues_selected_chat_assignments(api, 
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
-def test_external_chat_can_be_selected_again_after_deselect(api, db):
+@pytest.mark.parametrize(
+    ("account_history_depth", "expected_history_depth"),
+    [("all", "all"), (None, "30_days")],
+)
+def test_external_chat_can_be_selected_again_after_deselect(
+    api,
+    db,
+    account_history_depth,
+    expected_history_depth,
+):
     _enable_zulip_policy(db)
     bridge_instance_uuid, key_uuid, _ = _seed_zulip_bridge_target(db)
     account_uuid = sys_uuid.uuid4()
@@ -1304,6 +1318,14 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
             }
         ],
     }
+    account_settings = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.invalid",
+        "selection_mode": "explicit",
+        "default_project_id": api.project_id,
+    }
+    if account_history_depth is not None:
+        account_settings["history_depth"] = account_history_depth
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -1315,15 +1337,7 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
             (
                 account_uuid,
                 api.user_uuid,
-                json.dumps(
-                    {
-                        "kind": "zulip",
-                        "server_url": "https://zulip.example.invalid",
-                        "selection_mode": "explicit",
-                        "history_depth": "30_days",
-                        "default_project_id": api.project_id,
-                    }
-                ),
+                json.dumps(account_settings),
             ),
         )
         cursor.execute(
@@ -1350,10 +1364,10 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
                 provider_chat_id, source, display_name, selected, project_id,
-                projection_stream_uuid, status
+                history_depth, projection_stream_uuid, status
             ) VALUES (
                 %s, %s, %s, 'zulip', 'channel:42', %s::jsonb, 'Engineering',
-                FALSE, NULL, NULL, 'deselected'
+                FALSE, NULL, '30_days', NULL, 'deselected'
             )
             """,
             (chat_uuid, account_uuid, api.user_uuid, json.dumps(source)),
@@ -1370,10 +1384,12 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
         f"{chat_uuid}:stream:canonical",
     )
     assert selected.json()["projection_stream_uuid"] == str(expected_stream_uuid)
+    assert selected.json()["history_depth"] == expected_history_depth
     with db.cursor() as cursor:
         cursor.execute(
             """
-            SELECT selected, project_id, projection_stream_uuid, status
+            SELECT selected, project_id, history_depth, projection_stream_uuid,
+                   status
             FROM m_external_chats_v2 WHERE uuid = %s
             """,
             (chat_uuid,),
@@ -1381,9 +1397,24 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
         assert cursor.fetchone() == (
             True,
             sys_uuid.UUID(api.project_id),
+            expected_history_depth,
             expected_stream_uuid,
             "syncing",
         )
+        cursor.execute(
+            """
+            SELECT generation, resource
+            FROM m_external_bridge_desired_changes_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (chat_uuid,),
+        )
+        generation, resource = cursor.fetchone()
+        assert generation == 2
+        assert resource["history_depth"] == expected_history_depth
         cursor.execute(
             """
             SELECT COUNT(*) FROM m_workspace_streams

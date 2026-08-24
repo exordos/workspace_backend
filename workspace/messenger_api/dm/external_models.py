@@ -19,6 +19,7 @@ class ExternalProvider(str, enum.Enum):
 
 EXTERNAL_SELECTION_MODES = ("explicit", "all")
 EXTERNAL_HISTORY_DEPTHS = ("new", "7_days", "30_days", "90_days", "all")
+DEFAULT_EXTERNAL_HISTORY_DEPTH = "30_days"
 
 
 class ZulipAccountCreateSettings(types_dynamic.AbstractKindModel):
@@ -42,7 +43,7 @@ class ZulipAccountCreateSettings(types_dynamic.AbstractKindModel):
     )
     history_depth = properties.property(
         types.Enum(EXTERNAL_HISTORY_DEPTHS),
-        default="30_days",
+        default=DEFAULT_EXTERNAL_HISTORY_DEPTH,
     )
     default_project_id = properties.property(types.UUID(), required=True)
 
@@ -64,7 +65,7 @@ class ZulipAccountSettings(types_dynamic.AbstractKindModel):
     )
     history_depth = properties.property(
         types.Enum(EXTERNAL_HISTORY_DEPTHS),
-        default="30_days",
+        default=DEFAULT_EXTERNAL_HISTORY_DEPTH,
     )
     default_project_id = properties.property(types.UUID(), required=True)
 
@@ -253,7 +254,7 @@ class ExternalChat(RevisionTimestampModel, orm.SQLStorableMixin):
     project_id = properties.property(types.AllowNone(types.UUID()), default=None)
     history_depth = properties.property(
         types.Enum(EXTERNAL_HISTORY_DEPTHS),
-        default="30_days",
+        default=DEFAULT_EXTERNAL_HISTORY_DEPTH,
         read_only=True,
     )
     projection_stream_uuid = properties.property(
