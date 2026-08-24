@@ -1424,7 +1424,6 @@ class ExternalAccountController(ExternalResourceController):
             raise ra_exc.ValidationErrorException()
         account = self._get_account(uuid)
         self._required_if_match(account)
-        previous_history_depth = account.settings["history_depth"]
         update_settings = self._settings(
             external_models.EXTERNAL_ACCOUNT_UPDATE_SETTINGS_TYPE,
             kwargs["settings"],
@@ -1443,46 +1442,47 @@ class ExternalAccountController(ExternalResourceController):
         )
         credential = self._credential(account, session)
         self._append_desired(account, credential, session)
-        if account.settings["history_depth"] != previous_history_depth:
-            bridge_instance_uuid = credential.envelope["associated_data"][
-                "bridge_instance_uuid"
-            ]
-            chats = external_models.ExternalChat.objects.get_all(
-                filters={
-                    "external_account_uuid": dm_filters.EQ(account.uuid),
-                },
-                session=session,
-            )
-            for chat in chats:
-                values = {
-                    "history_depth": account.settings["history_depth"],
-                    "revision": chat.revision + 1,
-                }
-                if chat.selected:
-                    values["status"] = external_models.ExternalChatStatus.SYNCING.value
-                _update_internal_fields(chat, values, session=session)
-                if chat.selected:
-                    sql_state.append_upsert(
-                        session,
-                        bridge_instance_uuid,
-                        chat.provider,
-                        sql_state.external_chat_assignment_desired(
-                            chat,
-                            session=session,
-                        ),
-                    )
-                    messenger_events.create_external_resource_event(
-                        chat.project_id,
-                        chat.owner_user_uuid,
+        bridge_instance_uuid = credential.envelope["associated_data"][
+            "bridge_instance_uuid"
+        ]
+        chats = external_models.ExternalChat.objects.get_all(
+            filters={
+                "external_account_uuid": dm_filters.EQ(account.uuid),
+            },
+            session=session,
+        )
+        for chat in chats:
+            if chat.history_depth == account.settings["history_depth"]:
+                continue
+            values = {
+                "history_depth": account.settings["history_depth"],
+                "revision": chat.revision + 1,
+            }
+            if chat.selected:
+                values["status"] = external_models.ExternalChatStatus.SYNCING.value
+            _update_internal_fields(chat, values, session=session)
+            if chat.selected:
+                sql_state.append_upsert(
+                    session,
+                    bridge_instance_uuid,
+                    chat.provider,
+                    sql_state.external_chat_assignment_desired(
                         chat,
-                        messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
-                        hidden_fields=(
-                            "owner_user_uuid",
-                            "provider",
-                            "provider_chat_id",
-                        ),
                         session=session,
-                    )
+                    ),
+                )
+                messenger_events.create_external_resource_event(
+                    chat.project_id,
+                    chat.owner_user_uuid,
+                    chat,
+                    messenger_events.EXTERNAL_CHAT_UPDATED_EVENT,
+                    hidden_fields=(
+                        "owner_user_uuid",
+                        "provider",
+                        "provider_chat_id",
+                    ),
+                    session=session,
+                )
         self._emit_event(
             account,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
@@ -2062,6 +2062,10 @@ class ExternalChatController(ExternalResourceController):
             "revision": resource.revision + 1,
         }
         if selected:
+            values["history_depth"] = account.settings.get(
+                "history_depth",
+                resource.history_depth,
+            )
             values["projection_stream_uuid"] = projection_stream_uuid
             if projection_source != resource.source:
                 values["source"] = projection_source
@@ -2342,7 +2346,12 @@ class ExternalOperationController(ExternalResourceController):
         ):
             raise ra_exc.ValidationErrorException()
         return {
-            "allowed": account.live_ready and available,
+            "allowed": available
+            and (
+                account.live_ready
+                or account.status
+                == external_models.ExternalAccountStatus.BACKFILL.value
+            ),
             "action": action,
             "target": target,
             "losses": losses,

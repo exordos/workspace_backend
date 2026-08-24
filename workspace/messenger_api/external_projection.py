@@ -53,11 +53,11 @@ def _merge_topic_flags(
         """
         INSERT INTO m_workspace_user_topic_flags (
             uuid, user_uuid, project_id, is_done, notification_mode,
-            created_at, updated_at
+            notification_updated_at, created_at, updated_at
         )
         SELECT
             %s, user_uuid, project_id, is_done, notification_mode,
-            created_at, updated_at
+            notification_updated_at, created_at, updated_at
         FROM m_workspace_user_topic_flags
         WHERE project_id = %s AND uuid = %s
         ON CONFLICT (uuid, user_uuid) DO UPDATE
@@ -66,10 +66,15 @@ def _merge_topic_flags(
                 OR EXCLUDED.is_done
             ),
             notification_mode = CASE
-                WHEN m_workspace_user_topic_flags.notification_mode = 'default'
-                THEN EXCLUDED.notification_mode
-                ELSE m_workspace_user_topic_flags.notification_mode
+                WHEN m_workspace_user_topic_flags.notification_updated_at
+                    >= EXCLUDED.notification_updated_at
+                THEN m_workspace_user_topic_flags.notification_mode
+                ELSE EXCLUDED.notification_mode
             END,
+            notification_updated_at = GREATEST(
+                m_workspace_user_topic_flags.notification_updated_at,
+                EXCLUDED.notification_updated_at
+            ),
             updated_at = GREATEST(
                 m_workspace_user_topic_flags.updated_at,
                 EXCLUDED.updated_at

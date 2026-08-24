@@ -42,6 +42,8 @@ _OPERATION_CAPABILITIES = {
     "reaction.delete": "messenger.reaction.write",
     "membership.add": "messenger.membership.write",
     "membership.remove": "messenger.membership.write",
+    "stream.notification.update": "messenger.notification.write",
+    "topic.notification.update": "messenger.notification.write",
     "stream.delete": "messenger.stream.delete",
     "topic.create": "messenger.topic.create",
     "stream.update": "messenger.stream.rename",
@@ -350,7 +352,7 @@ def resolve_provider_target(
     external_models.ExternalChat,
     external_models.ExternalBridgeInstance,
 ]:
-    """Resolve one live selected chat and its bridge in the caller transaction."""
+    """Resolve one provider-capable selected chat and its bridge."""
     account = external_models.ExternalAccount.objects.get_one(
         filters={
             "uuid": dm_filters.EQ(external_account_uuid),
@@ -386,7 +388,11 @@ def resolve_provider_target(
         raise ProviderUnavailableError("External chat is not live and selected")
     chat = chats[0]
     if (
-        not account.live_ready
+        (
+            not account.live_ready
+            and account.status
+            != external_models.ExternalAccountStatus.BACKFILL.value
+        )
         or not _effective_capability_available(account.capabilities, capability_name)
         or not _effective_capability_available(chat.capabilities, capability_name)
     ):

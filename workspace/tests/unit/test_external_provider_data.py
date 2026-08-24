@@ -139,6 +139,37 @@ def test_membership_lease_requires_write_capability(operation_kind):
     )
 
 
+@pytest.mark.parametrize(
+    "operation_kind",
+    ["stream.notification.update", "topic.notification.update"],
+)
+def test_notification_lease_requires_write_capability(operation_kind):
+    now = datetime.datetime(2026, 8, 23, tzinfo=datetime.timezone.utc)
+    session = CapabilityLeaseSession(
+        {"messenger.notification.write": {"revision": 1}},
+        now,
+    )
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    provider_data.lease_provider_operations(
+        session,
+        identity,
+        request_uuid=sys_uuid.uuid4(),
+        limit=10,
+        lease_seconds=30,
+        now=now,
+    )
+
+    assert operation_kind in session.allowed_kinds
+    assert provider_data._required_capability(operation_kind) == (
+        "messenger.notification.write"
+    )
+
+
 def test_enqueue_operation_reuses_caller_transaction(monkeypatch):
     inserted = []
     events = []
@@ -213,6 +244,7 @@ def test_resolve_provider_target_intersects_account_and_chat_capabilities(monkey
     account = types.SimpleNamespace(
         uuid=sys_uuid.uuid4(),
         provider="zulip",
+        status="live",
         live_ready=True,
         capabilities={"messenger.message.send": {"available": True}},
     )
@@ -262,6 +294,63 @@ def test_resolve_provider_target_intersects_account_and_chat_capabilities(monkey
     assert policy_checks[0][0][1] == "zulip"
     assert policy_checks[0][1]["capability_name"] == "messenger.message.send"
     assert policy_checks[0][1]["capabilities"] is account.capabilities
+
+
+def test_resolve_provider_target_allows_capable_chat_during_backfill(monkeypatch):
+    account = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        provider="zulip",
+        status="backfill",
+        live_ready=False,
+        capabilities={"messenger.message.send": {"available": True}},
+    )
+    chat = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        capabilities={"messenger.message.send": {"available": True}},
+    )
+    bridge = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalAccount,
+        "objects",
+        types.SimpleNamespace(get_one=lambda **kwargs: account),
+    )
+    chat_calls = []
+    monkeypatch.setattr(
+        provider_data.external_models.ExternalChat,
+        "objects",
+        types.SimpleNamespace(
+            get_all=lambda **kwargs: chat_calls.append(kwargs) or [chat]
+        ),
+    )
+    monkeypatch.setattr(
+        provider_data,
+        "_require_current_provider_policy",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        provider_data,
+        "_lock_associated_bridge",
+        lambda *args, **kwargs: bridge,
+    )
+    input_checks = []
+    monkeypatch.setattr(
+        provider_data,
+        "_require_current_provider_inputs",
+        lambda *args, **kwargs: input_checks.append((args, kwargs)),
+    )
+
+    assert provider_data.resolve_provider_target(
+        object(),
+        project_id=sys_uuid.uuid4(),
+        owner_user_uuid=sys_uuid.uuid4(),
+        external_account_uuid=account.uuid,
+        stream_uuid=sys_uuid.uuid4(),
+        capability_name="messenger.message.send",
+    ) == (account, chat, bridge)
+    statuses = chat_calls[0]["filters"]["status"].value
+    assert set(statuses) == {"syncing", "live"}
+    assert input_checks[0][1]["chat_uuid"] == chat.uuid
 
 
 def test_resolve_provider_queue_target_preserves_route_without_capability(monkeypatch):
@@ -638,9 +727,7 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
     assert "UPDATE m_workspace_messages" in statements[0][0]
     assert statements[0][1][1:4] == ("delivered", None, updated_at)
     assert target_queries[0]["session"] is session
-    assert target_events == [
-        ((project_uuid, target_resource), {"session": session})
-    ]
+    assert target_events == [((project_uuid, target_resource), {"session": session})]
 
 
 def test_retry_operation_requeues_existing_provider_row():

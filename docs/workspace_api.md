@@ -1208,6 +1208,11 @@ stream mode. A stream in `mentions_only` likewise places only direct mentions
 in `active_unread_count`; all remaining raw unread messages stay in
 `passive_unread_count`.
 
+For provider-backed Zulip streams and topics, notification actions are queued
+for the provider in the same transaction. Provider updates are applied back to
+Workspace with a per-setting timestamp, so an older update cannot replace a
+newer one.
+
 Topic read action:
 
 ```http

@@ -1145,7 +1145,12 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
-def test_external_account_history_depth_requeues_selected_chat_assignments(api, db):
+@pytest.mark.parametrize("account_history_depth", ["30_days", "all"])
+def test_external_account_history_depth_requeues_selected_chat_assignments(
+    api,
+    db,
+    account_history_depth,
+):
     _enable_zulip_policy(db)
     realm_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
@@ -1167,7 +1172,7 @@ def test_external_account_history_depth_requeues_selected_chat_assignments(api, 
                     "email": "owner@example.invalid",
                     "api_key": "provider-secret",
                     "selection_mode": "explicit",
-                    "history_depth": "30_days",
+                    "history_depth": account_history_depth,
                     "default_project_id": api.project_id,
                 },
             },
@@ -1274,7 +1279,16 @@ def test_external_account_history_depth_requeues_selected_chat_assignments(api, 
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
-def test_external_chat_can_be_selected_again_after_deselect(api, db):
+@pytest.mark.parametrize(
+    ("account_history_depth", "expected_history_depth"),
+    [("all", "all"), (None, "30_days")],
+)
+def test_external_chat_can_be_selected_again_after_deselect(
+    api,
+    db,
+    account_history_depth,
+    expected_history_depth,
+):
     _enable_zulip_policy(db)
     bridge_instance_uuid, key_uuid, _ = _seed_zulip_bridge_target(db)
     account_uuid = sys_uuid.uuid4()
@@ -1304,6 +1318,14 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
             }
         ],
     }
+    account_settings = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.invalid",
+        "selection_mode": "explicit",
+        "default_project_id": api.project_id,
+    }
+    if account_history_depth is not None:
+        account_settings["history_depth"] = account_history_depth
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -1315,15 +1337,7 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
             (
                 account_uuid,
                 api.user_uuid,
-                json.dumps(
-                    {
-                        "kind": "zulip",
-                        "server_url": "https://zulip.example.invalid",
-                        "selection_mode": "explicit",
-                        "history_depth": "30_days",
-                        "default_project_id": api.project_id,
-                    }
-                ),
+                json.dumps(account_settings),
             ),
         )
         cursor.execute(
@@ -1350,10 +1364,10 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
             INSERT INTO m_external_chats_v2 (
                 uuid, external_account_uuid, owner_user_uuid, provider,
                 provider_chat_id, source, display_name, selected, project_id,
-                projection_stream_uuid, status
+                history_depth, projection_stream_uuid, status
             ) VALUES (
                 %s, %s, %s, 'zulip', 'channel:42', %s::jsonb, 'Engineering',
-                FALSE, NULL, NULL, 'deselected'
+                FALSE, NULL, '30_days', NULL, 'deselected'
             )
             """,
             (chat_uuid, account_uuid, api.user_uuid, json.dumps(source)),
@@ -1370,10 +1384,12 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
         f"{chat_uuid}:stream:canonical",
     )
     assert selected.json()["projection_stream_uuid"] == str(expected_stream_uuid)
+    assert selected.json()["history_depth"] == expected_history_depth
     with db.cursor() as cursor:
         cursor.execute(
             """
-            SELECT selected, project_id, projection_stream_uuid, status
+            SELECT selected, project_id, history_depth, projection_stream_uuid,
+                   status
             FROM m_external_chats_v2 WHERE uuid = %s
             """,
             (chat_uuid,),
@@ -1381,9 +1397,24 @@ def test_external_chat_can_be_selected_again_after_deselect(api, db):
         assert cursor.fetchone() == (
             True,
             sys_uuid.UUID(api.project_id),
+            expected_history_depth,
             expected_stream_uuid,
             "syncing",
         )
+        cursor.execute(
+            """
+            SELECT generation, resource
+            FROM m_external_bridge_desired_changes_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (chat_uuid,),
+        )
+        generation, resource = cursor.fetchone()
+        assert generation == 2
+        assert resource["history_depth"] == expected_history_depth
         cursor.execute(
             """
             SELECT COUNT(*) FROM m_workspace_streams
@@ -1486,7 +1517,10 @@ def test_external_provider_policy_blocks_account_and_operation_boundaries(
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
 
-def test_provider_operation_resolution_uses_current_administrative_policy(api, db):
+def test_provider_operation_resolution_allows_backfill_and_uses_current_policy(
+    api,
+    db,
+):
     _enable_zulip_policy(db)
     bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
     account_uuid = sys_uuid.uuid4()
@@ -1497,8 +1531,16 @@ def test_provider_operation_resolution_uses_current_administrative_policy(api, d
         api.user_uuid,
         "Current policy gate",
     )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
     capability = {
-        "messenger.message.read": {
+        "messenger.message.send": {
             "available": True,
             "revision": 1,
             "limits": {},
@@ -1578,6 +1620,29 @@ def test_provider_operation_resolution_uses_current_administrative_policy(api, d
             """,
             (json.dumps(capability), bridge_uuid),
         )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:current-policy'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.invalid",
+                        "source_scope": str(account_uuid),
+                    }
+                ),
+                account_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
     db.commit()
 
     def resolve():
@@ -1588,11 +1653,99 @@ def test_provider_operation_resolution_uses_current_administrative_policy(api, d
                 owner_user_uuid=api.user_uuid,
                 external_account_uuid=account_uuid,
                 stream_uuid=stream_uuid,
-                capability_name="messenger.message.read",
+                capability_name="messenger.message.send",
             )
         )
 
     assert resolve()[0].uuid == account_uuid
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'backfill', live_ready = FALSE
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET status = 'syncing'
+            WHERE uuid = %s
+            """,
+            (chat_uuid,),
+        )
+    db.commit()
+    assert resolve()[0].uuid == account_uuid
+    preflight = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "stream", "uuid": str(stream_uuid)},
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["allowed"] is True
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "payload": {"kind": "markdown", "content": "during backfill"},
+        },
+    )
+    assert message.status_code == 201, message.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT queue.operation_kind, operation.target_uuid
+            FROM m_external_provider_operations_v1 AS queue
+            JOIN m_external_operations_v2 AS operation
+              ON operation.uuid = queue.external_operation_uuid
+            WHERE queue.external_account_uuid = %s
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone() == (
+            "message.create",
+            sys_uuid.UUID(message.json()["uuid"]),
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'connecting'
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+    db.commit()
+    with pytest.raises(provider_data.ProviderUnavailableError):
+        resolve()
+    preflight = api.post(
+        f"{EXTERNAL_OPERATIONS}actions/preflight/invoke",
+        json={
+            "external_account_uuid": str(account_uuid),
+            "action": "messenger.message.send",
+            "target": {"type": "stream", "uuid": str(stream_uuid)},
+        },
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["allowed"] is False
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'backfill'
+            WHERE uuid = %s
+            """,
+            (account_uuid,),
+        )
+    db.commit()
 
     with db.cursor() as cursor:
         cursor.execute(

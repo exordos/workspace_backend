@@ -185,7 +185,14 @@ def test_assignment_repair_locks_chats_and_requires_distinct_verified_users():
         == 0
     )
     statement, _params = calls[0]
+    normalized = " ".join(statement.split())
     assert "COUNT(DISTINCT workspace_user.uuid)" in statement
+    assert "JOIN m_external_accounts_v2 AS account" in statement
+    assert (
+        "chat.history_depth IS DISTINCT FROM COALESCE( "
+        "account.settings->>'history_depth', chat.history_depth )"
+        in normalized
+    )
     assert "FOR UPDATE OF chat SKIP LOCKED" in statement
 
 

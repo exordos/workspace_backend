@@ -216,7 +216,15 @@ def test_external_account_controller_rejects_missing_exact_permission(monkeypatc
     assert called == []
 
 
-def test_external_chat_select_materialized_reuses_the_caller_session(monkeypatch):
+@pytest.mark.parametrize(
+    ("account_history_depth", "expected_history_depth"),
+    [("all", "all"), (None, "90_days")],
+)
+def test_external_chat_select_materialized_reuses_the_caller_session(
+    monkeypatch,
+    account_history_depth,
+    expected_history_depth,
+):
     session = object()
     owner_uuid = sys_uuid.uuid4()
     project_uuid = sys_uuid.uuid4()
@@ -239,14 +247,29 @@ def test_external_chat_select_materialized_reuses_the_caller_session(monkeypatch
         projection_stream_uuid=stream_uuid,
         provider="zulip",
         selected=False,
+        history_depth="90_days",
         revision=4,
         properties={
             name: Property(name)
-            for name in ("selected", "project_id", "status", "revision")
+            for name in (
+                "selected",
+                "project_id",
+                "history_depth",
+                "status",
+                "revision",
+            )
         },
         update=lambda *, session: calls.append(("chat.update", session)),
     )
-    account = types.SimpleNamespace(uuid=account_uuid, provider="zulip")
+    account = types.SimpleNamespace(
+        uuid=account_uuid,
+        provider="zulip",
+        settings=(
+            {}
+            if account_history_depth is None
+            else {"history_depth": account_history_depth}
+        ),
+    )
     credential = types.SimpleNamespace(
         envelope={"associated_data": {"bridge_instance_uuid": str(bridge_uuid)}}
     )
@@ -348,4 +371,5 @@ def test_external_chat_select_materialized_reuses_the_caller_session(monkeypatch
     assert append[2] == (str(bridge_uuid), "zulip", {"uuid": str(chat_uuid)})
     assert ("property.selected", True) in calls
     assert ("property.project_id", project_uuid) in calls
+    assert ("property.history_depth", expected_history_depth) in calls
     assert ("property.revision", 5) in calls
