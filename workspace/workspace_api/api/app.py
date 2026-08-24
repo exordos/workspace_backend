@@ -50,10 +50,12 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
                     operation["security"] = [{"bearerAuth": []}]
         specification = openapi_contract.add_collection_pagination_contract(
             specification,
+            components,
         )
         specification = openapi_contract.add_message_pagination_contract(
             specification,
             "/v1/messenger/messages/",
+            components,
         )
         specification = openapi_contract.add_draft_contract(
             specification,
@@ -79,6 +81,7 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             specification,
             "/v1/events/",
             "/v1/epoch/",
+            components,
         )
         return openapi_contract.add_current_user_contract(
             specification,
