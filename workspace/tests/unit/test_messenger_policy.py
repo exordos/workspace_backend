@@ -296,6 +296,8 @@ def test_message_mutations_use_current_scope_and_dedicated_store_operations(
             "read_up_to",
             {},
         ),
+        (controllers.WorkspaceMessageController, "messages", "star", {}),
+        (controllers.WorkspaceMessageController, "messages", "unstar", {}),
         (
             controllers.WorkspaceUserController,
             "users",
@@ -403,6 +405,8 @@ def test_route_permissions_and_action_owners_are_preserved():
         ),
         routes.WorkspaceMessageReadAction: controllers.WorkspaceMessageController,
         routes.WorkspaceMessageReadUpToAction: (controllers.WorkspaceMessageController),
+        routes.WorkspaceMessageStarAction: controllers.WorkspaceMessageController,
+        routes.WorkspaceMessageUnstarAction: controllers.WorkspaceMessageController,
         routes.WorkspaceFileDownloadAction: controllers.WorkspaceFileController,
     }
     for action_route, owner in expected_action_owners.items():

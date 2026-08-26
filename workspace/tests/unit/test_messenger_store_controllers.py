@@ -172,6 +172,29 @@ def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
     ]
 
 
+def test_message_star_actions_use_store_boundary(fake_store):
+    controller = _controller(controllers.WorkspaceMessageController)
+    resource = {"uuid": MESSAGE_UUID}
+
+    assert controllers.WorkspaceMessageController.star._post(controller, resource) == {
+        "uuid": MESSAGE_UUID
+    }
+    assert controllers.WorkspaceMessageController.unstar._post(
+        controller,
+        resource,
+    ) == {"uuid": MESSAGE_UUID}
+    assert fake_store.calls == [
+        ("action", "messages", MESSAGE_UUID, "star", {}),
+        ("action", "messages", MESSAGE_UUID, "unstar", {}),
+    ]
+    assert routes.WorkspaceMessageRoute.star.get_controller_class() is (
+        controllers.WorkspaceMessageController
+    )
+    assert routes.WorkspaceMessageRoute.unstar.get_controller_class() is (
+        controllers.WorkspaceMessageController
+    )
+
+
 def test_direct_chat_is_an_ordinary_stream_with_deterministic_pair_uuid(fake_store):
     controller = _controller(controllers.WorkspaceStreamController)
 

@@ -57,6 +57,13 @@ def _assert_message_pagination_contract(specification, operation):
     assert headers["X-Pagination-Marker"]["schema"]["format"] == "uuid"
 
 
+def _assert_message_star_actions(paths, message_path):
+    for action in ("star", "unstar"):
+        action_path = f"{message_path}/actions/{action}/invoke"
+        assert set(paths[action_path]) == {"post"}
+        assert "requestBody" not in paths[action_path]["post"]
+
+
 def _assert_multipart_object(operation, required):
     content = operation["requestBody"]["content"]
     assert set(content) == {"multipart/form-data"}
@@ -339,6 +346,10 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         specification,
         paths["/v1/messages/"]["get"],
     )
+    _assert_message_star_actions(
+        paths,
+        "/v1/messages/{WorkspaceUserMessageUuid}",
+    )
 
     add_users_path = "/v1/streams/{WorkspaceUserStreamUuid}/actions/add_users/invoke"
     assert set(paths[add_users_path]) == {"post"}
@@ -373,6 +384,10 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     paths = specification["paths"]
 
     assert "/v1/messenger/messages/" in paths
+    _assert_message_star_actions(
+        paths,
+        "/v1/messenger/messages/{WorkspaceUserMessageUuid}",
+    )
     assert not any(path.startswith("/v1/mail/") for path in paths)
     assert not any(path.startswith("/v1/calendar/") for path in paths)
     assert "/v1/providers/" not in paths

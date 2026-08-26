@@ -315,6 +315,8 @@ authoritative snapshots before starting a new cursor.
 | `DELETE` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Delete a message. |
 | `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read/invoke` | Mark message as read for the current user. |
 | `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read_up_to/invoke` | Mark unread messages in the same topic up to this message as read. |
+| `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/star/invoke` | Star message for the current user. |
+| `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/unstar/invoke` | Unstar message for the current user. |
 | `GET` | `/api/workspace/v1/messenger/drafts/` | List the current user's drafts, optionally filtered by stream or topic. |
 | `POST` | `/api/workspace/v1/messenger/drafts/` | Create a draft with a client-generated UUID. |
 | `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Get an owned draft and its strong revision ETag. |
@@ -1379,6 +1381,23 @@ message view. For an external chat, Workspace sends the already resolved UUID
 prefix as an exact selector; provider-specific message ordering cannot change
 which messages become read.
 
+Star and unstar actions:
+
+```http
+POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/star/invoke
+Authorization: Bearer <access_token>
+```
+
+```http
+POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/unstar/invoke
+Authorization: Bearer <access_token>
+```
+
+`star` and `unstar` set the current user's `starred` flag and return the
+updated message view. Both actions are idempotent. When the flag changes, the
+backend emits `message.updated` only for the current user. Star state is owned
+by Workspace and is not synchronized to an external provider.
+
 Realtime side effects:
 
 | Operation | payload.kind | object_type | Payload |
@@ -1390,6 +1409,7 @@ Realtime side effects:
 | create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` and `reaction_users` for every stream user. |
 | read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
 | read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
+| star or unstar message | `message.updated` | `message` | Full user message snapshot for the current user when the flag changes. |
 | delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
 | delete unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the deleted message was unread; UI derives folder aggregates from the stream snapshot. |
 

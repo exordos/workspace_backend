@@ -1816,6 +1816,14 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 target_uuid=resource_uuid,
                 provider_target=provider_target,
             )
+        elif resource == "messages" and action in {"star", "unstar"}:
+            row = helpers.sync_workspace_user_message_flags(
+                project_id=self.project_uuid,
+                user_uuid=self.user_uuid,
+                message_uuid=resource_uuid,
+                values={"starred": action == "star"},
+                session=contexts.Context().get_session(),
+            )
         elif resource == "users" and action == "presence":
             projection_values = {"status": values["status"]}
             if "emoji" in values:

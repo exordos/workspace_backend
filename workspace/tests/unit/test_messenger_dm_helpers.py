@@ -4678,6 +4678,65 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_update_workspace_user_message_flag_is_conditional_and_field_specific(
+        self,
+    ):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        cursor = types.SimpleNamespace(fetchone=mock.Mock(return_value={"uuid": message_uuid}))
+        session = types.SimpleNamespace(execute=mock.Mock(return_value=cursor))
+
+        changed = dm_helpers._update_workspace_user_message_flag(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="starred",
+            value=True,
+            session=session,
+        )
+
+        self.assertTrue(changed)
+        statement, params = session.execute.call_args.args
+        self.assertIn('SET "starred" = %s, updated_at = NOW()', statement)
+        self.assertIn('"starred" IS DISTINCT FROM %s', statement)
+        self.assertNotIn('SET "read"', statement)
+        self.assertNotIn('SET "pinned"', statement)
+        self.assertEqual(
+            (True, project_id, user_uuid, message_uuid, True),
+            params,
+        )
+
+    def test_update_workspace_user_message_flag_reports_atomic_noop(self):
+        cursor = types.SimpleNamespace(fetchone=mock.Mock(return_value=None))
+        session = types.SimpleNamespace(execute=mock.Mock(return_value=cursor))
+
+        changed = dm_helpers._update_workspace_user_message_flag(
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            message_uuid=sys_uuid.uuid4(),
+            field_name="read",
+            value=True,
+            session=session,
+        )
+
+        self.assertFalse(changed)
+
+    def test_update_workspace_user_message_flag_rejects_invalid_value(self):
+        session = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "must be boolean"):
+            dm_helpers._update_workspace_user_message_flag(
+                project_id=sys_uuid.uuid4(),
+                user_uuid=sys_uuid.uuid4(),
+                message_uuid=sys_uuid.uuid4(),
+                field_name="starred",
+                value="true",
+                session=session,
+            )
+
+        session.execute.assert_not_called()
+
     def test_sync_workspace_user_message_flags_marks_message_unread(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -4685,31 +4744,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         current_message = types.SimpleNamespace(
             author_uuid=author_uuid,
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
         )
         returned_message = types.SimpleNamespace(read=False)
-        updated_flag = {}
-
-        class ExistingFlags:
-            read = True
-            starred = False
-            pinned = False
-
-            def update_dm(self, values):
-                updated_flag["values"] = values
-                self.read = values["read"]
-
-            def update(self, session=None):
-                updated_flag["update_session"] = session
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=ExistingFlags())
-            )
 
         with (
             mock.patch.object(
@@ -4718,10 +4759,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 side_effect=[current_message, returned_message],
             ),
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=True,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
             ) as create_read_event,
@@ -4741,8 +4782,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(returned_message, result)
-        self.assertEqual({"read": False}, updated_flag["values"])
-        self.assertIs(session, updated_flag["update_session"])
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="read",
+            value=False,
+            session=session,
+        )
         create_read_event.assert_not_called()
         create_updated_event.assert_called_once_with(
             message=returned_message,
@@ -4760,21 +4807,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         current_message = types.SimpleNamespace(
             author_uuid=user_uuid,
             read=True,
         )
-        existing_flags = types.SimpleNamespace(
-            read=True,
-            starred=False,
-            pinned=False,
-        )
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=existing_flags)
-            )
 
         with (
             mock.patch.object(
@@ -4783,10 +4820,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 return_value=current_message,
             ) as get_user_message,
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=False,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
             ) as create_read_event,
@@ -4806,10 +4843,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(current_message, result)
-        get_user_message.assert_called_once_with(
+        self.assertEqual(2, get_user_message.call_count)
+        get_user_message.assert_called_with(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
+            session=session,
+        )
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="read",
+            value=True,
+            session=session,
         )
         create_read_event.assert_not_called()
         create_updated_event.assert_not_called()
@@ -4821,16 +4868,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         message_uuid = sys_uuid.uuid4()
         session = object()
         current_message = types.SimpleNamespace(user_uuid=user_uuid)
-        existing_flags = types.SimpleNamespace(
-            read=True,
-            starred=False,
-            pinned=False,
-        )
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=existing_flags)
-            )
 
         with (
             mock.patch.object(
@@ -4839,10 +4876,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 return_value=current_message,
             ) as get_message,
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=False,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_message",
@@ -4863,6 +4900,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             message_uuid=message_uuid,
             session=session,
         )
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="read",
+            value=True,
+            session=session,
+        )
         get_user_message.assert_not_called()
 
     def test_sync_workspace_user_message_flags_allows_provider_own_unread(self):
@@ -4871,7 +4916,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         message_uuid = sys_uuid.uuid4()
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         current_message = types.SimpleNamespace(
             author_uuid=user_uuid,
             stream_uuid=stream_uuid,
@@ -4879,24 +4924,6 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             read=True,
         )
         returned_message = types.SimpleNamespace(read=False)
-        updated_flag = {}
-
-        class ExistingFlags:
-            read = True
-            starred = False
-            pinned = False
-
-            def update_dm(self, values):
-                updated_flag["values"] = values
-                self.read = values["read"]
-
-            def update(self, session=None):
-                updated_flag["update_session"] = session
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=ExistingFlags())
-            )
 
         with (
             mock.patch.object(
@@ -4905,10 +4932,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 side_effect=[current_message, returned_message],
             ),
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=True,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
             ) as create_read_event,
@@ -4929,8 +4956,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(returned_message, result)
-        self.assertEqual({"read": False}, updated_flag["values"])
-        self.assertIs(session, updated_flag["update_session"])
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="read",
+            value=False,
+            session=session,
+        )
         create_read_event.assert_not_called()
         create_updated_event.assert_called_once_with(
             message=returned_message,
@@ -4950,30 +4983,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         current_message = types.SimpleNamespace(
             stream_uuid=stream_uuid,
             topic_uuid=topic_uuid,
         )
         returned_message = types.SimpleNamespace(read=True)
-        updated_flag = {}
-
-        class ExistingFlags:
-            read = False
-            starred = False
-            pinned = False
-
-            def update_dm(self, values):
-                updated_flag["values"] = values
-                self.read = values["read"]
-
-            def update(self, session=None):
-                updated_flag["update_session"] = session
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=ExistingFlags())
-            )
 
         with (
             mock.patch.object(
@@ -4982,10 +4997,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 side_effect=[current_message, returned_message],
             ),
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=True,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
             ) as create_read_event,
@@ -5005,7 +5020,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(returned_message, result)
-        self.assertEqual({"read": True}, updated_flag["values"])
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="read",
+            value=True,
+            session=session,
+        )
         create_read_event.assert_called_once_with(
             message=returned_message,
             session=session,
@@ -5025,8 +5047,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         first_topic_uuid = sys_uuid.uuid4()
         second_topic_uuid = sys_uuid.uuid4()
-        message_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
-        session = object()
+        message_uuids = sorted([sys_uuid.uuid4(), sys_uuid.uuid4()], key=str)
+        session = mock.Mock()
         messages = [
             types.SimpleNamespace(
                 uuid=message_uuid,
@@ -5043,30 +5065,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             types.SimpleNamespace(uuid=message_uuid, read=True)
             for message_uuid in message_uuids
         ]
-        update_sessions = []
-
-        class ExistingFlags:
-            read = False
-
-            def update_dm(self, values):
-                self.read = values["read"]
-
-            def update(self, session=None):
-                update_sessions.append(session)
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(
-                    side_effect=[ExistingFlags(), ExistingFlags()],
-                )
-            )
-
         with (
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                side_effect=[True, True],
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_message",
@@ -5094,7 +5098,19 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertEqual(returned_messages, result)
-        self.assertEqual([session, session], update_sessions)
+        update_flag.assert_has_calls(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    message_uuid=message_uuid,
+                    field_name="read",
+                    value=True,
+                    session=session,
+                )
+                for message_uuid in message_uuids
+            ]
+        )
         create_read_event.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
@@ -5116,7 +5132,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         stream_uuid = sys_uuid.uuid4()
         topic_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         message = types.SimpleNamespace(
             uuid=message_uuid,
             stream_uuid=stream_uuid,
@@ -5124,28 +5140,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             author_uuid=user_uuid,
         )
         returned_message = types.SimpleNamespace(uuid=message_uuid, read=False)
-        update_sessions = []
-
-        class ExistingFlags:
-            read = True
-
-            def update_dm(self, values):
-                self.read = values["read"]
-
-            def update(self, session=None):
-                update_sessions.append(session)
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=ExistingFlags()),
-            )
 
         with (
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=True,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_message",
@@ -5174,7 +5175,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertEqual([returned_message], result)
-        self.assertEqual([session], update_sessions)
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="read",
+            value=False,
+            session=session,
+        )
         create_read_event.assert_not_called()
         create_updated_event.assert_called_once_with(
             message=returned_message,
@@ -5192,27 +5200,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        session = object()
+        session = mock.Mock()
         current_message = types.SimpleNamespace()
         returned_message = types.SimpleNamespace(starred=True)
-        updated_flag = {}
-
-        class ExistingFlags:
-            read = False
-            starred = False
-            pinned = False
-
-            def update_dm(self, values):
-                updated_flag["values"] = values
-                self.starred = values["starred"]
-
-            def update(self, session=None):
-                updated_flag["update_session"] = session
-
-        class FakeWorkspaceUserMessageFlags:
-            objects = types.SimpleNamespace(
-                get_one=mock.Mock(return_value=ExistingFlags())
-            )
 
         with (
             mock.patch.object(
@@ -5221,10 +5211,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 side_effect=[current_message, returned_message],
             ),
             mock.patch.object(
-                dm_helpers.models,
-                "WorkspaceUserMessageFlags",
-                FakeWorkspaceUserMessageFlags,
-            ),
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=True,
+            ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
             ) as create_read_event,
@@ -5244,14 +5234,64 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(returned_message, result)
-        self.assertEqual({"starred": True}, updated_flag["values"])
-        self.assertIs(session, updated_flag["update_session"])
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="starred",
+            value=True,
+            session=session,
+        )
         create_read_event.assert_not_called()
         create_updated_event.assert_called_once_with(
             message=returned_message,
             session=session,
         )
         create_unread_events.assert_not_called()
+
+    def test_sync_workspace_user_message_flags_reloads_after_atomic_noop(self):
+        project_id = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        message_uuid = sys_uuid.uuid4()
+        session = mock.Mock()
+        stale_message = types.SimpleNamespace(starred=False)
+        refreshed_message = types.SimpleNamespace(starred=True)
+
+        with (
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_message",
+                side_effect=[stale_message, refreshed_message],
+            ) as get_user_message,
+            mock.patch.object(
+                dm_helpers,
+                "_update_workspace_user_message_flag",
+                return_value=False,
+            ) as update_flag,
+            mock.patch.object(
+                dm_helpers.messenger_events,
+                "create_message_updated_event",
+            ) as create_updated_event,
+        ):
+            result = dm_helpers.sync_workspace_user_message_flags(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+                values={"starred": True},
+                session=session,
+            )
+
+        self.assertIs(refreshed_message, result)
+        self.assertEqual(2, get_user_message.call_count)
+        update_flag.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name="starred",
+            value=True,
+            session=session,
+        )
+        create_updated_event.assert_not_called()
 
     def test_read_workspace_user_topic_messages_to_message_reads_to_current(self):
         project_id = sys_uuid.uuid4()
