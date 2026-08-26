@@ -38,6 +38,7 @@ from cryptography.x509.oid import NameOID
 from restalchemy.common import contexts as ra_contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
+from restalchemy.storage.sql import engines as ra_engines
 from restalchemy.storage.sql import migrations as ra_migrations
 from restalchemy.storage.sql import sessions as ra_sessions
 from oslo_config import cfg
@@ -8780,6 +8781,242 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
         True,
         False,
     ]
+
+
+def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
+    other_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "concurrent-starred-messages"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "keep this message concurrently",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    project_uuid = sys_uuid.UUID(api.project_id)
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    def latest_epoch():
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COALESCE(MAX(epoch_version), 0)
+                FROM m_workspace_visible_events
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            return cursor.fetchone()[0]
+
+    def message_events_after(epoch_version):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT payload
+                FROM m_workspace_visible_events
+                WHERE project_id = %s
+                  AND user_uuid = %s
+                  AND epoch_version > %s
+                  AND payload->>'uuid' = %s
+                ORDER BY epoch_version
+                """,
+                (project_uuid, other_user, epoch_version, str(message_uuid)),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    class CoordinatedSession:
+        def __init__(self, session, before_project_lock):
+            self._session = session
+            self._before_project_lock = before_project_lock
+            self._coordinated = False
+
+        def execute(self, statement, params=()):
+            if (
+                not self._coordinated
+                and isinstance(statement, str)
+                and "pg_advisory_xact_lock" in statement
+            ):
+                self._coordinated = True
+                self._before_project_lock()
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def update_flags(values, before_project_lock=lambda: None):
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            return messenger_dm_helpers.sync_workspace_user_message_flags(
+                project_id=project_uuid,
+                user_uuid=other_user,
+                message_uuid=message_uuid,
+                values=values,
+                session=CoordinatedSession(session, before_project_lock),
+            )
+
+    def mark_read(before_project_lock=lambda: None):
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            return messenger_dm_helpers.read_workspace_user_message(
+                project_id=project_uuid,
+                user_uuid=other_user,
+                message_uuid=message_uuid,
+                session=CoordinatedSession(session, before_project_lock),
+            )
+
+    before_read_race_epoch = latest_epoch()
+    star_project_lock_started = threading.Event()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with session_factory() as read_session:
+            read_session.execute("SET LOCAL statement_timeout = '5s'")
+            read_message = messenger_dm_helpers.read_workspace_user_message(
+                project_id=project_uuid,
+                user_uuid=other_user,
+                message_uuid=message_uuid,
+                session=read_session,
+            )
+            star_future = executor.submit(
+                update_flags,
+                {"starred": True},
+                star_project_lock_started.set,
+            )
+            assert star_project_lock_started.wait(timeout=3)
+        starred_message = star_future.result(timeout=5)
+
+    assert read_message.read is True
+    assert read_message.starred is False
+    assert starred_message.read is True
+    assert starred_message.starred is True
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read, starred
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
+            """,
+            (message_uuid, project_uuid, other_user),
+        )
+        assert cursor.fetchone() == (True, True)
+    read_race_events = message_events_after(before_read_race_epoch)
+    assert [event["kind"] for event in read_race_events] == [
+        "message.read",
+        "message.updated",
+    ]
+    assert read_race_events[-1]["read"] is True
+    assert read_race_events[-1]["starred"] is True
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET starred = FALSE, updated_at = NOW()
+            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
+            """,
+            (message_uuid, project_uuid, other_user),
+        )
+    before_duplicate_epoch = latest_epoch()
+    update_barrier = threading.Barrier(2)
+
+    def wait_for_both_updates():
+        update_barrier.wait(timeout=5)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                update_flags,
+                {"starred": True},
+                wait_for_both_updates,
+            ),
+            executor.submit(
+                update_flags,
+                {"starred": True},
+                wait_for_both_updates,
+            ),
+        ]
+        starred_messages = [future.result(timeout=10) for future in futures]
+
+    assert all(message.read is True for message in starred_messages)
+    assert all(message.starred is True for message in starred_messages)
+    duplicate_events = message_events_after(before_duplicate_epoch)
+    assert len(duplicate_events) == 1
+    assert duplicate_events[0]["kind"] == "message.updated"
+    assert duplicate_events[0]["starred"] is True
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read, starred
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
+            """,
+            (message_uuid, project_uuid, other_user),
+        )
+        assert cursor.fetchone() == (True, True)
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = FALSE, starred = FALSE, updated_at = NOW()
+            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
+            """,
+            (message_uuid, project_uuid, other_user),
+        )
+    before_star_race_epoch = latest_epoch()
+    read_project_lock_started = threading.Event()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with session_factory() as star_session:
+            star_session.execute("SET LOCAL statement_timeout = '5s'")
+            starred_message = messenger_dm_helpers.sync_workspace_user_message_flags(
+                project_id=project_uuid,
+                user_uuid=other_user,
+                message_uuid=message_uuid,
+                values={"starred": True},
+                session=star_session,
+            )
+            read_future = executor.submit(
+                mark_read,
+                read_project_lock_started.set,
+            )
+            assert read_project_lock_started.wait(timeout=3)
+        read_message = read_future.result(timeout=5)
+
+    assert starred_message.read is False
+    assert starred_message.starred is True
+    assert read_message.read is True
+    assert read_message.starred is True
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read, starred
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
+            """,
+            (message_uuid, project_uuid, other_user),
+        )
+        assert cursor.fetchone() == (True, True)
+    star_race_events = message_events_after(before_star_race_epoch)
+    assert [event["kind"] for event in star_race_events] == [
+        "message.updated",
+        "message.read",
+    ]
+    assert star_race_events[-1]["read"] is True
+    assert star_race_events[-1]["starred"] is True
 
 
 def test_message_update_read_delete_write_realtime_events(api, db):

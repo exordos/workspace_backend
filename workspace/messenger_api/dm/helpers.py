@@ -67,6 +67,7 @@ STREAM_SOURCE_IDENTITY_FIELDS = frozenset({"source_name", "source"})
 DIRECT_STREAM_IDENTITY_FIELDS = frozenset(
     {"direct_user_uuid", "private_index", "private"}
 )
+_WORKSPACE_USER_MESSAGE_FLAG_COLUMNS = frozenset({"pinned", "read", "starred"})
 DIRECT_STREAM_CREATE_IDENTITY_FIELDS = (
     STREAM_SOURCE_IDENTITY_FIELDS | DIRECT_STREAM_IDENTITY_FIELDS
 )
@@ -77,6 +78,19 @@ def _workspace_session(
     session: typing.Any = None,
 ) -> typing.Iterator[typing.Any]:
     yield session if session is not None else contexts.Context().get_session()
+
+
+def _lock_workspace_project_event_writes(
+    project_id: object,
+    session: typing.Any,
+) -> None:
+    """Match provider event ordering before a transaction mutates message flags."""
+    session.execute(
+        """
+        SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
+        """,
+        (project_id,),
+    )
 
 
 def _random_color() -> int:
@@ -4911,6 +4925,7 @@ def read_workspace_user_stream_messages(
             stream_uuid=stream_uuid,
             session=current_session,
         )
+        _lock_workspace_project_event_writes(project_id, current_session)
         rows = current_session.execute(
             _READ_STREAM_MESSAGES_SQL,
             (project_id, user_uuid, stream_uuid),
@@ -4957,6 +4972,7 @@ def read_workspace_user_stream_topic_messages(
             topic_uuid=topic_uuid,
             session=current_session,
         )
+        _lock_workspace_project_event_writes(project_id, current_session)
         rows = current_session.execute(
             _READ_TOPIC_MESSAGES_SQL,
             (project_id, user_uuid, current_topic.stream_uuid, topic_uuid),
@@ -5024,6 +5040,7 @@ def read_workspace_user_topic_messages_to_message(
             message_uuid=message_uuid,
             session=current_session,
         )
+        _lock_workspace_project_event_writes(project_id, current_session)
         rows = current_session.execute(
             _READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL,
             (
@@ -5075,6 +5092,7 @@ def read_workspace_user_message(
             message_uuid=message_uuid,
             session=current_session,
         )
+        _lock_workspace_project_event_writes(project_id, current_session)
         row = current_session.execute(
             _READ_MESSAGE_SQL,
             (project_id, user_uuid, message_uuid),
@@ -5103,6 +5121,34 @@ def read_workspace_user_message(
     return result
 
 
+def _update_workspace_user_message_flag(
+    project_id: object,
+    user_uuid: object,
+    message_uuid: object,
+    field_name: str,
+    value: bool,
+    session: typing.Any,
+) -> bool:
+    """Atomically update one flag and report whether the row changed."""
+    if field_name not in _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS:
+        raise ValueError(f"Unsupported workspace user message flag: {field_name}")
+    if not isinstance(value, bool):
+        raise ValueError(f"Workspace user message flag {field_name} must be boolean")
+    row = session.execute(
+        f"""
+        UPDATE m_workspace_user_message_flags
+        SET "{field_name}" = %s, updated_at = NOW()
+        WHERE project_id = %s
+          AND user_uuid = %s
+          AND uuid = %s
+          AND "{field_name}" IS DISTINCT FROM %s
+        RETURNING uuid
+        """,
+        (value, project_id, user_uuid, message_uuid, value),
+    ).fetchone()
+    return row is not None
+
+
 def sync_workspace_user_message_flags(
     project_id: object,
     user_uuid: object,
@@ -5112,18 +5158,19 @@ def sync_workspace_user_message_flags(
     allow_author_unread: bool = False,
     emit_events: bool = True,
 ) -> typing.Any:
+    current_session = session or contexts.Context().get_session()
     current_message = (
         get_workspace_user_message(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
-            session=session,
+            session=current_session,
         )
         if emit_events
         else _get_workspace_message(
             project_id=project_id,
             message_uuid=message_uuid,
-            session=session,
+            session=current_session,
         )
     )
     if (
@@ -5134,23 +5181,28 @@ def sync_workspace_user_message_flags(
     ):
         values = dict(values)
         values["read"] = True
-    flags = models.WorkspaceUserMessageFlags.objects.get_one(
-        filters={
-            "uuid": dm_filters.EQ(message_uuid),
-            "project_id": dm_filters.EQ(project_id),
-            "user_uuid": dm_filters.EQ(user_uuid),
-        },
-        session=session,
-    )
+    if emit_events:
+        _lock_workspace_project_event_writes(project_id, current_session)
     changed_values = {}
     for field_name, value in values.items():
-        if getattr(flags, field_name) != value:
+        if _update_workspace_user_message_flag(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=message_uuid,
+            field_name=field_name,
+            value=value,
+            session=current_session,
+        ):
             changed_values[field_name] = value
     if not changed_values:
+        if emit_events:
+            return get_workspace_user_message(
+                project_id=project_id,
+                user_uuid=user_uuid,
+                message_uuid=message_uuid,
+                session=current_session,
+            )
         return current_message
-
-    flags.update_dm(values=changed_values)
-    flags.update(session=session)
 
     if not emit_events:
         return current_message
@@ -5159,14 +5211,14 @@ def sync_workspace_user_message_flags(
         project_id=project_id,
         user_uuid=user_uuid,
         message_uuid=message_uuid,
-        session=session,
+        session=current_session,
     )
     create_updated_event = False
     if "read" in changed_values:
         if changed_values["read"]:
             messenger_events.create_message_read_event(
                 message=result,
-                session=session,
+                session=current_session,
             )
         else:
             create_updated_event = True
@@ -5175,14 +5227,14 @@ def sync_workspace_user_message_flags(
             user_uuid=user_uuid,
             stream_uuid=current_message.stream_uuid,
             topic_uuid=current_message.topic_uuid,
-            session=session,
+            session=current_session,
         )
     if any(field_name != "read" for field_name in changed_values):
         create_updated_event = True
     if create_updated_event:
         messenger_events.create_message_updated_event(
             message=result,
-            session=session,
+            session=current_session,
         )
     return result
 
@@ -5196,6 +5248,8 @@ def sync_workspace_user_messages_read_state(
     allow_author_unread: bool = False,
 ) -> typing.Any:
     """Apply one provider read-state batch and emit bounded public events."""
+    current_session = session or contexts.Context().get_session()
+    _lock_workspace_project_event_writes(project_id, current_session)
     changed_messages = []
     topic_uuids_by_stream: dict[object, list[object]] = {}
     for current_message in messages:
@@ -5203,22 +5257,20 @@ def sync_workspace_user_messages_read_state(
             getattr(current_message, "author_uuid", None) == user_uuid
             and not allow_author_unread
         )
-        flags = models.WorkspaceUserMessageFlags.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(current_message.uuid),
-                "project_id": dm_filters.EQ(project_id),
-                "user_uuid": dm_filters.EQ(user_uuid),
-            },
-            session=session,
-        )
-        if flags.read == effective_read:
+        if not _update_workspace_user_message_flag(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            message_uuid=current_message.uuid,
+            field_name="read",
+            value=effective_read,
+            session=current_session,
+        ):
             continue
-        flags.update_dm(values={"read": effective_read})
-        flags.update(session=session)
         changed_message = get_workspace_user_message(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=current_message.uuid,
+            session=current_session,
         )
         changed_messages.append(changed_message)
         topic_uuids = topic_uuids_by_stream.setdefault(
@@ -5235,13 +5287,13 @@ def sync_workspace_user_messages_read_state(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuids=[message.uuid for message in changed_messages],
-            session=session,
+            session=current_session,
         )
     else:
         for message in changed_messages:
             messenger_events.create_message_updated_event(
                 message=message,
-                session=session,
+                session=current_session,
             )
     for stream_uuid, topic_uuids in topic_uuids_by_stream.items():
         _create_unread_updated_events(
@@ -5249,7 +5301,7 @@ def sync_workspace_user_messages_read_state(
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             topic_uuids=topic_uuids,
-            session=session,
+            session=current_session,
         )
     return changed_messages
 
