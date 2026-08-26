@@ -4810,6 +4810,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
+            session=session,
         )
         create_read_event.assert_not_called()
         create_updated_event.assert_not_called()

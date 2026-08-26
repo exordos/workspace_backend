@@ -5117,6 +5117,7 @@ def sync_workspace_user_message_flags(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
+            session=session,
         )
         if emit_events
         else _get_workspace_message(
@@ -5158,6 +5159,7 @@ def sync_workspace_user_message_flags(
         project_id=project_id,
         user_uuid=user_uuid,
         message_uuid=message_uuid,
+        session=session,
     )
     create_updated_event = False
     if "read" in changed_values:

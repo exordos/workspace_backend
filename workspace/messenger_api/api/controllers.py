@@ -1051,6 +1051,20 @@ class WorkspaceMessageController(StoreResourceController):
         del args, kwargs
         return self._action(resource, "read_up_to")
 
+    @ra_actions.post
+    def star(
+        self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        del args, kwargs
+        return self._action(resource, "star")
+
+    @ra_actions.post
+    def unstar(
+        self, resource: typing.Any, *args: typing.Any, **kwargs: typing.Any
+    ) -> typing.Any:
+        del args, kwargs
+        return self._action(resource, "unstar")
+
 
 class WorkspaceDraftController(StoreResourceController):
     resource_name = "drafts"

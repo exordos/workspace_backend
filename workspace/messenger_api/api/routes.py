@@ -42,6 +42,14 @@ class WorkspaceMessageReadUpToAction(routes.Action):
     __controller__ = controllers.WorkspaceMessageController
 
 
+class WorkspaceMessageStarAction(routes.Action):
+    __controller__ = controllers.WorkspaceMessageController
+
+
+class WorkspaceMessageUnstarAction(routes.Action):
+    __controller__ = controllers.WorkspaceMessageController
+
+
 class ExternalAccountReconnectAction(routes.Action):
     __controller__ = controllers.ExternalAccountController
 
@@ -212,6 +220,8 @@ class WorkspaceMessageRoute(routes.Route):
 
     read = routes.action(WorkspaceMessageReadAction, invoke=True)
     read_up_to = routes.action(WorkspaceMessageReadUpToAction, invoke=True)
+    star = routes.action(WorkspaceMessageStarAction, invoke=True)
+    unstar = routes.action(WorkspaceMessageUnstarAction, invoke=True)
 
 
 class WorkspaceDraftRoute(routes.Route):

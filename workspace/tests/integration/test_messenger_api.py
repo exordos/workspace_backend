@@ -8665,6 +8665,123 @@ def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
     assert next_page == []
 
 
+def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
+    other_user = sys_uuid.uuid4()
+    outsider_user = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "starred-messages"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "keep this message",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_actions_epoch = cursor.fetchone()[0]
+
+    star_path = f"{MESSAGES}{message_uuid}/actions/star/invoke"
+    response = api.post(star_path, user=other_user)
+    assert response.status_code == 200, response.text
+    assert response.json()["starred"] is True
+
+    response = api.post(star_path, user=other_user)
+    assert response.status_code == 200, response.text
+    assert response.json()["starred"] is True
+
+    author_message = api.get(f"{MESSAGES}{message_uuid}")
+    assert author_message.status_code == 200, author_message.text
+    assert author_message.json()["starred"] is False
+
+    starred_page = api.get(
+        MESSAGES,
+        user=other_user,
+        params={"starred": "true"},
+    )
+    assert starred_page.status_code == 200, starred_page.text
+    assert [item["uuid"] for item in starred_page.json()] == [message_uuid]
+
+    author_starred_page = api.get(MESSAGES, params={"starred": "true"})
+    assert author_starred_page.status_code == 200, author_starred_page.text
+    assert author_starred_page.json() == []
+
+    outsider_response = api.post(star_path, user=outsider_user)
+    assert outsider_response.status_code == 404, outsider_response.text
+
+    unstar_path = f"{MESSAGES}{message_uuid}/actions/unstar/invoke"
+    response = api.post(unstar_path, user=other_user)
+    assert response.status_code == 200, response.text
+    assert response.json()["starred"] is False
+
+    response = api.post(unstar_path, user=other_user)
+    assert response.status_code == 200, response.text
+    assert response.json()["starred"] is False
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_uuid, starred
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s
+            ORDER BY user_uuid
+            """,
+            (api.project_id, message_uuid),
+        )
+        flags = {str(user_uuid): starred for user_uuid, starred in cursor.fetchall()}
+        cursor.execute(
+            """
+            SELECT user_uuid, payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, before_actions_epoch),
+        )
+        event_rows = cursor.fetchall()
+
+    assert flags == {
+        str(api.user_uuid): False,
+        str(other_user): False,
+    }
+    assert [str(user_uuid) for user_uuid, _payload in event_rows] == [
+        str(other_user),
+        str(other_user),
+    ]
+    assert [payload["kind"] for _user_uuid, payload in event_rows] == [
+        "message.updated",
+        "message.updated",
+    ]
+    assert [payload["starred"] for _user_uuid, payload in event_rows] == [
+        True,
+        False,
+    ]
+
+
 def test_message_update_read_delete_write_realtime_events(api, db):
     other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(

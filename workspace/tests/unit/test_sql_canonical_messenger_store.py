@@ -1733,6 +1733,64 @@ def test_read_up_to_locks_provider_before_update_without_unread_probe(monkeypatc
     assert queued[0]["provider_target"] is provider_target
 
 
+def test_message_star_actions_update_current_user_flag(monkeypatch):
+    message_uuid = sys_uuid.uuid4()
+    session = object()
+    calls = []
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+
+    def sync_flags(**kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(
+            uuid=message_uuid,
+            starred=kwargs["values"]["starred"],
+        )
+
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "sync_workspace_user_message_flags",
+        sync_flags,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: {
+            "uuid": value.uuid,
+            "starred": value.starred,
+        },
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    assert store.perform_action("messages", message_uuid, "star", {}) == {
+        "uuid": message_uuid,
+        "starred": True,
+    }
+    assert store.perform_action("messages", message_uuid, "unstar", {}) == {
+        "uuid": message_uuid,
+        "starred": False,
+    }
+    assert calls == [
+        {
+            "project_id": PROJECT_UUID,
+            "user_uuid": USER_UUID,
+            "message_uuid": message_uuid,
+            "values": {"starred": True},
+            "session": session,
+        },
+        {
+            "project_id": PROJECT_UUID,
+            "user_uuid": USER_UUID,
+            "message_uuid": message_uuid,
+            "values": {"starred": False},
+            "session": session,
+        },
+    ]
+
+
 def test_canonical_factory_separates_event_store_without_mail_runtime():
     factory = sql_canonical_store.SQLCanonicalMessengerStoreFactory()
 
