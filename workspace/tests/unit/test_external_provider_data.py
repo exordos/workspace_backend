@@ -3,13 +3,16 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import concurrent.futures
+import datetime
+import threading
 import types
 import uuid as sys_uuid
-import datetime
 
 import pytest
 
 from workspace.external_bridge_control import provider_data
+from workspace.messenger_api.dm import read_state
 
 
 @pytest.mark.parametrize(
@@ -50,42 +53,69 @@ class CapabilityLeaseSession:
         self.capabilities = capabilities
         self.now = now
         self.allowed_kinds = None
+        self.candidate_params = None
+        self.database_now_calls = 0
+        self.lease_fence_value = None
+        self.last_heartbeat_at = now
 
     def execute(self, statement, params):
+        if "SELECT statement_timestamp() AS current_time" in statement:
+            self.database_now_calls += 1
+            return LeaseResponse(one={"current_time": self.now})
+        if "WITH bridge_capabilities AS MATERIALIZED" in statement:
+            assert self.lease_fence_value is not None
+            self.allowed_kinds = params[4]
+            self.candidate_params = params
+            return LeaseResponse(all_rows=[])
+        if "workspace.provider_read_snapshot_lease_v2" in statement:
+            self.lease_fence_value = params[0]
+            return LeaseResponse()
         if 'FROM "m_external_bridge_instances_v2"' in statement:
             return LeaseResponse(
                 one={
                     "status": "active",
                     "capabilities": self.capabilities,
-                    "last_heartbeat_at": self.now,
+                    "last_heartbeat_at": self.last_heartbeat_at,
                 }
             )
         if 'AND "lease_uuid" = %s' in statement and statement.lstrip().startswith(
             "SELECT"
         ):
             return LeaseResponse(all_rows=[])
-        if "WITH candidates AS" in statement:
-            self.allowed_kinds = params[2]
+        if "COUNT(*) AS page_count" in statement:
+            return LeaseResponse(one={"page_count": 0})
+        if "FROM m_external_provider_read_snapshots_v1 AS snapshot" in statement:
             return LeaseResponse(all_rows=[])
         return LeaseResponse()
 
 
 @pytest.mark.parametrize(
-    ("capabilities", "expected"),
+    ("capabilities", "expected", "materializes"),
     [
-        ({"messenger.message.send": {"revision": 1}}, False),
+        ({"messenger.message.send": {"revision": 1}}, False, False),
         (
             {
                 "messenger.message.send": {"revision": 1},
                 "messenger.message.read": {"revision": 1},
             },
             True,
+            False,
+        ),
+        (
+            {
+                "messenger.message.send": {"revision": 1},
+                "messenger.message.read": {"revision": 2},
+            },
+            True,
+            True,
         ),
     ],
 )
-def test_read_state_lease_fails_closed_without_advertised_capability(
+def test_read_state_lease_materializes_only_paging_revision(
     capabilities,
     expected,
+    materializes,
+    monkeypatch,
 ):
     now = datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc)
     session = CapabilityLeaseSession(capabilities, now)
@@ -93,6 +123,12 @@ def test_read_state_lease_fails_closed_without_advertised_capability(
         bridge_instance_uuid=sys_uuid.uuid4(),
         provider_kind="zulip",
         identity_generation=1,
+    )
+    materialize_calls = []
+    monkeypatch.setattr(
+        provider_data,
+        "_materialize_provider_read_pages",
+        lambda *args, **kwargs: materialize_calls.append((args, kwargs)),
     )
 
     result = provider_data.lease_provider_operations(
@@ -106,9 +142,131 @@ def test_read_state_lease_fails_closed_without_advertised_capability(
 
     assert result["operations"] == []
     assert ("read_state.set" in session.allowed_kinds) is expected
+    assert bool(materialize_calls) is materializes
+    expected_fence = (
+        "on"
+        if provider_data._capability_revision(
+            capabilities,
+            "messenger.message.read",
+        )
+        >= provider_data.PROVIDER_READ_PAGING_REVISION
+        else "off"
+    )
+    assert session.lease_fence_value == expected_fence
     assert provider_data._required_capability("read_state.set") == (
         "messenger.message.read"
     )
+
+
+def test_read_state_operation_uses_published_physical_identity():
+    public_uuid = sys_uuid.uuid4()
+    physical_uuid = sys_uuid.uuid4()
+    lease_uuid = sys_uuid.uuid4()
+    now = datetime.datetime(2026, 8, 27, tzinfo=datetime.timezone.utc)
+
+    operation = provider_data._operation_dict(
+        {
+            "uuid": physical_uuid,
+            "external_operation_uuid": public_uuid,
+            "lease_uuid": lease_uuid,
+            "lease_expires_at": now,
+            "external_account_uuid": sys_uuid.uuid4(),
+            "project_id": sys_uuid.uuid4(),
+            "operation_kind": "read_state.set",
+            "attempt": 1,
+            "payload": {"message_uuids": []},
+        },
+    )
+
+    assert operation["external_operation_uuid"] == str(physical_uuid)
+    assert operation["provider_operation_uuid"] == str(physical_uuid)
+    assert operation["payload"] == {"message_uuids": []}
+
+
+def test_lease_reacquires_database_clock_after_materializer_lock():
+    database_now = datetime.datetime(2026, 8, 27, tzinfo=datetime.timezone.utc)
+    session = CapabilityLeaseSession(
+        {"messenger.message.read": {"revision": 1}},
+        database_now,
+    )
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    provider_data.lease_provider_operations(
+        session,
+        identity,
+        request_uuid=sys_uuid.uuid4(),
+        limit=10,
+        lease_seconds=30,
+    )
+
+    assert session.database_now_calls == 2
+    assert session.candidate_params[3] == database_now
+    assert session.candidate_params[7] == database_now + datetime.timedelta(seconds=30)
+    assert session.candidate_params[8] == database_now
+
+
+@pytest.mark.parametrize("refresh_heartbeat", [False, True])
+def test_lease_revalidates_clock_and_heartbeat_after_materializer_wait(
+    refresh_heartbeat,
+):
+    before_wait = datetime.datetime(2026, 8, 27, tzinfo=datetime.timezone.utc)
+    after_wait = before_wait + datetime.timedelta(seconds=61)
+    lock_started = threading.Event()
+    release_lock = threading.Event()
+
+    class BlockingClockLeaseSession(CapabilityLeaseSession):
+        def execute(self, statement, params):
+            if "SELECT statement_timestamp() AS current_time" in statement:
+                current_time = (before_wait, after_wait)[self.database_now_calls]
+                self.database_now_calls += 1
+                self.now = current_time
+                return LeaseResponse(one={"current_time": current_time})
+            if params and "provider-read-materialize-v1" in str(params[0]):
+                lock_started.set()
+                assert release_lock.wait(timeout=3)
+                return LeaseResponse()
+            return super().execute(statement, params)
+
+    session = BlockingClockLeaseSession(
+        {"messenger.message.read": {"revision": 1}},
+        before_wait,
+    )
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            provider_data.lease_provider_operations,
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=10,
+            lease_seconds=10,
+        )
+        assert lock_started.wait(timeout=3)
+        if refresh_heartbeat:
+            session.last_heartbeat_at = after_wait
+        release_lock.set()
+        if refresh_heartbeat:
+            assert future.result(timeout=3)["operations"] == []
+        else:
+            with pytest.raises(provider_data.ProviderUnavailableError):
+                future.result(timeout=3)
+
+    assert session.database_now_calls == 2
+    if refresh_heartbeat:
+        assert session.candidate_params[7] == after_wait + datetime.timedelta(
+            seconds=10
+        )
+    else:
+        assert session.candidate_params is None
 
 
 @pytest.mark.parametrize("operation_kind", ["membership.add", "membership.remove"])
@@ -213,24 +371,36 @@ def test_enqueue_operation_reuses_caller_transaction(monkeypatch):
     operation_uuid = sys_uuid.uuid4()
     project_uuid = sys_uuid.uuid4()
     owner_user_uuid = sys_uuid.uuid4()
+    bridge_instance_uuid = sys_uuid.uuid4()
+    external_account_uuid = sys_uuid.uuid4()
+    causal_lane = sys_uuid.uuid4()
 
-    _operation, record_uuid = provider_data.enqueue_provider_operation(
+    _operation, record_uuid = provider_data.enqueue_provider_operation_in_lane(
         session,
         operation_uuid=operation_uuid,
-        bridge_instance_uuid=sys_uuid.uuid4(),
-        external_account_uuid=sys_uuid.uuid4(),
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
         project_id=project_uuid,
         owner_user_uuid=owner_user_uuid,
         operation_kind="message.create",
         target_type="message",
         target_uuid=sys_uuid.uuid4(),
         payload={"payload": {"kind": "markdown", "content": "hello"}},
+        causal_lane=causal_lane,
     )
 
     assert inserted[0][1] is session
     assert inserted[0][0]["uuid"] == operation_uuid
     assert isinstance(record_uuid, sys_uuid.UUID)
-    assert 'INSERT INTO "m_external_provider_operations_v1"' in statements[0][0]
+    assert statements[0][1] == (read_state.READ_STATE_SCHEMA_LOCK_KEY,)
+    assert "provider-causal-lane-v1" in statements[1][1][0]
+    assert str(bridge_instance_uuid) in statements[1][1][0]
+    assert str(external_account_uuid) in statements[1][1][0]
+    assert str(causal_lane) in statements[1][1][0]
+    assert 'INSERT INTO "m_external_provider_operations_v1"' in statements[2][0]
+    assert "COALESCE(%s, statement_timestamp())" in statements[2][0]
+    assert statements[2][1][7] == causal_lane
+    assert statements[2][1][8:11] == (None, None, None)
     assert events[0][0][0:2] == (project_uuid, owner_user_uuid)
     assert events[0][0][2] is _operation
     assert (
@@ -724,10 +894,226 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
     )
 
     assert external_events[0][1]["session"] is session
-    assert "UPDATE m_workspace_messages" in statements[0][0]
-    assert statements[0][1][1:4] == ("delivered", None, updated_at)
+    assert "pg_advisory_xact_lock_shared" in statements[0][0]
+    assert "UPDATE m_workspace_messages" in statements[1][0]
+    assert statements[1][1][1:4] == ("delivered", None, updated_at)
     assert target_queries[0]["session"] is session
     assert target_events == [((project_uuid, target_resource), {"session": session})]
+
+
+def test_publish_operation_locks_schema_before_project_event(monkeypatch):
+    order = []
+    operation = types.SimpleNamespace(owner_user_uuid=sys_uuid.uuid4())
+    session = object()
+    monkeypatch.setattr(
+        provider_data.read_state,
+        "lock_read_state_schema_shared",
+        lambda current_session: order.append(("schema", current_session)),
+    )
+    monkeypatch.setattr(
+        provider_data.messenger_events,
+        "create_external_resource_event",
+        lambda *args, **kwargs: order.append(("project-event", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        provider_data,
+        "sync_operation_target_delivery",
+        lambda *args, **kwargs: order.append(("target", args, kwargs)),
+    )
+
+    provider_data.publish_operation_event(
+        session,
+        operation,
+        sys_uuid.uuid4(),
+        "external_operation.updated",
+    )
+
+    assert [item[0] for item in order] == ["schema", "project-event", "target"]
+    assert order[0][1] is session
+    assert order[2][2] == {"_event_order_locked": True}
+
+
+def test_direct_target_sync_locks_project_before_snapshot(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    updated_at = datetime.datetime(2026, 8, 27, tzinfo=datetime.timezone.utc)
+    operation = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        target_type="stream",
+        target_uuid=target_uuid,
+        status="succeeded",
+        safe_error=None,
+        can_retry=False,
+        can_discard=False,
+        updated_at=updated_at,
+        duplicate_risk=False,
+        retry_requires_confirmation=False,
+        original_url=None,
+        reconciliation_reason=None,
+    )
+    order = []
+
+    def execute(statement, params):
+        order.append(("sql", statement, params))
+        return types.SimpleNamespace(fetchone=lambda: {"uuid": target_uuid})
+
+    session = types.SimpleNamespace(execute=execute)
+    monkeypatch.setattr(
+        provider_data,
+        "_emit_target_updated_events",
+        lambda *args: order.append(("snapshot", args)),
+    )
+
+    provider_data.sync_operation_target_delivery(
+        session,
+        operation,
+        project_uuid,
+    )
+
+    assert "pg_advisory_xact_lock_shared" in order[0][1]
+    assert "pg_advisory_xact_lock(" in order[1][1]
+    assert "UPDATE m_workspace_streams" in order[2][1]
+    assert order[3][0] == "snapshot"
+
+
+@pytest.mark.parametrize("target_type", ["stream", "topic"])
+def test_compact_target_delivery_uses_bounded_snapshots(monkeypatch, target_type):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    target_uuid = stream_uuid if target_type == "stream" else sys_uuid.uuid4()
+    recipients = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+    resources = [object(), object()]
+    statements = []
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        return types.SimpleNamespace(fetchone=lambda: {"stream_uuid": stream_uuid})
+
+    session = types.SimpleNamespace(execute=execute)
+    monkeypatch.setattr(
+        provider_data.read_state,
+        "uses_compact_state",
+        lambda current_session, current_project: (
+            current_session is session and current_project == project_uuid
+        ),
+    )
+    recipient_queries = []
+    monkeypatch.setattr(
+        provider_data.models,
+        "get_stream_recipients",
+        lambda *args, **kwargs: recipient_queries.append((args, kwargs)) or recipients,
+    )
+    for model in (
+        provider_data.models.WorkspaceUserStream,
+        provider_data.models.WorkspaceUserTopic,
+    ):
+        monkeypatch.setattr(
+            model,
+            "objects",
+            types.SimpleNamespace(
+                get_all=lambda **_kwargs: pytest.fail("global view was queried")
+            ),
+        )
+    snapshot_queries = []
+    monkeypatch.setattr(
+        provider_data.messenger_helpers,
+        "get_compact_workspace_user_stream_snapshots",
+        lambda *args, **kwargs: (
+            snapshot_queries.append(("stream", args, kwargs)) or resources
+        ),
+    )
+    monkeypatch.setattr(
+        provider_data.messenger_helpers,
+        "get_compact_workspace_user_topic_snapshots",
+        lambda *args, **kwargs: (
+            snapshot_queries.append(("topic", args, kwargs)) or resources
+        ),
+    )
+    events = []
+    monkeypatch.setattr(
+        provider_data.messenger_events,
+        "create_stream_updated_events",
+        lambda *args, **kwargs: events.append(("stream", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        provider_data.messenger_events,
+        "create_topic_updated_events",
+        lambda *args, **kwargs: events.append(("topic", args, kwargs)),
+    )
+
+    provider_data._emit_target_updated_events(
+        session,
+        project_uuid,
+        target_type,
+        target_uuid,
+    )
+
+    if target_type == "topic":
+        assert "FROM m_workspace_stream_topics" in statements[0][0]
+        assert statements[0][1] == (project_uuid, target_uuid)
+    else:
+        assert statements == []
+    assert recipient_queries == [((project_uuid, stream_uuid), {"session": session})]
+    assert snapshot_queries == [
+        (
+            target_type,
+            (project_uuid, target_uuid, recipients),
+            {"session": session},
+        )
+    ]
+    assert events == [
+        (
+            target_type,
+            (project_uuid, resources),
+            {"session": session, "compact": True},
+        )
+    ]
+
+
+def test_noncompact_target_delivery_keeps_global_projection(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    session = object()
+    resource = object()
+    queries = []
+    events = []
+    monkeypatch.setattr(
+        provider_data.read_state,
+        "uses_compact_state",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        provider_data.models.WorkspaceUserStream,
+        "objects",
+        types.SimpleNamespace(
+            get_all=lambda **kwargs: queries.append(kwargs) or [resource]
+        ),
+    )
+    monkeypatch.setattr(
+        provider_data.messenger_events,
+        "create_stream_updated_events",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+
+    provider_data._emit_target_updated_events(
+        session,
+        project_uuid,
+        "stream",
+        stream_uuid,
+    )
+
+    assert queries == [
+        {
+            "filters": {
+                "project_id": provider_data.dm_filters.EQ(project_uuid),
+                "uuid": provider_data.dm_filters.EQ(stream_uuid),
+            },
+            "session": session,
+        }
+    ]
+    assert events == [
+        ((project_uuid, [resource]), {"session": session, "compact": True})
+    ]
 
 
 def test_retry_operation_requeues_existing_provider_row():
@@ -735,14 +1121,22 @@ def test_retry_operation_requeues_existing_provider_row():
     row_uuid = sys_uuid.uuid4()
     project_uuid = sys_uuid.uuid4()
     statements = []
-    session = types.SimpleNamespace(
-        execute=lambda statement, params: (
-            statements.append((statement, params))
-            or types.SimpleNamespace(
-                fetchone=lambda: {"uuid": row_uuid, "project_id": project_uuid}
-            )
-        )
+    responses = iter(
+        [
+            None,
+            None,
+            [{"uuid": row_uuid, "operation_kind": "message.create"}],
+            [],
+            [{"uuid": row_uuid, "project_id": project_uuid}],
+        ]
     )
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        rows = next(responses)
+        return types.SimpleNamespace(fetchone=lambda: rows, fetchall=lambda: rows)
+
+    session = types.SimpleNamespace(execute=execute)
 
     result = provider_data.retry_provider_operation(
         session,
@@ -751,10 +1145,49 @@ def test_retry_operation_requeues_existing_provider_row():
     )
 
     assert result == {"uuid": row_uuid, "project_id": project_uuid}
-    assert statements[0][1] == (3, operation_uuid)
-    assert "\"status\" = 'queued'" in statements[0][0]
-    assert '"attempt" = %s - 1' in statements[0][0]
-    assert '"lease_uuid" = NULL' in statements[0][0]
+    assert statements[0][1] == (read_state.READ_STATE_SCHEMA_LOCK_KEY,)
+    assert statements[1][1] == (operation_uuid,)
+    assert statements[4][1] == (3, operation_uuid)
+    assert "\"status\" = 'queued'" in statements[4][0]
+    assert '"attempt" = %s - 1' in statements[4][0]
+    assert '"lease_uuid" = NULL' in statements[4][0]
+
+
+def test_retry_read_operation_renews_bridge_delivery_identity():
+    operation_uuid = sys_uuid.uuid4()
+    old_row_uuid = sys_uuid.uuid4()
+    new_row_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    statements = []
+    responses = iter(
+        [
+            None,
+            {"bridge_instance_uuid": bridge_uuid},
+            None,
+            [{"uuid": old_row_uuid, "operation_kind": "read_state.set"}],
+            [{"uuid": new_row_uuid, "project_id": project_uuid}],
+            [],
+        ]
+    )
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        rows = next(responses)
+        return types.SimpleNamespace(fetchone=lambda: rows, fetchall=lambda: rows)
+
+    result = provider_data.retry_provider_operation(
+        types.SimpleNamespace(execute=execute),
+        external_operation_uuid=operation_uuid,
+        next_attempt=2,
+    )
+
+    assert result == {"uuid": new_row_uuid, "project_id": project_uuid}
+    assert statements[0][1] == (read_state.READ_STATE_SCHEMA_LOCK_KEY,)
+    assert "retry_source AS MATERIALIZED" in statements[4][0]
+    assert statements[4][1] == (operation_uuid, operation_uuid, 2)
+    assert "gen_random_uuid()" in statements[4][0]
+    assert "m_external_provider_operation_results_v1" not in statements[4][0]
 
 
 def test_discard_operation_prevents_future_provider_lease():
@@ -762,12 +1195,17 @@ def test_discard_operation_prevents_future_provider_lease():
     row_uuid = sys_uuid.uuid4()
     project_uuid = sys_uuid.uuid4()
     statements = []
+    responses = iter(
+        [
+            None,
+            None,
+            {"uuid": row_uuid, "project_id": project_uuid},
+        ]
+    )
     session = types.SimpleNamespace(
         execute=lambda statement, params: (
             statements.append((statement, params))
-            or types.SimpleNamespace(
-                fetchone=lambda: {"uuid": row_uuid, "project_id": project_uuid}
-            )
+            or types.SimpleNamespace(fetchone=lambda: next(responses))
         )
     )
 
@@ -777,8 +1215,10 @@ def test_discard_operation_prevents_future_provider_lease():
     )
 
     assert result == {"uuid": row_uuid, "project_id": project_uuid}
-    assert statements[0][1] == (operation_uuid,)
-    assert "\"status\" = 'discarded'" in statements[0][0]
+    assert statements[0][1] == (read_state.READ_STATE_SCHEMA_LOCK_KEY,)
+    assert statements[1][1] == (operation_uuid,)
+    assert "\"status\" = 'discarded'" in statements[3][0]
+    assert len(statements) == 4
 
 
 class ProviderEventSession:

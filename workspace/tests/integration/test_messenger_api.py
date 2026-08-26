@@ -20,6 +20,7 @@ import hashlib
 import http.server
 import importlib.util
 import io
+import itertools
 import concurrent.futures
 import base64
 import datetime
@@ -58,6 +59,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
+from workspace.messenger_api.dm import read_state
 from workspace.services.messenger_workers import agents as messenger_worker_agents
 from workspace.tests.integration import conftest
 
@@ -98,17 +100,43 @@ EXTERNAL_ACCOUNT_DISCONNECT = (
     "workspace.external_account.disconnect",
 )
 EXTERNAL_ACCOUNT_DELETE = ("workspace.external_account.delete",)
-TOPIC_SUMMARY_ENDPOINT_MANAGE = (
-    topic_summarization.ENDPOINT_MANAGE_PERMISSION,
-)
-TOPIC_SUMMARY_SETTINGS_MANAGE = (
-    topic_summarization.SETTINGS_MANAGE_PERMISSION,
-)
+TOPIC_SUMMARY_ENDPOINT_MANAGE = (topic_summarization.ENDPOINT_MANAGE_PERMISSION,)
+TOPIC_SUMMARY_SETTINGS_MANAGE = (topic_summarization.SETTINGS_MANAGE_PERMISSION,)
 
 
 def _run_database_operation(callback):
     with ra_contexts.Context().session_manager() as session:
         return callback(session)
+
+
+def _workspace_message_read_states(db, project_id, user_uuid, message_uuids):
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, read
+            FROM m_workspace_user_messages_view
+            WHERE project_id = %s AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            (project_id, user_uuid, message_uuids),
+        )
+        return {str(message_uuid): read for message_uuid, read in cursor.fetchall()}
+
+
+def _set_workspace_read_mode(db, project_id, mode):
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode, created_at, updated_at
+            ) VALUES (%s, %s, NOW(), NOW())
+            ON CONFLICT (project_id) DO UPDATE
+            SET mode = EXCLUDED.mode, updated_at = NOW()
+            """,
+            (project_id, mode),
+        )
+    db.commit()
 
 
 def _enable_zulip_policy(db, *, max_accounts=100):
@@ -233,11 +261,7 @@ def test_topic_summary_endpoint_registry_and_settings_are_permissioned_and_safe(
     )
     assert created.status_code == 201, created.text
     endpoint = created.json()
-    assert {
-        key: endpoint[key]
-        for key in payload
-        if key != "api_key"
-    } == {
+    assert {key: endpoint[key] for key in payload if key != "api_key"} == {
         **{key: value for key, value in payload.items() if key != "api_key"},
         "base_url": "https://llm.example.invalid/v1",
     }
@@ -255,11 +279,14 @@ def test_topic_summary_endpoint_registry_and_settings_are_permissioned_and_safe(
         )
         envelope = cursor.fetchone()[0]
     assert "endpoint-secret-value" not in json.dumps(envelope)
-    assert topic_summarization.decrypt_api_key(
-        endpoint_uuid,
-        envelope,
-        "integration-test-topic-summary-key",
-    ) == "endpoint-secret-value"
+    assert (
+        topic_summarization.decrypt_api_key(
+            endpoint_uuid,
+            envelope,
+            "integration-test-topic-summary-key",
+        )
+        == "endpoint-secret-value"
+    )
 
     denied_list = api.get(TOPIC_SUMMARY_ENDPOINTS)
     assert denied_list.status_code == 403, denied_list.text
@@ -538,13 +565,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
             else:
                 status = 200
                 response_payload = {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": "Decision: ship on Friday."
-                            }
-                        }
-                    ]
+                    "choices": [{"message": {"content": "Decision: ship on Friday."}}]
                 }
             body = json.dumps(response_payload).encode("utf-8")
             self.send_response(status)
@@ -631,10 +652,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
                 "topic_uuid": topic_uuid,
                 "payload": {
                     "kind": "markdown",
-                    "content": (
-                        "Decision: ship on Friday. "
-                        f"urn:image:{image_uuid}"
-                    ),
+                    "content": (f"Decision: ship on Friday. urn:image:{image_uuid}"),
                 },
             },
         )
@@ -709,8 +727,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
             )
             assert cursor.fetchone()[0] == 0
             cursor.execute(
-                "SELECT claim_token FROM m_workspace_llm_endpoints "
-                "WHERE uuid = %s",
+                "SELECT claim_token FROM m_workspace_llm_endpoints WHERE uuid = %s",
                 (str(claimed_before_disable.endpoint.uuid),),
             )
             assert cursor.fetchone()[0] is None
@@ -829,9 +846,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
         assert worker._summarize_one_topic() is True
         assert len(received_requests) == 3
         failed_request = received_requests[1]
-        assert failed_request["authorization"] == (
-            "Bearer retryable-failure-secret"
-        )
+        assert failed_request["authorization"] == ("Bearer retryable-failure-secret")
         assert failed_request["body"]["model"] == "retryable-failure-model"
         text_only_request = received_requests[2]
         assert text_only_request["authorization"] == "Bearer text-secret"
@@ -842,8 +857,9 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
         )
         assert "image_url" not in json.dumps(text_only_request["body"])
         refreshed_topic = api.get(f"{STREAM_TOPICS}{topic_uuid}").json()
-        assert refreshed_topic["summary_last_message_uuid"] == (
-            second_message_response.json()["uuid"]
+        assert (
+            refreshed_topic["summary_last_message_uuid"]
+            == (second_message_response.json()["uuid"])
         )
         assert refreshed_topic["summary_has_new_messages"] is False
         with db.cursor() as cursor:
@@ -2262,6 +2278,7 @@ def test_own_message_read_backfill_migration(api, db):
         is_default=True,
     )
     conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, other_user)
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
     message_uuid = sys_uuid.uuid4()
     _run_database_operation(
         lambda session: messenger_dm_helpers.create_workspace_user_message(
@@ -5187,9 +5204,7 @@ def test_provider_stream_membership_add_remove_duplicate_and_readd_queue(api, db
         )
         assert cur.fetchone()[0] == 3
 
-    suspended_remove = api.delete(
-        f"{STREAM_BINDINGS}{readded.json()[0]['uuid']}"
-    )
+    suspended_remove = api.delete(f"{STREAM_BINDINGS}{readded.json()[0]['uuid']}")
     assert suspended_remove.status_code in (200, 204), suspended_remove.text
     with db.cursor() as cur:
         cur.execute(
@@ -8038,6 +8053,173 @@ def test_compact_topic_unread_event_serializes_non_default_as_false(api, db):
     assert payload["is_default"] is False
 
 
+def test_scoped_read_state_snapshots_match_public_views_in_every_mode(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Scoped snapshot parity"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_ROLLBACK)
+    message_uuids = []
+    for content in (
+        "read message",
+        f"mention [Reader](urn:user:{reader_uuid})",
+        "passive message",
+    ):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    users = sorted(
+        [sys_uuid.UUID(str(api.user_uuid)), reader_uuid],
+        key=str,
+    )
+    modes = (
+        read_state.PROJECT_MODE_LEGACY,
+        read_state.PROJECT_MODE_PREPARING,
+        read_state.PROJECT_MODE_DUAL,
+        read_state.PROJECT_MODE_COMPACT,
+        read_state.PROJECT_MODE_ROLLBACK,
+    )
+    for mode in modes:
+        _set_workspace_read_mode(db, api.project_id, mode)
+        with db.cursor() as cursor:
+            cursor.execute(
+                messenger_dm_helpers._READ_STATE_USER_STREAM_SNAPSHOTS_SQL,
+                (
+                    users,
+                    api.project_id,
+                    users,
+                    api.project_id,
+                    stream_uuid,
+                    api.project_id,
+                    stream_uuid,
+                ),
+            )
+            scoped_streams = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT * FROM m_workspace_user_streams
+                WHERE project_id = %s AND user_uuid = ANY(%s::uuid[])
+                  AND uuid = %s
+                ORDER BY user_uuid
+                """,
+                (api.project_id, users, stream_uuid),
+            )
+            assert scoped_streams == cursor.fetchall(), mode
+
+            cursor.execute(
+                messenger_dm_helpers._READ_STATE_USER_TOPIC_SNAPSHOTS_SQL,
+                (
+                    users,
+                    [topic_uuid],
+                    api.project_id,
+                    users,
+                    api.project_id,
+                    api.project_id,
+                ),
+            )
+            scoped_topics = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT * FROM m_workspace_user_topics_view
+                WHERE project_id = %s AND user_uuid = ANY(%s::uuid[])
+                  AND uuid = ANY(%s::uuid[])
+                ORDER BY uuid, user_uuid
+                """,
+                (api.project_id, users, [topic_uuid]),
+            )
+            assert scoped_topics == cursor.fetchall(), mode
+
+            cursor.execute(
+                messenger_dm_helpers._READ_STATE_USER_MESSAGE_SNAPSHOTS_SQL,
+                (
+                    users,
+                    message_uuids,
+                    api.project_id,
+                    users,
+                    api.project_id,
+                    api.project_id,
+                ),
+            )
+            scoped_messages = cursor.fetchall()
+            cursor.execute(
+                """
+                SELECT * FROM m_workspace_user_messages_view
+                WHERE project_id = %s AND user_uuid = ANY(%s::uuid[])
+                  AND uuid = ANY(%s::uuid[])
+                ORDER BY created_at, uuid, user_uuid
+                """,
+                (api.project_id, users, message_uuids),
+            )
+            assert scoped_messages == cursor.fetchall(), mode
+
+    def relation_loops(plan, relation):
+        loops = []
+        if plan.get("Relation Name") == relation:
+            loops.append(plan.get("Actual Loops", 0))
+        for child in plan.get("Plans", []):
+            loops.extend(relation_loops(child, relation))
+        return loops
+
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    with db.cursor() as cursor:
+        cursor.execute(
+            "EXPLAIN (ANALYZE, FORMAT JSON) "
+            + messenger_dm_helpers._READ_STATE_USER_STREAM_SNAPSHOTS_SQL,
+            (
+                users,
+                api.project_id,
+                users,
+                api.project_id,
+                stream_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        compact_plan = cursor.fetchone()[0][0]["Plan"]
+    assert not any(relation_loops(compact_plan, "m_workspace_user_message_flags"))
+    assert not any(relation_loops(compact_plan, "m_external_accounts_v2"))
+
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    with db.cursor() as cursor:
+        cursor.execute(
+            "EXPLAIN (ANALYZE, FORMAT JSON) "
+            + messenger_dm_helpers._READ_STATE_USER_STREAM_SNAPSHOTS_SQL,
+            (
+                users,
+                api.project_id,
+                users,
+                api.project_id,
+                stream_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        legacy_plan = cursor.fetchone()[0][0]["Plan"]
+    assert not any(relation_loops(legacy_plan, "m_workspace_topic_message_stats_v1"))
+
+
 def test_message_mention_edit_refreshes_unread_snapshots(api, db):
     target_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
@@ -8456,7 +8638,10 @@ def test_epoch_is_zero_without_visible_events(api, workspace_api):
     assert cursor["epoch_generation"]
 
 
-def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
+def test_message_create_writes_compact_read_state_and_visible_events(
+    api, workspace_api, db
+):
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
     workspace_api.user_uuid = api.user_uuid
     workspace_api.project_id = api.project_id
     other_user = sys_uuid.uuid4()
@@ -8495,20 +8680,39 @@ def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
     assert other_message["is_own"] is False
     assert other_message["reactions"] == {}
 
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        api.user_uuid,
+        [message_uuid],
+    ) == {message_uuid: True}
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        other_user,
+        [message_uuid],
+    ) == {message_uuid: False}
     with db.cursor() as cur:
         cur.execute(
             """
-            SELECT user_uuid, read
+            SELECT COUNT(*)
             FROM m_workspace_user_message_flags
             WHERE uuid = %s
-            ORDER BY user_uuid
             """,
             (message_uuid,),
         )
-        flags = {str(row[0]): row[1] for row in cur.fetchall()}
-    assert flags == {
-        str(api.user_uuid): True,
-        str(other_user): False,
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT user_uuid, bit_count(read_bits)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid IN (%s, %s)
+            """,
+            (api.user_uuid, other_user),
+        )
+        compact_rows = {str(row[0]): row[1] for row in cur.fetchall()}
+    assert compact_rows == {
+        str(api.user_uuid): 1,
     }
 
     with db.cursor() as cur:
@@ -8667,6 +8871,7 @@ def test_message_create_writes_flags_and_visible_events(api, workspace_api, db):
 
 
 def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
     other_user = sys_uuid.uuid4()
     outsider_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
@@ -8765,10 +8970,9 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
         )
         event_rows = cursor.fetchall()
 
-    assert flags == {
-        str(api.user_uuid): False,
-        str(other_user): False,
-    }
+    # Compact projects materialize only exceptional pin/star rows.  Read state
+    # and ordinary false flag values stay implicit.
+    assert flags == {str(other_user): False}
     assert [str(user_uuid) for user_uuid, _payload in event_rows] == [
         str(other_user),
         str(other_user),
@@ -8784,6 +8988,7 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
 
 
 def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
     other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "concurrent-starred-messages"
@@ -8908,7 +9113,7 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
         cursor.execute(
             """
             SELECT read, starred
-            FROM m_workspace_user_message_flags
+            FROM m_workspace_user_messages_view
             WHERE uuid = %s AND project_id = %s AND user_uuid = %s
             """,
             (message_uuid, project_uuid, other_user),
@@ -8922,15 +9127,16 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
     assert read_race_events[-1]["read"] is True
     assert read_race_events[-1]["starred"] is True
 
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            UPDATE m_workspace_user_message_flags
-            SET starred = FALSE, updated_at = NOW()
-            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
-            """,
-            (message_uuid, project_uuid, other_user),
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.sync_workspace_user_message_flags(
+            project_id=project_uuid,
+            user_uuid=other_user,
+            message_uuid=message_uuid,
+            values={"starred": False},
+            session=session,
+            emit_events=False,
         )
+    )
     before_duplicate_epoch = latest_epoch()
     update_barrier = threading.Barrier(2)
 
@@ -8963,20 +9169,31 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
         cursor.execute(
             """
             SELECT read, starred
-            FROM m_workspace_user_message_flags
+            FROM m_workspace_user_messages_view
             WHERE uuid = %s AND project_id = %s AND user_uuid = %s
             """,
             (message_uuid, project_uuid, other_user),
         )
         assert cursor.fetchone() == (True, True)
-        cursor.execute(
-            """
-            UPDATE m_workspace_user_message_flags
-            SET read = FALSE, starred = FALSE, updated_at = NOW()
-            WHERE uuid = %s AND project_id = %s AND user_uuid = %s
-            """,
-            (message_uuid, project_uuid, other_user),
+    _run_database_operation(
+        lambda session: (
+            read_state.set_message_read(
+                session,
+                project_uuid,
+                other_user,
+                message_uuid,
+                False,
+            ),
+            messenger_dm_helpers.sync_workspace_user_message_flags(
+                project_id=project_uuid,
+                user_uuid=other_user,
+                message_uuid=message_uuid,
+                values={"starred": False},
+                session=session,
+                emit_events=False,
+            ),
         )
+    )
     before_star_race_epoch = latest_epoch()
     read_project_lock_started = threading.Event()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -9004,7 +9221,7 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
         cursor.execute(
             """
             SELECT read, starred
-            FROM m_workspace_user_message_flags
+            FROM m_workspace_user_messages_view
             WHERE uuid = %s AND project_id = %s AND user_uuid = %s
             """,
             (message_uuid, project_uuid, other_user),
@@ -9072,7 +9289,7 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         cur.execute(
             """
             SELECT read
-            FROM m_workspace_user_message_flags
+            FROM m_workspace_user_messages_view
             WHERE uuid = %s
                 AND project_id = %s
                 AND user_uuid = %s
@@ -9998,18 +10215,12 @@ def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
         message_uuids.append(resp.json()["uuid"])
 
     def other_user_flags():
-        with db.cursor() as cur:
-            cur.execute(
-                """
-                SELECT uuid, read
-                FROM m_workspace_user_message_flags
-                WHERE project_id = %s
-                    AND user_uuid = %s
-                    AND uuid IN (%s, %s, %s, %s)
-                """,
-                (api.project_id, str(other_user), *message_uuids),
-            )
-            return {str(uuid): read for uuid, read in cur.fetchall()}
+        return _workspace_message_read_states(
+            db,
+            api.project_id,
+            other_user,
+            message_uuids,
+        )
 
     assert other_user_flags() == {
         message_uuids[0]: False,
@@ -10076,6 +10287,7 @@ def test_stream_topic_and_message_read_actions_mark_expected_messages(api, db):
 
 
 def test_read_mutations_return_the_exact_rows_changed_by_postgres(api, db):
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
     reader_uuid = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
         db,
@@ -10122,17 +10334,15 @@ def test_read_mutations_return_the_exact_rows_changed_by_postgres(api, db):
         message_uuids.append(response.json()["uuid"])
 
     def set_all_unread():
-        with db.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE m_workspace_user_message_flags
-                SET read = FALSE
-                WHERE project_id = %s AND user_uuid = %s
-                  AND uuid = ANY(%s::uuid[])
-                """,
-                (api.project_id, reader_uuid, message_uuids),
+        _run_database_operation(
+            lambda session: read_state.set_message_uuids_read(
+                session,
+                api.project_id,
+                reader_uuid,
+                message_uuids,
+                False,
             )
-        db.commit()
+        )
 
     set_all_unread()
     _message, changed = _run_database_operation(
@@ -10182,6 +10392,7 @@ def test_read_mutations_return_the_exact_rows_changed_by_postgres(api, db):
 
 
 def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
     reader_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, reader_uuid, f"user-{reader_uuid}")
     bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
@@ -10227,7 +10438,7 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
     read_capability = {
         "messenger.message.read": {
             "available": True,
-            "revision": 1,
+            "revision": 2,
             "limits": {},
         }
     }
@@ -10400,20 +10611,16 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
         return _run_database_operation(operation)
 
     for _cycle in range(8):
-        with db.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE m_workspace_user_message_flags
-                SET read = FALSE
-                WHERE project_id = %s AND user_uuid = %s
-                  AND uuid = ANY(%s::uuid[])
-                """,
-                (
-                    api.project_id,
-                    str(reader_uuid),
-                    [str(value) for value in message_uuids],
-                ),
+        _run_database_operation(
+            lambda session: read_state.set_message_uuids_read(
+                session,
+                api.project_id,
+                reader_uuid,
+                message_uuids,
+                False,
             )
+        )
+        with db.cursor() as cursor:
             cursor.execute(
                 """
                 UPDATE m_external_accounts_v2
@@ -10441,41 +10648,46 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
         with db.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT message.uuid, flags.read
-                FROM m_workspace_user_message_flags AS flags
-                JOIN m_workspace_messages AS message
-                  ON message.project_id = flags.project_id
-                 AND message.uuid = flags.uuid
-                WHERE flags.project_id = %s AND flags.user_uuid = %s
-                  AND message.stream_uuid = %s
-                ORDER BY message.created_at, message.uuid
+                SELECT uuid, read
+                FROM m_workspace_user_messages_view
+                WHERE project_id = %s AND user_uuid = %s
+                  AND stream_uuid = %s
+                ORDER BY created_at, uuid
                 """,
                 (api.project_id, str(reader_uuid), str(stream_uuid)),
             )
             flags = cursor.fetchall()
             cursor.execute(
                 """
-                SELECT payload
-                FROM m_external_provider_operations_v1
-                WHERE external_account_uuid = %s
-                  AND operation_kind = 'read_state.set'
-                ORDER BY sequence DESC
+                SELECT array_agg(message.uuid ORDER BY message.created_at, message.uuid)
+                FROM m_external_provider_read_snapshots_v1 AS snapshot
+                JOIN m_external_provider_read_candidate_chunks_v1 AS candidate
+                  ON candidate.external_operation_uuid =
+                     snapshot.external_operation_uuid
+                CROSS JOIN LATERAL generate_series(0, 4095) AS bit_offset
+                JOIN m_workspace_messages AS message
+                  ON message.project_id = snapshot.project_id
+                 AND message.ingest_sequence =
+                        candidate.chunk_number * 4096 + bit_offset
+                WHERE snapshot.external_account_uuid = %s
+                  AND get_bit(candidate.candidate_bits, bit_offset) = 1
+                GROUP BY snapshot.queue_sequence
+                ORDER BY snapshot.queue_sequence DESC
                 LIMIT 1
                 """,
                 (str(account_uuid),),
             )
-            payload = cursor.fetchone()[0]
+            candidate_uuids = cursor.fetchone()[0]
 
         assert [read for _uuid, read in flags] == [True, True, False]
-        assert payload["message_uuids"] == expected_message_uuids
+        assert [str(value) for value in candidate_uuids] == expected_message_uuids
 
     with db.cursor() as cursor:
         cursor.execute(
             """
             SELECT COUNT(*)
-            FROM m_external_provider_operations_v1
+            FROM m_external_provider_read_snapshots_v1
             WHERE external_account_uuid = %s
-              AND operation_kind = 'read_state.set'
             """,
             (str(account_uuid),),
         )
@@ -10531,14 +10743,567 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
     with db.cursor() as cursor:
         cursor.execute(
             """
-            SELECT COUNT(*)
-            FROM m_external_provider_operations_v1
-            WHERE external_account_uuid = %s
-              AND operation_kind = 'read_state.set'
-            """,
+                SELECT COUNT(*)
+                FROM m_external_provider_read_snapshots_v1
+                WHERE external_account_uuid = %s
+                """,
             (str(account_uuid),),
         )
         assert cursor.fetchone()[0] == 8
+
+
+def test_provider_read_prelocks_lane_before_project_during_page_lease(api, db):
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    reader_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, reader_uuid, f"user-{reader_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Provider read lane order",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        reader_uuid,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "lane order"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    read_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    source = {
+        "kind": "zulip",
+        "chat_type": "channel",
+        "participants": [],
+        "topics": [],
+    }
+    stream_source = {
+        "kind": "zulip",
+        "stream_id": 43,
+        "server_url": "https://zulip.example.invalid",
+        "source_scope": str(account_uuid),
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb,
+                TRUE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (
+                account_uuid,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+                json.dumps(read_capability),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid, status, capabilities,
+                catalog_capabilities
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:43', %s::jsonb,
+                'Provider read lane order', TRUE, %s, %s, 'live',
+                %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                api.user_uuid,
+                json.dumps(source),
+                api.project_id,
+                stream_uuid,
+                json.dumps(read_capability),
+                json.dumps(read_capability),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip', source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:43'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(stream_source),
+                account_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+    db.commit()
+
+    def read_stream():
+        return _run_database_operation(
+            lambda _session: sql_canonical_store.SQLCanonicalMessengerStore(
+                api.project_id,
+                reader_uuid,
+            ).perform_action("streams", stream_uuid, "read", {})
+        )
+
+    read_stream()
+    _run_database_operation(
+        lambda session: read_state.set_message_uuids_read(
+            session,
+            api.project_id,
+            reader_uuid,
+            [message_uuid],
+            False,
+        )
+    )
+
+    lease_waiting_for_project = threading.Event()
+    release_lease = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    class CoordinatedLeaseSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            if (
+                not self._paused
+                and isinstance(statement, str)
+                and "hashtextextended(%s::text, 0)" in statement
+                and params
+                and str(params[0]) == str(api.project_id)
+            ):
+                self._paused = True
+                lease_waiting_for_project.set()
+                assert release_lease.wait(timeout=5)
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def lease_page():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '3s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            return provider_data.lease_provider_operations(
+                CoordinatedLeaseSession(session),
+                identity,
+                request_uuid=sys_uuid.uuid4(),
+                limit=1,
+                lease_seconds=30,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        lease_future = executor.submit(lease_page)
+        assert lease_waiting_for_project.wait(timeout=5)
+        read_future = executor.submit(read_stream)
+        with pytest.raises(concurrent.futures.TimeoutError):
+            read_future.result(timeout=0.2)
+        release_lease.set()
+        lease = lease_future.result(timeout=8)
+        read_future.result(timeout=8)
+
+    assert len(lease["operations"]) == 1
+    assert lease["operations"][0]["payload"]["message_uuids"] == [str(message_uuid)]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_account_uuid = %s
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone() == (2,)
+        cursor.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_messages_view
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (True,)
+
+
+def test_provider_account_read_and_delete_follow_account_project_lock_order(
+    api,
+    db,
+    monkeypatch,
+):
+    account_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, FALSE, 'disconnected')
+            """,
+            (account_uuid, api.user_uuid),
+        )
+
+    thread_context = threading.local()
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(
+            get_session=lambda: thread_context.session,
+        ),
+    )
+    account_row_locked = threading.Event()
+    delete_lock_attempted = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    def provider_read():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            thread_context.session = session
+            sql_canonical_store.SQLCanonicalMessengerStore._lock_provider_account(
+                None,
+                account_uuid,
+            )
+            account_row_locked.set()
+            assert delete_lock_attempted.wait(timeout=3)
+            read_state.lock_projects(session, (project_uuid,))
+        return "read"
+
+    def delete_account():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            delete_lock_attempted.set()
+            read_state.lock_external_account_resources(session, (account_uuid,))
+            read_state.lock_projects(session, (project_uuid,))
+            session.execute(
+                "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+                (account_uuid,),
+            )
+        return "deleted"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        read_future = executor.submit(provider_read)
+        assert account_row_locked.wait(timeout=3)
+        delete_future = executor.submit(delete_account)
+        assert read_future.result(timeout=10) == "read"
+        assert delete_future.result(timeout=10) == "deleted"
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_capability_refresh_claim_and_account_delete_follow_lock_order(api, db):
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.UUID(int=(1 << 128) - 1)
+    claim_after_uuid = sys_uuid.UUID(int=(1 << 128) - 2)
+    project_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, TRUE, 'live')
+            """,
+            (account_uuid, api.user_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+
+    account_row_locked = threading.Event()
+    delete_lock_attempted = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    def refresh_account():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            claimed_uuid = sql_state.claim_capability_refresh_account(
+                session,
+                after_uuid=claim_after_uuid,
+            )
+            assert claimed_uuid == account_uuid
+            account_row_locked.set()
+            assert delete_lock_attempted.wait(timeout=3)
+            read_state.lock_projects(session, (project_uuid,))
+        return "refreshed"
+
+    def delete_account():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            delete_lock_attempted.set()
+            read_state.lock_external_account_resources(session, (account_uuid,))
+            read_state.lock_projects(session, (project_uuid,))
+            session.execute(
+                "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+                (account_uuid,),
+            )
+        return "deleted"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        refresh_future = executor.submit(refresh_account)
+        assert account_row_locked.wait(timeout=3)
+        delete_future = executor.submit(delete_account)
+        assert refresh_future.result(timeout=10) == "refreshed"
+        assert delete_future.result(timeout=10) == "deleted"
+
+
+def test_external_account_delete_cleans_compact_state_across_projects(api, db):
+    bridge_uuid, key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    reader_uuid = sys_uuid.uuid4()
+    project_ids = [sys_uuid.UUID(api.project_id), sys_uuid.uuid4()]
+    streams = []
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+            """,
+            (
+                account_uuid,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_uuid),
+                            "credential_key_uuid": str(key_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+
+    for index, project_id in enumerate(project_ids):
+        _set_workspace_read_mode(db, project_id, read_state.PROJECT_MODE_COMPACT)
+        stream_uuid = sys_uuid.UUID(
+            conftest.seed_user_stream(
+                db,
+                project_id,
+                api.user_uuid,
+                f"Account cleanup {index}",
+            )
+        )
+        conftest.seed_user_stream_binding(
+            db,
+            project_id,
+            stream_uuid,
+            reader_uuid,
+        )
+        topic_uuid = sys_uuid.UUID(
+            conftest.seed_stream_topic(
+                db,
+                project_id,
+                stream_uuid,
+                api.user_uuid,
+                "general",
+                is_default=True,
+            )
+        )
+        message_uuid = sys_uuid.uuid4()
+        _run_database_operation(
+            lambda session, project_id=project_id, stream_uuid=stream_uuid, topic_uuid=topic_uuid, message_uuid=message_uuid: (
+                messenger_dm_helpers.create_workspace_user_message(
+                    uuid=message_uuid,
+                    project_id=project_id,
+                    user_uuid=sys_uuid.UUID(api.user_uuid),
+                    stream_uuid=stream_uuid,
+                    topic_uuid=topic_uuid,
+                    payload=message_payloads.MarkdownPayload(
+                        content=f"account cleanup {index}"
+                    ),
+                    session=session,
+                    emit_events=False,
+                )
+            )
+        )
+        _run_database_operation(
+            lambda session, project_id=project_id, message_uuid=message_uuid: (
+                read_state.set_message_uuids_read(
+                    session,
+                    project_id,
+                    reader_uuid,
+                    (message_uuid,),
+                    True,
+                )
+            )
+        )
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_workspace_streams
+                SET source_name = 'zulip',
+                    source = %s::jsonb,
+                    external_account_uuid = %s,
+                    provider_external_id = %s
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "server_url": "https://zulip.example.invalid",
+                            "source_scope": str(account_uuid),
+                        }
+                    ),
+                    account_uuid,
+                    f"channel:{index}",
+                    project_id,
+                    stream_uuid,
+                ),
+            )
+        streams.append(stream_uuid)
+
+    response = api.delete(
+        f"{EXTERNAL_ACCOUNTS}{account_uuid}",
+        permissions=EXTERNAL_ACCOUNT_DELETE,
+    )
+    assert response.status_code == 204, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_streams
+            WHERE project_id = ANY(%s::uuid[]) AND uuid = ANY(%s::uuid[])
+            """,
+            (project_ids, streams),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_topic_message_stats_v1
+            WHERE project_id = ANY(%s::uuid[])
+            """,
+            (project_ids,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+              AND read_bits <> B'0'::bit(4096)
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
 
 
 def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
@@ -10887,11 +11652,11 @@ def test_zulip_message_flag_sync_can_keep_author_unread(api, db):
         cur.execute(
             """
             SELECT user_uuid, read
-            FROM m_workspace_user_message_flags
-            WHERE uuid = %s
+            FROM m_workspace_user_messages_view
+            WHERE uuid = %s AND project_id = %s
             ORDER BY user_uuid
             """,
-            (message_uuid,),
+            (message_uuid, api.project_id),
         )
         flags = {str(row[0]): row[1] for row in cur.fetchall()}
 
@@ -10995,3 +11760,6658 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
     )
     assert exact_resp.status_code == 200, exact_resp.text
     assert [event["epoch_version"] for event in exact_resp.json()] == [second_epoch]
+
+
+def test_missing_read_state_project_stays_legacy_until_gated_compaction(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Rolling upgrade read state"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
+            (api.project_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"legacy"}'::jsonb,
+                NOW(), NOW()
+            )
+            """,
+            (
+                message_uuid,
+                api.project_id,
+                stream_uuid,
+                topic_uuid,
+                api.user_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read, created_at, updated_at
+            ) VALUES
+                (%s, %s, %s, TRUE, NOW(), NOW()),
+                (%s, %s, %s, FALSE, NOW(), NOW())
+            """,
+            (
+                message_uuid,
+                api.user_uuid,
+                api.project_id,
+                message_uuid,
+                reader_uuid,
+                api.project_id,
+            ),
+        )
+    db.commit()
+
+    _run_database_operation(
+        lambda session: read_state.ensure_new_project(session, api.project_id)
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == read_state.PROJECT_MODE_LEGACY
+
+    _finish_read_compaction(db, api.project_id)
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): False}
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        api.user_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): True}
+
+
+def test_read_state_maintenance_skips_a_locked_project(api, db):
+    del api
+    locked_project_id = sys_uuid.UUID("00000000-0000-0000-0000-000000000011")
+    available_project_id = sys_uuid.UUID("00000000-0000-0000-0000-000000000012")
+    project_ids = [locked_project_id, available_project_id]
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_compaction_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode, created_at, updated_at
+            ) VALUES
+                (%s, 'legacy', '2000-01-01 UTC', '2000-01-01 UTC'),
+                (%s, 'legacy', '2000-01-02 UTC', '2000-01-02 UTC')
+            """,
+            (locked_project_id, available_project_id),
+        )
+    db.commit()
+
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT pg_advisory_lock(hashtextextended(%s::text, 0))
+                """,
+                (locked_project_id,),
+            )
+        result = _run_database_operation(
+            lambda session: read_state.maintain_next_project(session)
+        )
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))
+                """,
+                (locked_project_id,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_compaction_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_projects_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+        db.commit()
+
+    assert result == ("prepare", available_project_id, 0)
+
+
+def test_read_state_maintenance_scans_past_full_locked_candidate_page(api, db):
+    del api
+    project_ids = [
+        sys_uuid.UUID(f"00000000-0000-0000-0001-{index:012x}")
+        for index in range(read_state.MAINTENANCE_CANDIDATE_LIMIT + 1)
+    ]
+    locked_project_ids = project_ids[:-1]
+    available_project_id = project_ids[-1]
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_compaction_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode, created_at, updated_at
+            ) VALUES (%s, 'legacy', '1900-01-01 UTC', '1900-01-01 UTC')
+            """,
+            ((project_id,) for project_id in project_ids),
+        )
+    db.commit()
+
+    try:
+        with db.cursor() as cursor:
+            for project_id in locked_project_ids:
+                cursor.execute(
+                    "SELECT pg_advisory_lock(hashtextextended(%s::text, 0))",
+                    (project_id,),
+                )
+        result = _run_database_operation(
+            lambda session: read_state.maintain_next_project(session)
+        )
+    finally:
+        with db.cursor() as cursor:
+            for project_id in locked_project_ids:
+                cursor.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                    (project_id,),
+                )
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_compaction_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_projects_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+        db.commit()
+
+    assert result == ("prepare", available_project_id, 0)
+
+
+def test_read_state_cleanup_scans_past_full_locked_candidate_page(api, db):
+    project_ids = [
+        sys_uuid.UUID(f"00000000-0000-0000-0002-{index:012x}")
+        for index in range(read_state.MAINTENANCE_CANDIDATE_LIMIT + 1)
+    ]
+    flag_uuids = [sys_uuid.uuid4() for _project_id in project_ids]
+    locked_project_ids = project_ids[:-1]
+    available_project_id = project_ids[-1]
+    stream_uuids = []
+    topic_uuids = []
+    for index, project_id in enumerate(project_ids):
+        stream_uuid = conftest.seed_user_stream(
+            db,
+            project_id,
+            api.user_uuid,
+            f"Cleanup candidate {index}",
+        )
+        stream_uuids.append(stream_uuid)
+        topic_uuids.append(
+            conftest.seed_stream_topic(
+                db,
+                project_id,
+                stream_uuid,
+                api.user_uuid,
+                "general",
+                is_default=True,
+            )
+        )
+    with db.cursor() as cursor:
+        cursor.executemany(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"cleanup"}'::jsonb,
+                NOW(), NOW()
+            )
+            """,
+            (
+                (
+                    flag_uuid,
+                    project_id,
+                    stream_uuid,
+                    topic_uuid,
+                    api.user_uuid,
+                )
+                for flag_uuid, project_id, stream_uuid, topic_uuid in zip(
+                    flag_uuids,
+                    project_ids,
+                    stream_uuids,
+                    topic_uuids,
+                )
+            ),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode, created_at, updated_at
+            ) VALUES (%s, 'compact', '1900-01-01 UTC', '1900-01-01 UTC')
+            """,
+            ((project_id,) for project_id in project_ids),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read, pinned, starred,
+                created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, FALSE, FALSE, FALSE, NOW(), NOW()
+            )
+            """,
+            (
+                (flag_uuid, api.user_uuid, project_id)
+                for flag_uuid, project_id in zip(flag_uuids, project_ids)
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT project_id
+            FROM m_workspace_read_state_projects_v1
+            WHERE NOT (project_id = ANY(%s::uuid[]))
+            """,
+            (project_ids,),
+        )
+        unrelated_project_ids = [row[0] for row in cursor.fetchall()]
+    db.commit()
+
+    try:
+        with db.cursor() as cursor:
+            for project_id in locked_project_ids:
+                cursor.execute(
+                    "SELECT pg_advisory_lock(hashtextextended(%s::text, 0))",
+                    (project_id,),
+                )
+        result = _run_database_operation(
+            lambda session: read_state.maintain_next_project(
+                session,
+                cleanup_enabled=True,
+                excluded_project_ids=unrelated_project_ids,
+            )
+        )
+    finally:
+        with db.cursor() as cursor:
+            for project_id in locked_project_ids:
+                cursor.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                    (project_id,),
+                )
+            cursor.execute(
+                "DELETE FROM m_workspace_user_message_flags "
+                "WHERE uuid = ANY(%s::uuid[])",
+                (flag_uuids,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_streams WHERE uuid = ANY(%s::uuid[])",
+                (stream_uuids,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_projects_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_project_ingest_ranges_v2 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+        db.commit()
+
+    assert result == ("cleanup", available_project_id, 1)
+
+
+def test_read_state_maintenance_rotates_after_each_bounded_batch(api, db):
+    del api
+    first_project_id = sys_uuid.UUID("00000000-0000-0000-0000-000000000021")
+    second_project_id = sys_uuid.UUID("00000000-0000-0000-0000-000000000022")
+    project_ids = [first_project_id, second_project_id]
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_compaction_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 "
+            "WHERE project_id = ANY(%s::uuid[])",
+            (project_ids,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode, created_at, updated_at
+            ) VALUES
+                (%s, 'preparing', '2000-01-01 UTC', '2000-01-01 UTC'),
+                (%s, 'preparing', '2000-01-01 UTC', '2000-01-01 UTC')
+            """,
+            (first_project_id, second_project_id),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_compaction_v1 (
+                project_id, phase, created_at, updated_at
+            ) VALUES
+                (%s, 'sequences', '2000-01-01 UTC', '2000-01-01 UTC'),
+                (%s, 'sequences', '2000-01-01 UTC', '2000-01-01 UTC')
+            """,
+            (first_project_id, second_project_id),
+        )
+    db.commit()
+
+    try:
+        first = _run_database_operation(
+            lambda session: read_state.maintain_next_project(session)
+        )
+        second = _run_database_operation(
+            lambda session: read_state.maintain_next_project(session)
+        )
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_compaction_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+            cursor.execute(
+                "DELETE FROM m_workspace_read_state_projects_v1 "
+                "WHERE project_id = ANY(%s::uuid[])",
+                (project_ids,),
+            )
+        db.commit()
+
+    assert first == ("prepare", first_project_id, 0)
+    assert second == ("prepare", second_project_id, 0)
+
+
+def test_compact_read_state_cutover_is_resumable_exact_and_sparse(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact cutover"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    message_uuids = []
+    for content in (
+        "first",
+        f"mention [reader](urn:user:{reader_uuid})",
+        "third",
+        f"raw urn:user:{reader_uuid} is not a mention",
+    ):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    response = api.post(
+        f"{MESSAGES}{message_uuids[1]}/actions/star/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    response = api.post(
+        f"{MESSAGES}{message_uuids[2]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    expected_messages = api.get(
+        MESSAGES,
+        user=reader_uuid,
+        params={"stream_uuid": stream_uuid},
+    ).json()
+
+    observed_phases = set()
+    for _iteration in range(50):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT phase
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (api.project_id,),
+            )
+            progress = cursor.fetchone()
+            if progress is not None:
+                observed_phases.add(progress[0])
+            cursor.execute(
+                """
+                SELECT mode
+                FROM m_workspace_read_state_projects_v1
+                WHERE project_id = %s
+                """,
+                (api.project_id,),
+            )
+            if cursor.fetchone()[0] == read_state.PROJECT_MODE_COMPACT:
+                break
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=2,
+            )
+        )
+    else:
+        pytest.fail("Compact read-state cutover did not complete")
+
+    assert observed_phases == {
+        "sequences",
+        "memberships",
+        "flags",
+        "stats",
+        "mentions",
+        "verify",
+        "verify_chunks",
+        "verify_read_stats",
+        "verify_stats",
+        "verify_mentions",
+    }
+    compact_messages = api.get(
+        MESSAGES,
+        user=reader_uuid,
+        params={"stream_uuid": stream_uuid},
+    )
+    assert compact_messages.status_code == 200, compact_messages.text
+    assert compact_messages.json() == expected_messages
+    assert (
+        next(
+            item for item in compact_messages.json() if item["uuid"] == message_uuids[1]
+        )["mentioned"]
+        is True
+    )
+    assert (
+        next(
+            item for item in compact_messages.json() if item["uuid"] == message_uuids[3]
+        )["mentioned"]
+        is False
+    )
+
+    while _run_database_operation(
+        lambda session: read_state.cleanup_legacy_flags(
+            session,
+            api.project_id,
+            batch_size=2,
+        )
+    ):
+        pass
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, user_uuid, pinned, starred
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        sparse_flags = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        chunk_count = cursor.fetchone()[0]
+    assert sparse_flags == [(sys_uuid.UUID(message_uuids[1]), reader_uuid, False, True)]
+    assert chunk_count <= 2
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=2,
+            )
+        )
+        == 0
+    )
+
+
+def test_compact_read_state_parity_failure_blocks_cutover(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact parity gate"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "verify me"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+
+    for _iteration in range(20):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT phase
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (api.project_id,),
+            )
+            if cursor.fetchone()[0] == "verify":
+                break
+    else:
+        pytest.fail("Compaction did not reach parity verification")
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (api.user_uuid,),
+        )
+    db.commit()
+    with pytest.raises(RuntimeError, match="parity check failed"):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == read_state.PROJECT_MODE_DUAL
+
+    def repair_compact_state(session):
+        read_state.set_message_read(
+            session,
+            api.project_id,
+            api.user_uuid,
+            message_uuid,
+            True,
+        )
+        read_state._refresh_topic_read_stats(
+            session,
+            api.project_id,
+            [(api.user_uuid, topic_uuid)],
+        )
+
+    _run_database_operation(repair_compact_state)
+    for _iteration in range(20):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT mode
+                FROM m_workspace_read_state_projects_v1
+                WHERE project_id = %s
+                """,
+                (api.project_id,),
+            )
+            if cursor.fetchone()[0] == read_state.PROJECT_MODE_COMPACT:
+                break
+    else:
+        pytest.fail("Compaction did not resume after parity repair")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == read_state.PROJECT_MODE_COMPACT
+
+
+def test_rollback_mode_reads_compact_state_and_dual_writes_legacy_flags(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Rollback dual writes"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for content in ("first", "second", "third"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_read_state_projects_v1
+            SET mode = 'rollback', updated_at = NOW()
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+    db.commit()
+
+    assert _workspace_message_read_states(
+        db, api.project_id, reader_uuid, message_uuids
+    ) == {
+        message_uuids[0]: True,
+        message_uuids[1]: False,
+        message_uuids[2]: False,
+    }
+    response = api.post(
+        f"{STREAMS}{stream_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid::text, read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            (api.project_id, reader_uuid, message_uuids),
+        )
+        assert dict(cursor.fetchall()) == {
+            message_uuid: True for message_uuid in message_uuids
+        }
+
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.sync_workspace_user_message_flags(
+            project_id=api.project_id,
+            user_uuid=reader_uuid,
+            message_uuid=message_uuids[-1],
+            values={"read": False},
+            session=session,
+            allow_author_unread=True,
+            emit_events=False,
+        )
+    )
+    assert _workspace_message_read_states(
+        db, api.project_id, reader_uuid, [message_uuids[-1]]
+    ) == {message_uuids[-1]: False}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, message_uuids[-1]),
+        )
+        assert cursor.fetchone() == (False,)
+
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "during rollback"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    new_message_uuid = response.json()["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_uuid, read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, new_message_uuid),
+        )
+        assert dict(cursor.fetchall()) == {
+            sys_uuid.UUID(str(api.user_uuid)): True,
+            reader_uuid: False,
+        }
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        [new_message_uuid],
+    ) == {new_message_uuid: False}
+
+
+def test_compact_bulk_read_rechecks_rollback_mode_under_project_lock(
+    api, db, monkeypatch
+):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Rollback transition race"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for content in ("first", "second"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+
+    original_lock_projects = read_state.lock_projects
+    transitioned = False
+
+    def transition_before_compact_write(session, project_ids):
+        nonlocal transitioned
+        original_lock_projects(session, project_ids)
+        if not transitioned:
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_projects_v1
+                SET mode = 'rollback', updated_at = NOW()
+                WHERE project_id = %s AND mode = 'compact'
+                """,
+                (api.project_id,),
+            )
+            transitioned = True
+
+    monkeypatch.setattr(read_state, "lock_projects", transition_before_compact_write)
+    _run_database_operation(
+        lambda session: read_state.read_stream(
+            session,
+            api.project_id,
+            reader_uuid,
+            stream_uuid,
+            collect_message_rows=False,
+        )
+    )
+
+    assert transitioned is True
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid::text, read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            (api.project_id, reader_uuid, message_uuids),
+        )
+        assert dict(cursor.fetchall()) == {
+            message_uuid: True for message_uuid in message_uuids
+        }
+
+
+@pytest.mark.parametrize("scope", ["stream", "topic", "boundary"])
+def test_bulk_read_rechecks_compact_mode_after_dual_cleanup(api, db, scope):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, f"Dual cleanup {scope}"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "dual cleanup race"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_DUAL)
+
+    mode_snapshot_read = threading.Event()
+    cleanup_finished = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class PausedDualSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, values=None):
+            result = self._session.execute(statement, values)
+            if (
+                not self._paused
+                and "SELECT mode" in statement
+                and "m_workspace_read_state_projects_v1" in statement
+            ):
+                self._paused = True
+                mode_snapshot_read.set()
+                assert cleanup_finished.wait(timeout=5)
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def run_bulk_read():
+        with session_factory() as session:
+            coordinated = PausedDualSession(session)
+            if scope == "stream":
+                return messenger_dm_helpers.read_workspace_user_stream_messages(
+                    api.project_id,
+                    reader_uuid,
+                    stream_uuid,
+                    session=coordinated,
+                    collect_message_uuids=False,
+                )
+            if scope == "topic":
+                return messenger_dm_helpers.read_workspace_user_stream_topic_messages(
+                    api.project_id,
+                    reader_uuid,
+                    topic_uuid,
+                    session=coordinated,
+                    collect_message_uuids=False,
+                )
+            return messenger_dm_helpers.read_workspace_user_topic_messages_to_message(
+                api.project_id,
+                reader_uuid,
+                message_uuid,
+                session=coordinated,
+                collect_message_uuids=False,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        read_future = executor.submit(run_bulk_read)
+        assert mode_snapshot_read.wait(timeout=5)
+
+        def compact_and_cleanup(session):
+            read_state.lock_projects(session, (api.project_id,))
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_projects_v1
+                SET mode = 'compact', updated_at = NOW()
+                WHERE project_id = %s AND mode = 'dual'
+                """,
+                (api.project_id,),
+            )
+            session.execute(
+                """
+                DELETE FROM m_workspace_user_message_flags
+                WHERE project_id = %s AND pinned = FALSE AND starred = FALSE
+                """,
+                (api.project_id,),
+            )
+
+        _run_database_operation(compact_and_cleanup)
+        cleanup_finished.set()
+        read_future.result(timeout=8)
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {message_uuid: True}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, message_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 1
+
+
+def test_compact_and_rollback_bulk_reads_have_no_lock_order_cycle(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Rollback lock ordering"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "lock ordering"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    compact_waiting_for_project = threading.Event()
+    release_compact = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class PausedCompactSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            if (
+                not self._paused
+                and isinstance(statement, str)
+                and "pg_advisory_xact_lock(hashtextextended(%s::text" in statement
+            ):
+                self._paused = True
+                compact_waiting_for_project.set()
+                assert release_compact.wait(timeout=5)
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def run_compact_bulk():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            return read_state.read_stream(
+                PausedCompactSession(session),
+                api.project_id,
+                reader_uuid,
+                stream_uuid,
+                collect_message_rows=False,
+            )
+
+    def run_rollback_bulk():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '2s'")
+            return read_state.read_stream(
+                session,
+                api.project_id,
+                reader_uuid,
+                stream_uuid,
+                collect_message_rows=False,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        compact_future = executor.submit(run_compact_bulk)
+        assert compact_waiting_for_project.wait(timeout=5)
+        _run_database_operation(
+            lambda session: (
+                read_state.lock_projects(session, (api.project_id,)),
+                session.execute(
+                    """
+                    UPDATE m_workspace_read_state_projects_v1
+                    SET mode = 'rollback', updated_at = NOW()
+                    WHERE project_id = %s AND mode = 'compact'
+                    """,
+                    (api.project_id,),
+                ),
+            )
+        )
+        rollback_future = executor.submit(run_rollback_bulk)
+        rollback_result = rollback_future.result(timeout=3)
+        release_compact.set()
+        compact_result = compact_future.result(timeout=5)
+
+    assert rollback_result.changed is True
+    # The rollback transaction linearizes first. The earlier compact snapshot
+    # is rebuilt under the project lock and correctly becomes a no-op.
+    assert compact_result.changed is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (True,)
+
+
+def _advance_read_compaction_to_phase(db, project_id, phase):
+    for _iteration in range(50):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT phase
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            progress = cursor.fetchone()
+        if progress is not None and progress[0] == phase:
+            return
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                project_id,
+                batch_size=10,
+            )
+        )
+    pytest.fail(f"Compaction did not reach {phase}")
+
+
+def test_readd_mode_snapshot_is_serialized_with_preparing_cutover(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Serialized preparing re-add"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    message_uuids = []
+    for content in ("old unread", "old read"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[1]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+    db.commit()
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "detached gap"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuids.append(response.json()["uuid"])
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _advance_read_compaction_to_phase(db, api.project_id, "memberships")
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=100,
+            )
+        )
+        > 0
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+
+    mode_snapshot_read = threading.Event()
+    compactor_has_project_lock = threading.Event()
+    compaction_finished = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class CoordinatedReaddSession:
+        def __init__(self, session):
+            self.session = session
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+        def execute(self, statement, values=None):
+            result = self.session.execute(statement, values)
+            if (
+                "SELECT mode" in statement
+                and "m_workspace_read_state_projects_v1" in statement
+            ):
+                mode_snapshot_read.set()
+                if compactor_has_project_lock.wait(timeout=0.25):
+                    assert compaction_finished.wait(timeout=5)
+            return result
+
+    class CoordinatedCompactionSession:
+        def __init__(self, session):
+            self.session = session
+
+        def __getattr__(self, name):
+            return getattr(self.session, name)
+
+        def execute(self, statement, values=None):
+            result = self.session.execute(statement, values)
+            if (
+                "pg_advisory_xact_lock(hashtextextended(%s::text, 0))" in statement
+                and values == (api.project_id,)
+            ):
+                compactor_has_project_lock.set()
+            return result
+
+    def readd():
+        with session_factory() as session:
+            coordinated = CoordinatedReaddSession(session)
+            messenger_dm_helpers._create_workspace_stream_binding_message_flags(
+                api.project_id,
+                stream_uuid,
+                reader_uuid,
+                session=coordinated,
+            )
+        return "readded"
+
+    def compact():
+        assert mode_snapshot_read.wait(timeout=3)
+        for _iteration in range(50):
+            with session_factory() as session:
+                coordinated = CoordinatedCompactionSession(session)
+                read_state.lock_projects(coordinated, ())
+                read_state.lock_projects(coordinated, (api.project_id,))
+                read_state.compact_legacy_batch(
+                    coordinated,
+                    api.project_id,
+                    batch_size=100,
+                )
+                mode = read_state.project_mode(coordinated, api.project_id)
+            if mode == read_state.PROJECT_MODE_COMPACT:
+                compaction_finished.set()
+                return "compacted"
+        pytest.fail("Concurrent compaction did not finish")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        readd_future = executor.submit(readd)
+        compact_future = executor.submit(compact)
+        assert readd_future.result(timeout=10) == "readded"
+        assert compact_future.result(timeout=10) == "compacted"
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: False,
+        message_uuids[1]: True,
+        message_uuids[2]: True,
+    }
+
+
+def test_compact_only_read_bit_blocks_cutover_for_detached_legacy_user(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact reverse parity"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "must stay unread"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+    db.commit()
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _advance_read_compaction_to_phase(db, api.project_id, "verify_chunks")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        ingest_sequence = cursor.fetchone()[0]
+        chunk_number, bit_offset = divmod(ingest_sequence, read_state.READ_CHUNK_BITS)
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_read_chunks_v1 (
+                user_uuid, chunk_number, read_bits, created_at, updated_at
+            ) VALUES (
+                %s, %s, set_bit(B'0'::bit(4096), %s, 1), NOW(), NOW()
+            )
+            ON CONFLICT (user_uuid, chunk_number) DO UPDATE
+            SET read_bits = set_bit(
+                    m_workspace_user_read_chunks_v1.read_bits,
+                    %s,
+                    1
+                ),
+                updated_at = NOW()
+            """,
+            (reader_uuid, chunk_number, bit_offset, bit_offset),
+        )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="read-state parity"):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+    _run_database_operation(
+        lambda session: read_state.set_message_read(
+            session,
+            api.project_id,
+            reader_uuid,
+            message_uuid,
+            False,
+        )
+    )
+    _finish_read_compaction(db, api.project_id)
+
+
+def test_compact_read_counter_corruption_blocks_cutover_and_can_resume(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact counter parity"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "count exactly once"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _advance_read_compaction_to_phase(db, api.project_id, "verify_read_stats")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_topic_read_stats_v1
+            SET read_count = read_count + 1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+    db.commit()
+
+    with pytest.raises(RuntimeError, match="read-counter parity"):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_topic_read_stats_v1
+            SET read_count = read_count - 1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+    db.commit()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+    db.commit()
+    for _iteration in range(20):
+        try:
+            _run_database_operation(
+                lambda session: read_state.compact_legacy_batch(
+                    session,
+                    api.project_id,
+                    batch_size=10,
+                )
+            )
+        except RuntimeError as exc:
+            assert "read-counter parity" in str(exc)
+            break
+    else:
+        pytest.fail("Missing compact read counter did not block cutover")
+    _run_database_operation(
+        lambda session: read_state._refresh_topic_read_stats(
+            session,
+            api.project_id,
+            [(reader_uuid, topic_uuid)],
+        )
+    )
+    _finish_read_compaction(db, api.project_id)
+
+
+def test_live_read_after_verified_chunk_keeps_counter_verification_exact(api, db):
+    reader_uuid = sys_uuid.UUID(int=1)
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Live compact counter verification"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "change while verifying"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _advance_read_compaction_to_phase(db, api.project_id, "verify_chunks")
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=1,
+            )
+        )
+        == 1
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT progress.last_user_uuid, flags.read
+            FROM m_workspace_read_state_compaction_v1 AS progress
+            JOIN m_workspace_user_message_flags AS flags
+              ON flags.project_id = progress.project_id
+             AND flags.user_uuid = progress.last_user_uuid
+             AND flags.uuid = %s
+            WHERE progress.project_id = %s
+              AND progress.phase = 'verify_chunks'
+            """,
+            (message_uuid, api.project_id),
+        )
+        verified_user_uuid, current_read = cursor.fetchone()
+    assert verified_user_uuid == reader_uuid
+    assert current_read is True
+
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.sync_workspace_user_message_flags(
+            project_id=api.project_id,
+            user_uuid=verified_user_uuid,
+            message_uuid=message_uuid,
+            values={"read": False},
+            session=session,
+            allow_author_unread=True,
+            emit_events=False,
+        )
+    )
+    _finish_read_compaction(db, api.project_id)
+
+
+def _finish_read_compaction(db, project_id):
+    for _iteration in range(50):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT mode
+                FROM m_workspace_read_state_projects_v1
+                WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            if cursor.fetchone()[0] == read_state.PROJECT_MODE_COMPACT:
+                return
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                project_id,
+                batch_size=10,
+            )
+        )
+    pytest.fail("Compaction did not finish")
+
+
+def test_compact_topic_stats_corruption_blocks_cutover_and_can_resume(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact stats parity"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "stats"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _advance_read_compaction_to_phase(db, api.project_id, "verify_stats")
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_topic_message_stats_v1
+            SET message_count = message_count + 1
+            WHERE topic_uuid = %s
+            """,
+            (topic_uuid,),
+        )
+    db.commit()
+    with pytest.raises(RuntimeError, match="topic-stats parity"):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_topic_message_stats_v1 AS stats
+            SET message_count = canonical.message_count,
+                last_ingest_sequence = canonical.last_ingest_sequence
+            FROM (
+                SELECT COUNT(*) AS message_count,
+                       MAX(ingest_sequence) AS last_ingest_sequence
+                FROM m_workspace_messages
+                WHERE project_id = %s AND topic_uuid = %s
+            ) AS canonical
+            WHERE stats.topic_uuid = %s
+            """,
+            (api.project_id, topic_uuid, topic_uuid),
+        )
+    db.commit()
+    _finish_read_compaction(db, api.project_id)
+
+
+def test_compact_mention_corruption_blocks_cutover_and_can_resume(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact mention parity"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": f"hello [reader](urn:user:{reader_uuid})",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _advance_read_compaction_to_phase(db, api.project_id, "verify_mentions")
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_workspace_message_mentions_v1 WHERE message_uuid = %s",
+            (message_uuid,),
+        )
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE uuid = %s
+            """,
+            (message_uuid,),
+        )
+        ingest_sequence = cursor.fetchone()[0]
+    db.commit()
+    with pytest.raises(RuntimeError, match="mention parity"):
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=10,
+            )
+        )
+    _run_database_operation(
+        lambda session: read_state.sync_message_mentions(
+            session,
+            api.project_id,
+            message_uuid,
+            stream_uuid,
+            topic_uuid,
+            ingest_sequence,
+            [reader_uuid],
+            f"hello [reader](urn:user:{reader_uuid})",
+        )
+    )
+    _finish_read_compaction(db, api.project_id)
+
+
+def test_detached_legacy_history_survives_cutover_and_reattach(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Detached compact history"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    message_uuids = []
+    for content in ("old unread", "old read"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[1]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+    db.commit()
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "detached gap"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuids.append(response.json()["uuid"])
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    _finish_read_compaction(db, api.project_id)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids),
+        )
+        sequences = {str(row[0]): row[1] for row in cursor.fetchall()}
+    assert (
+        sequences[message_uuids[0]]
+        < sequences[message_uuids[1]]
+        < sequences[message_uuids[2]]
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    _run_database_operation(
+        lambda session: (
+            messenger_dm_helpers._create_workspace_stream_binding_message_flags(
+                api.project_id,
+                stream_uuid,
+                reader_uuid,
+                session=session,
+            )
+        )
+    )
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: False,
+        message_uuids[1]: True,
+        message_uuids[2]: True,
+    }
+
+
+def test_readd_during_preparing_preserves_legacy_unread_history(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Preparing re-add"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    message_uuids = []
+    for content in ("old unread", "old read"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[1]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+    db.commit()
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "detached gap"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuids.append(response.json()["uuid"])
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    _run_database_operation(
+        lambda session: (
+            messenger_dm_helpers._create_workspace_stream_binding_message_flags(
+                api.project_id,
+                stream_uuid,
+                reader_uuid,
+                session=session,
+            )
+        )
+    )
+    _finish_read_compaction(db, api.project_id)
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: False,
+        message_uuids[1]: True,
+        message_uuids[2]: True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("source_mode", "destination_mode"),
+    list(
+        itertools.product(
+            (
+                read_state.PROJECT_MODE_LEGACY,
+                read_state.PROJECT_MODE_PREPARING,
+                read_state.PROJECT_MODE_DUAL,
+                read_state.PROJECT_MODE_COMPACT,
+                read_state.PROJECT_MODE_ROLLBACK,
+            ),
+            repeat=2,
+        )
+    ),
+)
+def test_stream_project_move_preserves_read_state_across_storage_modes(
+    api, db, source_mode, destination_mode
+):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Cross-project read state"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, source_mode)
+    _set_workspace_read_mode(db, destination_project_id, destination_mode)
+    message_uuids = []
+    for content in (
+        f"move mention ](urn:user:{reader_uuid})",
+        "move two",
+    ):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    expected = _workspace_message_read_states(
+        db, api.project_id, reader_uuid, message_uuids
+    )
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            api.project_id,
+            destination_project_id,
+        )
+    )
+    assert (
+        _workspace_message_read_states(
+            db, destination_project_id, reader_uuid, message_uuids
+        )
+        == expected
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT project_id, message_count, last_ingest_sequence
+            FROM m_workspace_topic_message_stats_v1
+            WHERE topic_uuid = %s
+            """,
+            (topic_uuid,),
+        )
+        stats_row = cursor.fetchone()
+        destination_has_compact_state = destination_mode != (
+            read_state.PROJECT_MODE_LEGACY
+        )
+        if destination_has_compact_state:
+            assert stats_row[:2] == (destination_project_id, 2)
+            assert stats_row[2] is not None
+        else:
+            assert stats_row is None
+        cursor.execute(
+            """
+            SELECT message_uuid, project_id
+            FROM m_workspace_message_mentions_v1
+            WHERE user_uuid = %s AND message_uuid = ANY(%s::uuid[])
+            """,
+            (reader_uuid, message_uuids),
+        )
+        mention_row = cursor.fetchone()
+        if destination_has_compact_state:
+            assert mention_row == (
+                sys_uuid.UUID(message_uuids[0]),
+                destination_project_id,
+            )
+        else:
+            assert mention_row is None
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        destination_chunks = cursor.fetchone()[0]
+    if destination_has_compact_state:
+        assert destination_chunks > 0
+    else:
+        assert destination_chunks == 0
+
+
+def test_compact_stream_move_rebinds_pre_dense_coordinates_across_projects(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    middle_project_id = sys_uuid.uuid4()
+    final_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Pre-dense compact project move"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    for project_id in (api.project_id, middle_project_id, final_project_id):
+        _set_workspace_read_mode(db, project_id, read_state.PROJECT_MODE_COMPACT)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "pre-dense read bit"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    pre_dense_sequence = 123_456_789
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (message_uuid,),
+        )
+        source_sequence = cursor.fetchone()[0]
+        source_chunk, source_offset = divmod(
+            source_sequence,
+            read_state.READ_CHUNK_BITS,
+        )
+        pre_dense_chunk, pre_dense_offset = divmod(
+            pre_dense_sequence,
+            read_state.READ_CHUNK_BITS,
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_read_chunks_v1
+            SET read_bits = set_bit(read_bits, %s, 0), updated_at = NOW()
+            WHERE user_uuid = %s AND chunk_number = %s
+            """,
+            (source_offset, reader_uuid, source_chunk),
+        )
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s AND chunk_number = %s
+              AND read_bits = B'0'::bit(4096)
+            """,
+            (reader_uuid, source_chunk),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_read_chunks_v1 (
+                user_uuid, chunk_number, read_bits, created_at, updated_at
+            ) VALUES (
+                %s, %s, set_bit(B'0'::bit(4096), %s, 1), NOW(), NOW()
+            )
+            ON CONFLICT (user_uuid, chunk_number) DO UPDATE
+            SET read_bits = set_bit(
+                    m_workspace_user_read_chunks_v1.read_bits,
+                    %s,
+                    1
+                ),
+                updated_at = NOW()
+            """,
+            (reader_uuid, pre_dense_chunk, pre_dense_offset, pre_dense_offset),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET ingest_sequence = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (pre_dense_sequence, api.project_id, message_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_topic_message_stats_v1
+            SET last_ingest_sequence = %s, updated_at = NOW()
+            WHERE project_id = %s AND topic_uuid = %s
+            """,
+            (pre_dense_sequence, api.project_id, topic_uuid),
+        )
+    db.commit()
+
+    def move(source_project_id, destination_project_id):
+        _run_database_operation(
+            lambda session: messenger_controllers._move_projection_rows(
+                session,
+                stream_uuid,
+                source_project_id,
+                destination_project_id,
+            )
+        )
+
+    move(api.project_id, middle_project_id)
+    assert _workspace_message_read_states(
+        db,
+        middle_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): True}
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (message_uuid,),
+        )
+        middle_sequence = cursor.fetchone()[0]
+        middle_chunk = middle_sequence // read_state.READ_CHUNK_BITS
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s AND chunk_number = %s
+            """,
+            (reader_uuid, pre_dense_chunk),
+        )
+        assert cursor.fetchone() == (0,)
+
+    move(middle_project_id, final_project_id)
+    assert _workspace_message_read_states(
+        db,
+        final_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): True}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT message.ingest_sequence, range.range_number
+            FROM m_workspace_messages AS message
+            JOIN m_workspace_project_ingest_ranges_v2 AS range
+              ON range.project_id = message.project_id
+            WHERE message.project_id = %s AND message.uuid = %s
+            """,
+            (final_project_id, message_uuid),
+        )
+        final_sequence, final_range = cursor.fetchone()
+        assert final_range * read_state.PROJECT_SEQUENCE_RANGE_SIZE < final_sequence
+        assert final_sequence < (
+            (final_range + 1) * read_state.PROJECT_SEQUENCE_RANGE_SIZE
+        )
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s AND chunk_number = ANY(%s::bigint[])
+            """,
+            (reader_uuid, [pre_dense_chunk, middle_chunk]),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            """
+            SELECT bit_count(read_bits)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s AND chunk_number = %s
+            """,
+            (reader_uuid, final_sequence // read_state.READ_CHUNK_BITS),
+        )
+        assert cursor.fetchone() == (1,)
+
+
+def test_compact_stream_move_into_preparing_survives_full_compaction(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Preparing compact project move"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "preparing destination"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (message_uuid,),
+        )
+        source_sequence = cursor.fetchone()[0]
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(
+            session,
+            destination_project_id,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (destination_project_id,),
+        )
+        assert cursor.fetchone() == (read_state.PROJECT_MODE_PREPARING,)
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            api.project_id,
+            destination_project_id,
+        )
+    )
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): True}
+    _finish_read_compaction(db, destination_project_id)
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): True}
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (message_uuid,),
+        )
+        destination_sequence = cursor.fetchone()[0]
+        assert destination_sequence != source_sequence
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s AND chunk_number = %s
+            """,
+            (reader_uuid, source_sequence // read_state.READ_CHUNK_BITS),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            """
+            SELECT bit_count(read_bits)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s AND chunk_number = %s
+            """,
+            (reader_uuid, destination_sequence // read_state.READ_CHUNK_BITS),
+        )
+        assert cursor.fetchone() == (1,)
+
+
+def test_readd_and_stream_project_move_do_not_deadlock(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Concurrent re-add and move",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        reader_uuid,
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    _set_workspace_read_mode(
+        db,
+        destination_project_id,
+        read_state.PROJECT_MODE_COMPACT,
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "concurrent re-add and move",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_memberships_v1 (
+                project_id, user_uuid, stream_uuid, last_detached_sequence,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, 0, NOW(), NOW())
+            ON CONFLICT (project_id, user_uuid, stream_uuid) DO UPDATE
+            SET last_detached_sequence = 0, updated_at = NOW()
+            """,
+            (api.project_id, reader_uuid, stream_uuid),
+        )
+
+    membership_locked = threading.Event()
+    move_project_lock_attempted = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class ReaddSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            result = self._session.execute(statement, params)
+            if (
+                "FROM m_workspace_read_memberships_v1" in statement
+                and "FOR UPDATE" in statement
+            ):
+                membership_locked.set()
+                assert move_project_lock_attempted.wait(timeout=3)
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    class MoveSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            if "pg_advisory_xact_lock(hashtextextended(%s::text, 0))" in statement:
+                move_project_lock_attempted.set()
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def readd_member():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            messenger_dm_helpers._create_workspace_stream_binding_message_flags(
+                api.project_id,
+                stream_uuid,
+                reader_uuid,
+                session=ReaddSession(session),
+            )
+        return "readded"
+
+    def move_stream():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            messenger_controllers._move_projection_rows(
+                MoveSession(session),
+                stream_uuid,
+                api.project_id,
+                destination_project_id,
+            )
+        return "moved"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        readd_future = executor.submit(readd_member)
+        assert membership_locked.wait(timeout=3)
+        move_future = executor.submit(move_stream)
+        assert readd_future.result(timeout=10) == "readded"
+        assert move_future.result(timeout=10) == "moved"
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT project_id
+            FROM m_workspace_read_memberships_v1
+            WHERE user_uuid = %s AND stream_uuid = %s
+            """,
+            (reader_uuid, stream_uuid),
+        )
+        assert cursor.fetchone()[0] == destination_project_id
+
+
+def test_compact_stream_move_through_legacy_discards_stale_shadow_state(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    legacy_project_id = sys_uuid.uuid4()
+    compact_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact legacy compact move"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    _set_workspace_read_mode(db, legacy_project_id, read_state.PROJECT_MODE_LEGACY)
+    _set_workspace_read_mode(db, compact_project_id, read_state.PROJECT_MODE_COMPACT)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": f"move mention ](urn:user:{reader_uuid})",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            api.project_id,
+            legacy_project_id,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = FALSE, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (legacy_project_id, message_uuid, reader_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET payload = '{"kind":"markdown","content":"mention removed"}',
+                updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (legacy_project_id, message_uuid),
+        )
+    db.commit()
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            legacy_project_id,
+            compact_project_id,
+        )
+    )
+
+    assert _workspace_message_read_states(
+        db,
+        compact_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {message_uuid: False}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_message_mentions_v1
+            WHERE message_uuid = %s AND user_uuid = %s
+            """,
+            (message_uuid, reader_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_legacy_stream_move_preserves_detached_flags_without_membership(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Detached legacy move"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    _set_workspace_read_mode(db, destination_project_id, read_state.PROJECT_MODE_LEGACY)
+    message_uuids = []
+    for content in ("detached read", "detached unread"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+    db.commit()
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            api.project_id,
+            destination_project_id,
+        )
+    )
+    conftest.seed_user_stream_binding(
+        db, destination_project_id, stream_uuid, reader_uuid
+    )
+    _run_database_operation(
+        lambda session: (
+            messenger_dm_helpers._create_workspace_stream_binding_message_flags(
+                destination_project_id,
+                stream_uuid,
+                reader_uuid,
+                session=session,
+            )
+        )
+    )
+
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: True,
+        message_uuids[1]: False,
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, reader_uuid, message_uuids),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_legacy_to_compact_stream_move_preserves_detached_boundary(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Detached legacy compact move"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    _set_workspace_read_mode(
+        db,
+        destination_project_id,
+        read_state.PROJECT_MODE_COMPACT,
+    )
+    message_uuids = []
+    for content in ("detached read", "detached unread"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+    db.commit()
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "post-detach gap"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuids.append(response.json()["uuid"])
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            api.project_id,
+            destination_project_id,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT membership.last_detached_sequence, message.ingest_sequence
+            FROM m_workspace_read_memberships_v1 AS membership
+            JOIN m_workspace_messages AS message
+              ON message.project_id = membership.project_id
+             AND message.uuid = %s
+            WHERE membership.project_id = %s
+              AND membership.user_uuid = %s
+              AND membership.stream_uuid = %s
+            """,
+            (
+                message_uuids[1],
+                destination_project_id,
+                reader_uuid,
+                stream_uuid,
+            ),
+        )
+        detached_sequence, last_pre_detach_sequence = cursor.fetchone()
+        assert detached_sequence == last_pre_detach_sequence
+
+    conftest.seed_user_stream_binding(
+        db,
+        destination_project_id,
+        stream_uuid,
+        reader_uuid,
+    )
+    _run_database_operation(
+        lambda session: (
+            messenger_dm_helpers._create_workspace_stream_binding_message_flags(
+                destination_project_id,
+                stream_uuid,
+                reader_uuid,
+                session=session,
+            )
+        )
+    )
+
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: True,
+        message_uuids[1]: False,
+        message_uuids[2]: True,
+    }
+
+
+def test_compact_topic_merge_preserves_read_counts_and_mentions(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact topic merge"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    destination_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "destination",
+        is_default=True,
+    )
+    source_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "source",
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for topic_uuid, content in (
+        (source_topic_uuid, f"read mention ](urn:user:{reader_uuid})"),
+        (destination_topic_uuid, "unread destination"),
+    ):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuids[0]}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    def merge(session):
+        read_state.merge_topics(
+            session,
+            api.project_id,
+            (source_topic_uuid,),
+            stream_uuid,
+            destination_topic_uuid,
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_messages
+            SET topic_uuid = %s, updated_at = NOW()
+            WHERE project_id = %s AND topic_uuid = %s
+            """,
+            (destination_topic_uuid, api.project_id, source_topic_uuid),
+        )
+        session.execute(
+            """
+            DELETE FROM m_workspace_stream_topics
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, source_topic_uuid),
+        )
+
+    _run_database_operation(merge)
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: True,
+        message_uuids[1]: False,
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT message_count
+            FROM m_workspace_topic_message_stats_v1
+            WHERE project_id = %s AND topic_uuid = %s
+            """,
+            (api.project_id, destination_topic_uuid),
+        )
+        assert cursor.fetchone() == (2,)
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, destination_topic_uuid),
+        )
+        assert cursor.fetchone() == (1,)
+        cursor.execute(
+            """
+            SELECT topic_uuid
+            FROM m_workspace_message_mentions_v1
+            WHERE message_uuid = %s AND user_uuid = %s
+            """,
+            (message_uuids[0], reader_uuid),
+        )
+        assert cursor.fetchone() == (sys_uuid.UUID(destination_topic_uuid),)
+
+
+@pytest.mark.parametrize(
+    "source_mode",
+    [read_state.PROJECT_MODE_LEGACY, read_state.PROJECT_MODE_COMPACT],
+)
+def test_message_move_materializes_compact_destination_before_canonical_move(
+    api, db, source_mode
+):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    source_stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact message source"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, source_stream_uuid, reader_uuid
+    )
+    source_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        source_stream_uuid,
+        api.user_uuid,
+        "source",
+        is_default=True,
+    )
+    destination_stream_uuid = conftest.seed_user_stream(
+        db, destination_project_id, api.user_uuid, "Compact message destination"
+    )
+    conftest.seed_user_stream_binding(
+        db, destination_project_id, destination_stream_uuid, reader_uuid
+    )
+    destination_topic_uuid = conftest.seed_stream_topic(
+        db,
+        destination_project_id,
+        destination_stream_uuid,
+        api.user_uuid,
+        "destination",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, source_mode)
+    _set_workspace_read_mode(
+        db, destination_project_id, read_state.PROJECT_MODE_COMPACT
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": f"move read bit ](urn:user:{reader_uuid})",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    def move_message(session):
+        read_state.relocate_message(
+            session,
+            message_uuid,
+            api.project_id,
+            destination_project_id,
+            destination_stream_uuid,
+            destination_topic_uuid,
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_messages
+            SET project_id = %s, stream_uuid = %s, topic_uuid = %s
+            WHERE uuid = %s AND project_id = %s
+            """,
+            (
+                destination_project_id,
+                destination_stream_uuid,
+                destination_topic_uuid,
+                message_uuid,
+                api.project_id,
+            ),
+        )
+
+    _run_database_operation(move_message)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (destination_project_id, reader_uuid, destination_topic_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (destination_project_id, message_uuid),
+        )
+        assert cursor.fetchone()[0] is not None
+        cursor.execute(
+            """
+            SELECT project_id, stream_uuid, topic_uuid
+            FROM m_workspace_message_mentions_v1
+            WHERE message_uuid = %s AND user_uuid = %s
+            """,
+            (message_uuid, reader_uuid),
+        )
+        assert cursor.fetchone() == (
+            destination_project_id,
+            sys_uuid.UUID(destination_stream_uuid),
+            sys_uuid.UUID(destination_topic_uuid),
+        )
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {str(message_uuid): True}
+
+
+def test_compact_message_cross_project_move_rebinds_every_coordinate(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    project_ids = (
+        sys_uuid.UUID(str(api.project_id)),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+    )
+    stream_uuids = []
+    topic_uuids = []
+    for index, project_id in enumerate(project_ids):
+        stream_uuid = conftest.seed_user_stream(
+            db,
+            project_id,
+            api.user_uuid,
+            f"Message coordinate destination {index}",
+        )
+        conftest.seed_user_stream_binding(db, project_id, stream_uuid, reader_uuid)
+        topic_uuid = conftest.seed_stream_topic(
+            db,
+            project_id,
+            stream_uuid,
+            api.user_uuid,
+            f"destination-{index}",
+            is_default=True,
+        )
+        _set_workspace_read_mode(db, project_id, read_state.PROJECT_MODE_COMPACT)
+        stream_uuids.append(sys_uuid.UUID(stream_uuid))
+        topic_uuids.append(sys_uuid.UUID(topic_uuid))
+
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(stream_uuids[0]),
+            "topic_uuid": str(topic_uuids[0]),
+            "payload": {
+                "kind": "markdown",
+                "content": f"moving read mention ](urn:user:{reader_uuid})",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (message_uuid,),
+        )
+        original_sequence = cursor.fetchone()[0]
+        original_chunk, original_offset = divmod(
+            original_sequence,
+            read_state.READ_CHUNK_BITS,
+        )
+        rolling_sequence = 123_456_789
+        rolling_chunk, rolling_offset = divmod(
+            rolling_sequence,
+            read_state.READ_CHUNK_BITS,
+        )
+        cursor.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_user_read_chunks_v1
+            WHERE chunk_number = %s AND get_bit(read_bits, %s) = 1
+            """,
+            (original_chunk, original_offset),
+        )
+        read_user_uuids = [row[0] for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_read_chunks_v1
+            SET read_bits = set_bit(read_bits, %s, 0), updated_at = NOW()
+            WHERE chunk_number = %s AND get_bit(read_bits, %s) = 1
+            """,
+            (original_offset, original_chunk, original_offset),
+        )
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_read_chunks_v1
+            WHERE chunk_number = %s AND bit_count(read_bits) = 0
+            """,
+            (original_chunk,),
+        )
+        for read_user_uuid in read_user_uuids:
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_user_read_chunks_v1 (
+                    user_uuid, chunk_number, read_bits, created_at, updated_at
+                ) VALUES (
+                    %s, %s, set_bit(B'0'::bit(4096), %s, 1), NOW(), NOW()
+                )
+                ON CONFLICT (user_uuid, chunk_number) DO UPDATE
+                SET read_bits = set_bit(
+                        m_workspace_user_read_chunks_v1.read_bits,
+                        %s,
+                        1
+                    ),
+                    updated_at = NOW()
+                """,
+                (
+                    read_user_uuid,
+                    rolling_chunk,
+                    rolling_offset,
+                    rolling_offset,
+                ),
+            )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET ingest_sequence = %s, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (rolling_sequence, project_ids[0], message_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_message_mentions_v1
+            SET ingest_sequence = %s
+            WHERE project_id = %s AND message_uuid = %s
+            """,
+            (rolling_sequence, project_ids[0], message_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_topic_message_stats_v1
+            SET last_ingest_sequence = %s, updated_at = NOW()
+            WHERE project_id = %s AND topic_uuid = %s
+            """,
+            (rolling_sequence, project_ids[0], topic_uuids[0]),
+        )
+    db.commit()
+    initial_sequence = rolling_sequence
+
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    read_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    operation_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(read_capability)),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, target_uuid, details
+            ) VALUES (
+                %s, %s, %s, 'read_state.set', 'stream', %s, '{}'::jsonb
+            )
+            """,
+            (
+                operation_uuid,
+                account_uuid,
+                api.user_uuid,
+                stream_uuids[0],
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_ids[0],
+                stream_uuids[0],
+                json.dumps(
+                    {
+                        "stream_uuid": str(stream_uuids[0]),
+                        "topic_uuid": None,
+                        "reader_uuid": str(api.user_uuid),
+                        "read": True,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_read_candidate_chunks_v1 (
+                external_operation_uuid, chunk_number, candidate_bits
+            ) VALUES (%s, %s, %s::bit(4096))
+            """,
+            (
+                operation_uuid,
+                initial_sequence // read_state.READ_CHUNK_BITS,
+                read_state._bits_literal(
+                    [initial_sequence % read_state.READ_CHUNK_BITS]
+                ),
+            ),
+        )
+    db.commit()
+
+    def move_message(source_index, destination_index):
+        def move(session):
+            read_state.relocate_message(
+                session,
+                message_uuid,
+                project_ids[source_index],
+                project_ids[destination_index],
+                stream_uuids[destination_index],
+                topic_uuids[destination_index],
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_messages
+                SET project_id = %s, stream_uuid = %s, topic_uuid = %s
+                WHERE uuid = %s AND project_id = %s
+                """,
+                (
+                    project_ids[destination_index],
+                    stream_uuids[destination_index],
+                    topic_uuids[destination_index],
+                    message_uuid,
+                    project_ids[source_index],
+                ),
+            )
+
+        _run_database_operation(move)
+
+    previous_sequences = [original_sequence, initial_sequence]
+    for source_index, destination_index in ((0, 1), (1, 2)):
+        move_message(source_index, destination_index)
+        assert _workspace_message_read_states(
+            db,
+            project_ids[destination_index],
+            reader_uuid,
+            [message_uuid],
+        ) == {str(message_uuid): True}
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT message.ingest_sequence, range.range_number
+                FROM m_workspace_messages AS message
+                JOIN m_workspace_project_ingest_ranges_v2 AS range
+                  ON range.project_id = message.project_id
+                WHERE message.project_id = %s AND message.uuid = %s
+                """,
+                (project_ids[destination_index], message_uuid),
+            )
+            moved_sequence, range_number = cursor.fetchone()
+            range_base = range_number * read_state.PROJECT_SEQUENCE_RANGE_SIZE
+            assert (
+                range_base
+                < moved_sequence
+                < (range_base + read_state.PROJECT_SEQUENCE_RANGE_SIZE)
+            )
+            cursor.execute(
+                """
+                SELECT project_id, stream_uuid, topic_uuid, ingest_sequence
+                FROM m_workspace_message_mentions_v1
+                WHERE message_uuid = %s AND user_uuid = %s
+                """,
+                (message_uuid, reader_uuid),
+            )
+            assert cursor.fetchone() == (
+                project_ids[destination_index],
+                stream_uuids[destination_index],
+                topic_uuids[destination_index],
+                moved_sequence,
+            )
+            cursor.execute(
+                """
+                SELECT message_count, last_ingest_sequence
+                FROM m_workspace_topic_message_stats_v1
+                WHERE project_id = %s AND topic_uuid = %s
+                """,
+                (project_ids[destination_index], topic_uuids[destination_index]),
+            )
+            assert cursor.fetchone() == (1, moved_sequence)
+            cursor.execute(
+                """
+                SELECT message_count, last_ingest_sequence
+                FROM m_workspace_topic_message_stats_v1
+                WHERE project_id = %s AND topic_uuid = %s
+                """,
+                (project_ids[source_index], topic_uuids[source_index]),
+            )
+            assert cursor.fetchone() == (0, None)
+            cursor.execute(
+                """
+                SELECT project_id, topic_uuid, read_count
+                FROM m_workspace_user_topic_read_stats_v1
+                WHERE user_uuid = %s
+                  AND (project_id, topic_uuid) IN (
+                        (%s, %s),
+                        (%s, %s)
+                  )
+                ORDER BY project_id = %s, project_id
+                """,
+                (
+                    reader_uuid,
+                    project_ids[source_index],
+                    topic_uuids[source_index],
+                    project_ids[destination_index],
+                    topic_uuids[destination_index],
+                    project_ids[source_index],
+                ),
+            )
+            assert set(cursor.fetchall()) == {
+                (
+                    project_ids[source_index],
+                    topic_uuids[source_index],
+                    0,
+                ),
+                (
+                    project_ids[destination_index],
+                    topic_uuids[destination_index],
+                    1,
+                ),
+            }
+            cursor.execute(
+                """
+                SELECT chunk_number, bit_count(candidate_bits)
+                FROM m_external_provider_read_candidate_chunks_v1
+                WHERE external_operation_uuid = %s
+                ORDER BY chunk_number
+                """,
+                (operation_uuid,),
+            )
+            assert cursor.fetchall() == [
+                (moved_sequence // read_state.READ_CHUNK_BITS, 1)
+            ]
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM m_workspace_user_read_chunks_v1
+                WHERE user_uuid = %s
+                  AND chunk_number = ANY(%s::bigint[])
+                """,
+                (
+                    reader_uuid,
+                    [
+                        sequence // read_state.READ_CHUNK_BITS
+                        for sequence in previous_sequences
+                    ],
+                ),
+            )
+            assert cursor.fetchone() == (0,)
+        previous_sequences.append(moved_sequence)
+
+
+def test_compact_message_move_through_legacy_discards_stale_shadow_state(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    legacy_project_id = sys_uuid.uuid4()
+    compact_project_id = sys_uuid.uuid4()
+    source_stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Message move source"
+    )
+    conftest.seed_user_stream_binding(
+        db, api.project_id, source_stream_uuid, reader_uuid
+    )
+    source_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        source_stream_uuid,
+        api.user_uuid,
+        "source",
+        is_default=True,
+    )
+    legacy_stream_uuid = conftest.seed_user_stream(
+        db, legacy_project_id, api.user_uuid, "Message move legacy"
+    )
+    conftest.seed_user_stream_binding(
+        db, legacy_project_id, legacy_stream_uuid, reader_uuid
+    )
+    legacy_topic_uuid = conftest.seed_stream_topic(
+        db,
+        legacy_project_id,
+        legacy_stream_uuid,
+        api.user_uuid,
+        "legacy",
+        is_default=True,
+    )
+    compact_stream_uuid = conftest.seed_user_stream(
+        db, compact_project_id, api.user_uuid, "Message move compact"
+    )
+    conftest.seed_user_stream_binding(
+        db, compact_project_id, compact_stream_uuid, reader_uuid
+    )
+    compact_topic_uuid = conftest.seed_stream_topic(
+        db,
+        compact_project_id,
+        compact_stream_uuid,
+        api.user_uuid,
+        "compact",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    _set_workspace_read_mode(db, legacy_project_id, read_state.PROJECT_MODE_LEGACY)
+    _set_workspace_read_mode(db, compact_project_id, read_state.PROJECT_MODE_COMPACT)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": f"move mention ](urn:user:{reader_uuid})",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    response = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        user=reader_uuid,
+    )
+    assert response.status_code == 200, response.text
+
+    def move_message(
+        session,
+        source_project_id,
+        destination_project_id,
+        destination_stream_uuid,
+        destination_topic_uuid,
+    ):
+        read_state.relocate_message(
+            session,
+            message_uuid,
+            source_project_id,
+            destination_project_id,
+            destination_stream_uuid,
+            destination_topic_uuid,
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_messages
+            SET project_id = %s, stream_uuid = %s, topic_uuid = %s
+            WHERE uuid = %s AND project_id = %s
+            """,
+            (
+                destination_project_id,
+                destination_stream_uuid,
+                destination_topic_uuid,
+                message_uuid,
+                source_project_id,
+            ),
+        )
+
+    _run_database_operation(
+        lambda session: move_message(
+            session,
+            api.project_id,
+            legacy_project_id,
+            legacy_stream_uuid,
+            legacy_topic_uuid,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = FALSE, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (legacy_project_id, message_uuid, reader_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET payload = '{"kind":"markdown","content":"mention removed"}',
+                updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (legacy_project_id, message_uuid),
+        )
+    db.commit()
+
+    _run_database_operation(
+        lambda session: move_message(
+            session,
+            legacy_project_id,
+            compact_project_id,
+            compact_stream_uuid,
+            compact_topic_uuid,
+        )
+    )
+
+    assert _workspace_message_read_states(
+        db,
+        compact_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {message_uuid: False}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_message_mentions_v1
+            WHERE message_uuid = %s AND user_uuid = %s
+            """,
+            (message_uuid, reader_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_compact_topic_and_stream_delete_clear_only_their_bitmap_bits(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact delete cleanup"
+    )
+    conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact delete survivor"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    default_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    deleted_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "delete first",
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for topic_uuid in (default_topic_uuid, deleted_topic_uuid):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": "read then delete"},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+    _run_database_operation(
+        lambda session: read_state.set_message_uuids_read(
+            session,
+            api.project_id,
+            reader_uuid,
+            message_uuids,
+            True,
+        )
+    )
+
+    response = api.delete(f"{STREAM_TOPICS}{deleted_topic_uuid}")
+    assert response.status_code in (200, 204), response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 1
+
+    response = api.delete(f"{STREAMS}{stream_uuid}")
+    assert response.status_code in (200, 204), response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_project_dense_read_coordinates_ignore_other_project_traffic(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Dense read coordinates"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    noise_project_uuid = sys_uuid.uuid4()
+    noise_stream_uuid = conftest.seed_user_stream(
+        db, noise_project_uuid, api.user_uuid, "Dense read coordinate noise"
+    )
+    noise_topic_uuid = conftest.seed_stream_topic(
+        db,
+        noise_project_uuid,
+        noise_stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+
+    first = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "before noise"},
+        },
+    )
+    assert first.status_code == 201, first.text
+    noise_seed = str(sys_uuid.uuid4())
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, created_at, updated_at
+            )
+            SELECT md5(%s || ':' || series)::uuid, %s, %s, %s, %s,
+                   '{"kind":"markdown","content":"noise"}'::jsonb,
+                   NOW() + series * interval '1 microsecond',
+                   NOW() + series * interval '1 microsecond'
+            FROM generate_series(1, 4096) AS series
+            """,
+            (
+                noise_seed,
+                noise_project_uuid,
+                noise_stream_uuid,
+                noise_topic_uuid,
+                api.user_uuid,
+            ),
+        )
+    db.commit()
+    second = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "after noise"},
+        },
+    )
+    assert second.status_code == 201, second.text
+    message_uuids = [
+        sys_uuid.UUID(first.json()["uuid"]),
+        sys_uuid.UUID(second.json()["uuid"]),
+    ]
+
+    _run_database_operation(
+        lambda session: read_state.set_message_uuids_read(
+            session,
+            api.project_id,
+            reader_uuid,
+            message_uuids,
+            True,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT array_agg(ingest_sequence ORDER BY created_at, uuid)
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids),
+        )
+        first_sequence, second_sequence = cursor.fetchone()[0]
+        assert second_sequence == first_sequence + 1
+        cursor.execute(
+            """
+            SELECT COUNT(*), SUM(bit_count(read_bits))
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone() == (1, 2)
+
+        cursor.execute(
+            "DELETE FROM m_workspace_streams WHERE uuid = %s AND project_id = %s",
+            (noise_stream_uuid, noise_project_uuid),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
+            (noise_project_uuid,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_project_ingest_ranges_v2 WHERE project_id = %s",
+            (noise_project_uuid,),
+        )
+    db.commit()
+
+
+def test_project_sequence_backfill_uses_bounded_low_half(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Bounded sequence backfill",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = []
+    for index in range(3):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": f"legacy coordinate {index}",
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT range_number, last_live_sequence
+            FROM m_workspace_project_ingest_ranges_v2
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        range_number, last_live_sequence = cursor.fetchone()
+        range_base = range_number * read_state.PROJECT_SEQUENCE_RANGE_SIZE
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET ingest_sequence = nextval(
+                'm_workspace_messages_legacy_ingest_sequence_v1_seq'
+            )
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids),
+        )
+
+    def backfill(batch_size):
+        def run(session):
+            read_state.lock_projects(session, (api.project_id,))
+            return read_state._assign_legacy_ingest_sequences(
+                session,
+                api.project_id,
+                batch_size=batch_size,
+            )
+
+        return _run_database_operation(run)
+
+    assert backfill(2) == 2
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            ORDER BY created_at, uuid
+            """,
+            (api.project_id, message_uuids),
+        )
+        sequences = [row[0] for row in cursor.fetchall()]
+        assert sequences[:2] == [range_base + 1, range_base + 2]
+        assert not (
+            range_base
+            < sequences[2]
+            < range_base + read_state.PROJECT_SEQUENCE_RANGE_SIZE
+        )
+
+    assert backfill(2) == 1
+    assert backfill(2) == 0
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT array_agg(ingest_sequence ORDER BY created_at, uuid)
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids),
+        )
+        assert cursor.fetchone()[0] == [
+            range_base + 1,
+            range_base + 2,
+            range_base + 3,
+        ]
+        cursor.execute(
+            """
+            SELECT last_backfill_sequence, last_live_sequence
+            FROM m_workspace_project_ingest_ranges_v2
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == (3, last_live_sequence)
+
+
+def test_compact_storage_stays_bounded_for_many_users_and_messages(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact scale"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    topic_uuids = [topic_uuid]
+    for index in range(1, 64):
+        topic_uuids.append(
+            conftest.seed_stream_topic(
+                db,
+                api.project_id,
+                stream_uuid,
+                api.user_uuid,
+                f"scale-{index}",
+            )
+        )
+    reader_uuids = [sys_uuid.uuid4() for _index in range(499)]
+    for reader_uuid in reader_uuids:
+        conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_count = 10_000
+    seed = str(sys_uuid.uuid4())
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, created_at, updated_at
+            )
+            SELECT md5(%s || ':' || series)::uuid, %s, %s,
+                   (%s::uuid[])[
+                       ((series - 1) %% array_length(%s::uuid[], 1)) + 1
+                   ],
+                   %s,
+                   '{"kind":"markdown","content":"scale"}'::jsonb,
+                   NOW() + series * interval '1 microsecond',
+                   NOW() + series * interval '1 microsecond'
+            FROM generate_series(1, %s) AS series
+            """,
+            (
+                seed,
+                api.project_id,
+                stream_uuid,
+                topic_uuids,
+                topic_uuids,
+                api.user_uuid,
+                message_count,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_topic_message_stats_v1 (
+                topic_uuid, project_id, stream_uuid, message_count,
+                last_ingest_sequence, created_at, updated_at
+            )
+            SELECT topic_uuid, %s, %s, COUNT(*), MAX(ingest_sequence), NOW(), NOW()
+            FROM m_workspace_messages
+            WHERE project_id = %s AND stream_uuid = %s
+            GROUP BY topic_uuid
+            ON CONFLICT (topic_uuid) DO UPDATE
+            SET message_count = EXCLUDED.message_count,
+                last_ingest_sequence = EXCLUDED.last_ingest_sequence,
+                updated_at = NOW()
+            """,
+            (
+                api.project_id,
+                stream_uuid,
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+    db.commit()
+
+    reader_uuid = reader_uuids[0]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT SUM(unread_count)
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+        assert cursor.fetchone()[0] == message_count
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+    result = _run_database_operation(
+        lambda session: read_state.read_stream(
+            session,
+            api.project_id,
+            reader_uuid,
+            stream_uuid,
+            collect_message_rows=False,
+        )
+    )
+    assert result.changed is True
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*), SUM(bit_count(read_bits))
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        chunk_count, read_count = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT SUM(unread_count)
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, stream_uuid, reader_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+    assert chunk_count <= (message_count // read_state.READ_CHUNK_BITS) + 2
+    assert read_count == message_count
+    response = api.get(
+        MESSAGES,
+        user=reader_uuid,
+        params={"stream_uuid": stream_uuid, "read": False, "page_limit": 50},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+
+    provider_reader_uuid = reader_uuids[1]
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    read_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, provider_reader_uuid, json.dumps(read_capability)),
+        )
+    db.commit()
+
+    public_operation_uuids = []
+
+    def queue_provider_snapshot(
+        session,
+        candidate_sql,
+        candidate_values,
+        candidate_chunks,
+    ):
+        operation = provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=provider_reader_uuid,
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(stream_uuid)),
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(provider_reader_uuid),
+                "read": True,
+            },
+            candidate_sql=candidate_sql,
+            candidate_values=candidate_values,
+            candidate_chunks=candidate_chunks,
+            use_candidate_chunks=True,
+        )
+        assert operation is not None
+        public_operation_uuids.append(operation.uuid)
+
+    provider_result = _run_database_operation(
+        lambda session: read_state.read_stream(
+            session,
+            api.project_id,
+            provider_reader_uuid,
+            stream_uuid,
+            collect_message_rows=False,
+            message_uuid_snapshot_callback=queue_provider_snapshot,
+        )
+    )
+    assert provider_result.changed is True
+    assert len(public_operation_uuids) == 1
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*), SUM(bit_count(read_bits))
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (provider_reader_uuid,),
+        )
+        provider_chunk_count, provider_read_count = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+              AND operation_kind = 'read_state.set'
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT COUNT(*), SUM(bit_count(candidate_bits)),
+                   SUM(pg_column_size(candidate_bits))
+            FROM m_external_provider_read_candidate_chunks_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (public_operation_uuids[0],),
+        )
+        (
+            snapshot_chunk_count,
+            snapshot_candidate_count,
+            snapshot_storage_bytes,
+        ) = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_candidate_packs_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (public_operation_uuids[0],),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT uuid::text
+            FROM m_workspace_messages
+            WHERE project_id = %s AND stream_uuid = %s
+            ORDER BY ingest_sequence
+            """,
+            (api.project_id, stream_uuid),
+        )
+        expected_provider_uuids = [row[0] for row in cursor.fetchall()]
+    assert provider_chunk_count <= (message_count // read_state.READ_CHUNK_BITS) + 2
+    assert provider_read_count == message_count
+    assert snapshot_chunk_count <= (message_count // read_state.READ_CHUNK_BITS) + 2
+    assert snapshot_candidate_count == message_count
+    assert snapshot_storage_bytes < message_count
+
+    post_snapshot = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "after snapshot"},
+        },
+    )
+    assert post_snapshot.status_code == 201, post_snapshot.text
+    post_snapshot_uuid = post_snapshot.json()["uuid"]
+
+    # A later exact read for the same provider account must stay behind the
+    # snapshot without consuming its bounded lazy-page window.
+    later_public_uuid = sys_uuid.uuid4()
+    _later_operation, later_provider_uuid = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_operation(
+            session,
+            operation_uuid=later_public_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=provider_reader_uuid,
+            operation_kind="read_state.set",
+            target_type="provider-read-test",
+            target_uuid=None,
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "reader_uuid": str(provider_reader_uuid),
+                "read": True,
+                "message_uuids": [post_snapshot_uuid],
+            },
+        )
+    )
+
+    # Coordinates are immutable while message UUIDs are resolved lazily. A
+    # fully deleted first page is skipped, its progress bits are consumed, and
+    # the same lease call continues to materialize useful pages.
+    deleted_after_snapshot_uuids = expected_provider_uuids[:500]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, deleted_after_snapshot_uuids),
+        )
+    db.commit()
+    expected_provider_uuids = expected_provider_uuids[500:]
+    operation_count = (len(expected_provider_uuids) + 499) // 500
+
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    def lease_once(page_limit=3, request_uuid=None):
+        return _run_database_operation(
+            lambda session: provider_data.lease_provider_operations(
+                session,
+                identity,
+                request_uuid=request_uuid or sys_uuid.uuid4(),
+                limit=page_limit,
+                lease_seconds=30,
+            )
+        )
+
+    concurrent_request_uuid = sys_uuid.uuid4()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        concurrent_leases = list(
+            executor.map(
+                lambda _index: lease_once(request_uuid=concurrent_request_uuid),
+                range(2),
+            )
+        )
+    assert [len(item["operations"]) for item in concurrent_leases] == [3, 3]
+    assert [
+        operation["provider_operation_uuid"]
+        for operation in concurrent_leases[0]["operations"]
+    ] == [
+        operation["provider_operation_uuid"]
+        for operation in concurrent_leases[1]["operations"]
+    ]
+    lease = concurrent_leases[0]
+    assert all(
+        leased["provider_operation_uuid"] != str(later_provider_uuid)
+        for leased in lease["operations"]
+    )
+    delivered_message_uuids = [
+        message_uuid
+        for leased in lease["operations"]
+        for message_uuid in leased["payload"]["message_uuids"]
+    ]
+    assert all(
+        1 <= len(leased["payload"]["message_uuids"]) <= 500
+        for leased in lease["operations"]
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+              AND operation_kind = 'read_state.set'
+              AND status IN ('queued', 'leased')
+            """,
+            (public_operation_uuids[0],),
+        )
+        assert cursor.fetchone()[0] == 3
+
+    def report_result(leased, status, safe_error=None, result_uuid=None):
+        result_uuid = result_uuid or sys_uuid.uuid4()
+        result = {
+            "result_uuid": str(result_uuid),
+            "provider_operation_uuid": leased["provider_operation_uuid"],
+            "lease_uuid": leased["lease_uuid"],
+            "status": status,
+            "safe_error": safe_error,
+        }
+        return _run_database_operation(
+            lambda session: provider_data.report_provider_result(
+                session,
+                identity,
+                result,
+            )
+        )
+
+    failed_lease = lease["operations"][0]
+    failed_provider_uuid = failed_lease["provider_operation_uuid"]
+    failed_result_uuid = sys_uuid.uuid4()
+    reported = report_result(
+        failed_lease,
+        "failed",
+        "temporary read failure",
+        failed_result_uuid,
+    )
+    assert reported["status"] == "applied"
+    for leased in lease["operations"][1:]:
+        assert report_result(leased, "succeeded")["status"] == "applied"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT status, can_retry
+            FROM m_external_operations_v2
+            WHERE uuid = %s
+            """,
+            (public_operation_uuids[0],),
+        )
+        assert cursor.fetchone() == ("failed", True)
+
+    response = api.post(
+        f"{EXTERNAL_OPERATIONS}{public_operation_uuids[0]}/actions/retry/invoke",
+        user=provider_reader_uuid,
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (bridge_uuid,),
+        )
+        cursor.execute(
+            """
+            SELECT uuid::text, status, attempt
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+              AND status = 'queued'
+            """,
+            (public_operation_uuids[0],),
+        )
+        retried_provider_uuid, retry_status, retry_attempt = cursor.fetchone()
+    db.commit()
+    assert retried_provider_uuid != failed_provider_uuid
+    assert (retry_status, retry_attempt) == ("queued", 1)
+
+    retry_lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=1,
+            lease_seconds=30,
+        )
+    )
+    assert len(retry_lease["operations"]) == 1
+    retried = retry_lease["operations"][0]
+    assert retried["provider_operation_uuid"] == retried_provider_uuid
+    assert retried["external_operation_uuid"] == retried_provider_uuid
+    assert retried["payload"] == failed_lease["payload"]
+    assert retried["attempt"] == 2
+    assert report_result(retried, "succeeded")["status"] == "applied"
+    assert (
+        report_result(
+            failed_lease,
+            "failed",
+            "temporary read failure",
+            failed_result_uuid,
+        )["status"]
+        == "duplicate"
+    )
+
+    while len(delivered_message_uuids) < len(expected_provider_uuids):
+        page_lease = lease_once()
+        assert 1 <= len(page_lease["operations"]) <= 3
+        for leased in page_lease["operations"]:
+            page_message_uuids = leased["payload"]["message_uuids"]
+            assert 1 <= len(page_message_uuids) <= 500
+            delivered_message_uuids.extend(page_message_uuids)
+            assert report_result(leased, "succeeded")["status"] == "applied"
+        if len(delivered_message_uuids) < len(expected_provider_uuids):
+            with db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status
+                    FROM m_external_operations_v2
+                    WHERE uuid = %s
+                    """,
+                    (public_operation_uuids[0],),
+                )
+                assert cursor.fetchone()[0] == "running"
+
+    assert delivered_message_uuids == expected_provider_uuids
+    assert post_snapshot_uuid not in delivered_message_uuids
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT status, attempt, safe_error
+            FROM m_external_operations_v2
+            WHERE uuid = %s
+            """,
+            (public_operation_uuids[0],),
+        )
+        assert cursor.fetchone() == ("succeeded", 2, None)
+        cursor.execute(
+            """
+            SELECT COUNT(*), MIN(attempt), MAX(attempt),
+                   COUNT(*) FILTER (
+                       WHERE status = 'succeeded'
+                         AND payload->'message_uuids' = '[]'::jsonb
+                   )
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (public_operation_uuids[0],),
+        )
+        assert cursor.fetchone() == (
+            operation_count + 1,
+            1,
+            2,
+            operation_count,
+        )
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (public_operation_uuids[0],),
+        )
+        assert cursor.fetchone()[0] == 0
+
+    later_lease = lease_once(page_limit=1)
+    assert len(later_lease["operations"]) == 1
+    assert later_lease["operations"][0]["provider_operation_uuid"] == str(
+        later_provider_uuid
+    )
+    assert report_result(later_lease["operations"][0], "succeeded")["status"] == (
+        "applied"
+    )
+
+    revision_one_reader_uuid = reader_uuids[2]
+    revision_one_operation = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=revision_one_reader_uuid,
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(stream_uuid)),
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(revision_one_reader_uuid),
+                "read": True,
+            },
+            candidate_sql="""
+                SELECT uuid, created_at, ingest_sequence
+                FROM m_workspace_messages
+                WHERE project_id = %s AND stream_uuid = %s
+            """,
+            candidate_values=(api.project_id, stream_uuid),
+            use_candidate_chunks=False,
+        )
+    )
+    assert revision_one_operation is not None
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*), MIN(jsonb_array_length(payload->'message_uuids')),
+                   MAX(jsonb_array_length(payload->'message_uuids'))
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+              AND payload->>'reader_uuid' = %s
+            """,
+            (account_uuid, str(revision_one_reader_uuid)),
+        )
+        assert cursor.fetchone() == (20, 1, 500)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_account_uuid = %s
+              AND payload->>'reader_uuid' = %s
+            """,
+            (account_uuid, str(revision_one_reader_uuid)),
+        )
+        assert cursor.fetchone()[0] == 0
+
+    # Keep the session-scoped integration database small.  Migration tests run
+    # a real downgrade later in the suite, and retaining this 5,000,000-row
+    # logical recipient/message matrix would turn their deliberately tiny
+    # resume batches into unrelated scale work.
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_streams WHERE project_id = %s AND uuid = %s",
+            (api.project_id, stream_uuid),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_users WHERE uuid = ANY(%s::uuid[])",
+            (reader_uuids,),
+        )
+    db.commit()
+
+
+def test_compact_provider_snapshot_bounds_deleted_candidate_scans(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Deleted provider read candidates"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "deleted before lease"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(capability)),
+        )
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        ingest_sequence = cursor.fetchone()[0]
+    db.commit()
+    # Point a full chunk beyond any message coordinate.  Resolving it produces
+    # no provider page, but one lease must not scan the whole chunk while it
+    # holds the bridge materialization lock.
+    chunk_number = ingest_sequence // read_state.READ_CHUNK_BITS + 1_000_000
+    candidate_bits = read_state._bits_literal(range(read_state.READ_CHUNK_BITS))
+    operation_uuid = sys_uuid.uuid4()
+    operation = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=operation_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(stream_uuid)),
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+            },
+            candidate_sql="SELECT * FROM compact_candidate_query_must_not_run",
+            candidate_values=(),
+            candidate_chunks=[
+                {"chunk_number": chunk_number, "read_bits": candidate_bits}
+            ],
+            use_candidate_chunks=True,
+        )
+    )
+    assert operation is not None
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    def lease_once():
+        return _run_database_operation(
+            lambda session: provider_data.lease_provider_operations(
+                session,
+                identity,
+                request_uuid=sys_uuid.uuid4(),
+                limit=1,
+                lease_seconds=30,
+            )
+        )
+
+    assert lease_once()["operations"] == []
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT status, attempt FROM m_external_operations_v2 WHERE uuid = %s",
+            (operation_uuid,),
+        )
+        assert cursor.fetchone() == ("queued", 0)
+        cursor.execute(
+            """
+            SELECT SUM(bit_count(candidate_bits))
+            FROM m_external_provider_read_candidate_chunks_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cursor.fetchone()[0] == read_state.READ_CHUNK_BITS - 4 * 500
+
+    assert lease_once()["operations"] == []
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT SUM(bit_count(candidate_bits))
+            FROM m_external_provider_read_candidate_chunks_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cursor.fetchone()[0] == read_state.READ_CHUNK_BITS - 8 * 500
+
+    assert lease_once()["operations"] == []
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT status, attempt FROM m_external_operations_v2 WHERE uuid = %s",
+            (operation_uuid,),
+        )
+        assert cursor.fetchone() == ("succeeded", 0)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_provider_read_materializer_bounds_snapshot_backlog_by_lease_limit(api, db):
+    conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(capability)),
+        )
+    db.commit()
+
+    operation_uuids = []
+    candidate_bits = read_state._bits_literal([0])
+    for index in range(6):
+        operation_uuid = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        operation = _run_database_operation(
+            lambda session, operation_uuid=operation_uuid, index=index, stream_uuid=stream_uuid: (
+                provider_data.enqueue_provider_read_operation(
+                    session,
+                    operation_uuid=operation_uuid,
+                    bridge_instance_uuid=bridge_uuid,
+                    external_account_uuid=account_uuid,
+                    project_id=sys_uuid.UUID(str(api.project_id)),
+                    owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+                    target_type="stream",
+                    target_uuid=stream_uuid,
+                    payload={
+                        "stream_uuid": str(stream_uuid),
+                        "topic_uuid": None,
+                        "reader_uuid": str(api.user_uuid),
+                        "read": True,
+                    },
+                    candidate_sql="SELECT * FROM candidate_query_must_not_run",
+                    candidate_values=(),
+                    candidate_chunks=[
+                        {
+                            "chunk_number": 10_000_000 + index,
+                            "read_bits": candidate_bits,
+                        }
+                    ],
+                    use_candidate_chunks=True,
+                )
+            )
+        )
+        assert operation is not None
+        operation_uuids.append(operation_uuid)
+
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    request_uuid = sys_uuid.uuid4()
+    lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )
+    assert lease["operations"] == []
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = ANY(%s::uuid[])
+            """,
+            (operation_uuids,),
+        )
+        assert cursor.fetchone() == (2,)
+        cursor.execute(
+            """
+            SELECT status, COUNT(*)
+            FROM m_external_operations_v2
+            WHERE uuid = ANY(%s::uuid[])
+            GROUP BY status
+            ORDER BY status
+            """,
+            (operation_uuids,),
+        )
+        assert cursor.fetchall() == [("queued", 2), ("succeeded", 4)]
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+    db.commit()
+
+
+def test_provider_read_replay_freezes_identity_across_revision_transitions(api, db):
+    conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(capability)),
+        )
+    db.commit()
+
+    public_uuid = sys_uuid.uuid4()
+    operation = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=public_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            target_type="stream",
+            target_uuid=stream_uuid,
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+            },
+            candidate_sql=(
+                "SELECT %s::uuid AS uuid, NOW() AS created_at, "
+                "1::bigint AS ingest_sequence"
+            ),
+            candidate_values=(message_uuid,),
+            use_candidate_chunks=False,
+        )
+    )
+    assert operation is not None
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    request_uuid = sys_uuid.uuid4()
+    lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert len(lease) == 1
+    assert lease[0]["provider_operation_uuid"] != str(public_uuid)
+    assert lease[0]["external_operation_uuid"] == lease[0]["provider_operation_uuid"]
+    assert lease[0]["payload"]["message_uuids"] == [str(message_uuid)]
+    capability["messenger.message.read"]["revision"] = 2
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+    db.commit()
+    replay = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert replay == lease
+    reported = _run_database_operation(
+        lambda session: provider_data.report_provider_result(
+            session,
+            identity,
+            {
+                "result_uuid": str(sys_uuid.uuid4()),
+                "provider_operation_uuid": lease[0]["provider_operation_uuid"],
+                "lease_uuid": lease[0]["lease_uuid"],
+                "status": "succeeded",
+                "safe_error": None,
+            },
+        )
+    )
+    assert reported["status"] == "applied"
+
+    revision_two_public_uuid = sys_uuid.uuid4()
+    _revision_two_operation, revision_two_provider_uuid = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_operation_in_lane(
+            session,
+            operation_uuid=revision_two_public_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            operation_kind="read_state.set",
+            target_type="stream",
+            target_uuid=stream_uuid,
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+                "message_uuids": [str(sys_uuid.uuid4())],
+            },
+            causal_lane=stream_uuid,
+        )
+    )
+    revision_two_request_uuid = sys_uuid.uuid4()
+    revision_two_lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=revision_two_request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert len(revision_two_lease) == 1
+    assert revision_two_lease[0]["provider_operation_uuid"] == str(
+        revision_two_provider_uuid
+    )
+    assert revision_two_lease[0]["external_operation_uuid"] == str(
+        revision_two_provider_uuid
+    )
+    capability["messenger.message.read"]["revision"] = 1
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+    db.commit()
+    revision_two_replay = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=revision_two_request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert revision_two_replay == revision_two_lease
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (public_uuid,),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+    db.commit()
+
+
+def test_revision_one_provider_read_rejects_500k_candidates_without_queue_growth(
+    api,
+    db,
+):
+    bridge_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    assert (
+        provider_data.PROVIDER_READ_LEGACY_MAX_PAGES
+        * provider_data.PROVIDER_READ_MAX_MESSAGES
+        == 50_000
+    )
+
+    with pytest.raises(
+        provider_data.ProviderUnavailableError,
+        match="paging capability revision 2",
+    ):
+        _run_database_operation(
+            lambda session: provider_data.enqueue_provider_read_operation(
+                session,
+                operation_uuid=operation_uuid,
+                bridge_instance_uuid=bridge_uuid,
+                external_account_uuid=account_uuid,
+                project_id=sys_uuid.UUID(str(api.project_id)),
+                owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+                target_type="stream",
+                target_uuid=stream_uuid,
+                payload={
+                    "stream_uuid": str(stream_uuid),
+                    "topic_uuid": None,
+                    "reader_uuid": str(api.user_uuid),
+                    "read": True,
+                },
+                candidate_sql="""
+                    SELECT
+                        (
+                            '00000000-0000-4000-8000-'
+                            || lpad(to_hex(candidate), 12, '0')
+                        )::uuid AS uuid,
+                        TIMESTAMPTZ '2026-01-01 00:00:00+00'
+                            + candidate * INTERVAL '1 microsecond' AS created_at,
+                        candidate::bigint AS ingest_sequence
+                    FROM generate_series(1, 500000) AS candidate
+                """,
+                candidate_values=(),
+                use_candidate_chunks=False,
+            )
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM m_external_operations_v2 WHERE uuid = %s),
+                (
+                    SELECT COUNT(*)
+                    FROM m_external_provider_operations_v1
+                    WHERE bridge_instance_uuid = %s
+                ),
+                (
+                    SELECT COUNT(*)
+                    FROM m_external_provider_read_snapshots_v1
+                    WHERE bridge_instance_uuid = %s
+                )
+            """,
+            (operation_uuid, bridge_uuid, bridge_uuid),
+        )
+        assert cursor.fetchone() == (0, 0, 0)
+
+
+def test_provider_read_lane_survives_full_cross_project_stream_move(api, db):
+    source_stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Provider snapshot source"
+    )
+    source_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        source_stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    destination_project_uuid = sys_uuid.uuid4()
+    _run_database_operation(
+        lambda session: read_state.ensure_new_project(session, destination_project_uuid)
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "payload": {"kind": "markdown", "content": "move after snapshot"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    read_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(read_capability)),
+        )
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        ingest_sequence = cursor.fetchone()[0]
+    db.commit()
+
+    operation_uuid = sys_uuid.uuid4()
+    candidate_bits = read_state._bits_literal(
+        [ingest_sequence % read_state.READ_CHUNK_BITS]
+    )
+    operation = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=operation_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(source_stream_uuid)),
+            payload={
+                "stream_uuid": str(source_stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+            },
+            candidate_sql="SELECT * FROM bitmap_candidate_query_must_not_run",
+            candidate_values=(),
+            candidate_chunks=[
+                {
+                    "chunk_number": ingest_sequence // read_state.READ_CHUNK_BITS,
+                    "read_bits": candidate_bits,
+                }
+            ],
+            use_candidate_chunks=True,
+        )
+    )
+    assert operation is not None
+
+    later_public_uuid = sys_uuid.uuid4()
+    later_operation, later_provider_uuid = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_operation_in_lane(
+            session,
+            operation_uuid=later_public_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            operation_kind="read_state.set",
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(source_stream_uuid)),
+            payload={
+                "stream_uuid": str(source_stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+                "message_uuids": [str(sys_uuid.uuid4())],
+            },
+            causal_lane=sys_uuid.UUID(str(source_stream_uuid)),
+        )
+    )
+    assert later_operation.uuid == later_public_uuid
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            sys_uuid.UUID(str(source_stream_uuid)),
+            sys_uuid.UUID(str(api.project_id)),
+            destination_project_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (destination_project_uuid, message_uuid),
+        )
+        moved_ingest_sequence = cursor.fetchone()[0]
+        assert moved_ingest_sequence != ingest_sequence
+        cursor.execute(
+            """
+            SELECT chunk_number, bit_count(candidate_bits)
+            FROM m_external_provider_read_candidate_chunks_v1
+            WHERE external_operation_uuid = %s
+            ORDER BY chunk_number
+            """,
+            (operation_uuid,),
+        )
+        assert cursor.fetchall() == [
+            (
+                moved_ingest_sequence // read_state.READ_CHUNK_BITS,
+                1,
+            )
+        ]
+        cursor.execute(
+            """
+            SELECT project_id
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cursor.fetchone() == (destination_project_uuid,)
+        cursor.execute(
+            """
+            SELECT project_id, status, attempt
+            FROM m_external_provider_operations_v1
+            WHERE uuid = %s
+            """,
+            (later_provider_uuid,),
+        )
+        assert cursor.fetchone() == (destination_project_uuid, "queued", 0)
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    request_uuid = sys_uuid.uuid4()
+    lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )
+    assert len(lease["operations"]) == 1
+    assert lease["operations"][0]["payload"]["message_uuids"] == [str(message_uuid)]
+    leased_snapshot_page = lease["operations"][0]
+    read_capability["messenger.message.read"]["revision"] = 1
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+    db.commit()
+    replay = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=request_uuid,
+            limit=1,
+            lease_seconds=30,
+        )
+    )
+    assert replay == lease
+    read_capability["messenger.message.read"]["revision"] = 2
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+    db.commit()
+    reported = _run_database_operation(
+        lambda session: provider_data.report_provider_result(
+            session,
+            identity,
+            {
+                "result_uuid": str(sys_uuid.uuid4()),
+                "provider_operation_uuid": leased_snapshot_page[
+                    "provider_operation_uuid"
+                ],
+                "lease_uuid": leased_snapshot_page["lease_uuid"],
+                "status": "succeeded",
+                "safe_error": None,
+            },
+        )
+    )
+    assert reported["status"] == "applied"
+    later_lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert len(later_lease) == 1
+    assert later_lease[0]["provider_operation_uuid"] == str(later_provider_uuid)
+    assert later_lease[0]["project_id"] == str(destination_project_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_streams WHERE uuid = %s AND project_id = %s",
+            (source_stream_uuid, destination_project_uuid),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
+            (destination_project_uuid,),
+        )
+        cursor.execute(
+            "DELETE FROM m_workspace_project_ingest_ranges_v2 WHERE project_id = %s",
+            (destination_project_uuid,),
+        )
+    db.commit()
+
+
+@pytest.mark.parametrize("page_status", ["queued", "leased"])
+def test_projection_move_rejects_attempted_provider_read_page(
+    api,
+    db,
+    page_status,
+):
+    conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    old_project_uuid = sys_uuid.UUID(str(api.project_id))
+    new_project_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE
+            )
+            """,
+            (account_uuid, api.user_uuid),
+        )
+    db.commit()
+    _operation, provider_uuid = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_operation_in_lane(
+            session,
+            operation_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=old_project_uuid,
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            operation_kind="read_state.set",
+            target_type="stream",
+            target_uuid=stream_uuid,
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+                "message_uuids": [str(sys_uuid.uuid4())],
+            },
+            causal_lane=stream_uuid,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET status = %s, attempt = 1,
+                lease_uuid = CASE WHEN %s = 'leased' THEN gen_random_uuid() END,
+                lease_expires_at = CASE
+                    WHEN %s = 'leased' THEN NOW() + INTERVAL '1 minute'
+                END
+            WHERE uuid = %s
+            """,
+            (page_status, page_status, page_status, provider_uuid),
+        )
+    db.commit()
+
+    with pytest.raises(
+        messenger_exceptions.ExternalProjectionMoveConflictError
+    ) as error:
+        _run_database_operation(
+            lambda session: messenger_controllers._move_projection_rows(
+                session,
+                stream_uuid,
+                old_project_uuid,
+                new_project_uuid,
+                bridge_instance_uuid=bridge_uuid,
+                external_account_uuid=account_uuid,
+            )
+        )
+    assert error.value.as_dict()["code"] == 409
+    assert error.value.as_dict()["retryable"] is True
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT project_id, status, attempt
+            FROM m_external_provider_operations_v1
+            WHERE uuid = %s
+            """,
+            (provider_uuid,),
+        )
+        assert cursor.fetchone() == (old_project_uuid, page_status, 1)
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+    db.commit()
+
+
+def test_projection_move_rebinds_failed_provider_read_snapshot_retry(
+    api,
+    db,
+    monkeypatch,
+):
+    conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    old_project_uuid = sys_uuid.UUID(str(api.project_id))
+    new_project_uuid = sys_uuid.uuid4()
+    capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(capability)),
+        )
+    db.commit()
+
+    public_uuid = sys_uuid.uuid4()
+    operation = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=public_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=old_project_uuid,
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            target_type="stream",
+            target_uuid=stream_uuid,
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+            },
+            candidate_sql=(
+                "SELECT %s::uuid AS uuid, NOW() AS created_at, "
+                "1::bigint AS ingest_sequence"
+            ),
+            candidate_values=(message_uuid,),
+            use_candidate_chunks=None,
+        )
+    )
+    assert operation is not None
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert len(lease) == 1
+    emitted_projects = []
+    monkeypatch.setattr(
+        provider_data,
+        "_emit_operation_event",
+        lambda session, operation_uuid, project_id, event_kind: emitted_projects.append(
+            project_id
+        ),
+    )
+    failed = _run_database_operation(
+        lambda session: provider_data.report_provider_result(
+            session,
+            identity,
+            {
+                "result_uuid": str(sys_uuid.uuid4()),
+                "provider_operation_uuid": lease[0]["provider_operation_uuid"],
+                "lease_uuid": lease[0]["lease_uuid"],
+                "status": "failed",
+                "safe_error": "provider rejected the read page",
+            },
+        )
+    )
+    assert failed["status"] == "applied"
+    assert emitted_projects == [old_project_uuid]
+
+    _run_database_operation(
+        lambda session: provider_data.rebind_provider_read_lane_project(
+            session,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            causal_lane=stream_uuid,
+            old_project_id=old_project_uuid,
+            new_project_id=new_project_uuid,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT snapshot.project_id, page.project_id, page.status
+            FROM m_external_provider_read_snapshots_v1 AS snapshot
+            JOIN m_external_provider_operations_v1 AS page
+              ON page.external_operation_uuid = snapshot.external_operation_uuid
+            WHERE snapshot.external_operation_uuid = %s
+            """,
+            (public_uuid,),
+        )
+        assert cursor.fetchone() == (
+            new_project_uuid,
+            new_project_uuid,
+            "failed",
+        )
+
+    queued = _run_database_operation(
+        lambda session: provider_data.retry_provider_operation(
+            session,
+            external_operation_uuid=public_uuid,
+            next_attempt=2,
+        )
+    )
+    assert queued["project_id"] == new_project_uuid
+    emitted_projects.clear()
+    retry_lease = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert len(retry_lease) == 1
+    assert retry_lease[0]["project_id"] == str(new_project_uuid)
+    succeeded = _run_database_operation(
+        lambda session: provider_data.report_provider_result(
+            session,
+            identity,
+            {
+                "result_uuid": str(sys_uuid.uuid4()),
+                "provider_operation_uuid": retry_lease[0]["provider_operation_uuid"],
+                "lease_uuid": retry_lease[0]["lease_uuid"],
+                "status": "succeeded",
+                "safe_error": None,
+            },
+        )
+    )
+    assert succeeded["status"] == "applied"
+    assert emitted_projects == [new_project_uuid, new_project_uuid]
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+    db.commit()
+
+
+def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypatch):
+    first_stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Provider lane first"
+    )
+    first_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        first_stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    second_stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Provider lane second"
+    )
+    message_response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": first_stream_uuid,
+            "topic_uuid": first_topic_uuid,
+            "payload": {"kind": "markdown", "content": "legacy sequence"},
+        },
+    )
+    assert message_response.status_code == 201, message_response.text
+    message_uuid = sys_uuid.UUID(message_response.json()["uuid"])
+
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    read_capability = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        }
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(read_capability)),
+        )
+    db.commit()
+
+    snapshot_uuid = sys_uuid.uuid4()
+    snapshot = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=snapshot_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(first_stream_uuid)),
+            payload={
+                "stream_uuid": str(first_stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+            },
+            candidate_sql="""
+                SELECT uuid, created_at, ingest_sequence
+                FROM m_workspace_messages
+                WHERE project_id = %s AND uuid = %s
+            """,
+            candidate_values=(api.project_id, message_uuid),
+        )
+    )
+    assert snapshot is not None
+
+    def queue_exact(stream_uuid, message_value):
+        return _run_database_operation(
+            lambda session: provider_data.enqueue_provider_operation_in_lane(
+                session,
+                operation_uuid=sys_uuid.uuid4(),
+                bridge_instance_uuid=bridge_uuid,
+                external_account_uuid=account_uuid,
+                project_id=sys_uuid.UUID(str(api.project_id)),
+                owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+                operation_kind="read_state.set",
+                target_type="provider-read-test",
+                target_uuid=None,
+                payload={
+                    "reader_uuid": str(api.user_uuid),
+                    "read": True,
+                    "message_uuids": [str(message_value)],
+                },
+                causal_lane=stream_uuid,
+            )
+        )[1]
+
+    same_lane_provider_uuid = queue_exact(first_stream_uuid, sys_uuid.uuid4())
+    other_lane_provider_uuid = queue_exact(second_stream_uuid, sys_uuid.uuid4())
+    _unknown_lane_operation, unknown_lane_provider_uuid = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_operation(
+            session,
+            operation_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            operation_kind="read_state.set",
+            target_type="provider-read-test",
+            target_uuid=None,
+            payload={
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+                "message_uuids": [str(sys_uuid.uuid4())],
+            },
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT candidate_count, candidate_uuids, cursor_position
+            FROM m_external_provider_read_candidate_packs_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (snapshot_uuid,),
+        )
+        assert cursor.fetchone() == (1, [message_uuid], 0)
+        cursor.execute(
+            """
+            SELECT causal_lane
+            FROM m_external_provider_operations_v1
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY causal_lane
+            """,
+            ([same_lane_provider_uuid, other_lane_provider_uuid],),
+        )
+        assert {row[0] for row in cursor.fetchall()} == {
+            sys_uuid.UUID(str(first_stream_uuid)),
+            sys_uuid.UUID(str(second_stream_uuid)),
+        }
+
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    def lease(limit):
+        return _run_database_operation(
+            lambda session: provider_data.lease_provider_operations(
+                session,
+                identity,
+                request_uuid=sys_uuid.uuid4(),
+                limit=limit,
+                lease_seconds=30,
+            )
+        )["operations"]
+
+    paging_lease = lease(3)
+    assert len(paging_lease) == 2
+    assert any(
+        operation["provider_operation_uuid"] == str(other_lane_provider_uuid)
+        for operation in paging_lease
+    )
+    snapshot_page = next(
+        operation
+        for operation in paging_lease
+        if operation["payload"]["message_uuids"] == [str(message_uuid)]
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (snapshot_uuid,),
+        )
+        assert cursor.fetchone() == (1,)
+        cursor.execute(
+            """
+            SELECT candidate_count, cursor_position
+            FROM m_external_provider_read_candidate_packs_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (snapshot_uuid,),
+        )
+        assert cursor.fetchone() is None
+
+    def report(operation, result_uuid=None):
+        return _run_database_operation(
+            lambda session: provider_data.report_provider_result(
+                session,
+                identity,
+                {
+                    "result_uuid": str(result_uuid or sys_uuid.uuid4()),
+                    "provider_operation_uuid": operation["provider_operation_uuid"],
+                    "lease_uuid": operation["lease_uuid"],
+                    "status": "succeeded",
+                    "safe_error": None,
+                },
+            )
+        )
+
+    other_lane_operation = next(
+        operation
+        for operation in paging_lease
+        if operation["provider_operation_uuid"] == str(other_lane_provider_uuid)
+    )
+    assert report(other_lane_operation)["status"] == "applied"
+
+    duplicate_result_uuid = sys_uuid.uuid4()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        duplicate_results = list(
+            executor.map(
+                lambda _index: report(snapshot_page, duplicate_result_uuid),
+                range(2),
+            )
+        )
+    assert {result["status"] for result in duplicate_results} == {
+        "applied",
+        "duplicate",
+    }
+
+    second_lease = lease(1)
+    assert len(second_lease) == 1
+    assert second_lease[0]["provider_operation_uuid"] == str(same_lane_provider_uuid)
+    third_lease = lease(1)
+    assert len(third_lease) == 1
+    assert third_lease[0]["provider_operation_uuid"] == str(unknown_lane_provider_uuid)
+    assert report(third_lease[0])["status"] == "applied"
+
+    # A rolling downgrade after the backend reads revision 2 is still fenced
+    # by the database trigger. Other lanes continue, and the lazy page becomes
+    # deliverable again only after the persisted bridge contract returns to 2.
+    rolling_snapshot_uuid = sys_uuid.uuid4()
+    rolling_snapshot = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=rolling_snapshot_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+            target_type="stream",
+            target_uuid=sys_uuid.UUID(str(first_stream_uuid)),
+            payload={
+                "stream_uuid": str(first_stream_uuid),
+                "topic_uuid": None,
+                "reader_uuid": str(api.user_uuid),
+                "read": True,
+            },
+            candidate_sql="""
+                SELECT uuid, created_at, ingest_sequence
+                FROM m_workspace_messages
+                WHERE project_id = %s AND uuid = %s
+            """,
+            candidate_values=(api.project_id, message_uuid),
+        )
+    )
+    assert rolling_snapshot is not None
+    rolling_page = lease(1)[0]
+    assert rolling_page["payload"]["message_uuids"] == [str(message_uuid)]
+    later_lane_provider_uuid = queue_exact(second_stream_uuid, sys_uuid.uuid4())
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET lease_expires_at = NOW() - INTERVAL '1 second'
+            WHERE uuid = %s
+            """,
+            (rolling_page["provider_operation_uuid"],),
+        )
+    db.commit()
+
+    original_bridge_capabilities = provider_data._bridge_capabilities
+
+    def downgrade_after_capability_read(session, identity, now):
+        capabilities = original_bridge_capabilities(session, identity, now)
+        read_capability["messenger.message.read"]["revision"] = 1
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_external_bridge_instances_v2
+                SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+                WHERE uuid = %s
+                """,
+                (json.dumps(read_capability), bridge_uuid),
+            )
+        db.commit()
+        return capabilities
+
+    monkeypatch.setattr(
+        provider_data,
+        "_bridge_capabilities",
+        downgrade_after_capability_read,
+    )
+
+    downgraded_lease = lease(1)
+    monkeypatch.setattr(
+        provider_data,
+        "_bridge_capabilities",
+        original_bridge_capabilities,
+    )
+    assert len(downgraded_lease) == 1
+    assert downgraded_lease[0]["provider_operation_uuid"] == str(
+        later_lane_provider_uuid
+    )
+    assert report(downgraded_lease[0])["status"] == "applied"
+
+    read_capability["messenger.message.read"]["revision"] = 2
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(read_capability), bridge_uuid),
+        )
+    db.commit()
+    resumed_page = lease(1)
+    assert len(resumed_page) == 1
+    assert (
+        resumed_page[0]["provider_operation_uuid"]
+        == rolling_page["provider_operation_uuid"]
+    )
+    assert report(resumed_page[0])["status"] == "applied"
+
+
+def test_compact_bulk_and_single_read_race_keeps_exact_topic_counter(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact bulk read race"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for content in ("single winner", "bulk remainder"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    bulk_waiting_for_project = threading.Event()
+    release_bulk = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class CoordinatedBulkSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            if (
+                not self._paused
+                and isinstance(statement, str)
+                and "pg_advisory_xact_lock" in statement
+                and "workspace-read:" not in statement
+            ):
+                self._paused = True
+                bulk_waiting_for_project.set()
+                assert release_bulk.wait(timeout=5)
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def run_bulk_read():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            return read_state.read_stream(
+                CoordinatedBulkSession(session),
+                api.project_id,
+                reader_uuid,
+                stream_uuid,
+                collect_message_rows=False,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        bulk_future = executor.submit(run_bulk_read)
+        assert bulk_waiting_for_project.wait(timeout=5)
+        _run_database_operation(
+            lambda session: messenger_dm_helpers.read_workspace_user_message(
+                project_id=api.project_id,
+                user_uuid=reader_uuid,
+                message_uuid=message_uuids[0],
+                session=session,
+            )
+        )
+        release_bulk.set()
+        bulk_result = bulk_future.result(timeout=10)
+    assert bulk_result.changed is True
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == 2
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 2
+
+
+def test_compact_bulk_read_ignores_another_users_read_revision(api, db):
+    bulk_reader_uuid = sys_uuid.uuid4()
+    other_reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact independent readers"
+    )
+    for reader_uuid in (bulk_reader_uuid, other_reader_uuid):
+        conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for content in ("first", "second"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    bulk_waiting_for_project = threading.Event()
+    release_bulk = threading.Event()
+    prepare_count = 0
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class CoordinatedBulkSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            nonlocal prepare_count
+            if (
+                isinstance(statement, str)
+                and "WITH unread AS MATERIALIZED" in statement
+            ):
+                prepare_count += 1
+            if (
+                not self._paused
+                and isinstance(statement, str)
+                and "pg_advisory_xact_lock" in statement
+                and "workspace-read:" not in statement
+            ):
+                self._paused = True
+                bulk_waiting_for_project.set()
+                assert release_bulk.wait(timeout=5)
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def run_bulk_read():
+        with session_factory() as session:
+            return read_state.read_stream(
+                CoordinatedBulkSession(session),
+                api.project_id,
+                bulk_reader_uuid,
+                stream_uuid,
+                collect_message_rows=False,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        bulk_future = executor.submit(run_bulk_read)
+        assert bulk_waiting_for_project.wait(timeout=5)
+        _run_database_operation(
+            lambda session: messenger_dm_helpers.read_workspace_user_message(
+                project_id=api.project_id,
+                user_uuid=other_reader_uuid,
+                message_uuid=message_uuids[0],
+                session=session,
+            )
+        )
+        release_bulk.set()
+        assert bulk_future.result(timeout=10).changed is True
+
+    assert prepare_count == 1
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        bulk_reader_uuid,
+        message_uuids,
+    ) == {str(message_uuid): True for message_uuid in message_uuids}
+
+
+def test_compact_provider_bulk_read_rebuilds_after_concurrent_message(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Bulk concurrent create",
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    first = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "before snapshot"},
+        },
+    )
+    assert first.status_code == 201, first.text
+    first_uuid = sys_uuid.UUID(first.json()["uuid"])
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, '{}'::jsonb
+            )
+            """,
+            (account_uuid, reader_uuid),
+        )
+    db.commit()
+
+    bulk_waiting_for_project = threading.Event()
+    release_bulk = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    def queue_provider_snapshot(
+        session,
+        candidate_sql,
+        candidate_values,
+        candidate_chunks,
+    ):
+        provider_data.enqueue_provider_read_operation(
+            session,
+            operation_uuid=sys_uuid.uuid4(),
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            owner_user_uuid=reader_uuid,
+            target_type="topic",
+            target_uuid=sys_uuid.UUID(str(topic_uuid)),
+            payload={
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "reader_uuid": str(reader_uuid),
+                "read": True,
+            },
+            candidate_sql=candidate_sql,
+            candidate_values=candidate_values,
+            candidate_chunks=candidate_chunks,
+            use_candidate_chunks=True,
+        )
+
+    class CoordinatedBulkSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            if (
+                not self._paused
+                and isinstance(statement, str)
+                and "pg_advisory_xact_lock(hashtextextended(%s::text" in statement
+            ):
+                self._paused = True
+                bulk_waiting_for_project.set()
+                assert release_bulk.wait(timeout=5)
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def run_bulk_read():
+        with session_factory() as session:
+            return read_state.read_topic(
+                CoordinatedBulkSession(session),
+                api.project_id,
+                reader_uuid,
+                stream_uuid,
+                topic_uuid,
+                collect_message_rows=False,
+                message_uuid_snapshot_callback=queue_provider_snapshot,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        bulk_future = executor.submit(run_bulk_read)
+        assert bulk_waiting_for_project.wait(timeout=5)
+        second = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": "after snapshot",
+                },
+            },
+        )
+        assert second.status_code == 201, second.text
+        second_uuid = sys_uuid.UUID(second.json()["uuid"])
+        release_bulk.set()
+        assert bulk_future.result(timeout=5).changed is True
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        [first_uuid, second_uuid],
+    ) == {
+        str(first_uuid): True,
+        str(second_uuid): True,
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone() == (2,)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operations_v1
+            WHERE external_account_uuid = %s
+              AND operation_kind = 'read_state.set'
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            """
+            SELECT array_agg(message.uuid ORDER BY chunk.chunk_number, bit_offset)
+            FROM m_external_provider_read_snapshots_v1 AS snapshot
+            JOIN m_external_provider_read_candidate_chunks_v1 AS chunk
+              ON chunk.external_operation_uuid = snapshot.external_operation_uuid
+            CROSS JOIN LATERAL generate_series(
+                0, 4095
+            ) AS bit_offset
+            JOIN m_workspace_messages AS message
+              ON message.project_id = snapshot.project_id
+             AND message.ingest_sequence =
+                    chunk.chunk_number * 4096 + bit_offset
+            WHERE snapshot.external_account_uuid = %s
+              AND get_bit(chunk.candidate_bits, bit_offset) = 1
+            """,
+            (account_uuid,),
+        )
+        assert cursor.fetchone()[0] == [first_uuid, second_uuid]
+
+
+@pytest.mark.parametrize(
+    "structural_change",
+    ["move", "delete", "purge", "stream_delete"],
+)
+def test_compact_bulk_read_retries_after_message_structure_changes(
+    api,
+    db,
+    structural_change,
+):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, f"Bulk structure {structural_change}"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    source_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "source",
+        is_default=True,
+    )
+    destination_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "destination",
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "payload": {"kind": "markdown", "content": structural_change},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    external_account_uuid = sys_uuid.uuid4()
+    if structural_change == "purge":
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_workspace_messages
+                SET external_account_uuid = %s
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (external_account_uuid, api.project_id, message_uuid),
+            )
+        db.commit()
+
+    bulk_waiting_for_project = threading.Event()
+    release_bulk = threading.Event()
+    structure_started = threading.Event()
+    session_factory = ra_engines.engine_factory.get_engine().session_manager
+
+    class CoordinatedBulkSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            if (
+                not self._paused
+                and isinstance(statement, str)
+                and "pg_advisory_xact_lock(hashtextextended(%s::text" in statement
+            ):
+                self._paused = True
+                bulk_waiting_for_project.set()
+                assert release_bulk.wait(timeout=5)
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def run_bulk_read():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            return read_state.read_topic(
+                CoordinatedBulkSession(session),
+                api.project_id,
+                reader_uuid,
+                stream_uuid,
+                source_topic_uuid,
+                collect_message_rows=False,
+            )
+
+    def change_structure(session):
+        structure_started.set()
+        if structural_change == "stream_delete":
+            messenger_controllers._delete_projection_stream_rows(
+                session,
+                project_id=api.project_id,
+                stream_uuid=stream_uuid,
+            )
+            return
+        if structural_change == "move":
+            read_state.relocate_message(
+                session,
+                message_uuid,
+                api.project_id,
+                api.project_id,
+                stream_uuid,
+                destination_topic_uuid,
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_messages
+                SET topic_uuid = %s, updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (destination_topic_uuid, api.project_id, message_uuid),
+            )
+            return
+        if structural_change == "purge":
+            read_state.purge_external_account_messages(
+                session,
+                api.project_id,
+                stream_uuid,
+                external_account_uuid,
+            )
+        else:
+            read_state.clear_message_for_all_users(
+                session,
+                api.project_id,
+                message_uuid,
+            )
+            read_state.record_message_deleted(
+                session,
+                api.project_id,
+                source_topic_uuid,
+                message_uuid,
+            )
+        session.execute(
+            """
+            DELETE FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        bulk_future = executor.submit(run_bulk_read)
+        assert bulk_waiting_for_project.wait(timeout=5)
+        structure_future = executor.submit(
+            lambda: _run_database_operation(change_structure)
+        )
+        assert structure_started.wait(timeout=5)
+        # Structural work is not blocked by the optimistic 500k-class scan.
+        # It commits first and bumps the revision; bulk must discard its stale
+        # masks after it acquires the project lock.
+        structure_future.result(timeout=5)
+        release_bulk.set()
+        bulk_result = bulk_future.result(timeout=5)
+
+    assert bulk_result.changed is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        remaining_read_bits = cursor.fetchone()[0]
+        if structural_change == "move":
+            assert remaining_read_bits == 0
+            assert _workspace_message_read_states(
+                db,
+                api.project_id,
+                reader_uuid,
+                [message_uuid],
+            ) == {str(message_uuid): False}
+            cursor.execute(
+                """
+                SELECT read_count
+                FROM m_workspace_user_topic_read_stats_v1
+                WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+                """,
+                (api.project_id, reader_uuid, destination_topic_uuid),
+            )
+            assert cursor.fetchone() is None
+        else:
+            assert remaining_read_bits == 0
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM m_workspace_messages
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (api.project_id, message_uuid),
+            )
+            assert cursor.fetchone() == (0,)
+
+
+def test_compact_account_message_purge_preserves_other_read_bits(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact account purge"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_COMPACT)
+    message_uuids = []
+    for content in ("first account", "second account"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+    first_account_uuid = sys_uuid.uuid4()
+    second_account_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET external_account_uuid = CASE uuid
+                    WHEN %s THEN %s
+                    ELSE %s
+                END
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (
+                message_uuids[0],
+                first_account_uuid,
+                second_account_uuid,
+                api.project_id,
+                message_uuids,
+            ),
+        )
+    db.commit()
+    _run_database_operation(
+        lambda session: read_state.set_message_uuids_read(
+            session,
+            api.project_id,
+            reader_uuid,
+            message_uuids,
+            True,
+        )
+    )
+
+    def purge_first_account(session):
+        read_state.purge_external_account_messages(
+            session,
+            api.project_id,
+            stream_uuid,
+            first_account_uuid,
+        )
+        session.execute(
+            """
+            DELETE FROM m_workspace_messages
+            WHERE project_id = %s AND stream_uuid = %s
+              AND external_account_uuid = %s
+            """,
+            (api.project_id, stream_uuid, first_account_uuid),
+        )
+
+    _run_database_operation(purge_first_account)
+
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        [message_uuids[1]],
+    ) == {str(message_uuids[1]): True}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT message_count
+            FROM m_workspace_topic_message_stats_v1
+            WHERE project_id = %s AND topic_uuid = %s
+            """,
+            (api.project_id, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(bit_count(read_bits)), 0)
+            FROM m_workspace_user_read_chunks_v1
+            WHERE user_uuid = %s
+            """,
+            (reader_uuid,),
+        )
+        assert cursor.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [read_state.PROJECT_MODE_COMPACT, read_state.PROJECT_MODE_ROLLBACK],
+)
+def test_compact_provider_read_state_uses_bitmaps_and_keeps_own_message_read(
+    api, db, mode
+):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Provider compact read state"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, mode)
+    message_uuids = []
+    for content in ("provider one", "provider two"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    _run_database_operation(
+        lambda session: provider_event_apply._sync_provider_read_state(
+            session,
+            sys_uuid.UUID(api.project_id),
+            reader_uuid,
+            sys_uuid.UUID(stream_uuid),
+            sys_uuid.UUID(topic_uuid),
+            message_uuids,
+            True,
+        )
+    )
+    assert _workspace_message_read_states(
+        db, api.project_id, reader_uuid, message_uuids
+    ) == {str(message_uuid): True for message_uuid in message_uuids}
+    _run_database_operation(
+        lambda session: provider_event_apply._sync_provider_read_state(
+            session,
+            sys_uuid.UUID(api.project_id),
+            reader_uuid,
+            sys_uuid.UUID(stream_uuid),
+            sys_uuid.UUID(topic_uuid),
+            message_uuids,
+            False,
+        )
+    )
+    assert _workspace_message_read_states(
+        db, api.project_id, reader_uuid, message_uuids
+    ) == {str(message_uuid): False for message_uuid in message_uuids}
+    _run_database_operation(
+        lambda session: provider_event_apply._sync_provider_read_state(
+            session,
+            sys_uuid.UUID(api.project_id),
+            sys_uuid.UUID(api.user_uuid),
+            sys_uuid.UUID(stream_uuid),
+            sys_uuid.UUID(topic_uuid),
+            message_uuids,
+            False,
+        )
+    )
+    assert _workspace_message_read_states(
+        db, api.project_id, api.user_uuid, message_uuids
+    ) == {str(message_uuid): True for message_uuid in message_uuids}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == (
+            0 if mode == read_state.PROJECT_MODE_COMPACT else 4
+        )

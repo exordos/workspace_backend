@@ -26,6 +26,7 @@ from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import read_state
 
 
 RESOURCE_MODELS: dict[str, typing.Any] = {
@@ -35,6 +36,7 @@ RESOURCE_MODELS: dict[str, typing.Any] = {
 }
 
 _PROVIDER_TARGET_UNSET = object()
+_PROVIDER_READ_STATE_MAX_MESSAGES = 500
 _PROVIDER_TARGET_EXISTS = object()
 EVENT_RETENTION = datetime.timedelta(hours=72)
 EVENT_PRUNE_BATCH_SIZE = 25000
@@ -76,6 +78,76 @@ MENTIONED_MESSAGE_UUIDS_SQL = """
         LIMIT %s
     ) AS candidate ON TRUE
     ORDER BY candidate.created_at {direction}, candidate.uuid {direction}
+    LIMIT %s
+"""
+COMPACT_MENTIONED_MESSAGE_UUIDS_SQL = """
+    WITH authorized_streams AS MATERIALIZED (
+        SELECT binding.stream_uuid
+        FROM m_workspace_stream_bindings AS binding
+        JOIN m_workspace_streams AS stream
+          ON stream.project_id = binding.project_id
+         AND stream.uuid = binding.stream_uuid
+        LEFT JOIN m_confirmed_external_stream_access AS access
+          ON access.project_id = binding.project_id
+         AND access.user_uuid = binding.user_uuid
+         AND access.stream_uuid = binding.stream_uuid
+        WHERE binding.project_id = %s
+          AND binding.user_uuid = %s
+          AND (stream.source_name = 'native' OR access.user_uuid IS NOT NULL)
+    )
+    SELECT candidate.uuid
+    FROM authorized_streams
+    JOIN LATERAL (
+        SELECT message.uuid, message.created_at
+        FROM m_workspace_message_mentions_v1 AS mention
+        JOIN m_workspace_messages AS message
+          ON message.project_id = mention.project_id
+         AND message.uuid = mention.message_uuid
+        LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+          ON chunk.user_uuid = mention.user_uuid
+         AND chunk.chunk_number = mention.ingest_sequence / 4096
+        WHERE mention.project_id = %s
+          AND mention.user_uuid = %s
+          AND mention.stream_uuid = authorized_streams.stream_uuid
+          {read_clause}
+          {marker_clause}
+        ORDER BY message.created_at {direction}, message.uuid {direction}
+        LIMIT %s
+    ) AS candidate ON TRUE
+    ORDER BY candidate.created_at {direction}, candidate.uuid {direction}
+    LIMIT %s
+"""
+COMPACT_READ_MESSAGE_UUIDS_SQL = """
+    WITH authorized_streams AS MATERIALIZED (
+        SELECT binding.stream_uuid
+        FROM m_workspace_stream_bindings AS binding
+        JOIN m_workspace_streams AS stream
+          ON stream.project_id = binding.project_id
+         AND stream.uuid = binding.stream_uuid
+        LEFT JOIN m_confirmed_external_stream_access AS access
+          ON access.project_id = binding.project_id
+         AND access.user_uuid = binding.user_uuid
+         AND access.stream_uuid = binding.stream_uuid
+        WHERE binding.project_id = %s
+          AND binding.user_uuid = %s
+          AND (stream.source_name = 'native' OR access.user_uuid IS NOT NULL)
+    )
+    SELECT message.uuid
+    FROM m_workspace_user_read_chunks_v1 AS chunk
+    JOIN m_workspace_messages AS message
+      ON message.project_id = %s
+     AND message.ingest_sequence >= chunk.chunk_number * 4096
+     AND message.ingest_sequence < (chunk.chunk_number + 1) * 4096
+    JOIN authorized_streams
+      ON authorized_streams.stream_uuid = message.stream_uuid
+    WHERE chunk.user_uuid = %s
+      AND get_bit(
+            chunk.read_bits,
+            (message.ingest_sequence %% 4096)::integer
+          ) = 1
+      {scope_clause}
+      {marker_clause}
+    ORDER BY message.created_at {direction}, message.uuid {direction}
     LIMIT %s
 """
 BOUNDED_VISIBLE_EVENTS_SQL = """
@@ -592,6 +664,40 @@ class SQLCanonicalReadStore:
             )
             marker_created_at = _database_timestamp(marker.created_at)
             marker_params = (marker_created_at, marker_created_at, marker.uuid)
+        session = contexts.Context().get_session()
+        if read_state.mode_uses_compact_state(
+            read_state.project_mode(session, self.project_uuid)
+        ):
+            read_clause = ""
+            if unread_only:
+                read_clause = """
+                  AND COALESCE(
+                        get_bit(
+                            chunk.read_bits,
+                            (mention.ingest_sequence %% 4096)::integer
+                        ),
+                        0
+                      ) = 0
+                """
+            statement = COMPACT_MENTIONED_MESSAGE_UUIDS_SQL.format(
+                read_clause=read_clause,
+                marker_clause=marker_clause,
+                direction=direction,
+            )
+            candidate_rows = session.execute(
+                statement,
+                (
+                    self.project_uuid,
+                    self.user_uuid,
+                    self.project_uuid,
+                    self.user_uuid,
+                    *marker_params,
+                    limit,
+                    limit,
+                ),
+            ).fetchall()
+        else:
+            candidate_rows = None
         flags_join = ""
         read_clause = ""
         read_params: tuple[object, ...] = ()
@@ -604,27 +710,195 @@ class SQLCanonicalReadStore:
             """
             read_clause = "AND COALESCE(flags.read, FALSE) = FALSE"
             read_params = (self.user_uuid,)
-        statement = MENTIONED_MESSAGE_UUIDS_SQL.format(
-            flags_join=flags_join,
-            read_clause=read_clause,
-            marker_clause=marker_clause,
-            direction=direction,
+        if candidate_rows is None:
+            statement = MENTIONED_MESSAGE_UUIDS_SQL.format(
+                flags_join=flags_join,
+                read_clause=read_clause,
+                marker_clause=marker_clause,
+                direction=direction,
+            )
+            candidate_rows = session.execute(
+                statement,
+                (
+                    self.project_uuid,
+                    self.user_uuid,
+                    *read_params,
+                    self.project_uuid,
+                    self.user_uuid,
+                    *marker_params,
+                    limit,
+                    limit,
+                ),
+            ).fetchall()
+        message_uuids = [row["uuid"] for row in candidate_rows]
+        snapshots = helpers.get_compact_workspace_user_message_snapshots(
+            self.project_uuid,
+            message_uuids,
+            [self.user_uuid],
+            session=session,
         )
-        session = contexts.Context().get_session()
-        candidate_rows = session.execute(
-            statement,
+        snapshots_by_uuid = {row["uuid"]: row for row in snapshots}
+        return [
+            _public_dict(snapshots_by_uuid[message_uuid], "messages")
+            for message_uuid in message_uuids
+        ]
+
+    def _filter_compact_unread_message_page(
+        self,
+        filters: dict[str, typing.Any],
+        marker: typing.Any,
+        sort_direction: str,
+        limit: int | None,
+    ) -> list[dict[str, typing.Any]] | None:
+        if not set(filters).issubset({"read", "stream_uuid", "topic_uuid"}):
+            return None
+        read_filter = filters.get("read")
+        if (
+            not isinstance(read_filter, dm_filters.EQ)
+            or read_filter._value is not False
+        ):
+            return None
+        direction = sort_direction.upper()
+        where = [
+            "stats.project_id = %s",
+            "binding.user_uuid = %s",
+            "(stream.source_name = 'native' OR access.user_uuid IS NOT NULL)",
+            "stats.message_count > COALESCE(topic_reads.read_count, 0)",
+        ]
+        params: list[object] = [self.project_uuid, self.user_uuid]
+        for name in ("stream_uuid", "topic_uuid"):
+            value_filter = filters.get(name)
+            if value_filter is None:
+                continue
+            if not isinstance(value_filter, dm_filters.EQ):
+                return None
+            where.append(f"stats.{name} = %s")
+            params.append(value_filter._value)
+        marker_clause = ""
+        marker_params: tuple[object, ...] = ()
+        if marker is not None:
+            operator = ">" if sort_direction == "asc" else "<"
+            marker_clause = (
+                f"AND (message.created_at {operator} %s OR "
+                f"(message.created_at = %s AND message.uuid {operator} %s))"
+            )
+            marker_created_at = _database_timestamp(marker.created_at)
+            marker_params = (marker_created_at, marker_created_at, marker.uuid)
+        params.extend(
             (
-                self.project_uuid,
-                self.user_uuid,
-                *read_params,
                 self.project_uuid,
                 self.user_uuid,
                 *marker_params,
                 limit,
+            )
+        )
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            f"""
+            WITH candidate_topics AS MATERIALIZED (
+                SELECT stats.topic_uuid, stats.stream_uuid
+                FROM m_workspace_topic_message_stats_v1 AS stats
+                JOIN m_workspace_stream_bindings AS binding
+                  ON binding.project_id = stats.project_id
+                 AND binding.stream_uuid = stats.stream_uuid
+                JOIN m_workspace_streams AS stream
+                  ON stream.project_id = stats.project_id
+                 AND stream.uuid = stats.stream_uuid
+                LEFT JOIN m_confirmed_external_stream_access AS access
+                  ON access.project_id = stats.project_id
+                 AND access.user_uuid = binding.user_uuid
+                 AND access.stream_uuid = stats.stream_uuid
+                LEFT JOIN m_workspace_user_topic_read_stats_v1 AS topic_reads
+                  ON topic_reads.project_id = stats.project_id
+                 AND topic_reads.user_uuid = binding.user_uuid
+                 AND topic_reads.topic_uuid = stats.topic_uuid
+                WHERE {" AND ".join(where)}
+            )
+            SELECT message.uuid
+            FROM candidate_topics AS candidate
+            JOIN m_workspace_messages AS message
+              ON message.project_id = %s
+             AND message.stream_uuid = candidate.stream_uuid
+             AND message.topic_uuid = candidate.topic_uuid
+            LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+              ON chunk.user_uuid = %s
+             AND chunk.chunk_number = message.ingest_sequence / 4096
+            WHERE COALESCE(
+                    get_bit(
+                        chunk.read_bits,
+                        (message.ingest_sequence %% 4096)::integer
+                    ),
+                    0
+                  ) = 0
+              {marker_clause}
+            ORDER BY message.created_at {direction}, message.uuid {direction}
+            LIMIT %s
+            """,
+            tuple(params),
+        ).fetchall()
+        message_uuids = [row["uuid"] for row in rows]
+        snapshots = helpers.get_compact_workspace_user_message_snapshots(
+            self.project_uuid,
+            message_uuids,
+            [self.user_uuid],
+            session=session,
+        )
+        snapshots_by_uuid = {row["uuid"]: row for row in snapshots}
+        return [
+            _public_dict(snapshots_by_uuid[message_uuid], "messages")
+            for message_uuid in message_uuids
+        ]
+
+    def _filter_compact_read_message_page(
+        self,
+        filters: dict[str, typing.Any],
+        marker: typing.Any,
+        sort_direction: str,
+        limit: int | None,
+    ) -> list[dict[str, typing.Any]] | None:
+        if not set(filters).issubset({"read", "stream_uuid", "topic_uuid"}):
+            return None
+        read_filter = filters.get("read")
+        if not isinstance(read_filter, dm_filters.EQ) or read_filter._value is not True:
+            return None
+        scope_clauses = []
+        scope_params: list[object] = []
+        for name in ("stream_uuid", "topic_uuid"):
+            value_filter = filters.get(name)
+            if value_filter is None:
+                continue
+            if not isinstance(value_filter, dm_filters.EQ):
+                return None
+            scope_clauses.append(f"AND message.{name} = %s")
+            scope_params.append(value_filter._value)
+        marker_clause = ""
+        marker_params: tuple[object, ...] = ()
+        if marker is not None:
+            operator = ">" if sort_direction == "asc" else "<"
+            marker_clause = (
+                f"AND (message.created_at {operator} %s OR "
+                f"(message.created_at = %s AND message.uuid {operator} %s))"
+            )
+            marker_created_at = _database_timestamp(marker.created_at)
+            marker_params = (marker_created_at, marker_created_at, marker.uuid)
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            COMPACT_READ_MESSAGE_UUIDS_SQL.format(
+                scope_clause=" ".join(scope_clauses),
+                marker_clause=marker_clause,
+                direction=sort_direction.upper(),
+            ),
+            (
+                self.project_uuid,
+                self.user_uuid,
+                self.project_uuid,
+                self.user_uuid,
+                *scope_params,
+                *marker_params,
                 limit,
             ),
         ).fetchall()
-        message_uuids = [row["uuid"] for row in candidate_rows]
+        message_uuids = [row["uuid"] for row in rows]
         snapshots = helpers.get_compact_workspace_user_message_snapshots(
             self.project_uuid,
             message_uuids,
@@ -645,6 +919,7 @@ class SQLCanonicalReadStore:
         limit: int | None,
     ) -> list[dict[str, typing.Any]]:
         started_at = time.monotonic()
+        requested_filters = filters.copy()
         scoped_filters = self._scope_filters("messages", filters)
         try:
             marker = None
@@ -661,6 +936,32 @@ class SQLCanonicalReadStore:
                     limit,
                     "read" in scoped_filters,
                 )
+            read_filter = requested_filters.get("read")
+            if set(requested_filters).issubset(
+                {"read", "stream_uuid", "topic_uuid"}
+            ) and isinstance(read_filter, dm_filters.EQ):
+                session = contexts.Context().get_session()
+                if read_state.mode_uses_compact_state(
+                    read_state.project_mode(session, self.project_uuid)
+                ):
+                    if read_filter._value is False:
+                        compact_page = self._filter_compact_unread_message_page(
+                            requested_filters,
+                            marker,
+                            sort_direction,
+                            limit,
+                        )
+                    elif read_filter._value is True:
+                        compact_page = self._filter_compact_read_message_page(
+                            requested_filters,
+                            marker,
+                            sort_direction,
+                            limit,
+                        )
+                    else:
+                        compact_page = None
+                    if compact_page is not None:
+                        return compact_page
             if marker is not None:
                 compare = dm_filters.GT if sort_direction == "asc" else dm_filters.LT
                 keyset = dm_filters.OR(
@@ -960,13 +1261,31 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                     raise ra_exceptions.ValidationErrorException() from policy_exc
                 except provider_data.ProviderUnavailableError:
                     raise ra_exceptions.ValidationErrorException() from exc
+                provider_data.lock_provider_causal_lane(
+                    session,
+                    bridge_instance_uuid=bridge.uuid,
+                    external_account_uuid=account.uuid,
+                    causal_lane=stream_uuid,
+                )
                 return account, bridge
             raise ra_exceptions.ValidationErrorException() from exc
+        provider_data.lock_provider_causal_lane(
+            session,
+            bridge_instance_uuid=bridge.uuid,
+            external_account_uuid=account.uuid,
+            causal_lane=stream_uuid,
+        )
         return account, bridge
 
     def _lock_provider_account(self, account_uuid: object) -> None:
         """Establish account-before-message/outbox lock ordering."""
-        contexts.Context().get_session().execute(
+        session = contexts.Context().get_session()
+        read_state.lock_external_account_resources(
+            session,
+            (account_uuid,),
+            shared=True,
+        )
+        session.execute(
             """
             SELECT uuid
             FROM m_external_accounts_v2
@@ -977,7 +1296,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         ).fetchone()
 
     def _lock_provider_account_for_stream(self, stream_uuid: object) -> bool:
-        """Lock a projected account without validating mutable capabilities."""
+        """Lock a projected account and its lane without capability validation."""
         session = contexts.Context().get_session()
         stream = models.WorkspaceStream.objects.get_one(
             filters={
@@ -989,6 +1308,29 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         if stream.external_account_uuid is None:
             return False
         self._lock_provider_account(stream.external_account_uuid)
+        try:
+            account, _chat, bridge = provider_data.resolve_provider_queue_target(
+                session,
+                project_id=self.project_uuid,
+                owner_user_uuid=stream.user_uuid,
+                external_account_uuid=stream.external_account_uuid,
+                stream_uuid=stream_uuid,
+                allow_policy_blocked=True,
+            )
+        except (
+            provider_data.ProviderUnavailableError,
+            storage_exceptions.RecordNotFound,
+        ):
+            # Preserve idempotent reads when no live route exists. A changed
+            # read validates the provider target later and keeps the existing
+            # public error contract.
+            return True
+        provider_data.lock_provider_causal_lane(
+            session,
+            bridge_instance_uuid=bridge.uuid,
+            external_account_uuid=account.uuid,
+            causal_lane=stream_uuid,
+        )
         return True
 
     def _queue_provider_operation(
@@ -1009,7 +1351,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         if target is None:
             return None
         account, bridge = target
-        operation, _record_uuid = provider_data.enqueue_provider_operation(
+        operation, _record_uuid = provider_data.enqueue_provider_operation_in_lane(
             contexts.Context().get_session(),
             operation_uuid=sys_uuid.uuid4(),
             bridge_instance_uuid=bridge.uuid,
@@ -1020,6 +1362,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             target_type=target_type,
             target_uuid=target_uuid,
             payload=resource_projection.simple(payload),
+            causal_lane=stream_uuid,
         )
         return operation
 
@@ -1033,25 +1376,133 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         target_uuid: object,
         provider_target: typing.Any = _PROVIDER_TARGET_UNSET,
     ) -> external_models.ExternalOperation | None:
-        """Queue one exact, retry-safe provider read-state projection."""
+        """Queue exact, retry-safe provider read-state projection chunks."""
         if not message_uuids:
             return None
-        queue_values: dict[str, typing.Any] = {
-            "operation_kind": "read_state.set",
-            "target_type": target_type,
-            "target_uuid": target_uuid,
-            "stream_uuid": stream_uuid,
-            "payload": {
-                "stream_uuid": str(stream_uuid),
-                "topic_uuid": None if topic_uuid is None else str(topic_uuid),
-                "reader_uuid": str(self.user_uuid),
-                "message_uuids": [str(message_uuid) for message_uuid in message_uuids],
-                "read": True,
-            },
-        }
-        if provider_target is not _PROVIDER_TARGET_UNSET:
-            queue_values["provider_target"] = provider_target
-        return self._queue_provider_operation(**queue_values)
+        first_operation = None
+        for offset in range(0, len(message_uuids), _PROVIDER_READ_STATE_MAX_MESSAGES):
+            chunk = message_uuids[offset : offset + _PROVIDER_READ_STATE_MAX_MESSAGES]
+            queue_values: dict[str, typing.Any] = {
+                "operation_kind": "read_state.set",
+                "target_type": target_type,
+                "target_uuid": target_uuid,
+                "stream_uuid": stream_uuid,
+                "payload": {
+                    "stream_uuid": str(stream_uuid),
+                    "topic_uuid": None if topic_uuid is None else str(topic_uuid),
+                    "reader_uuid": str(self.user_uuid),
+                    "message_uuids": [str(message_uuid) for message_uuid in chunk],
+                    "read": True,
+                },
+            }
+            if provider_target is not _PROVIDER_TARGET_UNSET:
+                queue_values["provider_target"] = provider_target
+            operation = self._queue_provider_operation(**queue_values)
+            if first_operation is None:
+                first_operation = operation
+        return first_operation
+
+    def _provider_read_batch_callback(
+        self,
+        *,
+        provider_account_locked: bool,
+        stream_uuid: object,
+        topic_uuid: object | None,
+        target_type: str,
+        target_uuid: object,
+    ) -> typing.Callable[[collections.abc.Sequence[object]], None] | None:
+        """Resolve once and enqueue bounded exact provider read snapshots."""
+        if not provider_account_locked:
+            return None
+        provider_target: typing.Any = _PROVIDER_TARGET_UNSET
+
+        def queue(message_uuids: collections.abc.Sequence[object]) -> None:
+            nonlocal provider_target
+            if provider_target is _PROVIDER_TARGET_UNSET:
+                provider_target = self._provider_target(
+                    stream_uuid,
+                    "read_state.set",
+                    account_locked=True,
+                )
+            self._queue_provider_read(
+                stream_uuid=stream_uuid,
+                topic_uuid=topic_uuid,
+                message_uuids=message_uuids,
+                target_type=target_type,
+                target_uuid=target_uuid,
+                provider_target=provider_target,
+            )
+
+        return queue
+
+    def _provider_read_snapshot_callback(
+        self,
+        *,
+        provider_account_locked: bool,
+        stream_uuid: object,
+        topic_uuid: object | None,
+        target_type: str,
+        target_uuid: object,
+    ) -> read_state.BulkReadSnapshotCallback | None:
+        """Queue one exact provider read snapshot from compact state."""
+        if not provider_account_locked:
+            return None
+        provider_target: typing.Any = _PROVIDER_TARGET_UNSET
+
+        def queue(
+            session: typing.Any,
+            candidate_sql: str,
+            candidate_values: collections.abc.Sequence[object],
+            candidate_chunks: collections.abc.Sequence[
+                collections.abc.Mapping[str, object]
+            ]
+            | None = None,
+        ) -> None:
+            nonlocal provider_target
+            if provider_target is _PROVIDER_TARGET_UNSET:
+                provider_target = self._provider_target(
+                    stream_uuid,
+                    "read_state.set",
+                    account_locked=True,
+                )
+            if provider_target is None:
+                return
+            account, bridge = provider_target
+            read_revision = provider_data._capability_revision(
+                bridge.capabilities,
+                "messenger.message.read",
+            )
+            use_lazy_snapshot = (
+                read_revision >= provider_data.PROVIDER_READ_PAGING_REVISION
+            )
+            candidate_chunk_mode: bool | None = False
+            if use_lazy_snapshot:
+                candidate_chunk_mode = True if candidate_chunks is not None else None
+            try:
+                provider_data.enqueue_provider_read_operation(
+                    session,
+                    operation_uuid=sys_uuid.uuid4(),
+                    bridge_instance_uuid=bridge.uuid,
+                    external_account_uuid=account.uuid,
+                    project_id=self.project_uuid,
+                    owner_user_uuid=self.user_uuid,
+                    target_type=target_type,
+                    target_uuid=target_uuid,
+                    payload={
+                        "stream_uuid": str(stream_uuid),
+                        "topic_uuid": (None if topic_uuid is None else str(topic_uuid)),
+                        "reader_uuid": str(self.user_uuid),
+                        "read": True,
+                    },
+                    candidate_sql=candidate_sql,
+                    candidate_values=candidate_values,
+                    candidate_chunks=candidate_chunks,
+                    use_candidate_chunks=candidate_chunk_mode,
+                )
+            except provider_data.ProviderUnavailableError as exc:
+                raise ra_exceptions.ValidationErrorException() from exc
+
+        return queue
 
     def create_resource(
         self,
@@ -1567,30 +2018,20 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             provider_account_locked = self._lock_provider_account_for_stream(
                 resource_uuid
             )
-            row, message_uuids = helpers.read_workspace_user_stream_messages(
+            row = helpers.read_workspace_user_stream_messages(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
                 session=session,
                 current_stream=stream,
-                return_message_uuids=True,
-            )
-            provider_target = (
-                self._provider_target(
-                    resource_uuid,
-                    "read_state.set",
-                    account_locked=provider_account_locked,
-                )
-                if message_uuids
-                else _PROVIDER_TARGET_UNSET
-            )
-            self._queue_provider_read(
-                stream_uuid=resource_uuid,
-                topic_uuid=None,
-                message_uuids=message_uuids,
-                target_type="stream",
-                target_uuid=resource_uuid,
-                provider_target=provider_target,
+                collect_message_uuids=False,
+                message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
+                    provider_account_locked=provider_account_locked,
+                    stream_uuid=resource_uuid,
+                    topic_uuid=None,
+                    target_type="stream",
+                    target_uuid=resource_uuid,
+                ),
             )
         elif resource == "stream_bindings" and action == "add_users":
             role_user_uuids = {
@@ -1715,30 +2156,20 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             provider_account_locked = self._lock_provider_account_for_stream(
                 topic.stream_uuid
             )
-            row, message_uuids = helpers.read_workspace_user_stream_topic_messages(
+            row = helpers.read_workspace_user_stream_topic_messages(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
                 session=session,
                 current_topic=topic,
-                return_message_uuids=True,
-            )
-            provider_target = (
-                self._provider_target(
-                    topic.stream_uuid,
-                    "read_state.set",
-                    account_locked=provider_account_locked,
-                )
-                if message_uuids
-                else _PROVIDER_TARGET_UNSET
-            )
-            self._queue_provider_read(
-                stream_uuid=topic.stream_uuid,
-                topic_uuid=resource_uuid,
-                message_uuids=message_uuids,
-                target_type="topic",
-                target_uuid=resource_uuid,
-                provider_target=provider_target,
+                collect_message_uuids=False,
+                message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
+                    provider_account_locked=provider_account_locked,
+                    stream_uuid=topic.stream_uuid,
+                    topic_uuid=resource_uuid,
+                    target_type="topic",
+                    target_uuid=resource_uuid,
+                ),
             )
         elif resource == "messages" and action == "read":
             session = contexts.Context().get_session()
@@ -1791,30 +2222,20 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             provider_account_locked = self._lock_provider_account_for_stream(
                 message.stream_uuid
             )
-            row, message_uuids = helpers.read_workspace_user_topic_messages_to_message(
+            row = helpers.read_workspace_user_topic_messages_to_message(
                 self.project_uuid,
                 self.user_uuid,
                 resource_uuid,
                 session=session,
                 current_message=message,
-                return_message_uuids=True,
-            )
-            provider_target = (
-                self._provider_target(
-                    message.stream_uuid,
-                    "read_state.set",
-                    account_locked=provider_account_locked,
-                )
-                if message_uuids
-                else _PROVIDER_TARGET_UNSET
-            )
-            self._queue_provider_read(
-                stream_uuid=message.stream_uuid,
-                topic_uuid=message.topic_uuid,
-                message_uuids=message_uuids,
-                target_type="message",
-                target_uuid=resource_uuid,
-                provider_target=provider_target,
+                collect_message_uuids=False,
+                message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
+                    provider_account_locked=provider_account_locked,
+                    stream_uuid=message.stream_uuid,
+                    topic_uuid=message.topic_uuid,
+                    target_type="message",
+                    target_uuid=resource_uuid,
+                ),
             )
         elif resource == "messages" and action in {"star", "unstar"}:
             row = helpers.sync_workspace_user_message_flags(

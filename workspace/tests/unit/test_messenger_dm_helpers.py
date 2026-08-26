@@ -20,11 +20,22 @@ import unittest
 import uuid as sys_uuid
 from unittest import mock
 
+import pytest
 from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.dm import helpers as dm_helpers
 from workspace.messenger_api.dm import message_payloads
+from workspace.messenger_api.dm import read_state
+
+
+@pytest.fixture(autouse=True)
+def _legacy_read_state(monkeypatch):
+    monkeypatch.setattr(
+        read_state,
+        "project_mode",
+        lambda _session, _project_id: read_state.PROJECT_MODE_LEGACY,
+    )
 
 
 def test_create_message_flags_bulk_uses_one_insert_for_all_recipients():
@@ -1474,21 +1485,53 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         topic_statement, topic_values = session.execute.call_args_list[1].args
         message_statement, message_values = session.execute.call_args_list[2].args
         self.assertEqual(
-            dm_helpers._COMPACT_USER_STREAM_SNAPSHOTS_SQL, stream_statement
+            dm_helpers._READ_STATE_USER_STREAM_SNAPSHOTS_SQL, stream_statement
         )
-        self.assertEqual(dm_helpers._COMPACT_USER_TOPIC_SNAPSHOTS_SQL, topic_statement)
-        self.assertNotIn("m_workspace_user_streams", stream_statement)
-        self.assertNotIn("m_workspace_user_topics", topic_statement)
-        self.assertNotIn("m_workspace_user_messages_view", message_statement)
-        self.assertIn("m_workspace_user_message_flags", message_statement)
-        self.assertIn("m_workspace_message_reactions", message_statement)
-        expected_users = sorted([first_user_uuid, second_user_uuid], key=str)
-        self.assertEqual(expected_users, stream_values[1])
-        self.assertEqual(expected_users, stream_values[5])
-        self.assertEqual(expected_users, topic_values[1])
-        self.assertEqual(expected_users, topic_values[5])
         self.assertEqual(
-            (project_id, [message_uuid], expected_users, project_id, [message_uuid]),
+            dm_helpers._READ_STATE_USER_TOPIC_SNAPSHOTS_SQL, topic_statement
+        )
+        self.assertEqual(
+            dm_helpers._READ_STATE_USER_MESSAGE_SNAPSHOTS_SQL, message_statement
+        )
+        self.assertIn("m_workspace_streams", stream_statement)
+        self.assertIn("m_workspace_stream_topics", topic_statement)
+        self.assertIn("m_workspace_messages", message_statement)
+        self.assertNotIn("FROM m_workspace_user_streams", stream_statement)
+        self.assertNotIn("FROM m_workspace_user_topics_view", topic_statement)
+        self.assertNotIn("FROM m_workspace_user_messages_view", message_statement)
+        expected_users = sorted([first_user_uuid, second_user_uuid], key=str)
+        self.assertEqual(
+            (
+                expected_users,
+                project_id,
+                expected_users,
+                project_id,
+                stream_uuid,
+                project_id,
+                stream_uuid,
+            ),
+            stream_values,
+        )
+        self.assertEqual(
+            (
+                expected_users,
+                [topic_uuid],
+                project_id,
+                expected_users,
+                project_id,
+                project_id,
+            ),
+            topic_values,
+        )
+        self.assertEqual(
+            (
+                expected_users,
+                [message_uuid],
+                project_id,
+                expected_users,
+                project_id,
+                project_id,
+            ),
             message_values,
         )
 
@@ -2058,7 +2101,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
-        session.execute.assert_called_once()
+        self.assertEqual(session.execute.call_count, 3)
         statement, values = session.execute.call_args.args
         self.assertIn(
             'INSERT INTO "m_workspace_user_message_flags"',
@@ -2108,7 +2151,45 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 user_uuid=user_uuid,
             )
 
-        session.execute.assert_called_once()
+        self.assertEqual(session.execute.call_count, 3)
+
+    def test_create_workspace_stream_binding_message_flags_locks_project_before_membership(
+        self,
+    ):
+        project_id = sys_uuid.uuid4()
+        stream_uuid = sys_uuid.uuid4()
+        user_uuid = sys_uuid.uuid4()
+        session = types.SimpleNamespace(execute=mock.Mock())
+        calls = []
+        with (
+            mock.patch.object(
+                dm_helpers.read_state,
+                "project_mode",
+                return_value=dm_helpers.read_state.PROJECT_MODE_COMPACT,
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "_lock_workspace_project_event_writes",
+                side_effect=lambda *args: calls.append("project"),
+            ),
+            mock.patch.object(
+                dm_helpers.read_state,
+                "mark_stream_history_read",
+                side_effect=lambda *args: calls.append("membership"),
+            ),
+            mock.patch.object(
+                dm_helpers.read_state,
+                "sync_stream_mentions_for_user",
+            ),
+        ):
+            dm_helpers._create_workspace_stream_binding_message_flags(
+                project_id=project_id,
+                stream_uuid=stream_uuid,
+                user_uuid=user_uuid,
+                session=session,
+            )
+
+        self.assertEqual(calls, ["project", "membership"])
 
     def test_ensure_workspace_message_recipients_emits_only_inserted_users(self):
         project_id = sys_uuid.uuid4()
@@ -2158,6 +2239,47 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             topic_uuid=message.topic_uuid,
             session=session,
             recipients_are_scoped=True,
+        )
+
+    def test_ensure_workspace_message_recipients_marks_inserted_author_compact_read(
+        self,
+    ):
+        project_id = sys_uuid.uuid4()
+        author_uuid = sys_uuid.uuid4()
+        message = types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            user_uuid=author_uuid,
+            stream_uuid=sys_uuid.uuid4(),
+            topic_uuid=sys_uuid.uuid4(),
+        )
+        result = types.SimpleNamespace(fetchall=lambda: [{"user_uuid": author_uuid}])
+        session = types.SimpleNamespace(execute=mock.Mock(return_value=result))
+        with (
+            mock.patch.object(
+                dm_helpers.read_state,
+                "writes_compact_state",
+                return_value=True,
+            ),
+            mock.patch.object(
+                dm_helpers.read_state,
+                "set_message_read",
+            ) as set_message_read,
+        ):
+            inserted = dm_helpers.ensure_workspace_message_recipients(
+                project_id,
+                message,
+                [author_uuid],
+                session,
+                emit_events=False,
+            )
+
+        self.assertEqual(inserted, [author_uuid])
+        set_message_read.assert_called_once_with(
+            session,
+            project_id,
+            author_uuid,
+            message.uuid,
+            True,
         )
 
     def test_get_or_create_workspace_stream_bindings_rejects_non_list_users(self):
@@ -2545,6 +2667,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         with (
+            mock.patch.object(dm_helpers.read_state, "lock_projects"),
+            mock.patch.object(dm_helpers.read_state, "lock_message_structure"),
+            mock.patch.object(
+                dm_helpers.read_state,
+                "bump_project_structure_revisions",
+            ),
             mock.patch.object(
                 dm_helpers, "get_workspace_user_stream", return_value=actor_stream
             ) as get_user_stream,
@@ -2641,6 +2769,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         with (
+            mock.patch.object(dm_helpers.read_state, "lock_projects"),
+            mock.patch.object(dm_helpers.read_state, "lock_message_structure"),
+            mock.patch.object(
+                dm_helpers.read_state,
+                "bump_project_structure_revisions",
+            ),
             mock.patch.object(
                 dm_helpers, "get_workspace_user_stream", return_value=user_stream
             ),
@@ -2950,6 +3084,12 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             objects = types.SimpleNamespace(get_one=get_stream)
 
         with (
+            mock.patch.object(dm_helpers.read_state, "lock_projects"),
+            mock.patch.object(dm_helpers.read_state, "lock_message_structure"),
+            mock.patch.object(
+                dm_helpers.read_state,
+                "bump_project_structure_revisions",
+            ),
             mock.patch.object(
                 dm_helpers,
                 "_get_workspace_stream_topic_for_user",
@@ -4076,6 +4216,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         reaction_uuid = sys_uuid.uuid4()
         session = object()
         created_reaction = {}
+        lock_order = []
 
         class FakeWorkspaceMessageReactions:
             def __init__(self, **kwargs):
@@ -4102,8 +4243,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 "_create_workspace_message_updated_events",
             ) as create_events,
             mock.patch.object(
+                dm_helpers,
+                "_lock_workspace_project_event_writes",
+                side_effect=lambda *args: lock_order.append("project"),
+            ),
+            mock.patch.object(
                 dm_helpers.reaction_users,
                 "lock_messages",
+                side_effect=lambda *args, **kwargs: lock_order.append("message"),
             ) as lock_messages,
             mock.patch.object(
                 dm_helpers.reaction_users,
@@ -4146,6 +4293,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             (message_uuid,),
             session=session,
         )
+        self.assertEqual(lock_order, ["project", "message"])
         refresh_groups.assert_called_once_with(
             project_id,
             ((message_uuid, "thumbs_up"),),
@@ -4684,7 +4832,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        cursor = types.SimpleNamespace(fetchone=mock.Mock(return_value={"uuid": message_uuid}))
+        cursor = types.SimpleNamespace(
+            fetchone=mock.Mock(return_value={"uuid": message_uuid})
+        )
         session = types.SimpleNamespace(execute=mock.Mock(return_value=cursor))
 
         changed = dm_helpers._update_workspace_user_message_flag(
@@ -5539,6 +5689,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 deleted_message["delete_session"] = session
 
         with (
+            mock.patch.object(dm_helpers.read_state, "lock_message_structure"),
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_message",

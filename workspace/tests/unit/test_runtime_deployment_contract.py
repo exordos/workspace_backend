@@ -115,9 +115,7 @@ def test_postgresql_runtime_has_import_scale_session_tuning():
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
-        assert (
-            "?options=-c%20work_mem%3D32MB%20-c%20jit%3Doff" in config
-        )
+        assert "?options=-c%20work_mem%3D32MB%20-c%20jit%3Doff" in config
 
 
 def test_reaction_user_lists_have_bounded_runtime_defaults():
@@ -129,6 +127,17 @@ def test_reaction_user_lists_have_bounded_runtime_defaults():
         assert "[messenger_reactions]" in config
         assert "user_list_limit = 4" in config
         assert "user_list_max_entries_per_message" not in config
+
+
+def test_compact_read_state_rollout_is_opt_in():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        assert "read_state_compaction_enabled = false" in config
+        assert "read_state_cleanup_enabled = false" in config
+        assert "only after every Workspace API and worker" in config
 
 
 def test_manifest_provisions_unassigned_external_integration_roles():

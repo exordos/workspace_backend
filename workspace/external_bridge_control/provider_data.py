@@ -22,6 +22,7 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import helpers as messenger_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import read_state
 
 
 LEASE_MIN_SECONDS = 10
@@ -29,6 +30,10 @@ LEASE_MAX_SECONDS = 300
 LEASE_MAX_ITEMS = 100
 RESULT_MAX_ITEMS = 500
 EVENT_MAX_ITEMS = 500
+PROVIDER_READ_MAX_MESSAGES = 500
+PROVIDER_READ_LEGACY_MAX_PAGES = LEASE_MAX_ITEMS
+PROVIDER_READ_MAX_EMPTY_BATCHES_PER_PAGE = 4
+PROVIDER_READ_PAGING_REVISION = 2
 HEARTBEAT_MAX_AGE = datetime.timedelta(seconds=60)
 LOG = logging.getLogger(__name__)
 
@@ -112,6 +117,10 @@ class ProviderBatchError(ProviderDataError):
     error = "provider_event_batch_rejected"
 
 
+class ProviderReadProjectMoveConflictError(RuntimeError):
+    """An in-flight provider read page cannot change project safely."""
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
@@ -122,6 +131,14 @@ def _sha256(value: object) -> str:
 
 def _timestamp(value: datetime.datetime) -> str:
     return value.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _database_now(session: typing.Any) -> datetime.datetime:
+    """Use PostgreSQL as the queue clock across independently clocked VMs."""
+    return session.execute(
+        "SELECT statement_timestamp() AS current_time",
+        (),
+    ).fetchone()["current_time"]
 
 
 def _uuid_string(value: str | sys_uuid.UUID | None) -> str | None:
@@ -229,6 +246,12 @@ def _capability_limit(capabilities: object, name: str, limit_name: str) -> int |
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _capability_revision(capabilities: object, name: str) -> int:
+    descriptor = capabilities.get(name) if isinstance(capabilities, dict) else None
+    value = descriptor.get("revision") if isinstance(descriptor, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _require_current_provider_inputs(
@@ -390,8 +413,7 @@ def resolve_provider_target(
     if (
         (
             not account.live_ready
-            and account.status
-            != external_models.ExternalAccountStatus.BACKFILL.value
+            and account.status != external_models.ExternalAccountStatus.BACKFILL.value
         )
         or not _effective_capability_available(account.capabilities, capability_name)
         or not _effective_capability_available(chat.capabilities, capability_name)
@@ -481,7 +503,11 @@ def _operation_dict(
     required_capability = _required_capability(row["operation_kind"])
     return {
         "provider_operation_uuid": str(row["uuid"]),
-        "external_operation_uuid": str(row["external_operation_uuid"]),
+        "external_operation_uuid": str(
+            row["uuid"]
+            if row["operation_kind"] == "read_state.set"
+            else row["external_operation_uuid"]
+        ),
         "lease_uuid": str(row["lease_uuid"]),
         "lease_expires_at": _timestamp(row["lease_expires_at"]),
         "external_account_uuid": str(row["external_account_uuid"]),
@@ -491,6 +517,489 @@ def _operation_dict(
         "attempt": row["attempt"],
         "payload": row["payload"],
     }
+
+
+def _provider_causal_lane(payload: object, causal_lane: object | None) -> object | None:
+    if causal_lane is not None:
+        return sys_uuid.UUID(str(causal_lane))
+    if isinstance(payload, dict) and payload.get("stream_uuid") is not None:
+        return sys_uuid.UUID(str(payload["stream_uuid"]))
+    return None
+
+
+def _lock_provider_causal_lane(
+    session: typing.Any,
+    *,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    causal_lane: object,
+) -> None:
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (
+            "provider-causal-lane-v1:"
+            f"{bridge_instance_uuid}:{external_account_uuid}:{causal_lane}",
+        ),
+    )
+
+
+def lock_provider_causal_lane(
+    session: typing.Any,
+    *,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    causal_lane: object,
+) -> None:
+    """Expose the provider lane lock to callers that lock before mutation."""
+    _lock_provider_causal_lane(
+        session,
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
+        causal_lane=causal_lane,
+    )
+
+
+def rebind_provider_read_lane_project(
+    session: typing.Any,
+    *,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    causal_lane: object,
+    old_project_id: object,
+    new_project_id: object,
+) -> None:
+    """Move idle provider read work before its projection changes project."""
+    read_state.lock_read_state_schema_shared(session)
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"provider-read-materialize-v1:{bridge_instance_uuid}",),
+    )
+    _lock_provider_causal_lane(
+        session,
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
+        causal_lane=causal_lane,
+    )
+    pages = session.execute(
+        """
+        SELECT page.uuid, page.status, page.attempt
+        FROM m_external_provider_operations_v1 AS page
+        JOIN m_external_operations_v2 AS public_operation
+          ON public_operation.uuid = page.external_operation_uuid
+         AND public_operation.status IN (
+                'queued', 'running', 'failed',
+                'manual_reconciliation_required'
+         )
+        WHERE page.bridge_instance_uuid = %s
+          AND page.external_account_uuid = %s
+          AND page.causal_lane = %s
+          AND page.project_id = %s
+          AND page.operation_kind = 'read_state.set'
+        ORDER BY page.sequence
+        FOR UPDATE OF page
+        """,
+        (
+            bridge_instance_uuid,
+            external_account_uuid,
+            causal_lane,
+            old_project_id,
+        ),
+    ).fetchall()
+    if any(
+        page["status"] == "leased"
+        or (page["status"] == "queued" and page["attempt"] > 0)
+        for page in pages
+    ):
+        raise ProviderReadProjectMoveConflictError()
+    session.execute(
+        """
+        UPDATE m_external_provider_read_snapshots_v1 AS snapshot
+        SET project_id = %s, updated_at = NOW()
+        FROM m_external_operations_v2 AS public_operation
+        WHERE public_operation.uuid = snapshot.external_operation_uuid
+          AND public_operation.status IN (
+                'queued', 'running', 'failed',
+                'manual_reconciliation_required'
+          )
+          AND snapshot.bridge_instance_uuid = %s
+          AND snapshot.external_account_uuid = %s
+          AND snapshot.causal_lane = %s
+          AND snapshot.project_id = %s
+        """,
+        (
+            new_project_id,
+            bridge_instance_uuid,
+            external_account_uuid,
+            causal_lane,
+            old_project_id,
+        ),
+    )
+    session.execute(
+        """
+        UPDATE m_external_provider_operations_v1 AS page
+        SET project_id = %s, updated_at = NOW()
+        FROM m_external_operations_v2 AS public_operation
+        WHERE public_operation.uuid = page.external_operation_uuid
+          AND public_operation.status IN (
+                'queued', 'running', 'failed',
+                'manual_reconciliation_required'
+          )
+          AND page.bridge_instance_uuid = %s
+          AND page.external_account_uuid = %s
+          AND page.causal_lane = %s
+          AND page.project_id = %s
+          AND page.operation_kind = 'read_state.set'
+        """,
+        (
+            new_project_id,
+            bridge_instance_uuid,
+            external_account_uuid,
+            causal_lane,
+            old_project_id,
+        ),
+    )
+
+
+def _materialize_provider_read_pages(
+    session: typing.Any,
+    *,
+    bridge_instance_uuid: object,
+    limit: int,
+    now: datetime.datetime,
+) -> None:
+    """Materialize only the read pages that one lease can expose."""
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"provider-read-materialize-v1:{bridge_instance_uuid}",),
+    )
+    outstanding = session.execute(
+        """
+        SELECT COUNT(*) AS page_count
+        FROM m_external_provider_operations_v1 AS page
+        JOIN m_external_provider_read_snapshots_v1 AS snapshot
+          ON snapshot.external_operation_uuid = page.external_operation_uuid
+        WHERE page.bridge_instance_uuid = %s
+          AND page.operation_kind = 'read_state.set'
+          AND page.status IN ('queued', 'leased')
+        """,
+        (bridge_instance_uuid,),
+    ).fetchone()["page_count"]
+    available_pages = max(0, limit - outstanding)
+    if not available_pages:
+        return
+    candidate_batches_remaining = (
+        available_pages * PROVIDER_READ_MAX_EMPTY_BATCHES_PER_PAGE
+    )
+    snapshot_limit = candidate_batches_remaining
+    snapshots = session.execute(
+        """
+        SELECT snapshot.*
+        FROM m_external_provider_read_snapshots_v1 AS snapshot
+        JOIN m_external_operations_v2 AS public_operation
+          ON public_operation.uuid = snapshot.external_operation_uuid
+        JOIN m_external_accounts_v2 AS account
+          ON account.uuid = snapshot.external_account_uuid
+        JOIN m_external_provider_policies_v1 AS policy
+          ON policy.provider = account.provider
+         AND policy.enabled = TRUE
+         AND policy.emergency_suspended = FALSE
+        WHERE snapshot.bridge_instance_uuid = %s
+          AND snapshot.exhausted = FALSE
+          AND public_operation.status IN ('queued', 'running')
+          AND NOT EXISTS (
+                SELECT 1
+                FROM m_external_provider_operations_v1 AS failed_page
+                WHERE failed_page.external_operation_uuid =
+                        snapshot.external_operation_uuid
+                  AND failed_page.status = 'failed'
+          )
+          AND NOT EXISTS (
+                SELECT 1
+                FROM m_external_provider_read_snapshots_v1 AS earlier
+                WHERE earlier.external_account_uuid =
+                        snapshot.external_account_uuid
+                  AND earlier.causal_lane = snapshot.causal_lane
+                  AND earlier.queue_sequence < snapshot.queue_sequence
+          )
+        ORDER BY snapshot.updated_at, snapshot.queue_sequence,
+                 snapshot.external_operation_uuid
+        LIMIT %s
+        FOR SHARE OF policy
+        FOR UPDATE OF snapshot SKIP LOCKED
+        """,
+        (bridge_instance_uuid, snapshot_limit),
+    ).fetchall()
+    active_snapshot_uuids = {
+        snapshot["external_operation_uuid"] for snapshot in snapshots
+    }
+    while available_pages and active_snapshot_uuids:
+        made_progress = False
+        for snapshot in snapshots:
+            if not candidate_batches_remaining:
+                break
+            operation_uuid = snapshot["external_operation_uuid"]
+            if operation_uuid not in active_snapshot_uuids:
+                continue
+            candidate_pack = session.execute(
+                """
+                SELECT pack_number, candidate_count, cursor_position
+                FROM m_external_provider_read_candidate_packs_v1
+                WHERE external_operation_uuid = %s
+                ORDER BY pack_number
+                LIMIT 1
+                """,
+                (operation_uuid,),
+            ).fetchone()
+            candidates = []
+            consumed_candidates = False
+            if candidate_pack is not None:
+                candidates = session.execute(
+                    """
+                    SELECT candidate.message_uuid,
+                           pack.cursor_position + candidate.ordinal_position
+                               AS position
+                    FROM m_external_provider_read_candidate_packs_v1 AS pack
+                    CROSS JOIN LATERAL unnest(
+                        pack.candidate_uuids[
+                            pack.cursor_position + 1:
+                            LEAST(
+                                pack.cursor_position + %s,
+                                pack.candidate_count
+                            )
+                        ]
+                    ) WITH ORDINALITY AS candidate(
+                        message_uuid, ordinal_position
+                    )
+                    WHERE pack.external_operation_uuid = %s
+                      AND pack.pack_number = %s
+                    ORDER BY candidate.ordinal_position
+                    """,
+                    (
+                        PROVIDER_READ_MAX_MESSAGES,
+                        operation_uuid,
+                        candidate_pack["pack_number"],
+                    ),
+                ).fetchall()
+                if not candidates:
+                    raise RuntimeError("Provider read candidate pack has no remainder")
+                next_cursor = candidates[-1]["position"]
+                if next_cursor == candidate_pack["candidate_count"]:
+                    session.execute(
+                        """
+                        DELETE FROM m_external_provider_read_candidate_packs_v1
+                        WHERE external_operation_uuid = %s AND pack_number = %s
+                        """,
+                        (operation_uuid, candidate_pack["pack_number"]),
+                    )
+                else:
+                    session.execute(
+                        """
+                        UPDATE m_external_provider_read_candidate_packs_v1
+                        SET cursor_position = %s
+                        WHERE external_operation_uuid = %s AND pack_number = %s
+                        """,
+                        (next_cursor, operation_uuid, candidate_pack["pack_number"]),
+                    )
+                consumed_candidates = True
+            else:
+                candidate_chunk = session.execute(
+                    """
+                    SELECT chunk_number
+                    FROM m_external_provider_read_candidate_chunks_v1
+                    WHERE external_operation_uuid = %s
+                    ORDER BY chunk_number
+                    LIMIT 1
+                    """,
+                    (operation_uuid,),
+                ).fetchone()
+                if candidate_chunk is not None:
+                    candidates = session.execute(
+                        f"""
+                        WITH selected AS MATERIALIZED (
+                            SELECT chunk.chunk_number, bit_offset
+                            FROM m_external_provider_read_candidate_chunks_v1
+                                AS chunk
+                            CROSS JOIN LATERAL generate_series(
+                                0, {read_state.READ_CHUNK_BITS - 1}
+                            ) AS bit_offset
+                            WHERE chunk.external_operation_uuid = %s
+                              AND get_bit(chunk.candidate_bits, bit_offset) = 1
+                            ORDER BY chunk.chunk_number, bit_offset
+                            LIMIT %s
+                        ), clear_masks AS (
+                            SELECT
+                                chunk_number,
+                                bit_or(
+                                    set_bit(
+                                        B'0'::bit({read_state.READ_CHUNK_BITS}),
+                                        bit_offset,
+                                        1
+                                    )
+                                ) AS clear_bits
+                            FROM selected
+                            GROUP BY chunk_number
+                        ), remaining AS MATERIALIZED (
+                            SELECT
+                                chunk.chunk_number,
+                                chunk.candidate_bits & ~clear_mask.clear_bits
+                                    AS candidate_bits
+                            FROM m_external_provider_read_candidate_chunks_v1
+                                AS chunk
+                            JOIN clear_masks AS clear_mask
+                              ON clear_mask.chunk_number = chunk.chunk_number
+                            WHERE chunk.external_operation_uuid = %s
+                        ), deleted AS (
+                            DELETE FROM
+                                m_external_provider_read_candidate_chunks_v1
+                                AS chunk
+                            USING remaining
+                            WHERE chunk.external_operation_uuid = %s
+                              AND chunk.chunk_number = remaining.chunk_number
+                              AND bit_count(remaining.candidate_bits) = 0
+                            RETURNING chunk.chunk_number
+                        ), cleared AS (
+                            UPDATE m_external_provider_read_candidate_chunks_v1
+                                AS chunk
+                            SET candidate_bits = remaining.candidate_bits
+                            FROM remaining
+                            WHERE chunk.external_operation_uuid = %s
+                              AND chunk.chunk_number = remaining.chunk_number
+                              AND bit_count(remaining.candidate_bits) > 0
+                            RETURNING chunk.chunk_number
+                        )
+                        SELECT message.uuid AS message_uuid
+                        FROM selected
+                        JOIN m_workspace_messages AS message
+                          ON message.ingest_sequence =
+                                selected.chunk_number
+                                    * {read_state.READ_CHUNK_BITS}
+                                + selected.bit_offset
+                        ORDER BY selected.chunk_number, selected.bit_offset
+                        """,
+                        (
+                            operation_uuid,
+                            PROVIDER_READ_MAX_MESSAGES,
+                            operation_uuid,
+                            operation_uuid,
+                            operation_uuid,
+                        ),
+                    ).fetchall()
+                    consumed_candidates = True
+            if consumed_candidates:
+                candidate_batches_remaining -= 1
+            exhausted = session.execute(
+                """
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM m_external_provider_read_candidate_packs_v1
+                    WHERE external_operation_uuid = %s
+                    UNION ALL
+                    SELECT 1
+                    FROM m_external_provider_read_candidate_chunks_v1
+                    WHERE external_operation_uuid = %s
+                ) AS exhausted
+                """,
+                (operation_uuid, operation_uuid),
+            ).fetchone()["exhausted"]
+            session.execute(
+                """
+                UPDATE m_external_provider_read_snapshots_v1
+                SET exhausted = %s, updated_at = %s
+                WHERE external_operation_uuid = %s
+                """,
+                (exhausted, now, operation_uuid),
+            )
+            if candidates:
+                _insert_provider_operation(
+                    session,
+                    external_operation_uuid=operation_uuid,
+                    bridge_instance_uuid=snapshot["bridge_instance_uuid"],
+                    external_account_uuid=snapshot["external_account_uuid"],
+                    project_id=snapshot["project_id"],
+                    operation_kind="read_state.set",
+                    causal_lane=snapshot["causal_lane"],
+                    payload={
+                        **snapshot["payload"],
+                        "message_uuids": [
+                            str(candidate["message_uuid"]) for candidate in candidates
+                        ],
+                    },
+                    now=now,
+                )
+                available_pages -= 1
+            elif exhausted:
+                terminal = session.execute(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (
+                            WHERE status IN ('queued', 'leased')
+                        ) AS nonterminal_count,
+                        COALESCE(MAX(attempt), 0) AS attempt,
+                        (array_agg(terminal_result ORDER BY sequence DESC)
+                            FILTER (WHERE status = 'succeeded'))[1]
+                            AS terminal_result
+                    FROM m_external_provider_operations_v1
+                    WHERE external_operation_uuid = %s
+                    """,
+                    (operation_uuid,),
+                ).fetchone()
+                if not terminal["nonterminal_count"]:
+                    terminal_result = terminal["terminal_result"] or {
+                        "status": "succeeded",
+                        "safe_error": None,
+                    }
+                    completed = session.execute(
+                        """
+                        UPDATE m_external_operations_v2
+                        SET status = 'succeeded', attempt = %s,
+                            safe_error = NULL, can_retry = FALSE,
+                            can_discard = FALSE,
+                            details = details || jsonb_build_object(
+                                'provider_result', %s::jsonb
+                            ),
+                            attempt_history = array_append(
+                                attempt_history, %s::jsonb
+                            ),
+                            revision = revision + 1, updated_at = %s
+                        WHERE uuid = %s AND status IN ('queued', 'running')
+                        RETURNING uuid
+                        """,
+                        (
+                            terminal["attempt"],
+                            _canonical_json(terminal_result),
+                            _canonical_json(
+                                {
+                                    "attempt": terminal["attempt"],
+                                    "status": "succeeded",
+                                    "completed_at": _timestamp(now),
+                                    "safe_error": None,
+                                }
+                            ),
+                            now,
+                            operation_uuid,
+                        ),
+                    ).fetchone()
+                    if completed is not None:
+                        session.execute(
+                            """
+                            DELETE FROM m_external_provider_read_snapshots_v1
+                            WHERE external_operation_uuid = %s
+                            """,
+                            (operation_uuid,),
+                        )
+                        _emit_operation_event(
+                            session,
+                            operation_uuid,
+                            snapshot["project_id"],
+                            messenger_events.EXTERNAL_OPERATION_UPDATED_EVENT,
+                        )
+            made_progress = made_progress or consumed_candidates
+            if exhausted:
+                active_snapshot_uuids.remove(operation_uuid)
+            if not available_pages:
+                break
+        if not made_progress:
+            break
 
 
 def _operation_delivery(
@@ -531,35 +1040,84 @@ def _emit_target_updated_events(
             session=session,
         )
         return
+    if target_type in {"stream", "topic"} and read_state.uses_compact_state(
+        session, project_id
+    ):
+        if target_type == "stream":
+            stream_uuid = target_uuid
+        else:
+            topic = session.execute(
+                """
+                SELECT stream_uuid
+                FROM m_workspace_stream_topics
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (project_id, target_uuid),
+            ).fetchone()
+            if topic is None:
+                return
+            stream_uuid = topic["stream_uuid"]
+        project_uuid = sys_uuid.UUID(str(project_id))
+        canonical_stream_uuid = sys_uuid.UUID(str(stream_uuid))
+        recipients = models.get_stream_recipients(
+            project_uuid,
+            canonical_stream_uuid,
+            session=session,
+        )
+        create_event: typing.Callable[..., typing.Any]
+        if target_type == "stream":
+            resources = messenger_helpers.get_compact_workspace_user_stream_snapshots(
+                project_uuid,
+                canonical_stream_uuid,
+                recipients,
+                session=session,
+            )
+            create_event = messenger_events.create_stream_updated_events
+        else:
+            resources = messenger_helpers.get_compact_workspace_user_topic_snapshots(
+                project_uuid,
+                target_uuid,
+                recipients,
+                session=session,
+            )
+            create_event = messenger_events.create_topic_updated_events
+        create_event(project_id, resources, session=session, compact=True)
+        return
     model_and_event = {
         "stream": (
             models.WorkspaceUserStream,
-            messenger_events.create_stream_updated_event,
+            messenger_events.create_stream_updated_events,
         ),
         "topic": (
             models.WorkspaceUserTopic,
-            messenger_events.create_topic_updated_event,
+            messenger_events.create_topic_updated_events,
         ),
     }.get(target_type)
     if model_and_event is None:
         return
     model, create_event = model_and_event
-    for resource in model.objects.get_all(
+    resources = model.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
             "uuid": dm_filters.EQ(target_uuid),
         },
         session=session,
-    ):
-        create_event(resource, session=session)
+    )
+    create_event(project_id, resources, session=session, compact=True)
 
 
 def sync_operation_target_delivery(
     session: typing.Any,
     operation: external_models.ExternalOperation,
     project_id: object,
+    *,
+    _event_order_locked: bool = False,
 ) -> None:
     """Project one public operation status onto its canonical target."""
+    # A direct caller may not have entered the normal messenger event path.
+    # Fence downgrade and serialize the target snapshot before it is prepared.
+    if not _event_order_locked:
+        read_state.lock_projects(session, (project_id,))
     target = {
         "stream": ("m_workspace_streams", "uuid"),
         "topic": ("m_workspace_stream_topics", "uuid"),
@@ -608,6 +1166,9 @@ def publish_operation_event(
     event_kind: str,
 ) -> None:
     """Publish one operation and its target delivery snapshot atomically."""
+    # Event insertion takes the project advisory lock. Keep the global lock
+    # order schema -> project so a concurrent downgrade cannot deadlock here.
+    read_state.lock_read_state_schema_shared(session)
     messenger_events.create_external_resource_event(
         project_id,
         operation.owner_user_uuid,
@@ -616,7 +1177,12 @@ def publish_operation_event(
         hidden_fields=("owner_user_uuid",),
         session=session,
     )
-    sync_operation_target_delivery(session, operation, project_id)
+    sync_operation_target_delivery(
+        session,
+        operation,
+        project_id,
+        _event_order_locked=True,
+    )
 
 
 def _emit_operation_event(
@@ -642,7 +1208,8 @@ def lease_provider_operations(
     now: datetime.datetime | None = None,
 ) -> dict[str, object]:
     """Lease one FIFO batch in the request-owned transaction."""
-    now = now or datetime.datetime.now(datetime.timezone.utc)
+    uses_database_clock = now is None
+    now = now if now is not None else _database_now(session)
     request_uuid = sys_uuid.UUID(str(request_uuid))
     limit = int(limit)
     lease_seconds = int(lease_seconds)
@@ -650,7 +1217,19 @@ def lease_provider_operations(
         raise ValueError("Lease limit is outside the supported range")
     if not LEASE_MIN_SECONDS <= lease_seconds <= LEASE_MAX_SECONDS:
         raise ValueError("Lease duration is outside the supported range")
+    read_state.lock_read_state_schema_shared(session)
     capabilities = _bridge_capabilities(session, identity, now)
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"provider-read-materialize-v1:{identity.bridge_instance_uuid}",),
+    )
+    if uses_database_clock:
+        now = _database_now(session)
+    capabilities = _bridge_capabilities(session, identity, now)
+    provider_read_revision = _capability_revision(
+        capabilities,
+        "messenger.message.read",
+    )
     existing = session.execute(
         """
         SELECT *
@@ -684,9 +1263,44 @@ def lease_provider_operations(
     )
     if not allowed_kinds:
         return {"request_uuid": str(request_uuid), "operations": []}
+    supports_provider_read_paging = (
+        provider_read_revision >= PROVIDER_READ_PAGING_REVISION
+    )
+    if "read_state.set" in allowed_kinds and supports_provider_read_paging:
+        _materialize_provider_read_pages(
+            session,
+            bridge_instance_uuid=identity.bridge_instance_uuid,
+            limit=limit,
+            now=now,
+        )
+    session.execute(
+        """
+        SELECT
+            set_config(
+                'workspace.provider_read_snapshot_lease_v2',
+                %s,
+                TRUE
+            )
+        """,
+        ("on" if supports_provider_read_paging else "off",),
+    )
     rows = session.execute(
         """
-        WITH candidates AS (
+        WITH bridge_capabilities AS MATERIALIZED (
+            SELECT CASE
+                     WHEN jsonb_typeof(
+                        bridge."capabilities"
+                            ->'messenger.message.read'->'revision'
+                     ) = 'number'
+                     THEN (
+                         bridge."capabilities"
+                             ->'messenger.message.read'->>'revision'
+                     )::integer >= %s
+                     ELSE FALSE
+                   END AS provider_read_paging
+            FROM "m_external_bridge_instances_v2" AS bridge
+            WHERE bridge."uuid" = %s
+        ), candidates AS (
             SELECT operation."uuid"
             FROM "m_external_provider_operations_v1" AS operation
             JOIN "m_external_accounts_v2" AS account
@@ -699,6 +1313,36 @@ def lease_provider_operations(
               AND operation."status" = 'queued'
               AND operation."available_at" <= %s
               AND operation."operation_kind" = ANY(%s::text[])
+              AND (
+                    operation."operation_kind" <> 'read_state.set'
+                    OR COALESCE(
+                        (SELECT provider_read_paging FROM bridge_capabilities),
+                        FALSE
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM m_external_provider_read_snapshots_v1 AS page_snapshot
+                        WHERE page_snapshot.external_operation_uuid =
+                                operation.external_operation_uuid
+                    )
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM m_external_provider_read_snapshots_v1 AS barrier
+                    WHERE barrier.bridge_instance_uuid =
+                            operation.bridge_instance_uuid
+                      AND barrier.external_account_uuid =
+                            operation.external_account_uuid
+                      AND barrier.queue_sequence < operation.sequence
+                      AND (
+                            -- Fail closed for rows written by an old process
+                            -- during a rolling migration.
+                            operation.causal_lane IS NULL
+                            OR barrier.causal_lane = operation.causal_lane
+                      )
+                      AND barrier.external_operation_uuid <>
+                            operation.external_operation_uuid
+              )
             ORDER BY operation."sequence"
             LIMIT %s
             FOR SHARE OF policy
@@ -713,6 +1357,8 @@ def lease_provider_operations(
         RETURNING operation.*
         """,
         (
+            PROVIDER_READ_PAGING_REVISION,
+            identity.bridge_instance_uuid,
             identity.bridge_instance_uuid,
             now,
             list(allowed_kinds),
@@ -723,7 +1369,7 @@ def lease_provider_operations(
         ),
     ).fetchall()
     if rows:
-        session.execute(
+        newly_running = session.execute(
             """
             UPDATE "m_external_operations_v2" AS public_operation
             SET "status" = 'running', "attempt" = provider_operation."attempt",
@@ -733,10 +1379,20 @@ def lease_provider_operations(
             FROM "m_external_provider_operations_v1" AS provider_operation
             WHERE public_operation."uuid" = provider_operation."external_operation_uuid"
               AND provider_operation."lease_uuid" = %s
+              AND public_operation."status" <> 'running'
+            RETURNING public_operation."uuid"
             """,
             (now, request_uuid),
-        )
+        ).fetchall()
+        newly_running_uuids = {row["uuid"] for row in newly_running}
+        emitted_operation_uuids = set()
         for row in rows:
+            if (
+                row["external_operation_uuid"] not in newly_running_uuids
+                or row["external_operation_uuid"] in emitted_operation_uuids
+            ):
+                continue
+            emitted_operation_uuids.add(row["external_operation_uuid"])
             _emit_operation_event(
                 session,
                 row["external_operation_uuid"],
@@ -813,6 +1469,11 @@ def report_provider_result(
     public_status = validated["public_status"]
     safe_error = validated["safe_error"]
     canonical_hash = _sha256(result)
+    read_state.lock_read_state_schema_shared(session)
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"provider-read-materialize-v1:{identity.bridge_instance_uuid}",),
+    )
     existing = session.execute(
         """
         SELECT "operation_uuid", "payload_sha256"
@@ -831,7 +1492,7 @@ def report_provider_result(
     operation = session.execute(
         """
         SELECT "external_operation_uuid", "project_id", "status", "lease_uuid",
-               "attempt"
+               "attempt", "operation_kind"
         FROM "m_external_provider_operations_v1"
         WHERE "uuid" = %s AND "bridge_instance_uuid" = %s
         FOR UPDATE
@@ -842,6 +1503,26 @@ def report_provider_result(
         return {"result_uuid": str(result_uuid), "status": "not_found"}
     if operation["status"] != "leased" or operation["lease_uuid"] != lease_uuid:
         return {"result_uuid": str(result_uuid), "status": "stale_lease"}
+    snapshot = None
+    if operation["operation_kind"] == "read_state.set":
+        snapshot = session.execute(
+            """
+            SELECT exhausted
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            FOR UPDATE
+            """,
+            (operation["external_operation_uuid"],),
+        ).fetchone()
+    session.execute(
+        """
+        SELECT uuid
+        FROM m_external_operations_v2
+        WHERE uuid = %s
+        FOR UPDATE
+        """,
+        (operation["external_operation_uuid"],),
+    ).fetchone()
     inserted = session.execute(
         """
         INSERT INTO "m_external_provider_operation_results_v1" (
@@ -872,11 +1553,67 @@ def report_provider_result(
         """
         UPDATE "m_external_provider_operations_v1"
         SET "status" = %s, "lease_uuid" = NULL, "lease_expires_at" = NULL,
-            "safe_error" = %s, "completed_at" = %s, "updated_at" = %s
+            "safe_error" = %s, "public_result_status" = %s,
+            "terminal_result" = %s::jsonb,
+            "payload" = CASE
+                WHEN %s = 'succeeded' AND "operation_kind" = 'read_state.set'
+                THEN jsonb_set("payload", '{message_uuids}', '[]'::jsonb)
+                ELSE "payload"
+            END,
+            "completed_at" = %s, "updated_at" = %s
         WHERE "uuid" = %s
         """,
-        (queue_status, safe_error, now, now, provider_operation_uuid),
+        (
+            queue_status,
+            safe_error,
+            public_status,
+            _canonical_json(result),
+            queue_status,
+            now,
+            now,
+            provider_operation_uuid,
+        ),
     )
+    aggregate = session.execute(
+        """
+        SELECT
+            COUNT(*) FILTER (
+                WHERE status IN ('queued', 'leased')
+            ) AS nonterminal_count,
+            MAX(attempt) AS attempt
+        FROM m_external_provider_operations_v1
+        WHERE external_operation_uuid = %s
+        """,
+        (operation["external_operation_uuid"],),
+    ).fetchone()
+    if aggregate["nonterminal_count"]:
+        return {"result_uuid": str(result_uuid), "status": "applied"}
+    representative = session.execute(
+        """
+        SELECT terminal_result
+        FROM m_external_provider_operations_v1
+        WHERE external_operation_uuid = %s
+          AND public_result_status IN (
+                'failed', 'manual_reconciliation_required'
+          )
+        ORDER BY
+            CASE public_result_status
+                WHEN 'manual_reconciliation_required' THEN 0
+                ELSE 1
+            END,
+            sequence
+        LIMIT 1
+        """,
+        (operation["external_operation_uuid"],),
+    ).fetchone()
+    if snapshot is not None and not snapshot["exhausted"] and representative is None:
+        return {"result_uuid": str(result_uuid), "status": "applied"}
+    terminal_result = (
+        result if representative is None else representative["terminal_result"]
+    )
+    validated = _validated_result(terminal_result)
+    public_status = validated["public_status"]
+    safe_error = validated["safe_error"]
     manual = validated["manual"]
     reconciliation = validated["reconciliation"]
     session.execute(
@@ -900,7 +1637,7 @@ def report_provider_result(
         """,
         (
             public_status,
-            operation["attempt"],
+            aggregate["attempt"],
             safe_error,
             public_status == "failed",
             public_status == "failed",
@@ -912,10 +1649,10 @@ def report_provider_result(
             else reconciliation.get("state", "not_required"),
             reconciliation.get("reason") if manual else None,
             _canonical_json(reconciliation.get("evidence", {})),
-            _canonical_json(result),
+            _canonical_json(terminal_result),
             _canonical_json(
                 {
-                    "attempt": operation["attempt"],
+                    "attempt": aggregate["attempt"],
                     "status": public_status,
                     "completed_at": _timestamp(now),
                     "safe_error": safe_error,
@@ -925,6 +1662,14 @@ def report_provider_result(
             operation["external_operation_uuid"],
         ),
     )
+    if snapshot is not None and public_status == "succeeded":
+        session.execute(
+            """
+            DELETE FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation["external_operation_uuid"],),
+        )
     _emit_operation_event(
         session,
         operation["external_operation_uuid"],
@@ -964,6 +1709,65 @@ def report_provider_results(
     return {"results": response}
 
 
+def _lock_provider_event_projects(
+    session: typing.Any,
+    project_ids: list[sys_uuid.UUID],
+    message_uuids: list[sys_uuid.UUID],
+    *,
+    structural_batch: bool,
+) -> list[sys_uuid.UUID]:
+    for message_uuid in sorted(set(message_uuids), key=str):
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"workspace-message-resource-v1:{message_uuid}",),
+        )
+    read_state.lock_read_state_schema_shared(session)
+    affected_projects = set(project_ids)
+    while True:
+        existing_projects = session.execute(
+            """
+            SELECT DISTINCT project_id
+            FROM m_workspace_messages
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY project_id
+            """,
+            (message_uuids,),
+        ).fetchall()
+        affected_projects.update(row["project_id"] for row in existing_projects)
+        ordered_projects = sorted(affected_projects, key=str)
+        session.execute("SAVEPOINT provider_project_discovery")
+        try:
+            # Existing message upserts can change topic/stream scope. Pure
+            # creation only needs project serialization and stays concurrent
+            # with an optimistic mark-read scan.
+            if structural_batch or existing_projects:
+                read_state.lock_message_structure(session, ordered_projects)
+            read_state.lock_projects(session, ordered_projects)
+            refreshed_projects = session.execute(
+                """
+                SELECT DISTINCT project_id
+                FROM m_workspace_messages
+                WHERE uuid = ANY(%s::uuid[])
+                ORDER BY project_id
+                """,
+                (message_uuids,),
+            ).fetchall()
+            expanded_projects = affected_projects | {
+                row["project_id"] for row in refreshed_projects
+            }
+            if expanded_projects != affected_projects:
+                session.execute("ROLLBACK TO SAVEPOINT provider_project_discovery")
+                session.execute("RELEASE SAVEPOINT provider_project_discovery")
+                affected_projects = expanded_projects
+                continue
+            session.execute("RELEASE SAVEPOINT provider_project_discovery")
+            return ordered_projects
+        except Exception:
+            session.execute("ROLLBACK TO SAVEPOINT provider_project_discovery")
+            session.execute("RELEASE SAVEPOINT provider_project_discovery")
+            raise
+
+
 def apply_provider_event_batch(
     session: typing.Any,
     identity: typing.Any,
@@ -979,7 +1783,13 @@ def apply_provider_event_batch(
     if not isinstance(events, list) or not 1 <= len(events) <= EVENT_MAX_ITEMS:
         raise ProviderBatchError("Provider event batch size is invalid")
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    read_state.lock_read_state_schema_shared(session)
     _bridge_capabilities(session, identity, now)
+    read_state.lock_external_account_resources(
+        session,
+        (sys_uuid.UUID(str(event["external_account_uuid"])) for event in events),
+        shared=True,
+    )
     cache_attribute = "_workspace_provider_event_batch_cache"
     missing_cache = object()
     previous_cache = getattr(session, cache_attribute, missing_cache)
@@ -995,16 +1805,36 @@ def apply_provider_event_batch(
                 sys_uuid.UUID(str(event["project_id"]))
                 for event in events
                 if not _is_quiet_backfill_event(event)
+                or str(event.get("kind", "")).startswith("message.")
             },
             key=str,
         )
-        for project_id in project_ids:
-            session.execute(
-                """
-                SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
-                """,
-                (project_id,),
-            )
+        message_uuids = []
+        message_upsert_uuids = []
+        for event in events:
+            if not str(event.get("kind", "")).startswith("message."):
+                continue
+            payload = event.get("payload")
+            resource = payload.get("resource") if isinstance(payload, dict) else None
+            if isinstance(resource, dict) and resource.get("uuid") is not None:
+                message_uuid = sys_uuid.UUID(str(resource["uuid"]))
+                message_uuids.append(message_uuid)
+                if event.get("kind") == "message.upsert":
+                    message_upsert_uuids.append(message_uuid)
+        structural_batch = any(
+            event.get("kind") in {"message.delete", "stream.delete", "topic.delete"}
+            for event in events
+        ) or len(message_upsert_uuids) != len(set(message_upsert_uuids))
+        locked_project_ids = _lock_provider_event_projects(
+            session,
+            project_ids,
+            message_uuids,
+            structural_batch=structural_batch,
+        )
+        batch_cache = getattr(session, cache_attribute)
+        batch_cache[("project_event_locks",)] = {
+            str(project_id) for project_id in locked_project_ids
+        }
         requested_routes = sorted(
             {
                 (
@@ -1312,6 +2142,105 @@ def apply_provider_event_batch(
     return {"results": results}
 
 
+def _insert_provider_operation(
+    session: typing.Any,
+    *,
+    external_operation_uuid: sys_uuid.UUID,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    project_id: object,
+    operation_kind: str,
+    payload: object,
+    causal_lane: object | None = None,
+    now: datetime.datetime | None = None,
+) -> sys_uuid.UUID:
+    """Append one immutable provider delivery row for a public operation."""
+    record_uuid = sys_uuid.uuid4()
+    causal_lane = _provider_causal_lane(payload, causal_lane)
+    session.execute(
+        """
+        INSERT INTO "m_external_provider_operations_v1" (
+            "uuid", "external_operation_uuid", "bridge_instance_uuid",
+            "external_account_uuid", "project_id", "operation_kind", "payload",
+            "causal_lane", "available_at", "created_at", "updated_at"
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+            COALESCE(%s, statement_timestamp()),
+            COALESCE(%s, statement_timestamp()),
+            COALESCE(%s, statement_timestamp())
+        )
+        """,
+        (
+            record_uuid,
+            external_operation_uuid,
+            bridge_instance_uuid,
+            external_account_uuid,
+            project_id,
+            operation_kind,
+            _canonical_json(payload),
+            causal_lane,
+            now,
+            now,
+            now,
+        ),
+    )
+    return record_uuid
+
+
+def _enqueue_provider_operation(
+    session: typing.Any,
+    *,
+    operation_uuid: sys_uuid.UUID,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    project_id: object,
+    owner_user_uuid: object,
+    operation_kind: str,
+    target_type: str,
+    target_uuid: object,
+    payload: object,
+    causal_lane: object | None = None,
+) -> tuple[external_models.ExternalOperation, sys_uuid.UUID]:
+    """Create the public operation and provider outbox row atomically."""
+    read_state.lock_read_state_schema_shared(session)
+    causal_lane = _provider_causal_lane(payload, causal_lane)
+    if causal_lane is not None:
+        _lock_provider_causal_lane(
+            session,
+            bridge_instance_uuid=bridge_instance_uuid,
+            external_account_uuid=external_account_uuid,
+            causal_lane=causal_lane,
+        )
+    operation = external_models.ExternalOperation(
+        uuid=operation_uuid,
+        external_account_uuid=external_account_uuid,
+        owner_user_uuid=owner_user_uuid,
+        action=operation_kind,
+        target_type=target_type,
+        target_uuid=target_uuid,
+        details={"payload": payload},
+        status=external_models.ExternalOperationStatus.QUEUED.value,
+    )
+    operation.insert(session=session)
+    record_uuid = _insert_provider_operation(
+        session,
+        external_operation_uuid=operation_uuid,
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
+        project_id=project_id,
+        operation_kind=operation_kind,
+        payload=payload,
+        causal_lane=causal_lane,
+    )
+    publish_operation_event(
+        session,
+        operation,
+        project_id,
+        messenger_events.EXTERNAL_OPERATION_CREATED_EVENT,
+    )
+    return operation, record_uuid
+
+
 def enqueue_provider_operation(
     session: typing.Any,
     *,
@@ -1325,47 +2254,223 @@ def enqueue_provider_operation(
     target_uuid: object,
     payload: object,
 ) -> tuple[external_models.ExternalOperation, sys_uuid.UUID]:
-    """Create the public operation and provider outbox row atomically."""
-    now = datetime.datetime.now(datetime.timezone.utc)
+    """Create one provider operation through the stable queue boundary."""
+    return _enqueue_provider_operation(
+        session,
+        operation_uuid=operation_uuid,
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
+        project_id=project_id,
+        owner_user_uuid=owner_user_uuid,
+        operation_kind=operation_kind,
+        target_type=target_type,
+        target_uuid=target_uuid,
+        payload=payload,
+    )
+
+
+def enqueue_provider_operation_in_lane(
+    session: typing.Any,
+    *,
+    operation_uuid: sys_uuid.UUID,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    project_id: object,
+    owner_user_uuid: object,
+    operation_kind: str,
+    target_type: str,
+    target_uuid: object,
+    payload: object,
+    causal_lane: object,
+) -> tuple[external_models.ExternalOperation, sys_uuid.UUID]:
+    """Queue with the authoritative stream lane known by the caller."""
+    return _enqueue_provider_operation(
+        session,
+        operation_uuid=operation_uuid,
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
+        project_id=project_id,
+        owner_user_uuid=owner_user_uuid,
+        operation_kind=operation_kind,
+        target_type=target_type,
+        target_uuid=target_uuid,
+        payload=payload,
+        causal_lane=causal_lane,
+    )
+
+
+def enqueue_provider_read_operation(
+    session: typing.Any,
+    *,
+    operation_uuid: sys_uuid.UUID,
+    bridge_instance_uuid: object,
+    external_account_uuid: object,
+    project_id: object,
+    owner_user_uuid: object,
+    target_type: str,
+    target_uuid: object,
+    payload: dict[str, object],
+    candidate_sql: str,
+    candidate_values: typing.Sequence[object],
+    candidate_chunks: typing.Sequence[typing.Mapping[str, object]] | None = None,
+    use_candidate_chunks: bool | None = None,
+) -> external_models.ExternalOperation | None:
+    """Queue eager compatibility pages or one lazy exact snapshot.
+
+    ``None`` stores bounded UUID packs when compact bitmap coordinates are
+    unavailable (for example while a project is still in legacy mode).
+    ``False`` eagerly creates revision-1 compatibility operations without a
+    lazy snapshot. Revision 2 uses bitmap chunks or bounded UUID packs.
+    """
+    read_state.lock_read_state_schema_shared(session)
+    causal_lane = sys_uuid.UUID(str(payload["stream_uuid"]))
+    _lock_provider_causal_lane(
+        session,
+        bridge_instance_uuid=bridge_instance_uuid,
+        external_account_uuid=external_account_uuid,
+        causal_lane=causal_lane,
+    )
+    if use_candidate_chunks is False:
+        candidate_limit = PROVIDER_READ_LEGACY_MAX_PAGES * PROVIDER_READ_MAX_MESSAGES
+        pages = session.execute(
+            f"""
+            WITH bounded_candidates AS MATERIALIZED (
+                SELECT candidate.uuid, candidate.created_at
+                FROM ({candidate_sql}) AS candidate
+                ORDER BY candidate.created_at, candidate.uuid
+                LIMIT %s
+            ), ordered_candidates AS MATERIALIZED (
+                SELECT
+                    candidate.uuid,
+                    row_number() OVER (
+                        ORDER BY candidate.created_at, candidate.uuid
+                    ) - 1 AS snapshot_position
+                FROM bounded_candidates AS candidate
+            )
+            SELECT array_agg(uuid ORDER BY snapshot_position) AS candidate_uuids
+            FROM ordered_candidates
+            GROUP BY snapshot_position / {PROVIDER_READ_MAX_MESSAGES}
+            ORDER BY snapshot_position / {PROVIDER_READ_MAX_MESSAGES}
+            """,
+            (*candidate_values, candidate_limit + 1),
+        ).fetchall()
+        if len(pages) > PROVIDER_READ_LEGACY_MAX_PAGES:
+            raise ProviderUnavailableError(
+                "Provider read paging capability revision 2 is required"
+            )
+        first_operation = None
+        for index, page in enumerate(pages):
+            operation, _record_uuid = _enqueue_provider_operation(
+                session,
+                operation_uuid=(operation_uuid if index == 0 else sys_uuid.uuid4()),
+                bridge_instance_uuid=bridge_instance_uuid,
+                external_account_uuid=external_account_uuid,
+                project_id=project_id,
+                owner_user_uuid=owner_user_uuid,
+                operation_kind="read_state.set",
+                target_type=target_type,
+                target_uuid=target_uuid,
+                payload={
+                    **payload,
+                    "message_uuids": [
+                        str(message_uuid) for message_uuid in page["candidate_uuids"]
+                    ],
+                },
+                causal_lane=causal_lane,
+            )
+            if first_operation is None:
+                first_operation = operation
+        return first_operation
+    if use_candidate_chunks and not candidate_chunks:
+        return None
     operation = external_models.ExternalOperation(
         uuid=operation_uuid,
         external_account_uuid=external_account_uuid,
         owner_user_uuid=owner_user_uuid,
-        action=operation_kind,
+        action="read_state.set",
         target_type=target_type,
         target_uuid=target_uuid,
-        details={"payload": payload},
+        details={"payload": {**payload, "message_uuids": []}},
         status=external_models.ExternalOperationStatus.QUEUED.value,
     )
     operation.insert(session=session)
-    record_uuid = sys_uuid.uuid4()
+    now = datetime.datetime.now(datetime.timezone.utc)
     session.execute(
         """
-        INSERT INTO "m_external_provider_operations_v1" (
-            "uuid", "external_operation_uuid", "bridge_instance_uuid",
-            "external_account_uuid", "project_id", "operation_kind", "payload",
-            "created_at", "updated_at"
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+        INSERT INTO m_external_provider_read_snapshots_v1 (
+            external_operation_uuid, bridge_instance_uuid,
+            external_account_uuid, project_id, causal_lane, payload,
+            created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
         """,
         (
-            record_uuid,
             operation_uuid,
             bridge_instance_uuid,
             external_account_uuid,
             project_id,
-            operation_kind,
+            causal_lane,
             _canonical_json(payload),
             now,
             now,
         ),
     )
+    if use_candidate_chunks:
+        session.execute(
+            """
+            INSERT INTO m_external_provider_read_candidate_chunks_v1 (
+                external_operation_uuid, chunk_number, candidate_bits
+            )
+            SELECT %s, chunk_number, candidate_bits::bit(4096)
+            FROM unnest(%s::bigint[], %s::text[])
+                AS candidate(chunk_number, candidate_bits)
+            """,
+            (
+                operation_uuid,
+                [chunk["chunk_number"] for chunk in candidate_chunks or ()],
+                [chunk["read_bits"] for chunk in candidate_chunks or ()],
+            ),
+        )
+    else:
+        inserted_packs = session.execute(
+            f"""
+            INSERT INTO m_external_provider_read_candidate_packs_v1 (
+                external_operation_uuid, pack_number, candidate_count,
+                candidate_uuids
+            )
+            WITH ordered_candidates AS MATERIALIZED (
+                SELECT
+                    candidate.uuid,
+                    row_number() OVER (
+                        ORDER BY candidate.created_at, candidate.uuid
+                    ) - 1 AS snapshot_position
+                FROM ({candidate_sql}) AS candidate
+            ), packed_candidates AS (
+                SELECT
+                    snapshot_position / 4000 AS pack_number,
+                    array_agg(uuid ORDER BY snapshot_position) AS candidate_uuids
+                FROM ordered_candidates
+                GROUP BY snapshot_position / 4000
+            )
+            SELECT
+                %s, pack_number, cardinality(candidate_uuids), candidate_uuids
+            FROM packed_candidates
+            ORDER BY pack_number
+            """,
+            (*candidate_values, operation_uuid),
+        ).rowcount
+        if not inserted_packs:
+            session.execute(
+                "DELETE FROM m_external_operations_v2 WHERE uuid = %s",
+                (operation_uuid,),
+            )
+            return None
     publish_operation_event(
         session,
         operation,
         project_id,
         messenger_events.EXTERNAL_OPERATION_CREATED_EVENT,
     )
-    return operation, record_uuid
+    return operation
 
 
 def retry_provider_operation(
@@ -1375,8 +2480,82 @@ def retry_provider_operation(
     next_attempt: int,
 ) -> typing.Any:
     """Requeue an existing provider operation in the caller transaction."""
-    row = session.execute(
+    read_state.lock_read_state_schema_shared(session)
+    snapshot_identity = session.execute(
         """
+        SELECT bridge_instance_uuid
+        FROM m_external_provider_read_snapshots_v1
+        WHERE external_operation_uuid = %s
+        """,
+        (external_operation_uuid,),
+    ).fetchone()
+    if snapshot_identity is not None:
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (
+                f"provider-read-materialize-v1:"
+                f"{snapshot_identity['bridge_instance_uuid']}",
+            ),
+        )
+    retryable = session.execute(
+        """
+        SELECT "uuid", "operation_kind"
+        FROM "m_external_provider_operations_v1"
+        WHERE "external_operation_uuid" = %s
+          AND (
+                "status" = 'failed'
+                OR (
+                    "status" = 'discarded'
+                    AND "operation_kind" <> 'read_state.set'
+                )
+          )
+        ORDER BY "sequence"
+        FOR UPDATE
+        """,
+        (external_operation_uuid,),
+    ).fetchall()
+    if not retryable:
+        raise ValueError("Provider operation cannot be retried from its current state")
+
+    rows = session.execute(
+        """
+        WITH retry_source AS MATERIALIZED (
+            SELECT uuid, bridge_instance_uuid, external_account_uuid,
+                   project_id, operation_kind, causal_lane, payload
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+              AND operation_kind = 'read_state.set'
+              AND status = 'failed'
+            FOR UPDATE
+        ), neutralized AS (
+            UPDATE m_external_provider_operations_v1 AS failed_page
+            SET status = 'discarded', public_result_status = NULL,
+                payload = jsonb_set(
+                    failed_page.payload, '{message_uuids}', '[]'::jsonb
+                ),
+                updated_at = NOW()
+            FROM retry_source
+            WHERE failed_page.uuid = retry_source.uuid
+            RETURNING failed_page.uuid
+        )
+        INSERT INTO m_external_provider_operations_v1 (
+            uuid, external_operation_uuid, bridge_instance_uuid,
+            external_account_uuid, project_id, operation_kind, causal_lane, payload,
+            status, attempt, available_at, created_at, updated_at
+        )
+        SELECT
+            gen_random_uuid(), %s, bridge_instance_uuid,
+            external_account_uuid, project_id, operation_kind, causal_lane, payload,
+            'queued', %s - 1, NOW(), NOW(), NOW()
+        FROM retry_source
+        CROSS JOIN (SELECT COUNT(*) FROM neutralized) AS completed_update
+        RETURNING uuid, project_id
+        """,
+        (external_operation_uuid, external_operation_uuid, next_attempt),
+    ).fetchall()
+    rows.extend(
+        session.execute(
+            """
         UPDATE "m_external_provider_operations_v1"
         SET
             "status" = 'queued',
@@ -1385,17 +2564,19 @@ def retry_provider_operation(
             "lease_uuid" = NULL,
             "lease_expires_at" = NULL,
             "safe_error" = NULL,
+            "public_result_status" = NULL,
+            "terminal_result" = NULL,
             "completed_at" = NULL,
             "updated_at" = NOW()
         WHERE "external_operation_uuid" = %s
           AND "status" IN ('failed', 'discarded')
+          AND "operation_kind" <> 'read_state.set'
         RETURNING "uuid", "project_id"
         """,
-        (next_attempt, external_operation_uuid),
-    ).fetchone()
-    if row is None:
-        raise ValueError("Provider operation cannot be retried from its current state")
-    return row
+            (next_attempt, external_operation_uuid),
+        ).fetchall()
+    )
+    return rows[0]
 
 
 def discard_provider_operation(
@@ -1404,6 +2585,49 @@ def discard_provider_operation(
     external_operation_uuid: object,
 ) -> typing.Any:
     """Prevent a queued provider operation from being leased before deletion."""
+    read_state.lock_read_state_schema_shared(session)
+    snapshot_identity = session.execute(
+        """
+        SELECT bridge_instance_uuid
+        FROM m_external_provider_read_snapshots_v1
+        WHERE external_operation_uuid = %s
+        """,
+        (external_operation_uuid,),
+    ).fetchone()
+    if snapshot_identity is not None:
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (
+                f"provider-read-materialize-v1:"
+                f"{snapshot_identity['bridge_instance_uuid']}",
+            ),
+        )
+    snapshot = session.execute(
+        """
+        SELECT project_id
+        FROM m_external_provider_read_snapshots_v1
+        WHERE external_operation_uuid = %s
+        FOR UPDATE
+        """,
+        (external_operation_uuid,),
+    ).fetchone()
+    if snapshot is not None:
+        public_operation = session.execute(
+            """
+            SELECT status
+            FROM m_external_operations_v2
+            WHERE uuid = %s
+            FOR UPDATE
+            """,
+            (external_operation_uuid,),
+        ).fetchone()
+        if public_operation is None or public_operation["status"] not in {
+            "queued",
+            "failed",
+        }:
+            raise ValueError(
+                "Provider operation cannot be discarded from its current state"
+            )
     row = session.execute(
         """
         UPDATE "m_external_provider_operations_v1"
@@ -1419,6 +2643,15 @@ def discard_provider_operation(
         """,
         (external_operation_uuid,),
     ).fetchone()
+    if snapshot is not None:
+        session.execute(
+            """
+            DELETE FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (external_operation_uuid,),
+        )
+        return snapshot
     if row is None:
         raise ValueError(
             "Provider operation cannot be discarded from its current state"

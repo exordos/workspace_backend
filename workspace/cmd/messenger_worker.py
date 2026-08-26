@@ -58,6 +58,12 @@ def main() -> None:
         heartbeat_retention=datetime.timedelta(
             seconds=CONF[DOMAIN].heartbeat_retention_seconds,
         ),
+        read_state_compaction_enabled=(CONF[DOMAIN].read_state_compaction_enabled),
+        read_state_cleanup_enabled=CONF[DOMAIN].read_state_cleanup_enabled,
+        read_state_batch_size=CONF[DOMAIN].read_state_batch_size,
+        read_state_max_batches_per_iteration=(
+            CONF[DOMAIN].read_state_max_batches_per_iteration
+        ),
         summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
         summary_connect_timeout_seconds=(
             CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds

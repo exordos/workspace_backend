@@ -35,10 +35,17 @@ class Session:
 
     def execute(self, statement, params=None):
         self.statements.append((statement, params))
-        if statement.startswith(("SAVEPOINT", "ROLLBACK", "RELEASE")) or (
-            "pg_advisory_xact_lock" in statement
+        if (
+            statement.startswith(("SAVEPOINT", "ROLLBACK", "RELEASE"))
+            or "pg_advisory_xact_lock" in statement
+            or "set_config(" in statement
         ):
             return Result(None)
+        if (
+            "SELECT DISTINCT project_id" in statement
+            and "FROM m_workspace_messages" in statement
+        ):
+            return Result([])
         return Result(next(self.values))
 
 
@@ -81,7 +88,16 @@ def test_lease_is_fifo_idempotent_and_reuses_request_session(monkeypatch):
     identity = _identity()
     request_uuid = sys_uuid.uuid4()
     row = _leased_row(identity, request_uuid)
-    session = Session([_healthy_bridge(), [], None, [row], None])
+    session = Session(
+        [
+            _healthy_bridge(),
+            _healthy_bridge(),
+            [],
+            None,
+            [row],
+            [{"uuid": row["external_operation_uuid"]}],
+        ]
+    )
     events = []
     monkeypatch.setattr(
         provider_data,
@@ -102,14 +118,21 @@ def test_lease_is_fifo_idempotent_and_reuses_request_session(monkeypatch):
     assert response["operations"][0]["required_capability"] == (
         "messenger.message.send"
     )
-    assert "FOR UPDATE OF operation SKIP LOCKED" in session.statements[3][0]
-    assert (
-        'JOIN "m_external_provider_policies_v1" AS policy' in (session.statements[3][0])
+    lease_statement, lease_params = next(
+        (statement, params)
+        for statement, params in session.statements
+        if "FOR UPDATE OF operation SKIP LOCKED" in statement
     )
-    assert 'policy."emergency_suspended" = FALSE' in session.statements[3][0]
-    assert "FOR SHARE OF policy" in session.statements[3][0]
-    assert session.statements[3][1][3] == 20
-    assert "m_external_operations_v2" in session.statements[4][0]
+    assert "FOR UPDATE OF operation SKIP LOCKED" in lease_statement
+    assert 'JOIN "m_external_provider_policies_v1" AS policy' in lease_statement
+    assert 'policy."emergency_suspended" = FALSE' in lease_statement
+    assert "FOR SHARE OF policy" in lease_statement
+    assert lease_statement.index("page_snapshot") < lease_statement.index("LIMIT %s")
+    assert lease_params[5] == 20
+    assert any(
+        'UPDATE "m_external_operations_v2"' in statement
+        for statement, _params in session.statements
+    )
     assert events == [
         (
             session,
@@ -119,7 +142,7 @@ def test_lease_is_fifo_idempotent_and_reuses_request_session(monkeypatch):
         )
     ]
 
-    repeated = Session([_healthy_bridge(), [row]])
+    repeated = Session([_healthy_bridge(), _healthy_bridge(), [row]])
     assert (
         provider_data.lease_provider_operations(
             repeated,
@@ -131,7 +154,7 @@ def test_lease_is_fifo_idempotent_and_reuses_request_session(monkeypatch):
         )
         == response
     )
-    assert len(repeated.statements) == 2
+    assert len(repeated.statements) == 5
 
 
 def test_lease_requires_current_compatible_heartbeat():
@@ -155,7 +178,7 @@ def test_lease_requires_current_compatible_heartbeat():
 
 def test_missing_capability_keeps_known_operation_out_of_lease():
     identity = _identity()
-    session = Session([_healthy_bridge({}), [], None])
+    session = Session([_healthy_bridge({}), _healthy_bridge({}), [], None])
 
     response = provider_data.lease_provider_operations(
         session,
@@ -167,7 +190,7 @@ def test_missing_capability_keeps_known_operation_out_of_lease():
     )
 
     assert response["operations"] == []
-    assert len(session.statements) == 3
+    assert len(session.statements) == 6
     assert not any("ANY(" in statement for statement, _params in session.statements)
 
 
@@ -175,6 +198,14 @@ def test_disabled_capability_descriptor_is_not_leasable():
     identity = _identity()
     session = Session(
         [
+            _healthy_bridge(
+                {
+                    "messenger.message.send": {
+                        "available": False,
+                        "revision": 1,
+                    }
+                }
+            ),
             _healthy_bridge(
                 {
                     "messenger.message.send": {
@@ -198,7 +229,7 @@ def test_disabled_capability_descriptor_is_not_leasable():
     )
 
     assert response["operations"] == []
-    assert len(session.statements) == 3
+    assert len(session.statements) == 6
 
 
 def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
@@ -217,8 +248,12 @@ def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
                 "status": "leased",
                 "lease_uuid": lease_uuid,
                 "attempt": 2,
+                "operation_kind": "message.create",
             },
+            None,
             {"result_uuid": result_uuid},
+            None,
+            {"nonterminal_count": 0, "attempt": 2},
             None,
             None,
         ]
@@ -244,9 +279,12 @@ def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
     )
 
     assert response == {"result_uuid": str(result_uuid), "status": "applied"}
-    assert "m_external_provider_operation_results_v1" in session.statements[2][0]
-    assert "m_external_provider_operations_v1" in session.statements[3][0]
-    assert "m_external_operations_v2" in session.statements[4][0]
+    assert session.statements[0][1] == (
+        provider_data.read_state.READ_STATE_SCHEMA_LOCK_KEY,
+    )
+    assert "m_external_provider_operation_results_v1" in session.statements[5][0]
+    assert "m_external_provider_operations_v1" in session.statements[6][0]
+    assert "m_external_operations_v2" in session.statements[9][0]
     assert events == [
         (
             session,
@@ -310,7 +348,9 @@ def test_concurrent_result_uuid_conflict_does_not_complete_operation():
                 "status": "leased",
                 "lease_uuid": lease_uuid,
                 "attempt": 1,
+                "operation_kind": "message.upsert",
             },
+            None,
             None,
             {
                 "operation_uuid": sys_uuid.uuid4(),
@@ -327,7 +367,7 @@ def test_concurrent_result_uuid_conflict_does_not_complete_operation():
     )
 
     assert response == {"result_uuid": str(result_uuid), "status": "conflict"}
-    assert "ON CONFLICT" in session.statements[2][0]
+    assert "ON CONFLICT" in session.statements[5][0]
     assert not any(
         'UPDATE "m_external_provider_operations_v1"' in statement
         for statement, _params in session.statements
@@ -371,13 +411,24 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     assert response["results"][0]["status"] == "applied"
     assert response["results"][0]["target_uuid"] == str(target_uuid)
     assert applied == [(event, session, identity)]
-    assert "pg_advisory_xact_lock" in session.statements[1][0]
-    assert session.statements[1][1] == (project_uuid,)
-    assert "m_external_bridge_desired_resources_v1" in session.statements[2][0]
-    assert session.statements[2][1][5] == identity.bridge_instance_uuid
-    assert session.statements[2][1][8] == identity.bridge_instance_uuid
-    assert session.statements[2][1][10] == identity.bridge_instance_uuid
-    assert "m_external_provider_events_v1" in session.statements[3][0]
+    project_lock = next(
+        (statement, params)
+        for statement, params in session.statements
+        if "pg_advisory_xact_lock(hashtextextended(%s::text" in statement
+    )
+    assert project_lock[1] == (project_uuid,)
+    route_gate, route_params = next(
+        (statement, params)
+        for statement, params in session.statements
+        if "m_external_bridge_desired_resources_v1" in statement
+    )
+    assert route_params[5] == identity.bridge_instance_uuid
+    assert route_params[8] == identity.bridge_instance_uuid
+    assert route_params[10] == identity.bridge_instance_uuid
+    assert any(
+        "m_external_provider_events_v1" in statement
+        for statement, _params in session.statements
+    )
     assert not hasattr(session, "_workspace_provider_event_batch_cache")
 
 
@@ -418,7 +469,11 @@ def test_inbound_account_identity_event_does_not_require_chat_assignment():
     )
 
     assert response["results"][0]["status"] == "applied"
-    route_gate, params = session.statements[2]
+    route_gate, params = next(
+        (statement, params)
+        for statement, params in session.statements
+        if "requested.account_global" in statement
+    )
     assert "requested.account_global" in route_gate
     assert "settings,default_project_id" in route_gate
     assert params[3] == [True]
@@ -594,7 +649,7 @@ def test_inbound_event_batch_primes_authorized_assignments(monkeypatch):
     assert 'chat."projection_stream_uuid"::text' in assignment_gate
 
 
-def test_inbound_quiet_backfill_batch_does_not_take_project_event_lock():
+def test_inbound_quiet_message_backfill_uses_read_state_project_lock():
     identity = _identity()
     event_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
@@ -626,10 +681,98 @@ def test_inbound_quiet_backfill_batch_does_not_take_project_event_lock():
     )
 
     assert response["results"][0]["status"] == "applied"
-    assert not any(
-        "pg_advisory_xact_lock" in statement
-        for statement, _params in session.statements
+    lock_statement = next(
+        (statement, params)
+        for statement, params in session.statements
+        if "pg_advisory_xact_lock(hashtextextended(%s::text" in statement
     )
+    assert lock_statement[1] == (project_uuid,)
+
+
+def test_inbound_duplicate_message_upserts_lock_structure_before_projects(
+    monkeypatch,
+):
+    identity = _identity()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    events = [
+        {
+            "provider_event_uuid": str(sys_uuid.uuid4()),
+            "external_account_uuid": str(account_uuid),
+            "external_chat_uuid": str(chat_uuid),
+            "project_id": str(project_uuid),
+            "kind": "message.upsert",
+            "payload": {"resource": {"uuid": str(message_uuid)}},
+        }
+        for _index in range(2)
+    ]
+    session = Session(
+        [
+            _healthy_bridge(),
+            {
+                "matched": 1,
+                "assignments": [
+                    {
+                        "account_uuid": str(account_uuid),
+                        "chat_uuid": str(chat_uuid),
+                        "project_id": str(project_uuid),
+                    }
+                ],
+            },
+            [
+                {"provider_event_uuid": sys_uuid.UUID(event["provider_event_uuid"])}
+                for event in events
+            ],
+            None,
+        ]
+    )
+    lock_calls = []
+
+    def capture_lock(
+        current_session,
+        project_ids,
+        message_uuids,
+        *,
+        structural_batch,
+    ):
+        lock_calls.append(
+            (current_session, project_ids, message_uuids, structural_batch)
+        )
+        return project_ids
+
+    monkeypatch.setattr(
+        provider_data,
+        "_lock_provider_event_projects",
+        capture_lock,
+    )
+    monkeypatch.setattr(
+        provider_data.provider_event_apply,
+        "prime_assignment_cache",
+        lambda *_args: None,
+    )
+
+    response = provider_data.apply_provider_event_batch(
+        session,
+        identity,
+        events,
+        lambda *_args: message_uuid,
+        now=NOW,
+    )
+
+    assert [result["status"] for result in response["results"]] == [
+        "applied",
+        "applied",
+    ]
+    assert lock_calls == [
+        (
+            session,
+            [project_uuid],
+            [message_uuid, message_uuid],
+            True,
+        )
+    ]
 
 
 def test_inbound_event_batch_requires_current_heartbeat_before_account_access():
@@ -657,7 +800,8 @@ def test_inbound_event_batch_requires_current_heartbeat_before_account_access():
             now=NOW,
         )
 
-    assert len(session.statements) == 1
+    assert len(session.statements) == 2
+    assert "workspace-read-state-schema-v1" in session.statements[0][1]
 
 
 def test_inbound_event_batch_rejects_another_bridge_assignment():
@@ -683,8 +827,13 @@ def test_inbound_event_batch_rejects_another_bridge_assignment():
             now=NOW,
         )
 
-    assert session.statements[2][1][5] == requesting_bridge.bridge_instance_uuid
-    assert session.statements[2][1][5] != assigned_bridge.bridge_instance_uuid
+    route_params = next(
+        params
+        for statement, params in session.statements
+        if "requested.account_global" in statement
+    )
+    assert route_params[5] == requesting_bridge.bridge_instance_uuid
+    assert route_params[5] != assigned_bridge.bridge_instance_uuid
 
 
 def test_inbound_event_batch_reports_storage_conflicts_as_batch_rejections():
@@ -727,9 +876,20 @@ def test_inbound_event_batch_reports_storage_conflicts_as_batch_rejections():
 
 def test_provider_http_service_dispatches_only_private_provider_routes():
     identity = _identity()
+    database_now = datetime.datetime.now(datetime.timezone.utc)
     healthy = _healthy_bridge()
-    healthy["last_heartbeat_at"] = datetime.datetime.now(datetime.timezone.utc)
-    session = Session([healthy, [], None, []])
+    healthy["last_heartbeat_at"] = database_now
+    session = Session(
+        [
+            {"current_time": database_now},
+            healthy,
+            {"current_time": database_now},
+            healthy,
+            [],
+            None,
+            [],
+        ]
+    )
     api = provider_service.ProviderDataService()
 
     response = api.handle(
@@ -798,7 +958,16 @@ def test_unknown_operation_kind_is_not_in_capability_allow_list():
         capability: {"revision": 1}
         for capability in provider_data._OPERATION_CAPABILITIES.values()
     }
-    session = Session([_healthy_bridge(capabilities), [], None, []])
+    session = Session(
+        [
+            _healthy_bridge(capabilities),
+            _healthy_bridge(capabilities),
+            [],
+            None,
+            [],
+            [],
+        ]
+    )
 
     provider_data.lease_provider_operations(
         session,
@@ -809,6 +978,10 @@ def test_unknown_operation_kind_is_not_in_capability_allow_list():
         now=NOW,
     )
 
-    allowed = session.statements[3][1][2]
+    allowed = next(
+        params[4]
+        for statement, params in session.statements
+        if "WITH bridge_capabilities AS MATERIALIZED" in statement
+    )
     assert "message.create" in allowed
     assert "unknown.operation" not in allowed

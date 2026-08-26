@@ -640,13 +640,18 @@ def test_external_account_delete_purges_projection_and_copied_files(monkeypatch)
     }
 
     class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
         def fetchall(self):
-            return [file_row]
+            return self._rows
 
     class Session:
         def execute(self, statement, params):
             statements.append((" ".join(statement.split()), params))
-            return Result()
+            if "SELECT project_id, uuid AS stream_uuid" in statement:
+                return Result([])
+            return Result([file_row])
 
     session = Session()
     deleted = []

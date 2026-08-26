@@ -41,6 +41,7 @@ from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import push_devices
+from workspace.messenger_api.dm import read_state
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import sql_state
@@ -85,7 +86,28 @@ def _move_projection_rows(
     stream_uuid: object,
     old_project_uuid: object,
     new_project_uuid: object,
+    *,
+    bridge_instance_uuid: object | None = None,
+    external_account_uuid: object | None = None,
 ) -> None:
+    if bridge_instance_uuid is not None and external_account_uuid is not None:
+        try:
+            provider_data.rebind_provider_read_lane_project(
+                session,
+                bridge_instance_uuid=bridge_instance_uuid,
+                external_account_uuid=external_account_uuid,
+                causal_lane=stream_uuid,
+                old_project_id=old_project_uuid,
+                new_project_id=new_project_uuid,
+            )
+        except provider_data.ProviderReadProjectMoveConflictError as exc:
+            raise messenger_exc.ExternalProjectionMoveConflictError() from exc
+    read_state.lock_message_structure(
+        session,
+        (old_project_uuid, new_project_uuid),
+        cross_project=old_project_uuid != new_project_uuid,
+    )
+    read_state.lock_projects(session, (old_project_uuid, new_project_uuid))
     identifiers = session.execute(
         """
         SELECT
@@ -101,6 +123,12 @@ def _move_projection_rows(
     topic_uuids = identifiers["topic_uuids"]
     message_uuids = identifiers["message_uuids"]
     file_uuids = identifiers["file_uuids"]
+    read_state.relocate_stream_project(
+        session,
+        stream_uuid,
+        old_project_uuid,
+        new_project_uuid,
+    )
     session.execute(
         "DELETE FROM m_workspace_drafts WHERE stream_uuid = %s AND project_id = %s",
         (stream_uuid, old_project_uuid),
@@ -125,7 +153,6 @@ def _move_projection_rows(
             (topic_uuids,),
         ),
         ("m_workspace_user_topic_flags", "uuid = ANY(%s)", (topic_uuids,)),
-        ("m_workspace_user_message_flags", "uuid = ANY(%s)", (message_uuids,)),
         ("m_workspace_message_reactions", "message_uuid = ANY(%s)", (message_uuids,)),
         ("m_workspace_file_accesses", "file_uuid = ANY(%s)", (file_uuids,)),
     ):
@@ -147,6 +174,12 @@ def _purge_external_account_projection_rows(
     external_account_uuid: object,
 ) -> None:
     """Remove one account's content without deleting a shared native DM."""
+    read_state.purge_external_account_messages(
+        session,
+        project_id,
+        stream_uuid,
+        external_account_uuid,
+    )
     session.execute(
         """
         DELETE FROM m_workspace_messages
@@ -162,6 +195,23 @@ def _purge_external_account_projection_rows(
           AND external_account_uuid = %s
         """,
         (project_id, stream_uuid, external_account_uuid),
+    )
+
+
+def _delete_projection_stream_rows(
+    session: typing.Any,
+    *,
+    project_id: object,
+    stream_uuid: object,
+) -> None:
+    """Delete a projection stream without leaving global bitmap shadows."""
+    read_state.lock_message_structure(session, (project_id,))
+    read_state.lock_projects(session, (project_id,))
+    if read_state.writes_compact_state(session, project_id):
+        read_state.clear_stream_for_all_users(session, project_id, stream_uuid)
+    session.execute(
+        "DELETE FROM m_workspace_streams WHERE uuid = %s AND project_id = %s",
+        (stream_uuid, project_id),
     )
 
 
@@ -1602,10 +1652,24 @@ class ExternalAccountController(ExternalResourceController):
         bridge_instance_uuid = credential.envelope["associated_data"][
             "bridge_instance_uuid"
         ]
+        # Freeze account-stream discovery before collecting the complete
+        # multi-project lock set. This path is rare and structural; the
+        # account-scoped lock prevents incremental discovery and A/B project
+        # lock inversions with provider batches.
+        read_state.lock_external_account_resources(session, (account.uuid,))
         chats = external_models.ExternalChat.objects.get_all(
             filters={"external_account_uuid": dm_filters.EQ(account.uuid)},
             session=session,
         )
+        remaining_streams = session.execute(
+            """
+            SELECT project_id, uuid AS stream_uuid
+            FROM m_workspace_streams
+            WHERE external_account_uuid = %s
+            ORDER BY project_id, uuid
+            """,
+            (account.uuid,),
+        ).fetchall()
         cleanup_files = session.execute(
             """
             SELECT uuid, storage_type, storage_id, storage_object_id
@@ -1614,7 +1678,19 @@ class ExternalAccountController(ExternalResourceController):
             """,
             (account.uuid,),
         ).fetchall()
-        removed_streams = set()
+        affected_project_ids = {
+            chat.project_id for chat in chats if chat.project_id is not None
+        }
+        affected_project_ids.update(
+            stream["project_id"] for stream in remaining_streams
+        )
+        read_state.lock_message_structure(
+            session,
+            affected_project_ids,
+            cross_project=len(affected_project_ids) > 1,
+        )
+        read_state.lock_projects(session, affected_project_ids)
+        removed_streams: set[tuple[object, object]] = set()
         for chat in chats:
             sql_state.append_delete(
                 session,
@@ -1627,7 +1703,8 @@ class ExternalAccountController(ExternalResourceController):
             if (
                 chat.projection_stream_uuid is not None
                 and chat.project_id is not None
-                and chat.projection_stream_uuid not in removed_streams
+                and (chat.project_id, chat.projection_stream_uuid)
+                not in removed_streams
             ):
                 if external_projection.is_native_direct_projection(
                     session,
@@ -1649,12 +1726,12 @@ class ExternalAccountController(ExternalResourceController):
                         chat.project_id,
                         write_new=False,
                     )
-                    session.execute(
-                        "DELETE FROM m_workspace_streams "
-                        "WHERE uuid = %s AND project_id = %s",
-                        (chat.projection_stream_uuid, chat.project_id),
+                    _delete_projection_stream_rows(
+                        session,
+                        project_id=chat.project_id,
+                        stream_uuid=chat.projection_stream_uuid,
                     )
-                removed_streams.add(chat.projection_stream_uuid)
+                removed_streams.add((chat.project_id, chat.projection_stream_uuid))
             if chat.project_id is not None:
                 messenger_events.create_external_resource_event(
                     chat.project_id,
@@ -1672,10 +1749,16 @@ class ExternalAccountController(ExternalResourceController):
             "DELETE FROM m_workspace_files WHERE external_account_uuid = %s",
             (account.uuid,),
         )
-        session.execute(
-            "DELETE FROM m_workspace_streams WHERE external_account_uuid = %s",
-            (account.uuid,),
-        )
+        for stream in remaining_streams:
+            stream_key = (stream["project_id"], stream["stream_uuid"])
+            if stream_key in removed_streams:
+                continue
+            _delete_projection_stream_rows(
+                session,
+                project_id=stream["project_id"],
+                stream_uuid=stream["stream_uuid"],
+            )
+            removed_streams.add(stream_key)
         sql_state.append_delete(
             session,
             bridge_instance_uuid,
@@ -1847,12 +1930,24 @@ class ExternalChatController(ExternalResourceController):
                 filters={"uuid": dm_filters.EQ(transition["external_chat_uuid"])},
                 session=session,
             )
+            credential = ExternalAccountController._credential(
+                external_models.ExternalAccount.objects.get_one(
+                    filters={"uuid": dm_filters.EQ(chat.external_account_uuid)},
+                    session=session,
+                ),
+                session,
+            )
+            bridge_instance_uuid = credential.envelope["associated_data"][
+                "bridge_instance_uuid"
+            ]
             if transition["action"] == "move":
                 _move_projection_rows(
                     session,
                     transition["stream_uuid"],
                     transition["old_project_uuid"],
                     transition["new_project_uuid"],
+                    bridge_instance_uuid=bridge_instance_uuid,
+                    external_account_uuid=chat.external_account_uuid,
                 )
                 values = {
                     "selected": True,
@@ -1873,13 +1968,10 @@ class ExternalChatController(ExternalResourceController):
                         external_account_uuid=chat.external_account_uuid,
                     )
                 else:
-                    session.execute(
-                        "DELETE FROM m_workspace_streams "
-                        "WHERE uuid = %s AND project_id = %s",
-                        (
-                            transition["stream_uuid"],
-                            transition["old_project_uuid"],
-                        ),
+                    _delete_projection_stream_rows(
+                        session,
+                        project_id=transition["old_project_uuid"],
+                        stream_uuid=transition["stream_uuid"],
                     )
                 values = {
                     "selected": False,
@@ -1889,16 +1981,6 @@ class ExternalChatController(ExternalResourceController):
                     "revision": chat.revision + 1,
                 }
             _update_internal_fields(chat, values, session=session)
-            credential = ExternalAccountController._credential(
-                external_models.ExternalAccount.objects.get_one(
-                    filters={"uuid": dm_filters.EQ(chat.external_account_uuid)},
-                    session=session,
-                ),
-                session,
-            )
-            bridge_instance_uuid = credential.envelope["associated_data"][
-                "bridge_instance_uuid"
-            ]
             if transition["action"] == "move":
                 sql_state.append_upsert(
                     session,
@@ -1967,6 +2049,10 @@ class ExternalChatController(ExternalResourceController):
         status: typing.Any,
     ) -> typing.Any:
         session = contexts.Context().get_session()
+        read_state.lock_external_account_resources(
+            session,
+            (resource.external_account_uuid,),
+        )
         unchanged = (
             not resource.transition_pending
             and resource.selected == selected

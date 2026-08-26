@@ -13,6 +13,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import read_state
 
 
 _DIRECT_PROVIDER_TOPIC_NAMESPACE = sys_uuid.UUID("4d1de6f0-5f93-58ad-9670-6a13754cb7aa")
@@ -137,6 +138,9 @@ def reconcile_personal_chat_projection(
     projection_stream_uuid: sys_uuid.UUID,
 ) -> tuple[sys_uuid.UUID, dict[str, typing.Any], bool]:
     """Merge a verified provider DM into an existing native direct chat."""
+    read_state.lock_message_structure(session, (project_id,))
+    read_state.lock_projects(session, (project_id,))
+    read_state.bump_project_structure_revisions(session, (project_id,))
     normalized_source = dict(source)
     normalized_source["participants"] = [
         dict(participant) for participant in source.get("participants", [])
@@ -281,6 +285,21 @@ def reconcile_personal_chat_projection(
             (project_id, projection_stream_uuid),
         ).fetchone()
         if source_stream is not None:
+            source_topics = session.execute(
+                """
+                SELECT DISTINCT topic_uuid
+                FROM m_workspace_messages
+                WHERE project_id = %s AND stream_uuid = %s
+                """,
+                (project_id, projection_stream_uuid),
+            ).fetchall()
+            read_state.merge_topics(
+                session,
+                project_id,
+                [row["topic_uuid"] for row in source_topics],
+                target_stream_uuid,
+                target_topic_uuid,
+            )
             session.execute(
                 """
                 UPDATE m_workspace_messages
@@ -315,6 +334,13 @@ def reconcile_personal_chat_projection(
             )
 
     if obsolete_topic_uuids:
+        read_state.merge_topics(
+            session,
+            project_id,
+            obsolete_topic_uuids,
+            target_stream_uuid,
+            target_topic_uuid,
+        )
         session.execute(
             """
             UPDATE m_workspace_messages
