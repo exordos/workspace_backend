@@ -174,6 +174,20 @@ class ExternalAccountConflictError(ra_exc.RestAlchemyException):
     code = 409
 
 
+class ExternalProjectionMoveConflictError(ra_exc.RestAlchemyException):
+    message = "Provider read delivery is in progress; retry the projection move"
+    code = 409
+
+    def as_dict(self) -> dict[str, typing.Any]:
+        return {
+            "type": self.__class__.__name__,
+            "code": self.code,
+            "error": "external_projection_move_in_progress",
+            "message": self.msg,
+            "retryable": True,
+        }
+
+
 class ExternalPreconditionRequiredError(ra_exc.RestAlchemyException):
     message = "External resource mutation requires If-Match"
     code = 428

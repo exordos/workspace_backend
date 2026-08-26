@@ -73,6 +73,151 @@ def test_assignment_preserves_provider_topic_ids_after_display_name_collision():
     assert [item["provider_topic_id"] for item in topics] == provider_topic_ids
 
 
+def test_catalog_prelock_includes_report_existing_and_changed_chat_projects(
+    monkeypatch,
+):
+    account_uuid = sys_uuid.uuid4()
+    duplicate_account_uuid = sys_uuid.uuid4()
+    changed_chat_account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    legacy_uuid = sys_uuid.uuid4()
+    linked_uuid = sys_uuid.uuid4()
+    existing_participant_uuid = sys_uuid.uuid4()
+    canonical_participant_uuid = sys_uuid.uuid4()
+    canonical_legacy_uuid = sys_uuid.uuid4()
+    realm_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    report_project_uuid = sys_uuid.uuid4()
+    existing_chat_project_uuid = sys_uuid.uuid4()
+    changed_chat_project_uuid = sys_uuid.uuid4()
+
+    def result(rows):
+        value = mock.Mock()
+        value.fetchall.return_value = rows
+        return value
+
+    def execute(statement, _params=None):
+        normalized = " ".join(statement.split())
+        if normalized.startswith(("SAVEPOINT", "ROLLBACK TO", "RELEASE SAVEPOINT")):
+            return result([])
+        if "SELECT uuid FROM m_external_accounts_v2" in normalized:
+            return result([{"uuid": duplicate_account_uuid}])
+        if "SELECT uuid, external_account_uuid, provider_external_id" in normalized:
+            return result(
+                [
+                    {
+                        "uuid": legacy_uuid,
+                        "external_account_uuid": account_uuid,
+                        "provider_external_id": "legacy-user",
+                    }
+                ]
+            )
+        if "SELECT workspace_user_uuid" in normalized:
+            return result([{"workspace_user_uuid": linked_uuid}])
+        if "SELECT source, project_id" in normalized:
+            return result(
+                [
+                    {
+                        "project_id": existing_chat_project_uuid,
+                        "source": {
+                            "participants": [
+                                {"identity_uuid": str(existing_participant_uuid)}
+                            ]
+                        },
+                    }
+                ]
+            )
+        if "SELECT DISTINCT external_account_uuid, project_id" in normalized:
+            return result(
+                [
+                    {
+                        "external_account_uuid": changed_chat_account_uuid,
+                        "project_id": changed_chat_project_uuid,
+                    }
+                ]
+            )
+        raise AssertionError(f"Unexpected SQL: {normalized}")
+
+    session = SimpleNamespace(execute=mock.Mock(side_effect=execute))
+    account_locks = []
+    merge_locks = []
+    monkeypatch.setattr(
+        sql_state.read_state,
+        "lock_external_account_resources",
+        lambda requested_session, values: account_locks.append(
+            (requested_session, set(values))
+        ),
+    )
+
+    def canonical_uuid(_provider, _realm_uuid, provider_user_id):
+        return (
+            canonical_participant_uuid
+            if provider_user_id == "participant"
+            else canonical_legacy_uuid
+        )
+
+    monkeypatch.setattr(
+        sql_state.identity_linking,
+        "canonical_provider_identity_uuid",
+        canonical_uuid,
+    )
+    monkeypatch.setattr(
+        sql_state.identity_linking,
+        "lock_identity_merge_resources",
+        lambda requested_session, users, projects: merge_locks.append(
+            (requested_session, set(users), set(projects))
+        ),
+    )
+    identity = SimpleNamespace(provider_kind="zulip")
+    report = {
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(chat_uuid),
+        "catalog": {
+            "external_account_uuid": str(account_uuid),
+            "owner_user_uuid": str(owner_uuid),
+            "project_id": str(report_project_uuid),
+            "source": {
+                "provider_realm_uuid": str(realm_uuid),
+                "provider_owner_user_id": "owner",
+            },
+            "participants": [{"provider_user_id": "participant"}],
+        },
+    }
+
+    assert sql_state._prelock_catalog_identity_resources(
+        session,
+        identity,
+        [report],
+    )
+    assert account_locks == [
+        (session, {account_uuid}),
+        (
+            session,
+            {
+                account_uuid,
+                duplicate_account_uuid,
+                changed_chat_account_uuid,
+            },
+        ),
+    ]
+    assert len(merge_locks) == 1
+    requested_session, users, projects = merge_locks[0]
+    assert requested_session is session
+    assert {
+        owner_uuid,
+        legacy_uuid,
+        linked_uuid,
+        existing_participant_uuid,
+        canonical_participant_uuid,
+        canonical_legacy_uuid,
+    } <= users
+    assert projects == {
+        report_project_uuid,
+        existing_chat_project_uuid,
+        changed_chat_project_uuid,
+    }
+
+
 def test_membership_write_is_available_only_for_live_channels():
     assert "messenger.membership.write" in sql_state.state.KNOWN_CAPABILITIES
     descriptor = {
@@ -159,12 +304,15 @@ def test_capability_refresh_claim_is_ordered_and_skips_locked_accounts():
         )
         == account_uuid
     )
-    statement, params = calls[0]
-    assert "ORDER BY account.uuid" in statement
-    assert "LIMIT 1" in statement
-    assert "FOR UPDATE OF account SKIP LOCKED" in statement
-    assert "account.uuid > %s" in statement
-    assert params == (account_uuid,)
+    candidate_statement, candidate_params = calls[0]
+    assert "ORDER BY account.uuid" in candidate_statement
+    assert "LIMIT 1" in candidate_statement
+    assert "account.uuid > %s" in candidate_statement
+    assert candidate_params == (account_uuid,)
+    claim_statement, claim_params = calls[-1]
+    assert "FOR UPDATE OF account SKIP LOCKED" in claim_statement
+    assert "account.uuid = %s" in claim_statement
+    assert claim_params == (account_uuid,)
 
 
 def test_assignment_repair_locks_chats_and_requires_distinct_verified_users():
@@ -190,8 +338,7 @@ def test_assignment_repair_locks_chats_and_requires_distinct_verified_users():
     assert "JOIN m_external_accounts_v2 AS account" in statement
     assert (
         "chat.history_depth IS DISTINCT FROM COALESCE( "
-        "account.settings->>'history_depth', chat.history_depth )"
-        in normalized
+        "account.settings->>'history_depth', chat.history_depth )" in normalized
     )
     assert "FOR UPDATE OF chat SKIP LOCKED" in statement
 
@@ -257,7 +404,7 @@ def test_projected_capability_events_do_not_fan_out_to_message_history(
     )
     monkeypatch.setattr(
         sql_state.messenger_dm_helpers,
-        "get_compact_workspace_user_topic_snapshots",
+        "get_compact_workspace_user_topic_snapshots_batch",
         mock.Mock(return_value=[topic]),
     )
     monkeypatch.setattr(
@@ -329,6 +476,11 @@ def test_large_projected_capability_stream_prepares_before_broadcast_lock(monkey
         for topic_uuid in reversed(topic_uuids)
         for user_uuid in reversed(user_uuids)
     ]
+    topic_snapshots = mock.Mock(
+        side_effect=lambda _project_id, selected_topics, _users, **_kwargs: [
+            topic for topic in topics if topic.uuid in selected_topics
+        ]
+    )
     monkeypatch.setattr(
         sql_state.models,
         "get_stream_recipients",
@@ -346,10 +498,8 @@ def test_large_projected_capability_stream_prepares_before_broadcast_lock(monkey
     )
     monkeypatch.setattr(
         sql_state.messenger_dm_helpers,
-        "get_compact_workspace_user_topic_snapshots",
-        lambda _project_id, topic_uuid, _users, **_kwargs: [
-            topic for topic in topics if topic.uuid == topic_uuid
-        ],
+        "get_compact_workspace_user_topic_snapshots_batch",
+        topic_snapshots,
     )
     calls = []
 
@@ -397,6 +547,12 @@ def test_large_projected_capability_stream_prepares_before_broadcast_lock(monkey
     )
 
     assert result == (4_000, 12_000, 4)
+    topic_snapshots.assert_called_once_with(
+        project_uuid,
+        topic_uuids,
+        user_uuids,
+        session=session,
+    )
     prepared = [call[1] for call in calls if call[0] == "prepare"]
     assert [kind for kind, _project, _values, _kwargs in prepared] == [
         "stream",
@@ -516,9 +672,12 @@ def test_capability_projection_claim_is_bounded_and_skips_locked_accounts():
         )
         == account_uuid
     )
-    statement, params = calls[0]
-    assert "m_workspace_stream_topics" in statement
-    assert "IS DISTINCT FROM chat.capabilities" in statement
-    assert "FOR UPDATE OF account SKIP LOCKED" in statement
-    assert "account.uuid > %s" in statement
-    assert params == (account_uuid,)
+    candidate_statement, candidate_params = calls[0]
+    assert "m_workspace_stream_topics" in candidate_statement
+    assert "IS DISTINCT FROM chat.capabilities" in candidate_statement
+    assert "account.uuid > %s" in candidate_statement
+    assert candidate_params == (account_uuid,)
+    claim_statement, claim_params = calls[-1]
+    assert "FOR UPDATE OF account SKIP LOCKED" in claim_statement
+    assert "account.uuid = %s" in claim_statement
+    assert claim_params == (account_uuid,)

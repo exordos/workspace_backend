@@ -16,7 +16,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.external_bridge_control import file_repository
 from workspace.messenger_api import external_projection, file_storage
-from workspace.messenger_api.dm import helpers, message_payloads, models
+from workspace.messenger_api.dm import helpers, message_payloads, models, read_state
 
 SUPPORTED_EVENT_KINDS = {
     "identity.upsert",
@@ -695,7 +695,9 @@ def _reproject_message_payload_files(
                     storage_type=source.storage_type,
                 )
                 if source_uuid not in native_source_file_uuids:
-                    raise ValueError("Native message file is not attached to the source")
+                    raise ValueError(
+                        "Native message file is not attached to the source"
+                    )
                 if (
                     source_metadata.project_id != source.project_id
                     or source_metadata.stream_uuid is not None
@@ -777,6 +779,14 @@ def _move_message_dependents_between_projects(
     destination_stream_uuid: sys_uuid.UUID,
     destination_topic_uuid: sys_uuid.UUID,
 ) -> None:
+    read_state.relocate_message(
+        session,
+        message_uuid,
+        source_project_id,
+        destination_project_id,
+        destination_stream_uuid,
+        destination_topic_uuid,
+    )
     session.execute(
         """
         UPDATE m_workspace_messages
@@ -1118,9 +1128,7 @@ def _message_event(
             existing = _existing(models.WorkspaceMessage, None, message_uuid, session)
     finally:
         models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
-    source_project_id = sys_uuid.UUID(
-        str(getattr(existing, "project_id", project_id))
-    )
+    source_project_id = sys_uuid.UUID(str(getattr(existing, "project_id", project_id)))
     cross_project_move = existing is not None and source_project_id != project_id
     if cross_project_move and (
         getattr(existing, "external_account_uuid", None)
@@ -1153,6 +1161,18 @@ def _message_event(
         isinstance(provider_metadata, collections.abc.Mapping)
         and provider_metadata.get("delivery_class") == "backfill"
     )
+    # Compaction and read-state writers use the same project lock.  Quiet
+    # backfill normally skips event ordering, but it still mutates the compact
+    # state and therefore must not race a legacy/dual cutover batch.
+    if quiet_backfill:
+        for locked_project_id in sorted(
+            {project_id, source_project_id},
+            key=str,
+        ):
+            helpers._lock_workspace_project_event_writes(
+                locked_project_id,
+                session,
+            )
     author_identity = resource.get("author_identity")
     if (
         isinstance(author_identity, collections.abc.Mapping)
@@ -1297,9 +1317,7 @@ def _message_event(
         )
         previous_stream_uuid = existing.stream_uuid
         previous_topic_uuid = existing.topic_uuid
-        reported_topic_uuid = update_values.get(
-            "topic_uuid", previous_topic_uuid
-        )
+        reported_topic_uuid = update_values.get("topic_uuid", previous_topic_uuid)
         if cross_project_move:
             payload = update_values.get("payload", getattr(existing, "payload", None))
             if payload is not None:
@@ -1346,6 +1364,15 @@ def _message_event(
             update_values,
         )
         if source_changed or projection_changed:
+            if moved and not cross_project_move:
+                read_state.relocate_message(
+                    session,
+                    message_uuid,
+                    source_project_id,
+                    project_id,
+                    stream_uuid,
+                    reported_topic_uuid,
+                )
             if cross_project_move:
                 if not quiet_backfill and source_recipients:
                     helpers.messenger_events.create_message_deleted_events(
@@ -1382,6 +1409,26 @@ def _message_event(
                     raise ValueError("Provider message project move was not persisted")
             existing.update_dm(values=update_values)
             existing.update(session=session)
+            if read_state.writes_compact_state(session, project_id):
+                coordinate = read_state.message_coordinate(
+                    session,
+                    project_id,
+                    message_uuid,
+                )
+                if coordinate is None:
+                    raise RuntimeError(
+                        "Updated provider message has no read coordinate"
+                    )
+                read_state.sync_message_mentions(
+                    session,
+                    project_id,
+                    message_uuid,
+                    existing.stream_uuid,
+                    existing.topic_uuid,
+                    coordinate.ingest_sequence,
+                    existing.get_recipients(session=session),
+                    _message_payload(existing.payload).content,
+                )
             if cross_project_move:
                 helpers.ensure_workspace_message_recipients(
                     project_id,
@@ -1393,11 +1440,7 @@ def _message_event(
             if moved:
                 external_projection._invalidate_moved_topic_summaries(
                     session,
-                    list(
-                        dict.fromkeys(
-                            [previous_topic_uuid, reported_topic_uuid]
-                        )
-                    ),
+                    list(dict.fromkeys([previous_topic_uuid, reported_topic_uuid])),
                 )
             if not quiet_backfill:
                 if cross_project_move:
@@ -1427,9 +1470,7 @@ def _message_event(
                         affected_project_id,
                         affected_stream_uuid,
                         affected_topic_uuid,
-                    ) in dict.fromkeys(
-                        affected_projections
-                    ):
+                    ) in dict.fromkeys(affected_projections):
                         helpers._create_compact_messages_unread_updated_events(
                             affected_project_id,
                             unread_recipients,
@@ -1583,25 +1624,57 @@ def _sync_provider_read_state(
         """,
         (project_id,),
     )
-    messages = session.execute(
-        """
-        SELECT
-            message.uuid,
-            message.user_uuid AS author_uuid,
-            message.stream_uuid,
-            message.topic_uuid,
-            flags.read
-        FROM m_workspace_messages AS message
-        JOIN m_workspace_user_message_flags AS flags
-          ON flags.uuid = message.uuid
-         AND flags.project_id = message.project_id
-         AND flags.user_uuid = %s
-        WHERE message.project_id = %s
-          AND message.uuid = ANY(%s::uuid[])
-        ORDER BY message.uuid
-        """,
-        (reader_uuid, project_id, message_uuids),
-    ).fetchall()
+    mode = read_state.project_mode(session, project_id)
+    if read_state.mode_uses_compact_state(mode):
+        messages = session.execute(
+            f"""
+            SELECT
+                message.uuid,
+                message.user_uuid AS author_uuid,
+                message.stream_uuid,
+                message.topic_uuid,
+                COALESCE(
+                    get_bit(
+                        chunk.read_bits,
+                        (
+                            message.ingest_sequence
+                            %% {read_state.READ_CHUNK_BITS}
+                        )::integer
+                    ),
+                    0
+                ) = 1 AS read
+            FROM m_workspace_messages AS message
+            LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+              ON chunk.user_uuid = %s
+             AND chunk.chunk_number = (
+                    message.ingest_sequence / {read_state.READ_CHUNK_BITS}
+                 )
+            WHERE message.project_id = %s
+              AND message.uuid = ANY(%s::uuid[])
+            ORDER BY message.uuid
+            """,
+            (reader_uuid, project_id, message_uuids),
+        ).fetchall()
+    else:
+        messages = session.execute(
+            """
+            SELECT
+                message.uuid,
+                message.user_uuid AS author_uuid,
+                message.stream_uuid,
+                message.topic_uuid,
+                flags.read
+            FROM m_workspace_messages AS message
+            JOIN m_workspace_user_message_flags AS flags
+              ON flags.uuid = message.uuid
+             AND flags.project_id = message.project_id
+             AND flags.user_uuid = %s
+            WHERE message.project_id = %s
+              AND message.uuid = ANY(%s::uuid[])
+            ORDER BY message.uuid
+            """,
+            (reader_uuid, project_id, message_uuids),
+        ).fetchall()
     if any(message["stream_uuid"] != stream_uuid for message in messages):
         raise ValueError("Provider read state message is outside the selected chat")
     changed_message_uuids_by_read: dict[bool, list[sys_uuid.UUID]] = {
@@ -1622,27 +1695,45 @@ def _sync_provider_read_state(
     for effective_read, changed_message_uuids in changed_message_uuids_by_read.items():
         if not changed_message_uuids:
             continue
-        updated_rows = session.execute(
-            """
-            UPDATE m_workspace_user_message_flags
-            SET read = %s, updated_at = NOW()
-            WHERE project_id = %s
-              AND user_uuid = %s
-              AND uuid = ANY(%s::uuid[])
-              AND read IS DISTINCT FROM %s
-            RETURNING uuid
-            """,
-            (
-                effective_read,
+        if read_state.mode_uses_compact_state(mode):
+            read_state.set_message_uuids_read(
+                session,
                 project_id,
                 reader_uuid,
                 changed_message_uuids,
                 effective_read,
-            ),
-        ).fetchall()
-        updated_message_uuids_by_read[effective_read] = [
-            row["uuid"] for row in updated_rows
-        ]
+            )
+            updated_message_uuids_by_read[effective_read] = changed_message_uuids
+        else:
+            updated_rows = session.execute(
+                """
+                UPDATE m_workspace_user_message_flags
+                SET read = %s, updated_at = NOW()
+                WHERE project_id = %s
+                  AND user_uuid = %s
+                  AND uuid = ANY(%s::uuid[])
+                  AND read IS DISTINCT FROM %s
+                RETURNING uuid
+                """,
+                (
+                    effective_read,
+                    project_id,
+                    reader_uuid,
+                    changed_message_uuids,
+                    effective_read,
+                ),
+            ).fetchall()
+            updated_message_uuids_by_read[effective_read] = [
+                row["uuid"] for row in updated_rows
+            ]
+            if read_state.writes_compact_state(session, project_id):
+                read_state.set_message_uuids_read(
+                    session,
+                    project_id,
+                    reader_uuid,
+                    updated_message_uuids_by_read[effective_read],
+                    effective_read,
+                )
     updated_message_uuids = [
         *updated_message_uuids_by_read[True],
         *updated_message_uuids_by_read[False],

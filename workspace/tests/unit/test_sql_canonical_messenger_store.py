@@ -235,6 +235,156 @@ def test_message_page_uses_created_at_uuid_keyset(monkeypatch):
     assert page_query["limit"] == 51
 
 
+def test_compact_read_page_starts_from_sparse_user_chunks(monkeypatch):
+    executed = []
+
+    class Result:
+        def fetchall(self):
+            return []
+
+    session = types.SimpleNamespace(
+        execute=lambda statement, params: (
+            executed.append((statement, params)) or Result()
+        )
+    )
+    context = types.SimpleNamespace(get_session=lambda: session)
+    objects = FakeObjects([])
+    model = _fake_model(objects, ("uuid", "project_id", "user_uuid"))
+    monkeypatch.setattr(sql_canonical_store.contexts, "Context", lambda: context)
+    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceUserMessage", model)
+    monkeypatch.setitem(sql_canonical_store.RESOURCE_MODELS, "messages", model)
+    monkeypatch.setattr(
+        sql_canonical_store.read_state,
+        "project_mode",
+        lambda current_session, project_id: (
+            sql_canonical_store.read_state.PROJECT_MODE_COMPACT
+        ),
+    )
+    snapshot_calls = []
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "get_compact_workspace_user_message_snapshots",
+        lambda project_id, message_uuids, user_uuids, session: (
+            snapshot_calls.append((project_id, message_uuids, user_uuids, session))
+            or []
+        ),
+    )
+
+    store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
+    assert (
+        store.filter_message_page(
+            {"read": dm_filters.EQ(True)},
+            None,
+            "desc",
+            51,
+        )
+        == []
+    )
+
+    assert objects.calls == []
+    statement, params = executed[0]
+    assert "FROM m_workspace_user_read_chunks_v1 AS chunk" in statement
+    assert "JOIN m_workspace_messages AS message" in statement
+    assert "message.ingest_sequence >= chunk.chunk_number * 4096" in statement
+    assert "get_bit(" in statement
+    assert ") = 1" in statement
+    assert "m_workspace_user_message_flags" not in statement
+    assert "m_workspace_user_messages_view" not in statement
+    assert "ORDER BY message.created_at DESC, message.uuid DESC" in statement
+    assert params == (
+        PROJECT_UUID,
+        USER_UUID,
+        PROJECT_UUID,
+        USER_UUID,
+        51,
+    )
+    assert snapshot_calls == [(PROJECT_UUID, [], [USER_UUID], session)]
+
+
+def test_compact_read_page_preserves_scope_marker_and_snapshot_order(monkeypatch):
+    marker_uuid = sys_uuid.uuid4()
+    first_uuid = sys_uuid.uuid4()
+    second_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    marker = types.SimpleNamespace(
+        uuid=marker_uuid,
+        created_at=datetime.datetime(2026, 8, 21, tzinfo=datetime.timezone.utc),
+    )
+    objects = FakeObjects([marker])
+    model = _fake_model(objects, ("uuid", "project_id", "user_uuid"))
+    monkeypatch.setattr(sql_canonical_store.models, "WorkspaceUserMessage", model)
+    monkeypatch.setitem(sql_canonical_store.RESOURCE_MODELS, "messages", model)
+    executed = []
+
+    class Result:
+        def fetchall(self):
+            return [{"uuid": second_uuid}, {"uuid": first_uuid}]
+
+    session = types.SimpleNamespace(
+        execute=lambda statement, params: (
+            executed.append((statement, params)) or Result()
+        )
+    )
+    context = types.SimpleNamespace(get_session=lambda: session)
+    monkeypatch.setattr(sql_canonical_store.contexts, "Context", lambda: context)
+    monkeypatch.setattr(
+        sql_canonical_store.read_state,
+        "project_mode",
+        lambda current_session, project_id: (
+            sql_canonical_store.read_state.PROJECT_MODE_COMPACT
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "get_compact_workspace_user_message_snapshots",
+        lambda project_id, message_uuids, user_uuids, session: [
+            {"uuid": first_uuid},
+            {"uuid": second_uuid},
+        ],
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: value.copy(),
+    )
+
+    store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
+    result = store.filter_message_page(
+        {
+            "read": dm_filters.EQ(True),
+            "stream_uuid": dm_filters.EQ(stream_uuid),
+            "topic_uuid": dm_filters.EQ(topic_uuid),
+        },
+        marker_uuid,
+        "asc",
+        21,
+    )
+
+    assert result == [{"uuid": second_uuid}, {"uuid": first_uuid}]
+    _operation, marker_query = objects.calls[0]
+    assert marker_query["filters"]["uuid"].value == marker_uuid
+    statement, params = executed[0]
+    assert "AND message.stream_uuid = %s" in statement
+    assert "AND message.topic_uuid = %s" in statement
+    assert "message.created_at > %s" in statement
+    assert "message.uuid > %s" in statement
+    assert "ORDER BY message.created_at ASC, message.uuid ASC" in statement
+    marker_created_at = marker.created_at.replace(tzinfo=None)
+    assert params == (
+        PROJECT_UUID,
+        USER_UUID,
+        PROJECT_UUID,
+        USER_UUID,
+        stream_uuid,
+        topic_uuid,
+        marker_created_at,
+        marker_created_at,
+        marker_uuid,
+        21,
+    )
+
+
 def test_mentioned_unread_page_uses_authorized_stream_candidates(monkeypatch):
     first_uuid = sys_uuid.uuid4()
     second_uuid = sys_uuid.uuid4()
@@ -278,7 +428,7 @@ def test_mentioned_unread_page_uses_authorized_stream_candidates(monkeypatch):
     )
 
     assert result == [{"uuid": second_uuid}, {"uuid": first_uuid}]
-    statement, params = executed[0]
+    statement, params = executed[-1]
     assert "WITH authorized_streams AS MATERIALIZED" in statement
     assert "ORDER BY message.created_at DESC, message.uuid DESC" in statement
     assert params[-2:] == (51, 51)
@@ -329,7 +479,7 @@ def test_mentioned_page_without_read_filter_uses_authorized_stream_candidates(
     )
 
     assert result == [{"uuid": message_uuid}]
-    statement, params = executed[0]
+    statement, params = executed[-1]
     assert "WITH authorized_streams AS MATERIALIZED" in statement
     assert "m_workspace_user_message_flags" not in statement
     assert "COALESCE(flags.read, FALSE)" not in statement
@@ -381,7 +531,7 @@ def test_mentioned_unread_page_uses_marker_keyset(monkeypatch):
     assert result == []
     _operation, marker_query = objects.calls[0]
     assert marker_query["filters"]["uuid"].value == marker_uuid
-    statement, params = executed[0]
+    statement, params = executed[-1]
     assert "message.created_at > %s" in statement
     assert "message.uuid > %s" in statement
     assert "ORDER BY message.created_at ASC, message.uuid ASC" in statement
@@ -657,7 +807,7 @@ def test_provider_operation_uses_projection_owner_target_in_request_transaction(
     )
     monkeypatch.setattr(
         sql_canonical_store.provider_data,
-        "enqueue_provider_operation",
+        "enqueue_provider_operation_in_lane",
         lambda current_session, **kwargs: (
             calls.append((current_session, kwargs))
             or (types.SimpleNamespace(uuid=kwargs["operation_uuid"]), sys_uuid.uuid4())
@@ -681,8 +831,11 @@ def test_provider_operation_uses_projection_owner_target_in_request_transaction(
     assert calls[0][1]["external_account_uuid"] == account_uuid
     assert calls[0][1]["project_id"] == PROJECT_UUID
     assert calls[0][1]["owner_user_uuid"] == USER_UUID
-    assert "FOR KEY SHARE" in lock_calls[0][0]
-    assert lock_calls[0][1] == (account_uuid,)
+    assert calls[0][1]["causal_lane"] == stream_uuid
+    assert "pg_advisory_xact_lock_shared" in lock_calls[0][0]
+    assert str(account_uuid) in lock_calls[1][1][0]
+    assert "FOR KEY SHARE" in lock_calls[2][0]
+    assert lock_calls[2][1] == (account_uuid,)
     assert target_calls == [
         (
             session,
@@ -1482,13 +1635,48 @@ def test_provider_read_operation_preserves_exact_workspace_order(monkeypatch):
     ]
 
 
+def test_provider_read_operation_chunks_large_exact_payloads(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuids = [sys_uuid.uuid4() for _index in range(1201)]
+    calls = []
+    operations = [object(), object(), object()]
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_queue_provider_operation",
+        lambda **kwargs: calls.append(kwargs) or operations[len(calls) - 1],
+    )
+
+    result = store._queue_provider_read(
+        stream_uuid=stream_uuid,
+        topic_uuid=topic_uuid,
+        message_uuids=message_uuids,
+        target_type="stream_topic",
+        target_uuid=topic_uuid,
+    )
+
+    assert result is operations[0]
+    assert [len(call["payload"]["message_uuids"]) for call in calls] == [
+        500,
+        500,
+        201,
+    ]
+    assert [
+        message_uuid
+        for call in calls
+        for message_uuid in call["payload"]["message_uuids"]
+    ] == [str(message_uuid) for message_uuid in message_uuids]
+
+
 def test_stream_read_queues_only_exact_unread_projection(monkeypatch):
     stream_uuid = sys_uuid.uuid4()
-    message_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
     row = types.SimpleNamespace(uuid=stream_uuid)
     session = object()
     call_order = []
     queued = []
+    candidate_sql = "SELECT uuid, created_at, ingest_sequence FROM candidate"
+    candidate_values = (stream_uuid,)
     monkeypatch.setattr(
         sql_canonical_store.contexts,
         "Context",
@@ -1499,10 +1687,20 @@ def test_stream_read_queues_only_exact_unread_projection(monkeypatch):
         "get_workspace_user_stream",
         lambda *args, **kwargs: call_order.append("visible") or row,
     )
+
+    def read_stream(*args, **kwargs):
+        call_order.append("update")
+        kwargs["message_uuid_snapshot_callback"](
+            session,
+            candidate_sql,
+            candidate_values,
+        )
+        return row
+
     monkeypatch.setattr(
         sql_canonical_store.helpers,
         "read_workspace_user_stream_messages",
-        lambda *args, **kwargs: call_order.append("update") or (row, message_uuids),
+        read_stream,
     )
     monkeypatch.setattr(
         sql_canonical_store.resource_projection,
@@ -1510,7 +1708,13 @@ def test_stream_read_queues_only_exact_unread_projection(monkeypatch):
         lambda value, resource, **kwargs: {"uuid": value.uuid},
     )
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
-    provider_target = object()
+    provider_target = (
+        types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+        types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            capabilities={"messenger.message.read": {"revision": 2}},
+        ),
+    )
     monkeypatch.setattr(
         store,
         "_lock_provider_account_for_stream",
@@ -1522,34 +1726,43 @@ def test_stream_read_queues_only_exact_unread_projection(monkeypatch):
         lambda *args, **kwargs: call_order.append("provider-target") or provider_target,
     )
     monkeypatch.setattr(
-        store,
-        "_queue_provider_read",
-        lambda **kwargs: queued.append(kwargs),
+        sql_canonical_store.provider_data,
+        "enqueue_provider_read_operation",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
     )
 
     assert store.perform_action("streams", stream_uuid, "read", {}) == {
         "uuid": stream_uuid
     }
     assert call_order == ["visible", "account-lock", "update", "provider-target"]
-    assert queued == [
-        {
-            "stream_uuid": stream_uuid,
-            "topic_uuid": None,
-            "message_uuids": message_uuids,
-            "target_type": "stream",
-            "target_uuid": stream_uuid,
-            "provider_target": provider_target,
-        }
-    ]
+    assert len(queued) == 1
+    args, values = queued[0]
+    assert args == (session,)
+    assert values["bridge_instance_uuid"] == provider_target[1].uuid
+    assert values["external_account_uuid"] == provider_target[0].uuid
+    assert values["project_id"] == PROJECT_UUID
+    assert values["owner_user_uuid"] == USER_UUID
+    assert values["target_type"] == "stream"
+    assert values["target_uuid"] == stream_uuid
+    assert values["payload"] == {
+        "stream_uuid": str(stream_uuid),
+        "topic_uuid": None,
+        "reader_uuid": str(USER_UUID),
+        "read": True,
+    }
+    assert values["candidate_sql"] == candidate_sql
+    assert values["candidate_values"] == candidate_values
 
 
 def test_topic_read_queues_exact_unread_projection(monkeypatch):
     stream_uuid = sys_uuid.uuid4()
     topic_uuid = sys_uuid.uuid4()
-    message_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
     topic = types.SimpleNamespace(uuid=topic_uuid, stream_uuid=stream_uuid)
     session = object()
     call_order = []
+    queued = []
+    candidate_sql = "SELECT uuid, created_at, ingest_sequence FROM candidate"
+    candidate_values = (stream_uuid, topic_uuid)
     monkeypatch.setattr(
         sql_canonical_store.contexts,
         "Context",
@@ -1560,19 +1773,34 @@ def test_topic_read_queues_exact_unread_projection(monkeypatch):
         "get_workspace_user_stream_topic",
         lambda *args, **kwargs: call_order.append("visible") or topic,
     )
+
+    def read_topic(*args, **kwargs):
+        call_order.append("update")
+        kwargs["message_uuid_snapshot_callback"](
+            session,
+            candidate_sql,
+            candidate_values,
+        )
+        return topic
+
     monkeypatch.setattr(
         sql_canonical_store.helpers,
         "read_workspace_user_stream_topic_messages",
-        lambda *args, **kwargs: call_order.append("update") or (topic, message_uuids),
+        read_topic,
     )
     monkeypatch.setattr(
         sql_canonical_store.resource_projection,
         "as_dict",
         lambda value, resource, **kwargs: {"uuid": value.uuid},
     )
-    queued = []
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
-    provider_target = object()
+    provider_target = (
+        types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+        types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            capabilities={"messenger.message.read": {"revision": 2}},
+        ),
+    )
     monkeypatch.setattr(
         store,
         "_lock_provider_account_for_stream",
@@ -1584,24 +1812,178 @@ def test_topic_read_queues_exact_unread_projection(monkeypatch):
         lambda *args, **kwargs: call_order.append("provider-target") or provider_target,
     )
     monkeypatch.setattr(
-        store,
-        "_queue_provider_read",
-        lambda **kwargs: queued.append(kwargs),
+        sql_canonical_store.provider_data,
+        "enqueue_provider_read_operation",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
     )
 
     store.perform_action("stream_topics", topic_uuid, "read", {})
 
     assert call_order == ["visible", "account-lock", "update", "provider-target"]
-    assert queued == [
-        {
-            "stream_uuid": stream_uuid,
-            "topic_uuid": topic_uuid,
-            "message_uuids": message_uuids,
-            "target_type": "topic",
-            "target_uuid": topic_uuid,
-            "provider_target": provider_target,
-        }
-    ]
+    assert len(queued) == 1
+    args, values = queued[0]
+    assert args == (session,)
+    assert values["bridge_instance_uuid"] == provider_target[1].uuid
+    assert values["external_account_uuid"] == provider_target[0].uuid
+    assert values["target_type"] == "topic"
+    assert values["target_uuid"] == topic_uuid
+    assert values["payload"]["stream_uuid"] == str(stream_uuid)
+    assert values["payload"]["topic_uuid"] == str(topic_uuid)
+    assert values["candidate_sql"] == candidate_sql
+    assert values["candidate_values"] == candidate_values
+
+
+@pytest.mark.parametrize(("revision", "expected"), [(1, False), (2, True)])
+def test_provider_read_snapshot_uses_bitmap_chunks_only_for_paging_revision(
+    monkeypatch,
+    revision,
+    expected,
+):
+    stream_uuid = sys_uuid.uuid4()
+    session = object()
+    queued = []
+    candidate_chunks = [{"chunk_number": 7, "read_bits": "1" * 4096}]
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda *args, **kwargs: (
+            types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+            types.SimpleNamespace(
+                uuid=sys_uuid.uuid4(),
+                capabilities={
+                    "messenger.message.read": {
+                        "available": True,
+                        "revision": revision,
+                    }
+                },
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "enqueue_provider_read_operation",
+        lambda *args, **kwargs: queued.append(kwargs),
+    )
+
+    callback = store._provider_read_snapshot_callback(
+        provider_account_locked=True,
+        stream_uuid=stream_uuid,
+        topic_uuid=None,
+        target_type="stream",
+        target_uuid=stream_uuid,
+    )
+    assert callback is not None
+    callback(session, "SELECT uuid FROM candidate", (), candidate_chunks)
+
+    assert queued[0]["candidate_chunks"] == candidate_chunks
+    assert queued[0]["use_candidate_chunks"] is expected
+
+
+@pytest.mark.parametrize(("revision", "expected"), [(1, False), (2, None)])
+def test_provider_read_snapshot_uses_lazy_uuid_packs_only_for_paging_revision(
+    monkeypatch,
+    revision,
+    expected,
+):
+    stream_uuid = sys_uuid.uuid4()
+    session = object()
+    queued = []
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda *args, **kwargs: (
+            types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+            types.SimpleNamespace(
+                uuid=sys_uuid.uuid4(),
+                capabilities={
+                    "messenger.message.read": {
+                        "available": True,
+                        "revision": revision,
+                    }
+                },
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "enqueue_provider_read_operation",
+        lambda *args, **kwargs: queued.append(kwargs),
+    )
+
+    callback = store._provider_read_snapshot_callback(
+        provider_account_locked=True,
+        stream_uuid=stream_uuid,
+        topic_uuid=None,
+        target_type="stream",
+        target_uuid=stream_uuid,
+    )
+    assert callback is not None
+    callback(session, "SELECT uuid FROM candidate", (), None)
+
+    assert queued[0]["candidate_chunks"] is None
+    assert queued[0]["use_candidate_chunks"] is expected
+
+
+def test_provider_read_snapshot_maps_legacy_capacity_to_validation_error(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    session = object()
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_provider_target",
+        lambda *args, **kwargs: (
+            types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+            types.SimpleNamespace(
+                uuid=sys_uuid.uuid4(),
+                capabilities={
+                    "messenger.message.read": {
+                        "available": True,
+                        "revision": 1,
+                    }
+                },
+            ),
+        ),
+    )
+
+    def reject_legacy_capacity(*args, **kwargs):
+        del args, kwargs
+        raise sql_canonical_store.provider_data.ProviderUnavailableError(
+            "Provider read paging capability revision 2 is required"
+        )
+
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "enqueue_provider_read_operation",
+        reject_legacy_capacity,
+    )
+
+    callback = store._provider_read_snapshot_callback(
+        provider_account_locked=True,
+        stream_uuid=stream_uuid,
+        topic_uuid=None,
+        target_type="stream",
+        target_uuid=stream_uuid,
+    )
+    assert callback is not None
+    with pytest.raises(sql_canonical_store.ra_exceptions.ValidationErrorException):
+        callback(session, "SELECT uuid FROM candidate", (), None)
 
 
 def test_duplicate_message_read_does_not_queue_provider_operation(monkeypatch):
@@ -1676,11 +2058,12 @@ def test_read_up_to_locks_provider_before_update_without_unread_probe(monkeypatc
         topic_uuid=topic_uuid,
         created_at=created_at,
     )
-    first_message_uuid = sys_uuid.uuid4()
-    message_uuids = [first_message_uuid, message_uuid]
     session = object()
     call_order = []
     read_calls = []
+    queued = []
+    candidate_sql = "SELECT uuid, created_at, ingest_sequence FROM candidate"
+    candidate_values = (topic_uuid, created_at, message_uuid)
     monkeypatch.setattr(
         sql_canonical_store.contexts,
         "Context",
@@ -1691,23 +2074,35 @@ def test_read_up_to_locks_provider_before_update_without_unread_probe(monkeypatc
         "get_workspace_user_message",
         lambda *args, **kwargs: message,
     )
+
+    def read_to_message(*args, **kwargs):
+        call_order.append("update")
+        read_calls.append((args, kwargs))
+        kwargs["message_uuid_snapshot_callback"](
+            session,
+            candidate_sql,
+            candidate_values,
+        )
+        return message
+
     monkeypatch.setattr(
         sql_canonical_store.helpers,
         "read_workspace_user_topic_messages_to_message",
-        lambda *args, **kwargs: (
-            call_order.append("update")
-            or read_calls.append((args, kwargs))
-            or (message, message_uuids)
-        ),
+        read_to_message,
     )
     monkeypatch.setattr(
         sql_canonical_store.resource_projection,
         "as_dict",
         lambda value, resource, **kwargs: {"uuid": value.uuid},
     )
-    queued = []
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
-    provider_target = object()
+    provider_target = (
+        types.SimpleNamespace(uuid=sys_uuid.uuid4()),
+        types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            capabilities={"messenger.message.read": {"revision": 2}},
+        ),
+    )
     monkeypatch.setattr(
         store,
         "_lock_provider_account_for_stream",
@@ -1719,18 +2114,25 @@ def test_read_up_to_locks_provider_before_update_without_unread_probe(monkeypatc
         lambda *args, **kwargs: call_order.append("provider-target") or provider_target,
     )
     monkeypatch.setattr(
-        store,
-        "_queue_provider_read",
-        lambda **kwargs: queued.append(kwargs),
+        sql_canonical_store.provider_data,
+        "enqueue_provider_read_operation",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
     )
 
     store.perform_action("messages", message_uuid, "read_up_to", {})
 
     assert call_order == ["account-lock", "update", "provider-target"]
     assert read_calls[0][1]["current_message"] is message
-    assert read_calls[0][1]["return_message_uuids"] is True
-    assert queued[0]["message_uuids"] == message_uuids
-    assert queued[0]["provider_target"] is provider_target
+    assert read_calls[0][1]["collect_message_uuids"] is False
+    assert len(queued) == 1
+    args, values = queued[0]
+    assert args == (session,)
+    assert values["bridge_instance_uuid"] == provider_target[1].uuid
+    assert values["external_account_uuid"] == provider_target[0].uuid
+    assert values["target_type"] == "message"
+    assert values["target_uuid"] == message_uuid
+    assert values["candidate_sql"] == candidate_sql
+    assert values["candidate_values"] == candidate_values
 
 
 def test_message_star_actions_update_current_user_flag(monkeypatch):

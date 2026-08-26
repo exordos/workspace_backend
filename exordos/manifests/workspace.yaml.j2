@@ -484,6 +484,13 @@ resources:
           event_prune_interval_seconds = 300
           event_prune_batch_size = 25000
           heartbeat_retention_seconds = 86400
+          # Enable only after every Workspace API and worker is current and
+          # connected bridges advertise bounded read result retention.
+          read_state_compaction_enabled = false
+          # Enable only after compaction is safe under the same rollout gate.
+          read_state_cleanup_enabled = false
+          read_state_batch_size = 50000
+          read_state_max_batches_per_iteration = 8
 
 
           [topic_summary]

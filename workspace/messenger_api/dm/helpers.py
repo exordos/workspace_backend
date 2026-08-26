@@ -25,6 +25,7 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
+from restalchemy.storage.sql import sessions as sql_sessions
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
@@ -32,6 +33,7 @@ from workspace.messenger_api import reaction_users
 from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import read_state
 
 
 _SUMMARY_REASONING_UNSET = object()
@@ -85,12 +87,31 @@ def _lock_workspace_project_event_writes(
     session: typing.Any,
 ) -> None:
     """Match provider event ordering before a transaction mutates message flags."""
-    session.execute(
+    execute = getattr(session, "execute", None)
+    if not callable(execute):
+        return
+    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
+    locked_projects = (
+        batch_cache.setdefault(("project_event_locks",), set())
+        if isinstance(batch_cache, dict)
+        else set()
+    )
+    lock_key = str(project_id)
+    if lock_key in locked_projects:
+        return
+    execute(
+        """
+        SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))
+        """,
+        (read_state.READ_STATE_SCHEMA_LOCK_KEY,),
+    )
+    execute(
         """
         SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
         """,
         (project_id,),
     )
+    locked_projects.add(lock_key)
 
 
 def _random_color() -> int:
@@ -1501,239 +1522,467 @@ WHERE projection_rank = 1 AND stream_uuid = %s
 """
 
 
-_COMPACT_USER_STREAM_SNAPSHOTS_SQL = """
-WITH unread AS (
+# These bounded projections reproduce the public collection rows without
+# expanding the global visibility and unread views. They select legacy flags or
+# compact bitmaps per project mode, so event snapshots cannot drift from a
+# subsequent client read during cutover.
+_READ_STATE_USER_STREAM_SNAPSHOTS_SQL = """
+WITH requested_users AS MATERIALIZED (
+    SELECT UNNEST(%s::uuid[]) AS user_uuid
+), confirmed_access AS MATERIALIZED (
+    SELECT access.project_id, access.user_uuid, access.stream_uuid
+    FROM m_confirmed_external_stream_access AS access
+    WHERE access.project_id = %s
+      AND access.user_uuid = ANY(%s::uuid[])
+      AND EXISTS (
+            SELECT 1
+            FROM m_workspace_streams AS target_stream
+            WHERE target_stream.project_id = %s
+              AND target_stream.uuid = %s
+              AND target_stream.source_name <> 'native'
+          )
+), scoped AS MATERIALIZED (
     SELECT
-        flags.user_uuid,
-        COUNT(*)::integer AS unread_count,
-        COUNT(*) FILTER (WHERE
-            CASE COALESCE(topic_flags.notification_mode, 'default')
-                WHEN 'mute' THEN FALSE
-                WHEN 'follow' THEN TRUE
-                WHEN 'unmute' THEN POSITION(
-                    '](' || 'urn:user:' || LOWER(flags.user_uuid::text) || ')'
-                    IN LOWER(COALESCE(message.payload->>'content', ''))
-                ) > 0
-                ELSE CASE binding.notification_mode
-                    WHEN 'all_messages' THEN TRUE
-                    WHEN 'mentions_only' THEN POSITION(
-                        '](' || 'urn:user:' || LOWER(flags.user_uuid::text) || ')'
-                        IN LOWER(COALESCE(message.payload->>'content', ''))
-                    ) > 0
-                    ELSE FALSE
-                END
-            END
-        )::integer AS active_unread_count
-    FROM m_workspace_user_message_flags AS flags
-    JOIN m_workspace_messages AS message
-      ON message.uuid = flags.uuid AND message.project_id = flags.project_id
+        stream.*,
+        binding.user_uuid AS scoped_user_uuid,
+        binding.role AS scoped_role,
+        binding.notification_mode AS stream_notification_mode,
+        COALESCE(project.mode, 'legacy') AS read_state_mode
+    FROM m_workspace_streams AS stream
+    JOIN requested_users AS requested ON TRUE
     JOIN m_workspace_stream_bindings AS binding
-      ON binding.project_id = message.project_id
-     AND binding.stream_uuid = message.stream_uuid
-     AND binding.user_uuid = flags.user_uuid
-    LEFT JOIN m_workspace_user_topic_flags AS topic_flags
-      ON topic_flags.uuid = message.topic_uuid
-     AND topic_flags.project_id = message.project_id
-     AND topic_flags.user_uuid = flags.user_uuid
-    WHERE flags.project_id = %s
-      AND flags.user_uuid = ANY(%s::uuid[])
-      AND flags.read = FALSE
-      AND message.stream_uuid = %s
-    GROUP BY flags.user_uuid
+      ON binding.project_id = stream.project_id
+     AND binding.stream_uuid = stream.uuid
+     AND binding.user_uuid = requested.user_uuid
+    LEFT JOIN m_workspace_read_state_projects_v1 AS project
+      ON project.project_id = stream.project_id
+    LEFT JOIN confirmed_access AS access
+      ON access.project_id = stream.project_id
+     AND access.user_uuid = binding.user_uuid
+     AND access.stream_uuid = stream.uuid
+    WHERE stream.project_id = %s
+      AND stream.uuid = %s
+      AND (stream.source_name = 'native' OR access.user_uuid IS NOT NULL)
 )
 SELECT
-    stream.uuid,
-    CASE
-        WHEN stream.private THEN COALESCE(
-            NULLIF(TRIM(
-                COALESCE(peer_user.first_name, '') || ' ' ||
-                COALESCE(peer_user.last_name, '')
-            ), ''),
-            peer_user.username,
-            stream.name
+    scoped.uuid,
+    CASE WHEN scoped.private THEN
+        COALESCE(
+            NULLIF(
+                TRIM(
+                    COALESCE(peer.first_name, '') || ' ' ||
+                    COALESCE(peer.last_name, '')
+                ),
+                ''
+            ),
+            peer.username,
+            scoped.name
         )
-        ELSE stream.name
-    END AS name,
-    stream.description,
-    stream.project_id,
-    stream.source_name,
-    stream.source,
-    stream.user_uuid AS owner,
-    binding.user_uuid,
-    binding.role,
-    COALESCE(unread.unread_count, 0) AS unread_count,
-    COALESCE(unread.active_unread_count, 0) AS active_unread_count,
-    COALESCE(unread.unread_count, 0) -
-        COALESCE(unread.active_unread_count, 0) AS passive_unread_count,
-    stream.invite_only,
-    stream.announce,
-    stream.private,
-    stream.created_at,
-    stream.updated_at,
+    ELSE scoped.name END AS name,
+    scoped.description,
+    scoped.project_id,
+    scoped.source_name,
+    scoped.source,
+    scoped.user_uuid AS owner,
+    scoped.scoped_user_uuid AS user_uuid,
+    scoped.scoped_role AS role,
+    COALESCE(
+        CASE WHEN scoped.read_state_mode IN ('compact', 'rollback')
+            THEN compact_counts.unread_count
+            ELSE legacy_counts.unread_count
+        END,
+        0
+    )::bigint AS unread_count,
+    scoped.invite_only,
+    scoped.announce,
+    scoped.private,
+    scoped.created_at,
+    scoped.updated_at,
     CASE
-        WHEN stream.private AND stream.direct_user_uuid IS NOT NULL
-             AND stream.user_uuid = binding.user_uuid
-            THEN stream.direct_user_uuid
-        WHEN stream.private AND stream.direct_user_uuid IS NOT NULL
-            THEN stream.user_uuid
+        WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
+             AND scoped.user_uuid = scoped.scoped_user_uuid
+            THEN scoped.direct_user_uuid
+        WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
+            THEN scoped.user_uuid
         ELSE NULL
     END AS direct_user_uuid,
-    stream.is_archived,
-    binding.notification_mode,
-    stream.color,
+    scoped.private_index,
+    scoped.is_archived,
+    scoped.stream_notification_mode AS notification_mode,
+    scoped.color,
     last_message.uuid AS last_message_uuid,
-    stream.default_topic_uuid
-FROM m_workspace_streams AS stream
-JOIN m_workspace_stream_bindings AS binding
-  ON binding.stream_uuid = stream.uuid AND binding.project_id = stream.project_id
-LEFT JOIN unread ON unread.user_uuid = binding.user_uuid
+    scoped.default_topic_uuid,
+    COALESCE(
+        CASE WHEN scoped.read_state_mode IN ('compact', 'rollback')
+            THEN compact_counts.active_unread_count
+            ELSE legacy_counts.active_unread_count
+        END,
+        0
+    )::integer AS active_unread_count,
+    COALESCE(
+        CASE WHEN scoped.read_state_mode IN ('compact', 'rollback')
+            THEN compact_counts.unread_count - compact_counts.active_unread_count
+            ELSE legacy_counts.unread_count - legacy_counts.active_unread_count
+        END,
+        0
+    )::integer AS passive_unread_count
+FROM scoped
 LEFT JOIN LATERAL (
     SELECT message.uuid
     FROM m_workspace_messages AS message
-    JOIN m_workspace_user_message_flags AS flags
-      ON flags.uuid = message.uuid
-     AND flags.project_id = message.project_id
-     AND flags.user_uuid = binding.user_uuid
-    WHERE message.project_id = stream.project_id
-      AND message.stream_uuid = stream.uuid
+    WHERE message.project_id = scoped.project_id
+      AND message.stream_uuid = scoped.uuid
     ORDER BY message.created_at DESC, message.uuid DESC
     LIMIT 1
 ) AS last_message ON TRUE
-LEFT JOIN m_workspace_users AS peer_user
-  ON peer_user.uuid = CASE
-      WHEN stream.private AND stream.direct_user_uuid IS NOT NULL
-           AND stream.user_uuid = binding.user_uuid
-          THEN stream.direct_user_uuid
-      WHEN stream.private AND stream.direct_user_uuid IS NOT NULL
-          THEN stream.user_uuid
-      WHEN stream.private AND stream.user_uuid <> binding.user_uuid
-          THEN stream.user_uuid
-      ELSE NULL
-  END
-WHERE stream.uuid = %s
-  AND stream.project_id = %s
-  AND binding.user_uuid = ANY(%s::uuid[])
-ORDER BY binding.user_uuid
-"""
-
-
-_COMPACT_USER_TOPIC_SNAPSHOTS_SQL = """
-WITH unread AS (
+LEFT JOIN m_workspace_users AS peer
+  ON peer.uuid = CASE
+        WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
+             AND scoped.user_uuid = scoped.scoped_user_uuid
+            THEN scoped.direct_user_uuid
+        WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
+            THEN scoped.user_uuid
+        WHEN scoped.private AND scoped.user_uuid <> scoped.scoped_user_uuid
+            THEN scoped.user_uuid
+        ELSE NULL
+    END
+LEFT JOIN LATERAL (
     SELECT
-        flags.user_uuid,
-        COUNT(*)::integer AS unread_count,
-        COUNT(*) FILTER (WHERE
-            CASE COALESCE(topic_flags.notification_mode, 'default')
+        COUNT(*)::bigint AS unread_count,
+        COUNT(*) FILTER (
+            WHERE CASE COALESCE(topic_flags.notification_mode, 'default')
                 WHEN 'mute' THEN FALSE
                 WHEN 'follow' THEN TRUE
                 WHEN 'unmute' THEN POSITION(
-                    '](' || 'urn:user:' || LOWER(flags.user_uuid::text) || ')'
+                    '](' || 'urn:user:' ||
+                    LOWER(scoped.scoped_user_uuid::text) || ')'
                     IN LOWER(COALESCE(message.payload->>'content', ''))
                 ) > 0
-                ELSE CASE binding.notification_mode
+                ELSE CASE scoped.stream_notification_mode
                     WHEN 'all_messages' THEN TRUE
                     WHEN 'mentions_only' THEN POSITION(
-                        '](' || 'urn:user:' || LOWER(flags.user_uuid::text) || ')'
+                        '](' || 'urn:user:' ||
+                        LOWER(scoped.scoped_user_uuid::text) || ')'
                         IN LOWER(COALESCE(message.payload->>'content', ''))
                     ) > 0
                     ELSE FALSE
                 END
             END
-        )::integer AS active_unread_count
-    FROM m_workspace_user_message_flags AS flags
-    JOIN m_workspace_messages AS message
-      ON message.uuid = flags.uuid AND message.project_id = flags.project_id
-    JOIN m_workspace_stream_bindings AS binding
-      ON binding.project_id = message.project_id
-     AND binding.stream_uuid = message.stream_uuid
-     AND binding.user_uuid = flags.user_uuid
+        )::bigint AS active_unread_count
+    FROM m_workspace_messages AS message
+    JOIN m_workspace_user_message_flags AS message_flags
+      ON message_flags.project_id = message.project_id
+     AND message_flags.uuid = message.uuid
+     AND message_flags.user_uuid = scoped.scoped_user_uuid
+     AND message_flags.read = FALSE
     LEFT JOIN m_workspace_user_topic_flags AS topic_flags
-      ON topic_flags.uuid = message.topic_uuid
-     AND topic_flags.project_id = message.project_id
-     AND topic_flags.user_uuid = flags.user_uuid
-    WHERE flags.project_id = %s
-      AND flags.user_uuid = ANY(%s::uuid[])
-      AND flags.read = FALSE
-      AND message.topic_uuid = %s
-    GROUP BY flags.user_uuid
+      ON topic_flags.project_id = message.project_id
+     AND topic_flags.uuid = message.topic_uuid
+     AND topic_flags.user_uuid = scoped.scoped_user_uuid
+    WHERE message.project_id = scoped.project_id
+      AND message.stream_uuid = scoped.uuid
+      AND scoped.read_state_mode NOT IN ('compact', 'rollback')
+) AS legacy_counts
+  ON scoped.read_state_mode NOT IN ('compact', 'rollback')
+LEFT JOIN LATERAL (
+    SELECT
+        COALESCE(SUM(per_topic.unread_count), 0)::bigint AS unread_count,
+        COALESCE(SUM(per_topic.active_unread_count), 0)::bigint
+            AS active_unread_count
+    FROM (
+        SELECT
+            GREATEST(stats.message_count - COALESCE(reads.read_count, 0), 0)
+                AS unread_count,
+            CASE COALESCE(topic_flags.notification_mode, 'default')
+                WHEN 'mute' THEN 0
+                WHEN 'follow' THEN GREATEST(
+                    stats.message_count - COALESCE(reads.read_count, 0),
+                    0
+                )
+                WHEN 'unmute' THEN COALESCE(mentions.unread_count, 0)
+                ELSE CASE scoped.stream_notification_mode
+                    WHEN 'all_messages' THEN GREATEST(
+                        stats.message_count - COALESCE(reads.read_count, 0),
+                        0
+                    )
+                    WHEN 'mentions_only' THEN COALESCE(mentions.unread_count, 0)
+                    ELSE 0
+                END
+            END AS active_unread_count
+        FROM m_workspace_topic_message_stats_v1 AS stats
+        LEFT JOIN m_workspace_user_topic_read_stats_v1 AS reads
+          ON reads.project_id = stats.project_id
+         AND reads.topic_uuid = stats.topic_uuid
+         AND reads.user_uuid = scoped.scoped_user_uuid
+        LEFT JOIN m_workspace_user_topic_flags AS topic_flags
+          ON topic_flags.project_id = stats.project_id
+         AND topic_flags.uuid = stats.topic_uuid
+         AND topic_flags.user_uuid = scoped.scoped_user_uuid
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS unread_count
+            FROM m_workspace_message_mentions_v1 AS mention
+            LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+              ON chunk.user_uuid = mention.user_uuid
+             AND chunk.chunk_number = mention.ingest_sequence / 4096
+            WHERE mention.project_id = stats.project_id
+              AND mention.topic_uuid = stats.topic_uuid
+              AND mention.user_uuid = scoped.scoped_user_uuid
+              AND (
+                    COALESCE(topic_flags.notification_mode, 'default') = 'unmute'
+                    OR (
+                        COALESCE(topic_flags.notification_mode, 'default') = 'default'
+                        AND scoped.stream_notification_mode = 'mentions_only'
+                    )
+                  )
+              AND COALESCE(
+                    get_bit(
+                        chunk.read_bits,
+                        (mention.ingest_sequence %% 4096)::integer
+                    ),
+                    0
+                  ) = 0
+        ) AS mentions ON TRUE
+        WHERE stats.project_id = scoped.project_id
+          AND stats.stream_uuid = scoped.uuid
+          AND scoped.read_state_mode IN ('compact', 'rollback')
+    ) AS per_topic
+) AS compact_counts
+  ON scoped.read_state_mode IN ('compact', 'rollback')
+ORDER BY user_uuid
+"""
+
+_READ_STATE_USER_TOPIC_SNAPSHOTS_SQL = """
+WITH requested_users AS MATERIALIZED (
+    SELECT UNNEST(%s::uuid[]) AS user_uuid
+), requested_topics AS MATERIALIZED (
+    SELECT UNNEST(%s::uuid[]) AS topic_uuid
+), confirmed_access AS MATERIALIZED (
+    SELECT access.project_id, access.user_uuid, access.stream_uuid
+    FROM m_confirmed_external_stream_access AS access
+    WHERE access.project_id = %s
+      AND access.user_uuid = ANY(%s::uuid[])
+      AND EXISTS (
+            SELECT 1
+            FROM requested_topics AS requested
+            JOIN m_workspace_stream_topics AS target_topic
+              ON target_topic.project_id = %s
+             AND target_topic.uuid = requested.topic_uuid
+            JOIN m_workspace_streams AS target_stream
+              ON target_stream.project_id = target_topic.project_id
+             AND target_stream.uuid = target_topic.stream_uuid
+            WHERE target_stream.source_name <> 'native'
+          )
+), scoped AS MATERIALIZED (
+    SELECT
+        topic.*,
+        stream.default_topic_uuid,
+        binding.user_uuid,
+        binding.notification_mode AS stream_notification_mode,
+        COALESCE(project.mode, 'legacy') AS read_state_mode,
+        COALESCE(flags.is_done, FALSE) AS is_done,
+        COALESCE(flags.notification_mode, 'default') AS topic_notification_mode
+    FROM requested_topics AS requested_topic
+    JOIN m_workspace_stream_topics AS topic
+      ON topic.project_id = %s
+     AND topic.uuid = requested_topic.topic_uuid
+    JOIN m_workspace_streams AS stream
+      ON stream.project_id = topic.project_id
+     AND stream.uuid = topic.stream_uuid
+    JOIN requested_users AS requested_user ON TRUE
+    JOIN m_workspace_stream_bindings AS binding
+      ON binding.project_id = topic.project_id
+     AND binding.stream_uuid = topic.stream_uuid
+     AND binding.user_uuid = requested_user.user_uuid
+    LEFT JOIN m_workspace_read_state_projects_v1 AS project
+      ON project.project_id = topic.project_id
+    LEFT JOIN m_workspace_user_topic_flags AS flags
+      ON flags.project_id = topic.project_id
+     AND flags.uuid = topic.uuid
+     AND flags.user_uuid = binding.user_uuid
+    LEFT JOIN confirmed_access AS access
+      ON access.project_id = topic.project_id
+     AND access.user_uuid = binding.user_uuid
+     AND access.stream_uuid = topic.stream_uuid
+    WHERE stream.source_name = 'native' OR access.user_uuid IS NOT NULL
 )
 SELECT
-    topic.uuid,
-    topic.name,
-    topic.stream_uuid,
-    topic.project_id,
-    topic.created_at,
-    topic.updated_at,
-    COALESCE(topic.uuid = stream.default_topic_uuid, FALSE) AS is_default,
-    binding.user_uuid,
-    COALESCE(unread.unread_count, 0) AS unread_count,
-    COALESCE(unread.active_unread_count, 0) AS active_unread_count,
-    COALESCE(unread.unread_count, 0) -
-        COALESCE(unread.active_unread_count, 0) AS passive_unread_count,
-    COALESCE(topic_flags.is_done, FALSE) AS is_done,
-    COALESCE(topic_flags.notification_mode, 'default') AS notification_mode,
-    topic.color,
+    scoped.uuid,
+    scoped.name,
+    scoped.stream_uuid,
+    scoped.project_id,
+    scoped.created_at,
+    scoped.updated_at,
+    COALESCE(scoped.uuid = scoped.default_topic_uuid, FALSE) AS is_default,
+    scoped.user_uuid,
+    COALESCE(
+        CASE WHEN scoped.read_state_mode IN ('compact', 'rollback')
+            THEN compact_counts.unread_count
+            ELSE legacy_counts.unread_count
+        END,
+        0
+    )::bigint AS unread_count,
+    scoped.is_done,
+    scoped.topic_notification_mode AS notification_mode,
+    scoped.color,
     last_message.uuid AS last_message_uuid,
-    topic.source_name,
-    topic.source,
-    topic.summary,
-    topic.summary_last_message_uuid,
-    CASE
-        WHEN topic.summary IS NULL THEN NULL
-        ELSE topic.summary_last_message_uuid IS DISTINCT FROM last_message.uuid
+    scoped.source_name,
+    scoped.source,
+    scoped.summary,
+    scoped.summary_last_message_uuid,
+    CASE WHEN scoped.summary IS NULL THEN NULL
+         ELSE scoped.summary_last_message_uuid IS DISTINCT FROM last_message.uuid
     END AS summary_has_new_messages,
-    topic.summary_system_prompt,
-    topic.summary_reasoning_effort,
-    topic.summary_enabled
-FROM m_workspace_stream_topics AS topic
-JOIN m_workspace_streams AS stream
-  ON stream.uuid = topic.stream_uuid AND stream.project_id = topic.project_id
-JOIN m_workspace_stream_bindings AS binding
-  ON binding.stream_uuid = topic.stream_uuid AND binding.project_id = topic.project_id
-LEFT JOIN unread ON unread.user_uuid = binding.user_uuid
+    scoped.summary_system_prompt,
+    scoped.summary_reasoning_effort,
+    scoped.summary_enabled,
+    COALESCE(
+        CASE WHEN scoped.read_state_mode IN ('compact', 'rollback')
+            THEN compact_counts.active_unread_count
+            ELSE legacy_counts.active_unread_count
+        END,
+        0
+    )::integer AS active_unread_count,
+    COALESCE(
+        CASE WHEN scoped.read_state_mode IN ('compact', 'rollback')
+            THEN compact_counts.unread_count - compact_counts.active_unread_count
+            ELSE legacy_counts.unread_count - legacy_counts.active_unread_count
+        END,
+        0
+    )::integer AS passive_unread_count
+FROM scoped
 LEFT JOIN LATERAL (
     SELECT message.uuid
     FROM m_workspace_messages AS message
-    JOIN m_workspace_user_message_flags AS flags
-      ON flags.uuid = message.uuid
-     AND flags.project_id = message.project_id
-     AND flags.user_uuid = binding.user_uuid
-    WHERE message.project_id = topic.project_id
-      AND message.topic_uuid = topic.uuid
+    WHERE message.project_id = scoped.project_id
+      AND message.topic_uuid = scoped.uuid
     ORDER BY message.created_at DESC, message.uuid DESC
     LIMIT 1
 ) AS last_message ON TRUE
-LEFT JOIN m_workspace_user_topic_flags AS topic_flags
-  ON topic_flags.uuid = topic.uuid
- AND topic_flags.project_id = topic.project_id
- AND topic_flags.user_uuid = binding.user_uuid
-WHERE topic.uuid = %s
-  AND topic.project_id = %s
-  AND binding.user_uuid = ANY(%s::uuid[])
-ORDER BY binding.user_uuid
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*)::bigint AS unread_count,
+        COUNT(*) FILTER (
+            WHERE CASE scoped.topic_notification_mode
+                WHEN 'mute' THEN FALSE
+                WHEN 'follow' THEN TRUE
+                WHEN 'unmute' THEN POSITION(
+                    '](' || 'urn:user:' || LOWER(scoped.user_uuid::text) || ')'
+                    IN LOWER(COALESCE(message.payload->>'content', ''))
+                ) > 0
+                ELSE CASE scoped.stream_notification_mode
+                    WHEN 'all_messages' THEN TRUE
+                    WHEN 'mentions_only' THEN POSITION(
+                        '](' || 'urn:user:' ||
+                        LOWER(scoped.user_uuid::text) || ')'
+                        IN LOWER(COALESCE(message.payload->>'content', ''))
+                    ) > 0
+                    ELSE FALSE
+                END
+            END
+        )::bigint AS active_unread_count
+    FROM m_workspace_messages AS message
+    JOIN m_workspace_user_message_flags AS message_flags
+      ON message_flags.project_id = message.project_id
+     AND message_flags.uuid = message.uuid
+     AND message_flags.user_uuid = scoped.user_uuid
+     AND message_flags.read = FALSE
+    WHERE message.project_id = scoped.project_id
+      AND message.topic_uuid = scoped.uuid
+      AND scoped.read_state_mode NOT IN ('compact', 'rollback')
+) AS legacy_counts
+  ON scoped.read_state_mode NOT IN ('compact', 'rollback')
+LEFT JOIN LATERAL (
+    SELECT
+        GREATEST(stats.message_count - COALESCE(reads.read_count, 0), 0)::bigint
+            AS unread_count,
+        CASE scoped.topic_notification_mode
+            WHEN 'mute' THEN 0
+            WHEN 'follow' THEN GREATEST(
+                stats.message_count - COALESCE(reads.read_count, 0),
+                0
+            )
+            WHEN 'unmute' THEN COALESCE(mentions.unread_count, 0)
+            ELSE CASE scoped.stream_notification_mode
+                WHEN 'all_messages' THEN GREATEST(
+                    stats.message_count - COALESCE(reads.read_count, 0),
+                    0
+                )
+                WHEN 'mentions_only' THEN COALESCE(mentions.unread_count, 0)
+                ELSE 0
+            END
+        END::bigint AS active_unread_count
+    FROM m_workspace_topic_message_stats_v1 AS stats
+    LEFT JOIN m_workspace_user_topic_read_stats_v1 AS reads
+      ON reads.project_id = stats.project_id
+     AND reads.topic_uuid = stats.topic_uuid
+     AND reads.user_uuid = scoped.user_uuid
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS unread_count
+        FROM m_workspace_message_mentions_v1 AS mention
+        LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+          ON chunk.user_uuid = mention.user_uuid
+         AND chunk.chunk_number = mention.ingest_sequence / 4096
+        WHERE mention.project_id = stats.project_id
+          AND mention.topic_uuid = stats.topic_uuid
+          AND mention.user_uuid = scoped.user_uuid
+          AND (
+                scoped.topic_notification_mode = 'unmute'
+                OR (
+                    scoped.topic_notification_mode = 'default'
+                    AND scoped.stream_notification_mode = 'mentions_only'
+                )
+              )
+          AND COALESCE(
+                get_bit(
+                    chunk.read_bits,
+                    (mention.ingest_sequence %% 4096)::integer
+                ),
+                0
+              ) = 0
+    ) AS mentions ON TRUE
+    WHERE stats.project_id = scoped.project_id
+      AND stats.topic_uuid = scoped.uuid
+      AND scoped.read_state_mode IN ('compact', 'rollback')
+) AS compact_counts
+  ON scoped.read_state_mode IN ('compact', 'rollback')
+ORDER BY uuid, user_uuid
 """
 
-
-_COMPACT_USER_MESSAGE_SNAPSHOTS_SQL = """
-WITH reaction_counts AS (
+_READ_STATE_USER_MESSAGE_SNAPSHOTS_SQL = """
+WITH requested_users AS MATERIALIZED (
+    SELECT UNNEST(%s::uuid[]) AS user_uuid
+), requested_messages AS MATERIALIZED (
+    SELECT UNNEST(%s::uuid[]) AS message_uuid
+), confirmed_access AS MATERIALIZED (
+    SELECT access.project_id, access.user_uuid, access.stream_uuid
+    FROM m_confirmed_external_stream_access AS access
+    WHERE access.project_id = %s
+      AND access.user_uuid = ANY(%s::uuid[])
+      AND EXISTS (
+            SELECT 1
+            FROM requested_messages AS requested
+            JOIN m_workspace_messages AS target_message
+              ON target_message.project_id = %s
+             AND target_message.uuid = requested.message_uuid
+            JOIN m_workspace_streams AS target_stream
+              ON target_stream.project_id = target_message.project_id
+             AND target_stream.uuid = target_message.stream_uuid
+            WHERE target_stream.source_name <> 'native'
+          )
+), scoped_messages AS MATERIALIZED (
     SELECT
-        reaction.message_uuid,
-        reaction.emoji_name,
-        COUNT(*) AS reaction_count
-    FROM m_workspace_message_reactions AS reaction
-    WHERE reaction.project_id = %s
-      AND reaction.message_uuid = ANY(%s::uuid[])
-    GROUP BY reaction.message_uuid, reaction.emoji_name
-), reactions AS (
-    SELECT
-        counts.message_uuid,
-        jsonb_object_agg(counts.emoji_name, counts.reaction_count) AS value
-    FROM (
-        SELECT message_uuid, emoji_name, reaction_count
-        FROM reaction_counts
-        ORDER BY message_uuid, emoji_name
-    ) AS counts
-    GROUP BY counts.message_uuid
+        message.*,
+        stream.source_name AS stream_source_name,
+        COALESCE(project.mode, 'legacy') AS read_state_mode
+    FROM requested_messages AS requested
+    JOIN m_workspace_messages AS message
+      ON message.project_id = %s
+     AND message.uuid = requested.message_uuid
+    JOIN m_workspace_streams AS stream
+      ON stream.project_id = message.project_id
+     AND stream.uuid = message.stream_uuid
+    LEFT JOIN m_workspace_read_state_projects_v1 AS project
+      ON project.project_id = message.project_id
 )
 SELECT
     message.uuid,
@@ -1743,30 +1992,67 @@ SELECT
     message.payload,
     message.created_at,
     message.updated_at,
-    recipient.user_uuid,
+    binding.user_uuid,
     message.project_id,
-    COALESCE(flags.read, FALSE) AS read,
+    CASE WHEN message.read_state_mode IN ('compact', 'rollback') THEN
+        COALESCE(
+            get_bit(
+                chunk.read_bits,
+                (message.ingest_sequence %% 4096)::integer
+            ),
+            0
+        ) = 1
+    ELSE COALESCE(flags.read, FALSE) END AS read,
     COALESCE(flags.pinned, FALSE) AS pinned,
     COALESCE(flags.starred, FALSE) AS starred,
-    message.user_uuid = recipient.user_uuid AS is_own,
-    COALESCE(reactions.value, '{}'::jsonb) AS reactions,
+    (message.user_uuid = binding.user_uuid) AS is_own,
+    COALESCE(
+        (
+            SELECT jsonb_object_agg(
+                reaction_counts.emoji_name,
+                reaction_counts.reaction_count
+            )
+            FROM (
+                SELECT reaction.emoji_name, COUNT(*) AS reaction_count
+                FROM m_workspace_message_reactions AS reaction
+                WHERE reaction.project_id = message.project_id
+                  AND reaction.message_uuid = message.uuid
+                GROUP BY reaction.emoji_name
+            ) AS reaction_counts
+        ),
+        '{}'::jsonb
+    ) AS reactions,
     message.source_name,
     message.source,
-    POSITION(
-        '](' || 'urn:user:' || LOWER(recipient.user_uuid::text) || ')'
+    CASE WHEN message.read_state_mode IN ('compact', 'rollback') THEN
+        mention.message_uuid IS NOT NULL
+    ELSE POSITION(
+        '](' || 'urn:user:' || LOWER(binding.user_uuid::text) || ')'
         IN LOWER(COALESCE(message.payload->>'content', ''))
-    ) > 0 AS mentioned,
+    ) > 0 END AS mentioned,
     message.reaction_users
-FROM m_workspace_messages AS message
-CROSS JOIN unnest(%s::uuid[]) AS recipient(user_uuid)
-LEFT JOIN reactions ON reactions.message_uuid = message.uuid
+FROM scoped_messages AS message
+JOIN requested_users AS requested ON TRUE
+JOIN m_workspace_stream_bindings AS binding
+  ON binding.project_id = message.project_id
+ AND binding.stream_uuid = message.stream_uuid
+ AND binding.user_uuid = requested.user_uuid
 LEFT JOIN m_workspace_user_message_flags AS flags
-  ON flags.uuid = message.uuid
- AND flags.project_id = message.project_id
- AND flags.user_uuid = recipient.user_uuid
-WHERE message.project_id = %s
-  AND message.uuid = ANY(%s::uuid[])
-ORDER BY message.created_at, message.uuid, recipient.user_uuid
+  ON flags.project_id = message.project_id
+ AND flags.uuid = message.uuid
+ AND flags.user_uuid = binding.user_uuid
+LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+  ON chunk.user_uuid = binding.user_uuid
+ AND chunk.chunk_number = message.ingest_sequence / 4096
+LEFT JOIN m_workspace_message_mentions_v1 AS mention
+  ON mention.message_uuid = message.uuid
+ AND mention.user_uuid = binding.user_uuid
+LEFT JOIN confirmed_access AS access
+  ON access.project_id = message.project_id
+ AND access.user_uuid = binding.user_uuid
+ AND access.stream_uuid = message.stream_uuid
+WHERE message.stream_source_name = 'native' OR access.user_uuid IS NOT NULL
+ORDER BY created_at, uuid, user_uuid
 """
 
 
@@ -1802,14 +2088,15 @@ def get_compact_workspace_user_stream_snapshots(
     with _workspace_session(session) as current_session:
         return list(
             current_session.execute(
-                _COMPACT_USER_STREAM_SNAPSHOTS_SQL,
+                _READ_STATE_USER_STREAM_SNAPSHOTS_SQL,
                 (
+                    recipients,
                     project_id,
                     recipients,
-                    stream_uuid,
+                    project_id,
                     stream_uuid,
                     project_id,
-                    recipients,
+                    stream_uuid,
                 ),
             ).fetchall()
         )
@@ -1822,20 +2109,36 @@ def get_compact_workspace_user_topic_snapshots(
     session: typing.Any = None,
 ) -> list[typing.Any]:
     """Build one topic snapshot per scoped user without a global view scan."""
+    return get_compact_workspace_user_topic_snapshots_batch(
+        project_id,
+        [topic_uuid],
+        user_uuids,
+        session=session,
+    )
+
+
+def get_compact_workspace_user_topic_snapshots_batch(
+    project_id: object,
+    topic_uuids: typing.Any,
+    user_uuids: typing.Any,
+    session: typing.Any = None,
+) -> list[typing.Any]:
+    """Build scoped topic snapshots in one query for a bounded topic batch."""
+    topics = sorted({sys_uuid.UUID(str(value)) for value in topic_uuids}, key=str)
     recipients = sorted({sys_uuid.UUID(str(value)) for value in user_uuids}, key=str)
-    if not recipients:
+    if not topics or not recipients:
         return []
     with _workspace_session(session) as current_session:
         return list(
             current_session.execute(
-                _COMPACT_USER_TOPIC_SNAPSHOTS_SQL,
+                _READ_STATE_USER_TOPIC_SNAPSHOTS_SQL,
                 (
+                    recipients,
+                    topics,
                     project_id,
                     recipients,
-                    topic_uuid,
-                    topic_uuid,
                     project_id,
-                    recipients,
+                    project_id,
                 ),
             ).fetchall()
         )
@@ -1858,13 +2161,14 @@ def get_compact_workspace_user_message_snapshots(
     with _workspace_session(session) as current_session:
         return list(
             current_session.execute(
-                _COMPACT_USER_MESSAGE_SNAPSHOTS_SQL,
+                _READ_STATE_USER_MESSAGE_SNAPSHOTS_SQL,
                 (
-                    project_id,
+                    recipients,
                     messages,
+                    project_id,
                     recipients,
                     project_id,
-                    messages,
+                    project_id,
                 ),
             ).fetchall()
         )
@@ -1927,25 +2231,26 @@ def _create_compact_messages_unread_updated_events(
         if not visible_users:
             return
         user_topics = current_session.execute(
-            _COMPACT_USER_TOPIC_SNAPSHOTS_SQL,
+            _READ_STATE_USER_TOPIC_SNAPSHOTS_SQL,
             (
+                visible_users,
+                [topic_uuid],
                 project_id,
                 visible_users,
-                topic_uuid,
-                topic_uuid,
                 project_id,
-                visible_users,
+                project_id,
             ),
         ).fetchall()
         user_streams = current_session.execute(
-            _COMPACT_USER_STREAM_SNAPSHOTS_SQL,
+            _READ_STATE_USER_STREAM_SNAPSHOTS_SQL,
             (
+                visible_users,
                 project_id,
                 visible_users,
-                stream_uuid,
+                project_id,
                 stream_uuid,
                 project_id,
-                visible_users,
+                stream_uuid,
             ),
         ).fetchall()
         messenger_events.create_topic_updated_events(
@@ -1992,14 +2297,14 @@ def create_compact_workspace_stream_topic_events(
         if not visible_users:
             return
         user_topics = current_session.execute(
-            _COMPACT_USER_TOPIC_SNAPSHOTS_SQL,
+            _READ_STATE_USER_TOPIC_SNAPSHOTS_SQL,
             (
+                visible_users,
+                [topic_uuid],
                 project_id,
                 visible_users,
-                topic_uuid,
-                topic_uuid,
                 project_id,
-                visible_users,
+                project_id,
             ),
         ).fetchall()
         event_factory = (
@@ -2194,6 +2499,7 @@ def delete_workspace_stream_binding(
     session: typing.Any = None,
 ) -> None:
     with _workspace_session(session=session) as s:
+        _lock_workspace_project_event_writes(project_id, s)
         _lock_workspace_stream_binding(project_id, binding_uuid, s)
         binding = models.WorkspaceStreamBinding.objects.get_one(
             filters={
@@ -2262,6 +2568,13 @@ def delete_workspace_stream_binding(
             remaining_user_uuids,
             session=s,
         )
+        if read_state.writes_compact_state(s, project_id):
+            read_state.record_stream_detached(
+                s,
+                project_id,
+                binding.user_uuid,
+                binding.stream_uuid,
+            )
         binding.delete(session=s)
         _create_available_folder_updated_events(
             project_id=project_id,
@@ -2290,6 +2603,28 @@ def _create_workspace_stream_binding_message_flags(
     user_uuid: object,
     session: typing.Any = None,
 ) -> None:
+    current_session = session or contexts.Context().get_session()
+    _lock_workspace_project_event_writes(project_id, current_session)
+    mode = read_state.project_mode(current_session, project_id)
+    if mode in {
+        read_state.PROJECT_MODE_DUAL,
+        read_state.PROJECT_MODE_COMPACT,
+        read_state.PROJECT_MODE_ROLLBACK,
+    }:
+        read_state.mark_stream_history_read(
+            current_session,
+            project_id,
+            user_uuid,
+            stream_uuid,
+        )
+        read_state.sync_stream_mentions_for_user(
+            current_session,
+            project_id,
+            user_uuid,
+            stream_uuid,
+        )
+    if mode == read_state.PROJECT_MODE_COMPACT:
+        return
     statement = """
         INSERT INTO "m_workspace_user_message_flags"
             ("uuid", "user_uuid", "project_id", "read")
@@ -2309,10 +2644,10 @@ def _create_workspace_stream_binding_message_flags(
         str(stream_uuid),
     )
     if session is not None:
-        session.execute(statement, values)
+        current_session.execute(statement, values)
         return
 
-    contexts.Context().get_session().execute(statement, values)
+    current_session.execute(statement, values)
 
 
 def _get_or_create_workspace_stream_binding(
@@ -2344,13 +2679,16 @@ def _get_or_create_workspace_stream_binding(
         who_uuid=who_uuid,
         role=role,
     )
-    binding.insert(session=session)
+    # Establish the read-state/project serialization before inserting the
+    # binding.  A structural delete can then neither wait on this new row while
+    # owning the project lock nor race the history snapshot.
     _create_workspace_stream_binding_message_flags(
         project_id=project_id,
         stream_uuid=stream_uuid,
         user_uuid=user_uuid,
         session=session,
     )
+    binding.insert(session=session)
     _create_workspace_stream_binding_file_accesses(
         project_id=project_id,
         stream_uuid=stream_uuid,
@@ -3122,6 +3460,9 @@ def delete_workspace_user_stream_topic(
     session: typing.Any = None,
 ) -> None:
     with _workspace_session(session=session) as s:
+        read_state.lock_message_structure(s, (project_id,))
+        read_state.lock_projects(s, (project_id,))
+        read_state.bump_project_structure_revisions(s, (project_id,))
         _lock_workspace_topic(project_id, topic_uuid, s)
         topic = _get_workspace_stream_topic_for_user(
             project_id=project_id,
@@ -3158,6 +3499,12 @@ def delete_workspace_user_stream_topic(
                 source_name=topic.source_name,
                 source=topic.source,
                 session=s,
+            )
+        if read_state.writes_compact_state(s, project_id):
+            read_state.clear_topic_for_all_users(
+                s,
+                project_id,
+                topic_uuid,
             )
         topic.delete(session=s)
 
@@ -3304,8 +3651,7 @@ def _normalize_workspace_user_stream_topic_notification_modes(
         topic_uuids = [topic.uuid for topic in topics]
         if (
             topic_uuids
-            and notification_mode
-            != models.WorkspaceStreamNotificationMode.MUTED.value
+            and notification_mode != models.WorkspaceStreamNotificationMode.MUTED.value
         ):
             # UPDATE owns the topic-flag row lock, serializing normalization
             # with a concurrent topic notification update. A delayed stream
@@ -3850,6 +4196,9 @@ def delete_workspace_user_stream(
     session: typing.Any = None,
 ) -> None:
     with _workspace_session(session=session) as s:
+        read_state.lock_message_structure(s, (project_id,))
+        read_state.lock_projects(s, (project_id,))
+        read_state.bump_project_structure_revisions(s, (project_id,))
         _lock_workspace_stream(project_id, stream_uuid, s)
         user_stream = get_workspace_user_stream(
             project_id=project_id,
@@ -3889,6 +4238,12 @@ def delete_workspace_user_stream(
                 session=s,
             )
 
+        if read_state.writes_compact_state(s, project_id):
+            read_state.clear_stream_for_all_users(
+                s,
+                project_id,
+                stream_uuid,
+            )
         stream.delete(session=s)
 
         _create_available_folder_updated_events(
@@ -4260,6 +4615,10 @@ def create_workspace_message_reaction(
             message_uuid=message_uuid,
             session=session,
         )
+    _lock_workspace_project_event_writes(
+        project_id,
+        session or contexts.Context().get_session(),
+    )
     reaction_users.lock_messages(
         project_id,
         (message_uuid,),
@@ -4340,6 +4699,10 @@ def update_workspace_message_reaction(
             )
     new_message_uuid = values.get("message_uuid", old_message_uuid)
     new_emoji_name = values.get("emoji_name", old_emoji_name)
+    _lock_workspace_project_event_writes(
+        project_id,
+        session or contexts.Context().get_session(),
+    )
     reaction_users.lock_messages(
         project_id,
         (old_message_uuid, new_message_uuid),
@@ -4412,6 +4775,10 @@ def delete_workspace_message_reaction(
             message_uuid=message_uuid,
             session=session,
         )
+    _lock_workspace_project_event_writes(
+        project_id,
+        session or contexts.Context().get_session(),
+    )
     reaction_users.lock_messages(
         project_id,
         (message_uuid,),
@@ -4508,7 +4875,20 @@ def create_message_flags(
     recipients: typing.Any,
     session: typing.Any = None,
 ) -> None:
-    for recipient_uuid in recipients:
+    current_session = session or contexts.Context().get_session()
+    mode = read_state.project_mode(current_session, project_id)
+    recipient_uuids = set(recipients)
+    if mode == read_state.PROJECT_MODE_COMPACT:
+        if author_uuid in recipient_uuids:
+            read_state.set_message_read(
+                current_session,
+                project_id,
+                author_uuid,
+                message_uuid,
+                True,
+            )
+        return
+    for recipient_uuid in recipient_uuids:
         flags = models.WorkspaceUserMessageFlags(
             uuid=message_uuid,
             user_uuid=recipient_uuid,
@@ -4516,6 +4896,17 @@ def create_message_flags(
             read=recipient_uuid == author_uuid,
         )
         flags.insert(session=session)
+    if author_uuid in recipient_uuids and read_state.writes_compact_state(
+        current_session,
+        project_id,
+    ):
+        read_state.set_message_read(
+            current_session,
+            project_id,
+            author_uuid,
+            message_uuid,
+            True,
+        )
 
 
 def create_message_flags_bulk(
@@ -4527,7 +4918,8 @@ def create_message_flags_bulk(
 ) -> None:
     """Insert a historical message audience without one ORM round trip per user."""
     recipient_uuids = sorted(set(recipients), key=str)
-    if recipient_uuids:
+    mode = read_state.project_mode(session, project_id)
+    if recipient_uuids and mode != read_state.PROJECT_MODE_COMPACT:
         session.execute(
             """
             INSERT INTO "m_workspace_user_message_flags" (
@@ -4537,6 +4929,19 @@ def create_message_flags_bulk(
             FROM unnest(%s::uuid[]) AS recipient_uuid
             """,
             (message_uuid, project_id, author_uuid, recipient_uuids),
+        )
+    if author_uuid in recipient_uuids and mode in {
+        read_state.PROJECT_MODE_PREPARING,
+        read_state.PROJECT_MODE_DUAL,
+        read_state.PROJECT_MODE_COMPACT,
+        read_state.PROJECT_MODE_ROLLBACK,
+    }:
+        read_state.set_message_read(
+            session,
+            project_id,
+            author_uuid,
+            message_uuid,
+            True,
         )
 
 
@@ -4553,6 +4958,17 @@ def ensure_workspace_message_recipients(
         key=str,
     )
     if not recipient_uuids:
+        return []
+    _lock_workspace_project_event_writes(project_id, session)
+    if read_state.project_mode(session, project_id) == read_state.PROJECT_MODE_COMPACT:
+        if message.user_uuid in recipient_uuids:
+            read_state.set_message_read(
+                session,
+                project_id,
+                message.user_uuid,
+                message.uuid,
+                True,
+            )
         return []
     inserted_rows = session.execute(
         """
@@ -4575,6 +4991,16 @@ def ensure_workspace_message_recipients(
         (sys_uuid.UUID(str(row["user_uuid"])) for row in inserted_rows),
         key=str,
     )
+    if message.user_uuid in inserted_recipients and read_state.writes_compact_state(
+        session, project_id
+    ):
+        read_state.set_message_read(
+            session,
+            project_id,
+            message.user_uuid,
+            message.uuid,
+            True,
+        )
     if not emit_events or not inserted_recipients:
         return inserted_recipients
     messenger_events.create_message_events(
@@ -4609,6 +5035,8 @@ def create_workspace_user_message(
     scoped_recipient_uuids: typing.Any = None,
     **kwargs: typing.Any,
 ) -> typing.Any:
+    current_session = session or contexts.Context().get_session()
+    _lock_workspace_project_event_writes(project_id, current_session)
     if enforce_visibility:
         try:
             get_workspace_user_stream(
@@ -4645,7 +5073,7 @@ def create_workspace_user_message(
         user_uuid=user_uuid,
         **kwargs,
     )
-    message.insert(session=session)
+    message.insert(session=current_session)
     batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
     recipients_are_scoped = scoped_recipient_uuids is not None
     recipients: collections.abc.Sequence[object] | None
@@ -4685,7 +5113,26 @@ def create_workspace_user_message(
             if batch_cache is not None:
                 batch_cache[visible_recipients_key] = event_recipients
     event_recipients = typing.cast(collections.abc.Sequence[object], event_recipients)
-    with _workspace_session(session) as current_session:
+    with _workspace_session(current_session) as current_session:
+        ingest_sequence = getattr(message, "ingest_sequence", None)
+        if ingest_sequence is None and isinstance(
+            current_session, sql_sessions.PgSQLSession
+        ):
+            coordinate = read_state.message_coordinate(
+                current_session,
+                project_id,
+                message.uuid,
+            )
+            ingest_sequence = None if coordinate is None else coordinate.ingest_sequence
+        if isinstance(ingest_sequence, int):
+            read_state.ensure_new_project(current_session, project_id)
+            read_state.record_message_created(
+                current_session,
+                project_id,
+                message.stream_uuid,
+                message.topic_uuid,
+                ingest_sequence,
+            )
         create_message_flags_bulk(
             project_id=project_id,
             message_uuid=message.uuid,
@@ -4693,6 +5140,25 @@ def create_workspace_user_message(
             recipients=event_recipients,
             session=current_session,
         )
+        if isinstance(ingest_sequence, int) and read_state.writes_compact_state(
+            current_session,
+            project_id,
+        ):
+            content = (
+                message.payload.get("content")
+                if hasattr(message.payload, "get")
+                else getattr(message.payload, "content", "")
+            )
+            read_state.sync_message_mentions(
+                current_session,
+                project_id,
+                message.uuid,
+                message.stream_uuid,
+                message.topic_uuid,
+                ingest_sequence,
+                event_recipients,
+                content,
+            )
     if emit_events:
         messenger_events.create_message_events(
             project_id=project_id,
@@ -4825,8 +5291,33 @@ def update_workspace_user_message(
             return message
         return result
 
+    current_session = session or contexts.Context().get_session()
+    _lock_workspace_project_event_writes(project_id, current_session)
     message.update_dm(values={"payload": values["payload"]})
-    message.update(session=session)
+    message.update(session=current_session)
+    if read_state.writes_compact_state(current_session, project_id):
+        coordinate = read_state.message_coordinate(
+            current_session,
+            project_id,
+            message_uuid,
+        )
+        if coordinate is None:
+            raise RuntimeError("Updated Workspace message has no read coordinate")
+        content = (
+            message.payload.get("content")
+            if hasattr(message.payload, "get")
+            else getattr(message.payload, "content", "")
+        )
+        read_state.sync_message_mentions(
+            current_session,
+            project_id,
+            message.uuid,
+            message.stream_uuid,
+            message.topic_uuid,
+            coordinate.ingest_sequence,
+            message.get_recipients(session=current_session),
+            content,
+        )
 
     user_messages = _create_workspace_message_updated_events(
         project_id=project_id,
@@ -4917,7 +5408,16 @@ def read_workspace_user_stream_messages(
     session: typing.Any = None,
     current_stream: typing.Any = None,
     return_message_uuids: bool = False,
+    collect_message_uuids: bool | None = None,
+    message_uuid_batch_callback: typing.Callable[
+        [collections.abc.Sequence[sys_uuid.UUID]], None
+    ]
+    | None = None,
+    message_uuid_snapshot_callback: read_state.BulkReadSnapshotCallback | None = None,
 ) -> typing.Any:
+    collect_message_uuids = (
+        return_message_uuids if collect_message_uuids is None else collect_message_uuids
+    )
     with _workspace_session(session) as current_session:
         current_stream = current_stream or get_workspace_user_stream(
             project_id=project_id,
@@ -4925,21 +5425,72 @@ def read_workspace_user_stream_messages(
             stream_uuid=stream_uuid,
             session=current_session,
         )
-        _lock_workspace_project_event_writes(project_id, current_session)
-        rows = current_session.execute(
-            _READ_STREAM_MESSAGES_SQL,
-            (project_id, user_uuid, stream_uuid),
-        ).fetchall()
+        mode = read_state.project_mode(current_session, project_id)
+        if mode != read_state.PROJECT_MODE_COMPACT or collect_message_uuids:
+            _lock_workspace_project_event_writes(project_id, current_session)
+            mode = read_state.project_mode(current_session, project_id)
+        if read_state.mode_uses_compact_state(mode):
+            compact_result = read_state.read_stream(
+                current_session,
+                project_id,
+                user_uuid,
+                stream_uuid,
+                collect_message_rows=collect_message_uuids,
+                message_uuid_batch_callback=message_uuid_batch_callback,
+                message_uuid_snapshot_callback=message_uuid_snapshot_callback,
+            )
+            rows = compact_result.message_rows
+            topic_uuids = compact_result.topic_uuids
+            changed = compact_result.changed
+        elif message_uuid_snapshot_callback is not None and not collect_message_uuids:
+            topic_uuids = read_state._mark_legacy_scope_read(
+                current_session,
+                project_id,
+                user_uuid,
+                "message.stream_uuid = %s",
+                (stream_uuid,),
+                message_uuid_snapshot_callback,
+            )
+            rows = []
+            if read_state.writes_compact_state(current_session, project_id):
+                read_state._bulk_mark_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    "message.stream_uuid = %s",
+                    (stream_uuid,),
+                )
+            changed = bool(topic_uuids)
+        else:
+            rows = current_session.execute(
+                _READ_STREAM_MESSAGES_SQL,
+                (project_id, user_uuid, stream_uuid),
+            ).fetchall()
+            if read_state.writes_compact_state(current_session, project_id):
+                read_state.set_message_uuids_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    [item["uuid"] for item in rows],
+                    True,
+                )
+            changed = bool(rows)
         rows.sort(key=lambda item: (item["created_at"], item["uuid"]))
+        if not read_state.mode_uses_compact_state(mode) and not (
+            message_uuid_snapshot_callback is not None and not collect_message_uuids
+        ):
+            topic_uuids = list(dict.fromkeys(item["topic_uuid"] for item in rows))
         message_uuids = [item["uuid"] for item in rows]
-        topic_uuids = list(dict.fromkeys(item["topic_uuid"] for item in rows))
+        if message_uuid_batch_callback is not None and message_uuids:
+            for offset in range(0, len(message_uuids), 500):
+                message_uuid_batch_callback(message_uuids[offset : offset + 500])
         result = get_workspace_user_stream(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
             session=current_session,
         )
-    if message_uuids:
+    if changed:
         messenger_events.create_stream_read_event(
             stream=result,
             session=current_session,
@@ -4964,7 +5515,16 @@ def read_workspace_user_stream_topic_messages(
     session: typing.Any = None,
     current_topic: typing.Any = None,
     return_message_uuids: bool = False,
+    collect_message_uuids: bool | None = None,
+    message_uuid_batch_callback: typing.Callable[
+        [collections.abc.Sequence[sys_uuid.UUID]], None
+    ]
+    | None = None,
+    message_uuid_snapshot_callback: read_state.BulkReadSnapshotCallback | None = None,
 ) -> typing.Any:
+    collect_message_uuids = (
+        return_message_uuids if collect_message_uuids is None else collect_message_uuids
+    )
     with _workspace_session(session) as current_session:
         current_topic = current_topic or get_workspace_user_stream_topic(
             project_id=project_id,
@@ -4972,21 +5532,70 @@ def read_workspace_user_stream_topic_messages(
             topic_uuid=topic_uuid,
             session=current_session,
         )
-        _lock_workspace_project_event_writes(project_id, current_session)
-        rows = current_session.execute(
-            _READ_TOPIC_MESSAGES_SQL,
-            (project_id, user_uuid, current_topic.stream_uuid, topic_uuid),
-        ).fetchall()
+        mode = read_state.project_mode(current_session, project_id)
+        if mode != read_state.PROJECT_MODE_COMPACT or collect_message_uuids:
+            _lock_workspace_project_event_writes(project_id, current_session)
+            mode = read_state.project_mode(current_session, project_id)
+        if read_state.mode_uses_compact_state(mode):
+            compact_result = read_state.read_topic(
+                current_session,
+                project_id,
+                user_uuid,
+                current_topic.stream_uuid,
+                topic_uuid,
+                collect_message_rows=collect_message_uuids,
+                message_uuid_batch_callback=message_uuid_batch_callback,
+                message_uuid_snapshot_callback=message_uuid_snapshot_callback,
+            )
+            rows = compact_result.message_rows
+            topic_uuids = compact_result.topic_uuids
+            changed = compact_result.changed
+        elif message_uuid_snapshot_callback is not None and not collect_message_uuids:
+            topic_uuids = read_state._mark_legacy_scope_read(
+                current_session,
+                project_id,
+                user_uuid,
+                "message.stream_uuid = %s AND message.topic_uuid = %s",
+                (current_topic.stream_uuid, topic_uuid),
+                message_uuid_snapshot_callback,
+            )
+            rows = []
+            if read_state.writes_compact_state(current_session, project_id):
+                read_state._bulk_mark_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    "message.stream_uuid = %s AND message.topic_uuid = %s",
+                    (current_topic.stream_uuid, topic_uuid),
+                )
+            changed = bool(topic_uuids)
+        else:
+            rows = current_session.execute(
+                _READ_TOPIC_MESSAGES_SQL,
+                (project_id, user_uuid, current_topic.stream_uuid, topic_uuid),
+            ).fetchall()
+            if read_state.writes_compact_state(current_session, project_id):
+                read_state.set_message_uuids_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    [item["uuid"] for item in rows],
+                    True,
+                )
+            topic_uuids = [sys_uuid.UUID(str(topic_uuid))] if rows else []
+            changed = bool(rows)
         rows.sort(key=lambda item: (item["created_at"], item["uuid"]))
         message_uuids = [item["uuid"] for item in rows]
-        topic_uuids = [topic_uuid] if rows else []
+        if message_uuid_batch_callback is not None and message_uuids:
+            for offset in range(0, len(message_uuids), 500):
+                message_uuid_batch_callback(message_uuids[offset : offset + 500])
         result = get_workspace_user_stream_topic(
             project_id=project_id,
             user_uuid=user_uuid,
             topic_uuid=topic_uuid,
             session=current_session,
         )
-    if message_uuids:
+    if changed:
         messenger_events.create_topic_read_event(
             topic=result,
             session=current_session,
@@ -5032,7 +5641,16 @@ def read_workspace_user_topic_messages_to_message(
     session: typing.Any = None,
     current_message: typing.Any = None,
     return_message_uuids: bool = False,
+    collect_message_uuids: bool | None = None,
+    message_uuid_batch_callback: typing.Callable[
+        [collections.abc.Sequence[sys_uuid.UUID]], None
+    ]
+    | None = None,
+    message_uuid_snapshot_callback: read_state.BulkReadSnapshotCallback | None = None,
 ) -> typing.Any:
+    collect_message_uuids = (
+        return_message_uuids if collect_message_uuids is None else collect_message_uuids
+    )
     with _workspace_session(session) as current_session:
         current_message = current_message or get_workspace_user_message(
             project_id=project_id,
@@ -5040,27 +5658,89 @@ def read_workspace_user_topic_messages_to_message(
             message_uuid=message_uuid,
             session=current_session,
         )
-        _lock_workspace_project_event_writes(project_id, current_session)
-        rows = current_session.execute(
-            _READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL,
-            (
+        mode = read_state.project_mode(current_session, project_id)
+        if mode != read_state.PROJECT_MODE_COMPACT or collect_message_uuids:
+            _lock_workspace_project_event_writes(project_id, current_session)
+            mode = read_state.project_mode(current_session, project_id)
+        if read_state.mode_uses_compact_state(mode):
+            compact_result = read_state.read_topic_to_boundary(
+                current_session,
                 project_id,
                 user_uuid,
                 current_message.stream_uuid,
                 current_message.topic_uuid,
                 _database_timestamp(current_message.created_at),
                 message_uuid,
-            ),
-        ).fetchall()
+                collect_message_rows=collect_message_uuids,
+                message_uuid_batch_callback=message_uuid_batch_callback,
+                message_uuid_snapshot_callback=message_uuid_snapshot_callback,
+            )
+            rows = compact_result.message_rows
+            changed = compact_result.changed
+        elif message_uuid_snapshot_callback is not None and not collect_message_uuids:
+            boundary_created_at = _database_timestamp(current_message.created_at)
+            scope_sql = """
+                message.stream_uuid = %s
+                AND message.topic_uuid = %s
+                AND (message.created_at, message.uuid) <= (%s, %s)
+            """
+            scope_values = (
+                current_message.stream_uuid,
+                current_message.topic_uuid,
+                boundary_created_at,
+                message_uuid,
+            )
+            topic_uuids = read_state._mark_legacy_scope_read(
+                current_session,
+                project_id,
+                user_uuid,
+                scope_sql,
+                scope_values,
+                message_uuid_snapshot_callback,
+            )
+            rows = []
+            if read_state.writes_compact_state(current_session, project_id):
+                read_state._bulk_mark_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    scope_sql,
+                    scope_values,
+                )
+            changed = bool(topic_uuids)
+        else:
+            rows = current_session.execute(
+                _READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL,
+                (
+                    project_id,
+                    user_uuid,
+                    current_message.stream_uuid,
+                    current_message.topic_uuid,
+                    _database_timestamp(current_message.created_at),
+                    message_uuid,
+                ),
+            ).fetchall()
+            if read_state.writes_compact_state(current_session, project_id):
+                read_state.set_message_uuids_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    [item["uuid"] for item in rows],
+                    True,
+                )
+            changed = bool(rows)
         rows.sort(key=lambda row: (row["created_at"], row["uuid"]))
         message_uuids = [row["uuid"] for row in rows]
+        if message_uuid_batch_callback is not None and message_uuids:
+            for offset in range(0, len(message_uuids), 500):
+                message_uuid_batch_callback(message_uuids[offset : offset + 500])
         result = get_workspace_user_message(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
             session=current_session,
         )
-    if message_uuids:
+    if changed:
         messenger_events.create_message_read_event(
             message=result,
             session=current_session,
@@ -5093,10 +5773,32 @@ def read_workspace_user_message(
             session=current_session,
         )
         _lock_workspace_project_event_writes(project_id, current_session)
-        row = current_session.execute(
-            _READ_MESSAGE_SQL,
-            (project_id, user_uuid, message_uuid),
-        ).fetchone()
+        mode = read_state.project_mode(current_session, project_id)
+        if read_state.mode_uses_compact_state(mode):
+            changed = read_state.set_message_read(
+                current_session,
+                project_id,
+                user_uuid,
+                message_uuid,
+                True,
+            )
+            row = {"uuid": message_uuid} if changed else None
+        else:
+            row = current_session.execute(
+                _READ_MESSAGE_SQL,
+                (project_id, user_uuid, message_uuid),
+            ).fetchone()
+            if row is not None and read_state.writes_compact_state(
+                current_session,
+                project_id,
+            ):
+                read_state.set_message_read(
+                    current_session,
+                    project_id,
+                    user_uuid,
+                    message_uuid,
+                    True,
+                )
         message_uuids = [] if row is None else [row["uuid"]]
         result = get_workspace_user_message(
             project_id=project_id,
@@ -5129,24 +5831,105 @@ def _update_workspace_user_message_flag(
     value: bool,
     session: typing.Any,
 ) -> bool:
-    """Atomically update one flag and report whether the row changed."""
+    """Atomically set one public message flag and report whether it changed."""
     if field_name not in _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS:
         raise ValueError(f"Unsupported workspace user message flag: {field_name}")
     if not isinstance(value, bool):
         raise ValueError(f"Workspace user message flag {field_name} must be boolean")
+    mode = read_state.project_mode(session, project_id)
+    if field_name == "read" and read_state.mode_uses_compact_state(mode):
+        return read_state.set_message_read(
+            session,
+            project_id,
+            user_uuid,
+            message_uuid,
+            value,
+        )
+    if not read_state.mode_uses_compact_state(mode):
+        row = session.execute(
+            f"""
+            UPDATE m_workspace_user_message_flags
+            SET "{field_name}" = %s, updated_at = NOW()
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND uuid = %s
+              AND "{field_name}" IS DISTINCT FROM %s
+            RETURNING uuid
+            """,
+            (value, project_id, user_uuid, message_uuid, value),
+        ).fetchone()
+        changed = row is not None
+        if (
+            changed
+            and field_name == "read"
+            and read_state.writes_compact_state(
+                session,
+                project_id,
+            )
+        ):
+            read_state.set_message_read(
+                session,
+                project_id,
+                user_uuid,
+                message_uuid,
+                value,
+            )
+        return changed
+    inserted_values = {
+        field: (
+            "input.value"
+            if field == field_name
+            else f'COALESCE(current_flags."{field}", FALSE)'
+        )
+        for field in _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS
+    }
+    if field_name != "read":
+        inserted_values["read"] = (
+            'COALESCE(current_flags."read", message.user_uuid = input.user_uuid)'
+        )
     row = session.execute(
         f"""
-        UPDATE m_workspace_user_message_flags
-        SET "{field_name}" = %s, updated_at = NOW()
-        WHERE project_id = %s
-          AND user_uuid = %s
-          AND uuid = %s
-          AND "{field_name}" IS DISTINCT FROM %s
-        RETURNING uuid
+        WITH input (uuid, user_uuid, project_id, value) AS (
+            VALUES (%s::uuid, %s::uuid, %s::uuid, %s::boolean)
+        ), candidate AS (
+            SELECT
+                input.uuid,
+                input.user_uuid,
+                input.project_id,
+                {inserted_values["read"]} AS read,
+                {inserted_values["pinned"]} AS pinned,
+                {inserted_values["starred"]} AS starred,
+                input.value,
+                current_flags.uuid IS NOT NULL AS existed
+            FROM input
+            JOIN m_workspace_messages AS message
+              ON message.uuid = input.uuid
+             AND message.project_id = input.project_id
+            LEFT JOIN m_workspace_user_message_flags AS current_flags
+              ON current_flags.uuid = input.uuid
+             AND current_flags.user_uuid = input.user_uuid
+             AND current_flags.project_id = input.project_id
+        ), changed AS (
+            INSERT INTO m_workspace_user_message_flags AS flags (
+                uuid, user_uuid, project_id, read, pinned, starred
+            )
+            SELECT uuid, user_uuid, project_id, read, pinned, starred
+            FROM candidate
+            WHERE value OR existed
+            ON CONFLICT (uuid, user_uuid) DO UPDATE
+            SET "{field_name}" = EXCLUDED."{field_name}", updated_at = NOW()
+            WHERE flags.project_id = EXCLUDED.project_id
+              AND flags."{field_name}" IS DISTINCT FROM EXCLUDED."{field_name}"
+            RETURNING uuid
+        )
+        SELECT changed.uuid, candidate.existed
+        FROM changed
+        JOIN candidate ON candidate.uuid = changed.uuid
         """,
-        (value, project_id, user_uuid, message_uuid, value),
+        (message_uuid, user_uuid, project_id, value),
     ).fetchone()
-    return row is not None
+    changed = row is not None
+    return changed
 
 
 def sync_workspace_user_message_flags(
@@ -5184,15 +5967,17 @@ def sync_workspace_user_message_flags(
     if emit_events:
         _lock_workspace_project_event_writes(project_id, current_session)
     changed_values = {}
-    for field_name, value in values.items():
-        if _update_workspace_user_message_flag(
+    ordered_values = sorted(values.items(), key=lambda item: item[1] is not True)
+    for field_name, value in ordered_values:
+        changed = _update_workspace_user_message_flag(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
             field_name=field_name,
             value=value,
             session=current_session,
-        ):
+        )
+        if changed:
             changed_values[field_name] = value
     if not changed_values:
         if emit_events:
@@ -5257,14 +6042,15 @@ def sync_workspace_user_messages_read_state(
             getattr(current_message, "author_uuid", None) == user_uuid
             and not allow_author_unread
         )
-        if not _update_workspace_user_message_flag(
+        changed = _update_workspace_user_message_flag(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=current_message.uuid,
             field_name="read",
             value=effective_read,
             session=current_session,
-        ):
+        )
+        if not changed:
             continue
         changed_message = get_workspace_user_message(
             project_id=project_id,
@@ -5431,6 +6217,9 @@ def delete_workspace_user_message(
     enforce_visibility: typing.Any = True,
     compact_events: typing.Any = False,
 ) -> None:
+    current_session = session or contexts.Context().get_session()
+    read_state.lock_message_structure(current_session, (project_id,))
+    _lock_workspace_project_event_writes(project_id, current_session)
     if enforce_visibility:
         get_workspace_user_message(
             project_id=project_id,
@@ -5478,7 +6267,19 @@ def delete_workspace_user_message(
                 session=session,
             )
 
-    current_session = session or contexts.Context().get_session()
+    if read_state.writes_compact_state(current_session, project_id):
+        read_state.clear_message_for_all_users(
+            current_session,
+            project_id,
+            message_uuid,
+        )
+    if callable(getattr(current_session, "execute", None)):
+        read_state.record_message_deleted(
+            current_session,
+            project_id,
+            message.topic_uuid,
+            message.uuid,
+        )
     message.delete(session=current_session)
     if message.topic_uuid is not None:
         _restore_topic_summary_after_message_deletion(

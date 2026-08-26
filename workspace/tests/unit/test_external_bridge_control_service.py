@@ -268,6 +268,9 @@ def test_provider_ingress_is_bound_to_authenticated_bridge_assignment(
         def fetchone(self):
             return self.row
 
+        def fetchall(self):
+            return self.row
+
     class Session:
         def __init__(self):
             self.rows = iter(
@@ -284,10 +287,17 @@ def test_provider_ingress_is_bound_to_authenticated_bridge_assignment(
             )
             self.statements = []
 
-        def execute(self, statement, params):
+        def execute(self, statement, params=None):
             self.statements.append((statement, params))
             if "pg_advisory_xact_lock" in statement:
                 return Result(None)
+            if statement.startswith(("SAVEPOINT", "ROLLBACK", "RELEASE")):
+                return Result(None)
+            if (
+                "SELECT DISTINCT project_id" in statement
+                and "FROM m_workspace_messages" in statement
+            ):
+                return Result([])
             return Result(next(self.rows))
 
     session = Session()
@@ -310,13 +320,20 @@ def test_provider_ingress_is_bound_to_authenticated_bridge_assignment(
             request_session=session,
         )
 
-    provider_statements = [
-        item for item in session.statements if "pg_advisory_xact_lock" not in item[0]
-    ]
-    assert provider_statements[0][1][0] == other_instance_uuid
-    assert provider_statements[1][1][5] == other_instance_uuid
-    assert provider_statements[1][1][8] == other_instance_uuid
-    assert provider_statements[1][1][10] == other_instance_uuid
+    heartbeat_params = next(
+        params
+        for statement, params in session.statements
+        if "m_external_bridge_instances_v2" in statement
+    )
+    route_params = next(
+        params
+        for statement, params in session.statements
+        if "requested.account_global" in statement
+    )
+    assert heartbeat_params[0] == other_instance_uuid
+    assert route_params[5] == other_instance_uuid
+    assert route_params[8] == other_instance_uuid
+    assert route_params[10] == other_instance_uuid
 
 
 def test_enrollment_invalid_token_is_401_and_does_not_consume_generation(

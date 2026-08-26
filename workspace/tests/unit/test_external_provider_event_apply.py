@@ -15,6 +15,21 @@ from workspace.external_bridge_control import provider_event_apply
 from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import read_state
+
+
+@pytest.fixture(autouse=True)
+def _legacy_read_state(monkeypatch):
+    monkeypatch.setattr(
+        read_state,
+        "project_mode",
+        lambda _session, _project_id: read_state.PROJECT_MODE_LEGACY,
+    )
+    monkeypatch.setattr(
+        read_state,
+        "_assign_legacy_ingest_sequences",
+        lambda *_args, **_kwargs: 0,
+    )
 
 
 def test_topic_merge_uses_notification_timestamp_not_generic_updated_at():
@@ -1592,6 +1607,8 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
                 "provider_chat_id": "zulip-channel-7",
             },
             None,
+            None,
+            None,
             user_topics,
             user_streams,
         ]
@@ -1670,6 +1687,11 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
         )
 
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
+    monkeypatch.setattr(
+        provider_event_apply.read_state,
+        "lock_projects",
+        lambda session, _project_ids: session.execute("SELECT 1"),
+    )
     monkeypatch.setattr(
         provider_event_apply,
         "_ensure_projection_owner_stream",
@@ -2279,9 +2301,7 @@ def test_message_update_moves_existing_provider_message_to_reported_topic(
             {"session": session},
         )
     ]
-    assert summary_invalidations == [
-        ((session, [old_topic_uuid, new_topic_uuid]), {})
-    ]
+    assert summary_invalidations == [((session, [old_topic_uuid, new_topic_uuid]), {})]
     assert unread_calls == [
         (
             (
@@ -2364,9 +2384,7 @@ def test_message_update_moves_existing_provider_message_to_reported_stream(
     assert provider_event_apply.apply_event(event, session, identity) == message_uuid
     assert updated_values[0]["stream_uuid"] == new_stream_uuid
     assert updated_values[0]["topic_uuid"] == new_topic_uuid
-    assert summary_invalidations == [
-        ((session, [old_topic_uuid, new_topic_uuid]), {})
-    ]
+    assert summary_invalidations == [((session, [old_topic_uuid, new_topic_uuid]), {})]
     assert unread_calls == [
         (
             (
@@ -2494,6 +2512,7 @@ def test_message_update_atomically_moves_provider_projection_between_projects(
         (statement, params)
         for statement, params in session.statements
         if statement.lstrip().startswith("UPDATE m_workspace_")
+        and "m_workspace_read_state_projects_v1" not in statement
     ]
     assert [params for _statement, params in dependent_updates] == [
         (
@@ -2510,9 +2529,7 @@ def test_message_update_atomically_moves_provider_projection_between_projects(
     assert deleted_events[0]["stream_uuid"] == old_stream_uuid
     assert created_events[0]["project_id"] == destination_project_uuid
     assert created_events[0]["recipients"] == [owner_uuid]
-    assert summary_invalidations == [
-        ((session, [old_topic_uuid, new_topic_uuid]), {})
-    ]
+    assert summary_invalidations == [((session, [old_topic_uuid, new_topic_uuid]), {})]
     assert [call[0][0] for call in unread_calls] == [
         source_project_uuid,
         destination_project_uuid,

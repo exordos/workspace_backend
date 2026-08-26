@@ -3,12 +3,20 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-from restalchemy.storage.sql import migrations as ra_migrations
+import concurrent.futures
+import threading
+import time
+import uuid as sys_uuid
+
 import psycopg
 import pytest
+from restalchemy.common import contexts as ra_contexts
+from restalchemy.storage.sql import migrations as ra_migrations
 
+from workspace.messenger_api.api import context as messenger_context
+from workspace.external_bridge_control import provider_data
+from workspace.messenger_api.dm import read_state
 from workspace.tests.integration import conftest
-
 
 LEGACY_MIGRATION_UUIDS = (
     "e8e1b2c3-3739-4238-97cf-fa7613109917",
@@ -81,6 +89,37 @@ UNREAD_FOLDER_PROJECTION_MIGRATION_UUID = "93849688-bd14-40b1-8703-12e5ebe13e6b"
 UNREAD_FOLDER_PROJECTION_MIGRATION_FILE = (
     "0132-optimize-unread-folder-projections-938496.py"
 )
+NOTIFICATION_TIMESTAMPS_MIGRATION_UUID = "52d0f82b-e692-4368-b004-f9263a1f3709"
+COMPACT_READ_STATE_MIGRATION_UUID = "e84da8dc-97f6-4b10-bce7-f9652c0207a3"
+COMPACT_READ_STATE_MIGRATION_FILE = "0134-add-compact-workspace-unread-state-e84da8.py"
+COMPACT_READ_STATE_INDEX_MIGRATION_UUID = "b469650b-f613-4f57-869a-1dd7f6f373c3"
+COMPACT_READ_STATE_INDEX_MIGRATION_FILE = (
+    "0135-add-resumable-compact-unread-indexes-b46965.py"
+)
+LAZY_PROVIDER_READ_MIGRATION_UUID = "e5b13624-7b61-4623-9081-61a2e51afd92"
+LAZY_PROVIDER_READ_MIGRATION_FILE = "0136-add-lazy-provider-read-snapshots-e5b136.py"
+PROVIDER_READ_LEASE_FENCE_MIGRATION_UUID = "dfc77921-c0d9-4d1e-b919-b360bc1f2b94"
+PROVIDER_READ_LEASE_FENCE_MIGRATION_FILE = (
+    "0137-fence-lazy-provider-read-leases-dfc779.py"
+)
+PROVIDER_READ_ROLLING_FENCE_MIGRATION_UUID = "1b0b0164-4d20-4d6a-9991-26a13b1a4d60"
+PROVIDER_READ_ROLLING_FENCE_MIGRATION_FILE = (
+    "0138-harden-lazy-provider-read-rolling-fences-1b0b01.py"
+)
+PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID = "1bca8f2b-147f-4af8-b6e4-8078a3be253b"
+PROJECT_DENSE_READ_SEQUENCE_MIGRATION_FILE = (
+    "0139-densify-project-read-sequences-1bca8f.py"
+)
+PROVIDER_HISTORY_DOWNGRADE_MIGRATION_UUID = "68c9b8f1-d900-46db-b395-b514499698df"
+PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE = (
+    "0140-add-resumable-provider-read-downgrade-68c9b8.py"
+)
+READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID = (
+    "60f5cad2-fe10-4df3-bced-2a248497afd1"
+)
+READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE = (
+    "0141-forward-correct-published-read-state-migrations-60f5ca.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -97,7 +136,7 @@ LEGACY_TABLES = (
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == UNREAD_FOLDER_PROJECTION_MIGRATION_FILE
+    assert engine.get_latest_migration() == READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -122,6 +161,15 @@ def test_current_migrations_have_a_single_head(_database, db):
                     UNREAD_COUNTERS_MIGRATION_UUID,
                     EXTERNAL_CONTENT_INDEX_MIGRATION_UUID,
                     UNREAD_FOLDER_PROJECTION_MIGRATION_UUID,
+                    NOTIFICATION_TIMESTAMPS_MIGRATION_UUID,
+                    COMPACT_READ_STATE_MIGRATION_UUID,
+                    COMPACT_READ_STATE_INDEX_MIGRATION_UUID,
+                    LAZY_PROVIDER_READ_MIGRATION_UUID,
+                    PROVIDER_READ_LEASE_FENCE_MIGRATION_UUID,
+                    PROVIDER_READ_ROLLING_FENCE_MIGRATION_UUID,
+                    PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID,
+                    PROVIDER_HISTORY_DOWNGRADE_MIGRATION_UUID,
+                    READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID,
                 ],
             ),
         )
@@ -145,6 +193,15 @@ def test_current_migrations_have_a_single_head(_database, db):
             (UNREAD_COUNTERS_MIGRATION_UUID, True),
             (EXTERNAL_CONTENT_INDEX_MIGRATION_UUID, True),
             (UNREAD_FOLDER_PROJECTION_MIGRATION_UUID, True),
+            (NOTIFICATION_TIMESTAMPS_MIGRATION_UUID, True),
+            (COMPACT_READ_STATE_MIGRATION_UUID, True),
+            (COMPACT_READ_STATE_INDEX_MIGRATION_UUID, True),
+            (LAZY_PROVIDER_READ_MIGRATION_UUID, True),
+            (PROVIDER_READ_LEASE_FENCE_MIGRATION_UUID, True),
+            (PROVIDER_READ_ROLLING_FENCE_MIGRATION_UUID, True),
+            (PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID, True),
+            (PROVIDER_HISTORY_DOWNGRADE_MIGRATION_UUID, True),
+            (READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -237,6 +294,2839 @@ def test_current_migrations_have_a_single_head(_database, db):
             """
         )
         assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT sequencename, start_value, min_value, max_value
+            FROM pg_sequences
+            WHERE sequencename IN (
+                'm_workspace_messages_ingest_sequence_v1_seq',
+                'm_workspace_messages_legacy_ingest_sequence_v1_seq'
+            )
+            ORDER BY sequencename
+            """
+        )
+        assert cur.fetchall() == [
+            (
+                "m_workspace_messages_ingest_sequence_v1_seq",
+                281474976710656,
+                1,
+                9223372036854775807,
+            ),
+            (
+                "m_workspace_messages_legacy_ingest_sequence_v1_seq",
+                1,
+                1,
+                281474976710655,
+            ),
+        ]
+        cur.execute(
+            """
+            SELECT pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conname = 'm_workspace_read_state_compaction_phase_check'
+            """
+        )
+        phase_constraint = cur.fetchone()[0]
+        assert "verify_chunks" in phase_constraint
+        assert "verify_read_stats" in phase_constraint
+        cur.execute(
+            """
+            SELECT pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conname = 'm_workspace_read_state_projects_mode_check'
+            """
+        )
+        assert "rollback" in cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'm_external_provider_operations_v1'
+              AND column_name IN ('public_result_status', 'terminal_result')
+            """
+        )
+        assert {row[0] for row in cur.fetchall()} == {
+            "public_result_status",
+            "terminal_result",
+        }
+        cur.execute(
+            """
+            SELECT to_regclass(
+                'm_external_provider_operations_external_operation_idx'
+            )
+            """
+        )
+        assert cur.fetchone()[0] == (
+            "m_external_provider_operations_external_operation_idx"
+        )
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM pg_constraint
+            WHERE conname =
+                'm_external_provider_operations_v1_external_operation_uuid_key'
+            """
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT indexrelid::regclass::text, indisvalid
+            FROM pg_index
+            WHERE indexrelid IN (
+                to_regclass('m_workspace_messages_ingest_sequence_idx'),
+                to_regclass(
+                    'm_workspace_messages_project_ingest_sequence_idx'
+                ),
+                to_regclass(
+                    'm_workspace_messages_topic_ingest_sequence_idx'
+                ),
+                to_regclass('m_workspace_messages_stream_read_page_idx'),
+                to_regclass('m_workspace_messages_topic_read_page_idx'),
+                to_regclass(
+                    'm_workspace_messages_stream_ingest_sequence_idx'
+                ),
+                to_regclass('m_workspace_read_flags_project_message_idx'),
+                to_regclass('m_workspace_flags_project_message_user_idx')
+            )
+            """
+        )
+        assert set(cur.fetchall()) == {
+            ("m_workspace_messages_ingest_sequence_idx", True),
+            ("m_workspace_messages_project_ingest_sequence_idx", True),
+            ("m_workspace_messages_topic_ingest_sequence_idx", True),
+            ("m_workspace_messages_stream_read_page_idx", True),
+            ("m_workspace_messages_topic_read_page_idx", True),
+            ("m_workspace_messages_stream_ingest_sequence_idx", True),
+            ("m_workspace_read_flags_project_message_idx", True),
+            ("m_workspace_flags_project_message_user_idx", True),
+        }
+
+
+def test_forward_correction_upgrades_published_read_state_without_rewrite(
+    _database,
+    db,
+):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+
+    project_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        user_uuid,
+        "Online sequence migration",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        user_uuid,
+        "general",
+        is_default=True,
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_project_ingest_ranges_v2'
+              AND column_name IN (
+                    'next_local_sequence',
+                    'last_backfill_sequence',
+                    'last_live_sequence'
+              )
+            """
+        )
+        assert {row[0] for row in cur.fetchall()} == {"next_local_sequence"}
+        cur.execute(
+            """
+            SELECT pg_get_functiondef(
+                'm_external_provider_read_lease_fence_v1()'::regprocedure
+            )
+            """
+        )
+        published_fence = cur.fetchone()[0]
+        assert "workspace.provider_read_snapshot_lease_v2" in published_fence
+        assert "m_external_bridge_instances_v2" not in published_fence
+        cur.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"stable coordinate"}',
+                'native', '{"kind":"native"}'
+            )
+            RETURNING ingest_sequence, xmin::text, ctid::text
+            """,
+            (message_uuid, project_uuid, stream_uuid, topic_uuid, user_uuid),
+        )
+        ingest_sequence, row_xmin, row_ctid = cur.fetchone()
+        assert ingest_sequence % 4_294_967_296 == 1
+        cur.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode
+            ) VALUES (%s, 'compact')
+            """,
+            (project_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_read_chunks_v1 (
+                user_uuid, chunk_number, read_bits
+            ) VALUES (
+                %s,
+                %s,
+                set_bit(B'0'::bit(4096), %s, 1)
+            )
+            """,
+            (
+                user_uuid,
+                ingest_sequence // read_state.READ_CHUNK_BITS,
+                ingest_sequence % read_state.READ_CHUNK_BITS,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT indexrelid::regclass::text, indexrelid
+            FROM pg_index
+            WHERE indexrelid IN (
+                to_regclass('m_workspace_messages_ingest_sequence_idx'),
+                to_regclass(
+                    'm_workspace_messages_project_ingest_sequence_idx'
+                )
+            )
+            ORDER BY indexrelid::regclass::text
+            """
+        )
+        index_oids = cur.fetchall()
+
+    # Published 0139 already assigned project-local coordinates. The new HEAD
+    # changes only allocator metadata and preserves every compact bitmap bit.
+    engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ingest_sequence, xmin::text, ctid::text
+            FROM m_workspace_messages
+            WHERE uuid = %s
+            """,
+            (message_uuid,),
+        )
+        assert cur.fetchone() == (ingest_sequence, row_xmin, row_ctid)
+        cur.execute(
+            """
+            SELECT indexrelid::regclass::text, indexrelid
+            FROM pg_index
+            WHERE indexrelid IN (
+                to_regclass('m_workspace_messages_ingest_sequence_idx'),
+                to_regclass(
+                    'm_workspace_messages_project_ingest_sequence_idx'
+                )
+            )
+            ORDER BY indexrelid::regclass::text
+            """
+        )
+        assert cur.fetchall() == index_oids
+        cur.execute(
+            """
+            SELECT last_backfill_sequence, last_live_sequence
+            FROM m_workspace_project_ingest_ranges_v2
+            WHERE project_id = %s
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == (1, 2_147_483_647)
+        cur.execute(
+            """
+            SELECT pg_get_functiondef(
+                'm_external_provider_read_lease_fence_v1()'::regprocedure
+            )
+            """
+        )
+        corrected_fence = cur.fetchone()[0]
+        assert "workspace.provider_read_snapshot_lease_v2" in corrected_fence
+        assert "m_external_bridge_instances_v2" in corrected_fence
+
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM m_workspace_user_read_chunks_v1 WHERE user_uuid = %s",
+            (user_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_streams WHERE uuid = %s AND project_id = %s",
+            (stream_uuid, project_uuid),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
+            (project_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_project_ingest_ranges_v2 WHERE project_id = %s",
+            (project_uuid,),
+        )
+
+
+def test_lazy_provider_read_migrations_roundtrip_install_rolling_triggers(
+    _database,
+    db,
+):
+    # Integration fixtures share one database process. Retire completed test
+    # operations from earlier messenger cases before exercising a real schema
+    # rollback; the dedicated concurrency test below covers the refusal path.
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM m_external_operations_v2
+            WHERE uuid IN (
+                SELECT external_operation_uuid
+                FROM m_external_provider_read_snapshots_v1
+            )
+            """
+        )
+    db.commit()
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+
+    engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    engine.rollback_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
+    engine.rollback_migration(PROJECT_DENSE_READ_SEQUENCE_MIGRATION_FILE)
+    engine.rollback_migration(PROVIDER_READ_ROLLING_FENCE_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT to_regclass('m_external_provider_read_candidate_chunks_v1')"
+        )
+        assert cur.fetchone() == (None,)
+        cur.execute("SELECT to_regclass('m_workspace_user_read_revisions_v1')")
+        assert cur.fetchone() == (None,)
+        cur.execute(
+            """
+            SELECT pg_get_functiondef(
+                'm_external_provider_read_lease_fence_v1()'::regprocedure
+            )
+            """
+        )
+        assert "workspace.provider_read_snapshot_lease_v2" not in cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT pg_get_functiondef(
+                'm_external_provider_read_completion_fence_v1()'::regprocedure
+            )
+            """
+        )
+        assert "provider_operation" not in cur.fetchone()[0]
+    engine.rollback_migration(PROVIDER_READ_LEASE_FENCE_MIGRATION_FILE)
+    engine.rollback_migration(LAZY_PROVIDER_READ_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (LAZY_PROVIDER_READ_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (False,)
+        cur.execute("SELECT to_regclass('m_external_provider_read_candidate_packs_v1')")
+        assert cur.fetchone() == (None,)
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_name = 'm_external_provider_operations_v1'
+              AND column_name = 'causal_lane'
+            """
+        )
+        assert cur.fetchone() == (0,)
+
+    engine.apply_migration(LAZY_PROVIDER_READ_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (LAZY_PROVIDER_READ_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute("SELECT to_regclass('m_external_provider_read_candidate_packs_v1')")
+        assert cur.fetchone() == ("m_external_provider_read_candidate_packs_v1",)
+        cur.execute(
+            """
+            SELECT tgname
+            FROM pg_trigger
+            WHERE tgname = ANY(%s)
+              AND NOT tgisinternal
+            ORDER BY tgname
+            """,
+            (
+                [
+                    "m_external_provider_operation_lane_v1",
+                    "m_external_provider_read_completion_fence_v1",
+                    "m_external_provider_read_payload_scrub_v1",
+                ],
+            ),
+        )
+        assert [row[0] for row in cur.fetchall()] == [
+            "m_external_provider_operation_lane_v1",
+            "m_external_provider_read_completion_fence_v1",
+            "m_external_provider_read_payload_scrub_v1",
+        ]
+
+    # Lab and other early adopters can already have 0136 recorded as applied.
+    # The independent 0137 step must install the lease fence in that state.
+    engine.apply_migration(PROVIDER_READ_LEASE_FENCE_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (PROVIDER_READ_LEASE_FENCE_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            """
+            SELECT tgname
+            FROM pg_trigger
+            WHERE tgname = 'm_external_provider_read_lease_fence_v1'
+              AND NOT tgisinternal
+            """
+        )
+        assert cur.fetchone() == ("m_external_provider_read_lease_fence_v1",)
+
+    engine.apply_migration(PROVIDER_READ_ROLLING_FENCE_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (PROVIDER_READ_ROLLING_FENCE_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            "SELECT to_regclass('m_external_provider_read_candidate_chunks_v1')"
+        )
+        assert cur.fetchone() == ("m_external_provider_read_candidate_chunks_v1",)
+        cur.execute("SELECT to_regclass('m_workspace_user_read_revisions_v1')")
+        assert cur.fetchone() == ("m_workspace_user_read_revisions_v1",)
+        cur.execute(
+            """
+            SELECT data_type, character_maximum_length, is_nullable
+            FROM information_schema.columns
+            WHERE table_name =
+                    'm_external_provider_read_candidate_chunks_v1'
+              AND column_name = 'candidate_bits'
+            """
+        )
+        assert cur.fetchone() == ("bit", 4096, "NO")
+
+    engine.apply_migration(PROJECT_DENSE_READ_SEQUENCE_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute("SELECT to_regclass('m_workspace_project_ingest_ranges_v2')")
+        assert cur.fetchone() == ("m_workspace_project_ingest_ranges_v2",)
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_project_ingest_ranges_v2'
+              AND column_name IN (
+                    'next_local_sequence',
+                    'last_backfill_sequence',
+                    'last_live_sequence'
+              )
+            """
+        )
+        assert {row[0] for row in cur.fetchall()} == {"next_local_sequence"}
+    engine.apply_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
+    engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_project_ingest_ranges_v2'
+              AND column_name IN (
+                    'next_local_sequence',
+                    'last_backfill_sequence',
+                    'last_live_sequence'
+              )
+            """
+        )
+        assert {row[0] for row in cur.fetchall()} == {
+            "last_backfill_sequence",
+            "last_live_sequence",
+        }
+
+
+def test_forward_correction_freezes_persisted_provider_read_response_identity(
+    _database,
+    db,
+):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    published_operation_uuid = sys_uuid.uuid4()
+    published_snapshot_uuid = sys_uuid.uuid4()
+    old_worker_operation_uuid = sys_uuid.uuid4()
+    old_worker_snapshot_uuid = sys_uuid.uuid4()
+    published_provider_uuid = sys_uuid.uuid4()
+    published_snapshot_provider_uuid = sys_uuid.uuid4()
+    old_worker_provider_uuid = sys_uuid.uuid4()
+    old_worker_snapshot_provider_uuid = sys_uuid.uuid4()
+    published_lease_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES (%s, %s, %s, 'read_state.set', 'stream', 'running')
+            """,
+            (
+                (published_operation_uuid, account_uuid, owner_uuid),
+                (published_snapshot_uuid, account_uuid, owner_uuid),
+                (old_worker_operation_uuid, account_uuid, owner_uuid),
+                (old_worker_snapshot_uuid, account_uuid, owner_uuid),
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                jsonb_build_object(
+                    'stream_uuid', %s::text,
+                    '_workspace_response_revision', 1
+                )
+            )
+            """,
+            (
+                published_snapshot_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind,
+                causal_lane, payload, status, attempt,
+                lease_uuid, lease_expires_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set', %s,
+                jsonb_build_object(
+                    'stream_uuid', %s::text,
+                    'message_uuids', '[]'::jsonb,
+                    '_workspace_response_revision', 1
+                ),
+                'leased', 1, %s, NOW() + INTERVAL '1 minute'
+            )
+            """,
+            (
+                (
+                    published_provider_uuid,
+                    published_operation_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    stream_uuid,
+                    published_lease_uuids[0],
+                ),
+                (
+                    published_snapshot_provider_uuid,
+                    published_snapshot_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    stream_uuid,
+                    published_lease_uuids[1],
+                ),
+            ),
+        )
+
+    engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    with db.cursor() as cur:
+        # A published worker does not know about the new columns. Its inserts
+        # must still persist the published physical-UUID response contract.
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind,
+                causal_lane, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set', %s,
+                jsonb_build_object(
+                    'stream_uuid', %s::text,
+                    'message_uuids', '[]'::jsonb
+                )
+            )
+            """,
+            (
+                old_worker_provider_uuid,
+                old_worker_operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                jsonb_build_object('stream_uuid', %s::text)
+            )
+            """,
+            (
+                old_worker_snapshot_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind,
+                causal_lane, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set', %s,
+                jsonb_build_object(
+                    'stream_uuid', %s::text,
+                    'message_uuids', '[]'::jsonb
+                )
+            )
+            """,
+            (
+                old_worker_snapshot_provider_uuid,
+                old_worker_snapshot_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                stream_uuid,
+            ),
+        )
+    with ra_contexts.Context().session_manager() as session:
+        rows = session.execute(
+            """
+            SELECT *
+            FROM m_external_provider_operations_v1
+            WHERE uuid = ANY(%s::uuid[])
+            """,
+            (
+                [
+                    published_provider_uuid,
+                    published_snapshot_provider_uuid,
+                    old_worker_provider_uuid,
+                    old_worker_snapshot_provider_uuid,
+                ],
+            ),
+        ).fetchall()
+        by_uuid = {row["uuid"]: row for row in rows}
+        for provider_uuid in (
+            published_provider_uuid,
+            published_snapshot_provider_uuid,
+            old_worker_provider_uuid,
+            old_worker_snapshot_provider_uuid,
+        ):
+            assert "_workspace_response_revision" not in by_uuid[provider_uuid][
+                "payload"
+            ]
+        published_response = provider_data._operation_dict(
+            by_uuid[published_provider_uuid]
+        )
+        assert published_response["external_operation_uuid"] == str(
+            published_provider_uuid
+        )
+        assert published_response["provider_operation_uuid"] == str(
+            published_provider_uuid
+        )
+
+        snapshots = session.execute(
+            """
+            SELECT external_operation_uuid, payload
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = ANY(%s::uuid[])
+            """,
+            ([published_snapshot_uuid, old_worker_snapshot_uuid],),
+        ).fetchall()
+        assert all(
+            "_workspace_response_revision" not in row["payload"]
+            for row in snapshots
+        )
+
+    # 0141 never changes the published read-delivery identity. A leased row
+    # therefore replays byte-for-byte across the forward migration downgrade.
+    engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    with ra_contexts.Context().session_manager() as session:
+        replay_row = session.execute(
+            "SELECT * FROM m_external_provider_operations_v1 WHERE uuid = %s",
+            (published_provider_uuid,),
+        ).fetchone()
+        assert provider_data._operation_dict(replay_row) == published_response
+    engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+
+
+def test_lazy_provider_read_rolling_lease_fence_blocks_old_worker(_database, db):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    other_stream_uuid = sys_uuid.uuid4()
+    snapshot_uuid = sys_uuid.uuid4()
+    later_uuid = sys_uuid.uuid4()
+    other_lane_uuid = sys_uuid.uuid4()
+    snapshot_page_uuid = sys_uuid.uuid4()
+    later_provider_uuid = sys_uuid.uuid4()
+    other_lane_provider_uuid = sys_uuid.uuid4()
+    old_bridge_lease_uuid = sys_uuid.uuid4()
+    paging_bridge_lease_uuid = sys_uuid.uuid4()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (
+                uuid, provider, capabilities
+            ) VALUES (
+                %s, 'zulip',
+                '{"messenger.message.read":{"revision":2}}'::jsonb
+            )
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES
+                (%s, %s, %s, 'read_state.set', 'stream', 'running'),
+                (%s, %s, %s, 'read_state.set', 'stream', 'queued'),
+                (%s, %s, %s, 'read_state.set', 'stream', 'queued')
+            """,
+            (
+                snapshot_uuid,
+                account_uuid,
+                owner_uuid,
+                later_uuid,
+                account_uuid,
+                owner_uuid,
+                other_lane_uuid,
+                account_uuid,
+                owner_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb)
+            """,
+            (
+                snapshot_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind, payload
+            ) VALUES
+                (%s, %s, %s, %s, %s, 'read_state.set',
+                 jsonb_build_object('stream_uuid', %s::text)),
+                (%s, %s, %s, %s, %s, 'read_state.set',
+                 jsonb_build_object('stream_uuid', %s::text)),
+                (%s, %s, %s, %s, %s, 'read_state.set',
+                 jsonb_build_object('stream_uuid', %s::text))
+            """,
+            (
+                snapshot_page_uuid,
+                snapshot_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                later_provider_uuid,
+                later_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                other_lane_provider_uuid,
+                other_lane_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                other_stream_uuid,
+            ),
+        )
+
+        # This is the pre-migration lease transition: it has no snapshot
+        # barrier predicate and relies entirely on the database trigger.
+        cur.execute(
+            """
+            WITH candidates AS (
+                SELECT uuid
+                FROM m_external_provider_operations_v1
+                WHERE bridge_instance_uuid = %s AND status = 'queued'
+                ORDER BY sequence
+                LIMIT 10
+            )
+            UPDATE m_external_provider_operations_v1 AS operation
+            SET status = 'leased', attempt = operation.attempt + 1,
+                lease_uuid = %s,
+                lease_expires_at = NOW() + INTERVAL '1 minute',
+                updated_at = NOW()
+            FROM candidates
+            WHERE operation.uuid = candidates.uuid
+            RETURNING operation.uuid
+            """,
+            (bridge_uuid, old_bridge_lease_uuid),
+        )
+        assert {row[0] for row in cur.fetchall()} == {other_lane_provider_uuid}
+
+        # Bridge revision alone is not a rolling-deployment proof. An old
+        # backend worker remains fenced because it cannot preserve the lazy
+        # aggregate lifecycle.
+        cur.execute(
+            """
+            WITH candidates AS (
+                SELECT uuid
+                FROM m_external_provider_operations_v1
+                WHERE bridge_instance_uuid = %s AND status = 'queued'
+                ORDER BY sequence
+                LIMIT 10
+            )
+            UPDATE m_external_provider_operations_v1 AS operation
+            SET status = 'leased', attempt = operation.attempt + 1,
+                lease_uuid = %s,
+                lease_expires_at = NOW() + INTERVAL '1 minute',
+                updated_at = NOW()
+            FROM candidates
+            WHERE operation.uuid = candidates.uuid
+            RETURNING operation.uuid
+            """,
+            (bridge_uuid, paging_bridge_lease_uuid),
+        )
+        assert cur.fetchall() == []
+
+        # Only the snapshot-aware lease path sets this transaction-local
+        # capability immediately before the queued-to-leased update.
+        with db.transaction():
+            with db.cursor() as capability_cur:
+                capability_cur.execute(
+                    """
+                    SELECT set_config(
+                        'workspace.provider_read_snapshot_lease_v2', 'on', TRUE
+                    )
+                    """
+                )
+                assert capability_cur.fetchone() == ("on",)
+                capability_cur.execute(
+                    """
+                    UPDATE m_external_bridge_instances_v2
+                    SET capabilities =
+                        '{"messenger.message.read":{"revision":1}}'::jsonb
+                    WHERE uuid = %s
+                    """,
+                    (bridge_uuid,),
+                )
+                capability_cur.execute(
+                    "SELECT current_setting("
+                    "'workspace.provider_read_snapshot_lease_v2', TRUE"
+                    ")"
+                )
+                assert capability_cur.fetchone() == ("on",)
+                capability_cur.execute(
+                    """
+                    WITH candidates AS (
+                        SELECT uuid
+                        FROM m_external_provider_operations_v1
+                        WHERE bridge_instance_uuid = %s AND status = 'queued'
+                        ORDER BY sequence
+                        LIMIT 10
+                    )
+                    UPDATE m_external_provider_operations_v1 AS operation
+                    SET status = 'leased', attempt = operation.attempt + 1,
+                        lease_uuid = %s,
+                        lease_expires_at = NOW() + INTERVAL '1 minute',
+                        updated_at = NOW()
+                    FROM candidates
+                    WHERE operation.uuid = candidates.uuid
+                    RETURNING operation.uuid
+                    """,
+                    (bridge_uuid, paging_bridge_lease_uuid),
+                )
+                assert capability_cur.fetchall() == []
+                capability_cur.execute(
+                    """
+                    UPDATE m_external_bridge_instances_v2
+                    SET capabilities =
+                        '{"messenger.message.read":{"revision":2}}'::jsonb
+                    WHERE uuid = %s
+                    """,
+                    (bridge_uuid,),
+                )
+                capability_cur.execute(
+                    """
+                    WITH candidates AS (
+                        SELECT uuid
+                        FROM m_external_provider_operations_v1
+                        WHERE bridge_instance_uuid = %s AND status = 'queued'
+                        ORDER BY sequence
+                        LIMIT 10
+                    )
+                    UPDATE m_external_provider_operations_v1 AS operation
+                    SET status = 'leased', attempt = operation.attempt + 1,
+                        lease_uuid = %s,
+                        lease_expires_at = NOW() + INTERVAL '1 minute',
+                        updated_at = NOW()
+                    FROM candidates
+                    WHERE operation.uuid = candidates.uuid
+                    RETURNING operation.uuid
+                    """,
+                    (bridge_uuid, paging_bridge_lease_uuid),
+                )
+                assert {row[0] for row in capability_cur.fetchall()} == {
+                    snapshot_page_uuid
+                }
+        cur.execute(
+            """
+            SELECT uuid, status, causal_lane
+            FROM m_external_provider_operations_v1
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            ([snapshot_page_uuid, later_provider_uuid, other_lane_provider_uuid],),
+        )
+        state = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+        assert state[snapshot_page_uuid] == ("leased", stream_uuid)
+        assert state[later_provider_uuid] == ("queued", stream_uuid)
+        assert state[other_lane_provider_uuid] == ("leased", other_stream_uuid)
+
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+    db.commit()
+
+
+def test_lazy_provider_read_rolling_triggers_fence_and_scrub(_database, db):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    provider_operation_uuid = sys_uuid.uuid4()
+    sibling_operation_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES (%s, %s, %s, 'read_state.set', 'stream', 'running')
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb)
+            """,
+            (
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind, payload,
+                status, attempt, lease_uuid, lease_expires_at
+            ) VALUES
+                (
+                    %s, %s, %s, %s, %s, 'read_state.set',
+                    jsonb_build_object(
+                        'stream_uuid', %s::text,
+                        'message_uuids', jsonb_build_array(%s::text)
+                    ),
+                    'leased', 1, %s, NOW() + INTERVAL '1 minute'
+                ),
+                (
+                    %s, %s, %s, %s, %s, 'read_state.set',
+                    jsonb_build_object(
+                        'stream_uuid', %s::text,
+                        'message_uuids', jsonb_build_array(%s::text)
+                    ),
+                    'leased', 1, %s, NOW() + INTERVAL '1 minute'
+                )
+            """,
+            (
+                provider_operation_uuid,
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                message_uuid,
+                sys_uuid.uuid4(),
+                sibling_operation_uuid,
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                sys_uuid.uuid4(),
+                sys_uuid.uuid4(),
+            ),
+        )
+
+        # Simulate an old worker: its successful page result must be scrubbed
+        # even though it has no application-level lazy snapshot handling.
+        cur.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET status = 'succeeded', lease_uuid = NULL,
+                lease_expires_at = NULL, completed_at = NOW()
+            WHERE uuid = %s
+            RETURNING payload->'message_uuids'
+            """,
+            (provider_operation_uuid,),
+        )
+        assert cur.fetchone() == ([],)
+
+        # An old worker must not finish the public aggregate while another
+        # lazy page remains. PostgreSQL suppresses just that status update.
+        cur.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'succeeded'
+            WHERE uuid = %s
+            RETURNING status
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() is None
+        cur.execute(
+            """
+            SELECT operation.status, snapshot.exhausted
+            FROM m_external_operations_v2 AS operation
+            JOIN m_external_provider_read_snapshots_v1 AS snapshot
+              ON snapshot.external_operation_uuid = operation.uuid
+            WHERE operation.uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == ("running", False)
+
+        # Exhausting the exact candidate set is insufficient while another
+        # sibling page is still leased.
+        cur.execute(
+            """
+            UPDATE m_external_provider_read_snapshots_v1
+            SET exhausted = TRUE
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        cur.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'succeeded'
+            WHERE uuid = %s
+            RETURNING status
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() is None
+        cur.execute(
+            """
+            SELECT operation.status, snapshot.exhausted
+            FROM m_external_operations_v2 AS operation
+            JOIN m_external_provider_read_snapshots_v1 AS snapshot
+              ON snapshot.external_operation_uuid = operation.uuid
+            WHERE operation.uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == ("running", True)
+
+        cur.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET status = 'failed', lease_uuid = NULL,
+                lease_expires_at = NULL, completed_at = NOW()
+            WHERE uuid = %s
+            """,
+            (sibling_operation_uuid,),
+        )
+        cur.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'succeeded'
+            WHERE uuid = %s
+            RETURNING status
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() is None
+
+        cur.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET status = 'succeeded', lease_uuid = NULL,
+                lease_expires_at = NULL, completed_at = NOW()
+            WHERE uuid = %s
+            RETURNING payload->'message_uuids'
+            """,
+            (sibling_operation_uuid,),
+        )
+        assert cur.fetchone() == ([],)
+        cur.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'succeeded'
+            WHERE uuid = %s
+            RETURNING status
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == ("succeeded",)
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == (0,)
+
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    "migration_file",
+    [
+        PROVIDER_READ_ROLLING_FENCE_MIGRATION_FILE,
+        PROVIDER_READ_LEASE_FENCE_MIGRATION_FILE,
+        LAZY_PROVIDER_READ_MIGRATION_FILE,
+    ],
+)
+def test_lazy_provider_read_downgrade_fences_concurrent_snapshot(
+    _database,
+    db,
+    migration_file,
+):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES (%s, %s, %s, 'read_state.set', 'stream', 'running')
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+    db.commit()
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration_step = engine._load_migrations()[migration_file]
+    downgrade_started = threading.Event()
+
+    def attempt_downgrade():
+        downgrade_started.set()
+        with ra_contexts.Context().session_manager() as session:
+            migration_step.downgrade(session)
+
+    with psycopg.connect(conftest.TEST_DB_URL) as writer:
+        with writer.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO m_external_provider_read_snapshots_v1 (
+                    external_operation_uuid, bridge_instance_uuid,
+                    external_account_uuid, project_id, causal_lane, payload
+                ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb)
+                """,
+                (
+                    operation_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                ),
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(attempt_downgrade)
+                assert downgrade_started.wait(timeout=5)
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    future.result(timeout=0.2)
+                writer.commit()
+                with pytest.raises(
+                    (RuntimeError, psycopg.errors.ObjectNotInPrerequisiteState),
+                    match="active snapshots to be completed or discarded",
+                ):
+                    future.result(timeout=5)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == (1,)
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+    db.commit()
+
+
+def test_lease_fence_downgrade_does_not_deadlock_old_provider_update(_database, db):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    provider_operation_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES (%s, %s, %s, 'read_state.set', 'stream', 'queued')
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set',
+                jsonb_build_object('stream_uuid', %s::text)
+            )
+            """,
+            (
+                provider_operation_uuid,
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+    db.commit()
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration_step = engine._load_migrations()[PROVIDER_READ_LEASE_FENCE_MIGRATION_FILE]
+
+    def downgrade():
+        with ra_contexts.Context().session_manager() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            migration_step.downgrade(session)
+
+    with psycopg.connect(conftest.TEST_DB_URL) as writer:
+        with writer.cursor() as cur:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                cur.execute(
+                    """
+                    UPDATE m_external_provider_operations_v1
+                    SET status = 'leased', attempt = attempt + 1,
+                        lease_uuid = %s,
+                        lease_expires_at = NOW() + INTERVAL '1 minute'
+                    WHERE uuid = %s
+                    RETURNING status
+                    """,
+                    (sys_uuid.uuid4(), provider_operation_uuid),
+                )
+                assert cur.fetchone() == ("leased",)
+
+                # This models an old worker that publishes only after its
+                # provider-table update. Queue the downgrade's exclusive gate
+                # first, then request the old worker's late shared gate.
+                with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as observer:
+                    with observer.cursor() as observer_cur:
+                        observer_cur.execute(
+                            """
+                            SELECT pg_advisory_lock_shared(
+                                hashtextextended(%s, 0)
+                            )
+                            """,
+                            ("workspace-read-state-schema-v1",),
+                        )
+                        observer_cur.execute(
+                            """
+                            SELECT classid, objid, objsubid
+                            FROM pg_locks
+                            WHERE pid = pg_backend_pid()
+                              AND locktype = 'advisory'
+                              AND mode = 'ShareLock'
+                              AND granted
+                            """
+                        )
+                        lock_coordinates = observer_cur.fetchone()
+                        assert lock_coordinates is not None
+                        future = executor.submit(downgrade)
+                        for _attempt in range(200):
+                            observer_cur.execute(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM pg_locks
+                                    WHERE locktype = 'advisory'
+                                      AND classid = %s
+                                      AND objid = %s
+                                      AND objsubid = %s
+                                      AND mode = 'ExclusiveLock'
+                                      AND NOT granted
+                                )
+                                """,
+                                lock_coordinates,
+                            )
+                            if observer_cur.fetchone() == (True,):
+                                break
+                            time.sleep(0.01)
+                        else:
+                            pytest.fail("downgrade did not wait for the schema gate")
+                        observer_cur.execute(
+                            """
+                            SELECT pg_advisory_unlock_shared(
+                                hashtextextended(%s, 0)
+                            )
+                            """,
+                            ("workspace-read-state-schema-v1",),
+                        )
+                        assert observer_cur.fetchone() == (True,)
+                cur.execute(
+                    """
+                    SELECT pg_advisory_xact_lock_shared(
+                        hashtextextended(%s, 0)
+                    )
+                    """,
+                    ("workspace-read-state-schema-v1",),
+                )
+                writer.commit()
+                future.result(timeout=5)
+
+    with ra_contexts.Context().session_manager() as session:
+        migration_step.upgrade(session)
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+    db.commit()
+
+
+def test_compact_read_state_downgrade_releases_each_bounded_project_lock(
+    _database,
+    db,
+    monkeypatch,
+):
+    project_uuids = (
+        "10000000-0000-4000-8000-0000000008f1",
+        "10000000-0000-4000-8000-0000000008f2",
+    )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration_step = engine._load_migrations()[COMPACT_READ_STATE_MIGRATION_FILE]
+    migration_module = __import__(migration_step.__class__.__module__)
+    original_batch = migration_module._hydrate_legacy_flags_batch
+    original_lock = migration_module._lock_read_state_project
+    observed_project_locks = []
+    lock_entries = []
+    forced_extra_batches = set()
+    existing_compact_project_uuids = []
+
+    def observe_released_lock(session, project_id):
+        if str(project_id) in project_uuids:
+            with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT pg_try_advisory_lock(
+                            hashtextextended(%s::text, 0)
+                        )
+                        """,
+                        (project_id,),
+                    )
+                    assert cur.fetchone() == (True,)
+                    cur.execute(
+                        """
+                        SELECT pg_advisory_unlock(
+                            hashtextextended(%s::text, 0)
+                        )
+                        """,
+                        (project_id,),
+                    )
+                    assert cur.fetchone() == (True,)
+            lock_entries.append(str(project_id))
+        return original_lock(session, project_id)
+
+    def observe_project_locks(session, project_id, batch_size):
+        if str(project_id) in project_uuids and not observed_project_locks:
+            assert str(project_id) == project_uuids[0]
+            with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT pg_try_advisory_lock(
+                            hashtextextended(%s::text, 0)
+                        )
+                        """,
+                        (project_uuids[0],),
+                    )
+                    assert cur.fetchone() == (False,)
+                    cur.execute(
+                        """
+                        SELECT pg_try_advisory_lock(
+                            hashtextextended(%s::text, 0)
+                        )
+                        """,
+                        (project_uuids[1],),
+                    )
+                    assert cur.fetchone() == (True,)
+                    cur.execute(
+                        """
+                        SELECT pg_advisory_unlock(
+                            hashtextextended(%s::text, 0)
+                        )
+                        """,
+                        (project_uuids[1],),
+                    )
+                    assert cur.fetchone() == (True,)
+            observed_project_locks.append(str(project_id))
+        if (
+            str(project_id) in project_uuids
+            and str(project_id) not in forced_extra_batches
+        ):
+            forced_extra_batches.add(str(project_id))
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_downgrade_v1
+                SET processed_rows = processed_rows + 1,
+                    updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            return 1
+        return original_batch(session, project_id, batch_size)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT project_id::text
+            FROM m_workspace_read_state_projects_v1
+            WHERE mode = 'compact'
+            """
+        )
+        existing_compact_project_uuids = [row[0] for row in cur.fetchall()]
+        if existing_compact_project_uuids:
+            cur.execute(
+                """
+                UPDATE m_workspace_read_state_projects_v1
+                SET mode = 'dual'
+                WHERE project_id = ANY(%s::uuid[])
+                """,
+                (existing_compact_project_uuids,),
+            )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode
+            ) VALUES (%s, 'compact')
+            """,
+            ((project_uuid,) for project_uuid in project_uuids),
+        )
+    monkeypatch.setattr(
+        migration_module,
+        "_hydrate_legacy_flags_batch",
+        observe_project_locks,
+    )
+    monkeypatch.setattr(
+        migration_module,
+        "_lock_read_state_project",
+        observe_released_lock,
+    )
+    try:
+        with ra_contexts.Context().session_manager() as session:
+            migration_module._prepare_downgrade_progress(session)
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_downgrade_v1 (
+                    project_id, completed_at
+                ) VALUES (%s, NOW())
+                """,
+                (project_uuids[0],),
+            )
+            session.commit()
+            migration_module._hydrate_legacy_flags(session)
+
+        assert observed_project_locks == [project_uuids[0]]
+        assert lock_entries.count(project_uuids[0]) >= 3
+        assert lock_entries.count(project_uuids[1]) >= 3
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT project_id::text, mode
+                FROM m_workspace_read_state_projects_v1
+                WHERE project_id = ANY(%s::uuid[])
+                ORDER BY project_id
+                """,
+                (list(project_uuids),),
+            )
+            assert cur.fetchall() == [
+                (project_uuid, "rollback") for project_uuid in project_uuids
+            ]
+            for project_uuid in project_uuids:
+                cur.execute(
+                    """
+                    SELECT pg_try_advisory_lock(
+                        hashtextextended(%s::text, 0)
+                    )
+                    """,
+                    (project_uuid,),
+                )
+                assert cur.fetchone() == (True,)
+                cur.execute(
+                    """
+                    SELECT pg_advisory_unlock(
+                        hashtextextended(%s::text, 0)
+                    )
+                    """,
+                    (project_uuid,),
+                )
+                assert cur.fetchone() == (True,)
+    finally:
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM m_workspace_read_state_downgrade_v1
+                WHERE project_id = ANY(%s::uuid[])
+                """,
+                (list(project_uuids),),
+            )
+            cur.execute(
+                """
+                DELETE FROM m_workspace_read_state_projects_v1
+                WHERE project_id = ANY(%s::uuid[])
+                """,
+                (list(project_uuids),),
+            )
+            if existing_compact_project_uuids:
+                cur.execute(
+                    """
+                    UPDATE m_workspace_read_state_projects_v1
+                    SET mode = 'compact'
+                    WHERE project_id = ANY(%s::uuid[])
+                    """,
+                    (existing_compact_project_uuids,),
+                )
+
+
+def test_compact_read_state_final_downgrade_gate_fences_new_project_writer(
+    _database,
+    db,
+):
+    project_uuid = sys_uuid.uuid4()
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration_step = engine._load_migrations()[COMPACT_READ_STATE_MIGRATION_FILE]
+    migration_module = __import__(migration_step.__class__.__module__)
+    gate_ready = threading.Event()
+    release_gate = threading.Event()
+    writer_started = threading.Event()
+    maintenance_started = threading.Event()
+    reader_started = threading.Event()
+    request_started = threading.Event()
+
+    def hold_final_gate():
+        with ra_contexts.Context().session_manager() as session:
+            migration_module._lock_read_state_projects(session)
+            gate_ready.set()
+            assert release_gate.wait(timeout=5)
+            session.rollback()
+
+    def insert_project():
+        with ra_contexts.Context().session_manager() as session:
+            writer_started.set()
+            read_state.lock_projects(session, (project_uuid,))
+            read_state.ensure_new_project(session, project_uuid)
+            session.commit()
+
+    def probe_maintenance():
+        class StopAfterSchemaGate:
+            def __init__(self, session):
+                self._session = session
+
+            def execute(self, statement, params=()):
+                if "FROM m_workspace_read_state_projects_v1 AS state" in statement:
+                    raise RuntimeError("candidate query reached")
+                return self._session.execute(statement, params)
+
+            def __getattr__(self, name):
+                return getattr(self._session, name)
+
+        with ra_contexts.Context().session_manager() as session:
+            maintenance_started.set()
+            with pytest.raises(RuntimeError, match="candidate query reached"):
+                read_state.maintain_next_project(StopAfterSchemaGate(session))
+            session.rollback()
+
+    def read_project_mode():
+        with ra_contexts.Context().session_manager() as session:
+            reader_started.set()
+            return read_state.project_mode(session, project_uuid)
+
+    def probe_api_relation():
+        context = messenger_context.WorkspaceMessengerAuthContext(req=object())
+        request_started.set()
+        with context.session_manager() as session:
+            return session.execute(
+                "SELECT COUNT(*) AS count FROM m_workspace_messages"
+            ).fetchone()["count"]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            gate_future = executor.submit(hold_final_gate)
+            assert gate_ready.wait(timeout=5)
+            with db.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT pg_try_advisory_xact_lock_shared(
+                        hashtextextended(%s, 0)
+                    )
+                    """,
+                    (read_state.READ_STATE_SCHEMA_LOCK_KEY,),
+                )
+                assert cur.fetchone() == (False,)
+
+            writer_future = executor.submit(insert_project)
+            maintenance_future = executor.submit(probe_maintenance)
+            reader_future = executor.submit(read_project_mode)
+            request_future = executor.submit(probe_api_relation)
+            assert writer_started.wait(timeout=5)
+            assert maintenance_started.wait(timeout=5)
+            assert reader_started.wait(timeout=5)
+            assert request_started.wait(timeout=5)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                writer_future.result(timeout=0.2)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                maintenance_future.result(timeout=0.2)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                reader_future.result(timeout=0.2)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                request_future.result(timeout=0.2)
+            release_gate.set()
+            gate_future.result(timeout=5)
+            writer_future.result(timeout=5)
+            maintenance_future.result(timeout=5)
+            assert reader_future.result(timeout=5) == read_state.PROJECT_MODE_LEGACY
+            assert request_future.result(timeout=5) >= 0
+
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT mode
+                FROM m_workspace_read_state_projects_v1
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            assert cur.fetchone() == ("legacy",)
+    finally:
+        release_gate.set()
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM m_workspace_read_state_projects_v1
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+
+
+def test_provider_history_downgrade_preserves_unbounded_result_replay(
+    _database,
+    db,
+):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    provider_operation_uuids = (
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+    )
+    result_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4(), sys_uuid.uuid4())
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status, can_retry, can_discard
+            ) VALUES (
+                %s, %s, %s, 'read_state.set', 'stream', 'running',
+                FALSE, FALSE
+            )
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind, payload,
+                status, attempt, public_result_status, terminal_result,
+                completed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set',
+                '{"message_uuids":[]}'::jsonb, 'succeeded', 1, 'succeeded',
+                '{"status":"succeeded"}'::jsonb, NOW()
+            )
+            """,
+            (
+                (
+                    provider_operation_uuid,
+                    operation_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                )
+                for provider_operation_uuid in provider_operation_uuids
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_operation_results_v1 (
+                result_uuid, operation_uuid, payload_sha256
+            ) VALUES (%s, %s, %s)
+            """,
+            (
+                (result_uuid, provider_operation_uuid, "a" * 64)
+                for result_uuid, provider_operation_uuid in zip(
+                    result_uuids,
+                    provider_operation_uuids,
+                    strict=True,
+                )
+            ),
+        )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration_step = engine._load_migrations()[COMPACT_READ_STATE_MIGRATION_FILE]
+    migration_module = __import__(migration_step.__class__.__module__)
+    with ra_contexts.Context().session_manager() as session:
+        with pytest.raises(RuntimeError, match="history to be drained"):
+            migration_module._ensure_no_active_aggregate_provider_reads(session)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'succeeded',
+                details = details || jsonb_build_object(
+                'provider_result', jsonb_build_object(
+                    'status', 'succeeded',
+                    'provider_operation_uuid', %s::text
+                )
+            )
+            WHERE uuid = %s
+            """,
+            (provider_operation_uuids[0], operation_uuid),
+        )
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == (0,)
+
+    # A lost HTTP response remains retryable from the bridge journal. Keep
+    # every physical page and result ledger for the supported retry horizon.
+    with ra_contexts.Context().session_manager() as session:
+        with pytest.raises(RuntimeError, match="history to be drained"):
+            migration_module._ensure_no_active_aggregate_provider_reads(session)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET completed_at = NOW() - INTERVAL '25 hours'
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        cur.execute(
+            """
+            UPDATE m_external_provider_operation_results_v1
+            SET created_at = NOW() - INTERVAL '25 hours'
+            WHERE operation_uuid = ANY(%s::uuid[])
+            """,
+            (list(provider_operation_uuids),),
+        )
+
+    # Age is not acknowledgement evidence: the bridge journal has no replay
+    # TTL. Even after 25 hours, downgrade must keep every physical page and
+    # idempotency ledger so a lost HTTP response still returns duplicate.
+    with ra_contexts.Context().session_manager() as session:
+        with pytest.raises(RuntimeError, match="history to be drained"):
+            migration_module._ensure_no_active_aggregate_provider_reads(session)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb)
+            """,
+            (
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                sys_uuid.uuid4(),
+            ),
+        )
+    with ra_contexts.Context().session_manager() as session:
+        with pytest.raises(
+            psycopg.errors.ObjectNotInPrerequisiteState,
+            match="active read snapshots",
+        ):
+            session.execute(
+                "SELECT m_external_prepare_provider_history_downgrade_v1(1)"
+            )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(DISTINCT external_operation_uuid)
+            FROM m_external_provider_operations_v1
+            WHERE uuid = ANY(%s::uuid[])
+            """,
+            (list(provider_operation_uuids),),
+        )
+        assert cur.fetchone() == (1,)
+        cur.execute(
+            """
+            DELETE FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+
+    # The forward migration provides a bounded, resumable drain. It preserves
+    # both physical operation UUIDs and their idempotency ledgers while giving
+    # every retained page its own legacy-compatible public parent.
+    with ra_contexts.Context().session_manager() as session:
+        assert (
+            session.execute(
+                "SELECT m_external_prepare_provider_history_downgrade_v1(1) "
+                "AS processed"
+            ).fetchone()["processed"]
+            == 1
+        )
+    engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    engine.rollback_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
+    with ra_contexts.Context().session_manager() as session:
+        assert (
+            session.execute(
+                """
+                SELECT to_regprocedure(
+                    'm_external_prepare_provider_history_downgrade_v1(integer)'
+                ) AS function
+                """
+            ).fetchone()["function"]
+            is None
+        )
+        migration_module._ensure_no_active_aggregate_provider_reads(session)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT external_operation_uuid)
+            FROM m_external_provider_operations_v1
+            WHERE uuid = ANY(%s::uuid[])
+            """,
+            (list(provider_operation_uuids),),
+        )
+        assert cur.fetchone() == (3, 3)
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_operation_results_v1
+            WHERE result_uuid = ANY(%s::uuid[])
+            """,
+            (list(result_uuids),),
+        )
+        assert cur.fetchone() == (3,)
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_operations_v2
+            WHERE uuid IN (
+                SELECT external_operation_uuid
+                FROM m_external_provider_operations_v1
+                WHERE uuid = ANY(%s::uuid[])
+            )
+              AND status = 'succeeded'
+            """,
+            (list(provider_operation_uuids),),
+        )
+        assert cur.fetchone() == (3,)
+    engine.apply_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
+    engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+
+
+def test_provider_history_downgrade_splits_mixed_pages_with_retryable_parents(
+    _database,
+    db,
+):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    provider_operation_uuids = tuple(sys_uuid.uuid4() for _index in range(3))
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status, can_retry, can_discard,
+                duplicate_risk, retry_requires_confirmation,
+                reconciliation_state, reconciliation_reason
+            ) VALUES (
+                %s, %s, %s, 'read_state.set', 'stream',
+                'manual_reconciliation_required', FALSE, FALSE,
+                TRUE, TRUE, 'manual_required', 'unsafe_provider_state'
+            )
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind, payload,
+                status, attempt, safe_error, public_result_status,
+                terminal_result, completed_at
+            ) VALUES
+                (
+                    %s, %s, %s, %s, %s, 'read_state.set',
+                    '{"message_uuids":[]}'::jsonb,
+                    'succeeded', 1, NULL, 'succeeded',
+                    jsonb_build_object(
+                        'status', 'succeeded',
+                        'provider_operation_uuid', %s::text
+                    ), NOW()
+                ),
+                (
+                    %s, %s, %s, %s, %s, 'read_state.set',
+                    '{"message_uuids":[]}'::jsonb,
+                    'failed', 1, 'temporary failure', 'failed',
+                    jsonb_build_object(
+                        'status', 'failed',
+                        'safe_error', 'temporary failure',
+                        'provider_operation_uuid', %s::text
+                    ), NOW()
+                ),
+                (
+                    %s, %s, %s, %s, %s, 'read_state.set',
+                    '{"message_uuids":[]}'::jsonb,
+                    'failed', 1, 'result uncertain',
+                    'manual_reconciliation_required',
+                    jsonb_build_object(
+                        'status', 'manual_reconciliation_required',
+                        'safe_error', 'result uncertain',
+                        'provider_operation_uuid', %s::text,
+                        'reconciliation', jsonb_build_object(
+                            'reason', 'unsafe_provider_state',
+                            'evidence', jsonb_build_object('page', 3)
+                        )
+                    ), NOW()
+                )
+            """,
+            (
+                provider_operation_uuids[0],
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                provider_operation_uuids[0],
+                provider_operation_uuids[1],
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                provider_operation_uuids[1],
+                provider_operation_uuids[2],
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                provider_operation_uuids[2],
+            ),
+        )
+
+    with ra_contexts.Context().session_manager() as session:
+        assert (
+            session.execute(
+                "SELECT m_external_prepare_provider_history_downgrade_v1(100) "
+                "AS processed"
+            ).fetchone()["processed"]
+            == 2
+        )
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT provider_operation.uuid, public_operation.uuid,
+                   provider_operation.status, public_operation.status,
+                   public_operation.can_retry, public_operation.can_discard,
+                   public_operation.duplicate_risk,
+                   public_operation.retry_requires_confirmation,
+                   public_operation.reconciliation_reason,
+                   public_operation.reconciliation_evidence
+            FROM m_external_provider_operations_v1 AS provider_operation
+            JOIN m_external_operations_v2 AS public_operation
+              ON public_operation.uuid =
+                    provider_operation.external_operation_uuid
+            WHERE provider_operation.uuid = ANY(%s::uuid[])
+            ORDER BY provider_operation.sequence
+            """,
+            (list(provider_operation_uuids),),
+        )
+        split_rows = cur.fetchall()
+    assert [row[3:8] for row in split_rows] == [
+        ("succeeded", False, False, False, False),
+        ("failed", True, True, False, False),
+        (
+            "manual_reconciliation_required",
+            True,
+            False,
+            True,
+            True,
+        ),
+    ]
+    assert split_rows[2][8:] == (
+        "unsafe_provider_state",
+        {"page": 3},
+    )
+    assert len({row[1] for row in split_rows}) == 3
+
+    for row in split_rows[1:]:
+        with ra_contexts.Context().session_manager() as session:
+            queued = provider_data.retry_provider_operation(
+                session,
+                external_operation_uuid=row[1],
+                next_attempt=2,
+            )
+            assert queued["uuid"] not in provider_operation_uuids
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, attempt
+                FROM m_external_provider_operations_v1
+                WHERE uuid = %s
+                """,
+                (queued["uuid"],),
+            )
+            assert cur.fetchone() == ("queued", 1)
+
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+
+
+def test_provider_history_downgrade_waits_for_skip_locked_aggregate(
+    _database,
+    db,
+):
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    provider_operation_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES (
+                %s, %s, %s, 'read_state.set', 'stream', 'succeeded'
+            )
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind, payload,
+                status, attempt, public_result_status, terminal_result,
+                completed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set',
+                '{"message_uuids":[]}'::jsonb,
+                'succeeded', 1, 'succeeded',
+                jsonb_build_object(
+                    'status', 'succeeded',
+                    'provider_operation_uuid', %s::text
+                ), NOW()
+            )
+            """,
+            (
+                (
+                    provider_operation_uuid,
+                    operation_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    provider_operation_uuid,
+                )
+                for provider_operation_uuid in provider_operation_uuids
+            ),
+        )
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration_step = engine._load_migrations()[
+        PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE
+    ]
+    locker = psycopg.connect(conftest.TEST_DB_URL)
+    downgrade_started = threading.Event()
+
+    def downgrade():
+        downgrade_started.set()
+        with ra_contexts.Context().session_manager() as session:
+            migration_step.downgrade(session)
+
+    try:
+        with locker.cursor() as cur:
+            cur.execute(
+                """
+                SELECT uuid
+                FROM m_external_provider_operations_v1
+                WHERE uuid = %s
+                FOR UPDATE
+                """,
+                (provider_operation_uuids[1],),
+            )
+            assert cur.fetchone() == (provider_operation_uuids[1],)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(downgrade)
+            try:
+                assert downgrade_started.wait(timeout=5)
+                with pytest.raises(concurrent.futures.TimeoutError):
+                    future.result(timeout=0.3)
+                with db.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT to_regprocedure(
+                            'm_external_prepare_provider_history_downgrade_v1(integer)'
+                        )
+                        """
+                    )
+                    assert cur.fetchone()[0] is not None
+            finally:
+                locker.commit()
+            future.result(timeout=5)
+    finally:
+        locker.rollback()
+        locker.close()
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT to_regprocedure(
+                'm_external_prepare_provider_history_downgrade_v1(integer)'
+            )
+            """
+        )
+        assert cur.fetchone() == (None,)
+    with ra_contexts.Context().session_manager() as session:
+        migration_step.upgrade(session)
+    with db.cursor() as cur:
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+
+
+def test_compact_read_state_populated_downgrade_restores_legacy_flags(
+    _database,
+    db,
+    monkeypatch,
+):
+    project_uuid = "10000000-0000-4000-8000-000000000901"
+    user_uuids = (
+        "10000000-0000-4000-8000-000000000902",
+        "10000000-0000-4000-8000-000000000905",
+        "10000000-0000-4000-8000-000000000906",
+        "10000000-0000-4000-8000-000000000907",
+        "10000000-0000-4000-8000-000000000908",
+    )
+    user_uuid = user_uuids[0]
+    message_uuid = "10000000-0000-4000-8000-000000000903"
+    next_message_uuid = "10000000-0000-4000-8000-000000000904"
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        user_uuid,
+        "Compact migration rollback",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        user_uuid,
+        "general",
+        is_default=True,
+    )
+    for bound_user_uuid in user_uuids[1:]:
+        conftest.seed_user_stream_binding(
+            db,
+            project_uuid,
+            stream_uuid,
+            bound_user_uuid,
+        )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    # Exercise the original compact-state downgrade on its own schema.
+    engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    engine.rollback_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
+    engine.rollback_migration(PROJECT_DENSE_READ_SEQUENCE_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"read before rollback"}',
+                'native', '{"kind":"native"}'
+            )
+            RETURNING ingest_sequence
+            """,
+            (message_uuid, project_uuid, stream_uuid, topic_uuid, user_uuid),
+        )
+        ingest_sequence = cur.fetchone()[0]
+        assert ingest_sequence >= 281474976710656
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read, pinned, starred
+            ) VALUES (%s, %s, %s, FALSE, TRUE, FALSE)
+            """,
+            (message_uuid, user_uuid, project_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode
+            ) VALUES (%s, 'compact')
+            ON CONFLICT (project_id) DO UPDATE SET mode = 'compact'
+            """,
+            (project_uuid,),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_user_read_chunks_v1 (
+                user_uuid, chunk_number, read_bits
+            ) VALUES (
+                %s,
+                %s / 4096,
+                set_bit(
+                    B'0'::bit(4096),
+                    (%s %% 4096)::integer,
+                    1
+                )
+            )
+            """,
+            (
+                (bound_user_uuid, ingest_sequence, ingest_sequence)
+                for bound_user_uuid in user_uuids
+            ),
+        )
+
+    migration_step = engine._load_migrations()[COMPACT_READ_STATE_MIGRATION_FILE]
+    migration_module = __import__(migration_step.__class__.__module__)
+    monkeypatch.setattr(migration_module, "DOWNGRADE_BATCH_SIZE", 2)
+    with ra_contexts.Context().session_manager() as session:
+        migration_module._prepare_downgrade_progress(session)
+        migration_module._prepare_rollback_projects(session)
+        rollback_view = session.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_messages_view
+            WHERE uuid = %s AND user_uuid = %s
+            """,
+            (message_uuid, user_uuid),
+        ).fetchone()
+        assert rollback_view["read"] is True
+        migration_module._lock_read_state_project(session, project_uuid)
+        assert (
+            migration_module._hydrate_legacy_flags_batch(
+                session,
+                project_uuid,
+                1,
+            )
+            == 1
+        )
+        session.commit()
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == ("rollback",)
+        cur.execute(
+            """
+            SELECT processed_rows, completed_at
+            FROM m_workspace_read_state_downgrade_v1
+            WHERE project_id = %s
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == (1, None)
+        # Simulate an application dual-write after the first committed
+        # hydration batch. A retry must preserve that newer legacy value when
+        # it resumes after the persisted cursor.
+        cur.execute(
+            """
+            UPDATE m_workspace_user_read_chunks_v1
+            SET read_bits = set_bit(
+                    read_bits,
+                    (%s %% 4096)::integer,
+                    0
+                ),
+                updated_at = NOW()
+            WHERE user_uuid = %s
+              AND chunk_number = %s / 4096
+            """,
+            (ingest_sequence, user_uuid, ingest_sequence),
+        )
+        cur.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = FALSE, updated_at = NOW()
+            WHERE uuid = %s AND user_uuid = %s
+            """,
+            (message_uuid, user_uuid),
+        )
+
+    engine.rollback_migration(COMPACT_READ_STATE_MIGRATION_FILE)
+    # RestAlchemy flips the migration metadata only after downgrade() returns.
+    # Calling the step again with the schema already committed away reproduces
+    # a retry after a crash in that narrow window.
+    with ra_contexts.Context().session_manager() as session:
+        migration_step.downgrade(session)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT user_uuid::text, read, pinned, starred
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s
+              AND user_uuid = ANY(%s::uuid[])
+            ORDER BY user_uuid
+            """,
+            (message_uuid, list(user_uuids)),
+        )
+        assert cur.fetchall() == [
+            (
+                bound_user_uuid,
+                bound_user_uuid != user_uuid,
+                bound_user_uuid == user_uuid,
+                False,
+            )
+            for bound_user_uuid in user_uuids
+        ]
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_messages'
+              AND column_name = 'ingest_sequence'
+            """
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            """
+            SELECT to_regclass('m_workspace_messages_ingest_sequence_v1_seq'),
+                   to_regclass(
+                       'm_workspace_messages_legacy_ingest_sequence_v1_seq'
+                   )
+            """
+        )
+        assert cur.fetchone() == (None, None)
+        cur.execute(
+            """
+            SELECT to_regclass('m_workspace_read_state_downgrade_v1')
+            """
+        )
+        assert cur.fetchone() == (None,)
+        cur.execute(
+            """
+            SELECT pg_try_advisory_lock(hashtextextended(%s::text, 0))
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            """
+            SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == (True,)
+
+    engine.apply_migration(COMPACT_READ_STATE_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == ("legacy",)
+        cur.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE uuid = %s
+            """,
+            (message_uuid,),
+        )
+        assert cur.fetchone() == (None,)
+        cur.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"written after reapply"}',
+                'native', '{"kind":"native"}'
+            )
+            RETURNING ingest_sequence
+            """,
+            (next_message_uuid, project_uuid, stream_uuid, topic_uuid, user_uuid),
+        )
+        assert cur.fetchone()[0] >= 281474976710656
+        cur.execute(
+            """
+            SELECT to_regclass('m_workspace_messages_ingest_sequence_idx'),
+                   to_regclass(
+                       'm_workspace_messages_project_ingest_sequence_idx'
+                   ),
+                   to_regclass(
+                       'm_workspace_messages_topic_ingest_sequence_idx'
+                   ),
+                   to_regclass('m_workspace_messages_stream_read_page_idx'),
+                   to_regclass('m_workspace_messages_topic_read_page_idx'),
+                   to_regclass(
+                       'm_workspace_messages_stream_ingest_sequence_idx'
+                   ),
+                   to_regclass('m_workspace_read_flags_project_message_idx'),
+                   to_regclass('m_workspace_flags_project_message_user_idx')
+            """
+        )
+        assert cur.fetchone() == (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        cur.execute(
+            """
+            SELECT uuid, applied
+            FROM ra_migrations
+            WHERE uuid = ANY(%s::text[])
+            """,
+            (
+                [
+                    COMPACT_READ_STATE_MIGRATION_UUID,
+                    COMPACT_READ_STATE_INDEX_MIGRATION_UUID,
+                ],
+            ),
+        )
+        assert set(cur.fetchall()) == {
+            (COMPACT_READ_STATE_MIGRATION_UUID, True),
+            (COMPACT_READ_STATE_INDEX_MIGRATION_UUID, False),
+        }
+
+    engine.apply_migration(COMPACT_READ_STATE_INDEX_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT indexrelid::regclass::text, indisvalid
+            FROM pg_index
+            WHERE indexrelid IN (
+                to_regclass('m_workspace_messages_ingest_sequence_idx'),
+                to_regclass(
+                    'm_workspace_messages_project_ingest_sequence_idx'
+                ),
+                to_regclass(
+                    'm_workspace_messages_topic_ingest_sequence_idx'
+                ),
+                to_regclass('m_workspace_messages_stream_read_page_idx'),
+                to_regclass('m_workspace_messages_topic_read_page_idx'),
+                to_regclass(
+                    'm_workspace_messages_stream_ingest_sequence_idx'
+                ),
+                to_regclass('m_workspace_read_flags_project_message_idx'),
+                to_regclass('m_workspace_flags_project_message_user_idx')
+            )
+            """
+        )
+        assert set(cur.fetchall()) == {
+            ("m_workspace_messages_ingest_sequence_idx", True),
+            ("m_workspace_messages_project_ingest_sequence_idx", True),
+            ("m_workspace_messages_topic_ingest_sequence_idx", True),
+            ("m_workspace_messages_stream_read_page_idx", True),
+            ("m_workspace_messages_topic_read_page_idx", True),
+            ("m_workspace_messages_stream_ingest_sequence_idx", True),
+            ("m_workspace_read_flags_project_message_idx", True),
+            ("m_workspace_flags_project_message_user_idx", True),
+        }
+    engine.apply_migration(engine.get_latest_migration())
+
+
+def test_compact_read_state_index_migration_recovers_invalid_index(
+    _database,
+    db,
+):
+    project_uuid = "10000000-0000-4000-8000-000000000911"
+    user_uuid = "10000000-0000-4000-8000-000000000912"
+    message_uuids = (
+        "10000000-0000-4000-8000-000000000913",
+        "10000000-0000-4000-8000-000000000914",
+    )
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        user_uuid,
+        "Compact index retry",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        user_uuid,
+        "general",
+        is_default=True,
+    )
+    with db.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"index retry"}',
+                'native', '{"kind":"native"}'
+            )
+            """,
+            (
+                (
+                    message_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    topic_uuid,
+                    user_uuid,
+                )
+                for message_uuid in message_uuids
+            ),
+        )
+        cur.execute('DROP INDEX "m_workspace_messages_ingest_sequence_idx"')
+        cur.execute(
+            """
+            UPDATE m_workspace_messages
+            SET ingest_sequence = (
+                SELECT ingest_sequence
+                FROM m_workspace_messages
+                WHERE uuid = %s
+            )
+            WHERE uuid = %s
+            """,
+            (message_uuids[0], message_uuids[1]),
+        )
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX CONCURRENTLY
+                    "m_workspace_messages_ingest_sequence_idx"
+                    ON "m_workspace_messages" ("ingest_sequence")
+                    WHERE "ingest_sequence" IS NOT NULL
+                """
+            )
+        cur.execute(
+            """
+            SELECT indisvalid
+            FROM pg_index
+            WHERE indexrelid =
+                'm_workspace_messages_ingest_sequence_idx'::regclass
+            """
+        )
+        assert cur.fetchone() == (False,)
+        cur.execute(
+            """
+            UPDATE m_workspace_messages
+            SET ingest_sequence = nextval(
+                'm_workspace_messages_ingest_sequence_v1_seq'
+            )
+            WHERE uuid = %s
+            """,
+            (message_uuids[1],),
+        )
+        cur.execute(
+            "DELETE FROM ra_migrations WHERE uuid = %s",
+            (COMPACT_READ_STATE_INDEX_MIGRATION_UUID,),
+        )
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.apply_migration(COMPACT_READ_STATE_INDEX_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT indisvalid
+            FROM pg_index
+            WHERE indexrelid =
+                'm_workspace_messages_ingest_sequence_idx'::regclass
+            """
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (COMPACT_READ_STATE_INDEX_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (True,)
 
 
 def test_list_and_folder_projections_reuse_outer_visibility(_database, db):
@@ -268,11 +3158,15 @@ def test_list_and_folder_projections_reuse_outer_visibility(_database, db):
     protected_unread = definitions["m_workspace_user_unread_messages_view"]
     assert "m_confirmed_external_stream_access" not in unread_base
     assert "m_confirmed_external_stream_access" in protected_unread
-    for name in ("m_workspace_user_streams", "m_workspace_user_topics_view"):
+    unread_sources = {
+        "m_workspace_user_streams": "m_unread_user_messages",
+        "m_workspace_user_topics_view": "m_workspace_user_topic_unread_counts_v1",
+    }
+    for name, unread_source in unread_sources.items():
         definition = definitions[name]
         assert "m_workspace_messages" in definition
         assert "m_workspace_user_messages_view" not in definition
-        assert "m_workspace_user_unread_messages_base_v1" in definition
+        assert unread_source in definition
         assert definition.count("m_confirmed_external_stream_access") == 1
     folders = definitions["m_folders_view"]
     assert "system_folder_templates" in folders

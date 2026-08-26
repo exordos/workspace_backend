@@ -1114,6 +1114,11 @@ class WorkspaceMessage(
         types.Dict(),
         default=dict,
     )
+    ingest_sequence = properties.property(
+        types.AllowNone(types.Integer(min_value=1)),
+        default=None,
+        read_only=True,
+    )
 
     def validate(self) -> None:
         super().validate()

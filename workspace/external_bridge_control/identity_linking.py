@@ -9,6 +9,7 @@ import typing
 import uuid as sys_uuid
 
 from workspace.messenger_api import reaction_users
+from workspace.messenger_api.dm import read_state
 
 
 _PROVIDER_IDENTITY_NAMESPACE = sys_uuid.UUID("fda6f96e-c86d-5c94-976d-4e813e3f3655")
@@ -314,6 +315,7 @@ def merge_account_scoped_provider_identities(
     provider: str,
     account_uuid: sys_uuid.UUID,
     provider_realm_uuid: sys_uuid.UUID,
+    _resources_locked: bool = False,
 ) -> list[sys_uuid.UUID]:
     """Merge every legacy identity owned by one now-verified account."""
     legacy_identities = session.execute(
@@ -325,7 +327,6 @@ def merge_account_scoped_provider_identities(
           AND provider_external_id IS NOT NULL
           AND provider_external_id != ''
         ORDER BY uuid
-        FOR UPDATE
         """,
         (account_uuid,),
     ).fetchall()
@@ -345,6 +346,12 @@ def merge_account_scoped_provider_identities(
     replacements: list[tuple[sys_uuid.UUID, sys_uuid.UUID]] = []
     for legacy_user_uuid, canonical_user_uuid in resolved_identities:
         replacements.append((legacy_user_uuid, canonical_user_uuid))
+    if replacements and not _resources_locked:
+        _lock_identity_merge_resources(
+            session,
+            (user_uuid for replacement in replacements for user_uuid in replacement),
+        )
+    for legacy_user_uuid, canonical_user_uuid in resolved_identities:
         merge_workspace_user_identity(
             session,
             legacy_user_uuid,
@@ -352,6 +359,7 @@ def merge_account_scoped_provider_identities(
             rewrite_payloads=False,
             rewrite_chats=False,
             delete_legacy=False,
+            _resources_locked=True,
         )
     _rewrite_payload_uuid_references(session, replacements)
     for legacy_user_uuid, canonical_user_uuid in replacements:
@@ -379,6 +387,95 @@ def merge_account_scoped_provider_identities(
     return sorted(changed_chat_uuids)
 
 
+def _find_identity_merge_projects(
+    session: typing.Any,
+    user_uuids: typing.Iterable[sys_uuid.UUID],
+) -> list[typing.Any]:
+    values = sorted(set(user_uuids), key=str)
+    if not values:
+        return []
+    return session.execute(
+        """
+        SELECT DISTINCT affected.project_id
+        FROM (
+            SELECT project_id FROM m_workspace_stream_bindings
+            WHERE user_uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT project_id FROM m_workspace_user_message_flags
+            WHERE user_uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT project_id FROM m_workspace_user_topic_read_stats_v1
+            WHERE user_uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT project_id FROM m_workspace_read_memberships_v1
+            WHERE user_uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT project_id FROM m_workspace_message_mentions_v1
+            WHERE user_uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT project_id FROM m_workspace_messages
+            WHERE user_uuid = ANY(%s::uuid[])
+            UNION ALL
+            SELECT project_id FROM m_workspace_message_reactions
+            WHERE user_uuid = ANY(%s::uuid[])
+        ) AS affected
+        ORDER BY affected.project_id
+        """,
+        (values, values, values, values, values, values, values),
+    ).fetchall()
+
+
+def _lock_identity_merge_resources(
+    session: typing.Any,
+    user_uuids: typing.Iterable[sys_uuid.UUID],
+    project_uuids: typing.Iterable[sys_uuid.UUID] = (),
+) -> set[sys_uuid.UUID]:
+    values = sorted(set(user_uuids), key=str)
+    read_state.lock_read_state_schema_shared(session)
+    for user_uuid in values:
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"workspace-user-resource-v1:{user_uuid}",),
+        )
+    affected_project_ids = set(project_uuids) | {
+        sys_uuid.UUID(str(row["project_id"]))
+        for row in _find_identity_merge_projects(session, values)
+    }
+    while True:
+        ordered_project_ids = sorted(affected_project_ids, key=str)
+        session.execute("SAVEPOINT identity_project_discovery")
+        try:
+            read_state.lock_message_structure(session, ordered_project_ids)
+            read_state.lock_projects(session, ordered_project_ids)
+            refreshed_project_ids = affected_project_ids | {
+                sys_uuid.UUID(str(row["project_id"]))
+                for row in _find_identity_merge_projects(session, values)
+            }
+            if refreshed_project_ids != affected_project_ids:
+                session.execute("ROLLBACK TO SAVEPOINT identity_project_discovery")
+                session.execute("RELEASE SAVEPOINT identity_project_discovery")
+                affected_project_ids = refreshed_project_ids
+                continue
+            session.execute("RELEASE SAVEPOINT identity_project_discovery")
+            break
+        except Exception:
+            session.execute("ROLLBACK TO SAVEPOINT identity_project_discovery")
+            session.execute("RELEASE SAVEPOINT identity_project_discovery")
+            raise
+    read_state.bump_project_structure_revisions(session, affected_project_ids)
+    read_state.reset_identity_sensitive_progress(session, affected_project_ids)
+    return affected_project_ids
+
+
+def lock_identity_merge_resources(
+    session: typing.Any,
+    user_uuids: typing.Iterable[sys_uuid.UUID],
+    project_uuids: typing.Iterable[sys_uuid.UUID] = (),
+) -> set[sys_uuid.UUID]:
+    """Prelock a complete identity-rewrite batch in canonical order."""
+    return _lock_identity_merge_resources(session, user_uuids, project_uuids)
+
+
 def merge_workspace_user_identity(
     session: typing.Any,
     legacy_user_uuid: sys_uuid.UUID,
@@ -387,10 +484,16 @@ def merge_workspace_user_identity(
     rewrite_payloads: bool = True,
     rewrite_chats: bool = True,
     delete_legacy: bool = True,
+    _resources_locked: bool = False,
 ) -> list[sys_uuid.UUID]:
     """Move an old account-scoped external user onto its canonical UUID."""
     if legacy_user_uuid == canonical_user_uuid:
         return []
+    if not _resources_locked:
+        _lock_identity_merge_resources(
+            session,
+            (legacy_user_uuid, canonical_user_uuid),
+        )
     legacy = session.execute(
         """
         SELECT uuid, created_at, updated_at, username, source, status,
@@ -560,6 +663,111 @@ def merge_workspace_user_identity(
     )
     session.execute(
         """
+        INSERT INTO m_workspace_user_read_chunks_v1 (
+            user_uuid, chunk_number,
+            read_bits, created_at, updated_at
+        )
+        SELECT %s, chunk_number,
+               read_bits, created_at, updated_at
+        FROM m_workspace_user_read_chunks_v1
+        WHERE user_uuid = %s
+        ON CONFLICT (user_uuid, chunk_number)
+        DO UPDATE SET
+            read_bits = (
+                m_workspace_user_read_chunks_v1.read_bits
+                | EXCLUDED.read_bits
+            ),
+            updated_at = GREATEST(
+                m_workspace_user_read_chunks_v1.updated_at,
+                EXCLUDED.updated_at
+            )
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        "DELETE FROM m_workspace_user_read_chunks_v1 WHERE user_uuid = %s",
+        (legacy_user_uuid,),
+    )
+    read_stat_scopes = session.execute(
+        """
+        SELECT DISTINCT project_id, topic_uuid
+        FROM m_workspace_user_topic_read_stats_v1
+        WHERE user_uuid IN (%s, %s)
+        ORDER BY project_id, topic_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    ).fetchall()
+    session.execute(
+        """
+        DELETE FROM m_workspace_user_topic_read_stats_v1
+        WHERE user_uuid = %s
+        """,
+        (legacy_user_uuid,),
+    )
+    scopes_by_project: dict[
+        sys_uuid.UUID, list[tuple[sys_uuid.UUID, sys_uuid.UUID]]
+    ] = {}
+    for scope in read_stat_scopes:
+        scopes_by_project.setdefault(scope["project_id"], []).append(
+            (canonical_user_uuid, scope["topic_uuid"])
+        )
+    for project_id, scopes in scopes_by_project.items():
+        read_state._refresh_topic_read_stats(
+            session,
+            project_id,
+            scopes,
+        )
+    session.execute(
+        """
+        INSERT INTO m_workspace_read_memberships_v1 (
+            project_id, user_uuid, stream_uuid, last_detached_sequence,
+            created_at, updated_at
+        )
+        SELECT project_id, %s, stream_uuid, last_detached_sequence,
+               created_at, updated_at
+        FROM m_workspace_read_memberships_v1
+        WHERE user_uuid = %s
+        ON CONFLICT (project_id, user_uuid, stream_uuid) DO UPDATE
+        SET last_detached_sequence = CASE
+                WHEN m_workspace_read_memberships_v1.last_detached_sequence IS NULL
+                  OR EXCLUDED.last_detached_sequence IS NULL
+                    THEN NULL
+                ELSE GREATEST(
+                    m_workspace_read_memberships_v1.last_detached_sequence,
+                    EXCLUDED.last_detached_sequence
+                )
+            END,
+            updated_at = GREATEST(
+                m_workspace_read_memberships_v1.updated_at,
+                EXCLUDED.updated_at
+            )
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        "DELETE FROM m_workspace_read_memberships_v1 WHERE user_uuid = %s",
+        (legacy_user_uuid,),
+    )
+    session.execute(
+        """
+        DELETE FROM m_workspace_message_mentions_v1 AS legacy
+        USING m_workspace_message_mentions_v1 AS canonical
+        WHERE legacy.user_uuid = %s
+          AND canonical.user_uuid = %s
+          AND canonical.message_uuid = legacy.message_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_message_mentions_v1
+        SET user_uuid = %s
+        WHERE user_uuid = %s
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        """
         INSERT INTO m_workspace_user_topic_flags (
             uuid, user_uuid, project_id, is_done, notification_mode,
             notification_updated_at, created_at, updated_at
@@ -675,8 +883,7 @@ def merge_workspace_user_identity(
         table_name = reference["table_name"].replace('"', '""')
         column_name = reference["column_name"].replace('"', '""')
         is_reaction_user_reference = (
-            table_name == "m_workspace_message_reactions"
-            and column_name == "user_uuid"
+            table_name == "m_workspace_message_reactions" and column_name == "user_uuid"
         )
         try:
             _update_uuid_reference_batch(
@@ -688,9 +895,7 @@ def merge_workspace_user_identity(
             )
         except IdentityMergePending:
             if is_reaction_user_reference:
-                for project_id, groups in sorted(
-                    reaction_groups_by_project.items()
-                ):
+                for project_id, groups in sorted(reaction_groups_by_project.items()):
                     reaction_users.refresh_groups(
                         project_id,
                         groups,

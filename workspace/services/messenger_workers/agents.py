@@ -15,6 +15,7 @@
 #    under the License.
 
 import datetime
+import contextlib
 import logging
 import random
 import time
@@ -26,6 +27,7 @@ from gcl_looper.services import basic
 
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
+from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.api import sql_canonical_store
@@ -42,12 +44,17 @@ CAPABILITY_PROJECTION_REFRESH_LIMIT = 100
 CAPABILITY_PROJECTION_BATCH_SIZE = 16
 DATABASE_DEADLOCK_MAX_ATTEMPTS = 3
 DATABASE_DEADLOCK_RETRY_BASE_SECONDS = 0.05
+READ_STATE_FAILURE_BACKOFF_BASE_SECONDS = 5.0
+READ_STATE_FAILURE_BACKOFF_MAX_SECONDS = 5 * 60.0
 
 
-def database_session_context() -> typing.ContextManager[typing.Any]:
+@contextlib.contextmanager
+def database_session_context() -> typing.Iterator[typing.Any]:
     """Own one transaction at a worker or operator-command boundary."""
     ctx = contexts.Context()
-    return ctx.session_manager()
+    with ctx.session_manager() as session:
+        read_state.lock_read_state_schema_shared(session)
+        yield session
 
 
 def _is_database_deadlock(error: BaseException) -> bool:
@@ -63,6 +70,14 @@ def _is_database_deadlock(error: BaseException) -> bool:
     return False
 
 
+def _read_state_failure_backoff_seconds(failure_count: int) -> float:
+    exponent = min(max(failure_count - 1, 0), 16)
+    return min(
+        READ_STATE_FAILURE_BACKOFF_BASE_SECONDS * (2**exponent),
+        READ_STATE_FAILURE_BACKOFF_MAX_SECONDS,
+    )
+
+
 class MessengerWorkerAgent(basic.BasicService):
     def __init__(
         self,
@@ -70,6 +85,10 @@ class MessengerWorkerAgent(basic.BasicService):
         event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
         event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
         heartbeat_retention: datetime.timedelta = HEARTBEAT_RETENTION,
+        read_state_compaction_enabled: bool = False,
+        read_state_cleanup_enabled: bool = False,
+        read_state_batch_size: int = read_state.COMPACTION_BATCH_SIZE,
+        read_state_max_batches_per_iteration: int = 1,
         summary_secret_key: str | None = None,
         summary_connect_timeout_seconds: int = (
             topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -90,6 +109,13 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_prune_interval_seconds = event_prune_interval_seconds
         self._event_prune_batch_size = event_prune_batch_size
         self._heartbeat_retention = heartbeat_retention
+        self._read_state_compaction_enabled = read_state_compaction_enabled
+        self._read_state_cleanup_enabled = read_state_cleanup_enabled
+        self._read_state_batch_size = read_state_batch_size
+        self._read_state_max_batches_per_iteration = (
+            read_state_max_batches_per_iteration
+        )
+        self._read_state_failures: dict[object, tuple[int, float]] = {}
         self._summary_secret_key = summary_secret_key
         self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
         self._summary_request_timeout_seconds = summary_request_timeout_seconds
@@ -155,6 +181,64 @@ class MessengerWorkerAgent(basic.BasicService):
         else:
             if degraded:
                 LOG.info("Degraded %d stale external bridge instances", degraded)
+
+        if self._read_state_compaction_enabled:
+            for _batch in range(self._read_state_max_batches_per_iteration):
+                retry_now = time.monotonic()
+                excluded_projects = {
+                    project_id
+                    for project_id, (_failure_count, retry_at) in (
+                        self._read_state_failures.items()
+                    )
+                    if retry_at > retry_now
+                }
+                try:
+                    with database_session_context() as session:
+                        read_state_maintenance = read_state.maintain_next_project(
+                            session,
+                            batch_size=self._read_state_batch_size,
+                            cleanup_enabled=self._read_state_cleanup_enabled,
+                            excluded_project_ids=excluded_projects,
+                        )
+                except read_state.MaintenanceProjectError as error:
+                    failure_now = time.monotonic()
+                    failure_count = (
+                        self._read_state_failures.get(
+                            error.project_id,
+                            (0, 0.0),
+                        )[0]
+                        + 1
+                    )
+                    backoff = _read_state_failure_backoff_seconds(
+                        failure_count,
+                    )
+                    self._read_state_failures[error.project_id] = (
+                        failure_count,
+                        failure_now + backoff,
+                    )
+                    LOG.exception(
+                        "Failed to maintain compact Workspace read state",
+                        extra={
+                            "project_id": str(error.project_id),
+                            "retry_in_seconds": backoff,
+                        },
+                    )
+                    continue
+                except Exception:
+                    LOG.exception("Failed to maintain compact Workspace read state")
+                    break
+                if read_state_maintenance is None:
+                    break
+                action, project_id, processed = read_state_maintenance
+                self._read_state_failures.pop(project_id, None)
+                LOG.info(
+                    "Completed bounded Workspace read-state maintenance",
+                    extra={
+                        "action": action,
+                        "project_id": str(project_id),
+                        "processed": processed,
+                    },
+                )
 
         self._refresh_capabilities(now)
         self._refresh_capability_projections()

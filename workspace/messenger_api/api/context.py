@@ -14,13 +14,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import typing
 import uuid as sys_uuid
 
 from gcl_iam import contexts as iam_contexts
 
+from workspace.messenger_api.dm import read_state
+
 
 class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
     """IAM-only context for workspace messenger models."""
+
+    def start_new_session(self) -> typing.Any:
+        """Fence every API transaction before its first relation access."""
+        session = super().start_new_session()
+        read_state.lock_read_state_schema_shared(session)
+        return session
 
     @property
     def user_uuid(self) -> sys_uuid.UUID:

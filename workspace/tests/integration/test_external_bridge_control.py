@@ -13,6 +13,7 @@ import time
 import uuid as sys_uuid
 from pathlib import Path
 
+import psycopg
 import pytest
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
@@ -28,7 +29,13 @@ from workspace.external_bridge_control import (
 )
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
-from workspace.messenger_api.dm import external_models, message_payloads
+from workspace.messenger_api.api import controllers as messenger_controllers
+from workspace.messenger_api.dm import (
+    external_models,
+    helpers,
+    message_payloads,
+    read_state,
+)
 from workspace.tests.integration import conftest
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -611,6 +618,177 @@ def test_account_global_identity_event_uses_account_authorization(_database, db)
                 [foreign_project_event],
                 provider_event_apply.apply_event,
             )
+
+
+def test_provider_batch_project_gate_locks_two_projects_in_uuid_order(_database):
+    lower_project_uuid = sys_uuid.UUID("10000000-0000-4000-8000-000000000001")
+    higher_project_uuid = sys_uuid.UUID("f0000000-0000-4000-8000-000000000001")
+    lock_started = threading.Event()
+    session_factory = engines.engine_factory.get_engine().session_manager
+
+    class ObservedSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            lock_started.set()
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def lock_reversed_input():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '5s'")
+            provider_data._lock_provider_event_projects(
+                ObservedSession(session),
+                [higher_project_uuid, lower_project_uuid],
+                [],
+                structural_batch=False,
+            )
+
+    with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as blocker:
+        with blocker.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s::text, 0))",
+                (lower_project_uuid,),
+            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            lock_future = executor.submit(lock_reversed_input)
+            assert lock_started.wait(timeout=5)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                lock_future.result(timeout=0.2)
+            with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as probe:
+                with probe.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_try_advisory_lock(hashtextextended(%s::text, 0))",
+                        (higher_project_uuid,),
+                    )
+                    assert cursor.fetchone() == (True,)
+                    cursor.execute(
+                        "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                        (higher_project_uuid,),
+                    )
+                    assert cursor.fetchone() == (True,)
+            with blocker.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                    (lower_project_uuid,),
+                )
+                assert cursor.fetchone() == (True,)
+            lock_future.result(timeout=5)
+
+
+def test_provider_batch_project_gate_retries_when_message_moves_projects(
+    _database,
+    db,
+):
+    owner_uuid = sys_uuid.uuid4()
+    source_project_uuid = sys_uuid.uuid4()
+    destination_project_uuid = sys_uuid.uuid4()
+    declared_project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db, source_project_uuid, owner_uuid, "Provider discovery source"
+        )
+    )
+    topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            source_project_uuid,
+            stream_uuid,
+            owner_uuid,
+            "Provider discovery topic",
+            is_default=True,
+        )
+    )
+    message_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload,
+                source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"move during discovery"}'::jsonb,
+                'native', '{"kind":"native"}'::jsonb
+            )
+            """,
+            (
+                message_uuid,
+                source_project_uuid,
+                stream_uuid,
+                topic_uuid,
+                owner_uuid,
+            ),
+        )
+    db.commit()
+
+    initial_lookup_finished = threading.Event()
+    continue_locking = threading.Event()
+    statements: list[str] = []
+    session_factory = engines.engine_factory.get_engine().session_manager
+
+    class CachedRows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class PausingSession:
+        def __init__(self, session):
+            self._session = session
+            self._paused = False
+
+        def execute(self, statement, params=()):
+            statements.append(statement)
+            result = self._session.execute(statement, params)
+            if (
+                not self._paused
+                and "SELECT DISTINCT project_id" in statement
+                and "FROM m_workspace_messages" in statement
+            ):
+                self._paused = True
+                rows = result.fetchall()
+                initial_lookup_finished.set()
+                assert continue_locking.wait(timeout=5)
+                return CachedRows(rows)
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def lock_provider_projects():
+        with session_factory() as session:
+            return provider_data._lock_provider_event_projects(
+                PausingSession(session),
+                [declared_project_uuid],
+                [message_uuid],
+                structural_batch=True,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        lock_future = executor.submit(lock_provider_projects)
+        assert initial_lookup_finished.wait(timeout=5)
+        with session_factory() as move_session:
+            messenger_controllers._move_projection_rows(
+                move_session,
+                stream_uuid,
+                source_project_uuid,
+                destination_project_uuid,
+            )
+        continue_locking.set()
+        locked_projects = lock_future.result(timeout=5)
+
+    assert locked_projects == sorted(
+        (source_project_uuid, destination_project_uuid, declared_project_uuid),
+        key=str,
+    )
+    assert any(
+        "ROLLBACK TO SAVEPOINT provider_project_discovery" in s for s in statements
+    )
 
 
 def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
@@ -1651,6 +1829,378 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             )
 
 
+def test_catalog_prelock_waits_for_changed_chat_account_before_project_locks(
+    _database,
+    db,
+):
+    report_account_uuid = sys_uuid.uuid4()
+    changed_chat_account_uuid = sys_uuid.uuid4()
+    report_owner_uuid = sys_uuid.uuid4()
+    changed_chat_owner_uuid = sys_uuid.uuid4()
+    report_project_uuid = sys_uuid.uuid4()
+    changed_chat_project_uuid = sys_uuid.uuid4()
+    changed_chat_uuid = sys_uuid.uuid4()
+    report_chat_uuid = sys_uuid.uuid4()
+    provider_realm_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, report_owner_uuid, "catalog-report-owner")
+    conftest.seed_workspace_user(db, changed_chat_owner_uuid, "changed-chat-owner")
+    with db.cursor() as cursor:
+        for account_uuid, owner_uuid, project_uuid in (
+            (report_account_uuid, report_owner_uuid, report_project_uuid),
+            (
+                changed_chat_account_uuid,
+                changed_chat_owner_uuid,
+                changed_chat_project_uuid,
+            ),
+        ):
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    credential_present, status
+                ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+                """,
+                (
+                    account_uuid,
+                    owner_uuid,
+                    json.dumps(
+                        {
+                            "default_project_id": str(project_uuid),
+                            "server_url": "https://zulip.example.test",
+                        }
+                    ),
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                transition_pending
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:changed-account', %s::jsonb,
+                'Changed account chat', TRUE, %s, FALSE
+            )
+            """,
+            (
+                changed_chat_uuid,
+                changed_chat_account_uuid,
+                changed_chat_owner_uuid,
+                json.dumps(
+                    {"participants": [{"identity_uuid": str(report_owner_uuid)}]}
+                ),
+                changed_chat_project_uuid,
+            ),
+        )
+    db.commit()
+
+    report = {
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(report_chat_uuid),
+        "catalog": {
+            "external_account_uuid": str(report_account_uuid),
+            "owner_user_uuid": str(report_owner_uuid),
+            "project_id": str(report_project_uuid),
+            "source": {
+                "provider_realm_uuid": str(provider_realm_uuid),
+                "provider_owner_user_id": "report-owner",
+            },
+            "participants": [
+                {
+                    "provider_user_id": "report-owner",
+                }
+            ],
+        },
+    }
+    identity = _identity(sys_uuid.uuid4(), sys_uuid.uuid4())
+    changed_account_lock_attempted = threading.Event()
+    project_lock_attempted = threading.Event()
+    blocker_ready = threading.Event()
+    release_blocker = threading.Event()
+    session_factory = engines.engine_factory.get_engine().session_manager
+    changed_account_lock_key = (
+        f"{read_state.EXTERNAL_ACCOUNT_RESOURCE_LOCK_KEY}:{changed_chat_account_uuid}"
+    )
+
+    class ObservedSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            first_param = params[0] if params else None
+            if first_param == changed_account_lock_key:
+                changed_account_lock_attempted.set()
+            if (
+                first_param == report_project_uuid
+                or (first_param == changed_chat_project_uuid)
+                or (
+                    isinstance(first_param, str)
+                    and first_param.startswith(read_state.READ_STATE_STRUCTURE_LOCK_KEY)
+                )
+            ):
+                project_lock_attempted.set()
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def hold_changed_chat_account():
+        # Use a dedicated connection so the blocker cannot consume the ORM
+        # pool slot needed by the prelock worker itself.
+        with psycopg.connect(conftest.TEST_DB_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL statement_timeout = '8s'")
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (changed_account_lock_key,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE m_external_chats_v2
+                    SET transition_pending = TRUE
+                    WHERE uuid = %s
+                    """,
+                    (changed_chat_uuid,),
+                )
+                blocker_ready.set()
+                assert release_blocker.wait(timeout=15)
+
+    def prelock_catalog():
+        with session_factory() as session:
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            return sql_state._prelock_catalog_identity_resources(
+                ObservedSession(session),
+                identity,
+                [report],
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        blocker_future = executor.submit(hold_changed_chat_account)
+        assert blocker_ready.wait(timeout=5)
+        prelock_future = executor.submit(prelock_catalog)
+        if not changed_account_lock_attempted.wait(timeout=5):
+            release_blocker.set()
+            blocker_future.result(timeout=5)
+            prelock_future.result(timeout=5)
+            pytest.fail("catalog prelock did not try the changed-chat account lock")
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                prelock_future.result(timeout=0.2)
+            assert not project_lock_attempted.is_set()
+        finally:
+            release_blocker.set()
+        blocker_future.result(timeout=5)
+        assert prelock_future.result(timeout=5) is True
+        assert project_lock_attempted.is_set()
+
+
+def test_provider_identity_merge_does_not_invert_message_create_lock_order(
+    _database,
+    db,
+):
+    provider_realm_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            project_uuid,
+            owner_uuid,
+            "Concurrent identity merge",
+        )
+    )
+    topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            project_uuid,
+            stream_uuid,
+            owner_uuid,
+            "Concurrent identity merge",
+            is_default=True,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status
+            ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+            """,
+            (
+                account_uuid,
+                owner_uuid,
+                json.dumps(
+                    {
+                        "default_project_id": str(project_uuid),
+                        "server_url": "https://zulip.example.test",
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_users (
+                uuid, username, source, status, avatar,
+                provider_uuid, external_account_uuid, provider_external_id,
+                created_at, updated_at, last_ping_at
+            )
+            SELECT %s, %s, 'zulip', 'active', avatar,
+                   %s, %s, '20', NOW(), NOW(), NOW()
+            FROM m_workspace_users
+            WHERE uuid = %s
+            """,
+            (
+                legacy_user_uuid,
+                f"zulip-{legacy_user_uuid}",
+                sys_uuid.uuid4(),
+                account_uuid,
+                owner_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, 'member', NOW(), NOW())
+            """,
+            (
+                sys_uuid.uuid4(),
+                project_uuid,
+                stream_uuid,
+                legacy_user_uuid,
+                owner_uuid,
+            ),
+        )
+
+    project_lock_acquired = threading.Event()
+    legacy_users_selected = threading.Event()
+    session_factory = engines.engine_factory.get_engine().session_manager
+
+    class MessageCreateSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            result = self._session.execute(statement, params)
+            if (
+                "pg_advisory_xact_lock(hashtextextended(%s::text" in statement
+                and not project_lock_acquired.is_set()
+            ):
+                project_lock_acquired.set()
+                if not legacy_users_selected.wait(timeout=5):
+                    raise TimeoutError("identity merge did not select legacy users")
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    class IdentityMergeSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            result = self._session.execute(statement, params)
+            if (
+                "FROM m_workspace_users" in statement
+                and "source = 'zulip'" in statement
+                and "external_account_uuid = %s" in statement
+            ):
+                legacy_users_selected.set()
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    def create_message():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            message = helpers.create_workspace_user_message(
+                project_id=project_uuid,
+                user_uuid=legacy_user_uuid,
+                session=MessageCreateSession(session),
+                stream_uuid=stream_uuid,
+                topic_uuid=topic_uuid,
+                uuid=message_uuid,
+                payload=message_payloads.MarkdownPayload(content="concurrent message"),
+                emit_events=False,
+                scoped_recipient_uuids=(),
+                return_visible=False,
+            )
+            return message.uuid
+
+    def merge_identities():
+        with session_factory() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'")
+            session.execute("SET LOCAL statement_timeout = '8s'")
+            return identity_linking.merge_account_scoped_provider_identities(
+                IdentityMergeSession(session),
+                provider="zulip",
+                account_uuid=account_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        create_future = executor.submit(create_message)
+        assert project_lock_acquired.wait(timeout=3)
+        merge_future = executor.submit(merge_identities)
+        assert create_future.result(timeout=10) == message_uuid
+        assert merge_future.result(timeout=10) == []
+
+    canonical_user_uuid = identity_linking.canonical_provider_identity_uuid(
+        "zulip",
+        provider_realm_uuid,
+        "20",
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT user_uuid FROM m_workspace_messages WHERE uuid = %s",
+            (message_uuid,),
+        )
+        assert cursor.fetchone()[0] == canonical_user_uuid
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_users
+            WHERE uuid = ANY(%s)
+            ORDER BY uuid
+            """,
+            ([legacy_user_uuid, canonical_user_uuid],),
+        )
+        assert [row[0] for row in cursor.fetchall()] == [canonical_user_uuid]
+        cursor.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s
+              AND stream_uuid = %s
+              AND user_uuid = ANY(%s)
+            """,
+            (
+                project_uuid,
+                stream_uuid,
+                [legacy_user_uuid, canonical_user_uuid],
+            ),
+        )
+        assert cursor.fetchall() == [(canonical_user_uuid,)]
+        cursor.execute(
+            """
+            SELECT workspace_user_uuid
+            FROM m_external_provider_identity_links_v1
+            WHERE provider = 'zulip'
+              AND provider_realm_uuid = %s
+              AND provider_user_id = '20'
+            """,
+            (provider_realm_uuid,),
+        )
+        assert cursor.fetchone()[0] == canonical_user_uuid
+
+
 def test_provider_identity_merge_invalidates_direct_event_history(
     _database,
     db,
@@ -1674,6 +2224,12 @@ def test_provider_identity_merge_invalidates_direct_event_history(
     )
     event_uuid = sys_uuid.uuid4()
     conftest.seed_workspace_user(db, owner_uuid, "payload-rewrite-owner")
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "Multi-identity lock ordering",
+    )
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -1705,6 +2261,21 @@ def test_provider_identity_merge_invalidates_direct_event_history(
                     sys_uuid.uuid4(),
                     account_uuid,
                     provider_user_id,
+                    owner_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_stream_bindings (
+                    uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, 'member', NOW(), NOW())
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    stream_uuid,
+                    legacy_uuid,
                     owner_uuid,
                 ),
             )
@@ -1754,11 +2325,24 @@ def test_provider_identity_merge_invalidates_direct_event_history(
         "_rewrite_payload_uuid_references",
         capture_rewrite,
     )
+    executed = []
+
+    class RecordingSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            executed.append((" ".join(statement.split()), params))
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
     session_factory = engines.engine_factory.get_engine().session_manager
     with session_factory() as session:
         assert (
             identity_linking.merge_account_scoped_provider_identities(
-                session,
+                RecordingSession(session),
                 provider="zulip",
                 account_uuid=account_uuid,
                 provider_realm_uuid=provider_realm_uuid,
@@ -1770,6 +2354,19 @@ def test_provider_identity_merge_invalidates_direct_event_history(
         (legacy_a_uuid, canonical_a_uuid),
         (legacy_b_uuid, canonical_b_uuid),
     }
+    user_lock_indexes = [
+        index
+        for index, (_statement, params) in enumerate(executed)
+        if params and str(params[0]).startswith("workspace-user-resource-v1:")
+    ]
+    project_lock_indexes = [
+        index
+        for index, (statement, _params) in enumerate(executed)
+        if "pg_advisory_xact_lock(hashtextextended(%s::text, 0))" in statement
+    ]
+    assert len(user_lock_indexes) == 4
+    assert project_lock_indexes
+    assert max(user_lock_indexes) < min(project_lock_indexes)
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT payload FROM m_workspace_events WHERE uuid = %s",
@@ -1811,6 +2408,138 @@ def test_provider_identity_merge_invalidates_direct_event_history(
     assert generation_after != generation_before
     assert current_epoch == event_epoch
     assert pruned_through == event_epoch
+
+
+@pytest.mark.parametrize("phase", ["memberships", "flags"])
+def test_identity_merge_restarts_user_keyed_migration_cursors(
+    _database,
+    db,
+    phase,
+):
+    project_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    canonical_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, legacy_user_uuid, f"legacy-{phase}")
+    conftest.seed_workspace_user(db, canonical_user_uuid, f"canonical-{phase}")
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        legacy_user_uuid,
+        f"Identity cursor {phase}",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        project_uuid,
+        stream_uuid,
+        legacy_user_uuid,
+    )
+    cursor_message_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_users
+            SET source = 'zulip', provider_uuid = %s,
+                provider_external_id = %s, updated_at = NOW()
+            WHERE uuid = %s
+            """,
+            (sys_uuid.uuid4(), f"legacy-{phase}", legacy_user_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (
+                project_id, mode, created_at, updated_at
+            ) VALUES (%s, 'preparing', NOW(), NOW())
+            ON CONFLICT (project_id) DO UPDATE
+            SET mode = 'preparing', updated_at = NOW()
+            """,
+            (project_uuid,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_compaction_v1 (
+                project_id, phase, last_message_uuid, last_user_uuid,
+                last_ingest_sequence, target_ingest_sequence, processed_rows,
+                completed_at, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, 7, 20, 11, NOW(), NOW(), NOW())
+            ON CONFLICT (project_id) DO UPDATE
+            SET phase = EXCLUDED.phase,
+                last_message_uuid = EXCLUDED.last_message_uuid,
+                last_user_uuid = EXCLUDED.last_user_uuid,
+                last_ingest_sequence = EXCLUDED.last_ingest_sequence,
+                target_ingest_sequence = EXCLUDED.target_ingest_sequence,
+                processed_rows = EXCLUDED.processed_rows,
+                completed_at = EXCLUDED.completed_at,
+                updated_at = NOW()
+            """,
+            (
+                project_uuid,
+                phase,
+                cursor_message_uuid,
+                legacy_user_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            CREATE TABLE m_workspace_read_state_downgrade_v1 (
+                project_id UUID PRIMARY KEY,
+                last_created_at TIMESTAMPTZ,
+                last_ingest_sequence BIGINT,
+                last_message_uuid UUID,
+                last_user_uuid UUID,
+                processed_rows BIGINT NOT NULL DEFAULT 0,
+                completed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_downgrade_v1 (
+                project_id, last_created_at, last_ingest_sequence,
+                last_message_uuid, last_user_uuid, processed_rows,
+                completed_at
+            ) VALUES (%s, NOW(), 7, %s, %s, 13, NOW())
+            """,
+            (project_uuid, cursor_message_uuid, legacy_user_uuid),
+        )
+    db.commit()
+
+    try:
+        session_factory = engines.engine_factory.get_engine().session_manager
+        with session_factory() as session:
+            identity_linking.merge_workspace_user_identity(
+                session,
+                legacy_user_uuid,
+                canonical_user_uuid,
+            )
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT phase, last_message_uuid, last_user_uuid,
+                       last_ingest_sequence, target_ingest_sequence,
+                       processed_rows, completed_at
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            assert cursor.fetchone() == (phase, None, None, 0, 20, 0, None)
+            cursor.execute(
+                """
+                SELECT last_created_at, last_ingest_sequence,
+                       last_message_uuid, last_user_uuid,
+                       processed_rows, completed_at
+                FROM m_workspace_read_state_downgrade_v1
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            assert cursor.fetchone() == (None, None, None, None, 0, None)
+    finally:
+        with db.cursor() as cursor:
+            cursor.execute("DROP TABLE IF EXISTS m_workspace_read_state_downgrade_v1")
+        db.commit()
 
 
 def test_provider_identity_merge_refreshes_persisted_reaction_users(_database, db):
@@ -3225,9 +3954,12 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
             (chat_uuid,),
         )
     repeated = catalog_report(chat_uuid, 1)
-    assert _request_call(repository.observed_reports, identity, [repeated])["results"][
-        0
-    ]["status"] == "applied"
+    assert (
+        _request_call(repository.observed_reports, identity, [repeated])["results"][0][
+            "status"
+        ]
+        == "applied"
+    )
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT history_depth FROM m_external_chats_v2 WHERE uuid = %s",

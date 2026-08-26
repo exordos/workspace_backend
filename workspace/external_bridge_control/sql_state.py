@@ -13,6 +13,7 @@ import itertools
 import json
 import logging
 import secrets
+import typing
 import uuid as sys_uuid
 from typing import Any
 
@@ -27,6 +28,7 @@ from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
+from workspace.messenger_api.dm import read_state
 
 
 LOG = logging.getLogger(__name__)
@@ -559,16 +561,12 @@ def _emit_projected_capability_events(
         """,
         (chat["project_id"], chat["projection_stream_uuid"]),
     ).fetchall()
-    topics = []
-    for topic_row in topic_rows:
-        topics.extend(
-            messenger_dm_helpers.get_compact_workspace_user_topic_snapshots(
-                chat["project_id"],
-                topic_row["uuid"],
-                recipients,
-                session=session,
-            )
-        )
+    topics = messenger_dm_helpers.get_compact_workspace_user_topic_snapshots_batch(
+        chat["project_id"],
+        [topic_row["uuid"] for topic_row in topic_rows],
+        recipients,
+        session=session,
+    )
     # Serialize every recipient-specific view before the first broadcast takes
     # the transaction-scoped project lock. Sorting keeps stream-before-topic
     # and topic UUID order deterministic once the prepared events are written.
@@ -789,26 +787,26 @@ def refresh_projected_capabilities_batch(
         """,
         (topic_project["project_id"], topic_uuids),
     ).fetchall()
-    recipients_by_stream: dict[object, list[object]] = {}
-    user_topics = []
+    topics_by_stream: dict[object, list[object]] = {}
     for topic in topic_streams:
-        recipients = recipients_by_stream.get(topic["stream_uuid"])
-        if recipients is None:
-            recipients = messenger_dm_helpers.get_compact_workspace_stream_users(
+        topics_by_stream.setdefault(topic["stream_uuid"], []).append(topic["uuid"])
+    user_topics = []
+    for stream_uuid, stream_topic_uuids in topics_by_stream.items():
+        typed_stream_uuid = typing.cast(sys_uuid.UUID, stream_uuid)
+        recipients = messenger_dm_helpers.get_compact_workspace_stream_users(
+            topic_project["project_id"],
+            typed_stream_uuid,
+            models.get_stream_recipients(
                 topic_project["project_id"],
-                topic["stream_uuid"],
-                models.get_stream_recipients(
-                    topic_project["project_id"],
-                    topic["stream_uuid"],
-                    session=session,
-                ),
+                typed_stream_uuid,
                 session=session,
-            )
-            recipients_by_stream[topic["stream_uuid"]] = recipients
+            ),
+            session=session,
+        )
         user_topics.extend(
-            messenger_dm_helpers.get_compact_workspace_user_topic_snapshots(
+            messenger_dm_helpers.get_compact_workspace_user_topic_snapshots_batch(
                 topic_project["project_id"],
-                topic["uuid"],
+                stream_topic_uuids,
                 recipients,
                 session=session,
             )
@@ -839,21 +837,8 @@ def refresh_projected_capabilities_batch(
     return len(topics), len(user_topics), len(prepared_events)
 
 
-def claim_capability_projection_refresh_account(
-    session: Any,
-    after_uuid: object | None = None,
-) -> object | None:
-    """Claim an account with stale projected capability metadata."""
-    cursor_filter = ""
-    params: list[object] = []
-    if after_uuid is not None:
-        cursor_filter = "AND account.uuid > %s"
-        params.append(after_uuid)
-    row = session.execute(
-        f"""
-        SELECT account.uuid
-        FROM m_external_accounts_v2 AS account
-        WHERE EXISTS (
+_CAPABILITY_PROJECTION_REFRESH_PREDICATE = """
+        EXISTS (
             SELECT 1
             FROM m_external_chats_v2 AS chat
             JOIN m_workspace_streams AS stream
@@ -872,17 +857,78 @@ def claim_capability_projection_refresh_account(
                         AND topic.external_account_uuid = chat.external_account_uuid
                         AND topic.provider_metadata->'capabilities'
                             IS DISTINCT FROM chat.capabilities
-                  )
-              )
+                )
+            )
         )
-        {cursor_filter}
-        ORDER BY account.uuid
-        LIMIT 1
-        FOR UPDATE OF account SKIP LOCKED
-        """,
-        tuple(params),
-    ).fetchone()
-    return None if row is None else row["uuid"]
+"""
+
+
+_CAPABILITY_REFRESH_PREDICATE = """
+        EXISTS (
+            SELECT 1
+            FROM m_external_credentials_v2 AS credential
+            WHERE credential.external_account_uuid = account.uuid
+        )
+"""
+
+
+def _claim_capability_account(
+    session: Any,
+    predicate: str,
+    after_uuid: object | None,
+) -> object | None:
+    """Claim account row after joining the account resource-lock protocol."""
+    cursor_uuid = after_uuid
+    while True:
+        cursor_filter = ""
+        params: tuple[object, ...] = ()
+        if cursor_uuid is not None:
+            cursor_filter = "AND account.uuid > %s"
+            params = (cursor_uuid,)
+        candidate = session.execute(
+            f"""
+            SELECT account.uuid
+            FROM m_external_accounts_v2 AS account
+            WHERE {predicate}
+            {cursor_filter}
+            ORDER BY account.uuid
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if candidate is None:
+            return None
+        candidate_uuid = candidate["uuid"]
+        read_state.lock_external_account_resources(
+            session,
+            (candidate_uuid,),
+            shared=True,
+        )
+        claimed = session.execute(
+            f"""
+            SELECT account.uuid
+            FROM m_external_accounts_v2 AS account
+            WHERE account.uuid = %s
+              AND {predicate}
+            FOR UPDATE OF account SKIP LOCKED
+            """,
+            (candidate_uuid,),
+        ).fetchone()
+        if claimed is not None:
+            return claimed["uuid"]
+        cursor_uuid = candidate_uuid
+
+
+def claim_capability_projection_refresh_account(
+    session: Any,
+    after_uuid: object | None = None,
+) -> object | None:
+    """Claim an account with stale projected capability metadata."""
+    return _claim_capability_account(
+        session,
+        _CAPABILITY_PROJECTION_REFRESH_PREDICATE,
+        after_uuid,
+    )
 
 
 def claim_capability_refresh_account(
@@ -890,28 +936,11 @@ def claim_capability_refresh_account(
     after_uuid: object | None = None,
 ) -> object | None:
     """Claim one deterministic account without waiting behind another worker."""
-    cursor_filter = ""
-    params: list[object] = []
-    if after_uuid is not None:
-        cursor_filter = "AND account.uuid > %s"
-        params.append(after_uuid)
-    row = session.execute(
-        f"""
-        SELECT account.uuid
-        FROM m_external_accounts_v2 AS account
-        WHERE EXISTS (
-            SELECT 1
-            FROM m_external_credentials_v2 AS credential
-            WHERE credential.external_account_uuid = account.uuid
-        )
-        {cursor_filter}
-        ORDER BY account.uuid
-        LIMIT 1
-        FOR UPDATE OF account SKIP LOCKED
-        """,
-        tuple(params),
-    ).fetchone()
-    return None if row is None else row["uuid"]
+    return _claim_capability_account(
+        session,
+        _CAPABILITY_REFRESH_PREDICATE,
+        after_uuid,
+    )
 
 
 def degrade_stale_bridge_instances(
@@ -1432,6 +1461,221 @@ def append_delete(
     return change_uuid
 
 
+def _prelock_catalog_identity_resources(
+    session: Any,
+    identity: pki.BridgeIdentity,
+    reports: collections.abc.Iterable[dict[str, Any]],
+) -> bool:
+    """Lock the complete catalog batch before any identity rewrite starts."""
+    account_uuids: set[sys_uuid.UUID] = set()
+    user_uuids: set[sys_uuid.UUID] = set()
+    chat_uuids: set[sys_uuid.UUID] = set()
+    project_uuids: set[sys_uuid.UUID] = set()
+    identity_pairs: set[tuple[sys_uuid.UUID, str]] = set()
+    realm_by_account: dict[sys_uuid.UUID, sys_uuid.UUID] = {}
+    for report in reports:
+        if report.get("resource_type") != "external_chat_catalog":
+            continue
+        catalog = report.get("catalog")
+        if not isinstance(catalog, dict):
+            continue
+        source = catalog.get("source")
+        if not isinstance(source, dict):
+            continue
+        try:
+            account_uuid = sys_uuid.UUID(str(catalog["external_account_uuid"]))
+            owner_uuid = sys_uuid.UUID(str(catalog["owner_user_uuid"]))
+            realm_uuid = sys_uuid.UUID(str(source["provider_realm_uuid"]))
+            chat_uuid = sys_uuid.UUID(str(report["resource_uuid"]))
+            project_uuid = sys_uuid.UUID(str(catalog["project_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        account_uuids.add(account_uuid)
+        realm_by_account[account_uuid] = realm_uuid
+        user_uuids.add(owner_uuid)
+        chat_uuids.add(chat_uuid)
+        project_uuids.add(project_uuid)
+        owner_provider_id = source.get("provider_owner_user_id")
+        if isinstance(owner_provider_id, str) and owner_provider_id:
+            identity_pairs.add((realm_uuid, owner_provider_id))
+        participants = catalog.get("participants")
+        if not isinstance(participants, list):
+            continue
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            provider_user_id = participant.get("provider_user_id")
+            if not isinstance(provider_user_id, str) or not provider_user_id:
+                continue
+            identity_pairs.add((realm_uuid, provider_user_id))
+            user_uuids.add(
+                identity_linking.canonical_provider_identity_uuid(
+                    identity.provider_kind,
+                    realm_uuid,
+                    provider_user_id,
+                )
+            )
+    if not account_uuids:
+        return False
+    ordered_pairs = sorted(identity_pairs, key=lambda pair: (str(pair[0]), pair[1]))
+    ordered_realms = [pair[0] for pair in ordered_pairs]
+    ordered_provider_ids = [pair[1] for pair in ordered_pairs]
+    while True:
+        # A legacy identity can be referenced by a selected chat owned by a
+        # different external account. Freeze that complete account set before
+        # taking any project lock: assignment moves hold their account lock
+        # while changing the chat row and old/new projects.
+        session.execute("SAVEPOINT catalog_account_discovery")
+        try:
+            read_state.lock_external_account_resources(session, account_uuids)
+            discovered_account_uuids = set(account_uuids)
+            discovered_user_uuids = set(user_uuids)
+            discovered_project_uuids = set(project_uuids)
+            if identity_pairs:
+                duplicate_accounts = session.execute(
+                    """
+                    SELECT uuid
+                    FROM m_external_accounts_v2
+                    WHERE provider = %s
+                      AND (provider_realm_uuid, provider_owner_user_id) IN (
+                            SELECT realm_uuid, provider_user_id
+                            FROM unnest(%s::uuid[], %s::text[])
+                                AS identity(realm_uuid, provider_user_id)
+                      )
+                    """,
+                    (
+                        identity.provider_kind,
+                        ordered_realms,
+                        ordered_provider_ids,
+                    ),
+                ).fetchall()
+                discovered_account_uuids.update(
+                    sys_uuid.UUID(str(row["uuid"])) for row in duplicate_accounts
+                )
+            legacy_users = session.execute(
+                """
+                SELECT uuid, external_account_uuid, provider_external_id
+                FROM m_workspace_users
+                WHERE external_account_uuid = ANY(%s::uuid[])
+                  AND provider_external_id IS NOT NULL
+                  AND provider_external_id != ''
+                """,
+                (sorted(realm_by_account, key=str),),
+            ).fetchall()
+            for row in legacy_users:
+                legacy_uuid = sys_uuid.UUID(str(row["uuid"]))
+                discovered_user_uuids.add(legacy_uuid)
+                legacy_realm_uuid = realm_by_account.get(
+                    sys_uuid.UUID(str(row["external_account_uuid"]))
+                )
+                if legacy_realm_uuid is not None:
+                    discovered_user_uuids.add(
+                        identity_linking.canonical_provider_identity_uuid(
+                            identity.provider_kind,
+                            legacy_realm_uuid,
+                            str(row["provider_external_id"]),
+                        )
+                    )
+            if identity_pairs:
+                links = session.execute(
+                    """
+                    SELECT workspace_user_uuid
+                    FROM m_external_provider_identity_links_v1
+                    WHERE provider = %s
+                      AND (provider_realm_uuid, provider_user_id) IN (
+                            SELECT realm_uuid, provider_user_id
+                            FROM unnest(%s::uuid[], %s::text[])
+                                AS identity(realm_uuid, provider_user_id)
+                      )
+                    """,
+                    (
+                        identity.provider_kind,
+                        ordered_realms,
+                        ordered_provider_ids,
+                    ),
+                ).fetchall()
+                discovered_user_uuids.update(
+                    sys_uuid.UUID(str(row["workspace_user_uuid"])) for row in links
+                )
+            if chat_uuids:
+                chat_rows = session.execute(
+                    """
+                    SELECT source, project_id
+                    FROM m_external_chats_v2
+                    WHERE uuid = ANY(%s::uuid[])
+                    """,
+                    (sorted(chat_uuids, key=str),),
+                ).fetchall()
+                for row in chat_rows:
+                    if row["project_id"] is not None:
+                        discovered_project_uuids.add(
+                            sys_uuid.UUID(str(row["project_id"]))
+                        )
+                    source = row["source"]
+                    if not isinstance(source, dict):
+                        continue
+                    for participant in source.get("participants", []):
+                        if not isinstance(participant, dict):
+                            continue
+                        identity_uuid = participant.get("identity_uuid")
+                        try:
+                            discovered_user_uuids.add(sys_uuid.UUID(str(identity_uuid)))
+                        except (TypeError, ValueError):
+                            continue
+            if discovered_user_uuids:
+                changed_chats = session.execute(
+                    """
+                    SELECT DISTINCT external_account_uuid, project_id
+                    FROM m_external_chats_v2
+                    WHERE selected
+                      AND project_id IS NOT NULL
+                      AND EXISTS (
+                            SELECT 1
+                            FROM unnest(%s::text[]) AS identity(user_uuid)
+                            WHERE position(identity.user_uuid in source::text) > 0
+                      )
+                    ORDER BY external_account_uuid, project_id
+                    """,
+                    (
+                        [
+                            str(user_uuid)
+                            for user_uuid in sorted(
+                                discovered_user_uuids,
+                                key=str,
+                            )
+                        ],
+                    ),
+                ).fetchall()
+                discovered_account_uuids.update(
+                    sys_uuid.UUID(str(row["external_account_uuid"]))
+                    for row in changed_chats
+                )
+                discovered_project_uuids.update(
+                    sys_uuid.UUID(str(row["project_id"])) for row in changed_chats
+                )
+            if discovered_account_uuids != account_uuids:
+                session.execute("ROLLBACK TO SAVEPOINT catalog_account_discovery")
+                session.execute("RELEASE SAVEPOINT catalog_account_discovery")
+                account_uuids = discovered_account_uuids
+                user_uuids = discovered_user_uuids
+                project_uuids = discovered_project_uuids
+                continue
+            session.execute("RELEASE SAVEPOINT catalog_account_discovery")
+            user_uuids = discovered_user_uuids
+            project_uuids = discovered_project_uuids
+            break
+        except Exception:
+            session.execute("ROLLBACK TO SAVEPOINT catalog_account_discovery")
+            session.execute("RELEASE SAVEPOINT catalog_account_discovery")
+            raise
+    identity_linking.lock_identity_merge_resources(
+        session,
+        user_uuids,
+        project_uuids,
+    )
+    return True
+
+
 class SQLControlState:
     """Production control repository backed by Workspace PostgreSQL."""
 
@@ -1851,6 +2095,11 @@ class SQLControlState:
         project_uuid = sys_uuid.UUID(str(catalog["project_id"]))
         provider_realm_uuid = sys_uuid.UUID(source["provider_realm_uuid"])
         chat_uuid = sys_uuid.UUID(str(report["resource_uuid"]))
+        read_state.lock_external_account_resources(
+            session,
+            (account_uuid,),
+            shared=True,
+        )
         account = session.execute(
             """
             SELECT account.owner_user_uuid, account.provider, account.settings,
@@ -1987,6 +2236,13 @@ class SQLControlState:
                     session,
                     legacy_owner_uuid,
                     owner_uuid,
+                    _resources_locked=bool(
+                        getattr(
+                            session,
+                            "_workspace_catalog_identity_resources_locked",
+                            False,
+                        )
+                    ),
                 )
             )
             identity_linking.bind_verified_account_owner(
@@ -2003,6 +2259,13 @@ class SQLControlState:
                 provider=identity.provider_kind,
                 account_uuid=account_uuid,
                 provider_realm_uuid=provider_realm_uuid,
+                _resources_locked=bool(
+                    getattr(
+                        session,
+                        "_workspace_catalog_identity_resources_locked",
+                        False,
+                    )
+                ),
             )
         )
         existing_participants = {
@@ -2040,6 +2303,13 @@ class SQLControlState:
                         session,
                         sys_uuid.UUID(legacy_identity_uuid),
                         identity_uuid,
+                        _resources_locked=bool(
+                            getattr(
+                                session,
+                                "_workspace_catalog_identity_resources_locked",
+                                False,
+                            )
+                        ),
                     )
                 )
             normalized_participants.append(
@@ -2455,6 +2725,9 @@ class SQLControlState:
     ) -> dict[str, Any]:
         if not 1 <= len(reports) <= 500:
             raise ValueError("Observed report batch size is invalid")
+        session._workspace_catalog_identity_resources_locked = (
+            _prelock_catalog_identity_resources(session, identity, reports)
+        )
         results = []
         for report in reports:
             report_uuid = sys_uuid.UUID(report["report_uuid"])
