@@ -4684,7 +4684,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
         message_uuid = sys_uuid.uuid4()
-        cursor = types.SimpleNamespace(fetchone=mock.Mock(return_value={"uuid": message_uuid}))
+        cursor = types.SimpleNamespace(
+            fetchone=mock.Mock(
+                return_value={"uuid": message_uuid, "existed": False}
+            )
+        )
         session = types.SimpleNamespace(execute=mock.Mock(return_value=cursor))
 
         changed = dm_helpers._update_workspace_user_message_flag(
@@ -4696,14 +4700,23 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
-        self.assertTrue(changed)
+        self.assertEqual((True, True), changed)
         statement, params = session.execute.call_args.args
-        self.assertIn('SET "starred" = %s, updated_at = NOW()', statement)
-        self.assertIn('"starred" IS DISTINCT FROM %s', statement)
+        self.assertIn("INSERT INTO m_workspace_user_message_flags", statement)
+        self.assertIn("ON CONFLICT (uuid, user_uuid) DO UPDATE", statement)
+        self.assertIn(
+            'SET "starred" = EXCLUDED."starred", updated_at = NOW()',
+            statement,
+        )
+        self.assertIn(
+            'flags."starred" IS DISTINCT FROM EXCLUDED."starred"',
+            statement,
+        )
+        self.assertIn("WHERE value OR existed", statement)
         self.assertNotIn('SET "read"', statement)
         self.assertNotIn('SET "pinned"', statement)
         self.assertEqual(
-            (True, project_id, user_uuid, message_uuid, True),
+            (message_uuid, user_uuid, project_id, True),
             params,
         )
 
@@ -4720,7 +4733,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             session=session,
         )
 
-        self.assertFalse(changed)
+        self.assertEqual((False, False), changed)
 
     def test_update_workspace_user_message_flag_rejects_invalid_value(self):
         session = mock.Mock()
@@ -4761,7 +4774,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=True,
+                return_value=(True, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
@@ -4822,7 +4835,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=False,
+                return_value=(False, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
@@ -4878,7 +4891,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=False,
+                return_value=(False, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers,
@@ -4934,7 +4947,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=True,
+                side_effect=[
+                    (True, True),
+                    (True, False),
+                ],
             ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
@@ -4950,19 +4966,32 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 project_id=project_id,
                 user_uuid=user_uuid,
                 message_uuid=message_uuid,
-                values={"read": False},
+                values={"read": False, "starred": True},
                 session=session,
                 allow_author_unread=True,
             )
 
         self.assertIs(returned_message, result)
-        update_flag.assert_called_once_with(
-            project_id=project_id,
-            user_uuid=user_uuid,
-            message_uuid=message_uuid,
-            field_name="read",
-            value=False,
-            session=session,
+        self.assertEqual(
+            [
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    message_uuid=message_uuid,
+                    field_name="starred",
+                    value=True,
+                    session=session,
+                ),
+                mock.call(
+                    project_id=project_id,
+                    user_uuid=user_uuid,
+                    message_uuid=message_uuid,
+                    field_name="read",
+                    value=False,
+                    session=session,
+                ),
+            ],
+            update_flag.call_args_list,
         )
         create_read_event.assert_not_called()
         create_updated_event.assert_called_once_with(
@@ -4999,7 +5028,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=True,
+                return_value=(True, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
@@ -5069,7 +5098,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                side_effect=[True, True],
+                side_effect=[(True, False), (True, False)],
             ) as update_flag,
             mock.patch.object(
                 dm_helpers,
@@ -5145,7 +5174,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=True,
+                return_value=(True, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers,
@@ -5213,7 +5242,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=True,
+                return_value=(True, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_message_read_event"
@@ -5266,7 +5295,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "_update_workspace_user_message_flag",
-                return_value=False,
+                return_value=(False, False),
             ) as update_flag,
             mock.patch.object(
                 dm_helpers.messenger_events,

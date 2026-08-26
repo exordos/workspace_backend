@@ -5128,25 +5128,66 @@ def _update_workspace_user_message_flag(
     field_name: str,
     value: bool,
     session: typing.Any,
-) -> bool:
-    """Atomically update one flag and report whether the row changed."""
+) -> tuple[bool, bool]:
+    """Atomically set one flag and return ``(changed, materialized)``."""
     if field_name not in _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS:
         raise ValueError(f"Unsupported workspace user message flag: {field_name}")
     if not isinstance(value, bool):
         raise ValueError(f"Workspace user message flag {field_name} must be boolean")
+    inserted_values = {
+        field: (
+            "input.value"
+            if field == field_name
+            else f'COALESCE(current_flags."{field}", FALSE)'
+        )
+        for field in _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS
+    }
+    if field_name != "read":
+        inserted_values["read"] = (
+            'COALESCE(current_flags."read", message.user_uuid = input.user_uuid)'
+        )
     row = session.execute(
         f"""
-        UPDATE m_workspace_user_message_flags
-        SET "{field_name}" = %s, updated_at = NOW()
-        WHERE project_id = %s
-          AND user_uuid = %s
-          AND uuid = %s
-          AND "{field_name}" IS DISTINCT FROM %s
-        RETURNING uuid
+        WITH input (uuid, user_uuid, project_id, value) AS (
+            VALUES (%s::uuid, %s::uuid, %s::uuid, %s::boolean)
+        ), candidate AS (
+            SELECT
+                input.uuid,
+                input.user_uuid,
+                input.project_id,
+                {inserted_values["read"]} AS read,
+                {inserted_values["pinned"]} AS pinned,
+                {inserted_values["starred"]} AS starred,
+                input.value,
+                current_flags.uuid IS NOT NULL AS existed
+            FROM input
+            JOIN m_workspace_messages AS message
+              ON message.uuid = input.uuid
+             AND message.project_id = input.project_id
+            LEFT JOIN m_workspace_user_message_flags AS current_flags
+              ON current_flags.uuid = input.uuid
+             AND current_flags.user_uuid = input.user_uuid
+             AND current_flags.project_id = input.project_id
+        ), changed AS (
+            INSERT INTO m_workspace_user_message_flags AS flags (
+                uuid, user_uuid, project_id, read, pinned, starred
+            )
+            SELECT uuid, user_uuid, project_id, read, pinned, starred
+            FROM candidate
+            WHERE value OR existed
+            ON CONFLICT (uuid, user_uuid) DO UPDATE
+            SET "{field_name}" = EXCLUDED."{field_name}", updated_at = NOW()
+            WHERE flags.project_id = EXCLUDED.project_id
+              AND flags."{field_name}" IS DISTINCT FROM EXCLUDED."{field_name}"
+            RETURNING uuid
+        )
+        SELECT changed.uuid, candidate.existed
+        FROM changed
+        JOIN candidate ON candidate.uuid = changed.uuid
         """,
-        (value, project_id, user_uuid, message_uuid, value),
+        (message_uuid, user_uuid, project_id, value),
     ).fetchone()
-    return row is not None
+    return row is not None, row is not None and not row["existed"]
 
 
 def sync_workspace_user_message_flags(
@@ -5184,16 +5225,22 @@ def sync_workspace_user_message_flags(
     if emit_events:
         _lock_workspace_project_event_writes(project_id, current_session)
     changed_values = {}
-    for field_name, value in values.items():
-        if _update_workspace_user_message_flag(
+    materialized = False
+    # A true flag materializes a missing projection. Apply those values first so
+    # a mixed batch has the same result regardless of the input dictionary order.
+    ordered_values = sorted(values.items(), key=lambda item: item[1] is not True)
+    for field_name, value in ordered_values:
+        changed, inserted = _update_workspace_user_message_flag(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=message_uuid,
             field_name=field_name,
             value=value,
             session=current_session,
-        ):
+        )
+        if changed:
             changed_values[field_name] = value
+            materialized = materialized or inserted
     if not changed_values:
         if emit_events:
             return get_workspace_user_message(
@@ -5229,6 +5276,14 @@ def sync_workspace_user_message_flags(
             topic_uuid=current_message.topic_uuid,
             session=current_session,
         )
+    elif materialized and not result.read:
+        _create_message_unread_updated_events(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=current_message.stream_uuid,
+            topic_uuid=current_message.topic_uuid,
+            session=current_session,
+        )
     if any(field_name != "read" for field_name in changed_values):
         create_updated_event = True
     if create_updated_event:
@@ -5257,14 +5312,15 @@ def sync_workspace_user_messages_read_state(
             getattr(current_message, "author_uuid", None) == user_uuid
             and not allow_author_unread
         )
-        if not _update_workspace_user_message_flag(
+        changed, _inserted = _update_workspace_user_message_flag(
             project_id=project_id,
             user_uuid=user_uuid,
             message_uuid=current_message.uuid,
             field_name="read",
             value=effective_read,
             session=current_session,
-        ):
+        )
+        if not changed:
             continue
         changed_message = get_workspace_user_message(
             project_id=project_id,

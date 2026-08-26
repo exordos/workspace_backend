@@ -8698,6 +8698,13 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
     with db.cursor() as cursor:
         cursor.execute(
             """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, other_user),
+        )
+        cursor.execute(
+            """
             SELECT COALESCE(MAX(epoch_version), 0)
             FROM m_workspace_visible_events
             WHERE project_id = %s
@@ -8707,6 +8714,21 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
         before_actions_epoch = cursor.fetchone()[0]
 
     star_path = f"{MESSAGES}{message_uuid}/actions/star/invoke"
+    unstar_path = f"{MESSAGES}{message_uuid}/actions/unstar/invoke"
+    response = api.post(unstar_path, user=other_user)
+    assert response.status_code == 200, response.text
+    assert response.json()["starred"] is False
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, other_user),
+        )
+        assert cursor.fetchone()[0] == 0
+
     response = api.post(star_path, user=other_user)
     assert response.status_code == 200, response.text
     assert response.json()["starred"] is True
@@ -8734,7 +8756,6 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
     outsider_response = api.post(star_path, user=outsider_user)
     assert outsider_response.status_code == 404, outsider_response.text
 
-    unstar_path = f"{MESSAGES}{message_uuid}/actions/unstar/invoke"
     response = api.post(unstar_path, user=other_user)
     assert response.status_code == 200, response.text
     assert response.json()["starred"] is False
@@ -8769,18 +8790,110 @@ def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
         str(api.user_uuid): False,
         str(other_user): False,
     }
-    assert [str(user_uuid) for user_uuid, _payload in event_rows] == [
+    assert {str(user_uuid) for user_uuid, _payload in event_rows} == {
+        str(other_user)
+    }
+    message_event_rows = [
+        (user_uuid, payload)
+        for user_uuid, payload in event_rows
+        if payload["kind"] == "message.updated"
+    ]
+    assert [str(user_uuid) for user_uuid, _payload in message_event_rows] == [
         str(other_user),
         str(other_user),
     ]
-    assert [payload["kind"] for _user_uuid, payload in event_rows] == [
-        "message.updated",
-        "message.updated",
-    ]
-    assert [payload["starred"] for _user_uuid, payload in event_rows] == [
+    assert [payload["starred"] for _user_uuid, payload in message_event_rows] == [
         True,
         False,
     ]
+    assert [
+        payload["kind"]
+        for _user_uuid, payload in event_rows
+        if payload["kind"] != "message.updated"
+    ] == [
+        "topic.updated",
+        "stream.updated",
+        "folder.updated",
+        "folder.updated",
+    ]
+
+
+def test_message_star_materializes_own_flags_as_read(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "own-starred-message"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {
+                "kind": "markdown",
+                "content": "keep my own message",
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, api.user_uuid),
+        )
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(epoch_version), 0)
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        before_action_epoch = cursor.fetchone()[0]
+
+    response = api.post(f"{MESSAGES}{message_uuid}/actions/star/invoke")
+    assert response.status_code == 200, response.text
+    assert response.json()["read"] is True
+    assert response.json()["starred"] is True
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read, pinned, starred
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, api.user_uuid),
+        )
+        assert cursor.fetchone() == (True, False, True)
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND epoch_version > %s
+            ORDER BY epoch_version
+            """,
+            (api.project_id, api.user_uuid, before_action_epoch),
+        )
+        events = [row[0] for row in cursor.fetchall()]
+
+    assert [event["kind"] for event in events] == ["message.updated"]
+    assert events[0]["uuid"] == message_uuid
+    assert events[0]["read"] is True
+    assert events[0]["starred"] is True
 
 
 def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
@@ -8925,8 +9038,7 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
     with db.cursor() as cursor:
         cursor.execute(
             """
-            UPDATE m_workspace_user_message_flags
-            SET starred = FALSE, updated_at = NOW()
+            DELETE FROM m_workspace_user_message_flags
             WHERE uuid = %s AND project_id = %s AND user_uuid = %s
             """,
             (message_uuid, project_uuid, other_user),
@@ -8952,7 +9064,7 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
         ]
         starred_messages = [future.result(timeout=10) for future in futures]
 
-    assert all(message.read is True for message in starred_messages)
+    assert all(message.read is False for message in starred_messages)
     assert all(message.starred is True for message in starred_messages)
     duplicate_events = message_events_after(before_duplicate_epoch)
     assert len(duplicate_events) == 1
@@ -8968,7 +9080,7 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
             """,
             (message_uuid, project_uuid, other_user),
         )
-        assert cursor.fetchone() == (True, True)
+        assert cursor.fetchone() == (False, True)
         cursor.execute(
             """
             UPDATE m_workspace_user_message_flags
@@ -10803,7 +10915,14 @@ def test_projection_helper_does_not_bypass_canonical_event_journal(
     assert events[0]["payload"]["uuid"] == str(message_uuid)
 
 
-def test_zulip_message_flag_sync_can_keep_author_unread(api, db):
+@pytest.mark.parametrize(
+    "flag_values",
+    [
+        pytest.param({"read": False, "starred": True}, id="read-first"),
+        pytest.param({"starred": True, "read": False}, id="starred-first"),
+    ],
+)
+def test_zulip_message_flag_sync_can_keep_author_unread(api, db, flag_values):
     server_url = "https://zulip.example.test"
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "zulip-own-message"
@@ -10869,15 +10988,23 @@ def test_zulip_message_flag_sync_can_keep_author_unread(api, db):
             session=session,
         )
         assert message.read is True
+        session.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, api.user_uuid),
+        )
         message = messenger_dm_helpers.sync_workspace_user_message_flags(
             project_id=sys_uuid.UUID(api.project_id),
             user_uuid=sys_uuid.UUID(api.user_uuid),
             message_uuid=message_uuid,
-            values={"read": False},
+            values=flag_values,
             session=session,
             allow_author_unread=True,
         )
         assert message.read is False
+        assert message.starred is True
         return message
 
     owner_message = _run_database_operation(create_and_sync_flags)
@@ -10886,17 +11013,17 @@ def test_zulip_message_flag_sync_can_keep_author_unread(api, db):
     with db.cursor() as cur:
         cur.execute(
             """
-            SELECT user_uuid, read
+            SELECT user_uuid, read, starred
             FROM m_workspace_user_message_flags
             WHERE uuid = %s
             ORDER BY user_uuid
             """,
             (message_uuid,),
         )
-        flags = {str(row[0]): row[1] for row in cur.fetchall()}
+        flags = {str(row[0]): (row[1], row[2]) for row in cur.fetchall()}
 
     assert flags == {
-        str(api.user_uuid): False,
+        str(api.user_uuid): (False, True),
     }
 
 
