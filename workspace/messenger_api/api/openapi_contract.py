@@ -1178,11 +1178,12 @@ def add_topic_summary_contract(
         },
         "summary_reasoning_effort": {
             "type": "string",
-            "enum": ["minimal", "low", "medium", "high"],
+            "enum": ["off", "minimal", "low", "medium", "high"],
             "nullable": True,
             "readOnly": True,
             "description": (
-                "Per-summary reasoning choice, or null for no reasoning option."
+                "Per-summary reasoning choice. Off explicitly disables "
+                "reasoning; null omits the provider option."
             ),
         },
     }
@@ -1213,8 +1214,12 @@ def add_topic_summary_contract(
             },
             "summary_reasoning_effort": {
                 "type": "string",
-                "enum": ["minimal", "low", "medium", "high"],
+                "enum": ["off", "minimal", "low", "medium", "high"],
                 "nullable": True,
+                "description": (
+                    "Per-summary reasoning choice. Off explicitly disables "
+                    "reasoning; null omits the provider option."
+                ),
             },
             "summary_enabled": {"type": "boolean"},
         },

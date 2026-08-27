@@ -959,7 +959,9 @@ def build_openai_request(work: SummaryWork) -> dict[str, typing.Any]:
         "frequency_penalty": work.endpoint.frequency_penalty,
     }
     if work.reasoning_effort is not None and work.endpoint.supports_reasoning:
-        payload["reasoning_effort"] = work.reasoning_effort
+        payload["reasoning_effort"] = (
+            "none" if work.reasoning_effort == "off" else work.reasoning_effort
+        )
     return payload
 
 

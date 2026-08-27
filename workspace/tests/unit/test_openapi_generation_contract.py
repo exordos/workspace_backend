@@ -163,8 +163,12 @@ def _assert_topic_summary_contract(paths, topic_path):
     assert prompt_schema["properties"]["summary_system_prompt"]["maxLength"] == 16384
     assert prompt_schema["properties"]["summary_reasoning_effort"] == {
         "type": "string",
-        "enum": ["minimal", "low", "medium", "high"],
+        "enum": ["off", "minimal", "low", "medium", "high"],
         "nullable": True,
+        "description": (
+            "Per-summary reasoning choice. Off explicitly disables reasoning; "
+            "null omits the provider option."
+        ),
     }
     assert prompt_schema["properties"]["summary_enabled"] == {
         "type": "boolean",
