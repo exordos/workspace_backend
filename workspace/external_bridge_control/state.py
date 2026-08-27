@@ -35,6 +35,7 @@ KNOWN_CAPABILITIES = {
     "messenger.message.delete",
     "messenger.message.edit",
     "messenger.message.read",
+    "messenger.message.read.paging",
     "messenger.message.send",
     "messenger.membership.write",
     "messenger.notification.write",

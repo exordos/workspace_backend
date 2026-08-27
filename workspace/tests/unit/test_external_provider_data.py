@@ -104,7 +104,8 @@ class CapabilityLeaseSession:
         (
             {
                 "messenger.message.send": {"revision": 1},
-                "messenger.message.read": {"revision": 2},
+                "messenger.message.read": {"revision": 1},
+                "messenger.message.read.paging": {"revision": 1},
             },
             True,
             True,
@@ -147,7 +148,7 @@ def test_read_state_lease_materializes_only_paging_revision(
         "on"
         if provider_data._capability_revision(
             capabilities,
-            "messenger.message.read",
+            provider_data.PROVIDER_READ_PAGING_CAPABILITY,
         )
         >= provider_data.PROVIDER_READ_PAGING_REVISION
         else "off"
@@ -158,12 +159,22 @@ def test_read_state_lease_materializes_only_paging_revision(
     )
 
 
-def test_read_state_operation_uses_published_physical_identity():
+@pytest.mark.parametrize(
+    ("response_revision", "expects_physical"),
+    ((None, False), (1, False), (2, True)),
+)
+def test_read_state_operation_versions_physical_page_identity(
+    response_revision,
+    expects_physical,
+):
     public_uuid = sys_uuid.uuid4()
     physical_uuid = sys_uuid.uuid4()
     lease_uuid = sys_uuid.uuid4()
     now = datetime.datetime(2026, 8, 27, tzinfo=datetime.timezone.utc)
 
+    payload = {"message_uuids": []}
+    if response_revision is not None:
+        payload["_workspace_response_revision"] = response_revision
     operation = provider_data._operation_dict(
         {
             "uuid": physical_uuid,
@@ -174,11 +185,13 @@ def test_read_state_operation_uses_published_physical_identity():
             "project_id": sys_uuid.uuid4(),
             "operation_kind": "read_state.set",
             "attempt": 1,
-            "payload": {"message_uuids": []},
+            "payload": payload,
         },
     )
 
-    assert operation["external_operation_uuid"] == str(physical_uuid)
+    assert operation["external_operation_uuid"] == str(
+        physical_uuid if expects_physical else public_uuid
+    )
     assert operation["provider_operation_uuid"] == str(physical_uuid)
     assert operation["payload"] == {"message_uuids": []}
 

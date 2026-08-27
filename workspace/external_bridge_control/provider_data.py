@@ -33,7 +33,8 @@ EVENT_MAX_ITEMS = 500
 PROVIDER_READ_MAX_MESSAGES = 500
 PROVIDER_READ_LEGACY_MAX_PAGES = LEASE_MAX_ITEMS
 PROVIDER_READ_MAX_EMPTY_BATCHES_PER_PAGE = 4
-PROVIDER_READ_PAGING_REVISION = 2
+PROVIDER_READ_PAGING_CAPABILITY = "messenger.message.read.paging"
+PROVIDER_READ_PAGING_REVISION = 1
 HEARTBEAT_MAX_AGE = datetime.timedelta(seconds=60)
 LOG = logging.getLogger(__name__)
 
@@ -501,12 +502,31 @@ def _operation_dict(
     row: typing.Mapping[str, typing.Any],
 ) -> dict[str, typing.Any]:
     required_capability = _required_capability(row["operation_kind"])
+    payload = row["payload"]
+    response_revision = (
+        payload.get("_workspace_response_revision", 0)
+        if isinstance(payload, dict)
+        else 0
+    )
+    is_physical_read_page = (
+        row["operation_kind"] == "read_state.set"
+        and isinstance(response_revision, int)
+        and not isinstance(response_revision, bool)
+        and response_revision >= 2
+    )
+    public_payload = (
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "_workspace_response_revision"
+        }
+        if isinstance(payload, dict)
+        else payload
+    )
     return {
         "provider_operation_uuid": str(row["uuid"]),
         "external_operation_uuid": str(
-            row["uuid"]
-            if row["operation_kind"] == "read_state.set"
-            else row["external_operation_uuid"]
+            row["uuid"] if is_physical_read_page else row["external_operation_uuid"]
         ),
         "lease_uuid": str(row["lease_uuid"]),
         "lease_expires_at": _timestamp(row["lease_expires_at"]),
@@ -515,7 +535,7 @@ def _operation_dict(
         "operation_kind": row["operation_kind"],
         "required_capability": required_capability,
         "attempt": row["attempt"],
-        "payload": row["payload"],
+        "payload": public_payload,
     }
 
 
@@ -920,6 +940,7 @@ def _materialize_provider_read_pages(
                     causal_lane=snapshot["causal_lane"],
                     payload={
                         **snapshot["payload"],
+                        "_workspace_response_revision": 2,
                         "message_uuids": [
                             str(candidate["message_uuid"]) for candidate in candidates
                         ],
@@ -1228,7 +1249,7 @@ def lease_provider_operations(
     capabilities = _bridge_capabilities(session, identity, now)
     provider_read_revision = _capability_revision(
         capabilities,
-        "messenger.message.read",
+        PROVIDER_READ_PAGING_CAPABILITY,
     )
     existing = session.execute(
         """
@@ -1290,11 +1311,11 @@ def lease_provider_operations(
             SELECT CASE
                      WHEN jsonb_typeof(
                         bridge."capabilities"
-                            ->'messenger.message.read'->'revision'
+                            ->'messenger.message.read.paging'->'revision'
                      ) = 'number'
                      THEN (
                          bridge."capabilities"
-                             ->'messenger.message.read'->>'revision'
+                             ->'messenger.message.read.paging'->>'revision'
                      )::integer >= %s
                      ELSE FALSE
                    END AS provider_read_paging
@@ -2356,7 +2377,8 @@ def enqueue_provider_read_operation(
         ).fetchall()
         if len(pages) > PROVIDER_READ_LEGACY_MAX_PAGES:
             raise ProviderUnavailableError(
-                "Provider read paging capability revision 2 is required"
+                "Provider capability messenger.message.read.paging revision 1 "
+                "is required"
             )
         first_operation = None
         for index, page in enumerate(pages):

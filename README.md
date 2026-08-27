@@ -113,5 +113,12 @@ Apply migrations with:
 .tox/develop/bin/ra-apply-migration --config-file etc/workspace/workspace.local.conf --path migrations
 ```
 
+Before upgrading an installation that predates the project-dense message
+sequence, take and verify a PostgreSQL backup. The compact-state compatibility
+steps `0142` and `0143` are intentionally forward-only because a rollback would
+renumber messages after bitmap coordinates had been published. Once either
+step is applied, rollback requires restoring that pre-upgrade database backup;
+do not use `ra-rollback-migration` for this upgrade path.
+
 Use the `admin/admin` account for local manual checks when the environment
 provides the test IAM user.

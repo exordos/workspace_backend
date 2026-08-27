@@ -120,6 +120,22 @@ READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID = (
 READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE = (
     "0141-forward-correct-published-read-state-migrations-60f5ca.py"
 )
+COMPACT_DENSE_PREPARATION_MIGRATION_UUID = (
+    "0c93a123-8205-43cf-93dc-29031e06f2a7"
+)
+COMPACT_DENSE_PREPARATION_MIGRATION_FILE = (
+    "0142-prepare-compact-dense-sequence-upgrade-0c93a1.py"
+)
+COMPACT_DENSE_JOIN_MIGRATION_UUID = "1ce3ae70-7ad1-447b-a7ca-e14318e38f98"
+COMPACT_DENSE_JOIN_MIGRATION_FILE = (
+    "0143-join-published-dense-sequence-upgrade-1ce3ae.py"
+)
+PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID = (
+    "523aa199-3aad-4678-b915-5b5439bb9f85"
+)
+PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE = (
+    "0144-use-additive-provider-read-paging-capability-523aa1.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -133,10 +149,59 @@ LEGACY_TABLES = (
 )
 
 
+def _set_historical_schema_fixture_before_forward_only_join(db):
+    """Expose the published 0141 state for migration tests only.
+
+    Production rollback is intentionally forbidden. Test databases start from
+    HEAD, so historical-schema cases must adjust only RestAlchemy bookkeeping
+    after asserting that the compatibility join left no staging relation.
+    """
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT to_regclass(staging_name)
+            FROM unnest(%s::text[]) AS staging_name
+            """,
+            (
+                [
+                    "m_workspace_dense_compact_projects_v1",
+                    "m_workspace_dense_membership_boundaries_v1",
+                    "m_workspace_dense_read_messages_v1",
+                ],
+            ),
+        )
+        assert cur.fetchall() == [(None,), (None,), (None,)]
+        cur.execute(
+            """
+            UPDATE ra_migrations
+            SET applied = FALSE
+            WHERE uuid = ANY(%s::text[])
+            """,
+            (
+                [
+                    COMPACT_DENSE_PREPARATION_MIGRATION_UUID,
+                    COMPACT_DENSE_JOIN_MIGRATION_UUID,
+                ],
+            ),
+        )
+
+
+def _restore_current_provider_read_lease_fence(engine):
+    """Restore the latest function after a historical owner is reapplied."""
+    migration = engine._load_migrations()[
+        PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE
+    ]
+    with ra_contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+
+
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE
+    assert (
+        engine.get_latest_migration()
+        == PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE
+    )
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -170,6 +235,9 @@ def test_current_migrations_have_a_single_head(_database, db):
                     PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID,
                     PROVIDER_HISTORY_DOWNGRADE_MIGRATION_UUID,
                     READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID,
+                    COMPACT_DENSE_PREPARATION_MIGRATION_UUID,
+                    COMPACT_DENSE_JOIN_MIGRATION_UUID,
+                    PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID,
                 ],
             ),
         )
@@ -202,6 +270,9 @@ def test_current_migrations_have_a_single_head(_database, db):
             (PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID, True),
             (PROVIDER_HISTORY_DOWNGRADE_MIGRATION_UUID, True),
             (READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID, True),
+            (COMPACT_DENSE_PREPARATION_MIGRATION_UUID, True),
+            (COMPACT_DENSE_JOIN_MIGRATION_UUID, True),
+            (PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -402,11 +473,34 @@ def test_current_migrations_have_a_single_head(_database, db):
         }
 
 
+@pytest.mark.parametrize(
+    "migration_file",
+    (
+        COMPACT_DENSE_PREPARATION_MIGRATION_FILE,
+        COMPACT_DENSE_JOIN_MIGRATION_FILE,
+    ),
+)
+def test_compact_dense_compatibility_join_is_explicitly_forward_only(
+    _database,
+    migration_file,
+):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[migration_file]
+
+    with ra_contexts.Context().session_manager() as session:
+        with pytest.raises(
+            RuntimeError,
+            match="compatibility migration is forward-only",
+        ):
+            migration.downgrade(session)
+
+
 def test_forward_correction_upgrades_published_read_state_without_rewrite(
     _database,
     db,
 ):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    _set_historical_schema_fixture_before_forward_only_join(db)
     engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
 
     project_uuid = sys_uuid.uuid4()
@@ -507,7 +601,8 @@ def test_forward_correction_upgrades_published_read_state_without_rewrite(
 
     # Published 0139 already assigned project-local coordinates. The new HEAD
     # changes only allocator metadata and preserves every compact bitmap bit.
-    engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    engine.apply_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
+    _restore_current_provider_read_lease_fence(engine)
     with db.cursor() as cur:
         cur.execute(
             """
@@ -571,6 +666,559 @@ def test_forward_correction_upgrades_published_read_state_without_rewrite(
         )
 
 
+def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    _set_historical_schema_fixture_before_forward_only_join(db)
+    for migration_file in (
+        READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE,
+        PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE,
+        PROJECT_DENSE_READ_SEQUENCE_MIGRATION_FILE,
+        PROVIDER_READ_ROLLING_FENCE_MIGRATION_FILE,
+    ):
+        engine.rollback_migration(migration_file)
+
+    project_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    external_operation_uuid = sys_uuid.uuid4()
+    provider_operation_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    first_message_uuid = sys_uuid.uuid4()
+    second_message_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        user_uuid,
+        "Compact 0137 forward upgrade",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        user_uuid,
+        "general",
+        is_default=True,
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source, created_at
+            ) VALUES
+                (
+                    %s, %s, %s, %s, %s,
+                    '{"kind":"markdown","content":"before detach"}',
+                    'native', '{"kind":"native"}', NOW() - INTERVAL '1 hour'
+                ),
+                (
+                    %s, %s, %s, %s, %s,
+                    '{"kind":"markdown","content":"while detached"}',
+                    'native', '{"kind":"native"}', NOW()
+                )
+            RETURNING uuid, ingest_sequence
+            """,
+            (
+                first_message_uuid,
+                project_uuid,
+                stream_uuid,
+                topic_uuid,
+                user_uuid,
+                second_message_uuid,
+                project_uuid,
+                stream_uuid,
+                topic_uuid,
+                user_uuid,
+            ),
+        )
+        sequences = dict(cur.fetchall())
+        first_sequence = sequences[first_message_uuid]
+        second_sequence = sequences[second_message_uuid]
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read, pinned, starred
+            ) VALUES (%s, %s, %s, FALSE, TRUE, FALSE)
+            """,
+            (first_message_uuid, user_uuid, project_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_read_state_projects_v1 (project_id, mode)
+            VALUES (%s, 'compact')
+            """,
+            (project_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_read_state_compaction_v1 (
+                project_id, phase, completed_at
+            ) VALUES (%s, 'verify_mentions', NOW())
+            """,
+            (project_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_read_chunks_v1 (
+                user_uuid, chunk_number, read_bits
+            ) VALUES (
+                %s,
+                %s / 4096,
+                set_bit(B'0'::bit(4096), (%s %% 4096)::integer, 1)
+            )
+            """,
+            (user_uuid, first_sequence, first_sequence),
+        )
+        # Empty chunks are valid but carry no logical reads. They must not turn
+        # coordinate translation into chunk_count x 4096 work or be restored.
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_read_chunks_v1 (
+                user_uuid, chunk_number, read_bits
+            )
+            SELECT %s, chunk_number, B'0'::bit(4096)
+            FROM generate_series(0, 255) AS chunk_number
+            ON CONFLICT (user_uuid, chunk_number) DO NOTHING
+            """,
+            (user_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_user_topic_read_stats_v1 (
+                project_id, user_uuid, topic_uuid, read_count
+            ) VALUES (%s, %s, %s, 1)
+            """,
+            (project_uuid, user_uuid, topic_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_message_mentions_v1 (
+                message_uuid, user_uuid, project_id, stream_uuid, topic_uuid,
+                ingest_sequence
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                first_message_uuid,
+                user_uuid,
+                project_uuid,
+                stream_uuid,
+                topic_uuid,
+                first_sequence,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_topic_message_stats_v1 (
+                topic_uuid, project_id, stream_uuid, message_count,
+                last_ingest_sequence
+            ) VALUES (%s, %s, %s, 2, %s)
+            """,
+            (topic_uuid, project_uuid, stream_uuid, second_sequence),
+        )
+        cur.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, user_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_read_memberships_v1 (
+                project_id, user_uuid, stream_uuid, last_detached_sequence
+            ) VALUES (%s, %s, %s, %s)
+            """,
+            (
+                project_uuid,
+                user_uuid,
+                stream_uuid,
+                first_sequence,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb)
+            """,
+            (account_uuid, user_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status
+            ) VALUES (%s, %s, %s, 'read_state.set', 'stream', 'running')
+            """,
+            (external_operation_uuid, account_uuid, user_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane, payload
+            ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb)
+            """,
+            (
+                external_operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind,
+                causal_lane, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set', %s,
+                '{"message_uuids":[]}'::jsonb
+            )
+            """,
+            (
+                (
+                    provider_operation_uuid,
+                    external_operation_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                )
+                for provider_operation_uuid in provider_operation_uuids
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="snapshots to be drained first"):
+        engine.apply_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (external_operation_uuid,),
+        )
+        assert cur.fetchone() == (1,)
+        cur.execute(
+            "SELECT applied FROM ra_migrations WHERE uuid = %s",
+            (PROJECT_DENSE_READ_SEQUENCE_MIGRATION_UUID,),
+        )
+        assert cur.fetchone() == (False,)
+        cur.execute(
+            "DELETE FROM m_external_provider_read_snapshots_v1 "
+            "WHERE external_operation_uuid = %s",
+            (external_operation_uuid,),
+        )
+
+        # Make the old ingest prefix non-representable in the published
+        # (created_at, uuid) ordering. The failed migration must not change
+        # coordinates, flags, project mode, or compact bits.
+        cur.execute(
+            "UPDATE m_workspace_messages SET created_at = NOW() WHERE uuid = %s",
+            (first_message_uuid,),
+        )
+        cur.execute(
+            "UPDATE m_workspace_messages SET created_at = NOW() - INTERVAL '1 hour' "
+            "WHERE uuid = %s",
+            (second_message_uuid,),
+        )
+
+    with pytest.raises(RuntimeError, match="cannot preserve a detached membership"):
+        engine.apply_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT mode FROM m_workspace_read_state_projects_v1 "
+            "WHERE project_id = %s",
+            (project_uuid,),
+        )
+        assert cur.fetchone() == ("compact",)
+        cur.execute(
+            "SELECT read FROM m_workspace_user_message_flags "
+            "WHERE uuid = %s AND user_uuid = %s",
+            (first_message_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (False,)
+        cur.execute(
+            "SELECT COUNT(*) FROM m_workspace_user_read_chunks_v1 "
+            "WHERE user_uuid = %s",
+            (user_uuid,),
+        )
+        assert cur.fetchone() == (257,)
+        cur.execute(
+            "SELECT last_detached_sequence FROM m_workspace_read_memberships_v1 "
+            "WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s",
+            (project_uuid, stream_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (first_sequence,)
+        cur.execute(
+            "UPDATE m_workspace_messages SET created_at = NOW() - INTERVAL '1 hour' "
+            "WHERE uuid = %s",
+            (first_message_uuid,),
+        )
+        cur.execute(
+            "UPDATE m_workspace_messages SET created_at = NOW() WHERE uuid = %s",
+            (second_message_uuid,),
+        )
+
+    engine.apply_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT uuid, ingest_sequence
+            FROM m_workspace_messages
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY created_at, uuid
+            """,
+            ([first_message_uuid, second_message_uuid],),
+        )
+        dense_messages = cur.fetchall()
+        assert [row[0] for row in dense_messages] == [
+            first_message_uuid,
+            second_message_uuid,
+        ]
+        dense_first_sequence = dense_messages[0][1]
+        dense_second_sequence = dense_messages[1][1]
+        assert dense_first_sequence != first_sequence
+        cur.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (project_uuid,),
+        )
+        assert cur.fetchone() == ("compact",)
+        cur.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT external_operation_uuid)
+            FROM m_external_provider_operations_v1
+            WHERE uuid = ANY(%s::uuid[])
+            """,
+            (list(provider_operation_uuids),),
+        )
+        assert cur.fetchone() == (2, 1)
+        cur.execute(
+            "SELECT status FROM m_external_operations_v2 WHERE uuid = %s",
+            (external_operation_uuid,),
+        )
+        assert cur.fetchone() == ("running",)
+        cur.execute(
+            "DELETE FROM m_external_operations_v2 WHERE uuid = %s",
+            (external_operation_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_external_bridge_instances_v2 WHERE uuid = %s",
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            SELECT read, pinned, starred
+            FROM m_workspace_user_message_flags
+            WHERE uuid = %s AND user_uuid = %s
+            """,
+            (first_message_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (False, True, False)
+        cur.execute(
+            """
+            SELECT get_bit(chunk.read_bits, (%s %% 4096)::integer) = 1
+            FROM m_workspace_user_read_chunks_v1 AS chunk
+            WHERE chunk.user_uuid = %s
+              AND chunk.chunk_number = %s / 4096
+            """,
+            (dense_first_sequence, user_uuid, dense_first_sequence),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            "SELECT COUNT(*) FROM m_workspace_user_read_chunks_v1 "
+            "WHERE user_uuid = %s",
+            (user_uuid,),
+        )
+        assert cur.fetchone() == (1,)
+        cur.execute(
+            """
+            SELECT last_detached_sequence
+            FROM m_workspace_read_memberships_v1
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (dense_first_sequence,)
+        cur.execute(
+            "SELECT completed_at IS NOT NULL "
+            "FROM m_workspace_read_state_compaction_v1 WHERE project_id = %s",
+            (project_uuid,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_message_mentions_v1
+            WHERE message_uuid = %s AND user_uuid = %s
+            """,
+            (first_message_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (dense_first_sequence,)
+        cur.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (project_uuid, user_uuid, topic_uuid),
+        )
+        assert cur.fetchone() == (1,)
+        cur.execute(
+            """
+            SELECT message_count, last_ingest_sequence
+            FROM m_workspace_topic_message_stats_v1
+            WHERE topic_uuid = %s
+            """,
+            (topic_uuid,),
+        )
+        assert cur.fetchone() == (2, dense_second_sequence)
+
+    # RestAlchemy exposes no caller context to distinguish a direct HEAD
+    # rollback from a recursive rollback that will later renumber 0139. Refuse
+    # both before any persisted coordinate can become ambiguous.
+    with pytest.raises(
+        RuntimeError,
+        match="compatibility migration is forward-only",
+    ):
+        engine.rollback_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (first_message_uuid,),
+        )
+        assert cur.fetchone() == (dense_first_sequence,)
+        cur.execute(
+            """
+            SELECT last_detached_sequence
+            FROM m_workspace_read_memberships_v1
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (dense_first_sequence,)
+        # An empty-prefix sentinel is guarded identically; it can exceed the old
+        # global sequence base at high dense range numbers.
+        cur.execute(
+            """
+            UPDATE m_workspace_read_memberships_v1
+            SET last_detached_sequence = 0
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, user_uuid),
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="compatibility migration is forward-only",
+    ):
+        engine.rollback_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_read_memberships_v1
+            SET last_detached_sequence = %s
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (dense_first_sequence, project_uuid, stream_uuid, user_uuid),
+        )
+
+    # RestAlchemy cannot remap a logical boundary after the published 0139
+    # dependency downgrade. Refuse before 0139 can widen detached history.
+    with pytest.raises(
+        RuntimeError,
+        match="compatibility migration is forward-only",
+    ):
+        engine.rollback_migration(PROVIDER_READ_ROLLING_FENCE_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT ingest_sequence FROM m_workspace_messages WHERE uuid = %s",
+            (first_message_uuid,),
+        )
+        assert cur.fetchone() == (dense_first_sequence,)
+        cur.execute(
+            """
+            SELECT last_detached_sequence
+            FROM m_workspace_read_memberships_v1
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, user_uuid),
+        )
+        assert cur.fetchone() == (dense_first_sequence,)
+
+    # Reattachment applies the saved detach boundary to the compact bitmap.
+    # Only the gap message is newly marked read and no dense flag rows appear.
+    with ra_contexts.Context().session_manager() as session:
+        read_state.mark_stream_history_read(
+            session,
+            project_uuid,
+            user_uuid,
+            stream_uuid,
+        )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                message.uuid,
+                get_bit(
+                    chunk.read_bits,
+                    (message.ingest_sequence %% 4096)::integer
+                ) = 1 AS read
+            FROM m_workspace_messages AS message
+            JOIN m_workspace_user_read_chunks_v1 AS chunk
+              ON chunk.user_uuid = %s
+             AND chunk.chunk_number = message.ingest_sequence / 4096
+            WHERE message.uuid = ANY(%s::uuid[])
+            ORDER BY message.uuid
+            """,
+            (user_uuid, [first_message_uuid, second_message_uuid]),
+        )
+        assert cur.fetchall() == sorted(
+            [(first_message_uuid, True), (second_message_uuid, True)]
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_user_read_chunks_v1 WHERE user_uuid = %s",
+            (user_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_streams WHERE uuid = %s AND project_id = %s",
+            (stream_uuid, project_uuid),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_read_state_compaction_v1 "
+            "WHERE project_id = %s",
+            (project_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
+            (project_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_project_ingest_ranges_v2 "
+            "WHERE project_id = %s",
+            (project_uuid,),
+        )
+
+
 def test_lazy_provider_read_migrations_roundtrip_install_rolling_triggers(
     _database,
     db,
@@ -590,6 +1238,7 @@ def test_lazy_provider_read_migrations_roundtrip_install_rolling_triggers(
         )
     db.commit()
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    _set_historical_schema_fixture_before_forward_only_join(db)
 
     engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
     engine.rollback_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
@@ -736,6 +1385,7 @@ def test_lazy_provider_read_migrations_roundtrip_install_rolling_triggers(
         assert {row[0] for row in cur.fetchall()} == {"next_local_sequence"}
     engine.apply_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
     engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    _restore_current_provider_read_lease_fence(engine)
     with db.cursor() as cur:
         cur.execute(
             """
@@ -760,6 +1410,7 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
     db,
 ):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    _set_historical_schema_fixture_before_forward_only_join(db)
     engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
     account_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
@@ -869,9 +1520,10 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
         )
 
     engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    _restore_current_provider_read_lease_fence(engine)
     with db.cursor() as cur:
-        # A published worker does not know about the new columns. Its inserts
-        # must still persist the published physical-UUID response contract.
+        # A published worker does not know about revision markers. Its inserts
+        # must keep the legacy public-operation response identity.
         cur.execute(
             """
             INSERT INTO m_external_provider_operations_v1 (
@@ -969,11 +1621,21 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
             by_uuid[published_provider_uuid]
         )
         assert published_response["external_operation_uuid"] == str(
-            published_provider_uuid
+            published_operation_uuid
         )
         assert published_response["provider_operation_uuid"] == str(
             published_provider_uuid
         )
+        revision_two_row = dict(by_uuid[published_provider_uuid])
+        revision_two_row["payload"] = {
+            **revision_two_row["payload"],
+            "_workspace_response_revision": 2,
+        }
+        revision_two_response = provider_data._operation_dict(revision_two_row)
+        assert revision_two_response["external_operation_uuid"] == str(
+            published_provider_uuid
+        )
+        assert "_workspace_response_revision" not in revision_two_response["payload"]
 
         snapshots = session.execute(
             """
@@ -988,8 +1650,9 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
             for row in snapshots
         )
 
-    # 0141 never changes the published read-delivery identity. A leased row
+    # 0141 never changes the legacy read-delivery identity. A leased row
     # therefore replays byte-for-byte across the forward migration downgrade.
+    engine.rollback_migration(PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE)
     engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
     with ra_contexts.Context().session_manager() as session:
         replay_row = session.execute(
@@ -998,6 +1661,8 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
         ).fetchone()
         assert provider_data._operation_dict(replay_row) == published_response
     engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    engine.apply_migration(PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE)
+    _restore_current_provider_read_lease_fence(engine)
 
     with db.cursor() as cur:
         cur.execute(
@@ -1217,8 +1882,10 @@ def test_lazy_provider_read_rolling_lease_fence_blocks_old_worker(_database, db)
                 capability_cur.execute(
                     """
                     UPDATE m_external_bridge_instances_v2
-                    SET capabilities =
-                        '{"messenger.message.read":{"revision":2}}'::jsonb
+                    SET capabilities = '{
+                        "messenger.message.read":{"revision":1},
+                        "messenger.message.read.paging":{"revision":1}
+                    }'::jsonb
                     WHERE uuid = %s
                     """,
                     (bridge_uuid,),
@@ -2171,6 +2838,7 @@ def test_provider_history_downgrade_preserves_unbounded_result_replay(
             ),
         )
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    _set_historical_schema_fixture_before_forward_only_join(db)
     migration_step = engine._load_migrations()[COMPACT_READ_STATE_MIGRATION_FILE]
     migration_module = __import__(migration_step.__class__.__module__)
     with ra_contexts.Context().session_manager() as session:
@@ -2334,6 +3002,7 @@ def test_provider_history_downgrade_preserves_unbounded_result_replay(
         assert cur.fetchone() == (3,)
     engine.apply_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
     engine.apply_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
+    _restore_current_provider_read_lease_fence(engine)
     with db.cursor() as cur:
         cur.execute(
             "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
@@ -2701,6 +3370,7 @@ def test_compact_read_state_populated_downgrade_restores_legacy_flags(
             bound_user_uuid,
         )
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    _set_historical_schema_fixture_before_forward_only_join(db)
     # Exercise the original compact-state downgrade on its own schema.
     engine.rollback_migration(READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE)
     engine.rollback_migration(PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE)
