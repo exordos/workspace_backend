@@ -160,6 +160,14 @@ def test_openai_request_applies_generation_and_capability_aware_reasoning():
         "reasoning_effort"
     ] == "medium"
 
+    disabled = _work(
+        endpoint=_endpoint(supports_reasoning=True),
+        reasoning_effort="off",
+    )
+    assert topic_summarization.build_openai_request(disabled)[
+        "reasoning_effort"
+    ] == "none"
+
 
 def test_openai_request_keeps_system_text_only_and_places_images_in_user_content():
     image_uuid = sys_uuid.uuid4()

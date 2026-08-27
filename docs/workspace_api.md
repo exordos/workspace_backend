@@ -967,7 +967,7 @@ to the current IAM user through current stream membership.
 | `summary_has_new_messages` | boolean or `null` | no | yes | `null` without a summary; otherwise whether the current latest message differs from `summary_last_message_uuid`. |
 | `summary_enabled` | boolean | no | action-managed | Whether the server-side worker may refresh this topic; defaults to `true`. Disabling preserves the current summary and staleness metadata. |
 | `summary_system_prompt` | string, max 16384, or `null` | no | action-managed | Topic-specific LLM system prompt; `null` selects the application default. |
-| `summary_reasoning_effort` | `minimal`, `low`, `medium`, `high`, or `null` | no | action-managed | Per-summary reasoning choice; used only when the selected endpoint declares reasoning support. |
+| `summary_reasoning_effort` | `off`, `minimal`, `low`, `medium`, `high`, or `null` | no | action-managed | Per-summary reasoning choice; `off` explicitly disables reasoning, while `null` omits the provider option. Used only when the selected endpoint declares reasoning support. |
 | `source_name` | `native`, `zulip` | no | no | Topic source name; defaults to `native` when omitted. |
 | `source` | object | no | no | Topic source payload. |
 | `provider` | object or `null` | no | yes | Provider badge for provider-backed topics; `null` for native topics. |
@@ -1030,7 +1030,9 @@ Setting `summary_system_prompt` to `null` restores the application default.
 Every field is optional, but the request must contain at least one field.
 Omitting a field preserves its current value. Sending
 `summary_reasoning_effort` as `null` clears the reasoning request. Reasoning
-effort belongs to the topic request, not to endpoint configuration. Setting
+effort belongs to the topic request, not to endpoint configuration. Setting it
+to `off` sends the OpenAI-compatible provider value `none`, explicitly
+disabling model reasoning instead of relying on the provider default. Setting
 `summary_enabled` to `false` cancels pending work for this topic and prevents
 new claims while preserving the current summary; setting it back to `true`
 allows the worker to refresh any stale content.

@@ -57,7 +57,7 @@ SourceName = base.SourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
 WorkspaceStreamNotificationMode = base.WorkspaceStreamNotificationMode
 WorkspaceTopicNotificationMode = base.WorkspaceTopicNotificationMode
-SUMMARY_REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+SUMMARY_REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high")
 
 
 class Folder(

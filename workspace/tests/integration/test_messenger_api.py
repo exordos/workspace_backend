@@ -663,7 +663,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
             f"{STREAM_TOPICS}{topic_uuid}/actions/set_summary_prompt/invoke",
             json={
                 "summary_system_prompt": "Summarize decisions only.",
-                "summary_reasoning_effort": "high",
+                "summary_reasoning_effort": "off",
             },
         )
         assert prompt_response.status_code == 200, prompt_response.text
@@ -784,7 +784,7 @@ def test_topic_summary_worker_waits_for_busy_vision_and_completes_outside_api(
         assert provider_request["path"] == "/v1/chat/completions"
         assert provider_request["authorization"] == "Bearer vision-secret"
         assert provider_request["body"]["model"] == "vision-model"
-        assert provider_request["body"]["reasoning_effort"] == "high"
+        assert provider_request["body"]["reasoning_effort"] == "none"
         assert provider_request["body"]["max_tokens"] == 321
         assert isinstance(provider_request["body"]["messages"][0]["content"], str)
         user_content = provider_request["body"]["messages"][-1]["content"]
@@ -8721,13 +8721,13 @@ def test_stream_topic_summary_prompt_requires_owner_or_administrator(api, db):
         user=administrator_uuid,
         json={
             "summary_system_prompt": "Focus on decisions and owners.",
-            "summary_reasoning_effort": "medium",
+            "summary_reasoning_effort": "off",
             "summary_enabled": False,
         },
     )
     assert response.status_code == 200, response.text
     assert response.json()["summary_system_prompt"] == "Focus on decisions and owners."
-    assert response.json()["summary_reasoning_effort"] == "medium"
+    assert response.json()["summary_reasoning_effort"] == "off"
     assert response.json()["summary_enabled"] is False
 
     response = api.post(
@@ -8737,7 +8737,7 @@ def test_stream_topic_summary_prompt_requires_owner_or_administrator(api, db):
     )
     assert response.status_code == 200, response.text
     assert response.json()["summary_system_prompt"] == "Focus on risks."
-    assert response.json()["summary_reasoning_effort"] == "medium"
+    assert response.json()["summary_reasoning_effort"] == "off"
     assert response.json()["summary_enabled"] is True
     member_topic = api.get(f"{STREAM_TOPICS}{topic_uuid}", user=member_uuid)
     assert member_topic.status_code == 200, member_topic.text
