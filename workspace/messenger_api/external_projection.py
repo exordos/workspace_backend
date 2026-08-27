@@ -24,6 +24,26 @@ def provider_topic_name(provider_kind: str) -> str:
     return provider_kind.replace("_", " ").title()
 
 
+def _native_direct_participant_uuids(
+    source: collections.abc.Mapping[str, typing.Any],
+) -> tuple[sys_uuid.UUID, sys_uuid.UUID] | None:
+    participants = source.get("participants", [])
+    chat_type = source.get("chat_type")
+    if chat_type in {None, "personal"} and len(participants) == 2:
+        return (
+            sys_uuid.UUID(str(participants[0]["identity_uuid"])),
+            sys_uuid.UUID(str(participants[1]["identity_uuid"])),
+        )
+    if (
+        chat_type == "group"
+        and len(participants) == 1
+        and participants[0]["role"] == "owner"
+    ):
+        user_uuid = sys_uuid.UUID(str(participants[0]["identity_uuid"]))
+        return user_uuid, user_uuid
+    return None
+
+
 def is_native_direct_projection(
     session: typing.Any,
     project_id: sys_uuid.UUID,
@@ -133,11 +153,13 @@ def reconcile_personal_chat_projection(
     session: typing.Any,
     *,
     project_id: sys_uuid.UUID,
+    owner_user_uuid: sys_uuid.UUID,
     provider_kind: str,
     source: collections.abc.Mapping[str, typing.Any],
     projection_stream_uuid: sys_uuid.UUID,
+    emit_events: bool = True,
 ) -> tuple[sys_uuid.UUID, dict[str, typing.Any], bool]:
-    """Merge a verified provider DM into an existing native direct chat."""
+    """Merge a verified provider DM into its canonical native direct chat."""
     read_state.lock_message_structure(session, (project_id,))
     read_state.lock_projects(session, (project_id,))
     read_state.bump_project_structure_revisions(session, (project_id,))
@@ -146,26 +168,25 @@ def reconcile_personal_chat_projection(
         dict(participant) for participant in source.get("participants", [])
     ]
     normalized_source["topics"] = [dict(topic) for topic in source.get("topics", [])]
+    participant_uuids = _native_direct_participant_uuids(normalized_source)
+    if participant_uuids is None or len(normalized_source["topics"]) != 1:
+        return projection_stream_uuid, normalized_source, False
     if (
-        source.get("chat_type") != "personal"
-        or len(normalized_source["participants"]) != 2
-        or len(normalized_source["topics"]) != 1
+        normalized_source["chat_type"] == "group"
+        and participant_uuids[0] != sys_uuid.UUID(str(owner_user_uuid))
     ):
         return projection_stream_uuid, normalized_source, False
 
-    participant_uuids = [
-        sys_uuid.UUID(str(participant["identity_uuid"]))
-        for participant in normalized_source["participants"]
-    ]
+    unique_participant_uuids = set(participant_uuids)
     verified_count = session.execute(
         """
         SELECT COUNT(*) AS count
         FROM m_workspace_users
         WHERE uuid = ANY(%s) AND source = 'iam'
         """,
-        (participant_uuids,),
+        (list(unique_participant_uuids),),
     ).fetchone()["count"]
-    if verified_count != 2:
+    if verified_count != len(unique_participant_uuids):
         return projection_stream_uuid, normalized_source, False
 
     private_index = helpers.build_private_stream_index(*participant_uuids)
@@ -179,7 +200,36 @@ def reconcile_personal_chat_projection(
         (project_id, private_index),
     ).fetchone()
     if target is None:
-        return projection_stream_uuid, normalized_source, False
+        if normalized_source["chat_type"] != "group":
+            return projection_stream_uuid, normalized_source, False
+        target_stream_uuid = helpers.deterministic_direct_stream_uuid(
+            project_id,
+            participant_uuids[0],
+            participant_uuids[1],
+        )
+        helpers.get_or_create_workspace_user_stream(
+            project_id,
+            participant_uuids[0],
+            session=session,
+            uuid=target_stream_uuid,
+            name=normalized_source["participants"][0]["display_name"],
+            description=normalized_source["description"],
+            source_name=models.SourceName.NATIVE.value,
+            source=models.NativeSource(),
+            direct_user_uuid=participant_uuids[0],
+            emit_events=emit_events,
+        )
+        target = session.execute(
+            """
+            SELECT uuid, default_topic_uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND private_index = %s
+            FOR UPDATE
+            """,
+            (project_id, private_index),
+        ).fetchone()
+        if target is None:
+            raise ValueError("Native self-direct stream is missing")
 
     target_stream_uuid = sys_uuid.UUID(str(target["uuid"]))
     topic_name = provider_topic_name(provider_kind)
@@ -485,45 +535,67 @@ def ensure_external_chat_stream(
             (topic for topic in source["topics"] if topic["is_default"]),
             None,
         )
-        helpers.get_or_create_workspace_user_stream(
-            project_id,
-            owner_user_uuid,
-            session=session,
-            uuid=projection_stream_uuid,
-            name=display_name,
-            description=source["description"],
-            private=chat_type != "channel",
-            invite_only=chat_type != "channel",
-            source_name=source_name,
-            source=workspace_source,
-            canonical_default_topic_uuid=(
+        self_direct_participants = _native_direct_participant_uuids(source)
+        self_direct_user_uuid = (
+            self_direct_participants[0]
+            if source["chat_type"] == "group"
+            and self_direct_participants is not None
+            else None
+        )
+        stream_fields = {
+            "uuid": projection_stream_uuid,
+            "name": display_name,
+            "description": source["description"],
+            "private": chat_type != "channel",
+            "invite_only": chat_type != "channel",
+            "source_name": source_name,
+            "source": workspace_source,
+            "canonical_default_topic_uuid": (
                 None
                 if default_topic is None
                 else sys_uuid.UUID(str(default_topic["topic_uuid"]))
             ),
-            default_topic_name=(
+            "default_topic_name": (
                 "General Topic" if default_topic is None else default_topic["name"]
             ),
-            create_default_topic=default_topic is not None,
-            provider_uuid=bridge_instance_uuid,
-            external_account_uuid=external_account_uuid,
-            provider_external_id=provider_chat_id,
-            provider_metadata={
+            "create_default_topic": default_topic is not None,
+            "provider_uuid": bridge_instance_uuid,
+            "external_account_uuid": external_account_uuid,
+            "provider_external_id": provider_chat_id,
+            "provider_metadata": {
                 "kind": provider_kind,
                 "account_uuid": str(external_account_uuid),
                 "external_id": provider_chat_id,
                 "capabilities": dict(capabilities),
             },
-            emit_events=emit_events,
+            "emit_events": emit_events,
+        }
+        if self_direct_user_uuid is not None:
+            stream_fields.update(
+                {
+                    "direct_user_uuid": self_direct_user_uuid,
+                    "source_name": models.SourceName.NATIVE.value,
+                    "source": models.NativeSource(),
+                }
+            )
+            for field_name in (
+                "provider_uuid",
+                "external_account_uuid",
+                "provider_external_id",
+                "provider_metadata",
+            ):
+                stream_fields.pop(field_name)
+        helpers.get_or_create_workspace_user_stream(
+            project_id,
+            owner_user_uuid,
+            session=session,
+            **stream_fields,
         )
     elif not reconcile_participants:
         if getattr(stream, "private_index", None) is not None:
-            participant_uuids = {
-                sys_uuid.UUID(str(participant["identity_uuid"]))
-                for participant in source["participants"]
-            }
+            participant_uuids = _native_direct_participant_uuids(source)
             if (
-                len(participant_uuids) != 2
+                participant_uuids is None
                 or owner_user_uuid not in participant_uuids
                 or stream.private_index
                 != helpers.build_private_stream_index(*participant_uuids)
@@ -558,10 +630,11 @@ def ensure_external_chat_stream(
         if user_uuid == owner_user_uuid or user_uuid not in revoked_user_uuids
     }
     if stream is not None and getattr(stream, "private_index", None) is not None:
-        if len(
-            participants
-        ) != 2 or stream.private_index != helpers.build_private_stream_index(
-            *participants
+        direct_participant_uuids = _native_direct_participant_uuids(source)
+        if (
+            direct_participant_uuids is None
+            or stream.private_index
+            != helpers.build_private_stream_index(*direct_participant_uuids)
         ):
             raise ValueError(
                 "Native direct stream participants do not match assignment"

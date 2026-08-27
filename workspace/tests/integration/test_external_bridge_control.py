@@ -56,6 +56,136 @@ def _request_call(callable_, *args, **kwargs):
         return callable_(*args, **kwargs)
 
 
+def test_shared_self_dm_provider_events_are_account_scoped(_database, db):
+    identity = _identity(sys_uuid.uuid4(), sys_uuid.uuid4())
+    account_a_uuid = sys_uuid.uuid4()
+    account_b_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(db, project_uuid, owner_uuid, "Shared self DM")
+    )
+    topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            project_uuid,
+            stream_uuid,
+            owner_uuid,
+            "default",
+            is_default=True,
+        )
+    )
+    message_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload,
+                external_account_uuid, provider_external_id
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"account A"}'::jsonb,
+                %s, '101'
+            )
+            """,
+            (
+                message_uuid,
+                project_uuid,
+                stream_uuid,
+                topic_uuid,
+                owner_uuid,
+                account_a_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags (
+                uuid, user_uuid, project_id, read
+            ) VALUES (%s, %s, %s, FALSE)
+            """,
+            (message_uuid, owner_uuid, project_uuid),
+        )
+    db.commit()
+
+    assignment = {
+        "owner_user_uuid": owner_uuid,
+        "projection_stream_uuid": stream_uuid,
+    }
+    foreign_event = {
+        "external_account_uuid": str(account_b_uuid),
+        "kind": "message.delete",
+    }
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="another account"):
+            provider_event_apply._message_event(
+                session,
+                foreign_event,
+                project_uuid,
+                assignment,
+                {"uuid": str(message_uuid), "stream_uuid": str(stream_uuid)},
+                identity,
+            )
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="another account"):
+            provider_event_apply._reaction_event(
+                session,
+                {
+                    "external_account_uuid": str(account_b_uuid),
+                    "kind": "reaction.upsert",
+                },
+                project_uuid,
+                assignment,
+                {
+                    "uuid": str(sys_uuid.uuid4()),
+                    "message_uuid": str(message_uuid),
+                    "user_uuid": str(owner_uuid),
+                    "emoji_name": "thumbs_up",
+                },
+                identity,
+            )
+    with session_factory() as session:
+        with pytest.raises(ValueError, match="another account"):
+            provider_event_apply._read_state_event(
+                session,
+                project_uuid,
+                assignment,
+                {
+                    "stream_uuid": str(stream_uuid),
+                    "topic_uuid": str(topic_uuid),
+                    "reader_uuid": str(owner_uuid),
+                    "message_uuids": [str(message_uuid), str(sys_uuid.uuid4())],
+                    "read": True,
+                },
+                account_b_uuid,
+            )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload->>'content'
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == ("account A",)
+        cursor.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (project_uuid, owner_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (False,)
+        cursor.execute(
+            "SELECT COUNT(*) FROM m_workspace_message_reactions WHERE message_uuid = %s",
+            (message_uuid,),
+        )
+        assert cursor.fetchone() == (0,)
+
+
 @pytest.mark.parametrize(
     "attachment_kind",
     ["provider", "native-stream", "native-public"],
@@ -3984,6 +4114,30 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         [invalid_direct, valid_after_invalid],
     )["results"]
     assert [result["status"] for result in partial] == ["rejected", "applied"]
+
+    self_dm_uuid = sys_uuid.uuid4()
+    self_dm = catalog_report(self_dm_uuid, 1)
+    self_dm["catalog"]["source"].update(
+        {
+            "chat_type": "group_direct",
+            "provider_chat_key": "group_direct:7",
+        }
+    )
+    self_dm["catalog"]["display_name"] = "Catalog owner"
+    self_dm["catalog"]["topics"][0]["is_default"] = True
+    assert (
+        _request_call(repository.observed_reports, identity, [self_dm])["results"][0][
+            "status"
+        ]
+        == "applied"
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT source->>'chat_type', provider_chat_id "
+            "FROM m_external_chats_v2 WHERE uuid = %s",
+            (self_dm_uuid,),
+        )
+        assert cursor.fetchone() == ("group", "group_direct:7")
 
     invalid_group_uuid = sys_uuid.uuid4()
     invalid_group = catalog_report(invalid_group_uuid, 1)

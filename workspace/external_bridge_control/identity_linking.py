@@ -111,19 +111,44 @@ def _rewrite_payload_uuid_references(
                 raise IdentityMergePending
 
 
-def invalidate_direct_event_history(session: typing.Any) -> None:
+def invalidate_direct_event_history(
+    session: typing.Any,
+    *,
+    project_id: object | None = None,
+    user_uuid: object | None = None,
+    stream_uuid: object | None = None,
+) -> None:
     """Force clients to reload canonical state instead of replaying stale UUIDs."""
     session.execute(
         """
-        UPDATE m_workspace_event_cursors
+        UPDATE m_workspace_event_cursors AS cursor
         SET epoch_generation = %s,
             pruned_through_epoch_version = GREATEST(
                 pruned_through_epoch_version,
                 current_epoch_version
             ),
             updated_at = NOW()
+        WHERE (%s::uuid IS NULL OR project_id = %s::uuid)
+          AND (%s::uuid IS NULL OR user_uuid = %s::uuid)
+          AND (
+              %s::uuid IS NULL
+              OR cursor.user_uuid IN (
+                  SELECT binding.user_uuid
+                  FROM m_workspace_stream_bindings AS binding
+                  WHERE binding.project_id = cursor.project_id
+                    AND binding.stream_uuid = %s::uuid
+              )
+          )
         """,
-        (sys_uuid.uuid4(),),
+        (
+            sys_uuid.uuid4(),
+            project_id,
+            project_id,
+            user_uuid,
+            user_uuid,
+            stream_uuid,
+            stream_uuid,
+        ),
     )
 
 

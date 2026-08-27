@@ -152,9 +152,9 @@ def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str
             existing_by_uuid = {item["topic_uuid"]: item for item in topics}
             topics = []
             materialized_topic_uuids = set()
-            if chat_kind == "personal_dm" and stream["private_index"] is not None:
+            if chat_kind != "channel" and stream["private_index"] is not None:
                 topic_uuids = [
-                    sys_uuid.UUID(str(item["topic_uuid"])) for item in topics
+                    sys_uuid.UUID(str(topic_uuid)) for topic_uuid in existing_by_uuid
                 ]
                 rows = session.execute(
                     """
@@ -247,6 +247,7 @@ def repair_external_chat_assignments(
         """
         SELECT chat.uuid,
                projection_repair.required AS repair_projection,
+               account.live_ready AS account_live_ready,
                COALESCE(
                    account.settings->>'history_depth',
                    chat.history_depth
@@ -261,10 +262,15 @@ def repair_external_chat_assignments(
          AND desired.resource_uuid = chat.uuid
         LEFT JOIN LATERAL (
             SELECT
-                STRING_AGG(
-                    participant->>'identity_uuid',
-                    ':' ORDER BY participant->>'identity_uuid'
-                ) AS private_index,
+                CASE
+                    WHEN COUNT(*) = 1
+                    THEN MIN(participant->>'identity_uuid') || ':' ||
+                         MIN(participant->>'identity_uuid')
+                    ELSE STRING_AGG(
+                        participant->>'identity_uuid',
+                        ':' ORDER BY participant->>'identity_uuid'
+                    )
+                END AS private_index,
                 COUNT(*) AS participant_count,
                 COUNT(DISTINCT workspace_user.uuid) AS verified_count
             FROM jsonb_array_elements(
@@ -286,9 +292,21 @@ def repair_external_chat_assignments(
          AND default_topic.uuid = native_stream.default_topic_uuid
         LEFT JOIN LATERAL (
             SELECT (
-                chat.source->>'chat_type' = 'personal'
-                AND participant_index.participant_count = 2
-                AND participant_index.verified_count = 2
+                (
+                    (
+                        chat.source->>'chat_type' = 'personal'
+                        AND participant_index.participant_count = 2
+                    )
+                    OR (
+                        chat.source->>'chat_type' = 'group'
+                        AND participant_index.participant_count = 1
+                        AND chat.source#>>'{participants,0,role}' = 'owner'
+                        AND chat.source#>>'{participants,0,identity_uuid}' =
+                            chat.owner_user_uuid::text
+                    )
+                )
+                AND participant_index.verified_count =
+                    participant_index.participant_count
                 AND jsonb_array_length(
                     CASE
                         WHEN jsonb_typeof(chat.source->'topics') = 'array'
@@ -296,14 +314,25 @@ def repair_external_chat_assignments(
                         ELSE '[]'::jsonb
                     END
                 ) = 1
-                AND native_stream.uuid IS NOT NULL
                 AND (
-                    chat.projection_stream_uuid IS DISTINCT FROM native_stream.uuid
-                    OR native_stream.default_topic_uuid IS NULL
-                    OR default_topic.name IS DISTINCT FROM
-                       INITCAP(REPLACE(chat.provider, '_', ' '))
-                    OR chat.source#>>'{topics,0,topic_uuid}'
-                       IS DISTINCT FROM native_stream.default_topic_uuid::text
+                    (
+                        native_stream.uuid IS NOT NULL
+                        AND (
+                            chat.projection_stream_uuid IS DISTINCT FROM
+                                native_stream.uuid
+                            OR native_stream.default_topic_uuid IS NULL
+                            OR default_topic.name IS DISTINCT FROM
+                               INITCAP(REPLACE(chat.provider, '_', ' '))
+                            OR chat.source#>>'{topics,0,topic_uuid}'
+                               IS DISTINCT FROM
+                                   native_stream.default_topic_uuid::text
+                        )
+                    )
+                    OR (
+                        chat.source->>'chat_type' = 'group'
+                        AND participant_index.participant_count = 1
+                        AND native_stream.uuid IS NULL
+                    )
                 )
             ) AS required
         ) AS projection_repair ON TRUE
@@ -354,9 +383,11 @@ def repair_external_chat_assignments(
             ) = external_projection.reconcile_personal_chat_projection(
                 session,
                 project_id=chat.project_id,
+                owner_user_uuid=chat.owner_user_uuid,
                 provider_kind=chat.provider,
                 source=chat.source,
                 projection_stream_uuid=chat.projection_stream_uuid,
+                emit_events=bool(row["account_live_ready"]),
             )
             projection_repaired = (
                 projection_changed
@@ -389,7 +420,11 @@ def repair_external_chat_assignments(
                 session=session,
             )
             if projection_changed:
-                identity_linking.invalidate_direct_event_history(session)
+                identity_linking.invalidate_direct_event_history(
+                    session,
+                    project_id=chat.project_id,
+                    stream_uuid=chat.projection_stream_uuid,
+                )
         change_uuid = append_upsert(
             session,
             sys_uuid.UUID(str(bridge_instance_uuid)),
@@ -2323,7 +2358,7 @@ class SQLControlState:
                 }
             )
         if (source["chat_type"] == "direct" and len(normalized_participants) != 2) or (
-            source["chat_type"] == "group_direct" and len(normalized_participants) < 3
+            source["chat_type"] == "group_direct" and len(normalized_participants) == 2
         ):
             raise ValueError("External chat catalog participant topology is invalid")
         provider_topic_ids = set()
@@ -2431,12 +2466,18 @@ class SQLControlState:
             ) = external_projection.reconcile_personal_chat_projection(
                 session,
                 project_id=projection_project_uuid,
+                owner_user_uuid=owner_uuid,
                 provider_kind=identity.provider_kind,
                 source=normalized_source,
                 projection_stream_uuid=projection_stream_uuid,
+                emit_events=bool(account["live_ready"]),
             )
             if projection_changed:
-                identity_linking.invalidate_direct_event_history(session)
+                identity_linking.invalidate_direct_event_history(
+                    session,
+                    project_id=projection_project_uuid,
+                    stream_uuid=projection_stream_uuid,
+                )
         session.execute(
             """
             INSERT INTO m_external_chats_v2 (
@@ -2532,6 +2573,7 @@ class SQLControlState:
             ) = external_projection.reconcile_personal_chat_projection(
                 session,
                 project_id=changed_chat.project_id,
+                owner_user_uuid=changed_chat.owner_user_uuid,
                 provider_kind=changed_chat.provider,
                 source=changed_chat.source,
                 projection_stream_uuid=changed_chat.projection_stream_uuid,
@@ -2560,7 +2602,11 @@ class SQLControlState:
                     session=session,
                 )
             if changed_projection:
-                identity_linking.invalidate_direct_event_history(session)
+                identity_linking.invalidate_direct_event_history(
+                    session,
+                    project_id=changed_chat.project_id,
+                    stream_uuid=changed_chat.projection_stream_uuid,
+                )
             append_upsert(
                 session,
                 identity.bridge_instance_uuid,

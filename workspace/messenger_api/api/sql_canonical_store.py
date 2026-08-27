@@ -1191,12 +1191,124 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             sys_uuid.UUID(avatar[len(models.WORKSPACE_USER_IMAGE_AVATAR_PREFIX) :]),
         )
 
+    def _provider_account_uuids_for_stream(
+        self,
+        stream: models.WorkspaceStream,
+    ) -> tuple[object, ...]:
+        """Resolve every selected provider route for a native self-DM."""
+        if stream.external_account_uuid is not None:
+            return (stream.external_account_uuid,)
+        if stream.private_index != helpers.build_private_stream_index(
+            self.user_uuid,
+            self.user_uuid,
+        ):
+            return ()
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            """
+            SELECT DISTINCT external_account_uuid
+            FROM m_external_chats_v2
+            WHERE owner_user_uuid = %s AND project_id = %s
+              AND projection_stream_uuid = %s AND selected
+              AND status IN ('syncing', 'live', 'degraded')
+              AND NOT transition_pending
+            ORDER BY external_account_uuid
+            """,
+            (self.user_uuid, self.project_uuid, stream.uuid),
+        ).fetchall()
+        return tuple(row["external_account_uuid"] for row in rows)
+
+    def _provider_account_uuid_for_stream(
+        self,
+        stream: models.WorkspaceStream,
+    ) -> object | None:
+        """Resolve the sole selected provider route for a stream operation."""
+        account_uuids = self._provider_account_uuids_for_stream(stream)
+        return account_uuids[0] if len(account_uuids) == 1 else None
+
+    def _provider_targets_for_stream(
+        self,
+        stream_uuid: object,
+        operation_kind: str,
+    ) -> tuple[typing.Any, ...]:
+        """Resolve every selected provider route before a canonical mutation."""
+        account_uuids = self._lock_provider_account_for_stream(stream_uuid)
+        return tuple(
+            target
+            for account_uuid in account_uuids
+            if (
+                target := self._provider_target(
+                    stream_uuid,
+                    operation_kind,
+                    account_locked=True,
+                    external_account_uuid=account_uuid,
+                )
+            )
+            is not None
+        )
+
+    def _message_provider_targets(
+        self,
+        message: models.WorkspaceMessage,
+        operation_kind: str,
+        *,
+        account_locked: bool = False,
+    ) -> tuple[typing.Any, ...]:
+        """Resolve every durable provider route that owns a message."""
+        session = contexts.Context().get_session()
+        provenance = session.execute(
+            """
+            SELECT external_account_uuid
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (self.project_uuid, message.uuid),
+        ).fetchone()
+        if provenance is None:
+            return ()
+        message_account_uuid = provenance["external_account_uuid"]
+        if message_account_uuid is not None:
+            account_uuids = (message_account_uuid,)
+        else:
+            create_routes = session.execute(
+                """
+                SELECT DISTINCT external_account_uuid
+                FROM m_external_operations_v2
+                WHERE owner_user_uuid = %s AND action = 'message.create'
+                  AND target_type = 'message'
+                  AND target_uuid = %s
+                ORDER BY external_account_uuid
+                """,
+                (self.user_uuid, message.uuid),
+            ).fetchall()
+            account_uuids = tuple(
+                route["external_account_uuid"] for route in create_routes
+            )
+        if not account_uuids:
+            return ()
+        if not account_locked:
+            self._lock_provider_accounts(account_uuids)
+        return tuple(
+            target
+            for account_uuid in account_uuids
+            if (
+                target := self._provider_target(
+                    message.stream_uuid,
+                    operation_kind,
+                    account_locked=True,
+                    external_account_uuid=account_uuid,
+                )
+            )
+            is not None
+        )
+
     def _provider_target(
         self,
         stream_uuid: object,
         operation_kind: str | None = None,
         *,
         account_locked: bool = False,
+        external_account_uuid: object | None = None,
     ) -> typing.Any:
         session = contexts.Context().get_session()
         stream = models.WorkspaceStream.objects.get_one(
@@ -1206,7 +1318,19 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             },
             session=session,
         )
-        if stream.external_account_uuid is None:
+        native_routes = getattr(self, "_provider_native_routes", None)
+        if native_routes is None:
+            native_routes = {}
+            self._provider_native_routes = native_routes
+        native_routes[sys_uuid.UUID(str(stream_uuid))] = (
+            stream.external_account_uuid is None
+        )
+        external_account_uuid = (
+            self._provider_account_uuid_for_stream(stream)
+            if external_account_uuid is None
+            else external_account_uuid
+        )
+        if external_account_uuid is None:
             return None
         if operation_kind is None:
             return _PROVIDER_TARGET_EXISTS
@@ -1222,7 +1346,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             # and members who do not own the selected provider account.
             return None
         if not account_locked:
-            self._lock_provider_account(stream.external_account_uuid)
+            self._lock_provider_account(external_account_uuid)
         required_capability = provider_data._required_capability(operation_kind)
         if required_capability is None:
             raise ra_exceptions.ValidationErrorException()
@@ -1231,7 +1355,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 session,
                 project_id=self.project_uuid,
                 owner_user_uuid=stream.user_uuid,
-                external_account_uuid=stream.external_account_uuid,
+                external_account_uuid=external_account_uuid,
                 stream_uuid=stream_uuid,
                 capability_name=required_capability,
             )
@@ -1248,7 +1372,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                             session,
                             project_id=self.project_uuid,
                             owner_user_uuid=stream.user_uuid,
-                            external_account_uuid=stream.external_account_uuid,
+                            external_account_uuid=external_account_uuid,
                             stream_uuid=stream_uuid,
                             allow_policy_blocked=operation_kind == "membership.remove",
                         )
@@ -1279,24 +1403,43 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
 
     def _lock_provider_account(self, account_uuid: object) -> None:
         """Establish account-before-message/outbox lock ordering."""
+        self._lock_provider_accounts((account_uuid,))
+
+    def _lock_provider_accounts(
+        self,
+        account_uuids: collections.abc.Iterable[object],
+    ) -> None:
+        """Lock all account resources before any account row or provider lane."""
         session = contexts.Context().get_session()
+        ordered = tuple(
+            sorted(
+                {sys_uuid.UUID(str(value)) for value in account_uuids},
+                key=str,
+            )
+        )
+        if not ordered:
+            return
         read_state.lock_external_account_resources(
             session,
-            (account_uuid,),
+            ordered,
             shared=True,
         )
         session.execute(
             """
             SELECT uuid
             FROM m_external_accounts_v2
-            WHERE uuid = %s
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY uuid
             FOR KEY SHARE
             """,
-            (account_uuid,),
+            (list(ordered),),
         ).fetchone()
 
-    def _lock_provider_account_for_stream(self, stream_uuid: object) -> bool:
-        """Lock a projected account and its lane without capability validation."""
+    def _lock_provider_account_for_stream(
+        self,
+        stream_uuid: object,
+    ) -> tuple[object, ...]:
+        """Lock projected accounts and lanes without capability validation."""
         session = contexts.Context().get_session()
         stream = models.WorkspaceStream.objects.get_one(
             filters={
@@ -1305,33 +1448,35 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             },
             session=session,
         )
-        if stream.external_account_uuid is None:
-            return False
-        self._lock_provider_account(stream.external_account_uuid)
-        try:
-            account, _chat, bridge = provider_data.resolve_provider_queue_target(
+        external_account_uuids = self._provider_account_uuids_for_stream(stream)
+        if not external_account_uuids:
+            return ()
+        self._lock_provider_accounts(external_account_uuids)
+        for external_account_uuid in external_account_uuids:
+            try:
+                account, _chat, bridge = provider_data.resolve_provider_queue_target(
+                    session,
+                    project_id=self.project_uuid,
+                    owner_user_uuid=stream.user_uuid,
+                    external_account_uuid=external_account_uuid,
+                    stream_uuid=stream_uuid,
+                    allow_policy_blocked=True,
+                )
+            except (
+                provider_data.ProviderUnavailableError,
+                storage_exceptions.RecordNotFound,
+            ):
+                # Preserve idempotent reads when no live route exists. A changed
+                # read validates the provider target later and keeps the existing
+                # public error contract.
+                continue
+            provider_data.lock_provider_causal_lane(
                 session,
-                project_id=self.project_uuid,
-                owner_user_uuid=stream.user_uuid,
-                external_account_uuid=stream.external_account_uuid,
-                stream_uuid=stream_uuid,
-                allow_policy_blocked=True,
+                bridge_instance_uuid=bridge.uuid,
+                external_account_uuid=account.uuid,
+                causal_lane=stream_uuid,
             )
-        except (
-            provider_data.ProviderUnavailableError,
-            storage_exceptions.RecordNotFound,
-        ):
-            # Preserve idempotent reads when no live route exists. A changed
-            # read validates the provider target later and keeps the existing
-            # public error contract.
-            return True
-        provider_data.lock_provider_causal_lane(
-            session,
-            bridge_instance_uuid=bridge.uuid,
-            external_account_uuid=account.uuid,
-            causal_lane=stream_uuid,
-        )
-        return True
+        return external_account_uuids
 
     def _queue_provider_operation(
         self,
@@ -1438,16 +1583,16 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     def _provider_read_snapshot_callback(
         self,
         *,
-        provider_account_locked: bool,
+        provider_account_uuids: collections.abc.Sequence[object],
         stream_uuid: object,
         topic_uuid: object | None,
         target_type: str,
         target_uuid: object,
     ) -> read_state.BulkReadSnapshotCallback | None:
         """Queue one exact provider read snapshot from compact state."""
-        if not provider_account_locked:
+        if not provider_account_uuids:
             return None
-        provider_target: typing.Any = _PROVIDER_TARGET_UNSET
+        provider_targets: tuple[typing.Any, ...] | None = None
 
         def queue(
             session: typing.Any,
@@ -1458,49 +1603,93 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             ]
             | None = None,
         ) -> None:
-            nonlocal provider_target
-            if provider_target is _PROVIDER_TARGET_UNSET:
-                provider_target = self._provider_target(
-                    stream_uuid,
-                    "read_state.set",
-                    account_locked=True,
+            nonlocal provider_targets
+            if provider_targets is None:
+                provider_targets = tuple(
+                    target
+                    for external_account_uuid in provider_account_uuids
+                    if (
+                        target := self._provider_target(
+                            stream_uuid,
+                            "read_state.set",
+                            account_locked=True,
+                            external_account_uuid=external_account_uuid,
+                        )
+                    )
+                    is not None
                 )
-            if provider_target is None:
-                return
-            account, bridge = provider_target
-            read_revision = provider_data._capability_revision(
-                bridge.capabilities,
-                "messenger.message.read",
+            native_routes = getattr(self, "_provider_native_routes", {})
+            native_route = native_routes.get(
+                sys_uuid.UUID(str(stream_uuid)), False
             )
-            use_lazy_snapshot = (
-                read_revision >= provider_data.PROVIDER_READ_PAGING_REVISION
-            )
-            candidate_chunk_mode: bool | None = False
-            if use_lazy_snapshot:
-                candidate_chunk_mode = True if candidate_chunks is not None else None
-            try:
-                provider_data.enqueue_provider_read_operation(
-                    session,
-                    operation_uuid=sys_uuid.uuid4(),
-                    bridge_instance_uuid=bridge.uuid,
-                    external_account_uuid=account.uuid,
-                    project_id=self.project_uuid,
-                    owner_user_uuid=self.user_uuid,
-                    target_type=target_type,
-                    target_uuid=target_uuid,
-                    payload={
-                        "stream_uuid": str(stream_uuid),
-                        "topic_uuid": (None if topic_uuid is None else str(topic_uuid)),
-                        "reader_uuid": str(self.user_uuid),
-                        "read": True,
-                    },
-                    candidate_sql=candidate_sql,
-                    candidate_values=candidate_values,
-                    candidate_chunks=candidate_chunks,
-                    use_candidate_chunks=candidate_chunk_mode,
+            for account, bridge in provider_targets:
+                target_candidate_sql = candidate_sql
+                target_candidate_values = candidate_values
+                target_candidate_chunks = candidate_chunks
+                if native_route:
+                    target_candidate_sql = f"""
+                        SELECT candidate.uuid, candidate.created_at
+                        FROM ({candidate_sql}) AS candidate
+                        JOIN m_workspace_messages AS message
+                          ON message.uuid = candidate.uuid
+                        WHERE message.external_account_uuid = %s
+                           OR (
+                                message.external_account_uuid IS NULL
+                                AND EXISTS (
+                                    SELECT 1
+                                    FROM m_external_operations_v2 AS operation
+                                    WHERE operation.external_account_uuid = %s
+                                      AND operation.owner_user_uuid = %s
+                                      AND operation.action = 'message.create'
+                                      AND operation.target_type = 'message'
+                                      AND operation.target_uuid = message.uuid
+                                )
+                           )
+                    """
+                    target_candidate_values = (
+                        *candidate_values,
+                        account.uuid,
+                        account.uuid,
+                        self.user_uuid,
+                    )
+                    target_candidate_chunks = None
+                read_revision = provider_data._capability_revision(
+                    bridge.capabilities,
+                    provider_data.PROVIDER_READ_PAGING_CAPABILITY,
                 )
-            except provider_data.ProviderUnavailableError as exc:
-                raise ra_exceptions.ValidationErrorException() from exc
+                use_lazy_snapshot = (
+                    read_revision >= provider_data.PROVIDER_READ_PAGING_REVISION
+                )
+                candidate_chunk_mode: bool | None = False
+                if use_lazy_snapshot:
+                    candidate_chunk_mode = (
+                        True if target_candidate_chunks is not None else None
+                    )
+                try:
+                    provider_data.enqueue_provider_read_operation(
+                        session,
+                        operation_uuid=sys_uuid.uuid4(),
+                        bridge_instance_uuid=bridge.uuid,
+                        external_account_uuid=account.uuid,
+                        project_id=self.project_uuid,
+                        owner_user_uuid=self.user_uuid,
+                        target_type=target_type,
+                        target_uuid=target_uuid,
+                        payload={
+                            "stream_uuid": str(stream_uuid),
+                            "topic_uuid": (
+                                None if topic_uuid is None else str(topic_uuid)
+                            ),
+                            "reader_uuid": str(self.user_uuid),
+                            "read": True,
+                        },
+                        candidate_sql=target_candidate_sql,
+                        candidate_values=target_candidate_values,
+                        candidate_chunks=target_candidate_chunks,
+                        use_candidate_chunks=candidate_chunk_mode,
+                    )
+                except provider_data.ProviderUnavailableError as exc:
+                    raise ra_exceptions.ValidationErrorException() from exc
 
         return queue
 
@@ -1553,8 +1742,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 self.user_uuid,
                 values["message_uuid"],
             )
-            provider_target = self._provider_target(
-                message.stream_uuid,
+            provider_targets = self._message_provider_targets(
+                message,
                 "reaction.create",
             )
             row = helpers.create_workspace_message_reaction(
@@ -1563,14 +1752,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 compact_events=True,
                 **values,
             )
-            self._queue_provider_operation(
-                operation_kind="reaction.create",
-                target_type="reaction",
-                target_uuid=row.uuid,
-                stream_uuid=message.stream_uuid,
-                payload=_public_dict(row, resource),
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_operation(
+                    operation_kind="reaction.create",
+                    target_type="reaction",
+                    target_uuid=row.uuid,
+                    stream_uuid=message.stream_uuid,
+                    payload=_public_dict(row, resource),
+                    provider_target=provider_target,
+                )
         elif resource == "files":
             row = helpers.create_workspace_file(
                 project_id=self.project_uuid,
@@ -1662,8 +1852,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 self.user_uuid,
                 reaction.message_uuid,
             )
-            provider_target = self._provider_target(
-                message.stream_uuid,
+            provider_targets = self._message_provider_targets(
+                message,
                 "reaction.update",
             )
             row = helpers.update_workspace_message_reaction(
@@ -1680,14 +1870,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                     "previous_emoji_name": previous_emoji_name,
                 }
             )
-            self._queue_provider_operation(
-                operation_kind="reaction.update",
-                target_type="reaction",
-                target_uuid=row.uuid,
-                stream_uuid=message.stream_uuid,
-                payload=provider_payload,
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_operation(
+                    operation_kind="reaction.update",
+                    target_type="reaction",
+                    target_uuid=row.uuid,
+                    stream_uuid=message.stream_uuid,
+                    payload=provider_payload,
+                    provider_target=provider_target,
+                )
         elif resource == "files":
             row = helpers.update_workspace_file(
                 self.project_uuid,
@@ -1724,6 +1915,8 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any] | None:
         provider_stream_uuid = None
         provider_payload = None
+        provider_target: typing.Any = _PROVIDER_TARGET_UNSET
+        provider_targets: tuple[typing.Any, ...] | None = None
         if resource == "streams":
             provider_stream_uuid = resource_uuid
             provider_payload = {"uuid": str(resource_uuid)}
@@ -1742,19 +1935,30 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
             provider_stream_uuid = message.stream_uuid
             provider_payload = _public_dict(reaction, resource)
+            provider_targets = self._message_provider_targets(
+                message,
+                "reaction.delete",
+            )
         if provider_stream_uuid is not None:
             operation_kind, target_type = {
                 "streams": ("stream.delete", "stream"),
                 "stream_topics": ("topic.delete", "topic"),
                 "message_reactions": ("reaction.delete", "reaction"),
             }[resource]
-            self._queue_provider_operation(
-                operation_kind=operation_kind,
-                target_type=target_type,
-                target_uuid=resource_uuid,
-                stream_uuid=provider_stream_uuid,
-                payload=provider_payload,
+            targets = (
+                provider_targets
+                if provider_targets is not None
+                else (provider_target,)
             )
+            for target in targets:
+                self._queue_provider_operation(
+                    operation_kind=operation_kind,
+                    target_type=target_type,
+                    target_uuid=resource_uuid,
+                    stream_uuid=provider_stream_uuid,
+                    payload=provider_payload,
+                    provider_target=target,
+                )
         if resource == "folders":
             helpers.delete_workspace_user_folder(
                 self.project_uuid, self.user_uuid, resource_uuid
@@ -1822,7 +2026,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
-        provider_target = self._provider_target(
+        provider_targets = self._provider_targets_for_stream(
             values["stream_uuid"],
             "message.create",
         )
@@ -1835,14 +2039,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             compact_events=True,
             **values,
         )
-        self._queue_provider_operation(
-            operation_kind="message.create",
-            target_type="message",
-            target_uuid=row.uuid,
-            stream_uuid=row.stream_uuid,
-            payload=_public_dict(row, "messages"),
-            provider_target=provider_target,
-        )
+        for provider_target in provider_targets:
+            self._queue_provider_operation(
+                operation_kind="message.create",
+                target_type="message",
+                target_uuid=row.uuid,
+                stream_uuid=row.stream_uuid,
+                payload=_public_dict(row, "messages"),
+                provider_target=provider_target,
+            )
         return _public_dict(row, "messages")
 
     def update_message(
@@ -1855,10 +2060,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             self.user_uuid,
             message_uuid,
         )
-        provider_target = self._provider_target(
-            message.stream_uuid,
-            "message.update",
-        )
+        provider_targets = self._message_provider_targets(message, "message.update")
         row = helpers.update_workspace_user_message(
             self.project_uuid,
             self.user_uuid,
@@ -1866,14 +2068,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             self._projection_values(values),
             compact_events=True,
         )
-        self._queue_provider_operation(
-            operation_kind="message.update",
-            target_type="message",
-            target_uuid=row.uuid,
-            stream_uuid=row.stream_uuid,
-            payload=_public_dict(row, "messages"),
-            provider_target=provider_target,
-        )
+        for provider_target in provider_targets:
+            self._queue_provider_operation(
+                operation_kind="message.update",
+                target_type="message",
+                target_uuid=row.uuid,
+                stream_uuid=row.stream_uuid,
+                payload=_public_dict(row, "messages"),
+                provider_target=provider_target,
+            )
         return _public_dict(row, "messages")
 
     def delete_message(
@@ -1883,24 +2086,22 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         message = helpers.get_workspace_user_message(
             self.project_uuid, self.user_uuid, message_uuid
         )
-        provider_target = self._provider_target(
-            message.stream_uuid,
-            "message.delete",
-        )
+        provider_targets = self._message_provider_targets(message, "message.delete")
         helpers.delete_workspace_user_message(
             self.project_uuid,
             self.user_uuid,
             message_uuid,
             compact_events=True,
         )
-        self._queue_provider_operation(
-            operation_kind="message.delete",
-            target_type="message",
-            target_uuid=message_uuid,
-            stream_uuid=message.stream_uuid,
-            payload=_public_dict(message, "messages"),
-            provider_target=provider_target,
-        )
+        for provider_target in provider_targets:
+            self._queue_provider_operation(
+                operation_kind="message.delete",
+                target_type="message",
+                target_uuid=message_uuid,
+                stream_uuid=message.stream_uuid,
+                payload=_public_dict(message, "messages"),
+                provider_target=provider_target,
+            )
         return None
 
     def create_draft(
@@ -2015,7 +2216,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 session=session,
             )
-            provider_account_locked = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_account_for_stream(
                 resource_uuid
             )
             row = helpers.read_workspace_user_stream_messages(
@@ -2026,7 +2227,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 current_stream=stream,
                 collect_message_uuids=False,
                 message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
-                    provider_account_locked=provider_account_locked,
+                    provider_account_uuids=provider_account_uuids,
                     stream_uuid=resource_uuid,
                     topic_uuid=None,
                     target_type="stream",
@@ -2153,7 +2354,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 session=session,
             )
-            provider_account_locked = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_account_for_stream(
                 topic.stream_uuid
             )
             row = helpers.read_workspace_user_stream_topic_messages(
@@ -2164,7 +2365,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 current_topic=topic,
                 collect_message_uuids=False,
                 message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
-                    provider_account_locked=provider_account_locked,
+                    provider_account_uuids=provider_account_uuids,
                     stream_uuid=topic.stream_uuid,
                     topic_uuid=resource_uuid,
                     target_type="topic",
@@ -2179,7 +2380,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 session=session,
             )
-            provider_account_locked = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_account_for_stream(
                 message.stream_uuid
             )
             row, message_uuids = helpers.read_workspace_user_message(
@@ -2190,23 +2391,24 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 current_message=message,
                 return_message_uuids=True,
             )
-            provider_target = (
-                self._provider_target(
-                    message.stream_uuid,
+            provider_targets = (
+                self._message_provider_targets(
+                    message,
                     "read_state.set",
-                    account_locked=provider_account_locked,
+                    account_locked=bool(provider_account_uuids),
                 )
                 if message_uuids
-                else _PROVIDER_TARGET_UNSET
+                else ()
             )
-            self._queue_provider_read(
-                stream_uuid=message.stream_uuid,
-                topic_uuid=message.topic_uuid,
-                message_uuids=message_uuids,
-                target_type="message",
-                target_uuid=resource_uuid,
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_read(
+                    stream_uuid=message.stream_uuid,
+                    topic_uuid=message.topic_uuid,
+                    message_uuids=message_uuids,
+                    target_type="message",
+                    target_uuid=resource_uuid,
+                    provider_target=provider_target,
+                )
         elif resource == "messages" and action == "read_up_to":
             session = contexts.Context().get_session()
             message = helpers.get_workspace_user_message(
@@ -2219,7 +2421,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             # A concurrent provider event can make a boundary row unread after
             # any separate probe. Capability validation stays after RETURNING
             # so an idempotent no-op does not depend on provider availability.
-            provider_account_locked = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_account_for_stream(
                 message.stream_uuid
             )
             row = helpers.read_workspace_user_topic_messages_to_message(
@@ -2230,7 +2432,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 current_message=message,
                 collect_message_uuids=False,
                 message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
-                    provider_account_locked=provider_account_locked,
+                    provider_account_uuids=provider_account_uuids,
                     stream_uuid=message.stream_uuid,
                     topic_uuid=message.topic_uuid,
                     target_type="message",

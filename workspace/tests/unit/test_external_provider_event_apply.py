@@ -18,6 +18,11 @@ from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import read_state
 
 
+_MISSING_PROVIDER_MESSAGE_IS_TOMBSTONED = (
+    provider_event_apply._missing_provider_message_is_tombstoned
+)
+
+
 @pytest.fixture(autouse=True)
 def _legacy_read_state(monkeypatch):
     monkeypatch.setattr(
@@ -29,6 +34,19 @@ def _legacy_read_state(monkeypatch):
         read_state,
         "_assign_legacy_ingest_sequences",
         lambda *_args, **_kwargs: 0,
+    )
+    # Handler-focused unit tests use lightweight message stubs without the
+    # canonical provenance columns. Account isolation is exercised with real
+    # PostgreSQL rows in the integration suite.
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_validate_provider_message_scope",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_missing_provider_message_is_tombstoned",
+        lambda *_args, **_kwargs: False,
     )
 
 
@@ -60,6 +78,45 @@ class Session:
     def execute(self, statement, params):
         self.statements.append((statement, params))
         return Result(next(self.rows, None))
+
+
+def test_missing_provider_message_uses_all_operation_states_as_provenance():
+    owner_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    other_account_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+
+    active = Session(
+        [[
+            {"external_account_uuid": account_uuid, "deleted": True},
+            {"external_account_uuid": other_account_uuid, "deleted": False},
+        ]]
+    )
+    assert _MISSING_PROVIDER_MESSAGE_IS_TOMBSTONED(
+        active,
+        message_uuid,
+        account_uuid,
+        owner_uuid,
+    )
+    assert "operation.status" not in active.statements[0][0]
+
+    foreign = Session(
+        [[{"external_account_uuid": other_account_uuid, "deleted": False}]]
+    )
+    with pytest.raises(ValueError, match="another account"):
+        _MISSING_PROVIDER_MESSAGE_IS_TOMBSTONED(
+            foreign,
+            message_uuid,
+            account_uuid,
+            owner_uuid,
+        )
+
+    assert not _MISSING_PROVIDER_MESSAGE_IS_TOMBSTONED(
+        Session([[]]),
+        message_uuid,
+        account_uuid,
+        owner_uuid,
+    )
 
 
 def test_stream_notification_event_applies_only_newer_provider_value(monkeypatch):
@@ -1187,6 +1244,11 @@ def test_live_message_author_identity_is_cached_per_provider_realm(monkeypatch):
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
     monkeypatch.setattr(
         provider_event_apply,
+        "_missing_provider_message_is_tombstoned",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
         "_ensure_projection_owner_stream",
         lambda *_args, **_kwargs: None,
     )
@@ -1687,6 +1749,11 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
         )
 
     monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: None)
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_missing_provider_message_is_tombstoned",
+        lambda *_args: False,
+    )
     monkeypatch.setattr(
         provider_event_apply.read_state,
         "lock_projects",
