@@ -90,6 +90,7 @@ UNREAD_FOLDER_PROJECTION_MIGRATION_FILE = (
     "0132-optimize-unread-folder-projections-938496.py"
 )
 NOTIFICATION_TIMESTAMPS_MIGRATION_UUID = "52d0f82b-e692-4368-b004-f9263a1f3709"
+TOPIC_SUMMARY_REASONING_MIGRATION_UUID = "b9d39435-f461-45b8-aabb-771061953c15"
 COMPACT_READ_STATE_MIGRATION_UUID = "e84da8dc-97f6-4b10-bce7-f9652c0207a3"
 COMPACT_READ_STATE_MIGRATION_FILE = "0134-add-compact-workspace-unread-state-e84da8.py"
 COMPACT_READ_STATE_INDEX_MIGRATION_UUID = "b469650b-f613-4f57-869a-1dd7f6f373c3"
@@ -150,6 +151,12 @@ READ_STATE_INDEX_REPAIR_MIGRATION_UUID = (
 )
 READ_STATE_INDEX_REPAIR_MIGRATION_FILE = (
     "0147-repair-read-state-maintenance-indexes-804f77.py"
+)
+TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID = (
+    "4588d689-bb04-4599-8ab4-ade40e386548"
+)
+TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_FILE = (
+    "0148-join-topic-summary-reasoning-head-4588d6.py"
 )
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
@@ -213,9 +220,7 @@ def _restore_current_provider_read_lease_fence(engine):
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert (
-        engine.get_latest_migration() == READ_STATE_INDEX_REPAIR_MIGRATION_FILE
-    )
+    assert engine.get_latest_migration() == TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -241,6 +246,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXTERNAL_CONTENT_INDEX_MIGRATION_UUID,
                     UNREAD_FOLDER_PROJECTION_MIGRATION_UUID,
                     NOTIFICATION_TIMESTAMPS_MIGRATION_UUID,
+                    TOPIC_SUMMARY_REASONING_MIGRATION_UUID,
                     COMPACT_READ_STATE_MIGRATION_UUID,
                     COMPACT_READ_STATE_INDEX_MIGRATION_UUID,
                     LAZY_PROVIDER_READ_MIGRATION_UUID,
@@ -255,6 +261,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID,
                     ROLLING_READ_STATE_PROJECT_MIGRATION_UUID,
                     READ_STATE_INDEX_REPAIR_MIGRATION_UUID,
+                    TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID,
                 ],
             ),
         )
@@ -279,6 +286,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXTERNAL_CONTENT_INDEX_MIGRATION_UUID, True),
             (UNREAD_FOLDER_PROJECTION_MIGRATION_UUID, True),
             (NOTIFICATION_TIMESTAMPS_MIGRATION_UUID, True),
+            (TOPIC_SUMMARY_REASONING_MIGRATION_UUID, True),
             (COMPACT_READ_STATE_MIGRATION_UUID, True),
             (COMPACT_READ_STATE_INDEX_MIGRATION_UUID, True),
             (LAZY_PROVIDER_READ_MIGRATION_UUID, True),
@@ -293,6 +301,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID, True),
             (ROLLING_READ_STATE_PROJECT_MIGRATION_UUID, True),
             (READ_STATE_INDEX_REPAIR_MIGRATION_UUID, True),
+            (TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
