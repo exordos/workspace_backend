@@ -140,6 +140,30 @@ def _set_workspace_read_mode(db, project_id, mode):
     db.commit()
 
 
+def _advance_read_compaction_to_phase(db, project_id, phase):
+    for _iteration in range(50):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT phase
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (project_id,),
+            )
+            progress = cursor.fetchone()
+            if progress is not None and progress[0] == phase:
+                return
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                project_id,
+                batch_size=10,
+            )
+        )
+    pytest.fail(f"Compaction did not reach {phase}")
+
+
 def _enable_zulip_policy(db, *, max_accounts=100):
     with db.cursor() as cursor:
         cursor.execute(
@@ -13574,6 +13598,7 @@ def test_compact_read_state_cutover_is_resumable_exact_and_sparse(api, db):
         "sequences",
         "memberships",
         "flags",
+        "legacy_gaps",
         "stats",
         "mentions",
         "verify",
@@ -13641,6 +13666,440 @@ def test_compact_read_state_cutover_is_resumable_exact_and_sparse(api, db):
         )
         == 0
     )
+
+
+def test_compact_cutover_preserves_missing_legacy_flags_as_read(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Compact legacy gaps"
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    message_uuids = []
+    for content in (
+        "explicit unread one",
+        "explicit unread two",
+        "implicit legacy read without compact bit",
+        "implicit legacy read with compact bit",
+    ):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids[2:]),
+        )
+        cursor.execute(
+            """
+            SELECT unread_count
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == 2
+    db.commit()
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(session, api.project_id)
+    )
+    for _iteration in range(20):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT phase
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (api.project_id,),
+            )
+            if cursor.fetchone()[0] == "legacy_gaps":
+                break
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=100,
+            )
+        )
+    else:
+        pytest.fail("Compaction did not reach the legacy gap phase")
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids[2:]),
+        )
+        gap_sequences = {str(row[0]): row[1] for row in cursor.fetchall()}
+        preexisting_read_sequence = gap_sequences[message_uuids[3]]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_messages AS message
+            JOIN m_workspace_stream_bindings AS binding
+              ON binding.project_id = message.project_id
+             AND binding.stream_uuid = message.stream_uuid
+            WHERE message.project_id = %s
+              AND message.uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, message_uuids[:2]),
+        )
+        no_gap_page_size = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, stream_uuid),
+        )
+        final_page_size = cursor.fetchone()[0] * 2
+
+    _run_database_operation(
+        lambda session: read_state._apply_coordinate_rows(
+            session,
+            api.project_id,
+            [
+                {
+                    "uuid": message_uuids[3],
+                    "user_uuid": reader_uuid,
+                    "read": True,
+                    "stream_uuid": stream_uuid,
+                    "topic_uuid": topic_uuid,
+                    "ingest_sequence": preexisting_read_sequence,
+                }
+            ],
+        )
+    )
+
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=no_gap_page_size,
+            )
+        )
+        == no_gap_page_size
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT COALESCE(
+                get_bit(
+                    chunk.read_bits,
+                    (message.ingest_sequence %% {read_state.READ_CHUNK_BITS})::integer
+                ),
+                0
+            )
+            FROM m_workspace_messages AS message
+            LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
+              ON chunk.user_uuid = %s
+             AND chunk.chunk_number =
+                    message.ingest_sequence / {read_state.READ_CHUNK_BITS}
+            WHERE message.project_id = %s
+              AND message.uuid = ANY(%s::uuid[])
+            ORDER BY message.ingest_sequence
+            """,
+            (reader_uuid, api.project_id, message_uuids[2:]),
+        )
+        assert cursor.fetchall() == [(0,), (1,)]
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        read_count_before_gap_repair = cursor.fetchone()[0]
+
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=1,
+            )
+        )
+        == 1
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT last_message_uuid, last_user_uuid,
+                   last_ingest_sequence, processed_rows
+            FROM m_workspace_read_state_compaction_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        partial_cursor = cursor.fetchone()
+        cursor.execute(
+            """
+            UPDATE m_workspace_read_state_compaction_v1
+            SET last_message_uuid = %s,
+                last_user_uuid = %s,
+                last_ingest_sequence = %s,
+                processed_rows = processed_rows + 1,
+                updated_at = NOW()
+            WHERE project_id = %s
+            """,
+            (
+                message_uuids[3],
+                reader_uuid,
+                gap_sequences[message_uuids[3]],
+                api.project_id,
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT last_message_uuid, last_user_uuid,
+                   last_ingest_sequence, processed_rows
+            FROM m_workspace_read_state_compaction_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == partial_cursor
+    db.commit()
+
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=no_gap_page_size,
+            )
+        )
+        == final_page_size - 1
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s
+              AND uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            (api.project_id, reader_uuid, message_uuids[2:]),
+        )
+        assert cursor.fetchall() == [(True,), (True,)]
+        cursor.execute(
+            """
+            SELECT read_count
+            FROM m_workspace_user_topic_read_stats_v1
+            WHERE project_id = %s AND user_uuid = %s AND topic_uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == read_count_before_gap_repair + 1
+
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=no_gap_page_size,
+            )
+        )
+        == 0
+    )
+    _finish_read_compaction(db, api.project_id)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT unread_count
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == 2
+    assert _workspace_message_read_states(
+        db,
+        api.project_id,
+        reader_uuid,
+        message_uuids,
+    ) == {
+        message_uuids[0]: False,
+        message_uuids[1]: False,
+        message_uuids[2]: True,
+        message_uuids[3]: True,
+    }
+
+
+def test_legacy_gap_scan_bounds_and_advances_recipient_empty_messages(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Recipient-empty legacy gap page",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = []
+    for index in range(5):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {
+                    "kind": "markdown",
+                    "content": f"recipient-empty {index}",
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(response.json()["uuid"])
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, stream_uuid),
+        )
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_read_memberships_v1
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, stream_uuid),
+        )
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+            ORDER BY ingest_sequence
+            """,
+            (api.project_id, message_uuids),
+        )
+        sequences = [row[0] for row in cursor.fetchall()]
+    db.commit()
+
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_DUAL)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_read_state_compaction_v1 (
+                project_id, phase, target_ingest_sequence,
+                legacy_gap_repair_kind, completed_at,
+                created_at, updated_at
+            ) VALUES (
+                %s, 'legacy_gaps', %s, 'full_pending', NULL, NOW(), NOW()
+            )
+            ON CONFLICT (project_id) DO UPDATE
+            SET phase = 'legacy_gaps',
+                last_message_uuid = NULL,
+                last_user_uuid = NULL,
+                last_ingest_sequence = 0,
+                target_ingest_sequence = EXCLUDED.target_ingest_sequence,
+                processed_rows = 0,
+                legacy_gap_repair_kind = 'full_pending',
+                completed_at = NULL,
+                updated_at = NOW()
+            """,
+            (api.project_id, sequences[-1]),
+        )
+    db.commit()
+
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=2,
+            )
+        )
+        == 2
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT phase, last_user_uuid, last_ingest_sequence, processed_rows
+            FROM m_workspace_read_state_compaction_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == ("legacy_gaps", None, sequences[1], 2)
+
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=2,
+            )
+        )
+        == 2
+    )
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=2,
+            )
+        )
+        == 1
+    )
+    assert (
+        _run_database_operation(
+            lambda session: read_state.compact_legacy_batch(
+                session,
+                api.project_id,
+                batch_size=2,
+            )
+        )
+        == 0
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT phase, legacy_gap_repair_kind, processed_rows
+            FROM m_workspace_read_state_compaction_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone() == ("stats", "full_done", 5)
 
 
 def test_compact_read_state_parity_failure_blocks_cutover(api, db):
@@ -14065,12 +14524,22 @@ def test_bulk_read_rechecks_compact_mode_after_dual_cleanup(api, db, scope):
             read_state.lock_projects(session, (api.project_id,))
             session.execute(
                 """
-                UPDATE m_workspace_read_state_projects_v1
-                SET mode = 'compact', updated_at = NOW()
-                WHERE project_id = %s AND mode = 'dual'
+                INSERT INTO m_workspace_read_state_compaction_v1 (
+                    project_id, phase, target_ingest_sequence,
+                    legacy_gap_repair_kind, completed_at,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, 'verify_mentions', 0, 'full_done', NULL, NOW(), NOW()
+                )
+                ON CONFLICT (project_id) DO UPDATE
+                SET phase = 'verify_mentions',
+                    legacy_gap_repair_kind = 'full_done',
+                    completed_at = NULL,
+                    updated_at = NOW()
                 """,
                 (api.project_id,),
             )
+            read_state._complete_compaction(session, api.project_id)
             session.execute(
                 """
                 DELETE FROM m_workspace_user_message_flags
@@ -14846,7 +15315,22 @@ def test_detached_legacy_history_survives_cutover_and_reattach(api, db):
         user=reader_uuid,
     )
     assert response.status_code == 200, response.text
+    _run_database_operation(
+        lambda session: read_state.record_stream_detached(
+            session,
+            api.project_id,
+            reader_uuid,
+            stream_uuid,
+        )
+    )
     with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, message_uuids[1]),
+        )
         cursor.execute(
             """
             DELETE FROM m_workspace_stream_bindings
@@ -14880,6 +15364,15 @@ def test_detached_legacy_history_survives_cutover_and_reattach(api, db):
             (api.project_id, message_uuids),
         )
         sequences = {str(row[0]): row[1] for row in cursor.fetchall()}
+        cursor.execute(
+            """
+            SELECT read
+            FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, message_uuids[1]),
+        )
+        assert cursor.fetchone() == (True,)
     assert (
         sequences[message_uuids[0]]
         < sequences[message_uuids[1]]
@@ -15387,6 +15880,105 @@ def test_compact_stream_move_into_preparing_survives_full_compaction(api, db):
             (reader_uuid, destination_sequence // read_state.READ_CHUNK_BITS),
         )
         assert cursor.fetchone() == (1,)
+
+
+def test_legacy_stream_move_into_dual_gap_cutover_preserves_missing_read(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Legacy missing read stream move",
+    )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, reader_uuid)
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "implicit legacy read"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, reader_uuid),
+        )
+    db.commit()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT unread_count
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, topic_uuid),
+        )
+        assert cursor.fetchone() == (0,)
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(
+            session,
+            destination_project_id,
+        )
+    )
+    _advance_read_compaction_to_phase(
+        db,
+        destination_project_id,
+        "legacy_gaps",
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT target_ingest_sequence
+            FROM m_workspace_read_state_compaction_v1
+            WHERE project_id = %s
+            """,
+            (destination_project_id,),
+        )
+        cutover_target = cursor.fetchone()[0]
+
+    _run_database_operation(
+        lambda session: messenger_controllers._move_projection_rows(
+            session,
+            stream_uuid,
+            api.project_id,
+            destination_project_id,
+        )
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (destination_project_id, message_uuid),
+        )
+        assert cursor.fetchone()[0] > cutover_target
+
+    _finish_read_compaction(db, destination_project_id)
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {message_uuid: True}
 
 
 def test_readd_and_stream_project_move_do_not_deadlock(api, db):
@@ -16058,6 +16650,147 @@ def test_message_move_materializes_compact_destination_before_canonical_move(
         reader_uuid,
         [message_uuid],
     ) == {str(message_uuid): True}
+
+
+def test_legacy_message_move_into_dual_gap_cutover_preserves_missing_read(api, db):
+    reader_uuid = sys_uuid.uuid4()
+    destination_project_id = sys_uuid.uuid4()
+    source_stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Legacy missing read message source",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        source_stream_uuid,
+        reader_uuid,
+    )
+    source_topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        source_stream_uuid,
+        api.user_uuid,
+        "source",
+        is_default=True,
+    )
+    destination_stream_uuid = conftest.seed_user_stream(
+        db,
+        destination_project_id,
+        api.user_uuid,
+        "Dual cutover message destination",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        destination_project_id,
+        destination_stream_uuid,
+        reader_uuid,
+    )
+    destination_topic_uuid = conftest.seed_stream_topic(
+        db,
+        destination_project_id,
+        destination_stream_uuid,
+        api.user_uuid,
+        "destination",
+        is_default=True,
+    )
+    _set_workspace_read_mode(db, api.project_id, read_state.PROJECT_MODE_LEGACY)
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "payload": {"kind": "markdown", "content": "implicit legacy read"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = response.json()["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM m_workspace_user_message_flags
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (api.project_id, message_uuid, reader_uuid),
+        )
+    db.commit()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT unread_count
+            FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, reader_uuid, source_topic_uuid),
+        )
+        assert cursor.fetchone() == (0,)
+
+    _run_database_operation(
+        lambda session: read_state.begin_compaction(
+            session,
+            destination_project_id,
+        )
+    )
+    _advance_read_compaction_to_phase(
+        db,
+        destination_project_id,
+        "legacy_gaps",
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT target_ingest_sequence
+            FROM m_workspace_read_state_compaction_v1
+            WHERE project_id = %s
+            """,
+            (destination_project_id,),
+        )
+        cutover_target = cursor.fetchone()[0]
+
+    def move_message(session):
+        read_state.relocate_message(
+            session,
+            message_uuid,
+            api.project_id,
+            destination_project_id,
+            destination_stream_uuid,
+            destination_topic_uuid,
+        )
+        session.execute(
+            """
+            UPDATE m_workspace_messages
+            SET project_id = %s, stream_uuid = %s, topic_uuid = %s
+            WHERE uuid = %s AND project_id = %s
+            """,
+            (
+                destination_project_id,
+                destination_stream_uuid,
+                destination_topic_uuid,
+                message_uuid,
+                api.project_id,
+            ),
+        )
+
+    _run_database_operation(move_message)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (destination_project_id, message_uuid),
+        )
+        assert cursor.fetchone()[0] > cutover_target
+
+    _finish_read_compaction(db, destination_project_id)
+    assert _workspace_message_read_states(
+        db,
+        destination_project_id,
+        reader_uuid,
+        [message_uuid],
+    ) == {message_uuid: True}
 
 
 def test_compact_message_cross_project_move_rebinds_every_coordinate(api, db):

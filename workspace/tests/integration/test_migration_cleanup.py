@@ -149,6 +149,14 @@ UNREAD_BRANCH_MIGRATION_UUID = "c84ae9cb-d3c1-4385-88b8-0b2c156d2cb5"
 UNREAD_BRANCH_MIGRATION_FILE = (
     "0149-split-messenger-unread-read-state-branches-c84ae9.py"
 )
+COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID = "7433535e-646d-4557-8f7e-5688aae458db"
+COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_FILE = (
+    "0151-index-detached-compact-read-memberships-743353.py"
+)
+COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
+COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
+    "0150-fence-compact-unread-legacy-gaps-8e6948.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -211,7 +219,7 @@ def _restore_current_provider_read_lease_fence(engine):
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == UNREAD_BRANCH_MIGRATION_FILE
+    assert engine.get_latest_migration() == COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -254,6 +262,8 @@ def test_current_migrations_have_a_single_head(_database, db):
                     READ_STATE_INDEX_REPAIR_MIGRATION_UUID,
                     TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID,
                     UNREAD_BRANCH_MIGRATION_UUID,
+                    COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID,
+                    COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID,
                 ],
             ),
         )
@@ -295,6 +305,8 @@ def test_current_migrations_have_a_single_head(_database, db):
             (READ_STATE_INDEX_REPAIR_MIGRATION_UUID, True),
             (TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID, True),
             (UNREAD_BRANCH_MIGRATION_UUID, True),
+            (COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID, True),
+            (COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -420,8 +432,33 @@ def test_current_migrations_have_a_single_head(_database, db):
             """
         )
         phase_constraint = cur.fetchone()[0]
+        assert "legacy_gaps" in phase_constraint
         assert "verify_chunks" in phase_constraint
         assert "verify_read_stats" in phase_constraint
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'm_workspace_read_state_compaction_v1'
+              AND column_name = 'legacy_gap_repair_kind'
+            """
+        )
+        assert cur.fetchone() == ("legacy_gap_repair_kind",)
+        cur.execute(
+            """
+            SELECT tgname
+            FROM pg_trigger
+            WHERE tgname IN (
+                'm_workspace_fence_legacy_gap_cutover_v1',
+                'm_workspace_hold_legacy_gap_progress_v1'
+            )
+              AND NOT tgisinternal
+            """
+        )
+        assert {row[0] for row in cur.fetchall()} == {
+            "m_workspace_fence_legacy_gap_cutover_v1",
+            "m_workspace_hold_legacy_gap_progress_v1",
+        }
         cur.execute(
             """
             SELECT pg_get_constraintdef(oid)
@@ -479,7 +516,10 @@ def test_current_migrations_have_a_single_head(_database, db):
                     'm_workspace_messages_stream_ingest_sequence_idx'
                 ),
                 to_regclass('m_workspace_read_flags_project_message_idx'),
-                to_regclass('m_workspace_flags_project_message_user_idx')
+                to_regclass('m_workspace_flags_project_message_user_idx'),
+                to_regclass(
+                    'm_workspace_read_memberships_stream_user_idx'
+                )
             )
             """
         )
@@ -492,7 +532,402 @@ def test_current_migrations_have_a_single_head(_database, db):
             ("m_workspace_messages_stream_ingest_sequence_idx", True),
             ("m_workspace_read_flags_project_message_idx", True),
             ("m_workspace_flags_project_message_user_idx", True),
+            ("m_workspace_read_memberships_stream_user_idx", True),
         }
+
+
+def test_legacy_gap_fence_is_active_before_online_index_build(_database):
+    project_uuid = sys_uuid.uuid4()
+    with ra_contexts.Context().session_manager() as session:
+        try:
+            session.execute(
+                "DROP INDEX m_workspace_read_memberships_stream_user_idx"
+            )
+            assert session.execute(
+                "SELECT to_regclass(%s) AS relation",
+                ("m_workspace_read_memberships_stream_user_idx",),
+            ).fetchone()["relation"] is None
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_projects_v1 (
+                    project_id, mode, created_at, updated_at
+                ) VALUES (%s, 'dual', NOW(), NOW())
+                """,
+                (project_uuid,),
+            )
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_compaction_v1 (
+                    project_id, phase, target_ingest_sequence,
+                    legacy_gap_repair_kind, completed_at,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, 'verify_mentions', 10, 'full_done', NULL, NOW(), NOW()
+                )
+                """,
+                (project_uuid,),
+            )
+            session.execute(
+                "SELECT set_config(%s, %s, TRUE)",
+                (read_state.LEGACY_GAP_CUTOVER_CAPABILITY, str(project_uuid)),
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_projects_v1
+                SET mode = 'compact', updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            fenced = session.execute(
+                """
+                SELECT state.mode, progress.phase,
+                       progress.legacy_gap_repair_kind
+                FROM m_workspace_read_state_projects_v1 AS state
+                JOIN m_workspace_read_state_compaction_v1 AS progress
+                  ON progress.project_id = state.project_id
+                WHERE state.project_id = %s
+                """,
+                (project_uuid,),
+            ).fetchone()
+            assert fenced["mode"] == "dual"
+            assert fenced["phase"] == "legacy_gaps"
+            assert fenced["legacy_gap_repair_kind"] == "full_pending"
+        finally:
+            session.rollback()
+
+
+def test_online_index_downgrade_defers_drop_to_gap_fence(_database):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    index_migration = engine._load_migrations()[
+        COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_FILE
+    ]
+    with ra_contexts.Context().session_manager() as session:
+        index_migration.downgrade(session)
+        assert session.execute(
+            "SELECT to_regclass(%s) AS relation",
+            ("m_workspace_read_memberships_stream_user_idx",),
+        ).fetchone()["relation"] == "m_workspace_read_memberships_stream_user_idx"
+
+
+def test_compact_legacy_gap_migration_leaves_completed_projects_unchanged(_database):
+    compact_project_uuid = sys_uuid.uuid4()
+    dual_project_uuid = sys_uuid.uuid4()
+    project_uuids = [compact_project_uuid, dual_project_uuid]
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE]
+    with ra_contexts.Context().session_manager() as session:
+        try:
+            migration.downgrade(session)
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_projects_v1 (
+                    project_id, mode, created_at, updated_at
+                ) VALUES
+                    (%s, 'compact', NOW(), NOW()),
+                    (%s, 'dual', NOW(), NOW())
+                """,
+                (compact_project_uuid, dual_project_uuid),
+            )
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_compaction_v1 (
+                    project_id, phase, target_ingest_sequence,
+                    completed_at, created_at, updated_at
+                ) VALUES
+                    (%s, 'verify_mentions', 10, NOW(), NOW(), NOW()),
+                    (%s, 'stats', 20, NULL, NOW(), NOW())
+                """,
+                (compact_project_uuid, dual_project_uuid),
+            )
+
+            migration.upgrade(session)
+            rows = session.execute(
+                """
+                SELECT progress.project_id, state.mode, progress.phase,
+                       progress.legacy_gap_repair_kind,
+                       progress.completed_at
+                FROM m_workspace_read_state_compaction_v1 AS progress
+                JOIN m_workspace_read_state_projects_v1 AS state
+                  ON state.project_id = progress.project_id
+                WHERE progress.project_id = ANY(%s::uuid[])
+                ORDER BY progress.project_id
+                """,
+                (project_uuids,),
+            ).fetchall()
+            scheduled = {
+                row["project_id"]: (
+                    row["mode"],
+                    row["phase"],
+                    row["legacy_gap_repair_kind"],
+                    row["completed_at"],
+                )
+                for row in rows
+            }
+            assert scheduled[compact_project_uuid][:3] == (
+                "compact",
+                "verify_mentions",
+                None,
+            )
+            assert scheduled[compact_project_uuid][3] is not None
+            assert scheduled[dual_project_uuid] == ("dual", "stats", None, None)
+
+            migration.downgrade(session)
+            rows = session.execute(
+                """
+                SELECT progress.project_id, state.mode, progress.phase,
+                       progress.completed_at
+                FROM m_workspace_read_state_compaction_v1 AS progress
+                JOIN m_workspace_read_state_projects_v1 AS state
+                  ON state.project_id = progress.project_id
+                WHERE progress.project_id = ANY(%s::uuid[])
+                ORDER BY progress.project_id
+                """,
+                (project_uuids,),
+            ).fetchall()
+            restored = {
+                row["project_id"]: (
+                    row["mode"],
+                    row["phase"],
+                    row["completed_at"],
+                )
+                for row in rows
+            }
+            assert restored[compact_project_uuid][:2] == (
+                "compact",
+                "verify_mentions",
+            )
+            assert restored[compact_project_uuid][2] is not None
+            assert restored[dual_project_uuid] == ("dual", "stats", None)
+        finally:
+            session.rollback()
+
+
+def test_compact_legacy_gap_migration_fences_old_dual_completion(_database):
+    project_uuid = sys_uuid.uuid4()
+    partial_user_uuid = sys_uuid.uuid4()
+    stale_user_uuid = sys_uuid.uuid4()
+    stale_message_uuid = sys_uuid.uuid4()
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE]
+    with ra_contexts.Context().session_manager() as session:
+        try:
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_projects_v1 (
+                    project_id, mode, created_at, updated_at
+                ) VALUES (%s, 'dual', NOW(), NOW())
+                """,
+                (project_uuid,),
+            )
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_compaction_v1 (
+                    project_id, phase, target_ingest_sequence,
+                    completed_at, created_at, updated_at
+                ) VALUES (%s, 'verify_mentions', 10, NULL, NOW(), NOW())
+                """,
+                (project_uuid,),
+            )
+
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_projects_v1
+                SET mode = 'compact', updated_at = NOW()
+                WHERE project_id = %s AND mode = 'dual'
+                """,
+                (project_uuid,),
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_compaction_v1
+                SET completed_at = NOW(), updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            fenced = session.execute(
+                """
+                SELECT state.mode, progress.phase,
+                       progress.legacy_gap_repair_kind,
+                       progress.completed_at
+                FROM m_workspace_read_state_projects_v1 AS state
+                JOIN m_workspace_read_state_compaction_v1 AS progress
+                  ON progress.project_id = state.project_id
+                WHERE state.project_id = %s
+                """,
+                (project_uuid,),
+            ).fetchone()
+            assert fenced["mode"] == "dual"
+            assert fenced["phase"] == "legacy_gaps"
+            assert fenced["legacy_gap_repair_kind"] == "full_pending"
+            assert fenced["completed_at"] is None
+
+            session.execute(
+                "SELECT set_config(%s, %s, TRUE)",
+                (read_state.LEGACY_GAP_SCAN_CAPABILITY, str(project_uuid)),
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_compaction_v1
+                SET last_user_uuid = %s,
+                    last_ingest_sequence = 5,
+                    processed_rows = processed_rows + 1,
+                    updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (partial_user_uuid, project_uuid),
+            )
+            session.execute(
+                "SELECT set_config(%s, '', TRUE)",
+                (read_state.LEGACY_GAP_SCAN_CAPABILITY,),
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_compaction_v1
+                SET last_message_uuid = %s,
+                    last_user_uuid = %s,
+                    processed_rows = processed_rows + 1,
+                    updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (stale_message_uuid, stale_user_uuid, project_uuid),
+            )
+            protected_cursor = session.execute(
+                """
+                SELECT last_message_uuid, last_user_uuid,
+                       last_ingest_sequence, processed_rows
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            ).fetchone()
+            assert protected_cursor["last_message_uuid"] is None
+            assert protected_cursor["last_user_uuid"] == partial_user_uuid
+            assert protected_cursor["last_ingest_sequence"] == 5
+            assert protected_cursor["processed_rows"] == 1
+
+            session.execute(
+                "SELECT set_config(%s, %s, TRUE)",
+                (read_state.LEGACY_GAP_SCAN_CAPABILITY, str(project_uuid)),
+            )
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_compaction_v1
+                SET phase = 'verify_mentions', updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            session.execute(
+                "SELECT set_config(%s, '', TRUE)",
+                (read_state.LEGACY_GAP_SCAN_CAPABILITY,),
+            )
+            read_state._complete_compaction(session, project_uuid)
+            refenced = session.execute(
+                """
+                SELECT state.mode, progress.phase,
+                       progress.legacy_gap_repair_kind,
+                       progress.completed_at
+                FROM m_workspace_read_state_projects_v1 AS state
+                JOIN m_workspace_read_state_compaction_v1 AS progress
+                  ON progress.project_id = state.project_id
+                WHERE state.project_id = %s
+                """,
+                (project_uuid,),
+            ).fetchone()
+            assert refenced["mode"] == "dual"
+            assert refenced["phase"] == "legacy_gaps"
+            assert refenced["legacy_gap_repair_kind"] == "full_pending"
+            assert refenced["completed_at"] is None
+
+            assert read_state.compact_legacy_batch(session, project_uuid, 1) == 0
+            gap_completed = session.execute(
+                """
+                SELECT phase, legacy_gap_repair_kind
+                FROM m_workspace_read_state_compaction_v1
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            ).fetchone()
+            assert gap_completed["phase"] == "stats"
+            assert gap_completed["legacy_gap_repair_kind"] == "full_done"
+            session.execute(
+                """
+                UPDATE m_workspace_read_state_compaction_v1
+                SET phase = 'verify_mentions', updated_at = NOW()
+                WHERE project_id = %s
+                """,
+                (project_uuid,),
+            )
+            read_state._complete_compaction(session, project_uuid)
+            repaired = session.execute(
+                """
+                SELECT state.mode, progress.phase,
+                       progress.legacy_gap_repair_kind,
+                       progress.completed_at
+                FROM m_workspace_read_state_projects_v1 AS state
+                JOIN m_workspace_read_state_compaction_v1 AS progress
+                  ON progress.project_id = state.project_id
+                WHERE state.project_id = %s
+                """,
+                (project_uuid,),
+            ).fetchone()
+            assert repaired["mode"] == "compact"
+            assert repaired["phase"] == "verify_mentions"
+            assert repaired["legacy_gap_repair_kind"] is None
+            assert repaired["completed_at"] is not None
+
+            migration.downgrade(session)
+        finally:
+            session.rollback()
+
+
+def test_compact_legacy_gap_migration_blocks_downgrade_during_full_repair(
+    _database,
+    db,
+):
+    project_uuid = sys_uuid.uuid4()
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE]
+    with ra_contexts.Context().session_manager() as session:
+        try:
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_projects_v1 (
+                    project_id, mode, created_at, updated_at
+                ) VALUES (%s, 'dual', NOW(), NOW())
+                """,
+                (project_uuid,),
+            )
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_compaction_v1 (
+                    project_id, phase, target_ingest_sequence,
+                    legacy_gap_repair_kind, completed_at,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, 'legacy_gaps', 10, 'full_pending', NULL, NOW(), NOW()
+                )
+                """,
+                (project_uuid,),
+            )
+
+            with pytest.raises(
+                psycopg.errors.RaiseException,
+                match="legacy gap repair must finish before downgrade",
+            ):
+                migration.downgrade(session)
+            with db.cursor() as cursor:
+                cursor.execute(
+                    "SELECT to_regclass(%s)",
+                    ("m_workspace_read_memberships_stream_user_idx",),
+                )
+                assert cursor.fetchone()[0] == (
+                    "m_workspace_read_memberships_stream_user_idx"
+                )
+        finally:
+            session.rollback()
 
 
 @pytest.mark.parametrize(
