@@ -44,6 +44,7 @@ from workspace.messenger_api.dm import push_devices
 from workspace.messenger_api.dm import read_state
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import file_repository
+from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import sql_state
 
 
@@ -174,6 +175,29 @@ def _purge_external_account_projection_rows(
     external_account_uuid: object,
 ) -> None:
     """Remove one account's content without deleting a shared native DM."""
+    # Native self-DM sends retain native message provenance until the provider
+    # echo arrives.  Their durable create operation is the authoritative link
+    # to this account, so materialize that link before the account-scoped purge.
+    session.execute(
+        """
+        UPDATE m_workspace_messages AS message
+        SET external_account_uuid = %s
+        FROM m_external_operations_v2 AS operation
+        WHERE message.project_id = %s AND message.stream_uuid = %s
+          AND operation.external_account_uuid = %s
+          AND operation.owner_user_uuid = message.user_uuid
+          AND operation.action = 'message.create'
+          AND operation.target_type = 'message'
+          AND operation.target_uuid = message.uuid
+          AND message.external_account_uuid IS NULL
+        """,
+        (
+            external_account_uuid,
+            project_id,
+            stream_uuid,
+            external_account_uuid,
+        ),
+    )
     read_state.purge_external_account_messages(
         session,
         project_id,
@@ -187,6 +211,35 @@ def _purge_external_account_projection_rows(
           AND external_account_uuid = %s
         """,
         (project_id, stream_uuid, external_account_uuid),
+    )
+    # A deselected projection must not continue delivering work that was queued
+    # for its native self-DM lane.  Removing the public operation also cascades
+    # lazy snapshots/pages, so no old lease can be re-exposed by this backend.
+    session.execute(
+        """
+        DELETE FROM m_external_operations_v2 AS operation
+        WHERE operation.external_account_uuid = %s
+          AND operation.status IN (
+              'queued', 'running', 'failed',
+              'manual_reconciliation_required'
+          )
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM m_external_provider_operations_v1 AS provider_operation
+                  WHERE provider_operation.external_operation_uuid =
+                        operation.uuid
+                    AND provider_operation.causal_lane = %s
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM m_external_provider_read_snapshots_v1 AS snapshot
+                  WHERE snapshot.external_operation_uuid = operation.uuid
+                    AND snapshot.causal_lane = %s
+              )
+          )
+        """,
+        (external_account_uuid, stream_uuid, stream_uuid),
     )
     session.execute(
         """
@@ -1717,6 +1770,11 @@ class ExternalAccountController(ExternalResourceController):
                         stream_uuid=chat.projection_stream_uuid,
                         external_account_uuid=account.uuid,
                     )
+                    identity_linking.invalidate_direct_event_history(
+                        session,
+                        project_id=chat.project_id,
+                        stream_uuid=chat.projection_stream_uuid,
+                    )
                 else:
                     _journal_projection_move(
                         chat.uuid,
@@ -1839,15 +1897,23 @@ class ExternalChatController(ExternalResourceController):
             resource.uuid,
             f"projection:{resource.revision}:{action}",
         )
+        carrier_stream_uuid = sql_state.external_chat_projection_stream_uuid(
+            resource.uuid
+        )
+        file_stream_uuids = list(
+            dict.fromkeys(
+                (resource.projection_stream_uuid, carrier_stream_uuid)
+            )
+        )
         files = session.execute(
             """
             SELECT uuid, storage_type, storage_id, storage_object_id
             FROM m_workspace_files
-            WHERE stream_uuid = %s AND project_id = %s
+            WHERE stream_uuid = ANY(%s) AND project_id = %s
               AND external_account_uuid = %s
             """,
             (
-                resource.projection_stream_uuid,
+                file_stream_uuids,
                 resource.project_id,
                 resource.external_account_uuid,
             ),
@@ -1967,6 +2033,20 @@ class ExternalChatController(ExternalResourceController):
                         stream_uuid=transition["stream_uuid"],
                         external_account_uuid=chat.external_account_uuid,
                     )
+                    identity_linking.invalidate_direct_event_history(
+                        session,
+                        project_id=transition["old_project_uuid"],
+                        stream_uuid=transition["stream_uuid"],
+                    )
+                    carrier_stream_uuid = (
+                        sql_state.external_chat_projection_stream_uuid(chat.uuid)
+                    )
+                    if carrier_stream_uuid != transition["stream_uuid"]:
+                        _delete_projection_stream_rows(
+                            session,
+                            project_id=transition["old_project_uuid"],
+                            stream_uuid=carrier_stream_uuid,
+                        )
                 else:
                     _delete_projection_stream_rows(
                         session,
@@ -2130,14 +2210,21 @@ class ExternalChatController(ExternalResourceController):
             (
                 projection_stream_uuid,
                 projection_source,
-                _projection_changed,
+                projection_changed,
             ) = external_projection.reconcile_personal_chat_projection(
                 session,
                 project_id=sys_uuid.UUID(str(project_id)),
+                owner_user_uuid=resource.owner_user_uuid,
                 provider_kind=resource.provider,
                 source=resource.source,
                 projection_stream_uuid=projection_stream_uuid,
             )
+            if projection_changed:
+                identity_linking.invalidate_direct_event_history(
+                    session,
+                    project_id=project_id,
+                    stream_uuid=projection_stream_uuid,
+                )
         if selected:
             external_projection.ensure_external_chat_stream(
                 session,
@@ -2152,6 +2239,7 @@ class ExternalChatController(ExternalResourceController):
                 source=projection_source,
                 capabilities=resource.capabilities,
                 account_settings=account.settings,
+                reconcile_participants="participants" in projection_source,
             )
         if unchanged:
             return resource

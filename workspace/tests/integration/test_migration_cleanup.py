@@ -136,6 +136,21 @@ PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID = (
 PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE = (
     "0144-use-additive-provider-read-paging-capability-523aa1.py"
 )
+READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID = (
+    "8e2468e1-ea6e-4611-9d6e-266917e6c64e"
+)
+ROLLING_READ_STATE_PROJECT_MIGRATION_UUID = (
+    "4c8dc326-40db-4045-addb-bb8ac4d472c5"
+)
+ROLLING_READ_STATE_PROJECT_MIGRATION_FILE = (
+    "0146-register-rolling-read-state-projects-4c8dc3.py"
+)
+READ_STATE_INDEX_REPAIR_MIGRATION_UUID = (
+    "804f7723-4d44-4d32-914e-3f9dfe90eee1"
+)
+READ_STATE_INDEX_REPAIR_MIGRATION_FILE = (
+    "0147-repair-read-state-maintenance-indexes-804f77.py"
+)
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
     "m_messenger_writer_gate_expected_v1",
@@ -199,8 +214,7 @@ def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
     assert (
-        engine.get_latest_migration()
-        == PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE
+        engine.get_latest_migration() == READ_STATE_INDEX_REPAIR_MIGRATION_FILE
     )
     with db.cursor() as cur:
         cur.execute(
@@ -238,6 +252,9 @@ def test_current_migrations_have_a_single_head(_database, db):
                     COMPACT_DENSE_PREPARATION_MIGRATION_UUID,
                     COMPACT_DENSE_JOIN_MIGRATION_UUID,
                     PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID,
+                    READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID,
+                    ROLLING_READ_STATE_PROJECT_MIGRATION_UUID,
+                    READ_STATE_INDEX_REPAIR_MIGRATION_UUID,
                 ],
             ),
         )
@@ -273,6 +290,9 @@ def test_current_migrations_have_a_single_head(_database, db):
             (COMPACT_DENSE_PREPARATION_MIGRATION_UUID, True),
             (COMPACT_DENSE_JOIN_MIGRATION_UUID, True),
             (PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID, True),
+            (READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID, True),
+            (ROLLING_READ_STATE_PROJECT_MIGRATION_UUID, True),
+            (READ_STATE_INDEX_REPAIR_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -565,6 +585,7 @@ def test_forward_correction_upgrades_published_read_state_without_rewrite(
             INSERT INTO m_workspace_read_state_projects_v1 (
                 project_id, mode
             ) VALUES (%s, 'compact')
+            ON CONFLICT (project_id) DO UPDATE SET mode = EXCLUDED.mode
             """,
             (project_uuid,),
         )
@@ -746,6 +767,7 @@ def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
             """
             INSERT INTO m_workspace_read_state_projects_v1 (project_id, mode)
             VALUES (%s, 'compact')
+            ON CONFLICT (project_id) DO UPDATE SET mode = EXCLUDED.mode
             """,
             (project_uuid,),
         )
@@ -3684,6 +3706,113 @@ def test_compact_read_state_populated_downgrade_restores_legacy_flags(
             ("m_workspace_flags_project_message_user_idx", True),
         }
     engine.apply_migration(engine.get_latest_migration())
+
+
+def test_multi_account_stream_access_migration_deduplicates_visibility_rows(
+    _database,
+    db,
+):
+    pytest.skip("multiple accounts per provider remain intentionally unsupported")
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "Multi-account self DM",
+    )
+    account_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    with db.cursor() as cur:
+        for index, account_uuid in enumerate(account_uuids):
+            cur.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    credential_present, status
+                ) VALUES (%s, %s, 'zulip', %s::jsonb, TRUE, 'live')
+                """,
+                (
+                    account_uuid,
+                    owner_uuid,
+                    '{"server_url":"https://zulip-%d.example.invalid"}' % index,
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_external_chats_v2 (
+                    uuid, external_account_uuid, owner_user_uuid, provider,
+                    provider_chat_id, source, display_name, selected,
+                    project_id, projection_stream_uuid, status
+                ) VALUES (
+                    %s, %s, %s, 'zulip', %s,
+                    '{"kind":"zulip","chat_type":"group_direct"}'::jsonb,
+                    'Saved messages', TRUE, %s, %s, 'live'
+                )
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    account_uuid,
+                    owner_uuid,
+                    f"group_direct:{index}",
+                    project_uuid,
+                    stream_uuid,
+                ),
+            )
+    db.commit()
+
+    def access_count():
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM m_confirmed_external_stream_access
+                WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+                """,
+                (project_uuid, owner_uuid, stream_uuid),
+            )
+            return cur.fetchone()[0]
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    assert access_count() == 1
+    engine.rollback_migration(
+        "0149-deduplicate-multi-account-stream-access-ed1c93.py"
+    )
+    assert access_count() == 2
+    engine.apply_migration(
+        "0149-deduplicate-multi-account-stream-access-ed1c93.py"
+    )
+    assert access_count() == 1
+
+
+def test_read_state_index_repair_recovers_partial_recursive_downgrade(
+    _database,
+    db,
+):
+    engine = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )
+    engine.rollback_migration(READ_STATE_INDEX_REPAIR_MIGRATION_FILE)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            DROP INDEX m_workspace_read_state_active_maintenance_idx;
+            DROP INDEX m_workspace_read_state_cleanup_maintenance_idx;
+            """
+        )
+
+    engine.apply_migration(READ_STATE_INDEX_REPAIR_MIGRATION_FILE)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT to_regclass('m_workspace_read_state_active_maintenance_idx'),
+                   to_regclass('m_workspace_read_state_cleanup_maintenance_idx')
+            """
+        )
+        assert cur.fetchone() == (
+            "m_workspace_read_state_active_maintenance_idx",
+            "m_workspace_read_state_cleanup_maintenance_idx",
+        )
 
 
 def test_compact_read_state_index_migration_recovers_invalid_index(

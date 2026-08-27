@@ -1106,6 +1106,106 @@ def _topic_notification_event(
     return topic_uuid
 
 
+def _validate_provider_message_scope(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    message_uuids: collections.abc.Iterable[object],
+    external_account_uuid: sys_uuid.UUID,
+    owner_user_uuid: sys_uuid.UUID,
+    *,
+    allow_missing: bool = False,
+) -> None:
+    """Keep shared native self-DM messages isolated by provider account."""
+    expected = {
+        sys_uuid.UUID(str(message_uuid)) for message_uuid in message_uuids
+    }
+    if not expected:
+        return
+    rows = session.execute(
+        """
+        SELECT message.uuid,
+               (
+                    message.external_account_uuid = %s
+                    OR (
+                        message.external_account_uuid IS NULL
+                        AND EXISTS (
+                            SELECT 1
+                            FROM m_external_operations_v2 AS operation
+                            WHERE operation.external_account_uuid = %s
+                              AND operation.owner_user_uuid = %s
+                              AND operation.action = 'message.create'
+                              AND operation.target_type = 'message'
+                              AND operation.target_uuid = message.uuid
+                        )
+                    )
+                    OR (
+                            message.external_account_uuid IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM m_external_chats_v2 AS chat
+                                WHERE chat.owner_user_uuid = %s
+                                  AND chat.project_id = message.project_id
+                                  AND chat.projection_stream_uuid =
+                                        message.stream_uuid
+                                  AND chat.selected
+                                  AND chat.status IN (
+                                      'syncing', 'live', 'degraded'
+                                  )
+                                  AND NOT chat.transition_pending
+                            )
+                        )
+                   ) AS account_scoped
+        FROM m_workspace_messages AS message
+        WHERE message.project_id = %s
+          AND message.uuid = ANY(%s::uuid[])
+        """,
+        (
+            external_account_uuid,
+            external_account_uuid,
+            owner_user_uuid,
+            owner_user_uuid,
+            project_id,
+            sorted(expected, key=str),
+        ),
+    ).fetchall()
+    if any(not row["account_scoped"] for row in rows) or (
+        not allow_missing and {row["uuid"] for row in rows} != expected
+    ):
+        raise ValueError("Provider message belongs to another account")
+
+
+def _missing_provider_message_is_tombstoned(
+    session: typing.Any,
+    message_uuid: sys_uuid.UUID,
+    external_account_uuid: sys_uuid.UUID,
+    owner_user_uuid: sys_uuid.UUID,
+) -> bool:
+    """Validate durable native provenance and suppress late post-delete echoes."""
+    rows = session.execute(
+        """
+        SELECT external_account_uuid,
+               BOOL_OR(action = 'message.delete') AS deleted
+        FROM m_external_operations_v2
+        WHERE owner_user_uuid = %s
+          AND target_type = 'message'
+          AND target_uuid = %s
+          AND action IN ('message.create', 'message.delete')
+        GROUP BY external_account_uuid
+        """,
+        (owner_user_uuid, message_uuid),
+    ).fetchall()
+    if not rows:
+        return False
+    matching = [
+        row
+        for row in rows
+        if sys_uuid.UUID(str(row["external_account_uuid"])) == external_account_uuid
+    ]
+    if not matching:
+        raise ValueError("Provider message belongs to another account")
+    return bool(matching[0]["deleted"])
+
+
 def _message_event(
     session: typing.Any,
     event: dict[str, typing.Any],
@@ -1130,10 +1230,24 @@ def _message_event(
         models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(validation_token)
     source_project_id = sys_uuid.UUID(str(getattr(existing, "project_id", project_id)))
     cross_project_move = existing is not None and source_project_id != project_id
+    account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
+    if existing is not None:
+        _validate_provider_message_scope(
+            session,
+            source_project_id,
+            (message_uuid,),
+            account_uuid,
+            assignment["owner_user_uuid"],
+        )
+    elif _missing_provider_message_is_tombstoned(
+        session,
+        message_uuid,
+        account_uuid,
+        assignment["owner_user_uuid"],
+    ):
+        return message_uuid
     if cross_project_move and (
-        getattr(existing, "external_account_uuid", None)
-        != sys_uuid.UUID(str(event["external_account_uuid"]))
-        or getattr(existing, "provider_uuid", None) != identity.bridge_instance_uuid
+        getattr(existing, "provider_uuid", None) != identity.bridge_instance_uuid
     ):
         raise ValueError("Provider message UUID belongs to another projection")
     if existing is not None and _is_stale_provider_message(existing, resource):
@@ -1534,6 +1648,13 @@ def _reaction_event(
     message = _existing(models.WorkspaceMessage, project_id, message_uuid, session)
     if message is None or message.stream_uuid != assignment["projection_stream_uuid"]:
         raise ValueError("Provider reaction message is outside the selected stream")
+    _validate_provider_message_scope(
+        session,
+        project_id,
+        (message_uuid,),
+        sys_uuid.UUID(str(event["external_account_uuid"])),
+        typing.cast(sys_uuid.UUID, assignment.get("owner_user_uuid")),
+    )
     actor_uuid = sys_uuid.UUID(str(resource["user_uuid"]))
     user_identity = resource.get("user_identity")
     if isinstance(user_identity, collections.abc.Mapping):
@@ -1552,6 +1673,8 @@ def _reaction_event(
         reaction_uuid,
         session,
     )
+    if existing is not None and existing.message_uuid != message_uuid:
+        raise ValueError("Provider reaction UUID belongs to another message")
     matching = models.WorkspaceMessageReactions.objects.get_one_or_none(
         filters={
             "project_id": dm_filters.EQ(project_id),
@@ -1787,6 +1910,7 @@ def _read_state_event(
     project_id: sys_uuid.UUID,
     assignment: typing.Mapping[str, typing.Any],
     resource: dict[str, typing.Any],
+    external_account_uuid: sys_uuid.UUID,
 ) -> sys_uuid.UUID:
     stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
     if stream_uuid != assignment["projection_stream_uuid"]:
@@ -1807,6 +1931,14 @@ def _read_state_event(
     message_uuids = [sys_uuid.UUID(str(value)) for value in message_values]
     if len(set(message_uuids)) != len(message_uuids):
         raise ValueError("Provider read state message list contains duplicates")
+    _validate_provider_message_scope(
+        session,
+        project_id,
+        message_uuids,
+        external_account_uuid,
+        assignment["owner_user_uuid"],
+        allow_missing=True,
+    )
     topic_value = resource.get("topic_uuid")
     topic_uuid = None if topic_value is None else sys_uuid.UUID(str(topic_value))
     _sync_provider_read_state(
@@ -1841,7 +1973,13 @@ def apply_event(
     account_uuid, project_id, assignment = _assignment(session, identity, event)
     resource = _resource(event, identity, account_uuid)
     if event["kind"] == "read_state.set":
-        return _read_state_event(session, project_id, assignment, resource)
+        return _read_state_event(
+            session,
+            project_id,
+            assignment,
+            resource,
+            account_uuid,
+        )
     if event["kind"] == "stream.notification.update":
         return _stream_notification_event(
             session,

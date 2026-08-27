@@ -46,6 +46,7 @@ from oslo_config import cfg
 
 from workspace.common import external_bridge_opts
 from workspace.common import messenger_reaction_opts
+from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_event_apply
 from workspace.external_bridge_control import sql_state
@@ -979,7 +980,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
     db,
     tmp_path,
 ):
-    _enable_zulip_policy(db)
+    _enable_zulip_policy(db, max_accounts=1)
     del tmp_path
     realm_uuid = sys_uuid.uuid4()
     _seed_zulip_bridge_target(db)
@@ -1028,7 +1029,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
             },
             permissions=EXTERNAL_ACCOUNT_CREATE,
         )
-        assert duplicate.status_code == 409, duplicate.text
+        assert duplicate.status_code == 403, duplicate.text
 
         another_user = sys_uuid.uuid4()
         foreign_list = api.get(
@@ -1158,6 +1159,125 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
                 ("upsert", 3),
                 ("delete", 4),
             ]
+    finally:
+        cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
+
+
+def test_external_account_policy_keeps_one_account_per_provider(api, db):
+    _enable_zulip_policy(db, max_accounts=2)
+    _seed_zulip_bridge_target(db)
+    cfg.CONF.set_override(
+        "realm_uuid",
+        str(sys_uuid.uuid4()),
+        group=external_bridge_opts.DOMAIN,
+    )
+    account_uuids = [sys_uuid.uuid4() for _index in range(3)]
+
+    def payload(account_uuid, index):
+        return {
+            "uuid": str(account_uuid),
+            "settings": {
+                "kind": "zulip",
+                "server_url": f"https://zulip-{index}.example.invalid",
+                "email": f"owner-{index}@example.invalid",
+                "api_key": f"provider-secret-{index}",
+                "selection_mode": "explicit",
+                "history_depth": "30_days",
+                "default_project_id": api.project_id,
+            },
+        }
+
+    try:
+        created = api.post(
+            EXTERNAL_ACCOUNTS,
+            json=payload(account_uuids[0], 0),
+            permissions=EXTERNAL_ACCOUNT_CREATE,
+        )
+        assert created.status_code == 201, created.text
+
+        duplicate_provider = api.post(
+            EXTERNAL_ACCOUNTS,
+            json=payload(account_uuids[1], 1),
+            permissions=EXTERNAL_ACCOUNT_CREATE,
+        )
+        assert duplicate_provider.status_code == 409, duplicate_provider.text
+
+        over_limit = api.post(
+            EXTERNAL_ACCOUNTS,
+            json=payload(account_uuids[2], 2),
+            permissions=EXTERNAL_ACCOUNT_CREATE,
+        )
+        assert over_limit.status_code == 409, over_limit.text
+
+        account_list = api.get(
+            EXTERNAL_ACCOUNTS,
+            permissions=EXTERNAL_ACCOUNT_READ,
+        )
+        assert account_list.status_code == 200, account_list.text
+        assert str(account_uuids[0]) in {row["uuid"] for row in account_list.json()}
+        assert str(account_uuids[1]) not in {
+            row["uuid"] for row in account_list.json()
+        }
+
+        deleted = api.delete(
+            f"{EXTERNAL_ACCOUNTS}{account_uuids[0]}",
+            permissions=EXTERNAL_ACCOUNT_DELETE,
+        )
+        assert deleted.status_code == 204, deleted.text
+    finally:
+        cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
+
+
+def test_external_account_limit_serializes_concurrent_creates(api, db):
+    _enable_zulip_policy(db, max_accounts=1)
+    _seed_zulip_bridge_target(db)
+    cfg.CONF.set_override(
+        "realm_uuid",
+        str(sys_uuid.uuid4()),
+        group=external_bridge_opts.DOMAIN,
+    )
+    account_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+
+    def create(index):
+        return api.post(
+            EXTERNAL_ACCOUNTS,
+            json={
+                "uuid": str(account_uuids[index]),
+                "settings": {
+                    "kind": "zulip",
+                    "server_url": f"https://zulip-{index}.example.invalid",
+                    "email": f"owner-{index}@example.invalid",
+                    "api_key": f"provider-secret-{index}",
+                    "selection_mode": "explicit",
+                    "history_depth": "30_days",
+                    "default_project_id": api.project_id,
+                },
+            },
+            permissions=EXTERNAL_ACCOUNT_CREATE,
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            responses = [
+                future.result(timeout=10)
+                for future in (
+                    executor.submit(create, 0),
+                    executor.submit(create, 1),
+                )
+            ]
+        assert sorted(response.status_code for response in responses) == [201, 403]
+        created_uuid = responses[
+            next(
+                index
+                for index, response in enumerate(responses)
+                if response.status_code == 201
+            )
+        ].json()["uuid"]
+        deleted = api.delete(
+            f"{EXTERNAL_ACCOUNTS}{created_uuid}",
+            permissions=EXTERNAL_ACCOUNT_DELETE,
+        )
+        assert deleted.status_code == 204, deleted.text
     finally:
         cfg.CONF.clear_override("realm_uuid", group=external_bridge_opts.DOMAIN)
 
@@ -1440,6 +1560,1040 @@ def test_external_chat_can_be_selected_again_after_deselect(
             (api.project_id, expected_stream_uuid),
         )
         assert cursor.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("scenario", ["materialize", "reuse", "repair"])
+def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
+    api,
+    db,
+    scenario,
+):
+    _enable_zulip_policy(db)
+    bridge_instance_uuid, key_uuid, _ = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    expected_stream_uuid = messenger_dm_helpers.deterministic_direct_stream_uuid(
+        api.project_id,
+        api.user_uuid,
+        api.user_uuid,
+    )
+    generic_projection_stream_uuid = sql_state.external_chat_projection_stream_uuid(
+        chat_uuid
+    )
+    legacy_message_uuid = sys_uuid.uuid4()
+    legacy_file_uuid = sys_uuid.uuid4()
+    native_message_uuid = sys_uuid.uuid4()
+    extra_native_topic_uuid = sys_uuid.uuid4()
+    unrelated_project_uuid = sys_uuid.uuid4()
+    unrelated_user_uuid = sys_uuid.uuid4()
+    expected_private_index = f"{api.user_uuid}:{api.user_uuid}"
+    has_legacy_projection = scenario in {"reuse", "repair"}
+    if has_legacy_projection:
+        created = api.post(
+            STREAMS,
+            json={
+                "name": "Personal notes",
+                "description": "",
+                "source_name": "native",
+                "source": {"kind": "native"},
+                "direct_user_uuid": api.user_uuid,
+            },
+        )
+        assert created.status_code in (200, 201), created.text
+        assert created.json()["uuid"] == str(expected_stream_uuid)
+
+    source = {
+        "kind": "zulip",
+        "chat_type": "group",
+        "description": "",
+        "participants": [
+            {
+                "identity_uuid": api.user_uuid,
+                "provider_user_id": "7",
+                "display_name": "Saved messages",
+                "email": "owner@example.invalid",
+                "avatar_urn": None,
+                "role": "owner",
+            }
+        ],
+        "topics": [
+            {
+                "topic_uuid": str(topic_uuid),
+                "provider_topic_id": "group_direct:7:default",
+                "name": "default",
+                "is_default": True,
+            }
+        ],
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings, credential_present,
+                status
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb, TRUE, 'live'
+            )
+            """,
+            (
+                account_uuid,
+                api.user_uuid,
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "server_url": "https://zulip.example.invalid",
+                        "selection_mode": "explicit",
+                        "default_project_id": api.project_id,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_credentials_v2 (
+                uuid, external_account_uuid, key_version, envelope
+            ) VALUES (%s, %s, 1, %s::jsonb)
+            """,
+            (
+                sys_uuid.uuid4(),
+                account_uuid,
+                json.dumps(
+                    {
+                        "associated_data": {
+                            "bridge_instance_uuid": str(bridge_instance_uuid),
+                            "credential_key_uuid": str(key_uuid),
+                        }
+                    }
+                ),
+            ),
+        )
+        if has_legacy_projection:
+            cursor.execute(
+                """
+                SELECT default_topic_uuid
+                FROM m_workspace_streams
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (api.project_id, expected_stream_uuid),
+            )
+            native_topic_uuid = cursor.fetchone()[0]
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_stream_topics (
+                    uuid, project_id, name, stream_uuid
+                ) VALUES (%s, %s, 'native-only', %s)
+                """,
+                (
+                    extra_native_topic_uuid,
+                    api.project_id,
+                    expected_stream_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_messages (
+                    uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                    payload, source_name, source
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    '{"kind":"markdown","content":"native before provider"}'::jsonb,
+                    'native', '{"kind":"native"}'::jsonb
+                )
+                """,
+                (
+                    native_message_uuid,
+                    api.project_id,
+                    expected_stream_uuid,
+                    native_topic_uuid,
+                    api.user_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_streams (
+                    uuid, name, description, source_name, source, user_uuid,
+                    project_id, private, invite_only, external_account_uuid,
+                    provider_external_id
+                ) VALUES (
+                    %s, 'Saved messages', '', 'zulip', %s::jsonb, %s, %s,
+                    TRUE, TRUE, %s, 'group_direct:7'
+                )
+                """,
+                (
+                    generic_projection_stream_uuid,
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "stream_id": 0,
+                            "server_url": "https://zulip.example.invalid",
+                            "source_scope": str(account_uuid),
+                        }
+                    ),
+                    api.user_uuid,
+                    api.project_id,
+                    account_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_stream_topics (
+                    uuid, project_id, name, stream_uuid
+                ) VALUES (%s, %s, 'default', %s)
+                """,
+                (topic_uuid, api.project_id, generic_projection_stream_uuid),
+            )
+            cursor.execute(
+                """
+                UPDATE m_workspace_streams
+                SET default_topic_uuid = %s
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (topic_uuid, api.project_id, generic_projection_stream_uuid),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_stream_bindings (
+                    uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+                ) VALUES (%s, %s, %s, %s, %s, 'owner')
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    api.project_id,
+                    generic_projection_stream_uuid,
+                    api.user_uuid,
+                    api.user_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_messages (
+                    uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                    payload, external_account_uuid, provider_external_id
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    '{"kind":"markdown","content":"legacy self DM"}'::jsonb,
+                    %s, '123'
+                )
+                """,
+                (
+                    legacy_message_uuid,
+                    api.project_id,
+                    generic_projection_stream_uuid,
+                    topic_uuid,
+                    api.user_uuid,
+                    account_uuid,
+                ),
+            )
+            if scenario == "reuse":
+                cursor.execute(
+                    """
+                    INSERT INTO m_workspace_files (
+                        uuid, project_id, name, user_uuid, stream_uuid,
+                        acl_mode, external_account_uuid, content_type,
+                        size_bytes, hash, storage_type, storage_object_id
+                    ) VALUES (
+                        %s, %s, 'legacy-self-dm.txt', %s, %s, 'stream', %s,
+                        'text/plain', 1, 'legacy-self-dm', 'file',
+                        'legacy-self-dm.txt'
+                    )
+                    """,
+                    (
+                        legacy_file_uuid,
+                        api.project_id,
+                        api.user_uuid,
+                        generic_projection_stream_uuid,
+                        account_uuid,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO m_workspace_file_accesses (
+                        uuid, project_id, file_uuid, user_uuid
+                    ) VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        sys_uuid.uuid4(),
+                        api.project_id,
+                        legacy_file_uuid,
+                        api.user_uuid,
+                    ),
+                )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                history_depth, projection_stream_uuid, status
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'group_direct:7', %s::jsonb,
+                'Saved messages', %s, %s, '30_days', %s, %s
+            )
+            """,
+            (
+                chat_uuid,
+                account_uuid,
+                api.user_uuid,
+                json.dumps(source),
+                scenario == "repair",
+                api.project_id if scenario == "repair" else None,
+                (
+                    generic_projection_stream_uuid
+                    if scenario == "repair"
+                    else None
+                ),
+                "live" if scenario == "repair" else "available",
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid, current_epoch_version
+            ) VALUES (%s, %s, 0)
+            ON CONFLICT (project_id, user_uuid) DO UPDATE
+            SET current_epoch_version = EXCLUDED.current_epoch_version
+            RETURNING epoch_generation
+            """,
+            (api.project_id, api.user_uuid),
+        )
+        epoch_generation_before = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid, current_epoch_version
+            ) VALUES (%s, %s, 0)
+            ON CONFLICT (project_id, user_uuid) DO UPDATE
+            SET current_epoch_version = EXCLUDED.current_epoch_version
+            RETURNING epoch_generation
+            """,
+            (unrelated_project_uuid, unrelated_user_uuid),
+        )
+        unrelated_epoch_generation = cursor.fetchone()[0]
+
+    if scenario == "repair":
+        db.commit()
+        with ra_engines.engine_factory.get_engine().session_manager() as session:
+            assert (
+                sql_state.repair_external_chat_assignments(
+                    session,
+                    account_uuid,
+                    bridge_instance_uuid,
+                    "zulip",
+                )
+                == 1
+            )
+        selected = api.get(f"{EXTERNAL_CHATS}{chat_uuid}")
+    else:
+        selected = api.post(
+            f"{EXTERNAL_CHATS}{chat_uuid}/actions/select/invoke",
+            json={"project_id": api.project_id},
+        )
+
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["projection_stream_uuid"] == str(expected_stream_uuid)
+    stream = api.get(f"{STREAMS}{expected_stream_uuid}")
+    assert stream.status_code == 200, stream.text
+    assert stream.json()["private"] is True
+    assert stream.json()["direct_user_uuid"] == api.user_uuid
+    assert "private_index" not in stream.json()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, source_name, direct_user_uuid, private_index
+            FROM m_workspace_streams
+            WHERE project_id = %s AND private_index = %s
+            """,
+            (api.project_id, expected_private_index),
+        )
+        assert cursor.fetchall() == [
+            (
+                expected_stream_uuid,
+                "native",
+                sys_uuid.UUID(api.user_uuid),
+                expected_private_index,
+            )
+        ]
+        cursor.execute(
+            """
+            SELECT default_topic_uuid FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, expected_stream_uuid),
+        )
+        canonical_topic_uuid = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT is_archived FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, generic_projection_stream_uuid),
+        )
+        assert cursor.fetchall() == ([(True,)] if has_legacy_projection else [])
+        cursor.execute(
+            """
+            SELECT user_uuid, role
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (api.project_id, expected_stream_uuid),
+        )
+        assert cursor.fetchall() == [(sys_uuid.UUID(api.user_uuid), "owner")]
+        if has_legacy_projection:
+            cursor.execute(
+                """
+                SELECT message.stream_uuid, message.topic_uuid,
+                       stream.default_topic_uuid
+                FROM m_workspace_messages AS message
+                JOIN m_workspace_streams AS stream
+                  ON stream.project_id = message.project_id
+                 AND stream.uuid = message.stream_uuid
+                WHERE message.project_id = %s AND message.uuid = %s
+                """,
+                (api.project_id, legacy_message_uuid),
+            )
+            moved_stream_uuid, moved_topic_uuid, moved_default_topic_uuid = (
+                cursor.fetchone()
+            )
+            assert moved_stream_uuid == expected_stream_uuid
+            assert moved_topic_uuid == moved_default_topic_uuid
+            assert moved_default_topic_uuid == canonical_topic_uuid
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_events
+            WHERE project_id = %s
+              AND payload->>'kind' = 'stream.created'
+              AND payload->>'uuid' = %s
+            """,
+            (api.project_id, str(expected_stream_uuid)),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT resource
+            FROM m_external_bridge_desired_changes_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = %s
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (chat_uuid,),
+        )
+        assignment = cursor.fetchone()[0]
+        assert assignment["provider_chat"]["chat_type"] == "group_direct"
+        assert assignment["workspace_projection"]["stream"]["uuid"] == str(
+            expected_stream_uuid
+        )
+        assignment_topics = assignment["workspace_projection"]["topics"]
+        assert len(assignment_topics) == 1
+        assert assignment_topics[0]["topic_uuid"] == str(canonical_topic_uuid)
+        assert (
+            assignment_topics[0]["provider_topic_id"]
+            == "group_direct:7:default"
+        )
+        assert assignment_topics[0]["is_default"] is True
+        cursor.execute(
+            """
+            SELECT epoch_generation
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, api.user_uuid),
+        )
+        assert cursor.fetchone()[0] != epoch_generation_before
+        cursor.execute(
+            """
+            SELECT epoch_generation
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (unrelated_project_uuid, unrelated_user_uuid),
+        )
+        assert cursor.fetchone()[0] == unrelated_epoch_generation
+
+        capability = {
+            "messenger.message.send": {
+                "available": True,
+                "revision": 1,
+                "limits": {},
+            },
+            "messenger.message.edit": {
+                "available": True,
+                "revision": 1,
+                "limits": {},
+            },
+            "messenger.message.delete": {
+                "available": True,
+                "revision": 1,
+                "limits": {},
+            },
+            "messenger.message.read": {
+                "available": True,
+                "revision": 2,
+                "limits": {},
+            },
+            "messenger.reaction.write": {
+                "available": True,
+                "revision": 1,
+                "limits": {},
+            },
+        }
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET live_ready = TRUE, capabilities = %s::jsonb
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), account_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET status = 'live', capabilities = %s::jsonb,
+                catalog_capabilities = %s::jsonb
+            WHERE uuid = %s
+            """,
+            (
+                json.dumps(capability),
+                json.dumps(capability),
+                chat_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (
+                json.dumps(capability),
+                bridge_instance_uuid,
+            ),
+        )
+    db.commit()
+
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(expected_stream_uuid),
+            "topic_uuid": str(canonical_topic_uuid),
+            "payload": {"kind": "markdown", "content": "provider self DM"},
+        },
+    )
+    assert message.status_code == 201, message.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT operation_kind, external_account_uuid
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid IN (
+                SELECT uuid FROM m_external_operations_v2
+                WHERE target_uuid = %s
+            )
+            """,
+            (message.json()["uuid"],),
+        )
+        assert cursor.fetchone() == ("message.create", account_uuid)
+        cursor.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'failed', can_retry = TRUE
+            WHERE target_uuid = %s AND action = 'message.create'
+            """,
+            (message.json()["uuid"],),
+        )
+    db.commit()
+
+    updated_provider_message = api.put(
+        f"{MESSAGES}{message.json()['uuid']}",
+        json={
+            "payload": {
+                "kind": "markdown",
+                "content": "provider self DM edited before echo",
+            }
+        },
+    )
+    assert updated_provider_message.status_code == 200, updated_provider_message.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT action
+            FROM m_external_operations_v2
+            WHERE target_uuid = %s
+            ORDER BY created_at, uuid
+            """,
+            (message.json()["uuid"],),
+        )
+        assert [row[0] for row in cursor.fetchall()] == [
+            "message.create",
+            "message.update",
+        ]
+
+    deleted_after_failed_create = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(expected_stream_uuid),
+            "topic_uuid": str(canonical_topic_uuid),
+            "payload": {"kind": "markdown", "content": "failed create route"},
+        },
+    )
+    assert deleted_after_failed_create.status_code == 201, (
+        deleted_after_failed_create.text
+    )
+    failed_message_uuid = deleted_after_failed_create.json()["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_operations_v2
+            SET status = 'failed', can_retry = TRUE
+            WHERE target_uuid = %s AND action = 'message.create'
+            """,
+            (failed_message_uuid,),
+        )
+    db.commit()
+    failed_update = api.put(
+        f"{MESSAGES}{failed_message_uuid}",
+        json={
+            "payload": {"kind": "markdown", "content": "failed create edited"}
+        },
+    )
+    assert failed_update.status_code == 200, failed_update.text
+    failed_delete = api.delete(f"{MESSAGES}{failed_message_uuid}")
+    assert failed_delete.status_code in (200, 204), failed_delete.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT action
+            FROM m_external_operations_v2
+            WHERE target_uuid = %s
+            ORDER BY created_at, uuid
+            """,
+            (failed_message_uuid,),
+        )
+        assert [row[0] for row in cursor.fetchall()] == [
+            "message.create",
+            "message.update",
+            "message.delete",
+        ]
+    with ra_engines.engine_factory.get_engine().session_manager() as session:
+        assert (
+            provider_event_apply._message_event(
+                session,
+                {
+                    "external_account_uuid": str(account_uuid),
+                    "kind": "message.upsert",
+                },
+                sys_uuid.UUID(api.project_id),
+                {
+                    "owner_user_uuid": sys_uuid.UUID(api.user_uuid),
+                    "projection_stream_uuid": expected_stream_uuid,
+                },
+                {
+                    "uuid": failed_message_uuid,
+                    "stream_uuid": str(expected_stream_uuid),
+                },
+                types.SimpleNamespace(
+                    bridge_instance_uuid=bridge_instance_uuid,
+                    provider_kind="zulip",
+                ),
+            )
+            == sys_uuid.UUID(failed_message_uuid)
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, failed_message_uuid),
+        )
+        assert cursor.fetchone() == (0,)
+
+    if has_legacy_projection:
+        read_native = api.post(
+            f"{MESSAGES}{native_message_uuid}/actions/read/invoke",
+            json={},
+        )
+        assert read_native.status_code == 200, read_native.text
+        native_reaction = api.post(
+            MESSAGE_REACTIONS,
+            json={
+                "message_uuid": str(native_message_uuid),
+                "emoji_name": "thumbs_up",
+            },
+        )
+        assert native_reaction.status_code == 201, native_reaction.text
+        native_reaction_uuid = native_reaction.json()["uuid"]
+        updated_native_reaction = api.put(
+            f"{MESSAGE_REACTIONS}{native_reaction_uuid}",
+            json={"emoji_name": "heart"},
+        )
+        assert updated_native_reaction.status_code == 200, (
+            updated_native_reaction.text
+        )
+        deleted_native_reaction = api.delete(
+            f"{MESSAGE_REACTIONS}{native_reaction_uuid}"
+        )
+        assert deleted_native_reaction.status_code in (200, 204), (
+            deleted_native_reaction.text
+        )
+        updated_native = api.put(
+            f"{MESSAGES}{native_message_uuid}",
+            json={
+                "payload": {
+                    "kind": "markdown",
+                    "content": "still Workspace-only",
+                }
+            },
+        )
+        assert updated_native.status_code == 200, updated_native.text
+        deleted_native = api.delete(f"{MESSAGES}{native_message_uuid}")
+        assert deleted_native.status_code in (200, 204), deleted_native.text
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM m_external_operations_v2
+                WHERE target_uuid = ANY(%s::uuid[])
+                  AND action IN (
+                      'read_state.set', 'reaction.create', 'reaction.update',
+                      'reaction.delete', 'message.update', 'message.delete'
+                  )
+                """,
+                ([str(native_message_uuid), str(native_reaction_uuid)],),
+            )
+            assert cursor.fetchone() == (0,)
+
+    if scenario == "reuse":
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT epoch_generation
+                FROM m_workspace_event_cursors
+                WHERE project_id = %s AND user_uuid = %s
+                """,
+                (api.project_id, api.user_uuid),
+            )
+            before_deselect_generation = cursor.fetchone()[0]
+        deselected = api.post(
+            f"{EXTERNAL_CHATS}{chat_uuid}/actions/deselect/invoke",
+            json={},
+        )
+        assert deselected.status_code == 200, deselected.text
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1 FROM m_workspace_streams
+                        WHERE project_id = %s AND uuid = %s
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM m_workspace_files WHERE uuid = %s
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM m_workspace_file_accesses
+                        WHERE file_uuid = %s
+                    )
+                """,
+                (
+                    api.project_id,
+                    generic_projection_stream_uuid,
+                    legacy_file_uuid,
+                    legacy_file_uuid,
+                ),
+            )
+            assert cursor.fetchone() == (False, False, False)
+            cursor.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1 FROM m_workspace_messages
+                        WHERE project_id = %s AND uuid = %s
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM m_external_operations_v2
+                        WHERE target_uuid = %s
+                          AND action IN ('message.create', 'message.update')
+                    )
+                """,
+                (
+                    api.project_id,
+                    message.json()["uuid"],
+                    message.json()["uuid"],
+                ),
+            )
+            assert cursor.fetchone() == (False, False)
+            cursor.execute(
+                """
+                SELECT epoch_generation
+                FROM m_workspace_event_cursors
+                WHERE project_id = %s AND user_uuid = %s
+                """,
+                (api.project_id, api.user_uuid),
+            )
+            assert cursor.fetchone()[0] != before_deselect_generation
+
+
+def test_native_self_dm_operations_fan_out_to_every_selected_provider_account(api, db):
+    pytest.skip("multiple accounts per provider remain intentionally unsupported")
+    _enable_zulip_policy(db, max_accounts=2)
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    created_stream = api.post(
+        STREAMS,
+        json={
+            "name": "Personal notes",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+            "direct_user_uuid": api.user_uuid,
+        },
+    )
+    assert created_stream.status_code in (200, 201), created_stream.text
+    stream_uuid = created_stream.json()["uuid"]
+    topic_uuid = created_stream.json()["default_topic_uuid"]
+    account_uuids = tuple(sorted((sys_uuid.uuid4(), sys_uuid.uuid4()), key=str))
+    capability = {
+        name: {"available": True, "revision": revision, "limits": {}}
+        for name, revision in (
+            ("messenger.message.send", 1),
+            ("messenger.message.edit", 1),
+            ("messenger.message.delete", 1),
+            ("messenger.message.read", 2),
+            ("messenger.reaction.write", 1),
+        )
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capability), bridge_uuid),
+        )
+        for index, account_uuid in enumerate(account_uuids):
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    credential_present, status, live_ready, capabilities
+                ) VALUES (
+                    %s, %s, 'zulip', %s::jsonb,
+                    TRUE, 'live', TRUE, %s::jsonb
+                )
+                """,
+                (
+                    account_uuid,
+                    api.user_uuid,
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "server_url": f"https://zulip-{index}.example.invalid",
+                            "default_project_id": api.project_id,
+                        }
+                    ),
+                    json.dumps(capability),
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_external_credentials_v2 (
+                    uuid, external_account_uuid, key_version, envelope
+                ) VALUES (%s, %s, 1, %s::jsonb)
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    account_uuid,
+                    json.dumps(
+                        {
+                            "associated_data": {
+                                "bridge_instance_uuid": str(bridge_uuid),
+                            }
+                        }
+                    ),
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_external_chats_v2 (
+                    uuid, external_account_uuid, owner_user_uuid, provider,
+                    provider_chat_id, source, display_name, selected, project_id,
+                    projection_stream_uuid, status, capabilities,
+                    catalog_capabilities
+                ) VALUES (
+                    %s, %s, %s, 'zulip', %s,
+                    %s::jsonb, 'Saved messages', TRUE, %s, %s, 'live',
+                    %s::jsonb, %s::jsonb
+                )
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    account_uuid,
+                    api.user_uuid,
+                    f"group_direct:{index}",
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "chat_type": "group_direct",
+                            "participants": [],
+                            "topics": [],
+                        }
+                    ),
+                    api.project_id,
+                    stream_uuid,
+                    json.dumps(capability),
+                    json.dumps(capability),
+                ),
+            )
+    db.commit()
+
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "fan out"},
+        },
+    )
+    assert message.status_code == 201, message.text
+    message_uuid = message.json()["uuid"]
+    edited = api.put(
+        f"{MESSAGES}{message_uuid}",
+        json={"payload": {"kind": "markdown", "content": "fan out edited"}},
+    )
+    assert edited.status_code == 200, edited.text
+    reaction = api.post(
+        MESSAGE_REACTIONS,
+        json={"message_uuid": message_uuid, "emoji_name": "thumbs_up"},
+    )
+    assert reaction.status_code == 201, reaction.text
+    reaction_uuid = reaction.json()["uuid"]
+    reaction_edit = api.put(
+        f"{MESSAGE_REACTIONS}{reaction_uuid}",
+        json={"emoji_name": "heart"},
+    )
+    assert reaction_edit.status_code == 200, reaction_edit.text
+    reaction_delete = api.delete(f"{MESSAGE_REACTIONS}{reaction_uuid}")
+    assert reaction_delete.status_code in (200, 204), reaction_delete.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_workspace_user_message_flags
+            SET read = FALSE
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, api.user_uuid, message_uuid),
+        )
+    db.commit()
+    read_message = api.post(
+        f"{MESSAGES}{message_uuid}/actions/read/invoke",
+        json={},
+    )
+    assert read_message.status_code == 200, read_message.text
+    deleted = api.delete(f"{MESSAGES}{message_uuid}")
+    assert deleted.status_code in (200, 204), deleted.text
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT action, ARRAY_AGG(external_account_uuid ORDER BY external_account_uuid)
+            FROM m_external_operations_v2
+            WHERE target_uuid = %s
+            GROUP BY action
+            """,
+            (message_uuid,),
+        )
+        message_routes = dict(cursor.fetchall())
+        assert message_routes == {
+            action: list(account_uuids)
+            for action in (
+                "message.create",
+                "message.update",
+                "read_state.set",
+                "message.delete",
+            )
+        }
+        cursor.execute(
+            """
+            SELECT action, ARRAY_AGG(external_account_uuid ORDER BY external_account_uuid)
+            FROM m_external_operations_v2
+            WHERE target_uuid = %s
+            GROUP BY action
+            """,
+            (reaction_uuid,),
+        )
+        assert dict(cursor.fetchall()) == {
+            action: list(account_uuids)
+            for action in (
+                "reaction.create",
+                "reaction.update",
+                "reaction.delete",
+            )
+        }
+
+
+def test_direct_event_history_invalidation_covers_every_bound_participant(api, db):
+    peer_uuid = sys_uuid.uuid4()
+    unrelated_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
+    conftest.seed_workspace_user(db, unrelated_uuid, f"user-{unrelated_uuid}")
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Direct invalidation scope",
+    )
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        peer_uuid,
+    )
+    generations_before = {}
+    with db.cursor() as cursor:
+        for user_uuid in (api.user_uuid, peer_uuid, unrelated_uuid):
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_event_cursors (
+                    project_id, user_uuid, current_epoch_version
+                ) VALUES (%s, %s, 0)
+                ON CONFLICT (project_id, user_uuid) DO UPDATE
+                SET current_epoch_version = EXCLUDED.current_epoch_version
+                RETURNING epoch_generation
+                """,
+                (api.project_id, user_uuid),
+            )
+            generations_before[sys_uuid.UUID(str(user_uuid))] = cursor.fetchone()[0]
+    db.commit()
+
+    _run_database_operation(
+        lambda session: identity_linking.invalidate_direct_event_history(
+            session,
+            project_id=api.project_id,
+            stream_uuid=stream_uuid,
+        )
+    )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_uuid, epoch_generation
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = ANY(%s::uuid[])
+            """,
+            (
+                api.project_id,
+                [str(api.user_uuid), str(peer_uuid), str(unrelated_uuid)],
+            ),
+        )
+        generations_after = dict(cursor.fetchall())
+    assert generations_after[sys_uuid.UUID(str(api.user_uuid))] != (
+        generations_before[sys_uuid.UUID(str(api.user_uuid))]
+    )
+    assert generations_after[peer_uuid] != generations_before[peer_uuid]
+    assert generations_after[unrelated_uuid] == generations_before[unrelated_uuid]
 
 
 def test_external_provider_policy_blocks_account_and_operation_boundaries(
@@ -10440,7 +11594,12 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     source = {
         "kind": "zulip",
@@ -10795,7 +11954,12 @@ def test_provider_read_prelocks_lane_before_project_during_page_lease(api, db):
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     source = {
         "kind": "zulip",
@@ -11029,9 +12193,9 @@ def test_provider_account_read_and_delete_follow_account_project_lock_order(
             session.execute("SET LOCAL lock_timeout = '5s'")
             session.execute("SET LOCAL statement_timeout = '8s'")
             thread_context.session = session
-            sql_canonical_store.SQLCanonicalMessengerStore._lock_provider_account(
+            sql_canonical_store.SQLCanonicalMessengerStore._lock_provider_accounts(
                 None,
-                account_uuid,
+                (account_uuid,),
             )
             account_row_locked.set()
             assert delete_lock_attempted.wait(timeout=3)
@@ -11762,7 +12926,7 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
     assert [event["epoch_version"] for event in exact_resp.json()] == [second_epoch]
 
 
-def test_missing_read_state_project_stays_legacy_until_gated_compaction(api, db):
+def test_old_writer_stream_registers_project_for_gated_compaction(api, db):
     reader_uuid = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "Rolling upgrade read state"
@@ -11777,10 +12941,23 @@ def test_missing_read_state_project_stays_legacy_until_gated_compaction(api, db)
         is_default=True,
     )
     message_uuid = sys_uuid.uuid4()
+    rolling_stream_uuid = sys_uuid.uuid4()
     with db.cursor() as cursor:
         cursor.execute(
             "DELETE FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
             (api.project_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_streams (
+                uuid, name, description, source_name, source,
+                user_uuid, project_id
+            ) VALUES (
+                %s, 'Rolling old writer', '', 'native',
+                '{"kind":"native"}'::jsonb, %s, %s
+            )
+            """,
+            (rolling_stream_uuid, api.user_uuid, api.project_id),
         )
         cursor.execute(
             """
@@ -11820,9 +12997,6 @@ def test_missing_read_state_project_stays_legacy_until_gated_compaction(api, db)
         )
     db.commit()
 
-    _run_database_operation(
-        lambda session: read_state.ensure_new_project(session, api.project_id)
-    )
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -11833,6 +13007,37 @@ def test_missing_read_state_project_stays_legacy_until_gated_compaction(api, db)
             (api.project_id,),
         )
         assert cursor.fetchone()[0] == read_state.PROJECT_MODE_LEGACY
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT project_id
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id <> %s
+            """,
+            (api.project_id,),
+        )
+        unrelated_project_ids = {row[0] for row in cursor.fetchall()}
+    maintenance = _run_database_operation(
+        lambda session: read_state.maintain_next_project(
+            session,
+            batch_size=10,
+            excluded_project_ids=unrelated_project_ids,
+        )
+    )
+    assert maintenance is not None
+    assert maintenance[0] == "prepare"
+    assert maintenance[1] == sys_uuid.UUID(str(api.project_id))
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT mode
+            FROM m_workspace_read_state_projects_v1
+            WHERE project_id = %s
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchone()[0] == read_state.PROJECT_MODE_PREPARING
 
     _finish_read_compaction(db, api.project_id)
     assert _workspace_message_read_states(
@@ -11847,6 +13052,56 @@ def test_missing_read_state_project_stays_legacy_until_gated_compaction(api, db)
         api.user_uuid,
         [message_uuid],
     ) == {str(message_uuid): True}
+
+
+def test_read_state_maintenance_candidate_plan_is_index_bounded(api, db):
+    del api
+    seed = str(sys_uuid.uuid4())
+    with db.cursor() as cursor:
+        cursor.execute("BEGIN")
+        try:
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_read_state_projects_v1 (
+                    project_id, mode, created_at, updated_at
+                )
+                SELECT md5(%s || sample::text)::uuid, 'legacy', NOW(),
+                       NOW() - sample * interval '1 second'
+                FROM generate_series(1, 20000) AS sample
+                ON CONFLICT (project_id) DO NOTHING
+                """,
+                (seed,),
+            )
+            cursor.execute("ANALYZE m_workspace_read_state_projects_v1")
+            cursor.execute(
+                """
+                EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON)
+                SELECT state.project_id, state.mode, state.updated_at
+                FROM m_workspace_read_state_projects_v1 AS state
+                WHERE state.mode IN ('legacy', 'preparing', 'dual')
+                ORDER BY state.updated_at, state.project_id
+                LIMIT %s
+                """,
+                (read_state.MAINTENANCE_CANDIDATE_LIMIT,),
+            )
+            plan = cursor.fetchone()[0][0]["Plan"]
+        finally:
+            cursor.execute("ROLLBACK")
+
+    def walk(node):
+        yield node
+        for child in node.get("Plans", []):
+            yield from walk(child)
+
+    nodes = list(walk(plan))
+    assert any(
+        node.get("Index Name")
+        == "m_workspace_read_state_active_maintenance_idx"
+        for node in nodes
+    )
+    assert max(int(node.get("Actual Rows", 0)) for node in nodes) <= (
+        read_state.MAINTENANCE_CANDIDATE_LIMIT
+    )
 
 
 def test_read_state_maintenance_skips_a_locked_project(api, db):
@@ -14900,7 +16155,12 @@ def test_compact_message_cross_project_move_rebinds_every_coordinate(api, db):
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     operation_uuid = sys_uuid.uuid4()
     with db.cursor() as cursor:
@@ -15744,7 +17004,12 @@ def test_compact_storage_stays_bounded_for_many_users_and_messages(api, db):
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     with db.cursor() as cursor:
         cursor.execute(
@@ -15958,6 +17223,11 @@ def test_compact_storage_stays_bounded_for_many_users_and_messages(api, db):
     lease = concurrent_leases[0]
     assert all(
         leased["provider_operation_uuid"] != str(later_provider_uuid)
+        for leased in lease["operations"]
+    )
+    assert all(
+        leased["external_operation_uuid"] == leased["provider_operation_uuid"]
+        and "_workspace_response_revision" not in leased["payload"]
         for leased in lease["operations"]
     )
     delivered_message_uuids = [
@@ -16247,7 +17517,12 @@ def test_compact_provider_snapshot_bounds_deleted_candidate_scans(api, db):
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     with db.cursor() as cursor:
         cursor.execute(
@@ -16385,7 +17660,12 @@ def test_provider_read_materializer_bounds_snapshot_backlog_by_lease_limit(api, 
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     with db.cursor() as cursor:
         cursor.execute(
@@ -16571,9 +17851,12 @@ def test_provider_read_replay_freezes_identity_across_revision_transitions(api, 
     )["operations"]
     assert len(lease) == 1
     assert lease[0]["provider_operation_uuid"] != str(public_uuid)
-    assert lease[0]["external_operation_uuid"] == lease[0]["provider_operation_uuid"]
+    assert lease[0]["external_operation_uuid"] == str(public_uuid)
     assert lease[0]["payload"]["message_uuids"] == [str(message_uuid)]
-    capability["messenger.message.read"]["revision"] = 2
+    capability[provider_data.PROVIDER_READ_PAGING_CAPABILITY] = {
+        "revision": 1,
+        "limits": {},
+    }
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -16626,6 +17909,7 @@ def test_provider_read_replay_freezes_identity_across_revision_transitions(api, 
                 "topic_uuid": None,
                 "reader_uuid": str(api.user_uuid),
                 "read": True,
+                "_workspace_response_revision": 2,
                 "message_uuids": [str(sys_uuid.uuid4())],
             },
             causal_lane=stream_uuid,
@@ -16648,7 +17932,7 @@ def test_provider_read_replay_freezes_identity_across_revision_transitions(api, 
     assert revision_two_lease[0]["external_operation_uuid"] == str(
         revision_two_provider_uuid
     )
-    capability["messenger.message.read"]["revision"] = 1
+    capability.pop(provider_data.PROVIDER_READ_PAGING_CAPABILITY)
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -16702,7 +17986,7 @@ def test_revision_one_provider_read_rejects_500k_candidates_without_queue_growth
 
     with pytest.raises(
         provider_data.ProviderUnavailableError,
-        match="paging capability revision 2",
+        match=r"messenger\.message\.read\.paging revision 1",
     ):
         _run_database_operation(
             lambda session: provider_data.enqueue_provider_read_operation(
@@ -16792,7 +18076,12 @@ def test_provider_read_lane_survives_full_cross_project_stream_move(api, db):
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     with db.cursor() as cursor:
         cursor.execute(
@@ -16954,7 +18243,9 @@ def test_provider_read_lane_survives_full_cross_project_stream_move(api, db):
     assert len(lease["operations"]) == 1
     assert lease["operations"][0]["payload"]["message_uuids"] == [str(message_uuid)]
     leased_snapshot_page = lease["operations"][0]
-    read_capability["messenger.message.read"]["revision"] = 1
+    paging_capability = read_capability.pop(
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY
+    )
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -16975,7 +18266,7 @@ def test_provider_read_lane_survives_full_cross_project_stream_move(api, db):
         )
     )
     assert replay == lease
-    read_capability["messenger.message.read"]["revision"] = 2
+    read_capability[provider_data.PROVIDER_READ_PAGING_CAPABILITY] = paging_capability
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -17147,7 +18438,12 @@ def test_projection_move_rebinds_failed_provider_read_snapshot_retry(
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     with db.cursor() as cursor:
         cursor.execute(
@@ -17341,7 +18637,12 @@ def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypat
             "available": True,
             "revision": 2,
             "limits": {},
-        }
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
     }
     with db.cursor() as cursor:
         cursor.execute(
@@ -17549,7 +18850,8 @@ def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypat
     assert third_lease[0]["provider_operation_uuid"] == str(unknown_lane_provider_uuid)
     assert report(third_lease[0])["status"] == "applied"
 
-    # A rolling downgrade after the backend reads revision 2 is still fenced
+    # A rolling paging-capability removal after the backend reads revision 1 is
+    # still fenced
     # by the database trigger. Other lanes continue, and the lazy page becomes
     # deliverable again only after the persisted bridge contract returns to 2.
     rolling_snapshot_uuid = sys_uuid.uuid4()
@@ -17593,10 +18895,16 @@ def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypat
     db.commit()
 
     original_bridge_capabilities = provider_data._bridge_capabilities
+    removed_paging_capability = {}
 
     def downgrade_after_capability_read(session, identity, now):
         capabilities = original_bridge_capabilities(session, identity, now)
-        read_capability["messenger.message.read"]["revision"] = 1
+        removed_paging_capability.update(
+            read_capability.pop(
+                provider_data.PROVIDER_READ_PAGING_CAPABILITY,
+                {},
+            )
+        )
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -17627,7 +18935,9 @@ def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypat
     )
     assert report(downgraded_lease[0])["status"] == "applied"
 
-    read_capability["messenger.message.read"]["revision"] = 2
+    read_capability[provider_data.PROVIDER_READ_PAGING_CAPABILITY] = (
+        removed_paging_capability
+    )
     with db.cursor() as cursor:
         cursor.execute(
             """
