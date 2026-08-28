@@ -98,6 +98,7 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
         "connection_keepalives_idle": 60,
         "connection_keepalives_interval": 30,
         "connection_keepalives_count": 5,
+        "connection_pool_max_size": 2,
     }
 
     for config_path in (
@@ -107,6 +108,22 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
         config = _read(config_path)
         for name, value in expected.items():
             assert f"{name} = {value}" in config
+
+
+def test_messenger_runtime_has_two_workers_with_bounded_pool_budget():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        messenger = config.split("[messenger_api]", 1)[1].split("[", 1)[0]
+        assert "workers = 2" in messenger
+        assert "connection_pool_max_size = 2" in config
+
+    messenger_source = _read("workspace/cmd/messenger_api.py")
+    provider_source = _read("workspace/cmd/external_bridge_api.py")
+    assert '"workspace-messenger-api"' in messenger_source
+    assert '"workspace-provider-control"' in provider_source
 
 
 def test_postgresql_runtime_has_import_scale_session_tuning():

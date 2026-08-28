@@ -63,6 +63,45 @@ def test_create_message_flags_bulk_uses_one_insert_for_all_recipients():
     )
 
 
+def test_stream_access_lookup_uses_only_bounded_visibility_projections():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    access_row = {
+        "stream_uuid": stream_uuid,
+        "project_id": project_id,
+        "user_uuid": user_uuid,
+        "notification_mode": "all_messages",
+    }
+    session = mock.Mock()
+    session.execute.return_value.fetchone.return_value = access_row
+
+    result = dm_helpers.get_workspace_user_stream_access(
+        project_id,
+        user_uuid,
+        stream_uuid,
+        session=session,
+    )
+
+    assert result is access_row
+    statement, params = session.execute.call_args.args
+    assert params == (project_id, stream_uuid, user_uuid)
+    for relation in (
+        "m_workspace_streams",
+        "m_workspace_stream_bindings",
+        "m_confirmed_external_stream_access",
+    ):
+        assert relation in statement
+    for forbidden in (
+        "m_workspace_messages",
+        "m_workspace_user_streams",
+        "m_workspace_user_unread_messages",
+        "m_workspace_user_message_flags",
+        "m_workspace_user_read_chunks",
+    ):
+        assert forbidden not in statement
+
+
 class MessengerDMHelpersTestCase(unittest.TestCase):
     def _existing_stream(self, **kwargs):
         class ExistingStream:
@@ -2361,8 +2400,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers.models, "WorkspaceUserStream", FakeWorkspaceUserStream
             ),
             mock.patch.object(
-                dm_helpers, "get_workspace_user_stream", return_value=returned_stream
-            ) as get_user_stream,
+                dm_helpers,
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": "all_messages"},
+            ) as get_stream_access,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_stream_updated_event"
             ) as create_event,
@@ -2389,10 +2430,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             updated_stream["values"],
         )
         self.assertIs(session, updated_stream["update_session"])
-        get_user_stream.assert_called_once_with(
+        get_stream_access.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         FakeWorkspaceStream.objects.get_one.assert_called_once()
         filters = FakeWorkspaceStream.objects.get_one.call_args.kwargs["filters"]
@@ -2424,8 +2466,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ),
             mock.patch.object(
                 dm_helpers,
-                "get_workspace_user_stream",
-                return_value=types.SimpleNamespace(uuid=stream_uuid),
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": "all_messages"},
             ),
         ):
             for field, value in (
@@ -2498,8 +2540,13 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_stream",
-                side_effect=[current_stream, returned_stream],
+                return_value=returned_stream,
             ) as get_user_stream,
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": current_stream.notification_mode},
+            ) as get_stream_access,
             mock.patch.object(
                 dm_helpers,
                 "_normalize_workspace_user_stream_topic_notification_modes",
@@ -2533,21 +2580,17 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(project_id, filters["project_id"].value)
         self.assertEqual(stream_uuid, filters["stream_uuid"].value)
         self.assertEqual(user_uuid, filters["user_uuid"].value)
-        get_user_stream.assert_has_calls(
-            [
-                mock.call(
-                    project_id=project_id,
-                    user_uuid=user_uuid,
-                    stream_uuid=stream_uuid,
-                    session=session,
-                ),
-                mock.call(
-                    project_id=project_id,
-                    user_uuid=user_uuid,
-                    stream_uuid=stream_uuid,
-                    session=session,
-                ),
-            ]
+        get_stream_access.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
+        )
+        get_user_stream.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=stream_uuid,
+            session=session,
         )
         normalize_topics.assert_called_once_with(
             project_id=project_id,
@@ -2928,8 +2971,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
 
         with (
             mock.patch.object(
-                dm_helpers, "get_workspace_user_stream", return_value=object()
-            ) as get_user_stream,
+                dm_helpers,
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": "all_messages"},
+            ) as get_stream_access,
             mock.patch.object(
                 dm_helpers,
                 "create_workspace_stream_topic_with_flags",
@@ -2955,10 +3000,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(returned_topic, result)
-        get_user_stream.assert_called_once_with(
+        get_stream_access.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         create_topic.assert_called_once_with(
             project_id=project_id,
@@ -3366,23 +3412,30 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             2026, 8, 23, 12, 0, tzinfo=datetime.timezone.utc
         )
         current_topic = types.SimpleNamespace(stream_uuid=stream_uuid)
-        current_stream = types.SimpleNamespace(notification_mode="muted")
         returned_topic = types.SimpleNamespace(
             uuid=topic_uuid,
             user_uuid=user_uuid,
             notification_mode="unmute",
         )
+        topic_objects = types.SimpleNamespace(
+            get_one=mock.Mock(return_value=current_topic)
+        )
         with (
+            mock.patch.object(
+                dm_helpers.models.WorkspaceStreamTopic,
+                "objects",
+                topic_objects,
+            ),
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_stream_topic",
-                side_effect=[current_topic, returned_topic],
+                return_value=returned_topic,
             ) as get_topic,
             mock.patch.object(
                 dm_helpers,
-                "get_workspace_user_stream",
-                return_value=current_stream,
-            ) as get_stream,
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": "muted"},
+            ) as get_stream_access,
             mock.patch.object(
                 dm_helpers, "_set_workspace_user_topic_notification_mode"
             ) as set_notification,
@@ -3401,23 +3454,14 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             )
 
         self.assertIs(returned_topic, result)
-        get_topic.assert_has_calls(
-            [
-                mock.call(
-                    project_id=project_id,
-                    user_uuid=user_uuid,
-                    topic_uuid=topic_uuid,
-                    session=session,
-                ),
-                mock.call(
-                    project_id=project_id,
-                    user_uuid=user_uuid,
-                    topic_uuid=topic_uuid,
-                    session=session,
-                ),
-            ]
+        topic_objects.get_one.assert_called_once()
+        get_topic.assert_called_once_with(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            topic_uuid=topic_uuid,
+            session=session,
         )
-        get_stream.assert_called_once_with(
+        get_stream_access.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
@@ -3448,18 +3492,24 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         topic_uuid = sys_uuid.uuid4()
         session = object()
         current_topic = types.SimpleNamespace(stream_uuid=stream_uuid)
-        current_stream = types.SimpleNamespace(notification_mode="all_messages")
+        topic_objects = types.SimpleNamespace(
+            get_one=mock.Mock(return_value=current_topic)
+        )
 
         with (
             mock.patch.object(
-                dm_helpers,
-                "get_workspace_user_stream_topic",
-                return_value=current_topic,
+                dm_helpers.models.WorkspaceStreamTopic,
+                "objects",
+                topic_objects,
             ),
             mock.patch.object(
                 dm_helpers,
-                "get_workspace_user_stream",
-                return_value=current_stream,
+                "get_workspace_user_stream_topic",
+            ),
+            mock.patch.object(
+                dm_helpers,
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": "all_messages"},
             ),
             mock.patch.object(
                 dm_helpers, "_set_workspace_user_topic_notification_mode"
@@ -3479,23 +3529,20 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
     def test_topic_notification_mode_matrix_matches_stream_mode(self):
         shared_modes = ("mute", "default", "follow")
         for stream_mode in ("all_messages", "mentions_only", "muted"):
-            stream = types.SimpleNamespace(notification_mode=stream_mode)
             for topic_mode in shared_modes:
                 dm_helpers._validate_topic_notification_mode(
-                    stream=stream,
+                    stream_notification_mode=stream_mode,
                     notification_mode=topic_mode,
                 )
 
-        muted_stream = types.SimpleNamespace(notification_mode="muted")
         dm_helpers._validate_topic_notification_mode(
-            stream=muted_stream,
+            stream_notification_mode="muted",
             notification_mode="unmute",
         )
 
-        default_stream = types.SimpleNamespace(notification_mode="all_messages")
         with self.assertRaises(messenger_exc.InvalidTopicNotificationModeError):
             dm_helpers._validate_topic_notification_mode(
-                stream=default_stream,
+                stream_notification_mode="all_messages",
                 notification_mode="unmute",
             )
 
@@ -5860,8 +5907,10 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers, "get_workspace_user_folder", return_value=returned_folder
             ) as get_user_folder,
             mock.patch.object(
-                dm_helpers, "get_workspace_user_stream", return_value=object()
-            ) as get_user_stream,
+                dm_helpers,
+                "get_workspace_user_stream_access",
+                return_value={"notification_mode": "all_messages"},
+            ) as get_stream_access,
             mock.patch.object(
                 dm_helpers,
                 "get_workspace_user_folder_item",
@@ -5886,10 +5935,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertEqual(stream_uuid, created_item["stream_uuid"])
         self.assertEqual("stream", created_item["chat_type"])
         self.assertIs(session, created_item["insert_session"])
-        get_user_stream.assert_called_once_with(
+        get_stream_access.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,
             stream_uuid=stream_uuid,
+            session=session,
         )
         get_user_folder.assert_called_once_with(
             project_id=project_id,

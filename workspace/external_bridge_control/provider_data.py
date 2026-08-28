@@ -2154,11 +2154,19 @@ def apply_provider_event_batch(
             delattr(session, cache_attribute)
         else:
             setattr(session, cache_attribute, previous_cache)
+    event_count = len(events)
+    broadcast_count = len(broadcast_epochs)
+    apply_duration = time.monotonic() - started_at
     LOG.info(
         "Applied provider event batch: events=%d broadcasts=%d duration_seconds=%.3f",
-        len(events),
-        len(broadcast_epochs),
-        time.monotonic() - started_at,
+        event_count,
+        broadcast_count,
+        apply_duration,
+        extra={
+            "provider_batch_event_count": event_count,
+            "provider_batch_broadcast_count": broadcast_count,
+            "provider_batch_apply_duration_seconds": apply_duration,
+        },
     )
     return {"results": results}
 

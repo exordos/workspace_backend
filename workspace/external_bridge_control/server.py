@@ -4,9 +4,11 @@
 # you may not use this file except in compliance with the License.
 
 import http.server
+import logging
 import re
 import socketserver
 import ssl
+import time
 import urllib.parse
 from collections.abc import Callable
 from typing import Any, cast
@@ -21,6 +23,7 @@ MAX_REQUEST_TARGET = 512
 MAX_BODY = 52 * 1024 * 1024
 MAX_ENROLLMENT_BODY = 1024 * 1024
 _CANONICAL_CONTENT_LENGTH = re.compile(r"(?:0|[1-9][0-9]*)")
+LOG = logging.getLogger(__name__)
 
 
 class _RollbackResponse(RuntimeError):
@@ -166,6 +169,7 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
                     "Private API request transaction is not configured"
                 )
             try:
+                commit_started_at = None
                 with server.request_session_factory() as request_session:
                     response = server.private_service.handle(
                         self.command,
@@ -177,6 +181,20 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
                     )
                     if response.status >= 400:
                         raise _RollbackResponse(response)
+                    commit_started_at = time.monotonic()
+                if (
+                    self.command == "POST"
+                    and urllib.parse.urlsplit(self.path).path
+                    == "/api/workspace-provider/v1/events"
+                ):
+                    commit_duration = time.monotonic() - commit_started_at
+                    LOG.info(
+                        "Committed provider event batch: duration_seconds=%.3f",
+                        commit_duration,
+                        extra={
+                            "provider_batch_commit_duration_seconds": commit_duration,
+                        },
+                    )
             except _RollbackResponse as rollback:
                 response = rollback.response
         except provider_data.ProviderDataError as error:

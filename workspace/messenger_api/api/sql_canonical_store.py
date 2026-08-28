@@ -579,6 +579,12 @@ class SQLCanonicalReadStore:
         self.project_uuid = sys_uuid.UUID(str(project_uuid))
         self.user_uuid = sys_uuid.UUID(str(user_uuid))
 
+    def _read_state_mode(self) -> str:
+        return read_state.project_mode(
+            contexts.Context().get_session(),
+            self.project_uuid,
+        )
+
     def _scope_filters(
         self,
         resource: str,
@@ -625,6 +631,10 @@ class SQLCanonicalReadStore:
             if resource == "users"
             else RESOURCE_MODELS[resource]
         )
+        read_state_mode = None
+        if resource == "streams":
+            read_state_mode = self._read_state_mode()
+        rows: typing.Any = ()
         started_at = time.monotonic()
         try:
             rows = model.objects.get_all(
@@ -634,6 +644,21 @@ class SQLCanonicalReadStore:
             )
         finally:
             duration = time.monotonic() - started_at
+            if resource == "streams":
+                row_count = len(rows)
+                LOG.info(
+                    "Messenger stream collection projection: "
+                    "read_state_mode=%s rows=%d duration_seconds=%.3f",
+                    read_state_mode,
+                    row_count,
+                    duration,
+                    extra={
+                        "projection_kind": "stream_collection",
+                        "projection_duration_seconds": duration,
+                        "read_state_mode": read_state_mode,
+                        "projection_row_count": row_count,
+                    },
+                )
             if duration >= SLOW_LIST_PROJECTION_SECONDS:
                 LOG.warning(
                     "Slow Messenger list projection",
@@ -1061,27 +1086,50 @@ class SQLCanonicalReadStore:
         resource: str,
         resource_uuid: sys_uuid.UUID,
     ) -> dict[str, typing.Any]:
-        if resource == "folder_items":
-            row = helpers.get_workspace_user_folder_item(
-                self.project_uuid,
-                self.user_uuid,
-                resource_uuid,
-            )
-        elif resource == "files":
-            row = models.WorkspaceVisibleFile.objects.get_one(
-                filters=self._scope_filters(
-                    resource,
-                    {"uuid": dm_filters.EQ(resource_uuid)},
+        read_state_mode = None
+        if resource == "streams":
+            read_state_mode = self._read_state_mode()
+        row = None
+        started_at = time.monotonic()
+        try:
+            if resource == "folder_items":
+                row = helpers.get_workspace_user_folder_item(
+                    self.project_uuid,
+                    self.user_uuid,
+                    resource_uuid,
                 )
-            )
-        else:
-            model = RESOURCE_MODELS[resource]
-            row = model.objects.get_one(
-                filters=self._scope_filters(
-                    resource,
-                    {model.get_id_property_name(): dm_filters.EQ(resource_uuid)},
+            elif resource == "files":
+                row = models.WorkspaceVisibleFile.objects.get_one(
+                    filters=self._scope_filters(
+                        resource,
+                        {"uuid": dm_filters.EQ(resource_uuid)},
+                    )
                 )
-            )
+            else:
+                model = RESOURCE_MODELS[resource]
+                row = model.objects.get_one(
+                    filters=self._scope_filters(
+                        resource,
+                        {model.get_id_property_name(): dm_filters.EQ(resource_uuid)},
+                    )
+                )
+        finally:
+            if resource == "streams":
+                duration = time.monotonic() - started_at
+                row_count = int(row is not None)
+                LOG.info(
+                    "Messenger exact stream projection: "
+                    "read_state_mode=%s rows=%d duration_seconds=%.3f",
+                    read_state_mode,
+                    row_count,
+                    duration,
+                    extra={
+                        "projection_kind": "stream_exact",
+                        "projection_duration_seconds": duration,
+                        "read_state_mode": read_state_mode,
+                        "projection_row_count": row_count,
+                    },
+                )
         return _public_dict(row, resource)
 
     def get_draft(
@@ -1619,9 +1667,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                     is not None
                 )
             native_routes = getattr(self, "_provider_native_routes", {})
-            native_route = native_routes.get(
-                sys_uuid.UUID(str(stream_uuid)), False
-            )
+            native_route = native_routes.get(sys_uuid.UUID(str(stream_uuid)), False)
             for account, bridge in provider_targets:
                 target_candidate_sql = candidate_sql
                 target_candidate_values = candidate_values
@@ -1946,9 +1992,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 "message_reactions": ("reaction.delete", "reaction"),
             }[resource]
             targets = (
-                provider_targets
-                if provider_targets is not None
-                else (provider_target,)
+                provider_targets if provider_targets is not None else (provider_target,)
             )
             for target in targets:
                 self._queue_provider_operation(

@@ -73,6 +73,33 @@ _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS = frozenset({"pinned", "read", "starred"})
 DIRECT_STREAM_CREATE_IDENTITY_FIELDS = (
     STREAM_SOURCE_IDENTITY_FIELDS | DIRECT_STREAM_IDENTITY_FIELDS
 )
+_WORKSPACE_USER_STREAM_ACCESS_SQL = """
+SELECT
+    stream.uuid AS stream_uuid,
+    stream.project_id,
+    binding.user_uuid,
+    stream.source_name,
+    stream.private,
+    stream.direct_user_uuid,
+    binding.notification_mode
+FROM m_workspace_streams AS stream
+JOIN m_workspace_stream_bindings AS binding
+  ON binding.project_id = stream.project_id
+ AND binding.stream_uuid = stream.uuid
+WHERE stream.project_id = %s
+  AND stream.uuid = %s
+  AND binding.user_uuid = %s
+  AND (
+        stream.source_name = 'native'
+        OR EXISTS (
+            SELECT 1
+            FROM m_confirmed_external_stream_access AS access
+            WHERE access.project_id = stream.project_id
+              AND access.stream_uuid = stream.uuid
+              AND access.user_uuid = binding.user_uuid
+        )
+      )
+"""
 
 
 @contextlib.contextmanager
@@ -788,23 +815,58 @@ def get_workspace_user_stream(
     )
 
 
+def get_workspace_user_stream_access(
+    project_id: object,
+    user_uuid: object,
+    stream_uuid: object,
+    session: typing.Any = None,
+) -> typing.Any:
+    """Return the bounded stream access row without unread projections."""
+    with _workspace_session(session) as current_session:
+        row = current_session.execute(
+            _WORKSPACE_USER_STREAM_ACCESS_SQL,
+            (project_id, stream_uuid, user_uuid),
+        ).fetchone()
+    if row is None:
+        raise storage_exc.RecordNotFound(
+            model=models.WorkspaceUserStream.__name__,
+            filters={
+                "uuid": stream_uuid,
+                "project_id": project_id,
+                "user_uuid": user_uuid,
+            },
+        )
+    return row
+
+
 def _ensure_workspace_user_message_target_visible(
-    project_id: object, user_uuid: object, values: typing.Any
+    project_id: object,
+    user_uuid: object,
+    values: typing.Any,
+    session: typing.Any = None,
 ) -> None:
-    get_workspace_user_stream(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        stream_uuid=values["stream_uuid"],
-    )
+    try:
+        get_workspace_user_stream_access(
+            project_id=project_id,
+            user_uuid=user_uuid,
+            stream_uuid=values["stream_uuid"],
+            session=session,
+        )
+    except storage_exc.RecordNotFound:
+        raise ra_exc.ValidationErrorException()
     if "topic_uuid" not in values or values["topic_uuid"] is None:
         return
 
-    topic = get_workspace_user_stream_topic(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        topic_uuid=values["topic_uuid"],
-    )
-    if topic.stream_uuid != values["stream_uuid"]:
+    try:
+        models.WorkspaceStreamTopic.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(values["topic_uuid"]),
+                "project_id": dm_filters.EQ(project_id),
+                "stream_uuid": dm_filters.EQ(values["stream_uuid"]),
+            },
+            session=session,
+        )
+    except storage_exc.RecordNotFound:
         raise ra_exc.ValidationErrorException()
 
 
@@ -3212,10 +3274,11 @@ def create_workspace_user_stream_topic(
     values: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
-    get_workspace_user_stream(
+    get_workspace_user_stream_access(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=values["stream_uuid"],
+        session=session,
     )
     topic = create_workspace_stream_topic_with_flags(
         project_id=project_id,
@@ -3683,9 +3746,9 @@ def _normalize_workspace_user_stream_topic_notification_modes(
 
 
 def _validate_topic_notification_mode(
-    stream: typing.Any, notification_mode: typing.Any
+    stream_notification_mode: typing.Any, notification_mode: typing.Any
 ) -> None:
-    if stream.notification_mode == models.WorkspaceStreamNotificationMode.MUTED.value:
+    if stream_notification_mode == models.WorkspaceStreamNotificationMode.MUTED.value:
         allowed_modes = MUTED_STREAM_TOPIC_NOTIFICATION_MODES
     else:
         allowed_modes = TOPIC_NOTIFICATION_MODES
@@ -3742,20 +3805,21 @@ def update_workspace_user_stream_topic_notifications(
     notification_updated_at = notification_updated_at or datetime.datetime.now(
         datetime.timezone.utc
     )
-    topic = get_workspace_user_stream_topic(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        topic_uuid=topic_uuid,
+    topic = models.WorkspaceStreamTopic.objects.get_one(
+        filters={
+            "uuid": dm_filters.EQ(topic_uuid),
+            "project_id": dm_filters.EQ(project_id),
+        },
         session=session,
     )
-    stream = get_workspace_user_stream(
+    stream_access = get_workspace_user_stream_access(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=topic.stream_uuid,
         session=session,
     )
     _validate_topic_notification_mode(
-        stream=stream,
+        stream_notification_mode=stream_access["notification_mode"],
         notification_mode=notification_mode,
     )
     _set_workspace_user_topic_notification_mode(
@@ -4094,10 +4158,11 @@ def update_workspace_user_stream(
     values: typing.Any,
     session: typing.Any = None,
 ) -> typing.Any:
-    get_workspace_user_stream(
+    get_workspace_user_stream_access(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=stream_uuid,
+        session=session,
     )
     stream = models.WorkspaceStream.objects.get_one(
         filters={
@@ -4144,7 +4209,7 @@ def update_workspace_user_stream_notifications(
     notification_updated_at = notification_updated_at or datetime.datetime.now(
         datetime.timezone.utc
     )
-    get_workspace_user_stream(
+    get_workspace_user_stream_access(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=stream_uuid,
@@ -4284,10 +4349,11 @@ def create_workspace_user_folder_item(
     session: typing.Any = None,
     **kwargs: typing.Any,
 ) -> typing.Any:
-    get_workspace_user_stream(
+    get_workspace_user_stream_access(
         project_id=project_id,
         user_uuid=user_uuid,
         stream_uuid=kwargs["stream_uuid"],
+        session=session,
     )
     item = models.FolderItem(
         uuid=kwargs.pop("uuid", None) or sys_uuid.uuid4(),
@@ -5037,15 +5103,6 @@ def create_workspace_user_message(
 ) -> typing.Any:
     current_session = session or contexts.Context().get_session()
     _lock_workspace_project_event_writes(project_id, current_session)
-    if enforce_visibility:
-        try:
-            get_workspace_user_stream(
-                project_id=project_id,
-                user_uuid=user_uuid,
-                stream_uuid=kwargs["stream_uuid"],
-            )
-        except storage_exc.RecordNotFound:
-            raise ra_exc.ValidationErrorException()
     if "topic_uuid" not in kwargs or kwargs["topic_uuid"] is None:
         topic = _get_workspace_stream_default_topic(
             project_id=project_id,
@@ -5057,6 +5114,7 @@ def create_workspace_user_message(
             project_id=project_id,
             user_uuid=user_uuid,
             values=kwargs,
+            session=current_session,
         )
     if "source_name" not in kwargs or "source" not in kwargs:
         kwargs.update(

@@ -1215,9 +1215,7 @@ def test_external_account_policy_keeps_one_account_per_provider(api, db):
         )
         assert account_list.status_code == 200, account_list.text
         assert str(account_uuids[0]) in {row["uuid"] for row in account_list.json()}
-        assert str(account_uuids[1]) not in {
-            row["uuid"] for row in account_list.json()
-        }
+        assert str(account_uuids[1]) not in {row["uuid"] for row in account_list.json()}
 
         deleted = api.delete(
             f"{EXTERNAL_ACCOUNTS}{account_uuids[0]}",
@@ -1837,11 +1835,7 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
                 json.dumps(source),
                 scenario == "repair",
                 api.project_id if scenario == "repair" else None,
-                (
-                    generic_projection_stream_uuid
-                    if scenario == "repair"
-                    else None
-                ),
+                (generic_projection_stream_uuid if scenario == "repair" else None),
                 "live" if scenario == "repair" else "available",
             ),
         )
@@ -1988,10 +1982,7 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
         assignment_topics = assignment["workspace_projection"]["topics"]
         assert len(assignment_topics) == 1
         assert assignment_topics[0]["topic_uuid"] == str(canonical_topic_uuid)
-        assert (
-            assignment_topics[0]["provider_topic_id"]
-            == "group_direct:7:default"
-        )
+        assert assignment_topics[0]["provider_topic_id"] == "group_direct:7:default"
         assert assignment_topics[0]["is_default"] is True
         cursor.execute(
             """
@@ -2154,9 +2145,7 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
     db.commit()
     failed_update = api.put(
         f"{MESSAGES}{failed_message_uuid}",
-        json={
-            "payload": {"kind": "markdown", "content": "failed create edited"}
-        },
+        json={"payload": {"kind": "markdown", "content": "failed create edited"}},
     )
     assert failed_update.status_code == 200, failed_update.text
     failed_delete = api.delete(f"{MESSAGES}{failed_message_uuid}")
@@ -2177,29 +2166,26 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
             "message.delete",
         ]
     with ra_engines.engine_factory.get_engine().session_manager() as session:
-        assert (
-            provider_event_apply._message_event(
-                session,
-                {
-                    "external_account_uuid": str(account_uuid),
-                    "kind": "message.upsert",
-                },
-                sys_uuid.UUID(api.project_id),
-                {
-                    "owner_user_uuid": sys_uuid.UUID(api.user_uuid),
-                    "projection_stream_uuid": expected_stream_uuid,
-                },
-                {
-                    "uuid": failed_message_uuid,
-                    "stream_uuid": str(expected_stream_uuid),
-                },
-                types.SimpleNamespace(
-                    bridge_instance_uuid=bridge_instance_uuid,
-                    provider_kind="zulip",
-                ),
-            )
-            == sys_uuid.UUID(failed_message_uuid)
-        )
+        assert provider_event_apply._message_event(
+            session,
+            {
+                "external_account_uuid": str(account_uuid),
+                "kind": "message.upsert",
+            },
+            sys_uuid.UUID(api.project_id),
+            {
+                "owner_user_uuid": sys_uuid.UUID(api.user_uuid),
+                "projection_stream_uuid": expected_stream_uuid,
+            },
+            {
+                "uuid": failed_message_uuid,
+                "stream_uuid": str(expected_stream_uuid),
+            },
+            types.SimpleNamespace(
+                bridge_instance_uuid=bridge_instance_uuid,
+                provider_kind="zulip",
+            ),
+        ) == sys_uuid.UUID(failed_message_uuid)
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -2229,9 +2215,7 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
             f"{MESSAGE_REACTIONS}{native_reaction_uuid}",
             json={"emoji_name": "heart"},
         )
-        assert updated_native_reaction.status_code == 200, (
-            updated_native_reaction.text
-        )
+        assert updated_native_reaction.status_code == 200, updated_native_reaction.text
         deleted_native_reaction = api.delete(
             f"{MESSAGE_REACTIONS}{native_reaction_uuid}"
         )
@@ -2589,8 +2573,9 @@ def test_direct_event_history_invalidation_covers_every_bound_participant(api, d
             ),
         )
         generations_after = dict(cursor.fetchall())
-    assert generations_after[sys_uuid.UUID(str(api.user_uuid))] != (
-        generations_before[sys_uuid.UUID(str(api.user_uuid))]
+    assert (
+        generations_after[sys_uuid.UUID(str(api.user_uuid))]
+        != (generations_before[sys_uuid.UUID(str(api.user_uuid))])
     )
     assert generations_after[peer_uuid] != generations_before[peer_uuid]
     assert generations_after[unrelated_uuid] == generations_before[unrelated_uuid]
@@ -12493,6 +12478,13 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
         "general",
         is_default=True,
     )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "EXPLAIN (FORMAT JSON) "
+            + messenger_dm_helpers._WORKSPACE_USER_STREAM_ACCESS_SQL,
+            (api.project_id, str(stream_uuid), str(reader_uuid)),
+        )
+        access_cost_before_history = cursor.fetchone()[0][0]["Plan"]["Total Cost"]
     history_size = 100_000
     unread_size = 100
     uuid_seed = str(sys_uuid.uuid4())
@@ -12556,6 +12548,32 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
         cursor.execute("ANALYZE m_workspace_messages")
         cursor.execute("ANALYZE m_workspace_user_message_flags")
         cursor.execute(
+            """
+            EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+            SELECT *
+            FROM m_workspace_user_streams
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, str(reader_uuid), str(stream_uuid)),
+        )
+        exact_stream_plan = cursor.fetchone()[0][0]["Plan"]
+        cursor.execute(
+            """
+            EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+            SELECT *
+            FROM m_workspace_user_streams
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, str(reader_uuid)),
+        )
+        stream_collection_plan = cursor.fetchone()[0][0]["Plan"]
+        cursor.execute(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+            + messenger_dm_helpers._WORKSPACE_USER_STREAM_ACCESS_SQL,
+            (api.project_id, str(stream_uuid), str(reader_uuid)),
+        )
+        access_plan = cursor.fetchone()[0][0]["Plan"]
+        cursor.execute(
             "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
             + messenger_dm_helpers._READ_TOPIC_MESSAGES_TO_BOUNDARY_SQL,
             (
@@ -12586,6 +12604,38 @@ def test_read_up_to_plan_starts_from_small_unread_tail(api, db):
         for node in nodes
     )
     assert plan["Actual Rows"] == unread_size
+
+    exact_nodes = list(walk(exact_stream_plan))
+    collection_nodes = list(walk(stream_collection_plan))
+    for projection_plan, nodes in (
+        (exact_stream_plan, exact_nodes),
+        (stream_collection_plan, collection_nodes),
+    ):
+        assert any(
+            node.get("Index Name") == "m_workspace_unread_flags_user_message_idx"
+            for node in nodes
+        )
+        assert sum(node.get("Temp Read Blocks", 0) for node in nodes) == 0
+        assert sum(node.get("Temp Written Blocks", 0) for node in nodes) == 0
+        assert (
+            sum(
+                node.get("Actual Rows", 0) * node.get("Actual Loops", 0)
+                for node in nodes
+                if node.get("Relation Name") == "m_workspace_messages"
+            )
+            <= unread_size + 1
+        )
+        assert projection_plan["Actual Rows"] == 1
+
+    access_nodes = list(walk(access_plan))
+    assert access_cost_before_history > 0
+    assert access_plan["Total Cost"] > 0
+    assert access_plan["Actual Rows"] == 1
+    assert not any(
+        node.get("Relation Name") == "m_workspace_messages" for node in access_nodes
+    )
+    assert sum(node.get("Temp Read Blocks", 0) for node in access_nodes) == 0
+    assert sum(node.get("Temp Written Blocks", 0) for node in access_nodes) == 0
 
 
 def test_unbound_user_cannot_send_message(api, db):
@@ -13095,8 +13145,7 @@ def test_read_state_maintenance_candidate_plan_is_index_bounded(api, db):
 
     nodes = list(walk(plan))
     assert any(
-        node.get("Index Name")
-        == "m_workspace_read_state_active_maintenance_idx"
+        node.get("Index Name") == "m_workspace_read_state_active_maintenance_idx"
         for node in nodes
     )
     assert max(int(node.get("Actual Rows", 0)) for node in nodes) <= (

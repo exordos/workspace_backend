@@ -87,10 +87,12 @@ def test_missing_provider_message_uses_all_operation_states_as_provenance():
     message_uuid = sys_uuid.uuid4()
 
     active = Session(
-        [[
-            {"external_account_uuid": account_uuid, "deleted": True},
-            {"external_account_uuid": other_account_uuid, "deleted": False},
-        ]]
+        [
+            [
+                {"external_account_uuid": account_uuid, "deleted": True},
+                {"external_account_uuid": other_account_uuid, "deleted": False},
+            ]
+        ]
     )
     assert _MISSING_PROVIDER_MESSAGE_IS_TOMBSTONED(
         active,
@@ -193,8 +195,8 @@ def test_topic_notification_event_uses_canonical_stream_for_unmute(monkeypatch):
     )
     monkeypatch.setattr(
         provider_event_apply.helpers,
-        "get_workspace_user_stream",
-        lambda **kwargs: types.SimpleNamespace(notification_mode="all_messages"),
+        "get_workspace_user_stream_access",
+        lambda **kwargs: {"notification_mode": "all_messages"},
     )
     calls = []
     monkeypatch.setattr(
