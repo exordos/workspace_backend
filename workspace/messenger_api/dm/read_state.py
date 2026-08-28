@@ -42,6 +42,8 @@ PROJECT_MODE_PREPARING = "preparing"
 PROJECT_MODE_DUAL = "dual"
 PROJECT_MODE_COMPACT = "compact"
 PROJECT_MODE_ROLLBACK = "rollback"
+LEGACY_GAP_CUTOVER_CAPABILITY = "workspace.legacy_gap_cutover_v1"
+LEGACY_GAP_SCAN_CAPABILITY = "workspace.legacy_gap_scan_v1"
 READ_STATE_SCHEMA_LOCK_KEY = "workspace-read-state-schema-v1"
 READ_STATE_STRUCTURE_LOCK_KEY = "workspace-read-state-structure-v1"
 EXTERNAL_ACCOUNT_RESOURCE_LOCK_KEY = "workspace-external-account-resource-v1"
@@ -471,6 +473,19 @@ def reset_identity_sensitive_progress(
             updated_at = NOW()
         WHERE project_id = ANY(%s::uuid[])
           AND phase IN ('memberships', 'flags')
+        """,
+        (values,),
+    )
+    session.execute(
+        """
+        UPDATE m_workspace_read_state_compaction_v1
+        SET last_message_uuid = NULL,
+            last_user_uuid = NULL,
+            last_ingest_sequence = 0,
+            completed_at = NULL,
+            updated_at = NOW()
+        WHERE project_id = ANY(%s::uuid[])
+          AND phase = 'legacy_gaps'
         """,
         (values,),
     )
@@ -1169,10 +1184,29 @@ def message_read_user_uuids(
             row["user_uuid"]
             for row in session.execute(
                 """
-                SELECT user_uuid
-                FROM m_workspace_user_message_flags
-                WHERE project_id = %s AND uuid = %s AND read = TRUE
-                ORDER BY user_uuid
+                SELECT recipient.user_uuid
+                FROM m_workspace_messages AS message
+                JOIN LATERAL (
+                    SELECT binding.user_uuid
+                    FROM m_workspace_stream_bindings AS binding
+                    WHERE binding.project_id = message.project_id
+                      AND binding.stream_uuid = message.stream_uuid
+                    UNION
+                    SELECT membership.user_uuid
+                    FROM m_workspace_read_memberships_v1 AS membership
+                    WHERE membership.project_id = message.project_id
+                      AND membership.stream_uuid = message.stream_uuid
+                      AND message.ingest_sequence
+                            <= membership.last_detached_sequence
+                ) AS recipient ON TRUE
+                LEFT JOIN m_workspace_user_message_flags AS flags
+                  ON flags.project_id = message.project_id
+                 AND flags.uuid = message.uuid
+                 AND flags.user_uuid = recipient.user_uuid
+                WHERE message.project_id = %s
+                  AND message.uuid = %s
+                  AND COALESCE(flags.read, TRUE)
+                ORDER BY recipient.user_uuid
                 """,
                 (project_id, message_uuid),
             ).fetchall()
@@ -1543,7 +1577,7 @@ def _materialize_stream_legacy_flags(
         "COALESCE(get_bit(chunk.read_bits, "
         f"(message.ingest_sequence %% {READ_CHUNK_BITS})::integer), 0) = 1"
         if mode_uses_compact_state(source_mode)
-        else "COALESCE(flags.read, FALSE)"
+        else "COALESCE(flags.read, TRUE)"
     )
     session.execute(
         f"""
@@ -1727,14 +1761,34 @@ def _rebind_stream_read_coordinates(
                 ) = 1
             """
             user_sql = "source_chunk.user_uuid"
+            read_source_values: tuple[object, ...] = ()
         else:
             read_source_sql = """
                 FROM m_workspace_stream_read_coordinate_move_v1 AS coordinate
-                JOIN m_workspace_user_message_flags AS source_flags
+                JOIN m_workspace_messages AS message
+                  ON message.uuid = coordinate.message_uuid
+                 AND message.project_id = %s
+                 AND message.stream_uuid = %s
+                JOIN LATERAL (
+                    SELECT binding.user_uuid
+                    FROM m_workspace_stream_bindings AS binding
+                    WHERE binding.project_id = message.project_id
+                      AND binding.stream_uuid = message.stream_uuid
+                    UNION
+                    SELECT membership.user_uuid
+                    FROM m_workspace_read_memberships_v1 AS membership
+                    WHERE membership.project_id = message.project_id
+                      AND membership.stream_uuid = message.stream_uuid
+                      AND message.ingest_sequence
+                            <= membership.last_detached_sequence
+                ) AS recipient ON TRUE
+                LEFT JOIN m_workspace_user_message_flags AS source_flags
                   ON source_flags.uuid = coordinate.message_uuid
-                 AND source_flags.read = TRUE
+                 AND source_flags.user_uuid = recipient.user_uuid
+                WHERE COALESCE(source_flags.read, TRUE)
             """
-            user_sql = "source_flags.user_uuid"
+            user_sql = "recipient.user_uuid"
+            read_source_values = (source_project_id, stream_uuid)
         session.execute(
             f"""
             INSERT INTO m_workspace_stream_user_read_move_v1 (
@@ -1762,7 +1816,8 @@ def _rebind_stream_read_coordinates(
                     m_workspace_stream_user_read_move_v1.read_bits
                     | EXCLUDED.read_bits
                 )
-            """
+            """,
+            read_source_values,
         )
 
     session.execute(
@@ -2063,29 +2118,63 @@ def relocate_stream_project(
             )
             session.execute(
                 """
+                WITH recipients AS (
+                    SELECT binding.user_uuid
+                    FROM m_workspace_stream_bindings AS binding
+                    WHERE binding.project_id = %s
+                      AND binding.stream_uuid = %s
+                    UNION
+                    SELECT membership.user_uuid
+                    FROM m_workspace_read_memberships_v1 AS membership
+                    WHERE membership.project_id = %s
+                      AND membership.stream_uuid = %s
+                )
                 INSERT INTO m_workspace_user_topic_read_stats_v1 (
                     project_id, user_uuid, topic_uuid, read_count,
                     created_at, updated_at
                 )
                 SELECT
                     %s,
-                    flags.user_uuid,
+                    recipient.user_uuid,
                     message.topic_uuid,
                     COUNT(*),
                     NOW(),
                     NOW()
-                FROM m_workspace_user_message_flags AS flags
-                JOIN m_workspace_messages AS message
-                  ON message.uuid = flags.uuid
-                 AND message.project_id = flags.project_id
-                WHERE flags.project_id = %s
+                FROM m_workspace_messages AS message
+                CROSS JOIN recipients AS recipient
+                LEFT JOIN m_workspace_stream_bindings AS binding
+                  ON binding.project_id = message.project_id
+                 AND binding.stream_uuid = message.stream_uuid
+                 AND binding.user_uuid = recipient.user_uuid
+                LEFT JOIN m_workspace_read_memberships_v1 AS membership
+                  ON membership.project_id = message.project_id
+                 AND membership.stream_uuid = message.stream_uuid
+                 AND membership.user_uuid = recipient.user_uuid
+                LEFT JOIN m_workspace_user_message_flags AS flags
+                  ON flags.project_id = message.project_id
+                 AND flags.uuid = message.uuid
+                 AND flags.user_uuid = recipient.user_uuid
+                WHERE message.project_id = %s
                   AND message.stream_uuid = %s
-                  AND flags.read = TRUE
-                GROUP BY flags.user_uuid, message.topic_uuid
+                  AND (
+                        binding.user_uuid IS NOT NULL
+                        OR message.ingest_sequence
+                            <= membership.last_detached_sequence
+                  )
+                  AND COALESCE(flags.read, TRUE)
+                GROUP BY recipient.user_uuid, message.topic_uuid
                 ON CONFLICT (project_id, user_uuid, topic_uuid) DO UPDATE
                 SET read_count = EXCLUDED.read_count, updated_at = NOW()
                 """,
-                (destination_project_id, source_project_id, stream_uuid),
+                (
+                    source_project_id,
+                    stream_uuid,
+                    source_project_id,
+                    stream_uuid,
+                    destination_project_id,
+                    source_project_id,
+                    stream_uuid,
+                ),
             )
             session.execute(
                 """
@@ -3526,6 +3615,10 @@ def _compact_memberships_batch(
 
 def _complete_compaction(session: typing.Any, project_id: object) -> None:
     session.execute(
+        "SELECT set_config(%s, %s, TRUE)",
+        (LEGACY_GAP_CUTOVER_CAPABILITY, str(project_id)),
+    )
+    session.execute(
         """
         UPDATE m_workspace_read_state_projects_v1
         SET mode = 'compact', updated_at = NOW()
@@ -3536,11 +3629,313 @@ def _complete_compaction(session: typing.Any, project_id: object) -> None:
     session.execute(
         """
         UPDATE m_workspace_read_state_compaction_v1
-        SET completed_at = NOW(), updated_at = NOW()
+        SET legacy_gap_repair_kind = NULL,
+            completed_at = NOW(), updated_at = NOW()
+        WHERE project_id = %s
+          AND EXISTS (
+                SELECT 1
+                FROM m_workspace_read_state_projects_v1 AS state
+                WHERE state.project_id = %s AND state.mode = 'compact'
+              )
+        """,
+        (project_id, project_id),
+    )
+
+
+def _existing_legacy_flag_coordinates(
+    session: typing.Any,
+    project_id: object,
+    rows: collections.abc.Sequence[collections.abc.Mapping[str, typing.Any]],
+) -> set[tuple[object, object]]:
+    flag_rows = session.execute(
+        """
+        SELECT flags.uuid, flags.user_uuid
+        FROM unnest(%s::uuid[], %s::uuid[])
+            AS coordinate(uuid, user_uuid)
+        JOIN m_workspace_user_message_flags AS flags
+          ON flags.project_id = %s
+         AND flags.uuid = coordinate.uuid
+         AND flags.user_uuid = coordinate.user_uuid
+        """,
+        (
+            [row["uuid"] for row in rows],
+            [row["user_uuid"] for row in rows],
+            project_id,
+        ),
+    ).fetchall()
+    return {(row["uuid"], row["user_uuid"]) for row in flag_rows}
+
+
+def _compact_legacy_gaps_batch(
+    session: typing.Any,
+    project_id: object,
+    last_user_uuid: object | None,
+    last_ingest_sequence: int,
+    target_ingest_sequence: int,
+    repair_kind: str | None,
+    batch_size: int,
+) -> int:
+    """Preserve legacy's implicit-read coordinates during compact cutover.
+
+    Legacy unread projections only included an explicit ``read = FALSE`` row.
+    Compact storage instead treats an absent read bit as unread, so recipient
+    coordinates without a legacy flag must be materialized as read.
+
+    Candidate messages are paged independently from their recipients so both
+    sparse flag gaps and recipient-empty message ranges stay bounded per
+    maintenance transaction.
+    """
+    mode = project_mode(session, project_id)
+    if mode != PROJECT_MODE_DUAL:
+        raise RuntimeError("Legacy gap backfill requires dual read-state mode")
+    if repair_kind != "full_pending":
+        raise RuntimeError("Legacy gap backfill requires a pending full repair")
+    session.execute(
+        "SELECT set_config(%s, %s, TRUE)",
+        (LEGACY_GAP_SCAN_CAPABILITY, str(project_id)),
+    )
+    raw_rows: list[dict[str, object]] = []
+    if last_user_uuid is not None:
+        current_message = session.execute(
+            """
+            SELECT uuid, stream_uuid, topic_uuid, ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s
+              AND ingest_sequence = %s
+              AND ingest_sequence <= %s
+            LIMIT 1
+            """,
+            (project_id, last_ingest_sequence, target_ingest_sequence),
+        ).fetchone()
+        if current_message is not None:
+            current_recipients = session.execute(
+                """
+                SELECT eligible.user_uuid
+                FROM (
+                    (
+                        SELECT binding.user_uuid
+                        FROM m_workspace_stream_bindings AS binding
+                        WHERE binding.project_id = %s
+                          AND binding.stream_uuid = %s
+                          AND binding.user_uuid > %s
+                        ORDER BY binding.user_uuid
+                    )
+                    UNION ALL
+                    (
+                        SELECT membership.user_uuid
+                        FROM m_workspace_read_memberships_v1 AS membership
+                        WHERE membership.project_id = %s
+                          AND membership.stream_uuid = %s
+                          AND membership.user_uuid > %s
+                          AND %s <= membership.last_detached_sequence
+                          AND NOT EXISTS (
+                                SELECT 1
+                                FROM m_workspace_stream_bindings
+                                    AS current_binding
+                                WHERE current_binding.project_id =
+                                        membership.project_id
+                                  AND current_binding.stream_uuid =
+                                        membership.stream_uuid
+                                  AND current_binding.user_uuid =
+                                        membership.user_uuid
+                              )
+                        ORDER BY membership.user_uuid
+                    )
+                ) AS eligible
+                ORDER BY eligible.user_uuid
+                LIMIT %s
+                """,
+                (
+                    project_id,
+                    current_message["stream_uuid"],
+                    last_user_uuid,
+                    project_id,
+                    current_message["stream_uuid"],
+                    last_user_uuid,
+                    current_message["ingest_sequence"],
+                    batch_size,
+                ),
+            ).fetchall()
+            raw_rows.extend(
+                {
+                    "uuid": current_message["uuid"],
+                    "user_uuid": recipient["user_uuid"],
+                    "read": True,
+                    "stream_uuid": current_message["stream_uuid"],
+                    "topic_uuid": current_message["topic_uuid"],
+                    "ingest_sequence": current_message["ingest_sequence"],
+                }
+                for recipient in current_recipients
+            )
+
+    remaining = batch_size - len(raw_rows)
+    candidate_boundary: int | None = None
+    candidate_count = 0
+    later_rows: list[typing.Any] = []
+    if remaining:
+        candidate_messages = session.execute(
+            """
+            SELECT ingest_sequence
+            FROM m_workspace_messages
+            WHERE project_id = %s
+              AND ingest_sequence > %s
+              AND ingest_sequence <= %s
+            ORDER BY ingest_sequence
+            LIMIT %s
+            """,
+            (
+                project_id,
+                last_ingest_sequence,
+                target_ingest_sequence,
+                remaining,
+            ),
+        ).fetchall()
+        candidate_count = len(candidate_messages)
+        if candidate_messages:
+            candidate_boundary = candidate_messages[-1]["ingest_sequence"]
+            later_rows = session.execute(
+                """
+                SELECT
+                    message.uuid,
+                    recipient.user_uuid,
+                    TRUE AS read,
+                    message.stream_uuid,
+                    message.topic_uuid,
+                    message.ingest_sequence
+                FROM m_workspace_messages AS message
+                JOIN LATERAL (
+                    SELECT eligible.user_uuid
+                    FROM (
+                        (
+                            SELECT binding.user_uuid
+                            FROM m_workspace_stream_bindings AS binding
+                            WHERE binding.project_id = message.project_id
+                              AND binding.stream_uuid = message.stream_uuid
+                            ORDER BY binding.user_uuid
+                        )
+                        UNION ALL
+                        (
+                            SELECT membership.user_uuid
+                            FROM m_workspace_read_memberships_v1 AS membership
+                            WHERE membership.project_id = message.project_id
+                              AND membership.stream_uuid = message.stream_uuid
+                              AND message.ingest_sequence
+                                    <= membership.last_detached_sequence
+                              AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM m_workspace_stream_bindings
+                                        AS current_binding
+                                    WHERE current_binding.project_id =
+                                            membership.project_id
+                                      AND current_binding.stream_uuid =
+                                            membership.stream_uuid
+                                      AND current_binding.user_uuid =
+                                            membership.user_uuid
+                                  )
+                            ORDER BY membership.user_uuid
+                        )
+                    ) AS eligible
+                    ORDER BY eligible.user_uuid
+                ) AS recipient ON TRUE
+                WHERE message.project_id = %s
+                  AND message.ingest_sequence > %s
+                  AND message.ingest_sequence <= %s
+                ORDER BY message.ingest_sequence, recipient.user_uuid
+                LIMIT %s
+                """,
+                (
+                    project_id,
+                    last_ingest_sequence,
+                    candidate_boundary,
+                    remaining,
+                ),
+            ).fetchall()
+        raw_rows.extend(dict(row) for row in later_rows)
+
+    if not raw_rows and candidate_boundary is None:
+        session.execute(
+            """
+            UPDATE m_workspace_read_state_compaction_v1
+            SET phase = 'stats',
+                legacy_gap_repair_kind = 'full_done',
+                last_message_uuid = NULL,
+                last_user_uuid = NULL, last_ingest_sequence = 0,
+                updated_at = NOW()
+            WHERE project_id = %s
+            """,
+            (project_id,),
+        )
+        return 0
+
+    existing_flags = (
+        _existing_legacy_flag_coordinates(session, project_id, raw_rows)
+        if raw_rows
+        else set()
+    )
+    rows = [
+        {
+            **row,
+            "is_gap": (row["uuid"], row["user_uuid"]) not in existing_flags,
+        }
+        for row in raw_rows
+    ]
+    repair_rows = [row for row in rows if row["is_gap"]]
+    _apply_coordinate_rows(session, project_id, repair_rows)
+    if repair_rows:
+        session.execute(
+            """
+            INSERT INTO m_workspace_user_message_flags AS flags (
+                uuid, user_uuid, project_id, read, pinned, starred,
+                created_at, updated_at
+            )
+            SELECT
+                coordinate.message_uuid,
+                coordinate.user_uuid,
+                %s,
+                TRUE,
+                FALSE,
+                FALSE,
+                NOW(),
+                NOW()
+            FROM unnest(%s::uuid[], %s::uuid[])
+                AS coordinate(message_uuid, user_uuid)
+            ON CONFLICT (uuid, user_uuid) DO NOTHING
+            """,
+            (
+                project_id,
+                [row["uuid"] for row in repair_rows],
+                [row["user_uuid"] for row in repair_rows],
+            ),
+        )
+    candidate_page_complete = (
+        candidate_boundary is not None and len(later_rows) < remaining
+    )
+    if candidate_page_complete:
+        cursor_user_uuid = None
+        cursor_ingest_sequence = candidate_boundary
+    else:
+        last = rows[-1]
+        cursor_user_uuid = last["user_uuid"]
+        cursor_ingest_sequence = typing.cast(int, last["ingest_sequence"])
+    processed_count = len(rows) if rows else candidate_count
+    session.execute(
+        """
+        UPDATE m_workspace_read_state_compaction_v1
+        SET last_message_uuid = NULL,
+            last_user_uuid = %s,
+            last_ingest_sequence = %s,
+            processed_rows = processed_rows + %s,
+            updated_at = NOW()
         WHERE project_id = %s
         """,
-        (project_id,),
+        (
+            cursor_user_uuid,
+            cursor_ingest_sequence,
+            processed_count,
+            project_id,
+        ),
     )
+    return processed_count
 
 
 def _compact_mentions_batch(
@@ -4179,7 +4574,8 @@ def compact_legacy_batch(
     progress = session.execute(
         """
         SELECT phase, last_message_uuid, last_user_uuid,
-               last_ingest_sequence, target_ingest_sequence, completed_at
+               last_ingest_sequence, target_ingest_sequence,
+               legacy_gap_repair_kind, completed_at
         FROM m_workspace_read_state_compaction_v1
         WHERE project_id = %s
         FOR UPDATE
@@ -4197,6 +4593,7 @@ def compact_legacy_batch(
         last_user_uuid = progress["last_user_uuid"]
         last_ingest_sequence = progress["last_ingest_sequence"]
         target_ingest_sequence = progress["target_ingest_sequence"]
+        repair_kind = progress["legacy_gap_repair_kind"]
 
     if phase == "memberships":
         return _compact_memberships_batch(
@@ -4226,6 +4623,16 @@ def compact_legacy_batch(
             session,
             project_id,
             last_message_uuid,
+            batch_size,
+        )
+    if phase == "legacy_gaps":
+        return _compact_legacy_gaps_batch(
+            session,
+            project_id,
+            last_user_uuid,
+            last_ingest_sequence,
+            target_ingest_sequence,
+            repair_kind,
             batch_size,
         )
     if phase == "verify":
@@ -4297,7 +4704,9 @@ def compact_legacy_batch(
         session.execute(
             """
             UPDATE m_workspace_read_state_compaction_v1
-            SET phase = 'stats', last_message_uuid = NULL,
+            SET phase = 'legacy_gaps',
+                legacy_gap_repair_kind = 'full_pending',
+                last_message_uuid = NULL,
                 last_user_uuid = NULL, last_ingest_sequence = 0,
                 updated_at = NOW()
             WHERE project_id = %s

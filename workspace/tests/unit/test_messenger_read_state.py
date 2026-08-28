@@ -100,3 +100,81 @@ def test_read_counter_verification_starts_from_sparse_true_flags():
     )
     assert fanout_join not in statement
     assert values == (project_id, 37, project_id)
+
+
+def test_legacy_gap_flag_lookup_keeps_message_user_pairs():
+    project_id = sys_uuid.uuid4()
+    first_message_uuid = sys_uuid.uuid4()
+    second_message_uuid = sys_uuid.uuid4()
+    first_user_uuid = sys_uuid.uuid4()
+    second_user_uuid = sys_uuid.uuid4()
+    session = unittest.mock.Mock()
+    session.execute.return_value.fetchall.return_value = [
+        {"uuid": first_message_uuid, "user_uuid": first_user_uuid}
+    ]
+
+    existing = read_state._existing_legacy_flag_coordinates(
+        session,
+        project_id,
+        [
+            {"uuid": first_message_uuid, "user_uuid": first_user_uuid},
+            {"uuid": second_message_uuid, "user_uuid": second_user_uuid},
+        ],
+    )
+
+    assert existing == {(first_message_uuid, first_user_uuid)}
+    statement, values = session.execute.call_args.args
+    assert "FROM unnest(%s::uuid[], %s::uuid[])" in statement
+    assert "flags.uuid = coordinate.uuid" in statement
+    assert "flags.user_uuid = coordinate.user_uuid" in statement
+    assert "ANY(" not in statement
+    assert values == (
+        [first_message_uuid, second_message_uuid],
+        [first_user_uuid, second_user_uuid],
+        project_id,
+    )
+
+
+def test_legacy_gap_empty_recipient_page_advances_bounded_message_cursor():
+    project_id = sys_uuid.uuid4()
+    session = types.SimpleNamespace(
+        execute=unittest.mock.Mock(
+            side_effect=(
+                object(),
+                types.SimpleNamespace(
+                    fetchone=lambda: {"mode": read_state.PROJECT_MODE_DUAL}
+                ),
+                object(),
+                types.SimpleNamespace(
+                    fetchall=lambda: [
+                        {"ingest_sequence": 11},
+                        {"ingest_sequence": 12},
+                    ]
+                ),
+                types.SimpleNamespace(fetchall=lambda: []),
+                object(),
+            )
+        )
+    )
+
+    processed = read_state._compact_legacy_gaps_batch(
+        session,
+        project_id,
+        last_user_uuid=None,
+        last_ingest_sequence=10,
+        target_ingest_sequence=99,
+        repair_kind="full_pending",
+        batch_size=2,
+    )
+
+    assert processed == 2
+    candidate_statement, candidate_values = session.execute.call_args_list[3].args
+    assert "SELECT ingest_sequence" in candidate_statement
+    assert "LIMIT %s" in candidate_statement
+    assert candidate_values == (project_id, 10, 99, 2)
+    recipient_statement, recipient_values = session.execute.call_args_list[4].args
+    assert "JOIN LATERAL" in recipient_statement
+    assert recipient_values == (project_id, 10, 12, 2)
+    progress_statement, progress_values = session.execute.call_args_list[5].args
+    assert "last_user_uuid = %s" in progress_statement
+    assert progress_values == (None, 12, 2, project_id)

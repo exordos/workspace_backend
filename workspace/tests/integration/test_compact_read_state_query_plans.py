@@ -3,6 +3,8 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import json
+
 import pytest
 
 
@@ -132,3 +134,219 @@ def test_membership_backfill_uses_full_project_message_user_index(db):
     )
 
     assert any(node.get("Index Name") == index_name for node in _walk_plan(plan))
+
+
+def test_legacy_gap_current_tail_uses_ordered_recipient_indexes(db):
+    plan = _explain(
+        db,
+        """
+        SELECT eligible.user_uuid
+        FROM (
+            (
+                SELECT binding.user_uuid
+                FROM m_workspace_stream_bindings AS binding
+                WHERE binding.project_id = %s
+                  AND binding.stream_uuid = %s
+                  AND binding.user_uuid > %s
+                ORDER BY binding.user_uuid
+            )
+            UNION ALL
+            (
+                SELECT membership.user_uuid
+                FROM m_workspace_read_memberships_v1 AS membership
+                WHERE membership.project_id = %s
+                  AND membership.stream_uuid = %s
+                  AND membership.user_uuid > %s
+                  AND %s <= membership.last_detached_sequence
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM m_workspace_stream_bindings AS current_binding
+                        WHERE current_binding.project_id = membership.project_id
+                          AND current_binding.stream_uuid = membership.stream_uuid
+                          AND current_binding.user_uuid = membership.user_uuid
+                      )
+                ORDER BY membership.user_uuid
+            )
+        ) AS eligible
+        ORDER BY eligible.user_uuid
+        LIMIT 500
+        """,
+        (
+            "10000000-0000-4000-8000-000000000001",
+            "10000000-0000-4000-8000-000000000003",
+            "10000000-0000-4000-8000-000000000002",
+            "10000000-0000-4000-8000-000000000001",
+            "10000000-0000-4000-8000-000000000003",
+            "10000000-0000-4000-8000-000000000002",
+            281474976710656,
+        ),
+    )
+    nodes = list(_walk_plan(plan))
+
+    assert any(
+        node.get("Index Name") == "m_workspace_stream_bindings_unique_idx"
+        for node in nodes
+    )
+    assert any(
+        node.get("Index Name") == "m_workspace_read_memberships_stream_user_idx"
+        for node in nodes
+    )
+    recipient_bounds = " ".join(
+        node.get("Index Cond", "") for node in nodes if node.get("Index Cond")
+    )
+    assert "user_uuid >" in recipient_bounds
+    assert not any(node.get("Node Type") == "Sort" for node in nodes), json.dumps(
+        plan, indent=2
+    )
+
+
+def test_legacy_gap_candidate_message_page_is_independently_bounded(db):
+    plan = _explain(
+        db,
+        """
+        SELECT ingest_sequence
+        FROM m_workspace_messages
+        WHERE project_id = %s
+          AND ingest_sequence > %s
+          AND ingest_sequence <= %s
+        ORDER BY ingest_sequence
+        LIMIT 500
+        """,
+        (
+            "10000000-0000-4000-8000-000000000001",
+            281474976710656,
+            281474976711656,
+        ),
+    )
+    nodes = list(_walk_plan(plan))
+
+    assert any(node.get("Node Type") == "Limit" for node in nodes)
+    message_nodes = [
+        node
+        for node in nodes
+        if node.get("Index Name") == "m_workspace_messages_project_ingest_sequence_idx"
+    ]
+    assert message_nodes
+    message_bounds = " ".join(
+        node.get("Index Cond", "") for node in message_nodes if node.get("Index Cond")
+    )
+    assert "ingest_sequence >" in message_bounds
+    assert "ingest_sequence <=" in message_bounds
+    assert not any(node.get("Node Type") == "Sort" for node in nodes), json.dumps(
+        plan, indent=2
+    )
+
+
+def test_legacy_gap_later_page_has_strict_indexed_sequence_bound(db):
+    plan = _explain(
+        db,
+        """
+        SELECT message.uuid, recipient.user_uuid, message.ingest_sequence
+        FROM m_workspace_messages AS message
+        JOIN LATERAL (
+            SELECT eligible.user_uuid
+            FROM (
+                (
+                    SELECT binding.user_uuid
+                    FROM m_workspace_stream_bindings AS binding
+                    WHERE binding.project_id = message.project_id
+                      AND binding.stream_uuid = message.stream_uuid
+                    ORDER BY binding.user_uuid
+                )
+                UNION ALL
+                (
+                    SELECT membership.user_uuid
+                    FROM m_workspace_read_memberships_v1 AS membership
+                    WHERE membership.project_id = message.project_id
+                      AND membership.stream_uuid = message.stream_uuid
+                      AND message.ingest_sequence
+                            <= membership.last_detached_sequence
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM m_workspace_stream_bindings AS current_binding
+                            WHERE current_binding.project_id =
+                                    membership.project_id
+                              AND current_binding.stream_uuid =
+                                    membership.stream_uuid
+                              AND current_binding.user_uuid = membership.user_uuid
+                          )
+                    ORDER BY membership.user_uuid
+                )
+            ) AS eligible
+            ORDER BY eligible.user_uuid
+        ) AS recipient ON TRUE
+        WHERE message.project_id = %s
+          AND message.ingest_sequence > %s
+          AND message.ingest_sequence <= %s
+        ORDER BY message.ingest_sequence, recipient.user_uuid
+        LIMIT 500
+        """,
+        (
+            "10000000-0000-4000-8000-000000000001",
+            281474976710656,
+            281474976711656,
+        ),
+    )
+    nodes = list(_walk_plan(plan))
+
+    message_nodes = [
+        node
+        for node in nodes
+        if node.get("Index Name") == "m_workspace_messages_project_ingest_sequence_idx"
+    ]
+    assert message_nodes
+    assert any(
+        "ingest_sequence >" in node.get("Index Cond", "") for node in message_nodes
+    )
+    assert any(
+        node.get("Index Name") == "m_workspace_stream_bindings_unique_idx"
+        for node in nodes
+    )
+    assert any(
+        node.get("Index Name") == "m_workspace_read_memberships_stream_user_idx"
+        for node in nodes
+    )
+    assert not any(node.get("Node Type") == "Sort" for node in nodes), json.dumps(
+        plan, indent=2
+    )
+
+
+def test_legacy_gap_flag_lookup_probes_only_paired_coordinates(db):
+    plan = _explain(
+        db,
+        """
+        SELECT flags.uuid, flags.user_uuid
+        FROM unnest(%s::uuid[], %s::uuid[])
+            AS coordinate(uuid, user_uuid)
+        JOIN m_workspace_user_message_flags AS flags
+          ON flags.project_id = %s
+         AND flags.uuid = coordinate.uuid
+         AND flags.user_uuid = coordinate.user_uuid
+        """,
+        (
+            [
+                "10000000-0000-4000-8000-000000000002",
+                "10000000-0000-4000-8000-000000000003",
+            ],
+            [
+                "10000000-0000-4000-8000-000000000004",
+                "10000000-0000-4000-8000-000000000005",
+            ],
+            "10000000-0000-4000-8000-000000000001",
+        ),
+    )
+    nodes = list(_walk_plan(plan))
+
+    assert any(
+        node.get("Index Name") == "m_workspace_flags_project_message_user_idx"
+        for node in nodes
+    ), json.dumps(plan, indent=2)
+    assert not any(
+        node.get("Node Type") == "Seq Scan"
+        and node.get("Relation Name") == "m_workspace_user_message_flags"
+        for node in nodes
+    ), json.dumps(plan, indent=2)
+    assert any(
+        node.get("Node Type") == "Function Scan" and node.get("Plan Rows") == 2
+        for node in nodes
+    ), json.dumps(plan, indent=2)
