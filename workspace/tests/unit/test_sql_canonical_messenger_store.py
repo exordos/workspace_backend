@@ -66,6 +66,11 @@ def test_resource_reads_are_project_and_user_scoped(monkeypatch):
         "as_dict",
         lambda value, resource, **kwargs: {**value, "resource": resource},
     )
+    monkeypatch.setattr(
+        sql_canonical_store.SQLCanonicalReadStore,
+        "_read_state_mode",
+        lambda self: "legacy",
+    )
     store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
 
     result = store.filter_resources(
@@ -111,6 +116,65 @@ def test_slow_list_projection_emits_bounded_telemetry(monkeypatch):
     ]
 
 
+def test_stream_projections_emit_mode_duration_and_row_count(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    row = {"uuid": stream_uuid}
+    objects = FakeObjects([row])
+    model = _fake_model(objects, ("uuid", "project_id", "user_uuid"))
+    monkeypatch.setitem(sql_canonical_store.RESOURCE_MODELS, "streams", model)
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: value,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.SQLCanonicalReadStore,
+        "_read_state_mode",
+        lambda self: "legacy",
+    )
+    clock = iter((10.0, 10.25, 20.0, 20.5))
+    monkeypatch.setattr(sql_canonical_store.time, "monotonic", lambda: next(clock))
+    infos = []
+    monkeypatch.setattr(
+        sql_canonical_store.LOG,
+        "info",
+        lambda message, *args, **kwargs: infos.append((message, args, kwargs)),
+    )
+
+    store = sql_canonical_store.SQLCanonicalReadStore(PROJECT_UUID, USER_UUID)
+    assert store.filter_resources("streams", {}) == [row]
+    assert store.get_resource("streams", stream_uuid) == row
+
+    assert infos == [
+        (
+            "Messenger stream collection projection: "
+            "read_state_mode=%s rows=%d duration_seconds=%.3f",
+            ("legacy", 1, 0.25),
+            {
+                "extra": {
+                    "projection_kind": "stream_collection",
+                    "projection_duration_seconds": 0.25,
+                    "read_state_mode": "legacy",
+                    "projection_row_count": 1,
+                }
+            },
+        ),
+        (
+            "Messenger exact stream projection: "
+            "read_state_mode=%s rows=%d duration_seconds=%.3f",
+            ("legacy", 1, 0.5),
+            {
+                "extra": {
+                    "projection_kind": "stream_exact",
+                    "projection_duration_seconds": 0.5,
+                    "read_state_mode": "legacy",
+                    "projection_row_count": 1,
+                }
+            },
+        ),
+    ]
+
+
 def test_provider_collection_serialization_does_not_lookup_each_canonical_row(
     monkeypatch,
 ):
@@ -141,6 +205,11 @@ def test_provider_collection_serialization_does_not_lookup_each_canonical_row(
         ),
     )
     monkeypatch.setitem(sql_canonical_store.RESOURCE_MODELS, "streams", model)
+    monkeypatch.setattr(
+        sql_canonical_store.SQLCanonicalReadStore,
+        "_read_state_mode",
+        lambda self: "legacy",
+    )
     lookups = []
     monkeypatch.setattr(
         sql_canonical_store.resource_projection.EXTENSION_CANONICAL_MODELS[
@@ -1717,8 +1786,7 @@ def test_stream_read_queues_only_exact_unread_projection(monkeypatch):
     monkeypatch.setattr(
         store,
         "_lock_provider_account_for_stream",
-        lambda *args: call_order.append("account-lock")
-        or (provider_target[0].uuid,),
+        lambda *args: call_order.append("account-lock") or (provider_target[0].uuid,),
     )
     monkeypatch.setattr(
         store,
@@ -1804,8 +1872,7 @@ def test_topic_read_queues_exact_unread_projection(monkeypatch):
     monkeypatch.setattr(
         store,
         "_lock_provider_account_for_stream",
-        lambda *args: call_order.append("account-lock")
-        or (provider_target[0].uuid,),
+        lambda *args: call_order.append("account-lock") or (provider_target[0].uuid,),
     )
     monkeypatch.setattr(
         store,
@@ -2099,7 +2166,9 @@ def test_message_targets_keep_failed_create_routes_and_lock_them_together(monkey
         "message.delete",
     )
 
-    assert targets == tuple(expected_targets[account_uuid] for account_uuid in account_uuids)
+    assert targets == tuple(
+        expected_targets[account_uuid] for account_uuid in account_uuids
+    )
     assert locked == [account_uuids]
     assert "status IN" not in statements[1]
 
@@ -2209,7 +2278,9 @@ def test_bulk_read_partitions_shared_self_dm_by_prelocked_account(monkeypatch):
     )
 
     assert [row["external_account_uuid"] for row in queued] == list(account_uuids)
-    assert all("message.external_account_uuid = %s" in row["candidate_sql"] for row in queued)
+    assert all(
+        "message.external_account_uuid = %s" in row["candidate_sql"] for row in queued
+    )
     assert [row["candidate_values"][-3:] for row in queued] == [
         (account_uuid, account_uuid, USER_UUID) for account_uuid in account_uuids
     ]
@@ -2337,8 +2408,7 @@ def test_read_up_to_locks_provider_before_update_without_unread_probe(monkeypatc
     monkeypatch.setattr(
         store,
         "_lock_provider_account_for_stream",
-        lambda *args: call_order.append("account-lock")
-        or (provider_target[0].uuid,),
+        lambda *args: call_order.append("account-lock") or (provider_target[0].uuid,),
     )
     monkeypatch.setattr(
         store,

@@ -374,7 +374,7 @@ def test_concurrent_result_uuid_conflict_does_not_complete_operation():
     )
 
 
-def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
+def test_inbound_event_batch_uses_one_transaction_and_deduplicates(monkeypatch):
     identity = _identity()
     event_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
@@ -397,6 +397,14 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
         ]
     )
     applied = []
+    clock = iter((10.0, 10.125))
+    monkeypatch.setattr(provider_data.time, "monotonic", lambda: next(clock))
+    infos = []
+    monkeypatch.setattr(
+        provider_data.LOG,
+        "info",
+        lambda message, *args, **kwargs: infos.append((message, args, kwargs)),
+    )
 
     response = provider_data.apply_provider_event_batch(
         session,
@@ -411,6 +419,20 @@ def test_inbound_event_batch_uses_one_transaction_and_deduplicates():
     assert response["results"][0]["status"] == "applied"
     assert response["results"][0]["target_uuid"] == str(target_uuid)
     assert applied == [(event, session, identity)]
+    assert infos == [
+        (
+            "Applied provider event batch: events=%d broadcasts=%d "
+            "duration_seconds=%.3f",
+            (1, 0, 0.125),
+            {
+                "extra": {
+                    "provider_batch_event_count": 1,
+                    "provider_batch_broadcast_count": 0,
+                    "provider_batch_apply_duration_seconds": 0.125,
+                }
+            },
+        )
+    ]
     project_lock = next(
         (statement, params)
         for statement, params in session.statements

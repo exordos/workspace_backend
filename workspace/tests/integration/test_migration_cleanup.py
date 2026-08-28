@@ -15,6 +15,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.messenger_api.api import context as messenger_context
 from workspace.external_bridge_control import provider_data
+from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import read_state
 from workspace.tests.integration import conftest
 
@@ -115,15 +116,11 @@ PROVIDER_HISTORY_DOWNGRADE_MIGRATION_UUID = "68c9b8f1-d900-46db-b395-b514499698d
 PROVIDER_HISTORY_DOWNGRADE_MIGRATION_FILE = (
     "0140-add-resumable-provider-read-downgrade-68c9b8.py"
 )
-READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID = (
-    "60f5cad2-fe10-4df3-bced-2a248497afd1"
-)
+READ_STATE_FORWARD_CORRECTION_MIGRATION_UUID = "60f5cad2-fe10-4df3-bced-2a248497afd1"
 READ_STATE_FORWARD_CORRECTION_MIGRATION_FILE = (
     "0141-forward-correct-published-read-state-migrations-60f5ca.py"
 )
-COMPACT_DENSE_PREPARATION_MIGRATION_UUID = (
-    "0c93a123-8205-43cf-93dc-29031e06f2a7"
-)
+COMPACT_DENSE_PREPARATION_MIGRATION_UUID = "0c93a123-8205-43cf-93dc-29031e06f2a7"
 COMPACT_DENSE_PREPARATION_MIGRATION_FILE = (
     "0142-prepare-compact-dense-sequence-upgrade-0c93a1.py"
 )
@@ -131,32 +128,26 @@ COMPACT_DENSE_JOIN_MIGRATION_UUID = "1ce3ae70-7ad1-447b-a7ca-e14318e38f98"
 COMPACT_DENSE_JOIN_MIGRATION_FILE = (
     "0143-join-published-dense-sequence-upgrade-1ce3ae.py"
 )
-PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID = (
-    "523aa199-3aad-4678-b915-5b5439bb9f85"
-)
+PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_UUID = "523aa199-3aad-4678-b915-5b5439bb9f85"
 PROVIDER_READ_PAGING_CAPABILITY_MIGRATION_FILE = (
     "0144-use-additive-provider-read-paging-capability-523aa1.py"
 )
-READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID = (
-    "8e2468e1-ea6e-4611-9d6e-266917e6c64e"
-)
-ROLLING_READ_STATE_PROJECT_MIGRATION_UUID = (
-    "4c8dc326-40db-4045-addb-bb8ac4d472c5"
-)
+READ_STATE_MAINTENANCE_INDEX_MIGRATION_UUID = "8e2468e1-ea6e-4611-9d6e-266917e6c64e"
+ROLLING_READ_STATE_PROJECT_MIGRATION_UUID = "4c8dc326-40db-4045-addb-bb8ac4d472c5"
 ROLLING_READ_STATE_PROJECT_MIGRATION_FILE = (
     "0146-register-rolling-read-state-projects-4c8dc3.py"
 )
-READ_STATE_INDEX_REPAIR_MIGRATION_UUID = (
-    "804f7723-4d44-4d32-914e-3f9dfe90eee1"
-)
+READ_STATE_INDEX_REPAIR_MIGRATION_UUID = "804f7723-4d44-4d32-914e-3f9dfe90eee1"
 READ_STATE_INDEX_REPAIR_MIGRATION_FILE = (
     "0147-repair-read-state-maintenance-indexes-804f77.py"
 )
-TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID = (
-    "4588d689-bb04-4599-8ab4-ade40e386548"
-)
+TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID = "4588d689-bb04-4599-8ab4-ade40e386548"
 TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_FILE = (
     "0148-join-topic-summary-reasoning-head-4588d6.py"
+)
+UNREAD_BRANCH_MIGRATION_UUID = "c84ae9cb-d3c1-4385-88b8-0b2c156d2cb5"
+UNREAD_BRANCH_MIGRATION_FILE = (
+    "0149-split-messenger-unread-read-state-branches-c84ae9.py"
 )
 LEGACY_TABLES = (
     "m_messenger_writer_gate_acks_v1",
@@ -220,7 +211,7 @@ def _restore_current_provider_read_lease_fence(engine):
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_FILE
+    assert engine.get_latest_migration() == UNREAD_BRANCH_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -262,6 +253,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     ROLLING_READ_STATE_PROJECT_MIGRATION_UUID,
                     READ_STATE_INDEX_REPAIR_MIGRATION_UUID,
                     TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID,
+                    UNREAD_BRANCH_MIGRATION_UUID,
                 ],
             ),
         )
@@ -302,6 +294,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (ROLLING_READ_STATE_PROJECT_MIGRATION_UUID, True),
             (READ_STATE_INDEX_REPAIR_MIGRATION_UUID, True),
             (TOPIC_SUMMARY_REASONING_JOIN_MIGRATION_UUID, True),
+            (UNREAD_BRANCH_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -969,8 +962,7 @@ def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
         engine.apply_migration(COMPACT_DENSE_JOIN_MIGRATION_FILE)
     with db.cursor() as cur:
         cur.execute(
-            "SELECT mode FROM m_workspace_read_state_projects_v1 "
-            "WHERE project_id = %s",
+            "SELECT mode FROM m_workspace_read_state_projects_v1 WHERE project_id = %s",
             (project_uuid,),
         )
         assert cur.fetchone() == ("compact",)
@@ -981,8 +973,7 @@ def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
         )
         assert cur.fetchone() == (False,)
         cur.execute(
-            "SELECT COUNT(*) FROM m_workspace_user_read_chunks_v1 "
-            "WHERE user_uuid = %s",
+            "SELECT COUNT(*) FROM m_workspace_user_read_chunks_v1 WHERE user_uuid = %s",
             (user_uuid,),
         )
         assert cur.fetchone() == (257,)
@@ -1077,8 +1068,7 @@ def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
         )
         assert cur.fetchone() == (True,)
         cur.execute(
-            "SELECT COUNT(*) FROM m_workspace_user_read_chunks_v1 "
-            "WHERE user_uuid = %s",
+            "SELECT COUNT(*) FROM m_workspace_user_read_chunks_v1 WHERE user_uuid = %s",
             (user_uuid,),
         )
         assert cur.fetchone() == (1,)
@@ -1235,8 +1225,7 @@ def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
             (stream_uuid, project_uuid),
         )
         cur.execute(
-            "DELETE FROM m_workspace_read_state_compaction_v1 "
-            "WHERE project_id = %s",
+            "DELETE FROM m_workspace_read_state_compaction_v1 WHERE project_id = %s",
             (project_uuid,),
         )
         cur.execute(
@@ -1244,8 +1233,7 @@ def test_forward_graph_upgrades_compact_0137_read_state(_database, db):
             (project_uuid,),
         )
         cur.execute(
-            "DELETE FROM m_workspace_project_ingest_ranges_v2 "
-            "WHERE project_id = %s",
+            "DELETE FROM m_workspace_project_ingest_ranges_v2 WHERE project_id = %s",
             (project_uuid,),
         )
 
@@ -1645,9 +1633,9 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
             old_worker_provider_uuid,
             old_worker_snapshot_provider_uuid,
         ):
-            assert "_workspace_response_revision" not in by_uuid[provider_uuid][
-                "payload"
-            ]
+            assert (
+                "_workspace_response_revision" not in by_uuid[provider_uuid]["payload"]
+            )
         published_response = provider_data._operation_dict(
             by_uuid[published_provider_uuid]
         )
@@ -1677,8 +1665,7 @@ def test_forward_correction_freezes_persisted_provider_read_response_identity(
             ([published_snapshot_uuid, old_worker_snapshot_uuid],),
         ).fetchall()
         assert all(
-            "_workspace_response_revision" not in row["payload"]
-            for row in snapshots
+            "_workspace_response_revision" not in row["payload"] for row in snapshots
         )
 
     # 0141 never changes the legacy read-delivery identity. A leased row
@@ -3783,13 +3770,9 @@ def test_multi_account_stream_access_migration_deduplicates_visibility_rows(
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     assert access_count() == 1
-    engine.rollback_migration(
-        "0149-deduplicate-multi-account-stream-access-ed1c93.py"
-    )
+    engine.rollback_migration("0149-deduplicate-multi-account-stream-access-ed1c93.py")
     assert access_count() == 2
-    engine.apply_migration(
-        "0149-deduplicate-multi-account-stream-access-ed1c93.py"
-    )
+    engine.apply_migration("0149-deduplicate-multi-account-stream-access-ed1c93.py")
     assert access_count() == 1
 
 
@@ -3797,9 +3780,7 @@ def test_read_state_index_repair_recovers_partial_recursive_downgrade(
     _database,
     db,
 ):
-    engine = ra_migrations.MigrationEngine(
-        migrations_path=str(conftest.MIGRATIONS_DIR)
-    )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine.rollback_migration(READ_STATE_INDEX_REPAIR_MIGRATION_FILE)
     with db.cursor() as cur:
         cur.execute(
@@ -3979,6 +3960,348 @@ def test_list_and_folder_projections_reuse_outer_visibility(_database, db):
     folders = definitions["m_folders_view"]
     assert "system_folder_templates" in folders
     assert folders.count("FROM m_workspace_user_streams") == 1
+
+
+def test_unread_views_split_legacy_and_compact_query_plans(_database, db):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[UNREAD_BRANCH_MIGRATION_FILE]
+    migration_module = __import__(migration.__class__.__module__)
+    with ra_contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+    legacy_sql = migration_module.LEGACY_UNREAD_SELECT_SQL
+    compact_sql = migration_module.COMPACT_UNREAD_SELECT_SQL
+    assert "JOIN LATERAL" in legacy_sql
+    assert "OFFSET 0" in legacy_sql
+    assert "m_workspace_user_message_flags" in legacy_sql
+    assert "read = FALSE" in legacy_sql
+    for compact_relation in (
+        "m_workspace_user_read_chunks_v1",
+        "m_workspace_message_mentions_v1",
+        "m_workspace_topic_message_stats_v1",
+    ):
+        assert compact_relation not in legacy_sql
+    assert "m_workspace_user_message_flags" not in compact_sql
+    assert "m_workspace_user_read_chunks_v1" in compact_sql
+    assert "m_workspace_message_mentions_v1" in compact_sql
+
+    view_names = (
+        "m_workspace_user_unread_messages_base_v1",
+        "m_workspace_user_topic_unread_counts_v1",
+        "m_unread_user_messages",
+        "m_workspace_user_streams",
+        "m_workspace_user_topics_view",
+        "m_folders_view",
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT relname, pg_get_viewdef(oid)
+            FROM pg_class
+            WHERE relname = ANY(%s::text[])
+            ORDER BY relname
+            """,
+            (list(view_names),),
+        )
+        definitions = dict(cur.fetchall())
+
+    assert set(definitions) == set(view_names)
+    unread_base = definitions["m_workspace_user_unread_messages_base_v1"]
+    assert "UNION ALL" in unread_base
+    assert unread_base.count("m_workspace_user_message_flags") == 1
+    assert unread_base.count("m_workspace_user_read_chunks_v1") == 1
+    assert unread_base.count("m_workspace_message_mentions_v1") == 1
+    assert "message_flags.read = false" in unread_base
+    assert "project.mode" in unread_base
+    assert "'compact'::character varying" in unread_base
+    assert "'rollback'::character varying" in unread_base
+
+    topic_counts = definitions["m_workspace_user_topic_unread_counts_v1"]
+    assert "m_workspace_user_message_flags" in topic_counts
+    assert "m_workspace_topic_message_stats_v1" in topic_counts
+    assert "m_workspace_user_topic_read_stats_v1" in topic_counts
+    assert "m_workspace_message_mentions_v1" in topic_counts
+
+    expected_dependencies = {
+        "m_unread_user_messages": "m_workspace_user_topic_unread_counts_v1",
+        "m_workspace_user_streams": "m_unread_user_messages",
+        "m_workspace_user_topics_view": "m_workspace_user_topic_unread_counts_v1",
+        "m_folders_view": "m_workspace_user_streams",
+    }
+    for view_name, dependency in expected_dependencies.items():
+        assert dependency in definitions[view_name]
+
+
+def test_unread_view_migration_downgrade_restores_mixed_mode_definitions(
+    _database,
+):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[UNREAD_BRANCH_MIGRATION_FILE]
+    view_names = (
+        "m_workspace_user_unread_messages_base_v1",
+        "m_workspace_user_topic_unread_counts_v1",
+    )
+
+    def definitions(session):
+        rows = session.execute(
+            """
+            SELECT relname, pg_get_viewdef(oid)
+            FROM pg_class
+            WHERE relname = ANY(%s::text[])
+            ORDER BY relname
+            """,
+            (list(view_names),),
+        ).fetchall()
+        return {row["relname"]: row["pg_get_viewdef"] for row in rows}
+
+    with ra_contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+        split_definitions = definitions(session)
+        migration.downgrade(session)
+        previous_definitions = definitions(session)
+        previous_base = previous_definitions["m_workspace_user_unread_messages_base_v1"]
+        assert "UNION ALL" not in previous_base
+        assert "CASE" in previous_base
+        assert "LEFT JOIN m_workspace_user_message_flags" in previous_base
+        assert "LEFT JOIN m_workspace_user_read_chunks_v1" in previous_base
+        assert "LEFT JOIN m_workspace_message_mentions_v1" in previous_base
+
+        migration.upgrade(session)
+        assert definitions(session) == split_definitions
+
+
+def test_stream_access_sql_excludes_message_and_unread_projections(_database, db):
+    with db.cursor() as cur:
+        cur.execute(
+            "EXPLAIN (FORMAT JSON) "
+            + messenger_dm_helpers._WORKSPACE_USER_STREAM_ACCESS_SQL,
+            (sys_uuid.uuid4(), sys_uuid.uuid4(), sys_uuid.uuid4()),
+        )
+        plan = cur.fetchone()[0][0]["Plan"]
+
+    def walk(node):
+        yield node
+        for child in node.get("Plans", []):
+            yield from walk(child)
+
+    relation_names = {
+        node["Relation Name"] for node in walk(plan) if "Relation Name" in node
+    }
+    assert "m_workspace_messages" not in relation_names
+    assert "m_workspace_user_streams" not in relation_names
+    assert "m_workspace_user_message_flags" not in relation_names
+    assert "m_workspace_user_read_chunks_v1" not in relation_names
+
+
+def test_unread_branch_outputs_match_previous_views_in_all_read_modes(
+    _database,
+    db,
+):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    reader_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "Unread migration parity",
+    )
+    conftest.seed_user_stream_binding(db, project_uuid, stream_uuid, reader_uuid)
+    topic_modes = ("mute", "follow", "unmute", "default")
+    topic_uuids = {
+        mode: conftest.seed_stream_topic(
+            db,
+            project_uuid,
+            stream_uuid,
+            owner_uuid,
+            mode,
+            is_default=mode == "default",
+        )
+        for mode in topic_modes
+    }
+    mention = f"[Reader](urn:user:{reader_uuid})"
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE m_workspace_stream_bindings
+            SET notification_mode = 'mentions_only'
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, reader_uuid),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_workspace_user_topic_flags (
+                uuid, user_uuid, project_id, notification_mode,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, NOW(), NOW())
+            """,
+            (
+                (topic_uuids[mode], reader_uuid, project_uuid, mode)
+                for mode in topic_modes
+                if mode != "default"
+            ),
+        )
+        for mode in topic_modes:
+            content = mention if mode in {"unmute", "default"} else "plain"
+            message_uuid = sys_uuid.uuid4()
+            cur.execute(
+                """
+                INSERT INTO m_workspace_messages (
+                    uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                    payload, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    jsonb_build_object(
+                        'kind', 'markdown', 'content', %s::text
+                    ),
+                    NOW(), NOW()
+                )
+                RETURNING ingest_sequence
+                """,
+                (
+                    message_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    topic_uuids[mode],
+                    owner_uuid,
+                    content,
+                ),
+            )
+            ingest_sequence = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO m_workspace_user_message_flags (
+                    uuid, user_uuid, project_id, read, pinned, starred
+                ) VALUES (%s, %s, %s, FALSE, FALSE, FALSE)
+                """,
+                (message_uuid, reader_uuid, project_uuid),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_workspace_topic_message_stats_v1 (
+                    topic_uuid, project_id, stream_uuid, message_count,
+                    last_ingest_sequence
+                ) VALUES (%s, %s, %s, 1, %s)
+                """,
+                (topic_uuids[mode], project_uuid, stream_uuid, ingest_sequence),
+            )
+            if mode in {"unmute", "default"}:
+                cur.execute(
+                    """
+                    INSERT INTO m_workspace_message_mentions_v1 (
+                        message_uuid, user_uuid, project_id, stream_uuid,
+                        topic_uuid, ingest_sequence
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        message_uuid,
+                        reader_uuid,
+                        project_uuid,
+                        stream_uuid,
+                        topic_uuids[mode],
+                        ingest_sequence,
+                    ),
+                )
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    migration = engine._load_migrations()[UNREAD_BRANCH_MIGRATION_FILE]
+    snapshot_queries = (
+        """
+        SELECT to_jsonb(projection) AS value FROM (
+            SELECT * FROM m_workspace_user_unread_messages_base_v1
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY message_uuid
+        ) AS projection
+        """,
+        """
+        SELECT to_jsonb(projection) AS value FROM (
+            SELECT * FROM m_workspace_user_topic_unread_counts_v1
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY topic_uuid
+        ) AS projection
+        """,
+        """
+        SELECT to_jsonb(projection) AS value FROM (
+            SELECT * FROM m_unread_user_messages
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+        ) AS projection
+        """,
+        """
+        SELECT to_jsonb(projection) AS value FROM (
+            SELECT * FROM m_workspace_user_streams
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+        ) AS projection
+        """,
+        """
+        SELECT to_jsonb(projection) AS value FROM (
+            SELECT * FROM m_workspace_user_topics_view
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+        ) AS projection
+        """,
+        """
+        SELECT to_jsonb(projection) AS value FROM (
+            SELECT * FROM m_folders_view
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY uuid
+        ) AS projection
+        """,
+    )
+
+    def snapshot(session):
+        return tuple(
+            [row["value"] for row in session.execute(query, params).fetchall()]
+            for query, params in (
+                (query, (project_uuid, reader_uuid)) for query in snapshot_queries
+            )
+        )
+
+    with ra_contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+        for mode in ("legacy", "compact", "rollback"):
+            session.execute(
+                """
+                INSERT INTO m_workspace_read_state_projects_v1 (
+                    project_id, mode
+                ) VALUES (%s, %s)
+                ON CONFLICT (project_id) DO UPDATE SET mode = EXCLUDED.mode
+                """,
+                (project_uuid, mode),
+            )
+            split_snapshot = snapshot(session)
+            counts = session.execute(
+                """
+                SELECT topic.name, counts.unread_count,
+                       counts.active_unread_count,
+                       counts.passive_unread_count
+                FROM m_workspace_user_topic_unread_counts_v1 AS counts
+                JOIN m_workspace_stream_topics AS topic
+                  ON topic.uuid = counts.topic_uuid
+                WHERE counts.project_id = %s AND counts.user_uuid = %s
+                ORDER BY topic.name
+                """,
+                (project_uuid, reader_uuid),
+            ).fetchall()
+            assert [
+                (
+                    row["name"],
+                    row["unread_count"],
+                    row["active_unread_count"],
+                    row["passive_unread_count"],
+                )
+                for row in counts
+            ] == [
+                ("default", 1, 1, 0),
+                ("follow", 1, 1, 0),
+                ("mute", 1, 0, 1),
+                ("unmute", 1, 1, 0),
+            ]
+
+            migration.downgrade(session)
+            assert snapshot(session) == split_snapshot
+            migration.upgrade(session)
 
 
 def test_external_projection_access_is_scoped_to_account(

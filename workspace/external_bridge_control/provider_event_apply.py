@@ -1084,14 +1084,14 @@ def _topic_notification_event(
         return topic_uuid
     notification_mode = resource["notification_mode"]
     if notification_mode == models.WorkspaceTopicNotificationMode.UNMUTE.value:
-        stream = helpers.get_workspace_user_stream(
+        stream_access = helpers.get_workspace_user_stream_access(
             project_id=project_id,
             user_uuid=assignment["owner_user_uuid"],
             stream_uuid=stream_uuid,
             session=session,
         )
         if (
-            stream.notification_mode
+            stream_access["notification_mode"]
             != models.WorkspaceStreamNotificationMode.MUTED.value
         ):
             notification_mode = models.WorkspaceTopicNotificationMode.DEFAULT.value
@@ -1116,9 +1116,7 @@ def _validate_provider_message_scope(
     allow_missing: bool = False,
 ) -> None:
     """Keep shared native self-DM messages isolated by provider account."""
-    expected = {
-        sys_uuid.UUID(str(message_uuid)) for message_uuid in message_uuids
-    }
+    expected = {sys_uuid.UUID(str(message_uuid)) for message_uuid in message_uuids}
     if not expected:
         return
     rows = session.execute(

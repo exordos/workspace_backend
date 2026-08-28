@@ -17,6 +17,7 @@ from restalchemy.common import contexts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
+from workspace.common import database
 from workspace.common import external_bridge_control_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
@@ -87,7 +88,7 @@ def build_runtime(
     )
     control_pki.initialize()
     enrollments = _load_enrollments(options.enrollment_config_path)
-    engines.engine_factory.configure_postgresql_factory(conf=conf)
+    database.configure_postgresql("workspace-provider-control", conf=conf)
     session_factory = engines.engine_factory.get_engine().session_manager
     request_context = contexts.Context()
     with session_factory() as session:

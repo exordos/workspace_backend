@@ -138,6 +138,35 @@ def test_private_handler_rolls_back_error_response():
     ]
 
 
+def test_provider_event_commit_duration_is_logged_separately(monkeypatch):
+    handler = _handler(
+        [("Content-Length", "0")],
+        path="/api/workspace-provider/v1/events",
+    )
+    clock = iter((10.0, 10.125))
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(clock))
+    infos = []
+    monkeypatch.setattr(
+        server.LOG,
+        "info",
+        lambda message, *args, **kwargs: infos.append((message, args, kwargs)),
+    )
+
+    handler._dispatch()
+
+    assert infos == [
+        (
+            "Committed provider event batch: duration_seconds=%.3f",
+            (0.125,),
+            {
+                "extra": {
+                    "provider_batch_commit_duration_seconds": 0.125,
+                }
+            },
+        )
+    ]
+
+
 def test_private_handler_rejects_incomplete_body_and_closes_connection():
     handler = _handler([("Content-Length", "2")], body=b"x")
 
