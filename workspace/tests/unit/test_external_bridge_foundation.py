@@ -141,6 +141,13 @@ def test_request_operations_do_not_open_database_session_managers(
 
 def test_production_database_session_boundaries_are_centralized():
     workspace_root = pathlib.Path(controllers.__file__).parents[2]
+    database_boundary_calls = {
+        "close",
+        "commit",
+        "get_session",
+        "rollback",
+        "session_manager",
+    }
     failures = []
     for path in workspace_root.rglob("*.py"):
         if "tests" in path.parts:
@@ -153,6 +160,8 @@ def test_production_database_session_boundaries_are_centralized():
             ):
                 continue
             name = node.func.attr
+            if name not in database_boundary_calls:
+                continue
             call = ast.get_source_segment(source, node) or name
             location = f"{path.relative_to(workspace_root)}:{node.lineno}"
             if name == "session_manager":
