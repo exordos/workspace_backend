@@ -251,9 +251,17 @@ UUIDv5(verified_realm_uuid,
   不是实时循环;全球暂停 control-plane writers 更简单,
   总的附加 commit-order 基础设施比较便宜;
 - 破坏性重置采用失败即关闭策略：一致的 `source_name`、`source.kind`、
-  `source.message_id`、account/provider evidence 和持久化的
-  `action=message.create` evidence 用于区分入站投影与原生出站数据。任何
-  不完整或相互矛盾的来源都会在删除前中止迁移；
+  来自 `source.message_id` 或旧版 `provider_external_id` 的消息标识、
+  精确的旧版 Bridge 身份
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`、
+  account/provider evidence 和持久化的
+  `action=message.create` evidence 用于区分入站投影与原生出站数据。一致的
+  `native`/`native` 来源对也会保留在持久化 operation queue 出现之前创建的
+  旧版出站行；后来附加的 provider 标识不会覆盖该分类。对于携带入站字段的
+  历史 echo，精确匹配的持久化 operation 同样优先。没有该 operation 的
+  任何 Zulip 来源 UUID（包括任意 UUIDv5），如果不等于完整的旧版身份且
+  没有该 operation，都会被视为有歧义并在删除前中止迁移。任何不完整或相互
+  矛盾的来源都会在删除前中止迁移；
 - 无人值守的冻结切换最多处理一百万条 legacy messages，等待锁最多 30 秒，
   statement deadline 为 30 分钟。更大的切换必须在完成备份和生产规模演练
   后由操作员明确授权；五千万消息是重新导入后的稳态目标，并不允许自动转换

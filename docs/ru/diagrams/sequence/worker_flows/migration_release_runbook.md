@@ -85,22 +85,32 @@ Cleanup не принимает решение по одному nullable пол
 echo reconciliation. Поэтому migration выполняет детерминированный preflight
 под тем же writer freeze и принимает только такие комбинации:
 
-- inbound message: согласованные `source_name` и `source.kind`, наличие
-  `source.message_id` и либо совпадающие Zulip account и
-  `provider_external_id`, либо Zulip-owned stream, либо дополнительное legacy
+- inbound message: согласованные `source_name` и `source.kind`, provider message
+  identity из `source.message_id` или legacy `provider_external_id` (если есть
+  оба значения, они должны совпадать), полная historical identity Bridge
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  а также matching Zulip account, Zulip-owned stream или дополнительное legacy
   entity evidence;
 - native outbound message: durable строка `m_external_operations_v2` с
   `action=message.create`, совпадающим `target_uuid`, локальным
   `owner_user_uuid` и тем же account, если он уже записан в message;
+- legacy native/outbound message, созданный до появления этой operation queue:
+  согласованная пара `source_name=native` и `source.kind=native`; provider
+  identifiers, добавленные поздней echo reconciliation, не отменяют эту пару;
 - external file: Zulip account, специальный external-content storage namespace
   и отсутствие ссылки из любого retained message. Любая surviving ссылка
   `urn:file|image|video:<uuid>` имеет приоритет и сохраняет row и physical object.
 
-Любая строка с частичными или противоречивыми Zulip signals останавливает
-migration до destructive work. Одновременное доказательство inbound и local
-outbound происхождения также блокирует migration. `m_zulip_processed_entities`
-никогда не является достаточным доказательством само по себе и используется
-только как дополнительный сигнал при согласованных source fields.
+Любая строка с частичными или противоречивыми source или Zulip signals
+останавливает migration до destructive work. Если полностью reconciled
+historical echo одновременно содержит inbound fields и точную durable
+`message.create` operation, operation имеет приоритет, а native/outbound row
+сохраняется. Любой UUID Zulip-source row, включая произвольный UUIDv5, который
+не совпадает с полной legacy identity и не имеет такой operation, считается
+неоднозначным Workspace send до появления operation queue и останавливает
+migration вместо reset. `m_zulip_processed_entities` никогда не является достаточным
+доказательством само по себе и используется только как дополнительный сигнал
+при согласованных source fields.
 
 Provider-origin reactions удаляются по Zulip account provenance, включая
 reactions на сохраняемых native/outbound messages. Native reactions остаются.

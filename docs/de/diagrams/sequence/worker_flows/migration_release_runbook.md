@@ -95,23 +95,38 @@ unter demselben Writer-Freeze eine deterministische Vorprüfung aus und akzeptie
 nur diese Kombinationen:
 
 - eingehende Nachricht: konsistente Werte für `source_name` und `source.kind`,
-  eine `source.message_id` sowie entweder einen passenden Zulip-Account und
-  `provider_external_id`, einen Zulip-eigenen Stream oder bestätigende
-  historische Entity-Evidenz;
+  eine Provider-Nachrichtenidentität aus `source.message_id` oder der älteren
+  `provider_external_id` (wenn beide vorhanden sind, müssen sie übereinstimmen)
+  und die vollständige historische Bridge-Identität
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`
+  sowie einen passenden
+  Zulip-Account, einen Zulip-eigenen Stream oder bestätigende historische
+  Entity-Evidenz;
 - native ausgehende Nachricht: eine dauerhafte Zeile in
   `m_external_operations_v2` mit `action=message.create`, passender
   `target_uuid`, lokaler `owner_user_uuid` und demselben Account, falls die
   Nachricht bereits einen Account trägt;
+- ältere native/ausgehende Nachricht, die vor dieser Operationswarteschlange
+  erstellt wurde: das konsistente Paar `source_name=native` und
+  `source.kind=native`; später beim Echo-Abgleich angefügte Provider-Kennungen
+  überschreiben dieses Paar nicht;
 - externe Datei: ein Zulip-Account, der reservierte External-Content-Namespace
   im Storage und keine Referenz aus einer erhaltenen Nachricht. Eine
   verbleibende Referenz `urn:file|image|video:<uuid>` hat immer Vorrang und
   erhält Zeile und physisches Objekt.
 
-Jede Zeile mit unvollständigen oder widersprüchlichen Zulip-Signalen bricht die
-Migration vor destruktiven Arbeiten ab. Gleichzeitiger Nachweis von eingehender
-und lokal ausgehender Herkunft führt ebenfalls zum Abbruch.
-`m_zulip_processed_entities` reicht allein niemals aus und dient nur zusammen
-mit konsistenten Source-Feldern als zusätzliche Evidenz.
+Jede Zeile mit unvollständigen oder widersprüchlichen Source- oder Zulip-Signalen
+bricht die Migration vor destruktiven Arbeiten ab. Wenn ein vollständig
+abgeglichenes historisches Echo sowohl eingehende Felder als auch eine exakt
+passende dauerhafte `message.create`-Operation enthält, hat die Operation Vorrang
+und die native/ausgehende Zeile bleibt erhalten. Jede UUID einer Zulip-Quellzeile,
+einschließlich einer beliebigen UUIDv5, gilt ohne Übereinstimmung mit der
+vollständigen Legacy-Identität und ohne diese Operation als mehrdeutiger
+Workspace-Versand aus der Zeit vor der Operationswarteschlange und bricht statt
+eines Resets ab.
+`m_zulip_processed_entities`
+reicht allein niemals aus und dient nur zusammen mit konsistenten Source-Feldern
+als zusätzliche Evidenz.
 
 Reaktionen aus dem Provider werden über ihre Zulip-Account-Herkunft gelöscht,
 auch wenn sie an erhaltenen nativen/ausgehenden Nachrichten hängen. Native

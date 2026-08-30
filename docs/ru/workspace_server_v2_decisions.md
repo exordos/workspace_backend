@@ -251,10 +251,19 @@ UUIDv5(verified_realm_uuid,
   не в realtime loop; глобальная краткая пауза control-plane writers проще и
   дешевле постоянной дополнительной commit-order инфраструктуры;
 - destructive reset работает fail-closed: согласованные `source_name`,
-  `source.kind`, `source.message_id`, account/provider evidence и durable
+  `source.kind`, message identity из `source.message_id` или legacy
+  `provider_external_id`, точная legacy identity Bridge
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  account/provider evidence и durable
   `action=message.create` evidence отличают inbound projection от native
-  outbound data. Частичное или противоречивое происхождение останавливает
-  migration до delete;
+  outbound data. Согласованная пара `native`/`native` также сохраняет legacy
+  outbound rows, созданные до появления durable operation queue; добавленные
+  позднее provider identifiers не отменяют эту классификацию. Точная durable
+  operation также имеет приоритет для historical echo с inbound fields.
+  Любой UUID Zulip-source row, включая произвольный UUIDv5, который не совпадает
+  с полной legacy identity и не имеет такой operation, считается неоднозначным
+  и останавливает migration до delete.
+  Частичное или противоречивое происхождение останавливает migration до delete;
 - unattended frozen cutover ограничен одним миллионом legacy messages,
   ожиданием lock не более 30 секунд и statement deadline 30 минут. Больший
   cutover требует явного разрешения оператора после backup и production-sized

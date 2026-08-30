@@ -251,10 +251,20 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
   nicht in der Realtime-Schleife; die globale Pause ist einfacher und
   billiger als die ständige Zusatz-Commit-Order-Infrastruktur;
 - Der destruktive Reset ist fehlersicher: konsistente Werte für `source_name`,
-  `source.kind`, `source.message_id`, Account-/Provider-Evidenz und dauerhafte
+  `source.kind`, Nachrichtenidentität aus `source.message_id` oder der älteren
+  `provider_external_id`, die exakte Legacy-Bridge-Identität
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  Account-/Provider-Evidenz und dauerhafte
   Evidenz mit `action=message.create` unterscheiden eingehende Projektionen von
-  nativen ausgehenden Daten. Unvollständige oder widersprüchliche Herkunft
-  bricht die Migration vor dem Löschen ab;
+  nativen ausgehenden Daten. Das konsistente Quellenpaar `native`/`native`
+  erhält außerdem ältere ausgehende Zeilen, die vor der dauerhaften
+  Operationswarteschlange entstanden; später angefügte Provider-Kennungen
+  überschreiben diese Klassifikation nicht. Eine exakt passende dauerhafte
+  Operation hat auch bei einem historischen Echo mit eingehenden Feldern
+  Vorrang. Jede UUID einer Zulip-Quellzeile, einschließlich einer beliebigen
+  UUIDv5, ist ohne Übereinstimmung mit der vollständigen Legacy-Identität und
+  ohne diese Operation mehrdeutig und bricht vor dem Löschen ab. Unvollständige oder widersprüchliche
+  Herkunft bricht die Migration vor dem Löschen ab;
 - ein unbeaufsichtigter eingefrorener Cutover ist auf eine Million
   Legacy-Nachrichten, 30 Sekunden Lock-Wartezeit und 30 Minuten Statement-Limit
   begrenzt. Ein größerer Cutover erfordert nach Backup und produktionsgroßem

@@ -1853,6 +1853,11 @@ def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
     engine.rollback_migration(V2_MIGRATION)
     ambiguous_uuid = sys_uuid.uuid4()
     conflicting_uuid = sys_uuid.uuid4()
+    legacy_outbound_uuid = sys_uuid.uuid5(
+        sys_uuid.NAMESPACE_URL,
+        "zulip-looking-but-not-the-legacy-provider-identity",
+    )
+    account_uuid = sys_uuid.uuid4()
     try:
         stream_uuid = conftest.seed_user_stream(
             db, api.project_id, api.user_uuid, "Ambiguous migration stream"
@@ -1874,15 +1879,25 @@ def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
                 """,
                 (api.project_id, stream_uuid),
             )
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    status, live_ready
+                ) VALUES (%s, %s, 'zulip', '{}'::jsonb, 'live', TRUE)
+                """,
+                (account_uuid, api.user_uuid),
+            )
             cursor.executemany(
                 """
                 INSERT INTO m_workspace_messages (
                     uuid, project_id, stream_uuid, topic_uuid, user_uuid,
-                    payload, source_name, source, provider_external_id
+                    payload, source_name, source, provider_external_id,
+                    external_account_uuid
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     '{"kind":"markdown","content":"ambiguous"}'::jsonb, %s,
-                    %s::jsonb, %s
+                    %s::jsonb, %s, %s
                 )
                 """,
                 (
@@ -1895,6 +1910,7 @@ def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
                         "zulip",
                         json.dumps({"kind": "native"}),
                         None,
+                        None,
                     ),
                     (
                         conflicting_uuid,
@@ -1905,6 +1921,18 @@ def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
                         "zulip",
                         json.dumps({"kind": "zulip", "message_id": "42"}),
                         "43",
+                        None,
+                    ),
+                    (
+                        legacy_outbound_uuid,
+                        api.project_id,
+                        stream_uuid,
+                        topic_uuid,
+                        api.user_uuid,
+                        "zulip",
+                        json.dumps({"kind": "zulip", "message_id": "44"}),
+                        "44",
+                        account_uuid,
                     ),
                 ),
             )
@@ -1936,6 +1964,19 @@ def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
             cursor.execute(
                 "DELETE FROM m_workspace_messages WHERE uuid = %s",
                 (conflicting_uuid,),
+            )
+        # A historical Workspace outbound row can carry a reconciled Zulip
+        # source pair but predate the durable operation queue. Even an arbitrary
+        # UUIDv5 is not provider provenance: without the exact legacy Bridge
+        # account/message identity it must stop before destructive reset work.
+        with pytest.raises(
+            Exception, match="ambiguous legacy Zulip message provenance"
+        ):
+            engine.apply_migration(V2_MIGRATION)
+        with db.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM m_workspace_messages WHERE uuid = %s",
+                (legacy_outbound_uuid,),
             )
     finally:
         with db.cursor() as cursor:
@@ -2065,7 +2106,10 @@ def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
         account_uuid = sys_uuid.uuid4()
         bridge_uuid = sys_uuid.uuid4()
         chat_uuid = sys_uuid.uuid4()
-        provider_message_uuid = sys_uuid.uuid4()
+        provider_message_uuid = sys_uuid.uuid5(
+            sys_uuid.UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f"),
+            f"zulip:{account_uuid}:message:42",
+        )
         provider_reaction_uuid = sys_uuid.uuid4()
         retained_provider_reaction_uuid = sys_uuid.uuid4()
         retained_native_reaction_uuid = sys_uuid.uuid4()
@@ -2138,7 +2182,7 @@ def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     '{"kind":"markdown","content":"zulip"}'::jsonb,
-                    'zulip', '{"kind":"zulip","message_id":"42"}'::jsonb,
+                    'zulip', '{"kind":"zulip","message_id":null}'::jsonb,
                     %s, '42', '{"chat_key":"channel:42"}'::jsonb
                 )
                 """,
@@ -2196,7 +2240,9 @@ def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
                 """
                 UPDATE m_workspace_messages
                 SET external_account_uuid = %s, provider_external_id = '43',
-                    provider_metadata = '{"chat_key":"channel:42"}'::jsonb
+                    provider_metadata = '{"chat_key":"channel:42"}'::jsonb,
+                    source_name = 'zulip',
+                    source = '{"kind":"zulip","message_id":"43"}'::jsonb
                 WHERE uuid = %s
                 """,
                 (account_uuid, outbound_uuid),
@@ -2205,23 +2251,23 @@ def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
                 """
                 UPDATE m_workspace_messages
                 SET external_account_uuid = %s,
-                    provider_external_id = 'legacy-native',
+                    provider_external_id = '44',
                     provider_metadata = '{"chat_key":"channel:42"}'::jsonb
                 WHERE uuid = %s
                 """,
                 (account_uuid, native_uuid),
             )
-            cursor.executemany(
+            # Rows created before the durable provider-operation queue retain
+            # their paired native source fields after echo reconciliation.
+            # The migration must preserve them even when no operation exists.
+            cursor.execute(
                 """
                 INSERT INTO m_external_operations_v2 (
                     uuid, external_account_uuid, owner_user_uuid,
                     action, target_type, target_uuid
                 ) VALUES (%s, %s, %s, 'message.create', 'message', %s)
                 """,
-                (
-                    (sys_uuid.uuid4(), account_uuid, api.user_uuid, native_uuid),
-                    (sys_uuid.uuid4(), account_uuid, api.user_uuid, outbound_uuid),
-                ),
+                (sys_uuid.uuid4(), account_uuid, api.user_uuid, outbound_uuid),
             )
             for file_uuid, object_id in (
                 (retained_file_uuid, "external-content/sha256/aa/retained"),

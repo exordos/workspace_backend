@@ -78,20 +78,29 @@ Bridge 随后丢弃旧的可重建去重状态，并从权威 Zulip 数据源执
 后也可能带上 provider/account 标识。因此，迁移会在同一个 writer freeze
 下执行确定性的预检查，并且只接受以下组合：
 
-- 入站消息：`source_name` 与 `source.kind` 一致，存在
-  `source.message_id`，并且还具有匹配的 Zulip account 与
-  `provider_external_id`、Zulip 所有的 stream，或可相互印证的历史
-  entity evidence 之一；
+- 入站消息：`source_name` 与 `source.kind` 一致，provider 消息标识来自
+  `source.message_id` 或旧版 `provider_external_id`（两者同时存在时必须
+  一致），具有完整的旧版 Bridge 身份
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`，
+  并且还具有匹配的 Zulip
+  account、Zulip 所有的 stream，或可相互印证的历史 entity evidence 之一；
 - 原生出站消息：`m_external_operations_v2` 中存在持久化记录，包含
   `action=message.create`、匹配的 `target_uuid`、本地
   `owner_user_uuid`，并且在消息已有 account 时二者一致；
+- 在该 operation queue 出现之前创建的旧版原生/出站消息：
+  `source_name=native` 与 `source.kind=native` 必须成对一致；之后通过 echo
+  对账附加的 provider 标识不会覆盖这一判断；
 - 外部文件：属于 Zulip account，位于专用 external-content 存储命名空间，
   且没有任何保留消息引用它。任何仍然存在的
   `urn:file|image|video:<uuid>` 引用都具有最高优先级，会保留数据库行和
   物理对象。
 
-任何带有不完整或相互矛盾 Zulip 信号的行，都会在破坏性操作开始前中止
-迁移。同时被证明为入站和本地出站的行也会中止迁移。
+任何带有不完整或相互矛盾 source 或 Zulip 信号的行，都会在破坏性操作
+开始前中止迁移。如果已完全对账的历史 echo 同时具有入站字段和精确匹配的
+持久化 `message.create` operation，则该 operation 优先，并保留原生/出站行。
+任何 Zulip 来源 UUID（包括任意 UUIDv5），如果不等于完整的旧版身份且没有
+该 operation，都会被视为 operation queue 出现之前 Workspace 发送的歧义
+记录，并中止迁移而不是重置。
 `m_zulip_processed_entities` 绝不能单独作为证据，只能在 source 字段一致
 时提供补充证明。
 

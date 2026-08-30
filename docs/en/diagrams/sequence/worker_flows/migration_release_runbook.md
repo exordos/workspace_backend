@@ -84,22 +84,32 @@ outbound message may acquire provider/account identifiers after echo
 reconciliation. The migration therefore runs a deterministic preflight under
 the same writer freeze and accepts only these combinations:
 
-- inbound message: consistent `source_name` and `source.kind`, a
-  `source.message_id`, plus either a matching Zulip account and
-  `provider_external_id`, a Zulip-owned stream, or corroborating legacy entity
-  evidence;
+- inbound message: consistent `source_name` and `source.kind`, provider message
+  identity from `source.message_id` or the legacy `provider_external_id` (the
+  values must match when both exist), the complete historical Bridge identity
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  plus either a matching Zulip account, a Zulip-owned stream, or corroborating
+  legacy entity evidence;
 - native outbound message: a durable `m_external_operations_v2` row with
   `action=message.create`, matching `target_uuid`, local `owner_user_uuid`, and
   the same account when the message already carries one;
+- legacy native/outbound message created before that operation queue existed:
+  the consistent pair `source_name=native` and `source.kind=native`; provider
+  identifiers attached by later echo reconciliation do not override this pair;
 - external file: a Zulip account, the dedicated external-content storage
   namespace, and no reference from any retained message. A surviving
   `urn:file|image|video:<uuid>` reference always wins and preserves the row and
   physical object.
 
-Any row with partial or contradictory Zulip signals aborts the migration before
-destructive work. A row that simultaneously proves inbound and local-outbound
-origin also aborts. `m_zulip_processed_entities` is never sufficient by itself;
-it is only corroborating evidence alongside consistent source fields.
+Any row with partial or contradictory source or Zulip signals aborts the
+migration before destructive work. When a fully reconciled historical echo has
+both inbound fields and an exact durable `message.create` operation, the
+operation takes precedence and the native/outbound row is retained.
+Likewise, any Zulip-source UUID—including an arbitrary UUIDv5—that does not
+equal the complete legacy identity and lacks that operation is treated as an
+ambiguous pre-operation-queue Workspace send and aborts instead of being reset.
+`m_zulip_processed_entities` is never sufficient by itself; it is only
+corroborating evidence alongside consistent source fields.
 
 Provider-origin reactions are removed through their Zulip account provenance,
 including reactions attached to retained native/outbound messages. Native

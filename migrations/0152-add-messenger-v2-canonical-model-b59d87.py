@@ -124,11 +124,50 @@ IN SHARE ROW EXCLUSIVE MODE;
 
 SET LOCAL lock_timeout = '0';
 
+CREATE OR REPLACE FUNCTION messenger_uuid_v5(namespace_uuid uuid, name text)
+RETURNS uuid
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+DECLARE
+    value bytea;
+BEGIN
+    value := substring(
+        digest(uuid_send(namespace_uuid) || convert_to(name, 'UTF8'), 'sha1')
+        FROM 1 FOR 16
+    );
+    value := set_byte(value, 6, (get_byte(value, 6) & 15) | 80);
+    value := set_byte(value, 8, (get_byte(value, 8) & 63) | 128);
+    RETURN encode(value, 'hex')::uuid;
+END;
+$$;
+
+-- workspace_zulip_bridge <= 0.0.45 assigned imported provider messages this
+-- exact account-scoped identity.  Recomputing the complete legacy identity is
+-- the destructive-reset proof; merely observing a UUID version is not.
+CREATE OR REPLACE FUNCTION messenger_v2_legacy_zulip_message_uuid(
+    account_uuid uuid,
+    provider_message_id text
+)
+RETURNS uuid
+LANGUAGE sql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+AS $$
+    SELECT messenger_uuid_v5(
+        '9a1d0e75-50a5-413c-b3e8-d070232ef57f'::uuid,
+        'zulip:' || account_uuid::text || ':message:' || provider_message_id
+    );
+$$;
+
 -- Fail closed before destructive work unless every row carrying any Zulip
--- signal has either consistent inbound provenance or a durable local
--- message.create operation.  source_name alone is intentionally insufficient:
--- old deployments may have incomplete source fields, while local outbound
--- messages acquire provider identifiers after their echo is reconciled.
+-- signal has consistent native provenance, consistent inbound provenance, or a
+-- durable local message.create operation.  The paired native source fields are
+-- authoritative for rows created before the outbound operation queue existed;
+-- provider identifiers may be attached later when their echo is reconciled.
 DO $messenger_v2_message_provenance_guard$
 BEGIN
     IF EXISTS (
@@ -146,10 +185,29 @@ BEGIN
               )
           AND NOT (
                 (
+                    message.source_name = 'native'
+                    AND message.source->>'kind' = 'native'
+                )
+                OR
+                (
                     message.source_name = 'zulip'
                     AND message.source->>'kind' = 'zulip'
-                    AND message.source->>'message_id' IS NOT NULL
+                    -- Only the complete historical Bridge identity proves an
+                    -- inbound import.  Arbitrary UUIDv5 rows remain ambiguous.
+                    AND message.external_account_uuid IS NOT NULL
+                    AND message.provider_external_id ~ '^(0|[1-9][0-9]*)$'
+                    AND message.uuid =
+                        messenger_v2_legacy_zulip_message_uuid(
+                            message.external_account_uuid,
+                            message.provider_external_id
+                        )
+                    AND COALESCE(
+                            message.source->>'message_id',
+                            message.provider_external_id
+                        ) IS NOT NULL
                     AND (
+                        message.source->>'message_id' IS NULL
+                        OR
                         message.provider_external_id IS NULL
                         OR message.provider_external_id =
                            message.source->>'message_id'
@@ -167,8 +225,12 @@ BEGIN
                     AND (
                         (
                             message.external_account_uuid IS NOT NULL
-                            AND message.provider_external_id =
-                                message.source->>'message_id'
+                            AND message.provider_external_id IS NOT NULL
+                            AND (
+                                message.source->>'message_id' IS NULL
+                                OR message.provider_external_id =
+                                   message.source->>'message_id'
+                            )
                             AND EXISTS (
                                 SELECT 1
                                 FROM m_external_accounts_v2 AS account
@@ -214,29 +276,6 @@ BEGIN
             MESSAGE = 'messenger v2 migration blocked: ambiguous legacy Zulip message provenance';
     END IF;
 
-    IF EXISTS (
-        SELECT 1
-        FROM m_workspace_messages AS message
-        WHERE message.source_name = 'zulip'
-          AND message.source->>'kind' = 'zulip'
-          AND EXISTS (
-                SELECT 1
-                FROM m_external_operations_v2 AS operation
-                WHERE operation.action = 'message.create'
-                  AND operation.target_type = 'message'
-                  AND operation.target_uuid = message.uuid
-                  AND operation.owner_user_uuid = message.user_uuid
-                  AND (
-                        message.external_account_uuid IS NULL
-                        OR operation.external_account_uuid =
-                           message.external_account_uuid
-                      )
-          )
-    ) THEN
-        RAISE EXCEPTION USING
-            ERRCODE = '23514',
-            MESSAGE = 'messenger v2 migration blocked: conflicting inbound and local outbound message provenance';
-    END IF;
 END
 $messenger_v2_message_provenance_guard$;
 
@@ -296,26 +335,6 @@ JOIN m_workspace_users AS existing_user
   ON existing_user.uuid = project_users.user_uuid
 WHERE project_users.user_uuid IS NOT NULL
 ON CONFLICT (project_id, user_uuid) DO NOTHING;
-
-CREATE OR REPLACE FUNCTION messenger_uuid_v5(namespace_uuid uuid, name text)
-RETURNS uuid
-LANGUAGE plpgsql
-IMMUTABLE
-STRICT
-PARALLEL SAFE
-AS $$
-DECLARE
-    value bytea;
-BEGIN
-    value := substring(
-        digest(uuid_send(namespace_uuid) || convert_to(name, 'UTF8'), 'sha1')
-        FROM 1 FOR 16
-    );
-    value := set_byte(value, 6, (get_byte(value, 6) & 15) | 80);
-    value := set_byte(value, 8, (get_byte(value, 8) & 63) | 128);
-    RETURN encode(value, 'hex')::uuid;
-END;
-$$;
 
 CREATE OR REPLACE FUNCTION messenger_v2_provider_message_uuid(
     provider_metadata jsonb,
@@ -385,8 +404,19 @@ SELECT message.project_id, message.uuid
 FROM m_workspace_messages AS message
 WHERE message.source_name = 'zulip'
   AND message.source->>'kind' = 'zulip'
-  AND message.source->>'message_id' IS NOT NULL
+  AND message.external_account_uuid IS NOT NULL
+  AND message.provider_external_id ~ '^(0|[1-9][0-9]*)$'
+  AND message.uuid = messenger_v2_legacy_zulip_message_uuid(
+        message.external_account_uuid,
+        message.provider_external_id
+      )
+  AND COALESCE(
+        message.source->>'message_id',
+        message.provider_external_id
+      ) IS NOT NULL
   AND (
+        message.source->>'message_id' IS NULL
+        OR
         message.provider_external_id IS NULL
         OR message.provider_external_id = message.source->>'message_id'
       )
@@ -402,7 +432,11 @@ WHERE message.source_name = 'zulip'
   AND (
         (
             message.external_account_uuid IS NOT NULL
-            AND message.provider_external_id = message.source->>'message_id'
+            AND message.provider_external_id IS NOT NULL
+            AND (
+                message.source->>'message_id' IS NULL
+                OR message.provider_external_id = message.source->>'message_id'
+            )
             AND EXISTS (
                 SELECT 1
                 FROM m_external_accounts_v2 AS account
@@ -5416,6 +5450,7 @@ ALTER TABLE m_external_accounts_v2
 ALTER TABLE m_external_accounts_v2
     DROP COLUMN IF EXISTS projection_reset_generation;
 DROP FUNCTION IF EXISTS messenger_v2_provider_message_uuid(jsonb, text, uuid);
+DROP FUNCTION IF EXISTS messenger_v2_legacy_zulip_message_uuid(uuid, text);
 DROP FUNCTION IF EXISTS messenger_uuid_v5(uuid, text);
 """
 

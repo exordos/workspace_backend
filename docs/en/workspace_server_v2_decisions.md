@@ -251,9 +251,19 @@ Clarification after the decisions `1B`–`5A`:
   not in realtime loop; global short-stop control-plane writers easier and
   Cheaper than the permanent additional commit-order infrastructure;
 - destructive reset is fail-closed: consistent `source_name`, `source.kind`,
-  `source.message_id`, account/provider evidence and durable
+  message identity from `source.message_id` or legacy `provider_external_id`,
+  exact legacy Bridge identity
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  account/provider evidence and durable
   `action=message.create` evidence distinguish inbound projection from native
-  outbound data. Partial or contradictory provenance aborts before deletion;
+  outbound data. The consistent `native`/`native` source pair also preserves
+  legacy outbound rows created before the durable operation queue existed;
+  provider identifiers attached later do not override it. An exact durable
+  operation also takes precedence for a historical echo carrying inbound
+  fields. Any Zulip-source UUID, including an arbitrary UUIDv5, that does not
+  equal the complete legacy identity and lacks that operation is ambiguous and
+  aborts before deletion. Partial or contradictory provenance aborts
+  before deletion;
 - an unattended frozen cutover is limited to one million legacy messages, a
   30-second lock wait and a 30-minute statement deadline. A larger cutover
   requires explicit operator authorization after backup and a production-sized
