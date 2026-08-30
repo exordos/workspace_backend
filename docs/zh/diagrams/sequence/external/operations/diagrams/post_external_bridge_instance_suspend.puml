@@ -1,0 +1,35 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/suspend/invoke
+actor "客户端" as C
+participant "REST / RestAlchemy\n控制器" as API
+database "PostgreSQL\n定律行/阅读行" as DB
+queue "Immutable outbox event\n+ delivery_snapshot_event 1:1" as O
+participant "工作者/管理者\n提供商处理器" as W
+
+C -> API: 查询 POST + bearer-标志物 IAM
+activate API
+API -> DB: 封锁/检查规范区域
+API -> DB: 记录状态变化
+API -> O: event -> delivery_snapshot_event(outbox_event_uuid)
+DB --> API: 已被记录的状态
+O --> API: 已固定的记录
+API --> C: 卫生照 200
+deactivate API
+W -> O: claim exact scope; lease/fencing/retry/DLQ
+W -> DB: 能够更新投影或控制
+DB --> W: 已确定的物质化状态
+note right of W
+  如果工作涉及到安置 Messenger:
+  一个插槽独占所有 (project_id, topic_uuid)
+  并且处理 MESSAGE.created_at DESC.
+  提供商的管理工作保持了自己的稳定秩序.
+end note
+
+note over API,DB
+  公开链接 UUID 是一个直角 UUID-属性.
+  物理列 *_uuid 仍然是索引 FK.
+end note
+@enduml

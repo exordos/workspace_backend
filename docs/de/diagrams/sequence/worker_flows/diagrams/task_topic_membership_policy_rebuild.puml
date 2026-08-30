@@ -1,0 +1,52 @@
+@startuml task_topic_membership_policy_rebuild
+!pragma layout smetana
+title Typisierte Projektionsvorgabe: topic_membership_policy_rebuild
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Outbox Mitgliedschaft/Politik" as OUTBOX
+participant "Aufgabenprojektor" as PROJECTOR
+database "Typisierte Aufgaben" as TASKS
+database "Thema-Aufnahme" as CLAIM
+participant "Ein Schlitz für den Worker" as WORKER
+database "Letzte Mitgliedschaft/Politik" as POLICY
+database "MESSAGE_PLACEMENT" as PLACEMENTS
+database "USER_TOPIC_BINDING\nUSER_MESSAGE_BINDING" as BINDINGS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket" as DISPATCHER
+actor "Der Client" as Client
+
+OUTBOX -> PROJECTOR : registriertes Mitglied/Politikereignis
+PROJECTOR -> TASKS : immutable topic_membership_policy_rebuild\n(outbox_event_uuid, scope=topic)\nunique derivation; Ohne coalescing
+TASKS -> WORKER : offensichtlicher Themenbereich
+WORKER -> CLAIM : Monopol (Projekt, Thema)
+WORKER -> POLICY : active membership + expected generation
+WORKER -> PLACEMENTS : die offensichtlichen Platzierungen lesen
+note right of PLACEMENTS
+  Massenordnung nach MESSAGE.created_at DESC:
+  14:20 -> 14:19 -> 14:15
+end note
+group Einer DB transaction
+  loop Betroffene Nutzer/Einrichtungen
+    WORKER -> BINDINGS : conditional upsert - und generation equality;\nstale task = no-op
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events exact scopes:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : Sie müssen sicher freigelassen werden.
+EVENTS -> DISPATCHER : Nachhaltige Aufzeichnungen
+DISPATCHER -> Client : Senden / Wiederholen / Wiedergeben
+
+note over TASKS,BINDINGS
+  Das ist es. exact topic-scope protocol Dienstleistungen für Einzelpersonen
+  TASK_KIND topic_state_projection für ready topic.updated;
+  authoritative TOPIC.is_done nur von einem Synchronbefehl geändert.
+  Revoke active=false + generation++ Synchronisiert;
+  stale rows nicht zugänglich machen und cleanup Nein . security boundary.
+  Topic worker shared rows Schreibt nicht..
+  Lease expiry/fencing, retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+
+@enduml

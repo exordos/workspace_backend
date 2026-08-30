@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title GET /api/workspace/v1/epoch/
+actor "客户端" as C
+participant "REST / RestAlchemy\n控制器" as API
+database "PostgreSQL\n定律行/阅读行" as DB
+
+C -> API: 查询 GET + bearer-标志物 IAM
+activate API
+API -> DB: 给定的区域的索引读数
+DB --> API: 卫生化规范/物质化的行
+note right of API
+  没有记录, outbox, 任务, fan-out,
+  提供商调用, COUNT/GROUP BY
+  或在查询路径中修改.
+end note
+API --> C: 公开的答案 200
+deactivate API
+
+note over API,DB
+  公开链接 UUID 是一个直角 UUID-属性.
+  物理列 *_uuid 仍然是索引 FK.
+end note
+@enduml

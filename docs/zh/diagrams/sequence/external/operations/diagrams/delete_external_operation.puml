@@ -1,0 +1,43 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title DELETE /api/workspace/v1/messenger/external_operations/{operation_uuid}
+actor "客户端" as C
+participant "REST / RestAlchemy\n控制器" as API
+database "PostgreSQL\n定律行/阅读行" as DB
+queue "Immutable outbox event\n+ delivery_snapshot_event 1:1" as O
+participant "工作者/管理者\n提供商处理器" as W
+database "准备的存储器\n公共活动" as E
+participant "控制器\nWebSocket" as D
+actor "连接的客户端" as WC
+
+C -> API: 查询 DELETE + bearer-标志物 IAM
+activate API
+API -> DB: 封锁/检查规范区域
+API -> DB: 记录状态变化
+API -> O: event -> delivery_snapshot_event(outbox_event_uuid)
+DB --> API: 已被记录的状态
+O --> API: 已固定的记录
+API --> C: 204 没有身体
+deactivate API
+W -> O: claim exact scope; lease/fencing/retry/DLQ
+group 一个 DB transaction
+  W -> DB: 能够更新投影或控制
+  W -> E: durable ready external_operation.deleted
+end
+note right of W
+  如果工作涉及到安置 Messenger:
+  一个插槽独占所有 (project_id, topic_uuid)
+  并且处理 MESSAGE.created_at DESC.
+  提供商的管理工作保持了自己的稳定秩序.
+end note
+D -> E: 播放下一个可见时代
+E --> D: 事件的平面图片
+D --> WC: 事件 WebSocket / 重复
+
+note over API,DB
+  公开链接 UUID 是一个直角 UUID-属性.
+  物理列 *_uuid 仍然是索引 FK.
+end note
+@enduml

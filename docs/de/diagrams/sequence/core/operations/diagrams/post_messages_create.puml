@@ -1,0 +1,39 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/
+actor "Der Client" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/
+API -> DB: Eine Transaktion: MESSAGE + - die TOPIC placement(UUIDv5)\n+ Autoren USER_MESSAGE_BINDING + USER_MESSAGE_STATE
+API -> DB: immutable outbox event für jede typed task
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgestellte Ereignisse
+Outbox ->> Worker: fanout / content_mentions / read_counters /\nfolder_projection / delivery_snapshot_event\njede task hat seine outbox_event_uuid
+Worker -> Worker: topic newest-first; recipient batches user_uuid ASC\ndefault 1000, max 5000; bounded fairness
+alt Streaming mit sich selbst
+    Worker -> Projection: Keine zusätzlichen USER_MESSAGE_BINDING\noder USER_MESSAGE_STATE; Die Eigentümerprojektionen aktualisieren
+else übliche/direkte Platzierung
+    Worker -> DB: keyset batch; active membership + expected generation
+    group Einer batch DB transaction
+      Worker -> Projection: bulk binding + state + downstream work
+      Worker -> Events: durable ready rows + checkpoint / next batch
+    end
+end
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Projection
+  Public uuid = MESSAGE_PLACEMENT.uuid =
+  UUIDv5(namespace=TOPIC.uuid, name=MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  MESSAGE.uuid und binding_uuid Verborgen.
+  Lease/fencing, retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+@enduml

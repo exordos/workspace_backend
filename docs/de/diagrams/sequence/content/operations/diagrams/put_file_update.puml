@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title PUT /api/workspace/v1/messenger/files/{file_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Einstellungen für den Dateispeicher" as STORE
+database "Metadaten der Datei + ACL in PostgreSQL" as DB
+queue "Transaktions- outbox" as OUT
+queue "delivery_snapshot_event\nexact file scope" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: PUT JSON Metadaten
+API -> DB: BEGIN; die Eigentümerdatei sperren
+API -> DB: Metadaten aktualisieren
+API -> STORE: die zugehörigen Metadaten aktualisieren
+API -> OUT: Hinzufügen file.updated
+API -> DB: COMMIT
+API --> Client: 200 JSON Metadaten
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: Ich will die Arbeit ergreifen.
+WORKER -> EVENT: bereit sein file.updated
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: file.updated
+@enduml

@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/files/{file_uuid}/actions/download
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "Метаданные файла + ACL в PostgreSQL" as DB
+database "Настроенное файловое хранилище" as STORE
+Client -> API: GET скачивания
+API -> DB: индексированные метаданные + проверка ACL
+DB --> API: locator хранилища + hash
+API -> STORE: прочитать неизменяемые байты
+STORE --> API: байты
+note right of API: без outbox / задачи / события
+API --> Client: 200 байты + ETag
+@enduml

@@ -1,0 +1,13 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/services/{service_uuid}
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: The request
+API -> DB: - It 's indexed . SELECT
+DB --> API: public lines
+note right of API: without outbox / tasks / events
+API --> Client: 200 JSON
+@enduml

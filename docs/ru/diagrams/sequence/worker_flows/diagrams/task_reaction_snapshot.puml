@@ -1,0 +1,41 @@
+@startuml task_reaction_snapshot
+!pragma layout smetana
+title Типизированная задача проекции: reaction_snapshot
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Событие outbox о факте реакции" as OUTBOX
+participant "Проектор задач" as PROJECTOR
+database "Типизированные задачи" as TASKS
+database "Scope message\nlease + fencing" as CLAIM
+participant "Слот воркера\n(единственный автор снимка)" as WORKER
+database "MESSAGE_REACTION_FACT" as FACTS
+database "MESSAGE\nreactions + reaction_users" as MESSAGE
+database "Хранилище публичных событий" as EVENTS
+participant "Диспетчер WebSocket" as DISPATCHER
+actor "Клиент" as Client
+
+OUTBOX -> PROJECTOR : факт создан/изменён/удалён
+PROJECTOR -> TASKS : immutable reaction_snapshot(outbox_event_uuid)\nscope=message; без coalescing
+TASKS -> WORKER : (project_id, canonical_message_uuid)
+WORKER -> CLAIM : получить монопольное владение exact key
+WORKER -> FACTS : прочитать последние факты сообщения
+FACTS --> WORKER : канонический набор фактов реакций
+group одна DB transaction
+  WORKER -> MESSAGE : атомарно заменить оба снимка
+  WORKER -> EVENTS : durable ready message.updated; unique derivation
+end
+WORKER -> CLAIM : освободить
+EVENTS -> DISPATCHER : устойчивая готовая запись
+DISPATCHER -> Client : отправить / повторить / воспроизвести
+
+note over FACTS,MESSAGE
+  Факты являются источником истины.
+  API не выполняет цикл чтение-изменение-запись JSON-снимка.
+  API чтения не агрегирует факты.
+  Topic lock не используется для canonical MESSAGE snapshot.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper обязательны.
+end note
+
+@enduml

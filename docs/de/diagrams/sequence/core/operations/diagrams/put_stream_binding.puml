@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/stream_bindings/[binding_uuid]
+actor "Der Client" as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: PUT /api/workspace/v1/messenger/stream_bindings/{binding_uuid}
+API -> DB: lock/update persistent USER_STREAM_BINDING;\nauthorization change => generation++
+API -> DB: immutable outbox event für jede typed task
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: topic_membership_policy_rebuild / read_counters /\nfolder_projection / delivery_snapshot_event\njede task hat seine outbox_event_uuid
+Worker -> Worker: topic scope: placement access;\nuser-stream/user-topic/user-folder: shared rows
+Worker -> DB: conditional generation; stale task = no-op
+Worker -> Projection: Zugriff auf das Thema + bereitgestellte Zähler
+Worker -> Events: Verbindungs-/Flow-Ereignisse\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Einer fenced owner exact scope key; - verschiedene scopes Parallel.
+  Lease expiry, retry/backoff, DLQ und reaper - Sie sind verpflichtend.
+end note
+@enduml

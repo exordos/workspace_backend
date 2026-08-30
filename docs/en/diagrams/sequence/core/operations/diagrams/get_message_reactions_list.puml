@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/message_reactions/
+actor "The client ." as Client
+participant "WorkspaceMessageReactionController\nRestAlchemy" as API
+database "Indexed public presentation\n+ physical lines of external keys" as DB
+Client -> API: GET /api/workspace/v1/messenger/message_reactions/
+note right of API: Target page_limit: omitted/0=100; 1..500 exact; invalid/>500=400
+API -> DB: message_uuid = public placement UUID;\njoin active stream membership + generation
+DB --> API: lines without calculations
+API --> Client: 200, public JSON
+note over API,DB
+No recording . / transactional outbox / The background artist / the events
+No aggregating or restoring during query
+Canonical-global reaction audience between placements It was taken intentionally .;
+placement UUID It 's only used for access check.
+end note
+@enduml

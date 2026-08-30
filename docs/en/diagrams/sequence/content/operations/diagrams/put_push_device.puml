@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title PUT /api/workspace/v1/push_devices/{registration_uuid}
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "The device push-The notification PostgreSQL" as DB
+queue "Internal domain name outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: PUT I 'm not sure . JSON The registration
+API -> DB: BEGIN; block the owner area
+API -> DB: Insert or replace UUID The registration
+API -> OUT: Add an internal insert/update to the registry
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; Finish without public event row
+API --> Client: 201 or 200 JSON
+@enduml

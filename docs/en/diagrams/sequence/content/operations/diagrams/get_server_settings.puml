@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/server_settings
+actor "The client ." as Client
+participant "ServerSettingsMiddleware" as API
+Client -> API: GET /api/workspace/v1/messenger/server_settings
+API -> API: normalize the path and calculate realm
+note right of API
+  The canonical endpoint is above
+  Finishing / receiving the same operation: 200 Without redirection
+end note
+API -> API: Form a fixed object of settings
+note right of API: Anonymously; Without the DB / outbox / tasks / events
+API --> Client: 200 JSON settings
+@enduml

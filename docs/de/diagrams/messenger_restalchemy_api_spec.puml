@@ -1,0 +1,340 @@
+@startuml messenger_restalchemy_api_spec
+!pragma layout smetana
+
+title Projektspezifikation Messenger RestAlchemy API
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam package {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam class {
+    BackgroundColor #EFF6FF
+    BorderColor #2563EB
+    FontColor #1E3A8A
+}
+skinparam entity {
+    BackgroundColor #FFFFFF
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+package "1. Geltende öffentliche Routen\n(Der Vertrag ändert sich nicht.)" as ROUTES {
+    class "/messages/ CRUD\nread/read_up_to/star/unstar" as R_MESSAGE
+    class "/message_reactions/ CRUD" as R_REACTION
+    class "/streams/ CRUD + actions" as R_STREAM
+    class "/stream_bindings/ R/U/D" as R_STREAM_BINDING
+    class "/stream_topics/ CRUD + actions" as R_TOPIC
+    class "/folders/ CRUD\n/folder_items/ CRUD + pin/unpin" as R_FOLDER
+    class "/users/ + /me/ + actions" as R_USER
+    class "GET /server_settings\ntrailing slash wird mit middleware" as R_SERVER
+}
+
+package "2. Standard RestAlchemy resource/controller" as RA {
+    class "WorkspaceMessageController\nWegadapter für placement UUID\nResourceByRAModel(WorkspaceUserMessage)" as C_MESSAGE
+    class "WorkspaceMessageReactionController\nResourceByRAModel(WorkspaceMessageReactionView)\nmit Pagina" as C_REACTION
+    class "WorkspaceStreamController\nResourceByRAModel(WorkspaceUserStream)\nmit Pagina" as C_STREAM
+    class "WorkspaceStreamBindingController\nResourceByRAModel(WorkspaceStreamBindingView)\nmit Pagina" as C_STREAM_BINDING
+    class "WorkspaceStreamTopicController\nResourceByRAModel(WorkspaceUserTopic)\nmit Pagina" as C_TOPIC
+    class "WorkspaceFolderController\nResourceByRAModel(WorkspaceUserFolder)\nmit Pagina" as C_FOLDER
+    class "WorkspaceUserController / MeController\nResourceByRAModel(WorkspaceUser)\nPagination/Direkter Zugriff" as C_USER
+    class "ServerSettingsMiddleware\nEine direkte Antwort\nohne Modell RestAlchemy" as C_SERVER
+}
+
+package "3. Lese- und Berechnungsmodelle" as VIEWS {
+    entity "messenger_api_user_messages_v1\nWurzeln: USER_MESSAGE_BINDING\nplacement.uuid -> öffentlich uuid\nbinding.uuid -> Verborgen ORM-Schlüssel" as V_MESSAGE
+    entity "messenger_api_message_reactions_v1\nWurzeln: Die Reaktion ist nicht verursacht." as V_REACTION
+    entity "messenger_api_user_streams_v1\nWurzeln: einzigartige Verbindung user/stream" as V_STREAM
+    entity "messenger_api_stream_bindings_v1\nWurzeln: Sichtbarer Zeil-Adapter binding" as V_STREAM_BINDING
+    entity "messenger_api_user_topics_v1\nWurzeln: einzigartige Verbindung user/topic" as V_TOPIC
+    entity "messenger_api_user_folders_v1\nWurzeln: einzigartige Verbindung user/folder" as V_FOLDER
+}
+
+package "4. Proposal: - physische SQL-storable - und" as PHYSICAL {
+    entity "MESSAGE\nmessenger_messages" as MESSAGE {
+        uuid : UUID <<PK, - Innen canonical ID>>
+        project_id
+        author
+        payload / source
+        external_account_uuid / provider_external_id <<hidden>>
+        provider / delivery
+        reactions / reaction_users
+        created_at / updated_at <<öffentliche>>
+    }
+
+    entity "MESSAGE_PLACEMENT\nmessenger_message_placements" as MESSAGE_PLACEMENT {
+        uuid <<öffentlich UUIDv5 placement>>
+        message_uuid <<FK>>
+        stream / topic <<FK>>
+        Einzigartig: project + message + stream + topic
+    }
+
+    entity "USER_MESSAGE_BINDING\nmessenger_user_message_bindings" as USER_MESSAGE_BINDING {
+        uuid <<Verborgen identity ORM-Zeilen>>
+        placement_uuid / user_uuid <<FK>>
+        relation_role / visibility / permissions
+        membership_generation snapshot
+        Einzigartig: project + placement + user
+        Ohne revision
+    }
+
+    entity "USER_MESSAGE_STATE\nmessenger_user_message_states" as USER_MESSAGE_STATE {
+        placement_uuid / user_uuid <<FK>>
+        membership_generation <<snapshot>>
+        read / mentioned / starred / pinned
+        Einzigartig: project + user + placement
+    }
+
+    entity "MESSAGE_REACTION_FACT\nmessenger_message_reaction_facts\nEinzigartig: project + message + user + emoji" as REACTION_FACT
+    entity "STREAM\nmessenger_streams" as STREAM {
+        owner_uuid <<- und nicht FK - Auf user>>
+        direct_user_uuid <<nullable - und nicht FK - Auf user>>
+        private
+    }
+    entity "USER_STREAM_BINDING\nmessenger_stream_bindings" as STREAM_BINDING {
+        user_uuid / stream_uuid <<Einzigartig, FK>>
+        Einzigartig: project + user + stream
+        role / notification
+        active / membership_generation
+        Nichtgelesenes zählen / last_message_uuid
+    }
+    entity "TOPIC\nmessenger_topics" as TOPIC
+    entity "USER_TOPIC_BINDING\nmessenger_user_topic_bindings" as TOPIC_BINDING {
+        user_uuid / topic_uuid <<Einzigartig, FK>>
+        Einzigartig: project + user + topic
+        Flaggen / notification / Nichtgelesenes zählen
+    }
+    entity "FOLDER\nmessenger_folders" as FOLDER
+    entity "USER_FOLDER_BINDING\nmessenger_user_folder_bindings" as FOLDER_BINDING {
+        user_uuid / folder_uuid <<Einzigartig, FK>>
+        Einzigartig: project + user + folder
+        rule / type
+        unread_count / mention_count
+        folder_items_snapshot : JSONB <<read-only>>
+        snapshot_version / snapshot_updated_at <<internal>>
+    }
+    entity "FOLDER_ITEM\nmessenger_folder_items" as FOLDER_ITEM {
+        user_uuid / folder_uuid / stream_uuid <<FK>>
+        automatic
+        Einzigartig: project + user + folder + stream
+    }
+    entity "USER\nmessenger_users" as USER
+    entity "DOMAIN_OUTBOX_EVENT\nmessenger_domain_outbox_events\nUnveränderlich" as OUTBOX_EVENT
+    entity "PROJECTION_TASK\nmessenger_projection_tasks\n1 immutable task - Auf outbox event" as PROJECTION_TASK {
+        unique outbox_event_uuid
+        scope_kind / exact scope_key
+        pending / leased / running / completed / failed / DLQ
+        lease expiry / owner / fencing token
+        attempts / next_retry_at
+    }
+    entity "SCOPE_LEASE\nmessenger_projection_scope_leases" as SCOPE_LEASE {
+        unique project + scope_kind + scope_key
+        lease owner / expiry / fencing token
+    }
+    entity "PUBLIC_EVENT_RECORD\nm_workspace_events\nwird atomar mit state;\ndispatchable Nachher commit" as PUBLIC_EVENT
+}
+
+package "5. Hintergrundmaterialisierung" as BACKGROUND {
+    class "Schlot worker mit ausschließlichem Besitz exact scope\nLiest den letzten Ausgangszustand ab" as WORKER
+    class "- Ein Dispatcher. WebSocket\nVersenden + Wiederholen + Wiederholen" as WS_DISPATCHER
+}
+
+R_MESSAGE --> C_MESSAGE
+R_REACTION --> C_REACTION
+R_STREAM --> C_STREAM
+R_STREAM_BINDING --> C_STREAM_BINDING
+R_TOPIC --> C_TOPIC
+R_FOLDER --> C_FOLDER
+R_USER --> C_USER
+R_SERVER --> C_SERVER
+
+C_MESSAGE --> V_MESSAGE : Erhalt / Liste
+C_MESSAGE ..> MESSAGE : Erstellen / ändern / löschen
+C_MESSAGE ..> MESSAGE_PLACEMENT : Versand- / Kopierungskontext
+C_MESSAGE ..> USER_MESSAGE_BINDING : Autorenzugriff
+C_MESSAGE ..> USER_MESSAGE_STATE : Autoren user flags
+C_MESSAGE ..> OUTBOX_EVENT : jede Änderung state
+C_REACTION --> V_REACTION : Erhalt / Liste
+C_REACTION ..> REACTION_FACT : Ein Fakt erstellen / ändern / löschen
+C_REACTION ..> USER_MESSAGE_BINDING : Index-Zugriffsprüfung
+C_REACTION ..> OUTBOX_EVENT : Reaktionsereignis
+C_STREAM --> V_STREAM : Erhalt / Liste
+C_STREAM ..> STREAM : Aufzeichnungen / Handlungen
+C_STREAM_BINDING --> V_STREAM_BINDING : Erhalt / Liste
+C_STREAM_BINDING ..> STREAM_BINDING : Änderung / Löschung / add_users
+C_TOPIC --> V_TOPIC : Erhalt / Liste
+C_TOPIC ..> TOPIC : Aufzeichnungen / Handlungen
+C_TOPIC ..> TOPIC_BINDING : Benutzeraktionen
+C_FOLDER --> V_FOLDER : Erhalt / Liste
+C_FOLDER ..> FOLDER : Kanonische Aufzeichnungen
+C_FOLDER ..> FOLDER_BINDING : Gebrauchsgerecht
+C_USER --> USER : Direktempfang / Liste / eigene Handlungen
+
+V_MESSAGE --> USER_MESSAGE_BINDING : - Genau so. 1 Die erste Zeile
+V_MESSAGE --> MESSAGE_PLACEMENT : Ein inktriertes Verbindungsgerät many-to-one
+V_MESSAGE --> USER_MESSAGE_STATE : Ein inktriertes Verbindungsgerät one-to-one\nuser + placement
+V_MESSAGE --> MESSAGE : Ein inktriertes Verbindungsgerät many-to-one
+V_REACTION --> REACTION_FACT : - Genau so. 1 Die führende Tatsache
+V_REACTION --> MESSAGE : Einfach infiziert LEFT JOIN\nProjektion many-to-one
+V_STREAM --> STREAM_BINDING : - Genau so. 1 Die erste Zeile
+V_STREAM --> STREAM : Ein inktriertes Verbindungsgerät\nmany-to-one
+V_STREAM_BINDING --> STREAM_BINDING : Ein inktriertes Verbindungsgerät many-to-one
+V_TOPIC --> TOPIC_BINDING : - Genau so. 1 Die erste Zeile
+V_TOPIC --> TOPIC : Ein inktriertes Verbindungsgerät\nmany-to-one
+V_FOLDER --> FOLDER_BINDING : - Genau so. 1 Die erste Zeile
+V_FOLDER --> FOLDER : Ein inktriertes Verbindungsgerät\nmany-to-one
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : offensichtliche Platzierungen
+MESSAGE_PLACEMENT }o--|| STREAM
+MESSAGE_PLACEMENT }o--|| TOPIC
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : Zugang des Empfängers
+USER_MESSAGE_BINDING }o--|| USER
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : state user/placement
+USER_MESSAGE_STATE }o--|| USER
+REACTION_FACT }o--|| MESSAGE : FK auf das kanonische message
+REACTION_FACT }o--|| USER : Reaktionsschreiber
+STREAM_BINDING }o--|| STREAM
+STREAM_BINDING }o--|| USER
+TOPIC_BINDING }o--|| TOPIC
+TOPIC_BINDING }o--|| USER
+FOLDER_BINDING }o--|| FOLDER
+FOLDER_BINDING }o--|| USER
+FOLDER_ITEM }o--|| FOLDER
+FOLDER_ITEM }o--|| STREAM
+TOPIC }o--|| STREAM
+
+note bottom of V_MESSAGE
+  Öffentlich uuid — MESSAGE_PLACEMENT.uuid.
+  get_id_property = Verborgen binding_uuid
+  Nur als einzigartige technische identity ORM-Zeilen.
+  Adapter URL-Benutzt die Ressource/den Controller placement uuid.
+  Marker tuple: MESSAGE.created_at + placement.uuid.
+  Öffentliche created_at/updated_at Sie kommen aus MESSAGE.
+  Keine Geräte, GROUP BY, Fenster/lateral-Ausdrücke,
+  Korrelatierte Unteranfragen oder fan-out one-to-many.
+end note
+
+note top of MESSAGE_PLACEMENT
+  uuid = UUIDv5(namespace = TOPIC.uuid,
+                name = MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  Name Ohne project/stream/braces/prefix.
+  TOPIC verbindlich, global einzigartig und unveränderlich
+  Gehört einem STREAM/PROJECT.
+  Business key und Komponenten FK Sie bleiben einflussreich.
+end note
+
+note bottom of STREAM_BINDING
+  Persistent membership row: revoke => active=false
+  und monotonic membership_generation++ in API transaction.
+  Message/reaction read Sie verlangt immer active und Gleichheit
+  snapshot generation; stale task Er tut es. no-op.
+end note
+
+note bottom of V_STREAM
+  Öffentlich owner und andere UUID-Verweise —
+  Skalier UUID properties, Nein. URI relationships.
+  Körperliche *_uuid Die Spalten bleiben indexiert FK
+  mit offensichtlichen Verweisintegrations-Aktionen.
+  owner_uuid Wird als öffentlich bezeichnet. owner.
+end note
+
+OUTBOX_EVENT --> PROJECTION_TASK : - Genau so. 1 immutable task - Auf event
+PROJECTION_TASK --> SCOPE_LEASE : claim exact scope key
+SCOPE_LEASE --> WORKER : lease + fencing token
+WORKER --> USER_MESSAGE_BINDING : fanout Ein Bindemittel für placement
+WORKER --> USER_MESSAGE_STATE : - Das ist fertig. state Jeder Empfänger
+REACTION_FACT --> WORKER : Die Tatsachen reaction_snapshot
+WORKER --> MESSAGE : - Ich habe es nicht verstanden. reactions + reaction_users
+WORKER --> STREAM_BINDING : Wir haben alle die realen Zähler.
+WORKER --> TOPIC_BINDING : Wir haben alle die realen Zähler.
+WORKER --> FOLDER_ITEM : folder_projection: normalized source of truth
+WORKER --> FOLDER_BINDING : folder_projection: snapshot + counts + version/time
+WORKER --> PUBLIC_EVENT : Das ist es. DB transaction, Was ist? state
+PUBLIC_EVENT --> WS_DISPATCHER : Bereite Aufzeichnungen
+
+note bottom of WORKER
+  Topic scope — Nur placements/bindings;
+  Innen topic Erst die neueste. MESSAGE.created_at.
+  Message scope — canonical snapshots.
+  user-stream/user-topic/user-folder — shared aggregates.
+  Einer gleichzeitig fenced owner exact key; - verschiedene scopes Parallel.
+  Topic worker Er tut es nicht. unsafe read-modify-write shared rows.
+  Atomic delta Erfordert exactly-once guard Nach outbox_event_uuid;
+  - Nein, sonst nicht. scope worker recomputes/writes.
+  Rohfakt  Quelle der Wahrheit.
+  Die Bilder werden überarbeitet und schließlich abgestimmt.
+  API Er tut es nie. read-modify-write Das ist ein Bild. JSON.
+  Die Elemente der Systemordner werden aus den aktiven
+  user/stream bindings und STREAM mit is_archived = false.
+  All chats: - Das ist alles.; Personal: private = true; Channels: private = false.
+end note
+
+note bottom of PROJECTION_TASK
+  fanout; content_mentions; reaction_snapshot;
+  read_counters; delivery_snapshot_event;
+  topic_membership_policy_rebuild; topic_state_projection;
+  folder_projection.
+  Initial design Ohne coalescing.
+  Unique outbox_event_uuid; duplicate derivation = no-op.
+  Lease/fencing; retry/backoff; max attempts/DLQ;
+  reaper/reconciliation; idempotent handlers.
+  Einer task - Auf event, coalescing nicht vorhanden.
+end note
+
+note right of FOLDER_BINDING
+  Public folder_items <- ready JSONB folder_items_snapshot; empty = [].
+  FOLDER_ITEM is normalized source of truth.
+  Stable serializer includes exact public item fields and ready stream counts.
+  API reads one indexed row/page: no N+1/json_agg/COUNT/custom SQL.
+  One user-folder worker transaction commits snapshot + counts
+  + version/updated_at + all ready event rows; dispatcher only after commit.
+end note
+
+note bottom of C_MESSAGE
+  Synchronisiert verschicken:
+  MESSAGE + MESSAGE_PLACEMENT + Autoren
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + OUTBOX.
+  Paare binding/state Die Empfänger werden asynchron erstellt.
+  GET/list Sie haben nie Aufgaben erstellt..
+  Wirksam custom SQL-Speicher nicht gespeichert.
+end note
+
+note bottom of C_STREAM
+  Wenn direct_user_uuid - Das ist es., private = true.
+  direct_user_uuid = - Das ist nicht wahr . owner => self-chat:
+  - Sie ist genau eins. binding Eigentümer und ein sichtbarer Teilnehmer.
+  Versand in self-chat Er erzeugt nur binding/state - Der Autor;
+  fanout Erstellt die Empfänger 0 Zusätzliche Zeilen.
+end note
+
+note bottom of WS_DISPATCHER
+  Worker Die Projektionen sind nicht mit Netzwerkverbindungen verbunden.
+  Der Controller sendet, wiederholt und spielt vorbereitete Ereignisse.
+end note
+
+note bottom of PHYSICAL
+  Die Namen wurden für proposal; In dieser Phase gibt es keine Migration..
+  Die Container-Aggregate leben in einzigartigen user bindings.
+  Es gibt keine separaten Tabellen . state.
+  Message bindings Sie halten niemals Containerzähler auf..
+end note
+
+note bottom of RA
+  Target list pagination: omitted/0 = 100; 1..500 wird genau angenommen;
+  negative/non-integer/>500 = HTTP 400; unlimited mode nicht vorhanden.
+  Jetzt nicht mehr da/0 Es gibt unbegrenzte Lesbarkeit, und zu viel Wert ist nicht begrenzt.:
+  Das ist ein bestätigter Lückenbereich in der aktuellen Umsetzung, nicht proposal.
+end note
+
+@enduml

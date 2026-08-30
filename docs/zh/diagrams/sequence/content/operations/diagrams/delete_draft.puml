@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/messenger/drafts/{draft_uuid}
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "草稿行 PostgreSQL" as DB
+queue "内部域名 outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: DELETE + If-Match
+API -> DB: BEGIN; 封锁和对比修改
+API -> DB: 物理删除草图
+API -> OUT: 增加内置 draft.deleted
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; 没有完成 public event row
+API --> Client: 204 没有答案
+@enduml

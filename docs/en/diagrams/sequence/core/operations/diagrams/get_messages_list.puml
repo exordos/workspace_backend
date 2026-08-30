@@ -1,0 +1,21 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/messages/
+actor "The client ." as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "Indicated user messages\n+ physical lines of external keys" as DB
+
+Client -> API: GET /messages/ + Filters and markers
+API -> DB: public placement marker + project/user scope;\njoin active stream membership + generation
+DB --> API: lines without calculations; uuid=PLACEMENT.uuid;\ncreated_at/updated_at from canonical MESSAGE
+API --> Client: 200, public JSON\n- What ? X-Pagination-*
+
+note over API,DB
+No recording ., transactional outbox, a task, background artist or event
+No , I 'm not . COUNT / GROUP BY / Restore during request
+Hidden binding_uuid serves as the internal identifier of the line only
+Marker tuple = (MESSAGE.created_at, MESSAGE_PLACEMENT.uuid)
+Current behavior: not present/0 page_limit => without limitation; There 's no hard maximum for positive .
+Target: There is no/0 => 100; 1..500 That 's right .; Otherwise 400; unlimited No , I 'm not .
+end note
+@enduml

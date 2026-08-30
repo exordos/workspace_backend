@@ -1,0 +1,64 @@
+@startuml task_read_counters
+!pragma layout smetana
+title Typed tasks: read_counters / folder_projection
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Recorded events outbox\nfanout/read/hide/move/delete" as OUTBOX
+participant "Task projector" as PROJECTOR
+database "Immutable tasks\n1 I 'm on outbox event/scope" as TASKS
+database "Rented exact scope key\nlease + fencing" as CLAIM
+participant "The worker's slot." as WORKER
+database "The facts of the message + read_at\nAccess + policy" as SOURCE
+database "Active USER_STREAM_BINDING\n+ STREAM.is_archived/private" as STREAM_SOURCE
+database "FOLDER + normalized FOLDER_ITEM\nsource of truth" as FOLDERS
+database "USER_STREAM_BINDING" as STREAM_BINDING
+database "USER_TOPIC_BINDING" as TOPIC_BINDING
+database "USER_FOLDER_BINDING" as FOLDER_BINDING
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket" as DISPATCHER
+actor "The client ." as Client
+
+OUTBOX -> PROJECTOR : The impact of the events that have been recorded
+PROJECTOR -> TASKS : immutable folder_projection for the folder\nuser-folder scope; unique derivation; without coalescing
+TASKS -> WORKER : Clearly affected areas
+WORKER -> CLAIM : Monopoly user-stream / user-topic / user-folder
+WORKER -> SOURCE : Read the last state of the original
+WORKER -> STREAM_SOURCE : Read the active link + canonical STREAM
+WORKER -> STREAM_BINDING : I'm ready to count.
+WORKER -> TOPIC_BINDING : We 're going to have a lot of potential topic counters .
+group One . worker DB transaction
+  WORKER -> FOLDERS : We can add/delete automatic FOLDER_ITEM
+  WORKER -> FOLDER_BINDING : deterministic folder_items_snapshot + counts\nversion/snapshot_updated_at; empty=[]
+  WORKER -> EVENTS : ready stream.updated / topic.updated / folder.updated\nand folder_item.deleted, When it 's announced contract operation\nunique derivation/effect key
+end
+WORKER -> CLAIM : I 'm going to get out .
+EVENTS -> DISPATCHER : Only after commit: - I 'm not sure .
+DISPATCHER -> Client : Send / repeat / play
+
+note over SOURCE,FOLDER_BINDING
+  Container aggregates are not stored in message binding/state.
+  USER_FOLDER_BINDING keeps access, personal status
+  and ready units + read-only folder_items_snapshot.
+  Public folder_items It 's showing exactly snapshot; empty=[].
+  API He 's reading one . indexed row/page, without N+1/json_agg/COUNT/custom SQL.
+  Correction / rearrangement is only done in the background.
+  Topic-worker He doesn't write these. shared rows.
+  Atomic delta It requires exactly-once effect guard The outbox_event_uuid;
+  Otherwise scope worker recomputes/writes.
+  Lifecycle: lease expiry/fencing, retry/backoff, DLQ/reaper.
+end note
+
+note over STREAM_SOURCE,FOLDERS
+  The predicate: active USER_STREAM_BINDING + STREAM.is_archived=false.
+  All chats = All these lines..
+  Personal = I 'm just STREAM.private=true.
+  Channels = I 'm just STREAM.private=false.
+  The client query doesn 't calculate this composition ..
+  Stable order: pinned_at DESC first; then
+  order_index ASC NULLS LAST, created_at ASC, uuid ASC.
+  No silent truncation; exact count/byte hard limits remain required.
+end note
+
+@enduml

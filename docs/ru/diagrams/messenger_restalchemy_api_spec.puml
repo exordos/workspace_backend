@@ -1,0 +1,340 @@
+@startuml messenger_restalchemy_api_spec
+!pragma layout smetana
+
+title Проектная спецификация Messenger RestAlchemy API
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam package {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam class {
+    BackgroundColor #EFF6FF
+    BorderColor #2563EB
+    FontColor #1E3A8A
+}
+skinparam entity {
+    BackgroundColor #FFFFFF
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+package "1. Действующие публичные маршруты\n(контракт не меняется)" as ROUTES {
+    class "/messages/ CRUD\nread/read_up_to/star/unstar" as R_MESSAGE
+    class "/message_reactions/ CRUD" as R_REACTION
+    class "/streams/ CRUD + actions" as R_STREAM
+    class "/stream_bindings/ R/U/D" as R_STREAM_BINDING
+    class "/stream_topics/ CRUD + actions" as R_TOPIC
+    class "/folders/ CRUD\n/folder_items/ CRUD + pin/unpin" as R_FOLDER
+    class "/users/ + /me/ + actions" as R_USER
+    class "GET /server_settings\ntrailing slash принимается тем же middleware" as R_SERVER
+}
+
+package "2. Стандартный RestAlchemy resource/controller" as RA {
+    class "WorkspaceMessageController\nадаптер маршрута для placement UUID\nResourceByRAModel(WorkspaceUserMessage)" as C_MESSAGE
+    class "WorkspaceMessageReactionController\nResourceByRAModel(WorkspaceMessageReactionView)\nс пагинацией" as C_REACTION
+    class "WorkspaceStreamController\nResourceByRAModel(WorkspaceUserStream)\nс пагинацией" as C_STREAM
+    class "WorkspaceStreamBindingController\nResourceByRAModel(WorkspaceStreamBindingView)\nс пагинацией" as C_STREAM_BINDING
+    class "WorkspaceStreamTopicController\nResourceByRAModel(WorkspaceUserTopic)\nс пагинацией" as C_TOPIC
+    class "WorkspaceFolderController\nResourceByRAModel(WorkspaceUserFolder)\nс пагинацией" as C_FOLDER
+    class "WorkspaceUserController / MeController\nResourceByRAModel(WorkspaceUser)\nпагинация/прямой доступ" as C_USER
+    class "ServerSettingsMiddleware\nпрямой действующий ответ\nбез модели RestAlchemy" as C_SERVER
+}
+
+package "3. Модели чтения без вычислений" as VIEWS {
+    entity "messenger_api_user_messages_v1\nкорень: USER_MESSAGE_BINDING\nplacement.uuid -> публичный uuid\nbinding.uuid -> скрытый ORM-ключ" as V_MESSAGE
+    entity "messenger_api_message_reactions_v1\nкорень: сырой факт реакции" as V_REACTION
+    entity "messenger_api_user_streams_v1\nкорень: уникальная привязка user/stream" as V_STREAM
+    entity "messenger_api_stream_bindings_v1\nкорень: видимая строка-адаптер binding" as V_STREAM_BINDING
+    entity "messenger_api_user_topics_v1\nкорень: уникальная привязка user/topic" as V_TOPIC
+    entity "messenger_api_user_folders_v1\nкорень: уникальная привязка user/folder" as V_FOLDER
+}
+
+package "4. Proposal: физические SQL-storable сущности" as PHYSICAL {
+    entity "MESSAGE\nmessenger_messages" as MESSAGE {
+        uuid : UUID <<PK, внутренний canonical ID>>
+        project_id
+        author
+        payload / source
+        external_account_uuid / provider_external_id <<hidden>>
+        provider / delivery
+        reactions / reaction_users
+        created_at / updated_at <<публичные>>
+    }
+
+    entity "MESSAGE_PLACEMENT\nmessenger_message_placements" as MESSAGE_PLACEMENT {
+        uuid <<публичный UUIDv5 placement>>
+        message_uuid <<FK>>
+        stream / topic <<FK>>
+        уникально: project + message + stream + topic
+    }
+
+    entity "USER_MESSAGE_BINDING\nmessenger_user_message_bindings" as USER_MESSAGE_BINDING {
+        uuid <<скрытая identity ORM-строки>>
+        placement_uuid / user_uuid <<FK>>
+        relation_role / visibility / permissions
+        membership_generation snapshot
+        уникально: project + placement + user
+        без revision
+    }
+
+    entity "USER_MESSAGE_STATE\nmessenger_user_message_states" as USER_MESSAGE_STATE {
+        placement_uuid / user_uuid <<FK>>
+        membership_generation <<snapshot>>
+        read / mentioned / starred / pinned
+        уникально: project + user + placement
+    }
+
+    entity "MESSAGE_REACTION_FACT\nmessenger_message_reaction_facts\nуникально: project + message + user + emoji" as REACTION_FACT
+    entity "STREAM\nmessenger_streams" as STREAM {
+        owner_uuid <<индексированный FK на user>>
+        direct_user_uuid <<nullable индексированный FK на user>>
+        private
+    }
+    entity "USER_STREAM_BINDING\nmessenger_stream_bindings" as STREAM_BINDING {
+        user_uuid / stream_uuid <<уникально, FK>>
+        уникально: project + user + stream
+        role / notification
+        active / membership_generation
+        счётчики непрочитанного / last_message_uuid
+    }
+    entity "TOPIC\nmessenger_topics" as TOPIC
+    entity "USER_TOPIC_BINDING\nmessenger_user_topic_bindings" as TOPIC_BINDING {
+        user_uuid / topic_uuid <<уникально, FK>>
+        уникально: project + user + topic
+        флаги / notification / счётчики непрочитанного
+    }
+    entity "FOLDER\nmessenger_folders" as FOLDER
+    entity "USER_FOLDER_BINDING\nmessenger_user_folder_bindings" as FOLDER_BINDING {
+        user_uuid / folder_uuid <<уникально, FK>>
+        уникально: project + user + folder
+        rule / type
+        unread_count / mention_count
+        folder_items_snapshot : JSONB <<read-only>>
+        snapshot_version / snapshot_updated_at <<internal>>
+    }
+    entity "FOLDER_ITEM\nmessenger_folder_items" as FOLDER_ITEM {
+        user_uuid / folder_uuid / stream_uuid <<FK>>
+        automatic
+        уникально: project + user + folder + stream
+    }
+    entity "USER\nmessenger_users" as USER
+    entity "DOMAIN_OUTBOX_EVENT\nmessenger_domain_outbox_events\nнеизменяемое" as OUTBOX_EVENT
+    entity "PROJECTION_TASK\nmessenger_projection_tasks\n1 immutable task на outbox event" as PROJECTION_TASK {
+        unique outbox_event_uuid
+        scope_kind / exact scope_key
+        pending / leased / running / completed / failed / DLQ
+        lease expiry / owner / fencing token
+        attempts / next_retry_at
+    }
+    entity "SCOPE_LEASE\nmessenger_projection_scope_leases" as SCOPE_LEASE {
+        unique project + scope_kind + scope_key
+        lease owner / expiry / fencing token
+    }
+    entity "PUBLIC_EVENT_RECORD\nm_workspace_events\nсоздаётся атомарно со state;\ndispatchable после commit" as PUBLIC_EVENT
+}
+
+package "5. Фоновая материализация" as BACKGROUND {
+    class "Слот worker с эксклюзивным владением exact scope\nчитает последнее исходное состояние" as WORKER
+    class "Диспетчер/сервис WebSocket\nотправка + повтор + воспроизведение" as WS_DISPATCHER
+}
+
+R_MESSAGE --> C_MESSAGE
+R_REACTION --> C_REACTION
+R_STREAM --> C_STREAM
+R_STREAM_BINDING --> C_STREAM_BINDING
+R_TOPIC --> C_TOPIC
+R_FOLDER --> C_FOLDER
+R_USER --> C_USER
+R_SERVER --> C_SERVER
+
+C_MESSAGE --> V_MESSAGE : получение / список
+C_MESSAGE ..> MESSAGE : создание / изменение / удаление
+C_MESSAGE ..> MESSAGE_PLACEMENT : контекст отправки / копирования
+C_MESSAGE ..> USER_MESSAGE_BINDING : доступ автора
+C_MESSAGE ..> USER_MESSAGE_STATE : авторские user flags
+C_MESSAGE ..> OUTBOX_EVENT : каждое изменение state
+C_REACTION --> V_REACTION : получение / список
+C_REACTION ..> REACTION_FACT : создание / изменение / удаление одного факта
+C_REACTION ..> USER_MESSAGE_BINDING : индексированная проверка доступа
+C_REACTION ..> OUTBOX_EVENT : событие реакции
+C_STREAM --> V_STREAM : получение / список
+C_STREAM ..> STREAM : записи / действия
+C_STREAM_BINDING --> V_STREAM_BINDING : получение / список
+C_STREAM_BINDING ..> STREAM_BINDING : изменение / удаление / add_users
+C_TOPIC --> V_TOPIC : получение / список
+C_TOPIC ..> TOPIC : записи / действия
+C_TOPIC ..> TOPIC_BINDING : действия пользователя
+C_FOLDER --> V_FOLDER : получение / список
+C_FOLDER ..> FOLDER : канонические записи
+C_FOLDER ..> FOLDER_BINDING : готовый агрегат пользователя
+C_USER --> USER : прямые получение / список / собственные действия
+
+V_MESSAGE --> USER_MESSAGE_BINDING : ровно 1 ведущая строка
+V_MESSAGE --> MESSAGE_PLACEMENT : инексированное соединение many-to-one
+V_MESSAGE --> USER_MESSAGE_STATE : инексированное соединение one-to-one\nuser + placement
+V_MESSAGE --> MESSAGE : инексированное соединение many-to-one
+V_REACTION --> REACTION_FACT : ровно 1 ведущий факт
+V_REACTION --> MESSAGE : инексированный LEFT JOIN\nпроекция many-to-one
+V_STREAM --> STREAM_BINDING : ровно 1 ведущая строка
+V_STREAM --> STREAM : инексированное соединение\nmany-to-one
+V_STREAM_BINDING --> STREAM_BINDING : инексированное соединение many-to-one
+V_TOPIC --> TOPIC_BINDING : ровно 1 ведущая строка
+V_TOPIC --> TOPIC : инексированное соединение\nmany-to-one
+V_FOLDER --> FOLDER_BINDING : ровно 1 ведущая строка
+V_FOLDER --> FOLDER : инексированное соединение\nmany-to-one
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : явные размещения
+MESSAGE_PLACEMENT }o--|| STREAM
+MESSAGE_PLACEMENT }o--|| TOPIC
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : доступ получателя
+USER_MESSAGE_BINDING }o--|| USER
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : state user/placement
+USER_MESSAGE_STATE }o--|| USER
+REACTION_FACT }o--|| MESSAGE : FK на каноническое message
+REACTION_FACT }o--|| USER : автор реакции
+STREAM_BINDING }o--|| STREAM
+STREAM_BINDING }o--|| USER
+TOPIC_BINDING }o--|| TOPIC
+TOPIC_BINDING }o--|| USER
+FOLDER_BINDING }o--|| FOLDER
+FOLDER_BINDING }o--|| USER
+FOLDER_ITEM }o--|| FOLDER
+FOLDER_ITEM }o--|| STREAM
+TOPIC }o--|| STREAM
+
+note bottom of V_MESSAGE
+  Публичный uuid — MESSAGE_PLACEMENT.uuid.
+  get_id_property = скрытый binding_uuid
+  только как уникальная техническая identity ORM-строки.
+  Адаптер URL-ресурса/контроллера использует placement uuid.
+  Marker tuple: MESSAGE.created_at + placement.uuid.
+  Публичные created_at/updated_at приходят из MESSAGE.
+  Нет агрегатов, GROUP BY, оконных/lateral-выражений,
+  коррелированных подзапросов или fan-out one-to-many.
+end note
+
+note top of MESSAGE_PLACEMENT
+  uuid = UUIDv5(namespace = TOPIC.uuid,
+                name = MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  Name без project/stream/braces/prefix.
+  TOPIC обязателен, глобально уникален и неизменно
+  принадлежит одному STREAM/PROJECT.
+  Business key и составные FK остаются авторитетными.
+end note
+
+note bottom of STREAM_BINDING
+  Persistent membership row: revoke => active=false
+  и monotonic membership_generation++ в API transaction.
+  Message/reaction read всегда требует active и равенство
+  snapshot generation; stale task делает no-op.
+end note
+
+note bottom of V_STREAM
+  Публичный owner и другие UUID-ссылки —
+  скалярные UUID properties, а не URI relationships.
+  Физические *_uuid колонки остаются индексированными FK
+  с явными действиями ссылочной целостности.
+  owner_uuid выходит как публичный owner.
+end note
+
+OUTBOX_EVENT --> PROJECTION_TASK : ровно 1 immutable task на event
+PROJECTION_TASK --> SCOPE_LEASE : claim exact scope key
+SCOPE_LEASE --> WORKER : lease + fencing token
+WORKER --> USER_MESSAGE_BINDING : fanout привязок для placement
+WORKER --> USER_MESSAGE_STATE : готовое state каждого получателя
+REACTION_FACT --> WORKER : факты reaction_snapshot
+WORKER --> MESSAGE : материализовать reactions + reaction_users
+WORKER --> STREAM_BINDING : идемпотентные готовые счётчики
+WORKER --> TOPIC_BINDING : идемпотентные готовые счётчики
+WORKER --> FOLDER_ITEM : folder_projection: normalized source of truth
+WORKER --> FOLDER_BINDING : folder_projection: snapshot + counts + version/time
+WORKER --> PUBLIC_EVENT : та же DB transaction, что state
+PUBLIC_EVENT --> WS_DISPATCHER : готовые записи
+
+note bottom of WORKER
+  Topic scope — только placements/bindings;
+  внутри topic сначала самый новый MESSAGE.created_at.
+  Message scope — canonical snapshots.
+  user-stream/user-topic/user-folder — shared aggregates.
+  Одновременно один fenced owner exact key; разные scopes параллельны.
+  Topic worker не делает unsafe read-modify-write shared rows.
+  Atomic delta требует exactly-once guard по outbox_event_uuid;
+  иначе scope worker recomputes/writes.
+  Сырые факты — источник истины.
+  Снимки перестраиваемы и согласуются в конечном счёте.
+  API никогда не делает read-modify-write снимка JSON.
+  Элементы системных папок материализуются из активных
+  user/stream bindings и STREAM с is_archived = false.
+  All chats: все; Personal: private = true; Channels: private = false.
+end note
+
+note bottom of PROJECTION_TASK
+  fanout; content_mentions; reaction_snapshot;
+  read_counters; delivery_snapshot_event;
+  topic_membership_policy_rebuild; topic_state_projection;
+  folder_projection.
+  Initial design без coalescing.
+  Unique outbox_event_uuid; duplicate derivation = no-op.
+  Lease/fencing; retry/backoff; max attempts/DLQ;
+  reaper/reconciliation; idempotent handlers.
+  Одна task на event, coalescing отсутствует.
+end note
+
+note right of FOLDER_BINDING
+  Public folder_items <- ready JSONB folder_items_snapshot; empty = [].
+  FOLDER_ITEM is normalized source of truth.
+  Stable serializer includes exact public item fields and ready stream counts.
+  API reads one indexed row/page: no N+1/json_agg/COUNT/custom SQL.
+  One user-folder worker transaction commits snapshot + counts
+  + version/updated_at + all ready event rows; dispatcher only after commit.
+end note
+
+note bottom of C_MESSAGE
+  Синхронная отправка:
+  MESSAGE + MESSAGE_PLACEMENT + авторские
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + OUTBOX.
+  Пары binding/state получателей создаются асинхронно.
+  GET/list никогда не создают задач.
+  Действующее custom SQL-хранилище не сохраняется.
+end note
+
+note bottom of C_STREAM
+  Если direct_user_uuid задан, private = true.
+  direct_user_uuid = текущий owner => self-chat:
+  ровно одна binding владельца и один видимый участник.
+  Отправка в self-chat создаёт только binding/state автора;
+  fanout получателей создаёт 0 дополнительных строк.
+end note
+
+note bottom of WS_DISPATCHER
+  Worker проекций не владеет сетевыми соединениями.
+  Диспетчер отправляет, повторяет и воспроизводит готовые события.
+end note
+
+note bottom of PHYSICAL
+  Имена выбраны для proposal; в этой фазе нет миграции.
+  Агрегаты контейнеров живут в уникальных user bindings.
+  По умолчанию нет отдельной таблицы state.
+  Message bindings никогда не хранят счётчики контейнеров.
+end note
+
+note bottom of RA
+  Target list pagination: omitted/0 = 100; 1..500 принимается точно;
+  negative/non-integer/>500 = HTTP 400; unlimited mode отсутствует.
+  Сейчас отсутствующий/0 даёт неограниченное чтение, а слишком большое значение не ограничивается:
+  это подтверждённый пробел текущей реализации, а не proposal.
+end note
+
+@enduml

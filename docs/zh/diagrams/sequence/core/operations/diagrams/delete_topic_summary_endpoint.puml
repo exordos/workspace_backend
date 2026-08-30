@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/topic_summary_endpoints/[endpoint_uuid]
+actor "客户端" as Client
+participant "TopicSummaryEndpointController\nRestAlchemy" as API
+database "统计管理平面的行\n+ 密码的账户数据" as DB
+queue "Transactional outbox\n1 immutable task 在 event" as Outbox
+participant "背景表演者\n统计管理平面" as Worker
+Client -> API: DELETE /api/workspace/v1/messenger/topic_summary_endpoints/{endpoint_uuid}
+API -> DB: 交易开始; 许可 + 变更
+API -> DB: 在此文件中添加不可更改的内录 transactional outbox
+DB --> API: 清理状态的固定
+API --> Client: 成功的公开回复
+DB ->> Outbox: 已固定的记录
+Outbox ->> Worker: immutable delivery_snapshot_event\n(outbox_event_uuid, registry scope)
+Worker -> DB: 应应用于计划/租的当前状态
+note over Worker
+没有公开事件行
+没有控制器 WebSocket
+主题任务保持独家性,从新帖子到旧帖子
+end note
+@enduml

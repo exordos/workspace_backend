@@ -1,0 +1,39 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/folder_items/
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "PostgreSQL\nFOLDER_ITEM + 连接容器" as DB
+queue "交易 outbox" as OUT
+queue "类型化文件投影任务" as TASK
+participant "沃克人游泳池" as WORKER
+database "公众活动存储器" as EVENT
+participant "控制器 WebSocket" as DISP
+participant "签名客户端" as WS
+Client -> API: POST JSON 文件元素
+note right of API
+  仅为用户文件进行手动连接
+  支持自动会员
+  来源: 活跃的 USER_STREAM_BINDING + 规范性 STREAM.is_archived = false
+  All chats = 所有的; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+API -> DB: BEGIN; 找到文件/流的绑定
+API -> DB: 插入一个唯一的 FOLDER_ITEM
+API -> OUT: 添加 folder_item.created
+API -> DB: COMMIT
+API --> Client: 201 JSON 元素
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; 没有 coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: 阅读 normalized items + ready stream counts
+note right of WORKER
+  USER_STREAM_BINDING C/U/D -> outbox -> immutable folder_projection(outbox_event_uuid)
+  -> 并且是可能的加/减 + unread_count/mention_count 文件
+end note
+group 一个 worker DB transaction
+  WORKER -> DB: replace folder_items_snapshot + counts\nversion/updated_at; stable order; empty=[]
+  WORKER -> EVENT: ready folder.updated + unique effect guard
+end
+DISP -> EVENT: 阅读/重复/播放
+DISP -> WS: folder.updated
+@enduml

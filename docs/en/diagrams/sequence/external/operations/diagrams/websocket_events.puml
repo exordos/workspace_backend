@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title Catching up WebSocket Events, Barrier of readiness and delivery in real time
+actor "The client ." as C
+participant "The controller . WebSocket" as D
+database "Visible event repository" as E
+
+C -> D: GET /api/workspace/v1/events/ws\nWebSocket upgrade + workspace.events.v1 + The token Bearer
+D -> D: I want to authenticate IAM and check a couple of cursors.
+D -> E: I 'm going to fix it . high-watermark; After the events last_epoch_version
+E --> D: The visible events are in order. epoch_version ASC
+loop Missed steady events
+  D --> C: Flat event Workspace
+end
+D -> E: drain The buffer live tail Until then high-watermark
+D --> C: {type: ready, epoch_generation, epoch_version}
+note over C,D
+  One shot of the readiness .; No real-time event can beat it ..
+end note
+loop recorded real-time events
+  D -> E: Get/reproduce the next visible epoch
+  E --> D: Ready event line
+  D --> C: Flat event Workspace
+end
+D --> C: The management staff ping I 'm not sure . WebSocket
+note over D,E
+  The path to the controller is read-only .: No domain name records outbox/The tasks.
+  Domain worker never owns network connections.
+  At-least-once: client dedupe The event UUID, cursor After processing.
+  Audience generation It 's suppressing . stale data events After revoke.
+  It 's leaking . cursor -> epoch_pruned/4410, No one 's quiet . gap.
+end note
+@enduml

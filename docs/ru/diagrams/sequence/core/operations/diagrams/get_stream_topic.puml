@@ -1,0 +1,15 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/stream_topics/[topic_uuid]
+actor "Клиент" as Client
+participant "WorkspaceStreamTopicController\nRestAlchemy" as API
+database "Индексированное публичное представление\n+ физические строки внешних ключей" as DB
+Client -> API: GET /api/workspace/v1/messenger/stream_topics/{topic_uuid}
+API -> DB: область проекта и текущего пользователя\nскалярные фильтры UUID
+DB --> API: строки без вычислений
+API --> Client: 200, публичный JSON
+note over API,DB
+Нет записей / transactional outbox / задач / фонового исполнителя / событий
+Нет агрегирования или восстановления во время запроса
+end note
+@enduml

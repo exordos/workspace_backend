@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/stream_bindings/[binding_uuid]
+actor "The client ." as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: DELETE /api/workspace/v1/messenger/stream_bindings/{binding_uuid}
+API -> DB: lock persistent USER_STREAM_BINDING\nactive=false; membership_generation++
+API -> DB: immutable outbox event For each typed task
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: topic_membership_policy_rebuild / read_counters /\nfolder_projection / delivery_snapshot_event\neach task It has its own outbox_event_uuid
+Worker -> Worker: topic scope: Hide it placement access;\nuser-stream/user-folder: shared projections
+Worker -> DB: conditional by active=false + new generation;\nstale generation = no-op
+Worker -> Projection: remaining access bindings/containers
+Worker -> Events: event to delete the stream/bind/folder\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Worker
+  After commit All of them . message/reaction paths They demand active membership
+  and generation equality; cleanup The old ones . rows No , not really . security boundary.
+  Task lifecycle: lease expiry/fencing, retry/backoff, DLQ/reaper.
+end note
+@enduml

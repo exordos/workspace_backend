@@ -1,0 +1,50 @@
+@startuml
+!pragma layout smetana
+title POST reconnect: credential replacement And the same bootstrap
+
+autonumber
+actor "The client ." as Client
+participant "REST / RestAlchemy controller" as API
+participant "Zulip" as Zulip
+database "Account / encrypted credential / lease / outbox" as DB
+participant "Bridge account coordinator" as Bridge
+participant "Private Workspace API\ncurrent realm mTLS" as PrivateAPI
+database "Ready public events" as Events
+
+Client -> API : POST reconnect(current request)
+API -> Zulip : validate replacement credential
+API -> API : compare expected realm_uuid/user_id/delivery_email
+alt validation/conflicting verified owner failed
+  Zulip --> API : failure
+  API --> Client : current error; old connection/sync unchanged
+else verified
+  Zulip --> API : realm_uuid/user_id/delivery_email
+  API -> DB : replace encrypted credential + connecting + outbox
+  API --> Client : 200 sanitized response
+  DB -> Bridge : desired-state task
+  Bridge -> PrivateAPI : mTLS client certificate\nclaim whole account
+  PrivateAPI -> DB : authorize identity + claim lease generation
+  PrivateAPI --> Bridge : account scope + generation
+  Bridge -> Zulip : register new supported queue
+  alt registration success
+    Zulip --> Bridge : boundary
+    Bridge -> Bridge : start sequential realtime
+    Bridge -> PrivateAPI : mTLS ensure history root after boundary
+    PrivateAPI -> DB : idempotent history root
+  else registration failure
+    Bridge -> Bridge : backoff; no history root
+  end
+  DB -> Events : external_account.updated atomically with projection
+end
+
+note over Bridge,DB
+  Connect and reconnect use exactly the same bootstrap.
+  Secret replacement happens only after full identity validation.
+  Old queue/cursor is not durable recovery state.
+end note
+
+note over Bridge,PrivateAPI
+  Certificate identity and account lease are checked separately.
+  Failed Zulip key validation leaves current S2S identity unchanged.
+end note
+@enduml

@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/drafts/
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "草稿行 PostgreSQL" as DB
+queue "内部域名 outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: POST JSON 草稿
+API -> DB: BEGIN; 检查主 + 主题
+API -> DB: 插入或比较客户端 UUID
+API -> OUT: 增加内置 draft.created
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; 没有完成 public event row
+API --> Client: 201 或是具有性质 200 + ETag
+@enduml

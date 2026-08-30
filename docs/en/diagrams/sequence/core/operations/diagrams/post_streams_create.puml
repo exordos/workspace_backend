@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/
+actor "The client ." as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/
+alt It 's a normal flow . (without direct_user_uuid)
+    API -> DB: STREAM + TOPIC By default + owner's binding
+else Direct flow (Other user)
+    API -> DB: Forced private=true\nDetermined pair + two unique user bindings
+else flow with itself. (direct_user_uuid == owner)
+    API -> DB: Forced private=true\nOnly one owner binding to the stream/topic
+end
+API -> DB: Add a record to the transactional outbox
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: immutable topic_membership_policy_rebuild /\nfolder_projection / read_counters\n- I 'm not sure . outbox event -> One . task
+Worker -> Worker: claim exact scope; For the topic work\nMESSAGE.created_at DESC
+Worker -> Projection: linking the user to the stream/topic/folder
+Worker -> Events: stream.created + folder.updated\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+@enduml

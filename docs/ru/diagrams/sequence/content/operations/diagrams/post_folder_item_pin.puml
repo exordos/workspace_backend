@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/folder_items/{folder_item_uuid}/actions/pin/invoke
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "PostgreSQL\nFOLDER_ITEM + привязки контейнеров" as DB
+queue "Транзакционный outbox" as OUT
+queue "Типизированная задача проекции папки" as TASK
+participant "Пул воркеров" as WORKER
+database "Хранилище публичных событий" as EVENT
+participant "Диспетчер WebSocket" as DISP
+participant "Подписанный клиент" as WS
+Client -> API: POST закрепления (без тела)
+note right of API
+  Меняется слой размещения (placement), не автоматическое правило/членство.
+  Проекция: активная USER_STREAM_BINDING + каноническая STREAM.is_archived = false.
+  All chats = все; Personal = STREAM.private = true; Channels = STREAM.private = false.
+end note
+API -> DB: BEGIN; заблокировать элемент в заданной области
+API -> DB: установить pinned_at = now
+API -> OUT: добавить folder_item.pin
+API -> DB: COMMIT
+API --> Client: 200 JSON элемента
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; без coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: прочитать normalized items + ready stream counts
+group одна worker DB transaction
+  WORKER -> DB: replace deterministic snapshot + counts\nversion/updated_at
+  WORKER -> EVENT: ready folder.updated + unique effect guard
+end
+DISP -> EVENT: читать/повторять/воспроизводить
+DISP -> WS: folder.updated
+@enduml

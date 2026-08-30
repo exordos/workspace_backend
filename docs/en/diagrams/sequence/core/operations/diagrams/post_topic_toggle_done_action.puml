@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/stream_topics/[topic_uuid]/actions/toggle_done/invoke
+actor "The client ." as Client
+participant "WorkspaceStreamTopicController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke
+API -> DB: lock canonical TOPIC; toggle is_done;\nversion++, updated_at; append immutable outbox
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: immutable topic_state_projection(outbox_event_uuid)\nscope=(project_id, topic_uuid)
+Worker -> Worker: claim exact topic scope + fencing
+group One . DB transaction
+  Worker -> Projection: Optional read-only copy from TOPIC
+  Worker -> Events: ready topic.updated For all who see users
+end
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+@enduml

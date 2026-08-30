@@ -1,0 +1,64 @@
+@startuml task_read_counters
+!pragma layout smetana
+title Typisierte Aufgaben: read_counters / folder_projection
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Veröffentlichung der Veranstaltung outbox\nfanout/read/hide/move/delete" as OUTBOX
+participant "Aufgabenprojektor" as PROJECTOR
+database "Immutable tasks\n1 - Auf outbox event/scope" as TASKS
+database "Miete exact scope key\nlease + fencing" as CLAIM
+participant "Ein Schlitz für den Worker" as WORKER
+database "Nachrichten Fakten + read_at\nZugriff + Richtlinie" as SOURCE
+database "Aktiv USER_STREAM_BINDING\n+ STREAM.is_archived/private" as STREAM_SOURCE
+database "FOLDER + normalized FOLDER_ITEM\nsource of truth" as FOLDERS
+database "USER_STREAM_BINDING" as STREAM_BINDING
+database "USER_TOPIC_BINDING" as TOPIC_BINDING
+database "USER_FOLDER_BINDING" as FOLDER_BINDING
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket" as DISPATCHER
+actor "Der Client" as Client
+
+OUTBOX -> PROJECTOR : festgestellte Einflussereignisse
+PROJECTOR -> TASKS : immutable folder_projection für den Ordner\nuser-folder scope; unique derivation; Ohne coalescing
+TASKS -> WORKER : offensichtliche betroffene Bereiche
+WORKER -> CLAIM : Monopolrecht user-stream / user-topic / user-folder
+WORKER -> SOURCE : Lesen Sie den letzten Ausgangszustand aus
+WORKER -> STREAM_SOURCE : Aktiv-Bindung + Kanonische lesen STREAM
+WORKER -> STREAM_BINDING : Wir sind bereit, die Zähler zu benutzen.
+WORKER -> TOPIC_BINDING : Wirdpotentielle Konto-Themen bereit
+group Einer worker DB transaction
+  WORKER -> FOLDERS : Wir können hinzufügen/löschen. automatic FOLDER_ITEM
+  WORKER -> FOLDER_BINDING : deterministic folder_items_snapshot + counts\nversion/snapshot_updated_at; empty=[]
+  WORKER -> EVENTS : ready stream.updated / topic.updated / folder.updated\nund folder_item.deleted, Wenn es bekannt gegeben wird contract operation\nunique derivation/effect key
+end
+WORKER -> CLAIM : Sie sollen entlassen werden.
+EVENTS -> DISPATCHER : Nur nach commit: Nachhaltige Aufzeichnungen
+DISPATCHER -> Client : Senden / Wiederholen / Wiedergeben
+
+note over SOURCE,FOLDER_BINDING
+  Die Aggregate des Containers werden nicht in Verbindung/Botschaftszustand gespeichert.
+  USER_FOLDER_BINDING Er behält Zugang, persönliche Status
+  und fertige Aggregate + read-only folder_items_snapshot.
+  Public folder_items Zeigt genau an snapshot; empty=[].
+  API Lesen Sie eine indexed row/page, Ohne N+1/json_agg/COUNT/custom SQL.
+  Korrektur/Umrüstung nur im Hintergrund.
+  Topic-worker Schreibt nicht diese shared rows.
+  Atomic delta Erfordert exactly-once effect guard Nach outbox_event_uuid;
+  - Nein, sonst nicht. scope worker recomputes/writes.
+  Lifecycle: lease expiry/fencing, retry/backoff, DLQ/reaper.
+end note
+
+note over STREAM_SOURCE,FOLDERS
+  Vorwort: Aktiv USER_STREAM_BINDING + STREAM.is_archived=false.
+  All chats = Alle diese Zeilen.
+  Personal = Nur STREAM.private=true.
+  Channels = Nur STREAM.private=false.
+  Die Anfrage des Clients berechnet diese Zusammensetzung nicht.
+  Stable order: pinned_at DESC first; then
+  order_index ASC NULLS LAST, created_at ASC, uuid ASC.
+  No silent truncation; exact count/byte hard limits remain required.
+end note
+
+@enduml

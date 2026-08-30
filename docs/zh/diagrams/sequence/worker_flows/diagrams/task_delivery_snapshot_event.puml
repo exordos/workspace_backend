@@ -1,0 +1,39 @@
+@startuml task_delivery_snapshot_event
+!pragma layout smetana
+title 标式化投影任务: delivery_snapshot_event
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "开始状态 exact resource scope" as SOURCE
+database "没有变化 outbox" as OUTBOX
+participant "任务投影器" as PROJECTOR
+database "类型任务" as TASKS
+participant "工人机" as WORKER
+database "卫生公共投影" as PROJECTION
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket" as DISPATCHER
+actor "客户端" as Client
+
+SOURCE -> OUTBOX : 已固定域名事件
+OUTBOX -> PROJECTOR : 没有变化的事件
+PROJECTOR -> TASKS : immutable delivery_snapshot_event\n(outbox_event_uuid, exact scope)\nunique derivation; 没有 coalescing
+TASKS -> WORKER : exact scope lease + fencing
+WORKER -> SOURCE : 阅读最后一个 exact-scope 情况
+group 一个 DB transaction
+  WORKER -> PROJECTION : 具有潜力的卫生照
+  WORKER -> EVENTS : durable ready event, 如果宣布 contract kind
+end
+EVENTS -> DISPATCHER : 稳定的记录
+DISPATCHER -> Client : 发送 / 重复 / 播放
+
+note over SOURCE,PROJECTION
+  Provider JSON 只有 provider/delivery.
+  为了 draft/push 没有 public event task 记录 effect guard
+  没有 event row.
+  协议原始元数据和帐户数据保持隐藏.
+  Lifecycle: lease expiry, retry/backoff, DLQ/reaper;
+  idempotent effect guard 根据 outbox_event_uuid.
+end note
+
+@enduml

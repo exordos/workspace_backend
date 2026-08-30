@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/message_reactions/[reaction_uuid]
+actor "Der Client" as Client
+participant "WorkspaceMessageReactionController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Worker scope=message\nexact lease + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: PUT /api/workspace/v1/messenger/message_reactions/{reaction_uuid}
+API -> DB: resolve applicable public placement;\ncheck active membership + generation
+API -> DB: update one canonical fact + immutable outbox event
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: immutable reaction_snapshot(outbox_event_uuid)\nOhne coalescing
+Worker -> Worker: claim (project_id, canonical_message_uuid)\nlease + fencing
+Worker -> Projection: MESSAGE.reactions + reaction_users
+Worker -> Events: message_reaction.updated + message.updated\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Topic lock nicht verwendet; retry/backoff + DLQ/reaper.
+  Wiederherstellungsmethode placement context für reaction_uuid Bleibt.
+  Zentralisierte OPEN-Entscheidung; arbitrary placement Verboten.
+end note
+@enduml

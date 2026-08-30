@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/files/
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "Настроенное файловое хранилище" as STORE
+database "Метаданные файла + ACL в PostgreSQL" as DB
+queue "Транзакционный outbox" as OUT
+queue "delivery_snapshot_event\nexact file scope" as TASK
+participant "Пул воркеров" as WORKER
+database "Хранилище публичных событий" as EVENT
+participant "Диспетчер WebSocket" as DISP
+participant "Подписанный клиент" as WS
+Client -> API: POST JSON или multipart
+API -> STORE: сохранить байты + сопутствующие метаданные (multipart)
+API -> DB: BEGIN; вставить метаданные + ACL
+API -> OUT: добавить file.created
+API -> DB: COMMIT
+API --> Client: 201 JSON метаданных
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: захватить работу
+WORKER -> EVENT: вставить готовое file.created
+DISP -> EVENT: читать/повторять/воспроизводить
+DISP -> WS: file.created
+@enduml

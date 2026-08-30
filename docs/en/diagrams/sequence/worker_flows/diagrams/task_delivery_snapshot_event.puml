@@ -1,0 +1,39 @@
+@startuml task_delivery_snapshot_event
+!pragma layout smetana
+title Typed projection task: delivery_snapshot_event
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "The original condition exact resource scope" as SOURCE
+database "Unchanged outbox" as OUTBOX
+participant "Task projector" as PROJECTOR
+database "Typed tasks" as TASKS
+participant "The worker's slot." as WORKER
+database "Sanitized public projection" as PROJECTION
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket" as DISPATCHER
+actor "The client ." as Client
+
+SOURCE -> OUTBOX : the domain event you 've fixed
+OUTBOX -> PROJECTOR : The unchanging event
+PROJECTOR -> TASKS : immutable delivery_snapshot_event\n(outbox_event_uuid, exact scope)\nunique derivation; without coalescing
+TASKS -> WORKER : exact scope lease + fencing
+WORKER -> SOURCE : Read the last one . exact-scope The condition
+group One . DB transaction
+  WORKER -> PROJECTION : I 'm going to take a sanitised image .
+  WORKER -> EVENTS : durable ready event, If it 's declared contract kind
+end
+EVENTS -> DISPATCHER : recording is stable
+DISPATCHER -> Client : Send / repeat / play
+
+note over SOURCE,PROJECTION
+  Provider JSON It only reveals provider/delivery.
+  For the draft/push without public event task It 's fixed . effect guard
+  And it ends without event row.
+  Raw protocol metadata and account data remain hidden.
+  Lifecycle: lease expiry, retry/backoff, DLQ/reaper;
+  idempotent effect guard The outbox_event_uuid.
+end note
+
+@enduml

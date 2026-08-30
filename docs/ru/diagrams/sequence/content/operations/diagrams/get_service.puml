@@ -1,0 +1,13 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/services/{service_uuid}
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: запрос
+API -> DB: индексированный SELECT
+DB --> API: публичные строки
+note right of API: без outbox / задачи / события
+API --> Client: 200 JSON
+@enduml

@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title GET /api/workspace/v1/messenger/external_accounts/{account_uuid}
+actor "Клиент" as C
+participant "REST / RestAlchemy\nконтроллер" as API
+database "PostgreSQL\nканонические строки/строки чтения" as DB
+
+C -> API: запрос GET + bearer-токен IAM
+activate API
+API -> DB: индексированное чтение в заданной области
+DB --> API: санитизированные канонические/материализованные строки
+note right of API
+  Нет записей, outbox, задач, fan-out,
+  вызова провайдера, COUNT/GROUP BY
+  или исправления в пути запроса.
+end note
+API --> C: публичный ответ 200
+deactivate API
+
+note over API,DB
+  Публичные ссылки UUID являются скалярными UUID-свойствами.
+  Физические столбцы *_uuid остаются индексированными FK.
+end note
+@enduml

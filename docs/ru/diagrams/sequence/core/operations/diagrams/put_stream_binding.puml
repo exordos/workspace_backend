@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/stream_bindings/[binding_uuid]
+actor "Клиент" as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\nканонические строки + привязки" as DB
+queue "Transactional outbox\n+ вывод типизированных задач" as Outbox
+participant "Фоновые исполнители\nexact scope leases + fencing" as Worker
+database "Готовые проекции\nпривязки контейнеров" as Projection
+database "Хранилище публичных событий" as Events
+participant "Диспетчер WebSocket" as Dispatcher
+actor "Клиент WebSocket" as WS
+Client -> API: PUT /api/workspace/v1/messenger/stream_bindings/{binding_uuid}
+API -> DB: lock/update persistent USER_STREAM_BINDING;\nauthorization change => generation++
+API -> DB: immutable outbox event на каждую typed task
+DB --> API: фиксация транзакции
+API --> Client: успешный публичный ответ
+DB ->> Outbox: зафиксированное событие
+Outbox ->> Worker: topic_membership_policy_rebuild / read_counters /\nfolder_projection / delivery_snapshot_event\nкаждая task имеет своё outbox_event_uuid
+Worker -> Worker: topic scope: placement access;\nuser-stream/user-topic/user-folder: shared rows
+Worker -> DB: conditional generation; stale task = no-op
+Worker -> Projection: доступ к теме + готовые счётчики
+Worker -> Events: события привязки/потока\nатомарно в одной DB transaction с проекцией
+Events ->> Dispatcher: зафиксированная готовая строка
+Dispatcher ->> WS: отправка / повтор / воспроизведение
+note over API,Worker
+  Один fenced owner exact scope key; разные scopes параллельны.
+  Lease expiry, retry/backoff, DLQ и reaper обязательны.
+end note
+@enduml

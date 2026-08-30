@@ -1,0 +1,41 @@
+@startuml task_reaction_snapshot
+!pragma layout smetana
+title 标式化投影任务: reaction_snapshot
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "事件 outbox 关于反应的事实" as OUTBOX
+participant "任务投影器" as PROJECTOR
+database "类型任务" as TASKS
+database "Scope message\nlease + fencing" as CLAIM
+participant "工人机\n(唯一的作者)" as WORKER
+database "MESSAGE_REACTION_FACT" as FACTS
+database "MESSAGE\nreactions + reaction_users" as MESSAGE
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket" as DISPATCHER
+actor "客户端" as Client
+
+OUTBOX -> PROJECTOR : 事件创建/修改/删除
+PROJECTOR -> TASKS : immutable reaction_snapshot(outbox_event_uuid)\nscope=message; 没有 coalescing
+TASKS -> WORKER : (project_id, canonical_message_uuid)
+WORKER -> CLAIM : 获得独占权 exact key
+WORKER -> FACTS : 阅读最新消息
+FACTS --> WORKER : 反应的正规集合
+group 一个 DB transaction
+  WORKER -> MESSAGE : 原子替换两个图片
+  WORKER -> EVENTS : durable ready message.updated; unique derivation
+end
+WORKER -> CLAIM : 释放
+EVENTS -> DISPATCHER : 稳定的准备记录
+DISPATCHER -> Client : 发送 / 重复 / 播放
+
+note over FACTS,MESSAGE
+  事实是真理的来源.
+  API 没有执行读循环-变更-记录 JSON-图片.
+  API 阅读不聚合事实.
+  Topic lock 没有用于 canonical MESSAGE snapshot.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper 必须.
+end note
+
+@enduml

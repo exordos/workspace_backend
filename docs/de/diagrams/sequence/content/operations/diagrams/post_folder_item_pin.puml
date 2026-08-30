@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/folder_items/{folder_item_uuid}/actions/pin/invoke
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL\nFOLDER_ITEM + Kontainerbindungen" as DB
+queue "Transaktions- outbox" as OUT
+queue "Typisierte Aufgabe für die Ordnerprojektion" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: POST Verankerung (Ohne Körper)
+note right of API
+  Die Platzierungsschicht wird geändert (placement), Nicht automatische Regel/Mitgliedschaft.
+  Projektion: Aktiv USER_STREAM_BINDING + Kanonische STREAM.is_archived = false.
+  All chats = - Das ist alles.; Personal = STREAM.private = true; Channels = STREAM.private = false.
+end note
+API -> DB: BEGIN; Elemente im angegebenen Bereich sperren
+API -> DB: - Setzen pinned_at = now
+API -> OUT: Hinzufügen folder_item.pin
+API -> DB: COMMIT
+API --> Client: 200 JSON Ein Element
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; Ohne coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: Lesen normalized items + ready stream counts
+group Einer worker DB transaction
+  WORKER -> DB: replace deterministic snapshot + counts\nversion/updated_at
+  WORKER -> EVENT: ready folder.updated + unique effect guard
+end
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: folder.updated
+@enduml

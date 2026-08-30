@@ -1,0 +1,284 @@
+# Workspace Server v2: die von der Kommission
+
+Status: **Aktive Ergänzung zur Architektur und geschlossen Provider API v2**.
+
+[← Hauptindex](index.md) · [Provider API v2](../workspace_provider_api_v2.yaml) · [Zilarchitektur Zulip Bridge](zulip_bridge/README.md)
+
+Dieses Dokument enthält die Entscheidungen `1B`, `2A`, `3A`, `4A`, `5A`, die vereinbart wurden
+Sie haben die ersten Implementierungen des neuen Workspace Servers vorbereitet. docs-first
+Architektur, schließen die entsprechenden Punkte der OPEN-Liste und ändern nicht
+ein öffentlicher Browser API oder JSON, der den bestehenden Workspace UI.
+
+## 1B — Provider Data API v2 - auf dem laufenden private transport
+
+Der neue Inbound-Vertrag befindet sich auf einem bereits existierenden separaten mTLS listener:
+
+- `POST /api/workspace-provider/v2/commands` — provider→Workspace commands;
+- `POST /api/workspace-provider/v2/operations/actions/lease` — - Wirksam
+  Schlange Workspace→provider;
+- `POST /api/workspace-provider/v2/operation-results` — der aktuelle Bericht über
+  Das Ergebnis Workspace→provider operation.
+
+V2 Wiederverwenden current certificate identity, heartbeat, body limits,
+transaction boundary, batch limit `500`, lease und result semantics v1. V1
+Der neue Hörer, der neue credential
+protocol und neue public/browser route werden nicht eingeführt.
+
+Inbound v2 nimmt die Provider Identity an, anstatt die berechneten Bridge-Werte
+Workspace. `external_account_uuid` Wählt nur die bereits festgelegte Verbindung aus;
+Der Server überprüft es gegen mTLS identity und desired state.
+wählt nicht aus `project_id`, external-chat UUID, stream/topic/user/message UUID,
+permissions Workspace in der Transaktion erlaubt account, realm, chat,
+project, stream/topic und Identity-Mapping und ruft dann nur die übliche
+Eine Domänenmutation.
+
+## 2A — Ein realm-global provider chat gehört einem project {#2a--один-realm-global-provider-chat-принадлежит-одному-project}
+
+Für das Paar `(provider, verified provider realm, provider_chat_key)` kann es sein
+Es ist nur ein Workspace Projekt ausgewählt.
+realm Sie können den Chat im selben Projekt wiederverwenden, aber den Chat in einem anderen Projekt auswählen.
+project bis zur Änderung abgelehnt desired state.
+
+Konflikt gibt HTTP `409` mit dem sicheren Code zurück
+`provider_scope_conflict`. Die Überprüfung erfolgt in einer Transaktion unter advisory lock,
+und ein Teilindex der ausgewählten Chats beschränkt den Arbeitstest.
+Ein einfaches und billiges Modell: Routing bleibt eindeutig, und Fan-Out und öffentliche
+Projektionen werden nicht zwischen projects.
+
+Upgrade Überprüft diese Invariante bis reset/copy. Legacy same-realm/same-chat
+aliases Innerhalb eines Projekts werden diese automatisch zusammengefasst, aber bereits vorhandene
+Die Auswahl des Chats in mehreren Projekten stoppt migration fail-closed:
+automatisch wählen würde bedeuten , ohne Zustimmung zu bewegen oder
+Verbergen von internen Workspace Nachrichten.
+
+Bis zur ersten Provider Discovery, wenn verified realm UUID noch nicht bekannt ist,
+Die vorläufige Region ist die normalisierte `server_url`. URL
+lock; Nach der Entdeckung  URL und realm locks in stabiler Reihenfolge.
+Konflikt vergleicht und das bekannte realm UUID, und die gleiche provider origin,
+Also bleibt der alte Web-Flow der Erstellung/Erste Wahl des Accounts ohne
+Die Kundenänderung, und die Parallelwahl umgeht nicht die Regel 2A.
+
+Provider origin wird als tatsächlicher HTTP origin berechnet: Schema und DNS-Name
+werden an die untere Register, den Endpunkt DNS und die Standard-Ports gebracht
+werden gelöscht, IPv6 bewahrt die Klammern; path ist nicht an scope key. DNS aliases
+Die ersten zwei Schritte werden nach der Entdeckung in der verifizierten Realität UUID abgeschlossen. trusted
+Die Bindung jedes Accounts nimmt die gleichen Advisory Locks für alle bereits ausgewählten Accounts ein chat
+Dieser Account und vor der Eintragung der Identity wird von seinem Katalog-Report abgelehnt, wenn kein anderer
+account Der erste, der bestätigt hat, dass er in einem anderen Projekt ist, hat bereits den gleichen realm/chat bestätigt.
+realm account bleibt der Besitzer des Routing; alias, in einem anderen ausgewählt project,
+Erhält den sicheren Code `provider_scope_conflict`.
+Ohne trusted realm:
+Die gleichen numerischen Chat-IDs sind in den unabhängigen Zulip Realms zulässig.
+account mit alias wird nicht die zweite aktive Datenquelle, aber bridge kann
+die Katalog-Veröffentlichung nach der Löschung der Konfliktwahl erneut durchführen.
+
+Wenn Sie den gleichen realm-global chat im gleichen project Workspace unter dem gleichen
+advisory lock Wiederverwendet bereits verwirklichte `projection_stream_uuid` und
+exact `provider_topic_id -> topic_uuid` mappings. Account-scoped external-chat
+UUID bleibt nur die Control-plane Identity Assignment: beide desired assignment
+Sie verweisen auf einen Stream/topic graph, also ist der erneute Account Import nicht möglich.
+Erstellt eine zweite öffentliche Projektion. Der erste ausgewählte Account bleibt der Besitzer
+provider routing; Die folgenden same-project-Konten sind Aliases dieses
+Deselect/delete der routing-Besitzer Atom überträgt den Routing an den ersten
+für den verbleibenden selected alias unter demselben realm/chat lock; Löschung des üblichen alias
+ändert nur die Control plane und löscht nicht die stream/topic graph.
+Die unabhängigen Backfill/live-Deliveries dieser Aliases kommen zusammen realm-global
+message/reaction UUID. Server Sie nehmen sie nur an, wenn sie übereinstimmen. verified realm,
+project, projection stream und provider chat, wobei der erste materializing
+account als stabiler Besitzer einer bereits existierenden Projektion.
+
+## 3A — realm-global provider identity und direct conversation key
+
+Numeric Zulip objects Sie benutzen:
+
+```text
+UUIDv5(namespace=verified_realm_uuid, name="<type>:<shortest-decimal-id>")
+```
+
+Erlaubte `type`: `user`, `channel`, `message`, `attachment`. Numeric ID —
+unsigned shortest base-10 ASCII ohne Zeichen, Leerzeichen und leading zero. Project,
+account, server URL, email und mutable display name sind nicht in die Identity eingebunden.
+
+Channel key hat eine Form `channel:<shortest-decimal-channel-id>`. Direct/self/
+group conversation key hat eine genaue Serialisierung:
+
+```text
+direct-conversation:v1:<count>:<id1>,<id2>,...
+```
+
+Die Liste enthält die eindeutigen Provider User IDs aller Teilnehmer und muss
+verified owner der verbundenen Account. IDs werden nach Zahlenwert sortiert;
+`count` Also hat ein selbstaufruf, DM oder Gruppe DM
+ein Schlüssel für History/realtime und für alle Accounts realm.
+
+## 4A — Nur die bestehenden autorisierten public actions für outbound
+
+Generic private command «jede Workspace Modell  zu schreiben ist verboten. Provider
+API v2 ist kein Weg , um die Nutzerabsicht zu beweisen und gibt keine Bridge browser/IAM
+Befugnisse.
+
+Workspace→Zulip operation wird nur nach dem aktuellen öffentlichen action,
+Die Benutzer, Projektumfang und Berechtigungen wurden überprüft.
+Bridge Er bekommt es durch den Leasing.
+Initiation paths, die nicht im aktuellen Server unterstützt werden
+mit dem aktuellen public API (einschließlich generic message move, mark-unread, typing und
+Erstmal wird die Funktion "Role/custom-profile Mutations" ausgeschaltet.. Unknown
+kind und die Workspace Identität werden bis zu mutation.
+
+Für lifecycle mapped channel/topic ist folgende genaue Semantik festgehalten:
+
+- `stream.delete` ruft den offiziellen Zulip archive-channel Endpunkt an.
+  Wiederholt Bridge den aktuellen Status des Channels und zählt bereits
+  Archivisierter Channel mit erreichtem Zustand;
+- `topic.delete` Sie ruft den offiziellen batch-delete-topic Endpunkt auf.
+  `complete=false` ist retryable, und die Abwesenheit von Thema bei vorläufigen
+  Die Lektüre gilt als idympotent erreicht;
+- `topic.create` erzeugt keine synthetische Zulip-Message: Zulip hat keine eigenständige
+  topic-Das ist der Grund, warum Bridge atomar speichert. deterministic
+  `<channel-id>:<topic-name>` mapping, Und die erste ist die normale. `message.create`
+  Das heißt, wenn man den Namen vor dem ersten Posten ändert, ändert das nur diesen Posten.
+  mapping und er erschafft nicht provider traffic.
+
+Diese drei Funktionen werden nur für Channel-Chats veröffentlicht.
+provider reads Die Ablehnung von der Verarbeitung von Daten wird nur auf die seltenen destruktive actions durchgeführt, also nicht
+Sie fügen dem Importeur eine konstante Belastung realtime/history hinzu.
+
+## 5A — state-based provider event key und Einzel delivery identity
+
+`provider_event_key` beschreibt den gewünschten logischen Provider-Stand.
+Es ist für History und Realtime und ist abhängig von account, project, queue event ID,
+Lokalsequenz oder Bridge database.
+
+Bevor der Schlüssel berechnet wird , wird der Bridge-Schlüssel JSON object:
+
+```json
+{
+  "provider_chat_key": "<exact chat key>",
+  "provider_object": {"kind": "<kind>", "id": "<provider object id>"},
+  "provider_references": {},
+  "payload": {}
+}
+```
+
+JSON wird mit den Schlüsseln in lexikografischer Reihenfolge kodiert UTF-8, separators
+`,`/`:`, ohne zusätzliche Whitespace und mit `ensure_ascii=false`. payload
+bis zur Normalisierung werden server-owned Workspace IDs gelöscht und transport-only
+metadata: `account_uuid`, `chat_key`, `delivery_class`, `external_id`,
+`provider_event_uuid`. Digest — lowercase hexadecimal SHA-256 Diese exact bytes.
+
+Wire key:
+
+```text
+provider-event:v1:<command-kind>:<object-kind>:<object-id-utf8-byte-length>:<object-id>:<sha256>
+```
+
+`provider_sequence` nur die aktuelle Provider-Revision überträgt;
+producer sequence Wenn der Provider Revision nicht vorhanden ist, wird der Wert
+Das ist gleich. `null`.
+
+Eine separate canonical UUID String `delivery_uuid` ist stabil bei transport retry
+eine durable delivery, aber keine semantische Identität ist. Workspace ergibt
+Internal Ledger UUID wie:
+
+```text
+UUIDv5(verified_realm_uuid,
+       "provider-delivery:v2:<provider_event_key>:<delivery_uuid>")
+```
+
+Also, der identische Retry einer Delivery wird dedupliziert, und die neue Delivery von der
+Der semantic state wird wieder in die Domain-Transaktion eingegeben und mit der aktuellen Transaktion verglichen
+Ein bereits erreichter Zustand gibt einen No-op ohne zusätzliche public event;
+Die Folge `add → remove → add` verwendet die zweite `add`, obwohl beide add
+haben die gleiche `provider_event_key`.
+
+## Datenmigration  native preserve und automatisch Zulip reimport
+
+Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
+
+- versioned migration Er kann alles aushalten. authoritative native streams, topics,
+  messages, user state, reactions, folders und files in canonical v2 ohne Änderung
+  der öffentlichen Browser-Kontrakt;
+- Verwahrte recipient-only UUID aus historischen Broadcast Snapshots nicht
+  werden zu fiktiven Project-Benutzern: migration speichert sich selbst native
+  Ereignis, aber erstellt keine canonical membership/guard für das bereits entfernte IAM
+  Benutzer;
+- In derselben frozen migration werden bewiesene Zulip-imported messages,
+  verknüpfte reactions/read/event projections und Zulip files, auf die keine
+  surviving native message reference;
+- Zulip-origin reaction wird auch aus dem gespeicherten native/outbound message:
+  Ihre Provider provenance wird durch `external_account_uuid` bestimmt, und UUID
+  Reaktionen werden in die Reinigung der alten Ereignisse eingeschaltet canonical copy. Native reaction
+  Sie wird in derselben gespeicherten Nachricht gespeichert;
+- Workspace→Zulip messages native und werden aus dem Reset ausgeschlossen, wenn ihre
+  `message.create` user operation bestätigt die lokale Herkunft;
+- alte `link_kind=provider_identity`, die von der Account-scoped-Implementierung erstellt wurden,
+  Sie werden auf genau `UUIDv5(verified_realm_uuid, "user:<id>")` übertragen.
+  surviving native relational references, event payloads, chat catalog und
+  current/pending desired resources in derselben Transaktion überschrieben werden;
+  `verified_account_owner` bleibt an IAM UUID gebunden und nimmt nicht an dieser teil
+  Der Konflikt zwischen der Provider Identity und dem IAM Owner stoppt
+  migration fail-closed statt einer unbemerkt verbundenen Nutzergemeinschaft;
+- selected external accounts/chats, credentials und project assignment
+  Für das alte Account-scoped Format same-realm/same-chat
+  stream/topic aliases Atomisch sind sie alle zusammen graph: membership, folders,
+  drafts, files, native messages, user topic state Und die Ereignisse werden in
+  Kanonische Container, danach werden nur die überflüssigen Container gelöscht.
+  Account Erhält einheitlich
+  `projection_reset_generation`, account/chat desired generations Steigen,
+  Der Zustand wird in `backfill`/`syncing`;
+- Bridge Die letzte Reset Generation, die verwendet wurde, wird gespeichert.
+  Atomisch löscht nur rebuildable Zulip cache/idempotency/mappings, wobei
+  identity Und der Katalog, annulliert die abgeschlossenen Backfill Jobs und startet den vollen
+  Die gleiche Generation wird nicht erneut ausgegeben.;
+- Die physische Inhalte der gelöschten Zulip files verarbeitet bounded durable
+  worker queue Nach der DB-Kommit-Verarbeitung
+  Überprüft , ob es keine retained DB Reference gibt; retry gehtpotent. Worker
+  Registriert beide File-Storage-Config-Domains, also die local und die S3 cleanup
+  Sie benutzen das gleiche Backend wie Messenger API;
+- wenn Sie native stream membership löschen , werden die alten broadcast audience rows dieses
+  membership generation Sie werden physisch zurückgerufen.
+  Es gibt keine Wiederholung der Ereignisse der vorherigen Generation, auch wenn rolling view rebuild;
+- logical desired-state snapshot wird nicht vollständig in Python zusammengestellt und nicht gespeichert
+  Einer .JSONBEr ist wie ein geordneter Array.PostgreSQLZeilen mit
+  cascade lifetime von snapshot token; page read wählt `limit + 1` rows.
+  Dies behält den abgestimmten Anker und beschränkt RSS control API unabhängig
+  von der Gesamtzahl der Chats und der Größe participant/topic catalogs;
+- Vor dem Anschalten und Lesen von Snapshot wird der Server von rows PostgreSQL
+  `SHARE ROW EXCLUSIVE` lock Snapshot wartet auf die bereits gestarteten
+  append transactions und für kurze Zeit nicht erlaubt , neue sequence,
+  also fällt der concurrent upsert/delete unbedingt entweder in frozen rows,
+  oder nach dem Anchor. Snapshot wird nur beim Bootstrap erstellt/reset, und
+  nicht in der Realtime-Schleife; die globale Pause ist einfacher und
+  billiger als die ständige Zusatz-Commit-Order-Infrastruktur;
+- Der destruktive Reset ist fehlersicher: konsistente Werte für `source_name`,
+  `source.kind`, `source.message_id`, Account-/Provider-Evidenz und dauerhafte
+  Evidenz mit `action=message.create` unterscheiden eingehende Projektionen von
+  nativen ausgehenden Daten. Unvollständige oder widersprüchliche Herkunft
+  bricht die Migration vor dem Löschen ab;
+- ein unbeaufsichtigter eingefrorener Cutover ist auf eine Million
+  Legacy-Nachrichten, 30 Sekunden Lock-Wartezeit und 30 Minuten Statement-Limit
+  begrenzt. Ein größerer Cutover erfordert nach Backup und produktionsgroßem
+  Probelauf eine ausdrückliche Operatorfreigabe; 50 Millionen Nachrichten sind
+  das Ziel im stabilen Betrieb nach dem Neuimport, keine Erlaubnis zur
+  automatischen Legacy-Konvertierung;
+- der Control-Plane-Snapshot-Lasttest verwendet mindestens 15.000 Zuweisungen
+  mit großen Teilnehmer-/Topic-Katalogen, misst einen begrenzten Backend-RSS und
+  liest nur begrenzte Seiten;
+- Das obligatorische Scale Gate verwendet mindestens `100 000` alte provider message
+  mappings Und beweist, dass der Reset abgeschlossen ist, ist der Backfill-Job wieder abgeschlossen.
+  wird `pending`, und die alte Deduplikation unterdrückt nicht die frischen Importe.
+
+Rollback schema nicht wiederherstellt , Zulip projection:
+Die Daten werden von den Native-Daten gespeichert.
+Sie sind sowohl bei Upgrade als auch bei schema downgrade.
+
+## Vereinbarkeit und Grenzen der ersten Umsetzung
+
+- Öffentliche Routen, Antworten und WebSocket events Workspace UI nicht geändert.
+- V2 ist ein geschlossener provider data-plane, nicht browser API.
+- Server-owned scope und canonical IDs werden nicht als neue Felder geöffnet public
+  Messenger resources.
+- V1 transport nur als rolling adapter gespeichert; eine neue Quelle der Wahrheit
+  Für provider identity ist v2 contract.
+- Der vollständige Wire-Kontrakt ist hier zu finden:
+    [`workspace_provider_api_v2.yaml`](../workspace_provider_api_v2.yaml).

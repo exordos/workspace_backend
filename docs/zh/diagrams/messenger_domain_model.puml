@@ -1,0 +1,263 @@
+@startuml messenger_domain_model
+!pragma layout smetana
+
+title 域名模型 Messenger
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam entity {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+entity MESSAGE {
+    uuid <<内部规范 ID>>
+    --
+    author_uuid
+    content
+    created_at
+    updated_at
+}
+
+entity MESSAGE_PLACEMENT {
+    uuid <<公开的 placement ID, UUIDv5>>
+    --
+    message_uuid
+    stream_uuid
+    topic_uuid
+}
+
+entity USER_MESSAGE_BINDING {
+    binding_uuid <<隐藏密钥 ORM>>
+    --
+    placement_uuid
+    user_uuid
+    --
+    relation_role
+    visibility
+    permissions
+    membership_generation snapshot
+}
+
+entity USER_MESSAGE_STATE {
+    placement_uuid
+    user_uuid
+    membership_generation snapshot
+    --
+    read
+    mentioned
+    starred
+    pinned
+}
+
+entity DOMAIN_OUTBOX_EVENT {
+    event_uuid
+    scope_kind
+    exact scope_key
+    payload
+    immutable
+}
+
+entity PROJECTION_TASK {
+    outbox_event_uuid <<unique derivation key>>
+    task_kind
+    scope_kind
+    exact scope_key
+    pending / leased / running / completed / failed / DLQ
+    lease / fencing / attempts / next_retry_at
+}
+
+entity PROJECTION_SCOPE_LEASE {
+    project_id
+    scope_kind
+    exact scope_key
+    --
+    owner / expiry / fencing_token
+}
+
+entity USER {
+    user_uuid
+}
+
+entity STREAM {
+    stream_uuid
+    owner_uuid <<已被索引 FK 在 user>>
+    direct_user_uuid <<nullable FK 在 user>>
+    private
+}
+
+entity TOPIC {
+    topic_uuid
+}
+
+entity FOLDER {
+    folder_uuid
+}
+
+entity USER_STREAM_BINDING {
+    stream_uuid
+    user_uuid
+    --
+    active / membership_generation
+    访问 / 通知
+    没有读取的计数器 / last_message_uuid
+}
+
+entity USER_TOPIC_BINDING {
+    topic_uuid
+    user_uuid
+    --
+    旗 / 通知 / 未读的计数器
+}
+
+entity USER_FOLDER_BINDING {
+    folder_uuid
+    user_uuid
+    --
+    rule / type
+    unread_count / mention_count
+    folder_items_snapshot : JSONB (read-only public source)
+    snapshot_version / snapshot_updated_at (internal)
+}
+
+entity FOLDER_ITEM {
+    folder_item_uuid
+    folder_uuid
+    stream_uuid
+    --
+    automatic
+}
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : "显而易见的背景"
+STREAM ||--o{ MESSAGE_PLACEMENT : 位置
+TOPIC ||--o{ MESSAGE_PLACEMENT : "必须的背景 / namespace UUIDv5"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : "接收者访问"
+USER ||--o{ USER_MESSAGE_BINDING : "唯一的位置"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : "唯一的 user/placement"
+USER ||--o{ USER_MESSAGE_STATE
+STREAM ||--o{ USER_STREAM_BINDING
+USER ||--o{ USER_STREAM_BINDING
+TOPIC ||--o{ USER_TOPIC_BINDING
+USER ||--o{ USER_TOPIC_BINDING
+FOLDER ||--o{ USER_FOLDER_BINDING
+USER ||--o{ USER_FOLDER_BINDING
+FOLDER ||--o{ FOLDER_ITEM : "文件组合"
+
+note right of USER_FOLDER_BINDING
+  Normalized FOLDER_ITEM = source of truth.
+  Public folder_items <- ready JSONB snapshot; empty = [].
+  folder_projection(user-folder scope) atomically writes
+  snapshot + counts + version/time + ready event rows.
+  API read: one indexed row/page; no N+1/json_agg/COUNT/custom SQL.
+end note
+STREAM ||--o{ FOLDER_ITEM : "规范物体"
+DOMAIN_OUTBOX_EVENT --> PROJECTION_TASK : "这就是 1 immutable task 在 event"
+PROJECTION_TASK --> PROJECTION_SCOPE_LEASE : "claim exact scope"
+PROJECTION_TASK ..> FOLDER_ITEM : "实现 automatic items"
+PROJECTION_TASK ..> USER_FOLDER_BINDING : "更新已准备的组件"
+
+note top of MESSAGE
+  一个物理的规范记录.
+  内容不会被用户复制.
+  MESSAGE.uuid — 内部稳定 ID.
+end note
+
+note top of MESSAGE_PLACEMENT
+  公开的 uuid = UUIDv5(
+    namespace = TOPIC.uuid,
+    name = MESSAGE.uuid
+  ).
+  Name — lowercase hyphenated canonical UUID.
+  Name 没有 project/stream, braces 或是前.
+  权威独特性:
+  (project, message, stream, topic).
+  TOPIC 具有约束力,全球性,独特性和不变性
+  属于一个人. STREAM/PROJECT.
+end note
+
+note right of USER_MESSAGE_BINDING
+  物理索引访问记录.
+  唯一的 (project, placement, user).
+  binding_uuid 隐藏于公开 JSON,
+  但可能是技术上的. identity 列表 ORM.
+  没有 revision 或版本 binding.
+end note
+
+note bottom of USER_MESSAGE_STATE
+  Placement-scoped read/starred/pinned/etc.
+  一行 (project, user, placement).
+  创建与 binding.
+  对于接收者 worker 创建 state 随着 binding.
+  Re-add: conditional upsert 新的 generation
+  并且完全 reset 个人 flags 其他 defaults.
+end note
+
+note bottom of STREAM
+  公众活动 owner/direct 其他链接 — UUID;
+  实物列 索引 FK.
+  direct_user_uuid 已设置 => private = true.
+  Self-chat 拥有一个所有者,没有
+  接收者信息的额外绑定.
+end note
+
+note right of USER_STREAM_BINDING
+  Persistent lifecycle row.
+  Revoke: active=false + generation++ 在 API transaction.
+  Re-add: 新的 generation; 旧的 message binding/state 它们是看不见的.
+  每一个 read/action 检查 active + 它们的相似性 generation.
+  Cleanup 没有 security-critical.
+end note
+
+note bottom of USER_FOLDER_BINDING
+  规范性 stream/topic/folder 保存一次.
+  准备的组件处于独特的绑定中
+  根据第十五条 user/container scope.
+  系统性 binding 具有固定 rule/type.
+  总的讲道: 活跃的 USER_STREAM_BINDING
+  + 规范性 STREAM.is_archived = false.
+  All chats: 所有的; Personal: STREAM.private = true;
+  Channels: STREAM.private = false.
+  Message binding 不保存容器计数器.
+end note
+
+note bottom of FOLDER_ITEM
+  元素 automatic = true — 转换的投影.
+  真理的来源: 活跃的 USER_STREAM_BINDING
+  规范性和属性 STREAM.
+  API 阅读已准备的行,使用简单的索引连接.
+end note
+
+note bottom of PROJECTION_TASK
+  变更写出不可改变的事件 outbox.
+  GET/list 没有创建任务.
+  Initial design: 没有 coalescing.
+  Unique outbox_event_uuid; lease expiry + fencing;
+  retry/backoff, max attempts/DLQ, reaper/reconciliation.
+  Worker 得到明确的工作 placement;
+  它没有扫描缺失的 bindings.
+  Topic scope 只有 placements/bindings.
+  Canonical snapshots: message scope.
+  Aggregates: user-stream/user-topic/user-folder.
+  Fallback shared row -> topic 禁止使用.
+  Atomic delta 要求 exactly-once effect guard;
+  否则 scope worker recomputes/writes.
+end note
+
+note bottom of DOMAIN_OUTBOX_EVENT
+  同时发送一个交易:
+  MESSAGE + MESSAGE_PLACEMENT + 创作权
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + outbox.
+  Fan-out 创建 binding/state 收件人一起;
+  self-chat 不会创建额外的对.
+end note
+
+@enduml

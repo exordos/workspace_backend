@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/[stream_uuid]/actions/add_users/invoke
+actor "Der Client" as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke
+API -> DB: create/reactivate persistent USER_STREAM_BINDING\nactive=true; membership_generation++
+API -> DB: immutable outbox event für jede typed task
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: topic_membership_policy_rebuild / fanout /\nread_counters / folder_projection\njede task hat seine outbox_event_uuid + expected generation
+Worker -> Worker: topic scope: catch-up MESSAGE.created_at DESC;\nshared aggregates: user-stream/user-folder
+Worker -> DB: conditional active + generation equality
+Worker -> Projection: fresh binding + placement state;\n- Bereit shared projections
+Worker -> Events: Ereignisse des Flusses/Verbindungs-/Ordners\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Grant active - Ich muss sofort gehen.; historische Sichtbarkeit eventual.
+  Die alten binding/state Der alte generation Sie werden nicht wieder lebendig..
+  Lease expiry/fencing, retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+@enduml

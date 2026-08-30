@@ -1,0 +1,35 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/resume/invoke
+actor "Der Client" as C
+participant "REST / RestAlchemy\n- Das ist ein Controller ." as API
+database "PostgreSQL\nKanonische Zeilen/Lesezeilen" as DB
+queue "Immutable outbox event\n+ delivery_snapshot_event 1:1" as O
+participant "Arbeiter / Manager\nVerarbeiter des Providers" as W
+
+C -> API: Anfrage POST + bearer-- Das ist ein Token . IAM
+activate API
+API -> DB: Sperren/Prüfen des Kanonischen Bereichs
+API -> DB: Verändern Sie den Status
+API -> O: event -> delivery_snapshot_event(outbox_event_uuid)
+DB --> API: festgestellter Zustand
+O --> API: Feststehende Eintrag
+API --> C: Sanitiertes Bild 200
+deactivate API
+W -> O: claim exact scope; lease/fencing/retry/DLQ
+W -> DB: Ich kann die Projektion oder das Steuerungssystem aktualisieren
+DB --> W: festgestellter materialisierter Zustand
+note right of W
+  Wenn die Arbeit eine Platzierung betrifft Messenger:
+  Ein Slot besitzt monopol (project_id, topic_uuid)
+  und verarbeitet MESSAGE.created_at DESC.
+  Die Verwaltung des Providers behält die eigene stabile Ordnung.
+end note
+
+note over API,DB
+  Öffentliche Verweise UUID sind skalar UUID-Eigenschaften.
+  Physische Spalten *_uuid bleiben indexiert FK.
+end note
+@enduml

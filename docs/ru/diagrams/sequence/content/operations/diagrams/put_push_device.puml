@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title PUT /api/workspace/v1/push_devices/{registration_uuid}
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "Устройство push-уведомлений в PostgreSQL" as DB
+queue "Внутренний доменный outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: PUT полного JSON регистрации
+API -> DB: BEGIN; заблокировать область владельца
+API -> DB: вставить или заменить UUID регистрации
+API -> OUT: добавить внутреннюю вставку/обновление регистрации
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; завершить без public event row
+API --> Client: 201 или 200 JSON
+@enduml

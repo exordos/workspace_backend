@@ -1,0 +1,39 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/
+actor "The client ." as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/
+API -> DB: One transaction: MESSAGE + - That 's it . TOPIC placement(UUIDv5)\n+ The author 's USER_MESSAGE_BINDING + USER_MESSAGE_STATE
+API -> DB: immutable outbox event For each typed task
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: The events that have been recorded
+Outbox ->> Worker: fanout / content_mentions / read_counters /\nfolder_projection / delivery_snapshot_event\neach task It has its own outbox_event_uuid
+Worker -> Worker: topic newest-first; recipient batches user_uuid ASC\ndefault 1000, max 5000; bounded fairness
+alt Placing the flow with yourself
+    Worker -> Projection: No additional USER_MESSAGE_BINDING\nor USER_MESSAGE_STATE; Update the owners projection
+else the usual/direct placement
+    Worker -> DB: keyset batch; active membership + expected generation
+    group One . batch DB transaction
+      Worker -> Projection: bulk binding + state + downstream work
+      Worker -> Events: durable ready rows + checkpoint / next batch
+    end
+end
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Projection
+  Public uuid = MESSAGE_PLACEMENT.uuid =
+  UUIDv5(namespace=TOPIC.uuid, name=MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  MESSAGE.uuid and binding_uuid They 're hidden ..
+  Lease/fencing, retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+@enduml

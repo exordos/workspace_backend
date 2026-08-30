@@ -1,0 +1,116 @@
+@startuml worker_architecture
+!pragma layout smetana
+
+title Architektur des Projektionsvorwerks Workspace
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequence {
+    ArrowColor #334155
+    LifeLineBorderColor #334155
+    ParticipantBorderColor #2563EB
+    ParticipantBackgroundColor #EFF6FF
+}
+
+actor "Der Client" as Client
+participant "REST / RestAlchemy\n- Das ist ein Controller ." as API
+database "Ausgangstabelle\nKanonische Wesen + Verknüpfungen + Fakten" as SOURCE
+database "Nicht zu verändernes Domänenname\noutbox" as OUTBOX
+participant "Aufgabenprojektor\n1 task - Auf outbox event" as PROJECTOR
+database "Typisierte Aufgaben\nProjektionen" as TASKS
+participant "Ein eingestellter Worker-Pool\n0..N Aktives Slot" as POOL
+database "Miete exact scope key\nlease + fencing token" as CLAIM
+participant "Ein Schlitz für den Worker" as WORKER
+database "Fertige Projektionen\nVerknüpfungen + Zustand / Bilder" as READY
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket\nWiederholung + Wiedergabe" as DISPATCHER
+actor "Der Client WebSocket" as WS
+
+Client -> API : eine Anfrage, die den Status ändert
+activate API
+API -> SOURCE : Zeilen  Wahrheitsquellen ändern
+API -> OUTBOX : ein unveränderliches Ereignis hinzufügen\nin derselben Transaktion
+API --> Client : Festgeschriebene sofortige Antwort
+deactivate API
+
+note over API,OUTBOX
+  POST Erstellt alle Nachrichten gleichzeitig:
+  MESSAGE + MESSAGE_PLACEMENT
+  + Autoren USER_MESSAGE_BINDING
+  + USER_MESSAGE_STATE + outbox.
+  Die Verbindung + der Empfängerstatus werden zusammen durch fanout.
+end note
+
+OUTBOX -> PROJECTOR : festgestellte Ereignisse
+PROJECTOR -> TASKS : immutable task(outbox_event_uuid, kind, scope)\nunique derivation; Ohne coalescing
+TASKS -> POOL : Sie warten auf eine offensichtliche Arbeit\n(ohne nach fehlenden Zeilen zu suchen)
+POOL -> CLAIM : Ergreifen Sie genau scope key
+CLAIM --> POOL : Monopolvermietung/Besitz
+POOL -> WORKER : - die Grenze festlegen N
+activate WORKER
+WORKER -> SOURCE : Lesen Sie den letzten festgelegten Status aus
+note right of WORKER
+  Nur für scope=topic:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+  fanout batch: user_uuid ASC, default 1000, max 5000
+  Nachher batch — checkpoint und bounded fairness
+end note
+group Einer DB transaction
+  WORKER -> READY : Wir sind potent. materialization / batch upsert
+  WORKER -> EVENTS : durable ready rows; unique derivation key
+end
+WORKER -> CLAIM : Sie müssen sicher freigelassen werden.
+deactivate WORKER
+
+EVENTS -> DISPATCHER : - die bereitgestellten Aufzeichnungen
+DISPATCHER -> WS : Senden / Wiederholen / Wiedergeben
+note over EVENTS,WS
+  Reconnect: cursor + high-watermark + replay + buffer/drain Ohne gap.
+  At-least-once; client dedupe Nach event UUID.
+  Membership generation Sie unterdrückt. data events Nachher revoke.
+end note
+
+note over SOURCE,READY
+  Öffentliche Verweise UUID sind skalar UUID-Eigenschaften.
+  Physische Spalten *_uuid bleiben als indexierte externe Schlüssel.
+  Die Aggregate der Container werden auf einzigartigen Bindungen gespeichert
+  Benutzer zum Container, aber nicht in Nachrichtenbindungen.
+  MESSAGE_PLACEMENT.uuid — öffentlich UUID Nachrichten.
+  MESSAGE.uuid — - Innen canonical content UUID;
+  UUID USER_MESSAGE_BINDING bleibt verborgen. row identity.
+  FOLDER wird einmal aufbewahrt; normalized FOLDER_ITEM = source of truth.
+  USER_FOLDER_BINDING Er bewahrt Zugriff, Zähler und read-only JSONB
+  folder_items_snapshot (empty=[]), version/updated_at.
+  Die automatischen Ordner lesen die aktive USER_STREAM_BINDING + STREAM.is_archived=false:
+  All chats = - Das ist alles.; Personal = STREAM.private=true; Channels = STREAM.private=false.
+end note
+
+note over TASKS,READY
+  Verlagerung des Besitzes:
+  fanout/placement state -> topic(project, topic)
+  reaction snapshot -> message(project, canonical message)
+  stream aggregates -> user-stream(project, user, stream)
+  folder_projection -> user-folder(project, user, folder)
+  topic aggregates -> user-topic(project, user, topic)
+  Andere shared rows Sie verlangen ein offenkundiges scope; fallback - Auf topic Verboten.
+  Topic-worker nicht erfüllt unsafe read-modify-write shared rows.
+  folder_projection Schreibt snapshot + counts + version/time
+  + - Das ist alles. ready events in einer worker DB transaction.
+  API Lesen Sie eine indexed row/page Ohne N+1/json_agg/COUNT/custom SQL.
+end note
+
+note over PROJECTOR,CLAIM
+  Lifecycle: pending -> leased/running -> completed/failed -> DLQ.
+  Lease expiry, attempts/backoff, max attempts, reaper/reconciliation.
+  Atomic counter delta nur mit exactly-once effect guard
+  Nach outbox_event_uuid; - Nein, sonst nicht. scope worker recomputes/writes.
+end note
+
+note over API,OUTBOX
+  GET/Liste endet nach dem Index-Lesung
+  und nicht erschaffen. outbox/Aufgabe.
+end note
+
+@enduml

@@ -1,0 +1,11 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+Client -> API: GET /api/workspace/v1/messenger/
+API -> API: 检查已注册的路线 Messenger
+note right of API: 没有DB / outbox / 任务 / 事件
+API --> Client: 200 字符串数组 JSON
+@enduml

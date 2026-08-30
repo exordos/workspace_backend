@@ -1,0 +1,29 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/stream_topics/[topic_uuid]/actions/read/invoke
+actor "Клиент" as Client
+participant "WorkspaceStreamTopicController\nRestAlchemy" as API
+database "PostgreSQL\nканонические строки + привязки" as DB
+queue "Transactional outbox\n+ вывод типизированных задач" as Outbox
+participant "Scope workers\nlease + fencing" as Worker
+database "Готовые проекции\nпривязки контейнеров" as Projection
+database "Хранилище публичных событий" as Events
+participant "Диспетчер WebSocket" as Dispatcher
+actor "Клиент WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/read/invoke
+API -> DB: состояния прочтения + immutable outbox event\nна каждую exact-scope task
+DB --> API: фиксация транзакции
+API --> Client: успешный публичный ответ
+DB ->> Outbox: зафиксированное событие
+Outbox ->> Worker: read_counters / folder_projection\nкаждая exact-scope task имеет своё outbox_event_uuid
+Worker -> Worker: один fenced owner exact scope; разные scopes параллельны
+Worker -> Projection: счётчики привязок темы/потока/папки
+Worker -> Events: topic.read + события контейнера\nатомарно в одной DB transaction с проекцией
+Events ->> Dispatcher: зафиксированная готовая строка
+Dispatcher ->> WS: отправка / повтор / воспроизведение
+note over Worker,Projection
+  Topic worker shared counters не пишет.
+  Atomic delta требует exactly-once guard; иначе recompute/write.
+  Retry/backoff, DLQ/reaper обязательны.
+end note
+@enduml

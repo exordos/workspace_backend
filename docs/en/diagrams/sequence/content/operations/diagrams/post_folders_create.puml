@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/folders/
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL\nFOLDER + USER_FOLDER_BINDING" as DB
+queue "It 's a transaction . outbox" as OUT
+queue "Typed projection task" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "Signed client" as WS
+Client -> API: POST JSON the folder
+note right of API
+  Creating a custom rule created
+  The system folder rule/type is fixed and not manually created
+  Automatically FOLDER_ITEM: active USER_STREAM_BINDING + It 's canonical . STREAM.is_archived = false
+  All chats = All of them .; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+API -> DB: BEGIN; I want to insert FOLDER + user-defined binding
+API -> OUT: I 'm going to add folder.created
+API -> DB: COMMIT
+API --> Client: 201 JSON the folder
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; without coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: Read the last folder + bind
+group One . worker DB transaction
+  WORKER -> DB: ensure snapshot=[] + zero counts + version/updated_at
+  WORKER -> EVENT: ready folder.created + unique effect guard
+end
+DISP -> EVENT: read/repeat/play
+DISP -> WS: folder.created
+@enduml

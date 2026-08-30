@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/drafts/
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "Строка черновика в PostgreSQL" as DB
+queue "Внутренний доменный outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: POST JSON черновика
+API -> DB: BEGIN; проверить владельца + тему
+API -> DB: вставить или сравнить клиентский UUID
+API -> OUT: добавить внутреннее draft.created
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; завершить без public event row
+API --> Client: 201 или идемпотентный 200 + ETag
+@enduml

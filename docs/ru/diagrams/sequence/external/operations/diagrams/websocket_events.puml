@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title Догоняющее чтение WebSocket Events, барьер готовности и доставка в реальном времени
+actor "Клиент" as C
+participant "Диспетчер WebSocket" as D
+database "Видимое хранилище готовых событий" as E
+
+C -> D: GET /api/workspace/v1/events/ws\nWebSocket upgrade + workspace.events.v1 + токен Bearer
+D -> D: аутентифицировать IAM и проверить пару курсора
+D -> E: зафиксировать high-watermark; события после last_epoch_version
+E --> D: видимые события в порядке epoch_version ASC
+loop пропущенные устойчивые события
+  D --> C: плоское событие Workspace
+end
+D -> E: drain буфера live tail до high-watermark
+D --> C: {type: ready, epoch_generation, epoch_version}
+note over C,D
+  Ровно один кадр готовности; ни одно событие реального времени не может его обогнать.
+end note
+loop зафиксированные события реального времени
+  D -> E: получить/воспроизвести следующую видимую эпоху
+  E --> D: готовая строка события
+  D --> C: плоское событие Workspace
+end
+D --> C: управляющий кадр ping уровня протокола WebSocket
+note over D,E
+  Путь диспетчера только для чтения: нет записей доменного outbox/задач.
+  Доменные воркеры никогда не владеют сетевыми соединениями.
+  At-least-once: client dedupe по event UUID, cursor после обработки.
+  Audience generation подавляет stale data events после revoke.
+  Истёкший cursor -> epoch_pruned/4410, без тихого gap.
+end note
+@enduml

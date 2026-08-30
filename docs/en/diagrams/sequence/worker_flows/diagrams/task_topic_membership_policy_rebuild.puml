@@ -1,0 +1,52 @@
+@startuml task_topic_membership_policy_rebuild
+!pragma layout smetana
+title Typed projection task: topic_membership_policy_rebuild
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Outbox membership/politics" as OUTBOX
+participant "Task projector" as PROJECTOR
+database "Typed tasks" as TASKS
+database "The subject line" as CLAIM
+participant "The worker's slot." as WORKER
+database "Recent membership/policy" as POLICY
+database "MESSAGE_PLACEMENT" as PLACEMENTS
+database "USER_TOPIC_BINDING\nUSER_MESSAGE_BINDING" as BINDINGS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket" as DISPATCHER
+actor "The client ." as Client
+
+OUTBOX -> PROJECTOR : recorded membership/politics event
+PROJECTOR -> TASKS : immutable topic_membership_policy_rebuild\n(outbox_event_uuid, scope=topic)\nunique derivation; without coalescing
+TASKS -> WORKER : The obvious subject area
+WORKER -> CLAIM : Monopoly (project, topic)
+WORKER -> POLICY : active membership + expected generation
+WORKER -> PLACEMENTS : Read the placement clearly
+note right of PLACEMENTS
+  Mass order by MESSAGE.created_at DESC:
+  14:20 -> 14:19 -> 14:15
+end note
+group One . DB transaction
+  loop affected users/sites
+    WORKER -> BINDINGS : conditional upsert The generation equality;\nstale task = no-op
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events exact scopes:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : I 'm gonna get you out of here .
+EVENTS -> DISPATCHER : - I 'm not sure .
+DISPATCHER -> Client : Send / repeat / play
+
+note over TASKS,BINDINGS
+  The same one. exact topic-scope protocol Serves a separate
+  TASK_KIND topic_state_projection For the ready topic.updated;
+  authoritative TOPIC.is_done Only changed by synchronous command.
+  Revoke active=false + generation++ It 's synchronized .;
+  stale rows They don 't give access and cleanup No , not really . security boundary.
+  Topic worker shared rows He doesn 't write ..
+  Lease expiry/fencing, retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+
+@enduml

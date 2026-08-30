@@ -1,0 +1,33 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/messenger/folders/{folder_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL\nFOLDER + USER_FOLDER_BINDING" as DB
+queue "Transaktions- outbox" as OUT
+queue "Typisierte Projektionsvorgabe" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: DELETE Ordner
+note right of API
+  Systemische USER_FOLDER_BINDING Dieser Weg wird nicht gelöscht.
+  Projektion: Aktiv USER_STREAM_BINDING + Kanonische STREAM.is_archived = false.
+  All chats = - Das ist alles.; Personal = STREAM.private = true; Channels = STREAM.private = false.
+end note
+API -> DB: BEGIN; den Ordner im angegebenen Bereich sperren
+API -> DB: Verknüpfung/Elemente löschen + FOLDER Durch den Lebenszyklus FK
+API -> OUT: Hinzufügen folder.deleted
+API -> DB: COMMIT
+API --> Client: 204 Leere Antwort
+OUT -> TASK: immutable folder_projection(outbox_event_uuid, scope=user-folder)
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+group Einer worker DB transaction
+  WORKER -> DB: idempotent tombstone effect guard
+  WORKER -> EVENT: ready folder.deleted {uuid}
+end
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: folder.deleted
+@enduml

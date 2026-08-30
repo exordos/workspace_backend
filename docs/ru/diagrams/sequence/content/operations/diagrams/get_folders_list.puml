@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folders/
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: запрос
+note right of API
+  Текущая реализация: page_limit отсутствует/0 => без ограничения
+  отрицательное/нецелое => 400; положительное без максимума/ограничения сверху
+  Target: отсутствует/0 => 100; 1..500 точно; иначе 400; unlimited нет
+end note
+API -> DB: индексированный SELECT
+note right of DB
+  FOLDER хранится один раз; USER_FOLDER_BINDING хранит доступ,
+  счётчики и read-only JSONB folder_items_snapshot; empty=[]
+  Каждая folder row готова: без N+1/json_agg/COUNT/custom SQL
+  Правило/тип системных папок фиксированы; API использует индексированные соединения без COUNT
+  Автоматические FOLDER_ITEM: активная USER_STREAM_BINDING + каноническая STREAM.is_archived = false
+  All chats = все; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Snapshot детерминированно поддерживает folder_projection.
+end note
+DB --> API: indexed page с ready snapshots/counts
+note right of API: без outbox / задачи / события
+API --> Client: 200 JSON
+@enduml

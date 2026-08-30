@@ -1,0 +1,11 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+Client -> API: GET /api/workspace/v1/messenger/
+API -> API: die registrierten Routen überprüfen Messenger
+note right of API: ohne DB / outbox / Aufgaben / Ereignisse
+API --> Client: 200 Zeilen-Array JSON
+@enduml

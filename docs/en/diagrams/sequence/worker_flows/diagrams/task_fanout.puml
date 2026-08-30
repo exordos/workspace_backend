@@ -1,0 +1,63 @@
+@startuml task_fanout
+!pragma layout smetana
+title Typed projection task: fanout
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+participant "The projector outbox" as PROJECTOR
+database "Typed tasks" as TASKS
+database "The subject line" as CLAIM
+participant "The worker's slot." as WORKER
+database "MESSAGE + PLACEMENT" as SOURCE
+database "Membership / policy" as POLICY
+database "USER_MESSAGE_BINDING\n+ USER_MESSAGE_STATE" as RECIPIENT_ROWS
+database "Subsequent Projection Tasks" as FOLLOWUPS
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket" as DISPATCHER
+actor "The client ." as Client
+
+PROJECTOR -> TASKS : immutable fanout(outbox_event_uuid, scope=topic)\nunique derivation; without coalescing
+TASKS -> WORKER : Clear work to place
+WORKER -> CLAIM : Monopoly (project_id, topic_uuid)
+CLAIM --> WORKER : ownership
+WORKER -> SOURCE : Read the placement + canonical message
+note right of SOURCE
+  Order within the topic:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+end note
+loop immutable batches: user_uuid ASC; default 1000, max 5000
+  WORKER -> POLICY : keyset recipients; active + expected generation
+  group One short one. DB transaction
+    WORKER -> RECIPIENT_ROWS : bulk conditional upsert binding + state
+    WORKER -> FOLLOWUPS : immutable downstream outbox events + tasks 1:1
+    WORKER -> EVENTS : durable ready rows + checkpoint/next batch
+  end
+end
+alt membership inactive / generation mismatch
+  note over WORKER,RECIPIENT_ROWS
+    Stale task Finishes no-op And it never restores access ..
+  end note
+end
+alt Chatting with yourself
+  note over WORKER,RECIPIENT_ROWS
+    The author link and status already exist.
+    No additional receiver lines are being created.
+  end note
+end
+WORKER -> CLAIM : I 'm going to get out .
+EVENTS -> DISPATCHER : - I 'm not sure .
+DISPATCHER -> Client : Send / repeat / play
+
+note over SOURCE,RECIPIENT_ROWS
+  It 's public . UUID = MESSAGE_PLACEMENT.uuid =
+  UUIDv5(namespace=TOPIC.uuid, name=MESSAGE.uuid).
+  UUID The user binding It stays. hidden.
+  Task: lease/fencing, retry/backoff, DLQ/reaper,
+  idempotent effect guard The outbox_event_uuid.
+  Retry It only repeats batch; OFFSET and unbounded transaction It 's forbidden ..
+  After batch scheduler It gives. bounded fairness I 'm going to the old job ..
+end note
+
+@enduml

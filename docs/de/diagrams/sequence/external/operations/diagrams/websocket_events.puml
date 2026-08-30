@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title Einholles Lesen WebSocket Events, Bereitschaftsbarriere und Lieferung in Echtzeit
+actor "Der Client" as C
+participant "- Das ist der Controller . WebSocket" as D
+database "Sichtbarer Speicher für Vorfälle" as E
+
+C -> D: GET /api/workspace/v1/events/ws\nWebSocket upgrade + workspace.events.v1 + - Das ist ein Token . Bearer
+D -> D: Authentifizieren IAM und ein paar Kurzer überprüfen
+D -> E: - Das ist nicht wahr . high-watermark; Nach den Ereignissen last_epoch_version
+E --> D: Die sichtbaren Ereignisse sind in Ordnung epoch_version ASC
+loop verpasste Nachhaltigkeitsereignisse
+  D --> C: Flachere Ereignis Workspace
+end
+D -> E: drain - Ein Buffer live tail bis high-watermark
+D --> C: {type: ready, epoch_generation, epoch_version}
+note over C,D
+  Genau ein Bereitschaftsbild.; Kein Ereignis in Echtzeit kann ihn überholen..
+end note
+loop festgestellte Ereignisse in Echtzeit
+  D -> E: Erhalten/wiederholen Sie die nächste sichtbare Epoche
+  E --> D: Vorbereitungszeile
+  D --> C: Flachere Ereignis Workspace
+end
+D --> C: Führungskräfte ping Protokoll-Ebene WebSocket
+note over D,E
+  Der Weg des Controllers ist nur für Lesen: Es gibt keine Domain-Einträge outbox/Aufgaben.
+  Domain-Worker haben nie die Kontrolle über Netzwerkverbindungen.
+  At-least-once: client dedupe Nach event UUID, cursor Nach der Bearbeitung.
+  Audience generation Sie unterdrückt. stale data events Nachher revoke.
+  Ausgelaufen cursor -> epoch_pruned/4410, Ohne Ruhe gap.
+end note
+@enduml

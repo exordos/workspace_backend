@@ -1,0 +1,28 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/[message_uuid]/actions/star/invoke
+actor "The client ." as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Worker scope=user-message\nlease + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/{message_uuid}/actions/star/invoke
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: placement STATE.starred=true + immutable outbox event
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: immutable read_counters(outbox_event_uuid,\nproject+user+placement); without coalescing
+Worker -> Worker: One fenced owner exact user-message scope
+Worker -> Projection: presenting a message to the current user
+Worker -> Events: message.updated current user\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Worker
+  Topic lock Not used. Retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+@enduml

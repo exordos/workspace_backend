@@ -1,0 +1,44 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/move/invoke
+actor "The client ." as C
+participant "REST / RestAlchemy\nThe controller ." as API
+database "PostgreSQL\ncanonical lines/read lines" as DB
+queue "Immutable outbox events\n+ exact typed tasks 1:1" as O
+participant "Worker / manager\nThe provider 's processor" as W
+database "Ready storage\npublic events" as E
+participant "The controller .\nWebSocket" as D
+actor "Connected client" as WC
+
+C -> API: The request POST + bearer-The token IAM
+activate API
+API -> DB: block/check the canonical area
+API -> DB: Fix the change in status
+API -> O: chat event -> delivery_snapshot_event
+API -> O: each topic event -> topic_membership_policy_rebuild
+DB --> API: The state of the system .
+O --> API: the recording is fixed
+API --> C: Sanitized photo . 200
+deactivate API
+W -> O: claim exact scope; lease/fencing/retry/DLQ
+group One . DB transaction
+  W -> DB: I 'm going to update the projection or control
+  W -> E: durable ready external_chat.updated
+end
+note right of W
+  If the job involves placement Messenger:
+  One slot is monopoly owned (project_id, topic_uuid)
+  and processing MESSAGE.created_at DESC.
+  Provider management keeps its own stable order.
+end note
+D -> E: Play the next visible epoch
+E --> D: A flat shot of the event
+D --> WC: The event WebSocket / I 'm going to repeat
+
+note over API,DB
+  Public links UUID are scalar UUID-The properties.
+  Physical columns *_uuid remain indexed FK.
+end note
+@enduml

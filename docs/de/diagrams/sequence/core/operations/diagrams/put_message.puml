@@ -1,0 +1,29 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/messages/[message_uuid]
+actor "Der Client" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: PUT /api/workspace/v1/messenger/messages/{message_uuid}
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: update canonical MESSAGE.payload;\nimmutable outbox event für jede typed task
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: content_mentions / read_counters /\ndelivery_snapshot_event\njede task hat seine outbox_event_uuid
+Worker -> Worker: topic scopes: placement mentions;\nmessage/delivery scopes: shared projections
+Worker -> Projection: Benutzermeldungen erwähnen + vorlegen
+Worker -> Events: message.updated + Die Ereignisse der Zähler\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Public ID = MESSAGE_PLACEMENT.uuid; canonical MESSAGE.uuid hidden.
+  Einer fenced owner exact scope; retry/backoff, DLQ/reaper.
+end note
+@enduml

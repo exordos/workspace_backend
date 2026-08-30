@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/stream_topics/[topic_uuid]
+actor "The client ." as Client
+participant "WorkspaceStreamTopicController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: DELETE /api/workspace/v1/messenger/stream_topics/{topic_uuid}
+API -> DB: The start of the transaction; I 'm not sure . TOPIC + The default indicator is in transactional outbox
+API -> DB: Add a record to the transactional outbox
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: topic_membership_policy_rebuild / read_counters /\nfolder_projection / delivery_snapshot_event\neach task It has its own outbox_event_uuid
+Worker -> Worker: claim exact scope; For the topic work\nMESSAGE.created_at DESC
+Worker -> Projection: The flow/topic/container representation
+Worker -> Events: topic.deleted + Optional stream.updated\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+@enduml

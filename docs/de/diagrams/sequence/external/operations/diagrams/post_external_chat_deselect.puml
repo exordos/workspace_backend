@@ -1,0 +1,44 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/deselect/invoke
+actor "Der Client" as C
+participant "REST / RestAlchemy\n- Das ist ein Controller ." as API
+database "PostgreSQL\nKanonische Zeilen/Lesezeilen" as DB
+queue "Immutable outbox events\n+ exact typed tasks 1:1" as O
+participant "Arbeiter / Manager\nVerarbeiter des Providers" as W
+database "Speicher für die Vorbereitungen\nöffentliche Veranstaltungen" as E
+participant "- Das ist der Controller .\nWebSocket" as D
+actor "Verbundener Client" as WC
+
+C -> API: Anfrage POST + bearer-- Das ist ein Token . IAM
+activate API
+API -> DB: Sperren/Prüfen des Kanonischen Bereichs
+API -> DB: Verändern Sie den Status
+API -> O: chat event -> delivery_snapshot_event
+API -> O: each topic event -> topic_membership_policy_rebuild
+DB --> API: festgestellter Zustand
+O --> API: Feststehende Eintrag
+API --> C: Sanitiertes Bild 200
+deactivate API
+W -> O: claim exact scope; lease/fencing/retry/DLQ
+group Einer DB transaction
+  W -> DB: Ich kann die Projektion oder das Steuerungssystem aktualisieren
+  W -> E: durable ready external_chat.deleted
+end
+note right of W
+  Wenn die Arbeit eine Platzierung betrifft Messenger:
+  Ein Slot besitzt monopol (project_id, topic_uuid)
+  und verarbeitet MESSAGE.created_at DESC.
+  Die Verwaltung des Providers behält die eigene stabile Ordnung.
+end note
+D -> E: Wiedergabe der nächsten sichtbaren Epoche
+E --> D: Flachbild des Ereignisses
+D --> WC: Ereignis WebSocket / Wiederholung
+
+note over API,DB
+  Öffentliche Verweise UUID sind skalar UUID-Eigenschaften.
+  Physische Spalten *_uuid bleiben indexiert FK.
+end note
+@enduml

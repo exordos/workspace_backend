@@ -1,0 +1,15 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/streams/[stream_uuid]
+actor "客户端" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "索引式公众展示\n+ 外键的物理行" as DB
+Client -> API: GET /api/workspace/v1/messenger/streams/{stream_uuid}
+API -> DB: 项目领域和当前用户\n形波器 UUID
+DB --> API: 没有计算的行
+API --> Client: 200, 公开的 JSON
+note over API,DB
+没有记录 / transactional outbox / 任务 / 背景表演者 / 事件
+没有集成或恢复在查询时
+end note
+@enduml

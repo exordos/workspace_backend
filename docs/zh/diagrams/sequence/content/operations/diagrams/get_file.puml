@@ -1,0 +1,13 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/files/{file_uuid}
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: 查询
+API -> DB: 已被索引 SELECT
+DB --> API: 公开行
+note right of API: 没有 outbox / 任务 / 事件
+API --> Client: 200 JSON
+@enduml

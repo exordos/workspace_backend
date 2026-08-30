@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folders/{folder_uuid}
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: The request
+API -> DB: - It 's indexed . SELECT
+note right of DB
+  FOLDER It 's only kept once .; USER_FOLDER_BINDING Keeping access,
+  The counting machines and read-only JSONB folder_items_snapshot; empty=[]
+  FOLDER_ITEM = normalized source of truth; snapshot He 's building . folder_projection
+  Automatically FOLDER_ITEM — The projection of the worker is restored
+  The source: active USER_STREAM_BINDING + It 's canonical . STREAM.is_archived = false
+  All chats = All of them .; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+DB --> API: One . indexed row I 'm with ready snapshot/counts
+note right of API: without N+1 / json_agg / COUNT / custom SQL
+note right of API: without outbox / tasks / events
+API --> Client: 200 JSON
+@enduml

@@ -1,0 +1,44 @@
+@startuml
+!pragma layout smetana
+title Content conversion, deferred URN repair und manual reconversion
+
+autonumber
+participant "Bridge converter" as Converter
+participant "Private Workspace API" as API
+database "Canonical MESSAGE + hidden latest raw metadata" as DB
+database "Deferred references" as Deferred
+participant "Manual versioned reconversion tool" as Tool
+database "Outbox + ready events" as Events
+
+Converter -> Converter : Zulip markup -> canonical Workspace Markdown/URN
+Converter -> API : content + latest raw payload/hash/revision
+API -> DB : store public canonical Markdown;
+API -> DB : store hidden latest raw + converter version
+
+alt Older message/file mapping missing
+  API -> Deferred : store provider target key + source message + status
+else All URNs resolved
+  API -> Events : outbox for actual state transition
+end
+
+Deferred -> API : target mapping appeared; idempotent repair
+alt Canonical content/mentions changed
+  API -> DB : update derived URNs/mentions
+  API -> Events : one outbox/ready-event path
+else no-op
+  API --> Deferred : completed without event
+end
+
+Tool -> API : dry-run scoped batch using hidden latest raw
+API --> Tool : validation diff/manifest
+Tool -> API : explicit apply
+API -> DB : content/URN/mentions only
+API -> Events : actual changes only
+
+note over Converter,Tool
+  Public REST/WS/log/error never exposes raw payload.
+  Raw revision history is not stored.
+  Reconnection does not run heavy reconversion automatically.
+end note
+
+@enduml

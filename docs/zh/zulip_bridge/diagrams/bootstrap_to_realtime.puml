@@ -1,0 +1,68 @@
+@startuml
+!pragma layout smetana
+title 统一 bootstrap: 新的 queue, realtime 其他 history root
+
+autonumber
+participant "Bridge instance" as Bridge
+participant "Private Workspace API" as API
+database "Workspace leases / tasks / mappings" as Workspace
+participant "Zulip" as Zulip
+participant "Sequential Realtime Connector" as Realtime
+participant "History Importer" as History
+
+API -> Workspace : choose healthy compatible instance\nby min(active_accounts / declared_capacity)
+Workspace --> Bridge : sticky whole-account assignment
+Bridge -> API : TLS 1.2+ mTLS certificate\nclaim whole account
+API -> Workspace : authorize realm/provider/instance/identity generation
+API -> Workspace : increment/lease fencing generation
+API --> Bridge : account scope + generation
+
+loop 接下来 registration 没有成功
+  Bridge -> Zulip : register queue(supported event types only)
+  alt registration failed
+    Zulip --> Bridge : transient failure
+    Bridge -> Bridge : bounded backoff
+  else queue registered
+    Zulip --> Bridge : queue + registration boundary
+    Bridge -> Realtime : start sequential consumption from boundary
+    Bridge -> API : ensure history root(account, selection,\nboundary, generation)
+    API -> Workspace : idempotent root task
+    API --> Bridge : created / duplicate
+  end
+end
+
+par Realtime 优先级较高
+  Realtime -> Zulip : next supported event
+  Realtime -> API : one command + provider keys + generation
+  API -> Workspace : canonical mutation + outbox
+  API --> Realtime : applied / duplicate / stale / permanent
+else Finite history
+  History -> API : claim root, create per-stream tasks
+  API -> Workspace : durable task lifecycle
+  History -> Zulip : snapshot/range before boundary
+  History -> API : same idempotent commands/provider keys
+end
+
+alt queue expiry / missing heartbeat / restart / web_reload_client
+  Realtime -> Bridge : lifecycle signal
+  Bridge -> Bridge : discard local queue/cache
+  note right of Bridge
+    重复整个 bootstrap.
+    Old queue/cursor 没有 durable state.
+  end note
+end
+
+note over Realtime,History
+  Boundary + 它们是相同的 provider keys 他们给 overlap-safe no-gap.
+  Durable leases, mappings, tasks 其他 operations 属于 Workspace.
+  在 Bridge 没有共同的 database.
+end note
+
+note over Bridge,Workspace
+  mTLS service identity and account lease are independent checks.
+  Realtime + history 一个 account 有一个 owner.
+  Heartbeat 10s; degraded 30s; offline/takeover 60s.
+  Healthy assignments 没有重新平衡; graceful stop releases lease.
+end note
+
+@enduml

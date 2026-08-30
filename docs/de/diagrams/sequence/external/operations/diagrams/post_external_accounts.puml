@@ -1,0 +1,51 @@
+@startuml
+!pragma layout smetana
+title POST external_accounts: verified connect und bootstrap
+
+autonumber
+actor "Der Client" as Client
+participant "REST / RestAlchemy controller" as API
+participant "Zulip" as Zulip
+database "Account / encrypted credential / identity / outbox" as DB
+participant "Bridge account coordinator" as Bridge
+participant "Private Workspace API\ncurrent realm mTLS" as PrivateAPI
+database "Ready public events" as Events
+participant "WebSocket dispatcher" as WS
+
+Client -> API : POST current request (api_key write-only)
+API -> Zulip : validate credential
+Zulip --> API : verified realm_uuid/user_id/delivery_email
+API -> DB : account + encrypted credential + verified link + outbox
+API --> Client : 201 sanitized status=connecting
+
+DB -> Bridge : account desired-state task
+Bridge -> PrivateAPI : mTLS client certificate\nclaim account
+PrivateAPI -> DB : authorize current identity generation\nsticky assignment + account lease generation
+PrivateAPI --> Bridge : server-owned account scope + lease generation
+Bridge -> Zulip : register queue(supported events)
+alt registration success
+  Zulip --> Bridge : boundary
+  Bridge -> Bridge : start sequential realtime
+  Bridge -> PrivateAPI : mTLS ensure history root after boundary
+  PrivateAPI -> DB : idempotent history root
+else registration failure
+  Zulip --> Bridge : transient failure
+  Bridge -> Bridge : backoff; no history root
+end
+
+DB -> Events : external_account.created with projection transaction
+WS -> Events : replay/live
+WS -> Client : current-contract event
+
+note over API,DB
+  Email is candidate, not ownership proof.
+  api_key is encrypted and never returned/logged.
+  Maximum one Zulip account per Workspace user.
+  Heartbeat 10s; degraded 30s; offline 60s.
+end note
+
+note over Bridge,PrivateAPI
+  mTLS authenticates realm/provider/instance/identity generation.
+  Account lease is a separate authorization fence.
+end note
+@enduml

@@ -1,0 +1,61 @@
+@startuml migration_release_runbook
+!pragma layout smetana
+
+title Миграция и выпуск целевой модели Messenger
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+actor "Оператор" as Operator
+database "Backup DB + object storage" as Backup
+participant "Versioned DB migration" as Migration
+database "Target DB" as DB
+participant "File cleanup worker" as Worker
+participant "Zulip Bridge" as Bridge
+participant "Workspace API/workers/dispatcher" as Runtime
+participant "Zulip source" as Zulip
+
+Operator -> Backup : полный согласованный snapshot
+Operator -> Backup : проверенные restore и полный rehearsal
+Operator -> Runtime : freeze writes/workers/dispatcher/integrations
+Operator -> Migration : применить reviewed migration
+Migration -> DB : bounded size и writer-lock gates
+Migration -> DB : fail-closed provenance preflight
+
+alt неоднозначное происхождение или нерепетированный large cutover
+  Migration --> Operator : abort до destructive work
+  Operator -> Runtime : оставить freeze; исправить или восстановить
+else все preflight gates пройдены
+  Migration -> DB : создать target schema
+  Migration -> DB : сохранить и преобразовать native data
+  Migration -> DB : атомарно удалить доказанную Zulip projection
+  Migration -> DB : повысить projection reset generation
+  Migration --> Operator : commit
+end
+
+loop bounded idempotent physical cleanup
+  Worker -> DB : взять lease задачи удалённого zero-reference file
+  Worker -> DB : повторно проверить полный storage tuple refcount
+  Worker -> Backup : удалить provider object и sidecar
+end
+
+Bridge -> DB : заметить новую reset generation
+Bridge -> Bridge : один раз удалить rebuildable cache/mappings
+loop bounded keyset import с durable checkpoint
+  Bridge -> Zulip : читать до final high-water mark
+  Zulip --> Bridge : authoritative messages/files/attachments
+  Bridge -> DB : idempotent canonical upsert по provider identity
+end
+
+Operator -> DB : сверить native/reimport counts/state/FKs/cursors
+Operator -> Backup : проверить native objects и полноту links
+
+alt все acceptance gates пройдены
+  Operator -> Runtime : открыть runtime/integrations
+else любой migration/import/acceptance gate не пройден
+  Operator -> Runtime : оставить систему остановленной
+  Operator -> Backup : восстановить DB + storage + previous app version
+end
+
+@enduml

@@ -1,0 +1,13 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/drafts/{draft_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: Anfrage
+API -> DB: - und nicht SELECT
+DB --> API: öffentliche Zeilen
+note right of API: Ohne outbox / Aufgaben / Ereignisse
+API --> Client: 200 JSON
+@enduml

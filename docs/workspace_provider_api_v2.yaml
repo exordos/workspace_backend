@@ -1,0 +1,264 @@
+openapi: 3.1.0
+info:
+  title: Workspace Provider Data API
+  version: 2.0.0
+  description: |
+    Private provider-neutral data plane for enrolled bridge instances. V2 keeps
+    the v1 mTLS listener, lease, result, heartbeat, and transaction semantics,
+    but provider-to-Workspace commands carry provider identities and desired
+    state. Workspace resolves every project and Workspace UUID server-side.
+    This API is never routed to browsers and does not change the public
+    Messenger contract.
+servers:
+  - url: https://workspace-provider.example.invalid
+    description: Symbolic private backend listener.
+security:
+  - bridgeMtls: []
+tags:
+  - name: Commands
+  - name: Operations
+  - name: Results
+paths:
+  /api/workspace-provider/v2/commands:
+    post:
+      tags: [Commands]
+      operationId: applyWorkspaceProviderCommandsV2
+      summary: Apply one atomic provider-state command batch.
+      description: |
+        Up to 500 commands are applied in request order in one transaction. The
+        authenticated bridge must own each external account and desired chat
+        assignment. external_account_uuid selects an authorized connection;
+        project, chat assignment, stream, topic and Workspace identities are
+        resolved from server-owned state. Any rejected item rolls back the full
+        batch. A current compatible heartbeat is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ProviderCommandBatch'}
+      responses:
+        '200':
+          description: Every command was applied or converged idempotently.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProviderCommandResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: The bridge has no current compatible heartbeat.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/ProviderProblem'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422':
+          description: The atomic command batch was rejected; nothing committed.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/ProviderProblem'}
+        '503':
+          description: Canonical provider-command application is not enabled.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/ProviderProblem'}
+  /api/workspace-provider/v2/operations/actions/lease:
+    post:
+      tags: [Operations]
+      operationId: leaseWorkspaceProviderOperationsV2
+      summary: Lease the next authorized Workspace-to-provider operation batch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './workspace_provider_api_v1.yaml#/components/schemas/OperationLeaseRequest'
+      responses:
+        '200':
+          description: A possibly empty leased operation batch.
+          content:
+            application/json:
+              schema:
+                $ref: './workspace_provider_api_v1.yaml#/components/schemas/OperationLeaseResponse'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409':
+          description: The bridge has no current compatible heartbeat.
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/ProviderProblem'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+  /api/workspace-provider/v2/operation-results:
+    post:
+      tags: [Results]
+      operationId: reportWorkspaceProviderOperationResultsV2
+      summary: Report terminal provider outcomes with v1 per-item semantics.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './workspace_provider_api_v1.yaml#/components/schemas/OperationResultBatch'
+      responses:
+        '200':
+          description: One application status per input item.
+          content:
+            application/json:
+              schema:
+                $ref: './workspace_provider_api_v1.yaml#/components/schemas/OperationResultResponse'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+components:
+  securitySchemes:
+    bridgeMtls:
+      type: mutualTLS
+      description: |
+        Realm, provider kind, bridge instance and active identity generation are
+        taken only from the verified client certificate. Body and forwarding
+        headers are never service identity inputs.
+  schemas:
+    ProviderCommandBatch:
+      type: object
+      additionalProperties: false
+      required: [commands]
+      properties:
+        commands:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: {$ref: '#/components/schemas/ProviderCommand'}
+    ProviderCommand:
+      type: object
+      additionalProperties: false
+      required:
+        - provider_event_key
+        - delivery_uuid
+        - external_account_uuid
+        - provider_chat_key
+        - provider_sequence
+        - kind
+        - provider_object
+        - provider_references
+        - payload
+      properties:
+        provider_event_key:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          description: |
+            Exact state key defined in workspace_server_v2_decisions.md. It is
+            account-independent and identical for history/realtime representations
+            of the same desired provider state.
+        delivery_uuid:
+          type: string
+          format: uuid
+          description: Stable retry identity of this durable transport delivery.
+        external_account_uuid:
+          type: string
+          format: uuid
+          description: Authorized connection selector, never an identity namespace.
+        provider_chat_key:
+          type: string
+          minLength: 1
+          description: |
+            `account`, `channel:<numeric-id>`, or the exact
+            `direct-conversation:v1:<count>:<sorted-ids>` serialization.
+        provider_sequence:
+          type: [string, 'null']
+          description: Real provider revision only; null when none exists.
+        kind:
+          enum:
+            - identity.upsert
+            - stream.upsert
+            - stream.delete
+            - stream.notification.update
+            - topic.upsert
+            - topic.delete
+            - topic.notification.update
+            - message.upsert
+            - message.delete
+            - reaction.upsert
+            - reaction.delete
+            - read_state.set
+        provider_object:
+          $ref: '#/components/schemas/ProviderObject'
+        provider_references:
+          $ref: '#/components/schemas/ProviderReferences'
+        payload:
+          type: object
+          description: |
+            Desired provider state after removing server-owned Workspace UUIDs
+            and transport-only metadata. Unsupported kinds fail before mutation.
+    ProviderObject:
+      type: object
+      additionalProperties: false
+      required: [kind, id]
+      properties:
+        kind: {type: string, minLength: 1, maxLength: 64}
+        id: {type: string, minLength: 1, maxLength: 1024}
+    ProviderReferences:
+      type: object
+      additionalProperties: false
+      properties:
+        message: {type: string, minLength: 1}
+        messages:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: {type: string, minLength: 1}
+        reader: {type: string, minLength: 1}
+        topic: {type: string, minLength: 1}
+        user: {type: string, minLength: 1}
+    ProviderCommandResponse:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - provider_event_key
+              - status
+              - target_uuid
+              - safe_error
+              - duplicate
+            properties:
+              provider_event_key: {type: string}
+              status: {enum: [applied, rejected]}
+              target_uuid: {type: [string, 'null'], format: uuid}
+              safe_error: {type: [string, 'null']}
+              duplicate: {type: boolean}
+    ProviderProblem:
+      type: object
+      required: [type, status, error, message]
+      properties:
+        type: {const: ProviderProblem}
+        status: {type: integer}
+        error: {type: string}
+        message: {type: string}
+  responses:
+    BadRequest:
+      description: The request envelope is invalid.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}
+    Unauthenticated:
+      description: A current bridge certificate was not presented.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}
+    Forbidden:
+      description: The bridge identity cannot access this provider scope.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}
+    PayloadTooLarge:
+      description: The request exceeds the private listener body limit.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProviderProblem'}

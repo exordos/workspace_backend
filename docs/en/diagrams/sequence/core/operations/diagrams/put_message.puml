@@ -1,0 +1,29 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/messages/[message_uuid]
+actor "The client ." as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: PUT /api/workspace/v1/messenger/messages/{message_uuid}
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: update canonical MESSAGE.payload;\nimmutable outbox event For each typed task
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: content_mentions / read_counters /\ndelivery_snapshot_event\neach task It has its own outbox_event_uuid
+Worker -> Worker: topic scopes: placement mentions;\nmessage/delivery scopes: shared projections
+Worker -> Projection: Mention + submit user messages
+Worker -> Events: message.updated + The countdown to the events\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Worker
+  Public ID = MESSAGE_PLACEMENT.uuid; canonical MESSAGE.uuid hidden.
+  One . fenced owner exact scope; retry/backoff, DLQ/reaper.
+end note
+@enduml

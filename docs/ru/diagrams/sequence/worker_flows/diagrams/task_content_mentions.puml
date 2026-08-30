@@ -1,0 +1,47 @@
+@startuml task_content_mentions
+!pragma layout smetana
+title Типизированная задача проекции: content_mentions
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Неизменяемый outbox" as OUTBOX
+participant "Проектор задач" as PROJECTOR
+database "Захват темы" as CLAIM
+participant "Слот воркера" as WORKER
+database "MESSAGE.payload" as MESSAGE
+database "PLACEMENT + привязки пользователей" as ACCESS
+database "USER_MESSAGE_STATE" as STATE
+database "Типизированные задачи" as TASKS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "Хранилище публичных событий" as EVENTS
+participant "Диспетчер WebSocket" as DISPATCHER
+actor "Клиент" as Client
+
+OUTBOX -> PROJECTOR : событие создания/изменения сообщения
+PROJECTOR -> TASKS : immutable content_mentions(outbox_event_uuid, scope=topic)\nunique derivation; без coalescing
+TASKS -> WORKER : явная ожидающая работа
+WORKER -> CLAIM : монопольный захват темы
+WORKER -> MESSAGE : прочитать последнюю каноническую нагрузку
+WORKER -> ACCESS : прочитать зафиксированные размещения/получателей
+group одна DB transaction
+  loop затронутый пользователь/сообщение
+    WORKER -> STATE : идемпотентная вставка или обновление состояния упоминания
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : освободить
+EVENTS -> DISPATCHER : устойчивые записи
+DISPATCHER -> Client : отправить / повторить / воспроизвести
+
+note over MESSAGE,STATE
+  Полезная нагрузка остаётся в единственном экземпляре в MESSAGE.
+  Состояние хранит только персональные флаги,
+  но не агрегаты потока/темы/папки.
+  USER_MESSAGE_STATE key = (project,user,placement).
+  Shared rows изменяет только владелец exact scope key.
+  Lease/fencing + retry/backoff + DLQ/reaper обязательны.
+end note
+
+@enduml

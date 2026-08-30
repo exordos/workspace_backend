@@ -1,0 +1,67 @@
+@startuml
+!pragma layout smetana
+title Realtime Connector: - Ich bin allein. event bis terminal acceptance
+
+autonumber
+participant "Zulip supported queue" as Zulip
+participant "Realtime Connector\nwhole-account lease" as Realtime
+participant "Private Workspace API" as API
+database "Canonical state + idempotency + outbox" as DB
+participant "Workspace projection worker" as Worker
+database "Durable ready events" as Events
+participant "WebSocket dispatcher" as WS
+participant "Workspace client" as Client
+
+loop Streng konsequent loop
+  Realtime -> Zulip : receive next supported event
+  Realtime -> Realtime : exact type/op -> one command
+  loop Bis terminal acceptance
+    Realtime -> API : mTLS command(provider object/event key,\norigin/causation, account generation)
+    API -> API : verify certificate identity/generation;\nthen assignment/account lease/scope
+    alt actual state transition
+      API -> DB : canonical mutation + immutable outbox
+      API --> Realtime : applied
+    else repeated/older state
+      API -> DB : idempotency/version check, no mutation
+      API --> Realtime : duplicate / stale
+    else transient/ambiguous
+      API --> Realtime : retryable
+      Realtime -> Realtime : backoff; same key; do not read next
+    else classified permanent failure
+      API -> DB : durable safe failure / DLQ evidence
+      API --> Realtime : permanent
+    end
+  end
+
+  opt Actual outbox transition
+    DB -> Worker : immutable one-event task
+    Worker -> DB : projection update
+    Worker -> Events : ready public event
+    note over Worker,Events
+      Projection und ready event commit
+      in einer transaction.
+    end note
+    WS -> Events : cursor replay/live read
+    WS -> Client : at-least-once current-contract event
+  end
+end
+
+note over Zulip,Realtime
+  Queue expiry, missing heartbeat, restart oder web_reload_client
+  Wiederholen Sie die Einheitliche bootstrap mit einer neuen queue/boundary.
+end note
+
+note over Realtime,WS
+  Bridge Er tut es nicht. fan-out/projections und nicht bringt WebSocket.
+  Membership/archive/delete command Sie gibt provider fact;
+  Workspace Das ist seine Entscheidung. history/bindings/visibility policy.
+  Duplicate/no-op nicht erzeugt outbox oder public event.
+end note
+
+note over Zulip,API
+  Presence/status changes Nachfolgend geliefert.
+  Last confirmed wins; origin/causation suppresses echo only.
+  mTLS authenticates Bridge; lease separately authorizes account ownership.
+end note
+
+@enduml

@@ -1,0 +1,19 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/topic_summary_endpoints/
+actor "Der Client" as Client
+participant "TopicSummaryEndpointController\nRestAlchemy" as API
+database "Indizierte Zeilen der Sammelungssteuerung" as DB
+Client -> API: GET /api/workspace/v1/messenger/topic_summary_endpoints/
+note right of API
+Target accepts page_limit/page_marker without JSON envelope change:
+omitted/0=100; 1..500 exact; invalid/>500=400; X-Pagination-* headers.
+end note
+API -> DB: Genehmigung / Projektbereich + Skala UUID
+DB --> API: gelöschte Zeilen
+API --> Client: 200, öffentlich JSON
+note over API,DB
+Nein, nicht transactional outbox / Hintergrund- / öffentliche Veranstaltung / WebSocket
+Die Anmeldedaten und Token werden nicht serialisiert
+end note
+@enduml

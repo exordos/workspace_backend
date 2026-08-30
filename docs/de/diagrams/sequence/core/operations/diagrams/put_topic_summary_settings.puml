@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/topic_summary_settings/[project_uuid]
+actor "Der Client" as Client
+participant "TopicSummarySettingsController\nRestAlchemy" as API
+database "Zeilen der Sammelungssteuerung\n+ Verschlüsselte Anmeldedaten" as DB
+queue "Transactional outbox\n1 immutable task - Auf event" as Outbox
+participant "Hintergrund-Aussteller\nDie Fläche der Sammelungssteuerung" as Worker
+Client -> API: PUT /api/workspace/v1/messenger/topic_summary_settings/{project_uuid}
+API -> DB: Beginn der Transaktion; Erlaubnis + Änderung
+API -> DB: Eine unveränderliche interne Eingabe in transactional outbox
+DB --> API: Festsetzung des gereinigten Zustands
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: Feststehende Eintrag
+Outbox ->> Worker: immutable delivery_snapshot_event\n(outbox_event_uuid, policy scope)
+Worker -> DB: Planungs-/Mietstand anzuwenden
+note over Worker
+Es gibt keine öffentliche Ereigniszeile
+Keine Leitung. WebSocket
+Die Aufgaben des Themas bleiben exklusiv und gehen von neuen zu alten Nachrichten
+end note
+@enduml

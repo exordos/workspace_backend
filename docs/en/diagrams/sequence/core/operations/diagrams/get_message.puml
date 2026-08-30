@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/messages/[message_uuid]
+actor "The client ." as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "Indexed public presentation\n+ physical lines of external keys" as DB
+Client -> API: GET /api/workspace/v1/messenger/messages/{message_uuid}
+API -> DB: {message_uuid}=MESSAGE_PLACEMENT.uuid;\njoin active stream membership + generation
+DB --> API: lines without calculations
+API --> Client: 200, public JSON
+note over API,DB
+No recording . / transactional outbox / The background artist / the events
+No aggregating or restoring during query
+Canonical MESSAGE.uuid and binding_uuid They 're hidden ..
+end note
+@enduml

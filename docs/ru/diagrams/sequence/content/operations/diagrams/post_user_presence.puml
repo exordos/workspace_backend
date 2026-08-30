@@ -1,0 +1,32 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/users/{user_uuid}/actions/presence/invoke
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "Пользователь Workspace в PostgreSQL" as DB
+queue "Транзакционный outbox" as OUT
+queue "delivery_snapshot_event\nexact user scope" as TASK
+participant "Пул воркеров" as WORKER
+database "Хранилище публичных событий" as EVENT
+participant "Диспетчер WebSocket" as DISP
+participant "Клиенты Workspace" as WS
+participant "Zulip Bridge / Zulip" as ZULIP
+Client -> API: POST JSON присутствия
+API -> DB: BEGIN; проверить/заблокировать собственного пользователя
+API -> DB: обновить присутствие + last_ping_at
+API -> OUT: добавить изменение присутствия
+API -> DB: COMMIT
+API --> Client: 200 JSON пользователя
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: прочитать последнего пользователя
+WORKER -> EVENT: вставить готовое user.updated для каждого проекта
+DISP -> EVENT: отправлять/повторять/воспроизводить
+DISP -> WS: user.updated
+OUT -> ZULIP: durable mapped presence operation
+note right of ZULIP
+  Последнее confirmed изменение побеждает.
+  origin/causation подавляет echo,
+  но не выбирает winner.
+end note
+@enduml

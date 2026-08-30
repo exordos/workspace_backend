@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folders/
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: The request
+note right of API
+  Currently implemented: page_limit There is no/0 => without limitation
+  Negative/not clear => 400; positive without maximum/limitation from above
+  Target: There is no/0 => 100; 1..500 That 's right .; Otherwise 400; unlimited No , I 'm not .
+end note
+API -> DB: - It 's indexed . SELECT
+note right of DB
+  FOLDER It 's only kept once .; USER_FOLDER_BINDING Keeping access,
+  The counting machines and read-only JSONB folder_items_snapshot; empty=[]
+  Each folder row I 'm ready .: without N+1/json_agg/COUNT/custom SQL
+  The system folder rule/type is fixed; API uses indexed connections without COUNT
+  Automatically FOLDER_ITEM: active USER_STREAM_BINDING + It 's canonical . STREAM.is_archived = false
+  All chats = All of them .; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Snapshot It 's a deterministic support . folder_projection.
+end note
+DB --> API: indexed page I 'm with ready snapshots/counts
+note right of API: without outbox / tasks / events
+API --> Client: 200 JSON
+@enduml

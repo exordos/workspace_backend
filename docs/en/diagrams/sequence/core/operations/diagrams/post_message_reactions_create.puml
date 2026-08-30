@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/message_reactions/
+actor "The client ." as Client
+participant "WorkspaceMessageReactionController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Worker scope=message\nexact lease + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/message_reactions/
+API -> DB: resolve public placement UUID;\ncheck active membership + generation
+API -> DB: insert canonical reaction fact + immutable outbox event
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: immutable reaction_snapshot(outbox_event_uuid)\nwithout coalescing
+Worker -> Worker: claim (project_id, canonical_message_uuid)\nlease + fencing
+Worker -> Projection: MESSAGE.reactions + reaction_users
+Worker -> Events: message_reaction.created + message.updated\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Worker
+  Topic lock Not used. Lifecycle: retry/backoff, DLQ/reaper.
+  Canonical-global audience between placements It was taken intentionally .;
+  placement UUID It 's only used for access check.
+end note
+@enduml

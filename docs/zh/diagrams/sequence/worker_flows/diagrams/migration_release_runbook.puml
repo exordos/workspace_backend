@@ -1,0 +1,61 @@
+@startuml migration_release_runbook
+!pragma layout smetana
+
+title Messenger 目标模型迁移与发布
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+actor "操作员" as Operator
+database "数据库与对象存储备份" as Backup
+participant "版本化数据库迁移" as Migration
+database "目标数据库" as DB
+participant "文件清理 Worker" as Worker
+participant "Zulip Bridge" as Bridge
+participant "Workspace API/Worker/Dispatcher" as Runtime
+participant "Zulip 权威数据源" as Zulip
+
+Operator -> Backup : 创建完整一致的快照
+Operator -> Backup : 验证恢复并完成全流程演练
+Operator -> Runtime : 冻结写入/Worker/Dispatcher/集成
+Operator -> Migration : 执行已评审的迁移
+Migration -> DB : 执行有界规模和 writer-lock 门禁
+Migration -> DB : 执行失败即关闭的来源预检查
+
+alt 来源不明确/冲突或大规模切换未经演练
+  Migration --> Operator : 在破坏性操作前中止
+  Operator -> Runtime : 保持冻结；解决问题或恢复
+else 所有预检查通过
+  Migration -> DB : 创建目标结构
+  Migration -> DB : 保留并转换原生数据
+  Migration -> DB : 原子删除已证实的 Zulip 投影
+  Migration -> DB : 推进投影重置代次
+  Migration --> Operator : 提交
+end
+
+loop 有界且幂等的物理清理
+  Worker -> DB : 租用已删除零引用文件的任务
+  Worker -> DB : 再次检查完整存储 tuple 的引用计数
+  Worker -> Backup : 删除 provider 对象与 sidecar
+end
+
+Bridge -> DB : 发现新的重置代次
+Bridge -> Bridge : 仅一次清除可重建缓存/映射
+loop 带持久化 checkpoint 的有界 keyset 导入
+  Bridge -> Zulip : 读取至最终 high-water mark
+  Zulip --> Bridge : 权威消息/文件/附件
+  Bridge -> DB : 按 provider identity 幂等 upsert 规范数据
+end
+
+Operator -> DB : 对账原生与重导入的数量/状态/FK/cursor
+Operator -> Backup : 验证原生对象未变且链接完整
+
+alt 所有验收门禁通过
+  Operator -> Runtime : 重新开放运行时/集成
+else 迁移/导入/验收任一步失败
+  Operator -> Runtime : 保持停止状态
+  Operator -> Backup : 恢复数据库 + 存储 + 上一应用版本
+end
+
+@enduml

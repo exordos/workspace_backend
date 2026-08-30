@@ -1,0 +1,41 @@
+@startuml task_reaction_snapshot
+!pragma layout smetana
+title Typed projection task: reaction_snapshot
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "The event outbox The fact of the reaction" as OUTBOX
+participant "Task projector" as PROJECTOR
+database "Typed tasks" as TASKS
+database "Scope message\nlease + fencing" as CLAIM
+participant "The worker's slot.\n(The only author of the image)" as WORKER
+database "MESSAGE_REACTION_FACT" as FACTS
+database "MESSAGE\nreactions + reaction_users" as MESSAGE
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket" as DISPATCHER
+actor "The client ." as Client
+
+OUTBOX -> PROJECTOR : The fact was created/modified/deleted
+PROJECTOR -> TASKS : immutable reaction_snapshot(outbox_event_uuid)\nscope=message; without coalescing
+TASKS -> WORKER : (project_id, canonical_message_uuid)
+WORKER -> CLAIM : to get monopoly ownership exact key
+WORKER -> FACTS : Read the latest facts about the message
+FACTS --> WORKER : The canonical set of reactions facts
+group One . DB transaction
+  WORKER -> MESSAGE : I want to replace both photos atomically.
+  WORKER -> EVENTS : durable ready message.updated; unique derivation
+end
+WORKER -> CLAIM : I 'm going to get out .
+EVENTS -> DISPATCHER : stable ready record
+DISPATCHER -> Client : Send / repeat / play
+
+note over FACTS,MESSAGE
+  Facts are the source of truth.
+  API Not running a reading cycle-The change-recording JSON-The picture ..
+  API The reading doesn 't aggregate facts ..
+  Topic lock Not used for canonical MESSAGE snapshot.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+
+@enduml

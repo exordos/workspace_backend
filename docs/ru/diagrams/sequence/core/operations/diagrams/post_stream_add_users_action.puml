@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/[stream_uuid]/actions/add_users/invoke
+actor "Клиент" as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\nканонические строки + привязки" as DB
+queue "Transactional outbox\n+ вывод типизированных задач" as Outbox
+participant "Фоновые исполнители\nexact scope leases + fencing" as Worker
+database "Готовые проекции\nпривязки контейнеров" as Projection
+database "Хранилище публичных событий" as Events
+participant "Диспетчер WebSocket" as Dispatcher
+actor "Клиент WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke
+API -> DB: create/reactivate persistent USER_STREAM_BINDING\nactive=true; membership_generation++
+API -> DB: immutable outbox event на каждую typed task
+DB --> API: фиксация транзакции
+API --> Client: успешный публичный ответ
+DB ->> Outbox: зафиксированное событие
+Outbox ->> Worker: topic_membership_policy_rebuild / fanout /\nread_counters / folder_projection\nкаждая task имеет своё outbox_event_uuid + expected generation
+Worker -> Worker: topic scope: catch-up MESSAGE.created_at DESC;\nshared aggregates: user-stream/user-folder
+Worker -> DB: conditional active + generation equality
+Worker -> Projection: fresh binding + placement state;\nготовые shared projections
+Worker -> Events: события потока/привязки/папки\nатомарно в одной DB transaction с проекцией
+Events ->> Dispatcher: зафиксированная готовая строка
+Dispatcher ->> WS: отправка / повтор / воспроизведение
+note over API,Worker
+  Grant active немедленно; историческая видимость eventual.
+  Старые binding/state прежнего generation не оживают.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper обязательны.
+end note
+@enduml

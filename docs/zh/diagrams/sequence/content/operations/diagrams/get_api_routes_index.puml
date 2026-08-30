@@ -1,0 +1,11 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+Client -> API: GET /api/workspace/v1/
+API -> API: 检查收藏的登记路线
+note right of API: 没有DB / outbox / 任务 / 事件
+API --> Client: 200 字符串数组 JSON
+@enduml

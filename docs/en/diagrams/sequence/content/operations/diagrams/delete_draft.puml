@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/messenger/drafts/{draft_uuid}
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "The draft line in PostgreSQL" as DB
+queue "Internal domain name outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: DELETE + If-Match
+API -> DB: BEGIN; Block and compare revisions
+API -> DB: physically delete the draft
+API -> OUT: Adding an internal draft.deleted
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; Finish without public event row
+API --> Client: 204 The answer is blank.
+@enduml

@@ -1,0 +1,47 @@
+@startuml task_content_mentions
+!pragma layout smetana
+title Typisierte Projektionsvorgabe: content_mentions
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Unveränderlich outbox" as OUTBOX
+participant "Aufgabenprojektor" as PROJECTOR
+database "Thema-Aufnahme" as CLAIM
+participant "Ein Schlitz für den Worker" as WORKER
+database "MESSAGE.payload" as MESSAGE
+database "PLACEMENT + Benutzerbindungen" as ACCESS
+database "USER_MESSAGE_STATE" as STATE
+database "Typisierte Aufgaben" as TASKS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket" as DISPATCHER
+actor "Der Client" as Client
+
+OUTBOX -> PROJECTOR : Ereignis, bei dem eine Nachricht erstellt/geändert wurde
+PROJECTOR -> TASKS : immutable content_mentions(outbox_event_uuid, scope=topic)\nunique derivation; Ohne coalescing
+TASKS -> WORKER : offensichtliche Wartearbeit
+WORKER -> CLAIM : Monopolisierte Erfassung des Themas
+WORKER -> MESSAGE : Lesen Sie die letzte Kanonische Ausgabe
+WORKER -> ACCESS : die registrierten Platzierungen/Empfänger lesen
+group Einer DB transaction
+  loop Betroffener Benutzer/Nachricht
+    WORKER -> STATE : Idempotent-Einfügen oder Erwähnungszustand aktualisieren
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : Sie sollen entlassen werden.
+EVENTS -> DISPATCHER : Nachhaltige Aufzeichnungen
+DISPATCHER -> Client : Senden / Wiederholen / Wiedergeben
+
+note over MESSAGE,STATE
+  Die Nutzlast bleibt in einem einzigen Exemplar in MESSAGE.
+  Status speichert nur persönliche Flags,
+  aber nicht Strom-/Thema-/Ordner-Aggregate.
+  USER_MESSAGE_STATE key = (project,user,placement).
+  Shared rows Nur der Besitzer ändert es. exact scope key.
+  Lease/fencing + retry/backoff + DLQ/reaper - Sie sind verpflichtend.
+end note
+
+@enduml

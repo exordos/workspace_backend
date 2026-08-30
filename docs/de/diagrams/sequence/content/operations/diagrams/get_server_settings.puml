@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/server_settings
+actor "Der Client" as Client
+participant "ServerSettingsMiddleware" as API
+Client -> API: GET /api/workspace/v1/messenger/server_settings
+API -> API: Normalisieren und berechnen realm
+note right of API
+  Der Kanonische Endpunkt ist oben angegeben
+  Beendet / wird mit derselben Operation angenommen: 200 ohne Weiterleitung
+end note
+API -> API: Feststehende Einstellungen erstellen
+note right of API: Anonym; ohne DB / outbox / Aufgaben / Ereignisse
+API --> Client: 200 JSON Einstellungen
+@enduml

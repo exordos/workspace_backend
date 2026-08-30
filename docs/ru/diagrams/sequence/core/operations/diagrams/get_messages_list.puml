@@ -1,0 +1,21 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/messages/
+actor "Клиент" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "Индексированное представление сообщений пользователя\n+ физические строки внешних ключей" as DB
+
+Client -> API: GET /messages/ + фильтры + маркер
+API -> DB: public placement marker + project/user scope;\njoin active stream membership + generation
+DB --> API: строки без вычислений; uuid=PLACEMENT.uuid;\ncreated_at/updated_at из canonical MESSAGE
+API --> Client: 200, публичный JSON\nзаголовки X-Pagination-*
+
+note over API,DB
+Нет записей, transactional outbox, задачи, фонового исполнителя или события
+Нет COUNT / GROUP BY / восстановления во время запроса
+Скрытый binding_uuid служит только внутренним идентификатором строки
+Marker tuple = (MESSAGE.created_at, MESSAGE_PLACEMENT.uuid)
+Текущее поведение: отсутствующий/0 page_limit => без ограничения; для положительного значения нет жёсткого максимума
+Target: отсутствует/0 => 100; 1..500 точно; иначе 400; unlimited нет
+end note
+@enduml

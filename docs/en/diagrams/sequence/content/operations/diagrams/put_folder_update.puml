@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title PUT /api/workspace/v1/messenger/folders/{folder_uuid}
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL\nFOLDER + USER_FOLDER_BINDING" as DB
+queue "It 's a transaction . outbox" as OUT
+queue "Typed projection task" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "Signed client" as WS
+Client -> API: PUT JSON the folder
+note right of API
+  System rules/types are not manually changed.
+  Automatically FOLDER_ITEM: active USER_STREAM_BINDING + It 's canonical . STREAM.is_archived = false.
+  All chats = All of them .; Personal = STREAM.private = true; Channels = STREAM.private = false.
+end note
+API -> DB: BEGIN; block the folder in the specified region
+API -> DB: I want to update the canonical FOLDER
+API -> OUT: I 'm going to add folder.updated
+API -> DB: COMMIT
+API --> Client: 200 JSON the folder
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; without coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: I 'm going to read it . ready snapshot/counts
+group One . worker DB transaction
+  WORKER -> DB: preserve ready snapshot/counts; idempotent effect guard
+  WORKER -> EVENT: ready folder.updated
+end
+DISP -> EVENT: read/repeat/play
+DISP -> WS: folder.updated
+@enduml

@@ -1,0 +1,340 @@
+@startuml messenger_restalchemy_api_spec
+!pragma layout smetana
+
+title 项目规范 Messenger RestAlchemy API
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam package {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam class {
+    BackgroundColor #EFF6FF
+    BorderColor #2563EB
+    FontColor #1E3A8A
+}
+skinparam entity {
+    BackgroundColor #FFFFFF
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+package "1. 现行公开路线\n(合同没有变更)" as ROUTES {
+    class "/messages/ CRUD\nread/read_up_to/star/unstar" as R_MESSAGE
+    class "/message_reactions/ CRUD" as R_REACTION
+    class "/streams/ CRUD + actions" as R_STREAM
+    class "/stream_bindings/ R/U/D" as R_STREAM_BINDING
+    class "/stream_topics/ CRUD + actions" as R_TOPIC
+    class "/folders/ CRUD\n/folder_items/ CRUD + pin/unpin" as R_FOLDER
+    class "/users/ + /me/ + actions" as R_USER
+    class "GET /server_settings\ntrailing slash 根据第2条 middleware" as R_SERVER
+}
+
+package "2. 标准 RestAlchemy resource/controller" as RA {
+    class "WorkspaceMessageController\n路由适配器 placement UUID\nResourceByRAModel(WorkspaceUserMessage)" as C_MESSAGE
+    class "WorkspaceMessageReactionController\nResourceByRAModel(WorkspaceMessageReactionView)\n标签为" as C_REACTION
+    class "WorkspaceStreamController\nResourceByRAModel(WorkspaceUserStream)\n标签为" as C_STREAM
+    class "WorkspaceStreamBindingController\nResourceByRAModel(WorkspaceStreamBindingView)\n标签为" as C_STREAM_BINDING
+    class "WorkspaceStreamTopicController\nResourceByRAModel(WorkspaceUserTopic)\n标签为" as C_TOPIC
+    class "WorkspaceFolderController\nResourceByRAModel(WorkspaceUserFolder)\n标签为" as C_FOLDER
+    class "WorkspaceUserController / MeController\nResourceByRAModel(WorkspaceUser)\n页面化/直接访问" as C_USER
+    class "ServerSettingsMiddleware\n直接的有效答案\n没有模型 RestAlchemy" as C_SERVER
+}
+
+package "3. 没有计算的阅读模式" as VIEWS {
+    entity "messenger_api_user_messages_v1\n根: USER_MESSAGE_BINDING\nplacement.uuid -> 公开的 uuid\nbinding.uuid -> 隐藏的 ORM-关键" as V_MESSAGE
+    entity "messenger_api_message_reactions_v1\n根: 反应的原始事实" as V_REACTION
+    entity "messenger_api_user_streams_v1\n根: 唯一的绑定 user/stream" as V_STREAM
+    entity "messenger_api_stream_bindings_v1\n根: 可见的行-适配器 binding" as V_STREAM_BINDING
+    entity "messenger_api_user_topics_v1\n根: 唯一的绑定 user/topic" as V_TOPIC
+    entity "messenger_api_user_folders_v1\n根: 唯一的绑定 user/folder" as V_FOLDER
+}
+
+package "4. Proposal: 物理 SQL-storable 实质性" as PHYSICAL {
+    entity "MESSAGE\nmessenger_messages" as MESSAGE {
+        uuid : UUID <<PK, 国内 canonical ID>>
+        project_id
+        author
+        payload / source
+        external_account_uuid / provider_external_id <<hidden>>
+        provider / delivery
+        reactions / reaction_users
+        created_at / updated_at <<公开的>>
+    }
+
+    entity "MESSAGE_PLACEMENT\nmessenger_message_placements" as MESSAGE_PLACEMENT {
+        uuid <<公开的 UUIDv5 placement>>
+        message_uuid <<FK>>
+        stream / topic <<FK>>
+        独特的: project + message + stream + topic
+    }
+
+    entity "USER_MESSAGE_BINDING\nmessenger_user_message_bindings" as USER_MESSAGE_BINDING {
+        uuid <<隐藏的 identity ORM-列表>>
+        placement_uuid / user_uuid <<FK>>
+        relation_role / visibility / permissions
+        membership_generation snapshot
+        独特的: project + placement + user
+        没有 revision
+    }
+
+    entity "USER_MESSAGE_STATE\nmessenger_user_message_states" as USER_MESSAGE_STATE {
+        placement_uuid / user_uuid <<FK>>
+        membership_generation <<snapshot>>
+        read / mentioned / starred / pinned
+        独特的: project + user + placement
+    }
+
+    entity "MESSAGE_REACTION_FACT\nmessenger_message_reaction_facts\n独特的: project + message + user + emoji" as REACTION_FACT
+    entity "STREAM\nmessenger_streams" as STREAM {
+        owner_uuid <<已被索引 FK 在 user>>
+        direct_user_uuid <<nullable 已被索引 FK 在 user>>
+        private
+    }
+    entity "USER_STREAM_BINDING\nmessenger_stream_bindings" as STREAM_BINDING {
+        user_uuid / stream_uuid <<独特的, FK>>
+        独特的: project + user + stream
+        role / notification
+        active / membership_generation
+        未读数计 / last_message_uuid
+    }
+    entity "TOPIC\nmessenger_topics" as TOPIC
+    entity "USER_TOPIC_BINDING\nmessenger_user_topic_bindings" as TOPIC_BINDING {
+        user_uuid / topic_uuid <<独特的, FK>>
+        独特的: project + user + topic
+        旗 / notification / 未读数计
+    }
+    entity "FOLDER\nmessenger_folders" as FOLDER
+    entity "USER_FOLDER_BINDING\nmessenger_user_folder_bindings" as FOLDER_BINDING {
+        user_uuid / folder_uuid <<独特的, FK>>
+        独特的: project + user + folder
+        rule / type
+        unread_count / mention_count
+        folder_items_snapshot : JSONB <<read-only>>
+        snapshot_version / snapshot_updated_at <<internal>>
+    }
+    entity "FOLDER_ITEM\nmessenger_folder_items" as FOLDER_ITEM {
+        user_uuid / folder_uuid / stream_uuid <<FK>>
+        automatic
+        独特的: project + user + folder + stream
+    }
+    entity "USER\nmessenger_users" as USER
+    entity "DOMAIN_OUTBOX_EVENT\nmessenger_domain_outbox_events\n没有变化" as OUTBOX_EVENT
+    entity "PROJECTION_TASK\nmessenger_projection_tasks\n1 immutable task 在 outbox event" as PROJECTION_TASK {
+        unique outbox_event_uuid
+        scope_kind / exact scope_key
+        pending / leased / running / completed / failed / DLQ
+        lease expiry / owner / fencing token
+        attempts / next_retry_at
+    }
+    entity "SCOPE_LEASE\nmessenger_projection_scope_leases" as SCOPE_LEASE {
+        unique project + scope_kind + scope_key
+        lease owner / expiry / fencing token
+    }
+    entity "PUBLIC_EVENT_RECORD\nm_workspace_events\n原子由 state;\ndispatchable 在之后 commit" as PUBLIC_EVENT
+}
+
+package "5. 背景的物质化" as BACKGROUND {
+    class "机场 worker 独家拥有 exact scope\n读取最后的初始状态" as WORKER
+    class "服务管理员 WebSocket\n发送 + 重复 + 播放" as WS_DISPATCHER
+}
+
+R_MESSAGE --> C_MESSAGE
+R_REACTION --> C_REACTION
+R_STREAM --> C_STREAM
+R_STREAM_BINDING --> C_STREAM_BINDING
+R_TOPIC --> C_TOPIC
+R_FOLDER --> C_FOLDER
+R_USER --> C_USER
+R_SERVER --> C_SERVER
+
+C_MESSAGE --> V_MESSAGE : 收取 / 列表
+C_MESSAGE ..> MESSAGE : 创建 / 修改 / 删除
+C_MESSAGE ..> MESSAGE_PLACEMENT : 发送/复制的背景
+C_MESSAGE ..> USER_MESSAGE_BINDING : 作者访问权限
+C_MESSAGE ..> USER_MESSAGE_STATE : 创作权 user flags
+C_MESSAGE ..> OUTBOX_EVENT : 每一次更改 state
+C_REACTION --> V_REACTION : 收取 / 列表
+C_REACTION ..> REACTION_FACT : 创建/更改/删除一个事实
+C_REACTION ..> USER_MESSAGE_BINDING : 索引访问检查
+C_REACTION ..> OUTBOX_EVENT : 反应事件
+C_STREAM --> V_STREAM : 收取 / 列表
+C_STREAM ..> STREAM : 记录 / 操作
+C_STREAM_BINDING --> V_STREAM_BINDING : 收取 / 列表
+C_STREAM_BINDING ..> STREAM_BINDING : 修改/删除 / add_users
+C_TOPIC --> V_TOPIC : 收取 / 列表
+C_TOPIC ..> TOPIC : 记录 / 操作
+C_TOPIC ..> TOPIC_BINDING : 用户的操作
+C_FOLDER --> V_FOLDER : 收取 / 列表
+C_FOLDER ..> FOLDER : 规范性记录
+C_FOLDER ..> FOLDER_BINDING : 用户的准备式集装机
+C_USER --> USER : 直接收取 / 列表 / 自己的行为
+
+V_MESSAGE --> USER_MESSAGE_BINDING : 这就是 1 首页
+V_MESSAGE --> MESSAGE_PLACEMENT : 插入连接 many-to-one
+V_MESSAGE --> USER_MESSAGE_STATE : 插入连接 one-to-one\nuser + placement
+V_MESSAGE --> MESSAGE : 插入连接 many-to-one
+V_REACTION --> REACTION_FACT : 这就是 1 引领的事实
+V_REACTION --> MESSAGE : 已经被入 LEFT JOIN\n投影 many-to-one
+V_STREAM --> STREAM_BINDING : 这就是 1 首页
+V_STREAM --> STREAM : 插入连接\nmany-to-one
+V_STREAM_BINDING --> STREAM_BINDING : 插入连接 many-to-one
+V_TOPIC --> TOPIC_BINDING : 这就是 1 首页
+V_TOPIC --> TOPIC : 插入连接\nmany-to-one
+V_FOLDER --> FOLDER_BINDING : 这就是 1 首页
+V_FOLDER --> FOLDER : 插入连接\nmany-to-one
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : 显而易见的位置
+MESSAGE_PLACEMENT }o--|| STREAM
+MESSAGE_PLACEMENT }o--|| TOPIC
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : 接收者访问
+USER_MESSAGE_BINDING }o--|| USER
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : state user/placement
+USER_MESSAGE_STATE }o--|| USER
+REACTION_FACT }o--|| MESSAGE : FK 在正规的 message
+REACTION_FACT }o--|| USER : 反应作者
+STREAM_BINDING }o--|| STREAM
+STREAM_BINDING }o--|| USER
+TOPIC_BINDING }o--|| TOPIC
+TOPIC_BINDING }o--|| USER
+FOLDER_BINDING }o--|| FOLDER
+FOLDER_BINDING }o--|| USER
+FOLDER_ITEM }o--|| FOLDER
+FOLDER_ITEM }o--|| STREAM
+TOPIC }o--|| STREAM
+
+note bottom of V_MESSAGE
+  公开的 uuid — MESSAGE_PLACEMENT.uuid.
+  get_id_property = 隐藏的 binding_uuid
+  只有作为一个独特的技术 identity ORM-列表.
+  适配器 URL-资源/控制器使用 placement uuid.
+  Marker tuple: MESSAGE.created_at + placement.uuid.
+  公众活动 created_at/updated_at 它们来自 MESSAGE.
+  没有组件, GROUP BY, 窗口/lateral-语句中的,
+  相关的小查询或 fan-out one-to-many.
+end note
+
+note top of MESSAGE_PLACEMENT
+  uuid = UUIDv5(namespace = TOPIC.uuid,
+                name = MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  Name 没有 project/stream/braces/prefix.
+  TOPIC 具有约束力,全球性,独特性和不变性
+  属于一个人 STREAM/PROJECT.
+  Business key 其他 FK 保持权威性.
+end note
+
+note bottom of STREAM_BINDING
+  Persistent membership row: revoke => active=false
+  其他 monotonic membership_generation++ 在 API transaction.
+  Message/reaction read 总是要求 active 平等
+  snapshot generation; stale task 它们 no-op.
+end note
+
+note bottom of V_STREAM
+  公开的 owner 其他 UUID-其他链接 —
+  形 UUID properties, 而不是 URI relationships.
+  物理 *_uuid 列保持索引 FK
+  具有明显的引用完整性作用.
+  owner_uuid 作为公开的 owner.
+end note
+
+OUTBOX_EVENT --> PROJECTION_TASK : 这就是 1 immutable task 在 event
+PROJECTION_TASK --> SCOPE_LEASE : claim exact scope key
+SCOPE_LEASE --> WORKER : lease + fencing token
+WORKER --> USER_MESSAGE_BINDING : fanout 为了 placement
+WORKER --> USER_MESSAGE_STATE : 准备好了 state 每个收件人
+REACTION_FACT --> WORKER : 实际情况 reaction_snapshot
+WORKER --> MESSAGE : 实现 reactions + reaction_users
+WORKER --> STREAM_BINDING : 进电容量计数器
+WORKER --> TOPIC_BINDING : 进电容量计数器
+WORKER --> FOLDER_ITEM : folder_projection: normalized source of truth
+WORKER --> FOLDER_BINDING : folder_projection: snapshot + counts + version/time
+WORKER --> PUBLIC_EVENT : 这就是 DB transaction, 这就是 state
+PUBLIC_EVENT --> WS_DISPATCHER : 已准备的记录
+
+note bottom of WORKER
+  Topic scope — 只有 placements/bindings;
+  在里面 topic 最新的先 MESSAGE.created_at.
+  Message scope — canonical snapshots.
+  user-stream/user-topic/user-folder — shared aggregates.
+  一个同时 fenced owner exact key; 其他 scopes 它们是平行的.
+  Topic worker 没有 unsafe read-modify-write shared rows.
+  Atomic delta 要求 exactly-once guard 根据 outbox_event_uuid;
+  否则 scope worker recomputes/writes.
+  原始事实是真理的来源.
+  图片可以重新构建和最终调整.
+  API 没有人会这样做. read-modify-write 图片 JSON.
+  系统文件的元素从活动文件中实现
+  user/stream bindings 其他 STREAM 没有 is_archived = false.
+  All chats: 所有的; Personal: private = true; Channels: private = false.
+end note
+
+note bottom of PROJECTION_TASK
+  fanout; content_mentions; reaction_snapshot;
+  read_counters; delivery_snapshot_event;
+  topic_membership_policy_rebuild; topic_state_projection;
+  folder_projection.
+  Initial design 没有 coalescing.
+  Unique outbox_event_uuid; duplicate derivation = no-op.
+  Lease/fencing; retry/backoff; max attempts/DLQ;
+  reaper/reconciliation; idempotent handlers.
+  一个 task 在 event, coalescing 没有.
+end note
+
+note right of FOLDER_BINDING
+  Public folder_items <- ready JSONB folder_items_snapshot; empty = [].
+  FOLDER_ITEM is normalized source of truth.
+  Stable serializer includes exact public item fields and ready stream counts.
+  API reads one indexed row/page: no N+1/json_agg/COUNT/custom SQL.
+  One user-folder worker transaction commits snapshot + counts
+  + version/updated_at + all ready event rows; dispatcher only after commit.
+end note
+
+note bottom of C_MESSAGE
+  同步发送:
+  MESSAGE + MESSAGE_PLACEMENT + 创作权
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + OUTBOX.
+  情侣 binding/state 收件人是异步创建的.
+  GET/list 它们从来没有创造过问题..
+  现有 custom SQL-存储器没有保存.
+end note
+
+note bottom of C_STREAM
+  如果 direct_user_uuid 已设置, private = true.
+  direct_user_uuid = 现在 owner => self-chat:
+  确切地说, binding 拥有者和一个可见的参与者.
+  发送到 self-chat 只有创建 binding/state 编辑:;
+  fanout 创建收件人 0 其他行.
+end note
+
+note bottom of WS_DISPATCHER
+  Worker 投影器没有网络连接.
+  控制器发送,重复和播放已准备的事件.
+end note
+
+note bottom of PHYSICAL
+  名称为 proposal; 在这个阶段,没有迁移..
+  集装箱集体生活在独特的 user bindings.
+  默认没有单独表格 state.
+  Message bindings 永远不会存储容器计数器.
+end note
+
+note bottom of RA
+  Target list pagination: omitted/0 = 100; 1..500 确切地接受;
+  negative/non-integer/>500 = HTTP 400; unlimited mode 没有.
+  目前没有/0 给出了无限的读数,而太大的值则不受限制.:
+  现在的实现中, proposal.
+end note
+
+@enduml

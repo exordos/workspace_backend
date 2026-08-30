@@ -1,0 +1,29 @@
+@startuml
+!pragma layout smetana
+title DELETE external account: account-scoped unlink
+
+autonumber
+actor "The client ." as Client
+participant "REST / RestAlchemy controller" as API
+database "Account / mappings / work / access / canonical union" as DB
+database "Object storage" as Storage
+database "Ready public events" as Events
+participant "WebSocket dispatcher" as WS
+
+Client -> API : DELETE current account route
+API -> DB : lock account; revoke lease generation
+API -> DB : delete credential + account work/assignments
+API -> DB : unlink verified owner + remove account-derived access
+API -> DB : retain shared MESSAGE/TOPIC/STREAM/file rows
+API -> Storage : delete blob only if zero remaining references
+API -> DB : immutable external_account.deleted outbox
+API --> Client : 204 No Content
+DB -> Events : deleted projection/event atomically
+WS -> Events : replay/live
+
+note over API,Storage
+  Public route/status unchanged.
+  Other connected/native references keep canonical rows and blobs.
+  Cleanup retry is idempotent; credentials never enter events.
+end note
+@enduml

@@ -1,0 +1,63 @@
+@startuml
+!pragma layout smetana
+title Durable outbound retry, permanent failure and no-duplicate event
+
+autonumber
+actor "Workspace client" as Client
+participant "Current Workspace API" as API
+database "Canonical state + outbox + outbound operation" as DB
+participant "Realtime Connector\nwhole-account lease" as Bridge
+participant "Private Workspace API\ncurrent realm mTLS" as PrivateAPI
+participant "Zulip" as Zulip
+database "Durable ready events" as Events
+participant "WebSocket dispatcher" as WS
+
+Client -> API : current provider-backed mutation
+API -> DB : canonical mutation + outbox + durable outbound op
+API --> Client : 2xx/201 = local commit, not provider confirmation
+
+loop Until confirmed or permanent
+  Bridge -> PrivateAPI : mTLS claim due op(account generation)
+  PrivateAPI -> DB : verify certificate identity + account lease;\nlease due operation
+  PrivateAPI --> Bridge : operation + lease generation
+  Bridge -> Zulip : provider call(operation UUID, causation, expected revision)
+  alt transient / ambiguous
+    Zulip --> Bridge : timeout / 429 / temporary failure
+    Bridge -> PrivateAPI : mTLS retryable receipt
+    PrivateAPI -> DB : conditional attempts/backoff update
+  else provider rejection
+    Zulip --> Bridge : permanent error
+    Bridge -> PrivateAPI : mTLS permanent receipt(code, safe reason)
+    PrivateAPI -> DB : conditional permanent_failed
+  else confirmed response/echo
+    Zulip --> Bridge : confirmed state/revision
+    Bridge -> PrivateAPI : mTLS confirmed receipt
+    PrivateAPI -> DB : conditional confirmed state
+  end
+end
+
+alt Actual client-visible transition
+  DB -> Events : state/projection + one ready event in one transaction
+  WS -> Events : replay/live read
+  WS -> Client : at-least-once current-contract event
+else duplicate / stale / echo-only
+  DB -> DB : no new outbox or ready event
+end
+
+note over Bridge,Zulip
+  Last confirmed wins; delete wins stale edit.
+  Retry survives process/lease failover with same operation UUID.
+  Echo confirms causation and never loops back.
+end note
+
+note over Bridge,PrivateAPI
+  Current mTLS certificate authenticates Bridge identity.
+  Whole-account lease/fencing separately authorizes each claim/receipt.
+end note
+
+note over DB,WS
+  delivery_class/notification metadata preserved.
+  Dispatcher delivers; Bridge never owns public WebSocket connections.
+end note
+
+@enduml

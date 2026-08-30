@@ -1,0 +1,11 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+Client -> API: GET /api/workspace/v1/
+API -> API: Check the registered routes of the collections
+note right of API: Without the DB / outbox / tasks / events
+API --> Client: 200 row array JSON
+@enduml

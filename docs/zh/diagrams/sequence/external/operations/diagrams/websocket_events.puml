@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title 追赶阅读 WebSocket Events, 现实时间的准备和交付屏障
+actor "客户端" as C
+participant "控制器 WebSocket" as D
+database "已准备的事件可见存储器" as E
+
+C -> D: GET /api/workspace/v1/events/ws\nWebSocket upgrade + workspace.events.v1 + 标志物 Bearer
+D -> D: 验证 IAM 检查几个指针
+D -> E: 固定 high-watermark; 事件发生后 last_epoch_version
+E --> D: 看到的事件是顺序的 epoch_version ASC
+loop 错过的持续事件
+  D --> C: 平面事件 Workspace
+end
+D -> E: drain 缓冲键 live tail 在 high-watermark
+D --> C: {type: ready, epoch_generation, epoch_version}
+note over C,D
+  准备的正确一张镜头; 没有任何实时事件可以超过它..
+end note
+loop 实时记录的事件
+  D -> E: 获取/重现下一个可见时代
+  E --> D: 已准备的事件行
+  D --> C: 平面事件 Workspace
+end
+D --> C: 管理人员 ping 协议级别 WebSocket
+note over D,E
+  管理器路径仅供读取: 没有域名记录 outbox/任务.
+  域名工作者永远不会拥有网络连接.
+  At-least-once: client dedupe 根据 event UUID, cursor 在处理后.
+  Audience generation 压抑 stale data events 在之后 revoke.
+  已经流失 cursor -> epoch_pruned/4410, 没有安静 gap.
+end note
+@enduml

@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/files/
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: запрос
+note right of API
+  Текущая реализация: page_limit отсутствует/0 => без ограничения
+  отрицательное/нецелое => 400; положительное без максимума/ограничения сверху
+  Target: отсутствует/0 => 100; 1..500 точно; иначе 400; unlimited нет
+end note
+API -> DB: индексированный SELECT
+DB --> API: публичные строки
+note right of API: без outbox / задачи / события
+API --> Client: 200 JSON
+@enduml
