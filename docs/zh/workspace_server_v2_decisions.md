@@ -202,15 +202,21 @@ UUIDv5(verified_realm_uuid,
   转换为虚拟的 project users: migration 保存自动 native
   事件,但不会为已删除的事件创建 canonical membership/guard IAM
   用户;
-- 在同一 frozen migration 中,删除已被证明的 Zulip-imported messages,
-  相关的反应/read/event 投影和Zulip文件,没有
-  surviving native message reference;
-- Zulip-origin reaction 也可以从存储的 native/outbound message:
-  它的提供者来源值是 `external_account_uuid`, UUID
-  反应在清理旧事件之前 canonical copy. Native reaction
-  在同一存储的消息中保持;
-- Workspace→Zulip messages 它们被认为是原生,如果它们
-  `message.create` user operation 确认本地产地;
+- `0157` 使用容器边界：只要消息位于同时满足 `source_name=zulip` 与
+  `source.kind=zulip` 的 canonical stream 中，就会被删除，而不再按消息本身的
+  来源分类。因此，该 stream 中的 Workspace→Zulip outbound messages 也会被
+  删除，随后由常规 Zulip backfill 重新导入。`0158` 会完成重置：即使消息被
+  投影到 native Direct container，只要具有同样明确的 Zulip provenance，也会
+  被删除；同一 container 中 native-origin 的消息仍会保留；
+- 同一事务还会删除相关 reaction/read/event projections 与无剩余引用的 Zulip
+  files，并在提交前刷新 legacy compact statistics 以及 canonical v2 的
+  stream/topic/folder counters，数据来源是保留下来的 messages。因此，混合的
+  native container 会保留 roles、membership generations、notification modes、
+  topic state 和 folder placement，同时精确重建 unread、active/passive 与
+  last-message 值。迁移会先刷新受影响 stream 中每个 topic 的 compact
+  message/read statistics；随后，每个用户的 canonical `read_at` 会与权威的
+  compact bitmap 对齐（非 compact/rollback 模式则使用 legacy read flag），
+  最后才发布 counters；
 - 旧的 `link_kind=provider_identity`,由 account-scoped 实现创建,
   它们的重写是`UUIDv5(verified_realm_uuid, "user:<id>")`.
   surviving native relational references, event payloads, chat catalog 其他
@@ -250,20 +256,13 @@ UUIDv5(verified_realm_uuid,
   快照只在bootstrap/reset时创建,而
   不是实时循环;全球暂停 control-plane writers 更简单,
   总的附加 commit-order 基础设施比较便宜;
-- 破坏性重置采用失败即关闭策略：一致的 `source_name`、`source.kind`、
-  来自 `source.message_id` 或旧版 `provider_external_id` 的消息标识、
-  精确的旧版 Bridge 身份
-  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`、
-  account/provider evidence 和持久化的
-  `action=message.create` evidence 用于区分入站投影与原生出站数据。一致的
-  `native`/`native` 来源对也会保留在持久化 operation queue 出现之前创建的
-  旧版出站行；后来附加的 provider 标识不会覆盖该分类。对于携带入站字段的
-  历史 echo，精确匹配的持久化 operation 同样优先。没有该 operation 的
-  任何 Zulip 来源 UUID（包括任意 UUIDv5），如果不等于完整的旧版身份且
-  没有该 operation，都会被视为有歧义并在删除前中止迁移。任何不完整或相互
-  矛盾的来源都会在删除前中止迁移；
+- 破坏性重置对 container 与 message metadata 都采用 fail-closed 策略：
+  `source_name` 与 `source.kind` 只要部分缺失或相互矛盾，就会在删除前中止。
+  完整边界是已确认的 Zulip containers 与已确认 Zulip-origin messages 的并集，
+  其中包括 legacy-only compatibility rows，以及通过 message 或 placement 关联的
+  canonical rows；
 - 无人值守的冻结切换最多处理一百万条 legacy messages，等待锁最多 30 秒，
-  statement deadline 为 30 分钟。更大的切换必须在完成备份和生产规模演练
+  statement deadline 为 45 分钟。更大的切换必须在完成备份和生产规模演练
   后由操作员明确授权；五千万消息是重新导入后的稳态目标，并不允许自动转换
   legacy 数据；
 - control-plane snapshot 规模门禁至少使用 15,000 个包含大型
@@ -276,6 +275,55 @@ UUIDv5(verified_realm_uuid,
 Rollback schema 没有恢复故意摧毁的 Zulip projection:
 通过验证的前迁移备份.
 升级和升级都可用 schema downgrade.
+
+## 不可变切换与身份前向修复
+
+Workspace Server `1.0.0` 已发布的迁移 `0152` 保持不可变。新的准备分支
+`0155` 从 `0151` 开始，join head `0156` 会先列出该分支，再列出正常的
+`0152` → `0154` 链。因此，全新升级会先准备来源证据，再执行已发布的
+cutover；已经记录 `0152` 的安装会跳过准备工作，并由 `0156` 前向修复。
+由于 `pg_dump` 不保留 planner statistics，全新路径还会在执行不可变的
+set-based statements 之前，对所有冻结的 cutover inputs 运行 `ANALYZE`。
+
+只有存在精确匹配且成功的 `message.create` operation 时，准备阶段才把历史
+outbound echo 视为原生数据。`source.message_id` 可以缺失，但不能与 provider
+ID 冲突。在 durable operation queue 出现之前创建的一致 native rows 会获得
+短期 `discarded` 来源标记；这些标记不会进入 provider queue，并由 join head
+删除。
+
+`0152` 之后首个已发布的 Bridge payload 未写入 `source.message_id`，但仍携带
+完整且一致的旧版证据：`source.kind=zulip`、数字
+`provider_external_id`、provider metadata 中相同的 ID、原始 provider URL，
+以及不冲突的 realm。`0156` 在前向修复时只接受这一完整旧版形态。唯一行会
+获得 realm-global identity；如果已经存在带 global key 的导入行，则仅解除
+已证明 account-alias 副本的 provider linkage。任何不完整或矛盾的变体仍会
+原子中止。Rolling legacy triggers 在该已发布 Bridge 退役前使用相同的兼容
+规则。
+
+`0156` 为保留消息补充 realm-global provider identity，并确保同一条物理
+Zulip message 只有一个保留 provider linkage 的赢家。已证明的 account aliases
+必须在 realm/message ID、project、author、不同账户、provider URL 和 metadata
+identity 上一致。所有内部 messages、placements 和 public UUID 都会保留；
+仅从失败 alias 上解除 provider linkage。已有 global identity 的导入行优先于
+匹配的 retained alias。任何未经证明的冲突都会原子中止。随后，legacy
+insert/update rolling triggers 会继续执行相同规则，直到旧服务器退役。
+
+## 共享 Zulip 投影的所有权与重新导入
+
+每个 Workspace 项目中的 realm-global Zulip 频道只对应一个规范 stream。
+因此，多个已选择的账户可以指向同一个 `projection_stream_uuid`，而物理
+stream 仍保留首次创建它的所有者。只有当同一项目中存在另一个指向该 stream
+的已选择 assignment 时，provider 导入才允许由不同账户所有者写入。若没有
+这条持久化的 peer assignment，所有者不匹配仍然是硬错误。
+
+处理 `topic.upsert` 时，服务器根据持久化的 canonical stream 生成类型化
+Workspace source，保留其稳定的账户 scope，并补充 topic 名称。Bridge 无需
+在每个事件中重复由服务器管理的 source 字段。
+
+迁移 `0154` 会将每个 Zulip 账户的 reset generation 增加一次，并重新发布
+已选择的 assignments。这样会丢弃被隔离的部分投递并启动一次完整重试。
+Provider key 保持幂等，因此已接受的行会被更新而不是重复创建。全新升级时，
+已停止的 Bridge 只会看到最终 generation，并且只执行一次导入。
 
 ## 首次实现的兼容性和边界
 

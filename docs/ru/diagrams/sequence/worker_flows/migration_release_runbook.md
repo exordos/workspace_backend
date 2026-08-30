@@ -137,6 +137,35 @@ reference. Metadata sidecar удаляется отдельно, retry идем�
 surviving payloads до выбора file candidate, поэтому не создаёт dangling link и
 не полагается на выдуманный FK.
 
+## Топология миграций и rolling repair идентичности
+
+Опубликованный файл `0152` изменять нельзя; перед релизом проверяется его
+checksum. Применяется только текущий head `0156`, а порядок зависимостей даёт
+два безопасных пути:
+
+- чистая v1 database: `0155` подготавливает provenance, затем выполняется
+  неизменяемая цепочка `0152` → `0153` → `0154`, после чего `0156` завершает
+  cleanup;
+- database, где `0152`–`0154` уже применены: `0155` фиксируется как no-op, а
+  `0156` выполняет forward-repair сохранённых provider identities.
+
+Для доказанных aliases одного физического provider message миграция `0156`
+сохраняет каждый internal message, placement, content revision и public UUID.
+Provider linkage остаётся у одного детерминированного победителя; у остальных
+очищаются только `external_account_uuid`/`provider_external_id`. Сначала
+выбирается строка с terminal local operation, затем non-lossy copy, затем самая
+новая copy. Уже realm-keyed imported row всегда имеет приоритет над совпадающим
+retained alias. Доказательство требует совпадения realm/message ID, project,
+author, provider URL и metadata identity, а также разных alias accounts. Любой
+более слабый конфликт требует rollback.
+
+После миграции обязательны один migration head, отсутствие дубликатов
+`(provider_realm_uuid, provider_message_id)`, отсутствие подходящих
+provider-linked rows без realm key, отсутствие transient provenance marker и
+подготовительных indexes, а также включённые оба rolling legacy repair
+triggers. Количество messages/placements/public UUID для retained set не должно
+меняться.
+
 ## Fresh complete Zulip reimport
 
 Fresh import назначает новый canonical `MESSAGE.uuid`; публичный placement UUID
@@ -163,6 +192,21 @@ Import автоматически работает bounded batches с keyset/che
 retry/backoff, progress logs и reconciliation. Provider integration остаётся frozen до фиксации
 финального source cursor/high-watermark, чтобы сообщения и файлы на границе
 freeze не потерялись и не задублировались.
+
+## Восстановление после частичного v2 import
+
+Если развёрнутый v2 server принял только часть Zulip history, Bridge следует
+остановить и развернуть server build с миграцией `0154`. Миграция один раз
+увеличивает reset generation всех Zulip-аккаунтов и повторно публикует все
+выбранные assignments. Bridge запускается только после подтверждения здоровья
+backend.
+
+Нужно проверить, что каждый аккаунт увидел новое generation, старые
+quarantined deliveries удалены, backfill jobs запустились заново, а новых
+Provider API rejections нет. Общий realm-global stream допустим только если у
+каждого дополнительного владельца есть выбранный peer assignment на тот же
+project и stream. Pre-migration backup сохраняется до завершения повторного
+импорта и прохождения всех acceptance gates.
 
 ## Rebuild и acceptance gates
 

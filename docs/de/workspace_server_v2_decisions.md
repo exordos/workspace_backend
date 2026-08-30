@@ -202,15 +202,25 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
   werden zu fiktiven Project-Benutzern: migration speichert sich selbst native
   Ereignis, aber erstellt keine canonical membership/guard für das bereits entfernte IAM
   Benutzer;
-- In derselben frozen migration werden bewiesene Zulip-imported messages,
-  verknüpfte reactions/read/event projections und Zulip files, auf die keine
-  surviving native message reference;
-- Zulip-origin reaction wird auch aus dem gespeicherten native/outbound message:
-  Ihre Provider provenance wird durch `external_account_uuid` bestimmt, und UUID
-  Reaktionen werden in die Reinigung der alten Ereignisse eingeschaltet canonical copy. Native reaction
-  Sie wird in derselben gespeicherten Nachricht gespeichert;
-- Workspace→Zulip messages native und werden aus dem Reset ausgeschlossen, wenn ihre
-  `message.create` user operation bestätigt die lokale Herkunft;
+- `0157` verwendet eine Container-Grenze: Die Migration löscht jede Nachricht,
+  die in einem kanonischen Stream mit dem exakten Paar `source_name=zulip` und
+  `source.kind=zulip` liegt, unabhängig vom Ursprung der Nachricht. Auch
+  Workspace→Zulip-Nachrichten in einem solchen Stream werden entfernt und durch
+  den normalen Zulip-Backfill wiederhergestellt. `0158` vervollständigt den
+  Reset und löscht Nachrichten mit derselben exakten Zulip-Herkunft auch dann,
+  wenn sie in einen nativen Direct-Container projiziert wurden. Nachrichten
+  nativen Ursprungs im selben Container bleiben erhalten;
+- dieselbe Transaktion entfernt zugehörige Reaction-/Read-/Event-Projektionen
+  und nicht mehr referenzierte Zulip-Dateien. Legacy-Compact-Statistiken sowie
+  kanonische v2-Stream-/Topic-/Folder-Zähler werden vor dem Commit aus den
+  erhaltenen Nachrichten neu berechnet. Gemischte native Container behalten
+  Rollen, Membership-Generationen, Benachrichtigungsmodi, Topic-Zustand und
+  Folder-Platzierung; Unread-, Aktiv/Passiv- und Last-Message-Werte werden exakt
+  rekonstruiert. Zuerst werden die Compact-Message-/Read-Statistiken jedes
+  Topics im betroffenen Stream aktualisiert. Danach folgt das kanonische
+  `read_at` je Benutzer der maßgeblichen Compact-Bitmap (außerhalb der Modi
+  compact/rollback dem Legacy-Read-Flag), bevor die Zähler veröffentlicht
+  werden;
 - alte `link_kind=provider_identity`, die von der Account-scoped-Implementierung erstellt wurden,
   Sie werden auf genau `UUIDv5(verified_realm_uuid, "user:<id>")` übertragen.
   surviving native relational references, event payloads, chat catalog und
@@ -250,23 +260,14 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
   oder nach dem Anchor. Snapshot wird nur beim Bootstrap erstellt/reset, und
   nicht in der Realtime-Schleife; die globale Pause ist einfacher und
   billiger als die ständige Zusatz-Commit-Order-Infrastruktur;
-- Der destruktive Reset ist fehlersicher: konsistente Werte für `source_name`,
-  `source.kind`, Nachrichtenidentität aus `source.message_id` oder der älteren
-  `provider_external_id`, die exakte Legacy-Bridge-Identität
-  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
-  Account-/Provider-Evidenz und dauerhafte
-  Evidenz mit `action=message.create` unterscheiden eingehende Projektionen von
-  nativen ausgehenden Daten. Das konsistente Quellenpaar `native`/`native`
-  erhält außerdem ältere ausgehende Zeilen, die vor der dauerhaften
-  Operationswarteschlange entstanden; später angefügte Provider-Kennungen
-  überschreiben diese Klassifikation nicht. Eine exakt passende dauerhafte
-  Operation hat auch bei einem historischen Echo mit eingehenden Feldern
-  Vorrang. Jede UUID einer Zulip-Quellzeile, einschließlich einer beliebigen
-  UUIDv5, ist ohne Übereinstimmung mit der vollständigen Legacy-Identität und
-  ohne diese Operation mehrdeutig und bricht vor dem Löschen ab. Unvollständige oder widersprüchliche
-  Herkunft bricht die Migration vor dem Löschen ab;
+- der destruktive Reset arbeitet bei Container- und Message-Metadaten
+  fail-closed: Ein unvollständiges oder widersprüchliches Paar aus
+  `source_name` und `source.kind` bricht vor dem Löschen ab. Die vollständige
+  Grenze ist die Vereinigung bestätigter Zulip-Container und Nachrichten mit
+  bestätigter Zulip-Herkunft, einschließlich Legacy-only-Kompatibilitätszeilen
+  und kanonischer Zeilen, die über Message oder Placement verknüpft sind;
 - ein unbeaufsichtigter eingefrorener Cutover ist auf eine Million
-  Legacy-Nachrichten, 30 Sekunden Lock-Wartezeit und 30 Minuten Statement-Limit
+  Legacy-Nachrichten, 30 Sekunden Lock-Wartezeit und 45 Minuten Statement-Limit
   begrenzt. Ein größerer Cutover erfordert nach Backup und produktionsgroßem
   Probelauf eine ausdrückliche Operatorfreigabe; 50 Millionen Nachrichten sind
   das Ziel im stabilen Betrieb nach dem Neuimport, keine Erlaubnis zur
@@ -281,6 +282,69 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
 Rollback schema nicht wiederherstellt , Zulip projection:
 Die Daten werden von den Native-Daten gespeichert.
 Sie sind sowohl bei Upgrade als auch bei schema downgrade.
+
+## Unveränderlicher Cutover und Forward-Reparatur der Identität
+
+Die in Workspace Server `1.0.0` veröffentlichte Migration `0152` ist
+unveränderlich. Ein neuer Vorbereitungszweig (`0155`) beginnt bei `0151`; der
+Join-Head (`0156`) führt ihn vor der normalen Kette `0152` → `0154` auf. Bei
+einem frischen Upgrade wird die Herkunft daher vor dem veröffentlichten
+Cutover vorbereitet. Installationen, die `0152` bereits verbucht haben,
+überspringen diese Vorbereitung und werden durch `0156` vorwärts repariert. Da
+`pg_dump` keine Planner-Statistiken erhält, führt der frische Pfad außerdem
+`ANALYZE` für alle eingefrorenen Cutover-Eingaben aus, bevor die unveränderlichen
+mengenbasierten Anweisungen laufen.
+
+Die Vorbereitung akzeptiert ein historisches ausgehendes Echo nur mit einer
+exakt passenden, erfolgreichen `message.create`-Operation. Die Source-Message-
+ID darf fehlen, aber nicht der Provider-ID widersprechen. Konsistente native
+Zeilen aus der Zeit vor der Operationswarteschlange erhalten kurzlebige
+`discarded`-Herkunftsmarker. Sie können nie in eine Provider-Warteschlange
+gelangen und werden vom Join-Head entfernt.
+
+Die erste veröffentlichte Bridge-Nutzlast nach `0152` ließ
+`source.message_id` aus, enthielt aber weiterhin die vollständige konsistente
+Legacy-Form: `source.kind=zulip`, eine numerische `provider_external_id`,
+dieselbe ID in den Provider-Metadaten, die ursprüngliche Provider-URL und ein
+widerspruchsfreies Realm. `0156` akzeptiert beim Forward-Repair ausschließlich
+diese vollständige Form. Eine eindeutige Zeile erhält die realm-globale
+Identität; eine nachgewiesene Account-Alias-Kopie wird gelöst, wenn bereits ein
+global identifizierter Import existiert. Unvollständige oder widersprüchliche
+Varianten brechen weiterhin atomar ab. Die Rolling-Legacy-Trigger verwenden
+dieselbe Kompatibilitätsregel, bis diese veröffentlichte Bridge außer Betrieb
+ist.
+
+`0156` weist erhaltenen Nachrichten eine realm-globale Provider-Identität zu
+und lässt für eine physische Zulip-Nachricht genau einen Provider-verknüpften
+Gewinner. Nachgewiesene Account-Aliase müssen bei Realm/Message-ID, Projekt,
+Autor, getrennten Accounts, Provider-URL und Metadatenidentität übereinstimmen.
+Alle internen Nachrichten, Placements und öffentlichen UUIDs bleiben erhalten;
+nur die Provider-Verknüpfung der übrigen Aliase wird gelöst. Eine bereits
+global identifizierte Importzeile gewinnt gegen einen passenden erhaltenen
+Alias. Jeder nicht belegte Konflikt bricht atomar ab. Rolling Trigger für
+Legacy-Insert/Update erzwingen dieselbe Regel, bis alte Server entfernt sind.
+
+## Eigentum gemeinsamer Zulip-Projektionen und erneuter Import
+
+Ein realm-globaler Zulip-Kanal besitzt genau einen kanonischen Stream pro
+Workspace-Projekt. Mehrere ausgewählte Accounts dürfen deshalb auf dieselbe
+`projection_stream_uuid` zeigen, während der physische Stream den Eigentümer
+behält, der ihn zuerst materialisiert hat. Der Provider-Import akzeptiert einen
+anderen Account-Eigentümer nur, wenn im selben Projekt eine weitere ausgewählte
+Zuweisung auf diesen Stream zeigt. Ohne diese gespeicherte Peer-Zuweisung bleibt
+die abweichende Eigentümerschaft ein harter Fehler.
+
+Bei `topic.upsert` leitet der Server die typisierte Workspace-Quelle aus dem
+persistierten kanonischen Stream ab. Dessen stabiler Account-Scope bleibt
+erhalten und der Topic-Name wird ergänzt. Die Bridge muss serververwaltete
+Source-Felder nicht in jedem Event wiederholen.
+
+Migration `0154` erhöht die Reset-Generation jedes Zulip-Accounts einmal und
+veröffentlicht die ausgewählten Zuweisungen erneut. Damit werden unter
+Quarantäne gestellte Teillieferungen verworfen und ein vollständiger Neuversuch
+gestartet. Provider-Schlüssel bleiben idempotent; bereits angenommene Zeilen
+werden aktualisiert statt dupliziert. Bei einer frischen Aktualisierung sieht
+die gestoppte Bridge nur die finale Generation und führt einen Import aus.
 
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 

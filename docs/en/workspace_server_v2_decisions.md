@@ -202,15 +202,24 @@ Clarification after the decisions `1B`–`5A`:
   become fictitious project users: migration saves itself native
   event, but does not create a canonical membership/guard for the already deleted event IAM
   The user;
-- In the same frozen migration , the proven ones are removed . Zulip-imported messages,
-  related reactions/read/event projections and Zulip files, which have no
-  surviving native message reference;
-- Zulip-origin reaction It 's also deleted from the saved native/outbound message:
-  its provider provenance is defined by `external_account_uuid`, and UUID
-  The reaction is turned on to clean up old events before canonical copy. Native reaction
-  It 's still in the same message .;
-- Workspace→Zulip messages are considered native and are excluded from reset if their
-  `message.create` user operation It 's a local origin .;
+- `0157` uses a container boundary: it deletes every message placed in a
+  canonical stream with the exact pair `source_name=zulip` and
+  `source.kind=zulip`, regardless of the message's own origin. Workspace→Zulip
+  outbound messages in that stream are therefore removed and later restored by
+  the normal Zulip backfill. `0158` completes the reset by deleting messages
+  with the same exact Zulip provenance even when they were projected into a
+  native Direct container. Native-origin messages in that same container stay
+  intact;
+- the same transaction removes related reaction/read/event projections and
+  unreferenced Zulip files. It refreshes legacy compact statistics and canonical
+  v2 stream/topic/folder counters from retained messages before commit. Mixed
+  native containers therefore preserve roles, membership generations,
+  notification modes, topic state and folder placement while their unread,
+  active/passive and last-message values are rebuilt exactly. For every topic
+  in an affected stream, compact message/read statistics are refreshed first;
+  canonical per-user `read_at` then follows the authoritative compact bitmap
+  (or legacy read flag outside compact/rollback mode) before counters are
+  published;
 - old `link_kind=provider_identity`, account-scoped implementation,
   They're all going to be exactly `UUIDv5(verified_realm_uuid, "user:<id>")`.
   surviving native relational references, event payloads, chat catalog and
@@ -250,22 +259,13 @@ Clarification after the decisions `1B`–`5A`:
   Snapshot is created only at bootstrap/reset, and
   not in realtime loop; global short-stop control-plane writers easier and
   Cheaper than the permanent additional commit-order infrastructure;
-- destructive reset is fail-closed: consistent `source_name`, `source.kind`,
-  message identity from `source.message_id` or legacy `provider_external_id`,
-  exact legacy Bridge identity
-  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
-  account/provider evidence and durable
-  `action=message.create` evidence distinguish inbound projection from native
-  outbound data. The consistent `native`/`native` source pair also preserves
-  legacy outbound rows created before the durable operation queue existed;
-  provider identifiers attached later do not override it. An exact durable
-  operation also takes precedence for a historical echo carrying inbound
-  fields. Any Zulip-source UUID, including an arbitrary UUIDv5, that does not
-  equal the complete legacy identity and lacks that operation is ambiguous and
-  aborts before deletion. Partial or contradictory provenance aborts
-  before deletion;
+- the destructive reset is fail-closed on both container and message metadata:
+  a partial or contradictory `source_name`/`source.kind` pair aborts before
+  deletion. The complete boundary is the union of confirmed Zulip containers
+  and confirmed Zulip-origin messages, including legacy-only compatibility
+  rows and canonical rows linked through either the message or placement;
 - an unattended frozen cutover is limited to one million legacy messages, a
-  30-second lock wait and a 30-minute statement deadline. A larger cutover
+  30-second lock wait and a 45-minute statement deadline. A larger cutover
   requires explicit operator authorization after backup and a production-sized
   rehearsal; the 50-million-message target is post-reimport steady state, not an
   automatic legacy-conversion allowance;
@@ -279,6 +279,62 @@ Clarification after the decisions `1B`–`5A`:
 Rollback schema It doesn 't restore the intentionally destroyed Zulip projection:
 This is done by using a validated pre-migration backup.
 available both for upgrade and for schema downgrade.
+
+## Immutable cutover and forward identity repair
+
+Migration `0152`, published in Workspace Server `1.0.0`, is immutable. A new
+preparation branch (`0155`) starts from `0151`; the join head (`0156`) lists
+that branch before the normal `0152` → `0154` chain. A fresh upgrade therefore
+prepares provenance before the released cutover runs. An installation that
+already recorded `0152` skips the preparation work and is repaired forward by
+`0156`. Because `pg_dump` does not preserve planner statistics, the fresh path
+also runs `ANALYZE` for every frozen cutover input before immutable set-based
+statements execute.
+
+The preparation accepts a historical outbound echo only with an exact,
+successful `message.create` operation. The source message ID may be absent, but
+it must not contradict the provider ID. Consistent native rows created before
+the operation queue receive short-lived `discarded` provenance markers; these
+cannot enter a provider queue and the join head removes them.
+
+The first released post-`0152` Bridge payload omitted `source.message_id` while
+still carrying `source.kind=zulip`, a numeric `provider_external_id`, the same
+ID in provider metadata, the original provider URL, and a non-contradictory
+realm. `0156` accepts only that complete legacy shape during forward repair.
+It promotes a unique row to the realm-global identity and detaches a proven
+account-alias copy when an already keyed import exists; partial or
+contradictory variants still abort atomically. The rolling legacy triggers use
+the same compatibility rule until that released Bridge is retired.
+
+`0156` assigns realm-global provider identity to retained messages and keeps
+exactly one provider-linked winner for a physical Zulip message. Proven account
+aliases must agree on realm/message ID, project, author, distinct account
+ownership, provider URL, and metadata identity. Every internal message,
+placement, and public UUID is preserved; only provider linkage is detached from
+losing aliases. An already keyed imported row wins over a matching retained
+alias. Any unproven collision aborts atomically. Rolling legacy insert/update
+triggers then enforce the same realm-global identity until old servers are
+gone.
+
+## Shared Zulip projection ownership and recovery retry
+
+A realm-global Zulip channel has one canonical stream per Workspace project.
+Several selected accounts may therefore point to the same
+`projection_stream_uuid`, while the physical stream keeps the owner that first
+materialized it. Provider ingestion accepts a different account owner only
+when another selected assignment in the same project points to that stream.
+Without that persisted peer assignment, owner mismatch remains a hard error.
+
+Provider topic upserts derive their typed Workspace source from the persisted
+canonical stream, preserving its stable account scope while adding the topic
+name; the Bridge does not have to repeat server-owned source fields in every
+event.
+
+Migration `0154` advances each Zulip account reset generation once and republishes
+selected assignments. This discards quarantined partial deliveries and starts a
+complete retry. Provider keys remain idempotent, so already accepted rows are
+updated rather than duplicated. On a fresh upgrade the stopped Bridge observes
+only the final generation and performs one import.
 
 ## Compatibility and boundaries of first implementation
 

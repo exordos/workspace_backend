@@ -202,15 +202,23 @@ UUIDv5(verified_realm_uuid,
   превращаются в фиктивных project users: migration сохраняет само native
   событие, но не создаёт canonical membership/guard для уже удалённого IAM
   пользователя;
-- в том же frozen migration удаляются доказанные Zulip-imported messages,
-  связанные reactions/read/event projections и Zulip files, на которые нет
-  surviving native message reference;
-- Zulip-origin reaction удаляется также с сохраняемого native/outbound message:
-  её provider provenance определяется по `external_account_uuid`, а UUID
-  реакции включается в очистку старых events до canonical copy. Native reaction
-  на том же сохраняемом сообщении остаётся;
-- Workspace→Zulip messages считаются native и исключаются из reset, если их
-  `message.create` user operation подтверждает локальное происхождение;
+- `0157` использует container boundary: удаляются все messages, размещённые в
+  canonical stream с точной парой `source_name=zulip` и `source.kind=zulip`,
+  независимо от происхождения самого message. Поэтому Workspace→Zulip
+  outbound messages в таком stream также удаляются и затем возвращаются
+  обычным backfill из Zulip. `0158` завершает reset: удаляет messages с такой же
+  точной Zulip provenance, даже если они были спроецированы в native Direct
+  container. Native-origin messages в том же container сохраняются;
+- в той же транзакции удаляются связанные reactions/read/event projections и
+  неиспользуемые Zulip files. Legacy compact stats и canonical v2
+  stream/topic/folder counters пересчитываются по сохранённым messages до
+  commit. Поэтому смешанные native containers сохраняют roles, membership
+  generations, notification modes, topic state и положение в folders, а их
+  unread, active/passive и last-message значения восстанавливаются точно.
+  Сначала обновляются compact message/read stats каждого topic в затронутом
+  stream; затем canonical `read_at` каждого пользователя приводится к
+  authoritative compact bitmap (либо к legacy read flag вне режимов
+  compact/rollback), и только после этого публикуются counters;
 - старые `link_kind=provider_identity`, созданные account-scoped реализацией,
   переводятся на exact `UUIDv5(verified_realm_uuid, "user:<id>")`. Все
   surviving native relational references, event payloads, chat catalog и
@@ -250,22 +258,13 @@ UUIDv5(verified_realm_uuid,
   либо строго после anchor. Snapshot создаётся только при bootstrap/reset, а
   не в realtime loop; глобальная краткая пауза control-plane writers проще и
   дешевле постоянной дополнительной commit-order инфраструктуры;
-- destructive reset работает fail-closed: согласованные `source_name`,
-  `source.kind`, message identity из `source.message_id` или legacy
-  `provider_external_id`, точная legacy identity Bridge
-  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
-  account/provider evidence и durable
-  `action=message.create` evidence отличают inbound projection от native
-  outbound data. Согласованная пара `native`/`native` также сохраняет legacy
-  outbound rows, созданные до появления durable operation queue; добавленные
-  позднее provider identifiers не отменяют эту классификацию. Точная durable
-  operation также имеет приоритет для historical echo с inbound fields.
-  Любой UUID Zulip-source row, включая произвольный UUIDv5, который не совпадает
-  с полной legacy identity и не имеет такой operation, считается неоднозначным
-  и останавливает migration до delete.
-  Частичное или противоречивое происхождение останавливает migration до delete;
+- destructive reset работает fail-closed по container и message metadata:
+  частичная или противоречивая пара `source_name`/`source.kind` останавливает
+  migration до удаления. Полная граница — объединение подтверждённых Zulip
+  containers и messages с подтверждённым Zulip origin, включая legacy-only
+  compatibility rows и canonical rows, связанные через message или placement;
 - unattended frozen cutover ограничен одним миллионом legacy messages,
-  ожиданием lock не более 30 секунд и statement deadline 30 минут. Больший
+  ожиданием lock не более 30 секунд и statement deadline 45 минут. Больший
   cutover требует явного разрешения оператора после backup и production-sized
   rehearsal; целевые 50 миллионов сообщений — steady state после reimport, а
   не разрешение на automatic legacy conversion;
@@ -279,6 +278,65 @@ UUIDv5(verified_realm_uuid,
 Rollback schema не восстанавливает намеренно уничтоженную Zulip projection:
 для этого используется проверенный pre-migration backup. Native data остаются
 доступны и при upgrade, и при schema downgrade.
+
+## Неизменяемый cutover и forward-repair идентичности
+
+Миграция `0152`, опубликованная в Workspace Server `1.0.0`, неизменяема. Новая
+подготовительная ветка (`0155`) начинается от `0151`, а join-head (`0156`)
+перечисляет её перед обычной цепочкой `0152` → `0154`. Поэтому при чистом
+upgrade происхождение данных подготавливается до запуска опубликованного
+cutover. Инсталляция, где `0152` уже записана, пропускает подготовку и получает
+forward-repair в `0156`. Поскольку `pg_dump` не сохраняет planner statistics,
+fresh-путь также выполняет `ANALYZE` для всех замороженных inputs до запуска
+неизменяемых set-based statements.
+
+Подготовка признаёт historical outbound echo только при точной успешной
+операции `message.create`. `source.message_id` может отсутствовать, но не может
+противоречить provider ID. Согласованные native rows, созданные до появления
+operation queue, временно получают `discarded` provenance markers. Они не могут
+попасть в provider queue и удаляются join-head миграцией.
+
+Первая опубликованная после `0152` версия Bridge не записывала
+`source.message_id`, но сохраняла полный согласованный legacy-набор:
+`source.kind=zulip`, числовой `provider_external_id`, тот же ID в provider
+metadata, исходный provider URL и непротиворечивый realm. Во время forward
+repair `0156` принимает только такую полную форму. Уникальная строка получает
+realm-global identity, а доказанная account-alias копия отсоединяется, если уже
+есть импорт с global key. Частичные или противоречивые варианты по-прежнему
+атомарно останавливают миграцию. Rolling legacy triggers применяют то же правило
+совместимости до вывода этой версии Bridge из эксплуатации.
+
+`0156` назначает сохранённым сообщениям realm-global provider identity и
+оставляет provider linkage только у одного победителя для физического Zulip
+message. Доказанные account aliases должны совпадать по realm/message ID,
+project, author, разным account owners, provider URL и metadata identity. Все
+внутренние messages, placements и public UUID сохраняются; у проигравших
+aliases отсоединяется только provider linkage. Уже импортированная строка с
+global identity имеет приоритет над совпадающим retained alias. Любой
+недоказанный конфликт атомарно останавливает миграцию. Rolling triggers на
+legacy insert/update затем поддерживают то же правило до отключения старых
+серверов.
+
+## Владение общей Zulip projection и повторный импорт
+
+Для realm-global Zulip channel используется один canonical stream на проект
+Workspace. Поэтому несколько выбранных аккаунтов могут ссылаться на один
+`projection_stream_uuid`, а физический stream сохраняет владельца, который
+материализовал его первым. Provider ingestion принимает другого владельца
+аккаунта только тогда, когда в том же проекте есть выбранный peer assignment на
+этот stream. Без такой сохранённой связи несовпадение владельца остаётся
+жёсткой ошибкой.
+
+Для `topic.upsert` сервер формирует типизированный Workspace source из
+сохранённого canonical stream: его стабильный account scope не меняется, а к
+нему добавляется имя topic. Bridge не обязан повторять server-owned source
+fields в каждом событии.
+
+Миграция `0154` один раз увеличивает reset generation каждого Zulip-аккаунта и
+повторно публикует выбранные assignments. Это удаляет карантин частично
+доставленного импорта и запускает полный повтор. Provider keys идемпотентны,
+поэтому уже принятые строки обновляются, а не дублируются. При новой установке
+остановленный Bridge видит только итоговое generation и выполняет один импорт.
 
 ## Совместимость и границы первой реализации
 

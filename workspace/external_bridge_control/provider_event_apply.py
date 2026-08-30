@@ -868,6 +868,55 @@ def _ensure_projection_owner_stream(
     )
     if batch_cache is not None and cache_key in batch_cache:
         return
+    shared_projection_row = session.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM m_external_chats_v2 AS peer
+            JOIN m_external_accounts_v2 AS peer_account
+              ON peer_account.uuid = peer.external_account_uuid
+             AND peer_account.provider = peer.provider
+            JOIN m_workspace_streams AS canonical_stream
+              ON canonical_stream.project_id = peer.project_id
+             AND canonical_stream.uuid = peer.projection_stream_uuid
+             AND canonical_stream.external_account_uuid =
+                 peer.external_account_uuid
+             AND canonical_stream.user_uuid = peer.owner_user_uuid
+            WHERE peer.selected
+              AND peer.provider = %s
+              AND peer.external_account_uuid != %s
+              AND peer.provider_chat_id = %s
+              AND peer.project_id = %s
+              AND peer.projection_stream_uuid = %s
+              AND peer_account.provider_realm_uuid IS NOT DISTINCT FROM %s
+              AND EXISTS (
+                    SELECT 1
+                    FROM m_external_bridge_desired_resources_v1 AS desired
+                    WHERE desired.bridge_instance_uuid = %s
+                      AND desired.provider_kind = %s
+                      AND desired.resource_type = 'external_chat_assignment'
+                      AND desired.resource_uuid = peer.uuid
+                      AND desired.operation = 'upsert'
+                      AND desired.resource->>'external_account_uuid' =
+                          peer.external_account_uuid::text
+                      AND desired.resource->>'project_id' = peer.project_id::text
+                      AND desired.resource#>>
+                          '{workspace_projection,stream,uuid}' =
+                          peer.projection_stream_uuid::text
+              )
+        ) AS shared_projection
+        """,
+        (
+            identity.provider_kind,
+            account_uuid,
+            assignment["provider_chat_id"],
+            project_id,
+            assignment["projection_stream_uuid"],
+            assignment.get("provider_realm_uuid"),
+            identity.bridge_instance_uuid,
+            identity.provider_kind,
+        ),
+    ).fetchone()
     external_projection.ensure_external_chat_stream(
         session=session,
         project_id=project_id,
@@ -883,6 +932,9 @@ def _ensure_projection_owner_stream(
         account_settings=assignment["account_settings"],
         emit_events=emit_events,
         reconcile_participants=False,
+        shared_projection=bool(
+            shared_projection_row and shared_projection_row["shared_projection"]
+        ),
     )
     if batch_cache is not None:
         batch_cache[cache_key] = True
@@ -1021,10 +1073,21 @@ def _topic_event(
         }
         values["name"] = external_projection.provider_topic_name(identity.provider_kind)
     else:
-        values = _scoped_provider_values(
+        canonical_stream = _existing(
+            models.WorkspaceStream,
+            project_id,
+            stream_uuid,
+            session,
+        )
+        if canonical_stream is None:
+            raise ValueError("Provider topic stream projection is missing")
+        values = _provider_values(
             resource,
-            {"color", "name", "source", "source_name", "stream_uuid", "uuid"},
-            sys_uuid.UUID(str(event["external_account_uuid"])),
+            {"color", "name", "stream_uuid", "uuid"},
+        )
+        values["source_name"] = canonical_stream.source_name
+        values["source"] = helpers._build_topic_source(
+            values["source_name"], canonical_stream.source, values["name"]
         )
     if existing is None:
         values.update({"uuid": topic_uuid, "stream_uuid": stream_uuid})

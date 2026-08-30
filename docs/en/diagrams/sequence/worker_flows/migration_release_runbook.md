@@ -138,6 +138,33 @@ inside Markdown as `urn:file|image|video:<uuid>`. The migration scans all
 surviving payloads before choosing a file candidate, so it cannot create a
 dangling link or rely on an invented FK.
 
+## Migration topology and rolling identity repair
+
+Do not edit the released `0152` file. Verify its published checksum before the
+release. Apply only the current head, `0156`; its dependency order provides two
+safe paths:
+
+- fresh v1 database: `0155` prepares provenance, then the immutable
+  `0152` → `0153` → `0154` chain runs, and `0156` completes cleanup;
+- database that already applied `0152`–`0154`: `0155` records a no-op and
+  `0156` repairs retained provider identities forward.
+
+For proven aliases of one physical provider message, `0156` preserves every
+internal message, placement, content revision, and public UUID. It keeps
+provider linkage on one deterministic winner and clears only
+`external_account_uuid`/`provider_external_id` on the other aliases. A terminal
+local operation wins, then a non-lossy copy, then the newest copy. An already
+realm-keyed imported row always wins over an otherwise matching retained
+alias. Proof requires the same realm/message ID, project, author, provider URL,
+metadata identity, and distinct alias accounts. Any weaker collision is a hard
+rollback condition.
+
+After the migration, require one migration head, no duplicate
+`(provider_realm_uuid, provider_message_id)`, no eligible provider-linked row
+without a realm key, no transient provenance marker or preparation index, and
+both rolling legacy repair triggers enabled. Message/placement/public UUID
+counts for the retained set must be unchanged.
+
 ## Complete fresh Zulip reimport
 
 Fresh import assigns a new canonical `MESSAGE.uuid`; the public placement UUID
@@ -162,6 +189,19 @@ Import runs automatically in bounded keyset batches with durable checkpoints,
 retry/backoff, progress logging, and reconciliation. Provider integration stays
 frozen until the final source cursor/high-water mark is recorded, preventing
 loss or duplication at the freeze boundary.
+
+## Recovery after a partial v2 import
+
+If a deployed v2 server accepted only part of the Zulip history, deploy the
+server build containing migration `0154` while the Bridge is stopped. The
+migration advances every Zulip account reset generation once and republishes
+all selected assignments. Start the Bridge only after the backend is healthy.
+
+Confirm that every account observes the new generation, old quarantined
+deliveries are gone, backfill jobs restart, and no new Provider API rejection
+appears. Shared realm-global streams are valid only when every additional owner
+has a selected peer assignment for the same project and stream. Keep the
+pre-migration backup until the repeated import and all acceptance gates pass.
 
 ## Rebuild and acceptance gates
 

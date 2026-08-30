@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import concurrent.futures
+import hashlib
 import threading
 import time
 import uuid as sys_uuid
@@ -33,6 +34,13 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
+        engine.rollback_migration("0158-reset-Zulip-message-projections-c1e8bf.py")
+        engine.rollback_migration("0157-reset-zulip-projections-9a596b.py")
+        engine.rollback_migration("0156-repair-retained-provider-identities-2022d5.py")
+        engine.rollback_migration(
+            "0155-prepare-immutable-messenger-v2-cutover-887065.py"
+        )
+        engine.rollback_migration("0154-retry-shared-provider-projections-603fd0.py")
         engine.rollback_migration("0153-page-external-bridge-snapshots-75ad6f.py")
         engine.rollback_migration("0152-add-messenger-v2-canonical-model-b59d87.py")
         with ra_contexts.Context().session_manager() as session:
@@ -46,7 +54,12 @@ def _restore_latest_migration_after_module(_database):
                     m_workspace_user_topic_read_stats_v1,
                     m_workspace_topic_message_stats_v1,
                     m_external_provider_operations_v1,
-                    m_external_operations_v2
+                    m_external_operations_v2,
+                    m_external_bridge_desired_changes_v1,
+                    m_external_bridge_desired_resources_v1,
+                    m_external_chats_v2,
+                    m_external_accounts_v2,
+                    m_external_bridge_instances_v2
                 RESTART IDENTITY CASCADE
                 """
             )
@@ -195,6 +208,22 @@ EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_UUID = "75ad6f73-4ed6-43b5-9cb2-f853a8
 EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_FILE = (
     "0153-page-external-bridge-snapshots-75ad6f.py"
 )
+SHARED_PROJECTION_RECOVERY_MIGRATION_UUID = "603fd077-99da-421a-baf6-2b3abc6312ee"
+SHARED_PROJECTION_RECOVERY_MIGRATION_FILE = (
+    "0154-retry-shared-provider-projections-603fd0.py"
+)
+MESSENGER_V2_PREPARATION_MIGRATION_UUID = "8870659b-eeb7-4e1c-9f3a-d84ff25dea96"
+MESSENGER_V2_PREPARATION_MIGRATION_FILE = (
+    "0155-prepare-immutable-messenger-v2-cutover-887065.py"
+)
+RETAINED_PROVIDER_IDENTITY_MIGRATION_UUID = "2022d56e-484d-4047-8e65-f37c65da229d"
+RETAINED_PROVIDER_IDENTITY_MIGRATION_FILE = (
+    "0156-repair-retained-provider-identities-2022d5.py"
+)
+ZULIP_PROJECTION_RESET_MIGRATION_UUID = "9a596b13-a187-45d6-8da6-d3b5d39a5c85"
+ZULIP_PROJECTION_RESET_MIGRATION_FILE = "0157-reset-zulip-projections-9a596b.py"
+ZULIP_MESSAGE_RESET_MIGRATION_UUID = "c1e8bf60-ff3c-4027-9b8c-410bec2c959d"
+ZULIP_MESSAGE_RESET_MIGRATION_FILE = "0158-reset-Zulip-message-projections-c1e8bf.py"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -258,12 +287,36 @@ def _restore_current_provider_read_lease_fence(engine):
         migration.upgrade(session)
 
 
+def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
+    published_bytes = (
+        conftest.MIGRATIONS_DIR / MESSENGER_V2_MIGRATION_FILE
+    ).read_bytes()
+    assert hashlib.sha256(published_bytes).hexdigest() == (
+        "017f98bd8cf93c67feadd5900bfd7c15d0a45f6c121ce8e53c8ba97c2840d9d2"
+    )
+
+    migrations = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )._load_migrations()
+    assert migrations[MESSENGER_V2_PREPARATION_MIGRATION_FILE]._depends == [
+        COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_FILE
+    ]
+    assert migrations[RETAINED_PROVIDER_IDENTITY_MIGRATION_FILE]._depends == [
+        MESSENGER_V2_PREPARATION_MIGRATION_FILE,
+        SHARED_PROJECTION_RECOVERY_MIGRATION_FILE,
+    ]
+    assert migrations[ZULIP_PROJECTION_RESET_MIGRATION_FILE]._depends == [
+        RETAINED_PROVIDER_IDENTITY_MIGRATION_FILE,
+    ]
+    assert migrations[ZULIP_MESSAGE_RESET_MIGRATION_FILE]._depends == [
+        ZULIP_PROJECTION_RESET_MIGRATION_FILE,
+    ]
+
+
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert (
-        engine.get_latest_migration() == EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_FILE
-    )
+    assert engine.get_latest_migration() == ZULIP_MESSAGE_RESET_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -310,6 +363,11 @@ def test_current_migrations_have_a_single_head(_database, db):
                     COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID,
                     MESSENGER_V2_MIGRATION_UUID,
                     EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_UUID,
+                    SHARED_PROJECTION_RECOVERY_MIGRATION_UUID,
+                    MESSENGER_V2_PREPARATION_MIGRATION_UUID,
+                    RETAINED_PROVIDER_IDENTITY_MIGRATION_UUID,
+                    ZULIP_PROJECTION_RESET_MIGRATION_UUID,
+                    ZULIP_MESSAGE_RESET_MIGRATION_UUID,
                 ],
             ),
         )
@@ -355,6 +413,11 @@ def test_current_migrations_have_a_single_head(_database, db):
             (COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID, True),
             (MESSENGER_V2_MIGRATION_UUID, True),
             (EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_UUID, True),
+            (SHARED_PROJECTION_RECOVERY_MIGRATION_UUID, True),
+            (MESSENGER_V2_PREPARATION_MIGRATION_UUID, True),
+            (RETAINED_PROVIDER_IDENTITY_MIGRATION_UUID, True),
+            (ZULIP_PROJECTION_RESET_MIGRATION_UUID, True),
+            (ZULIP_MESSAGE_RESET_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -425,6 +488,7 @@ def test_current_migrations_have_a_single_head(_database, db):
               )
             """
         )
+
         assert {row[0] for row in cur.fetchall()} == {
             "summary",
             "summary_last_message_uuid",
@@ -582,6 +646,249 @@ def test_current_migrations_have_a_single_head(_database, db):
             ("m_workspace_flags_project_message_user_idx", True),
             ("m_workspace_read_memberships_stream_user_idx", True),
         }
+
+
+def test_shared_projection_recovery_advances_reset_and_desired_generations(
+    _database,
+):
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    blocked_owner_uuid = sys_uuid.uuid4()
+    blocked_account_uuid = sys_uuid.uuid4()
+    blocked_chat_uuid = sys_uuid.uuid4()
+    migration = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )._load_migrations()[SHARED_PROJECTION_RECOVERY_MIGRATION_FILE]
+    connection = psycopg.connect(conftest.TEST_DB_URL)
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+                VALUES (%s, 'zulip')
+                """,
+                (bridge_uuid,),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings, status,
+                    live_ready, desired_generation, revision,
+                    projection_reset_generation
+                ) VALUES (
+                    %s, %s, 'zulip', '{}'::jsonb, 'live', TRUE, 7, 11, 3
+                )
+                """,
+                (account_uuid, owner_uuid),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings, status,
+                    live_ready, desired_generation, revision,
+                    projection_reset_generation, safe_error
+                ) VALUES (
+                    %s, %s, 'zulip', '{}'::jsonb, 'disconnected', FALSE,
+                    4, 6, 0, 'Provider disconnected'
+                )
+                """,
+                (blocked_account_uuid, blocked_owner_uuid),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_external_chats_v2 (
+                    uuid, external_account_uuid, owner_user_uuid, provider,
+                    provider_chat_id, source, display_name, selected,
+                    project_id, status, revision
+                ) VALUES (
+                    %s, %s, %s, 'zulip', 'channel:42', '{}'::jsonb,
+                    'Shared projection', TRUE, %s, 'live', 13
+                )
+                """,
+                (chat_uuid, account_uuid, owner_uuid, project_uuid),
+            )
+            cur.execute(
+                """
+                INSERT INTO m_external_chats_v2 (
+                    uuid, external_account_uuid, owner_user_uuid, provider,
+                    provider_chat_id, source, display_name, selected,
+                    project_id, status, revision, safe_error
+                ) VALUES (
+                    %s, %s, %s, 'zulip', 'channel:99', '{}'::jsonb,
+                    'Disconnected projection', TRUE, %s, 'degraded', 9,
+                    'Provider disconnected'
+                )
+                """,
+                (
+                    blocked_chat_uuid,
+                    blocked_account_uuid,
+                    blocked_owner_uuid,
+                    project_uuid,
+                ),
+            )
+            cur.executemany(
+                """
+                INSERT INTO m_external_bridge_desired_resources_v1 (
+                    bridge_instance_uuid, provider_kind, resource_type,
+                    resource_uuid, operation, generation, resource
+                ) VALUES (%s, 'zulip', %s, %s, 'upsert', %s, %s::jsonb)
+                """,
+                (
+                    (
+                        bridge_uuid,
+                        "external_account",
+                        account_uuid,
+                        7,
+                        '{"generation":7,"projection_reset_generation":3}',
+                    ),
+                    (
+                        bridge_uuid,
+                        "external_chat_assignment",
+                        chat_uuid,
+                        13,
+                        '{"generation":13}',
+                    ),
+                    (
+                        bridge_uuid,
+                        "external_account",
+                        blocked_account_uuid,
+                        4,
+                        '{"generation":4,"projection_reset_generation":0}',
+                    ),
+                    (
+                        bridge_uuid,
+                        "external_chat_assignment",
+                        blocked_chat_uuid,
+                        9,
+                        '{"generation":9}',
+                    ),
+                ),
+            )
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM m_external_bridge_desired_changes_v1
+                WHERE resource_uuid = ANY(%s::uuid[])
+                """,
+                (
+                    [
+                        account_uuid,
+                        chat_uuid,
+                        blocked_account_uuid,
+                        blocked_chat_uuid,
+                    ],
+                ),
+            )
+            changes_before = cur.fetchone()[0]
+
+            migration.upgrade(cur)
+
+            cur.execute(
+                """
+                SELECT desired_generation, projection_reset_generation,
+                       revision, status, live_ready, safe_error
+                FROM m_external_accounts_v2
+                WHERE uuid = %s
+                """,
+                (account_uuid,),
+            )
+            assert cur.fetchone() == (8, 4, 12, "backfill", False, None)
+            cur.execute(
+                """
+                SELECT desired_generation, projection_reset_generation,
+                       revision, status, live_ready, safe_error
+                FROM m_external_accounts_v2
+                WHERE uuid = %s
+                """,
+                (blocked_account_uuid,),
+            )
+            assert cur.fetchone() == (
+                5,
+                1,
+                7,
+                "disconnected",
+                False,
+                "Provider disconnected",
+            )
+            cur.execute(
+                """
+                SELECT revision, status, safe_error
+                FROM m_external_chats_v2
+                WHERE uuid = %s
+                """,
+                (chat_uuid,),
+            )
+            assert cur.fetchone() == (14, "syncing", None)
+            cur.execute(
+                """
+                SELECT revision, status, safe_error
+                FROM m_external_chats_v2
+                WHERE uuid = %s
+                """,
+                (blocked_chat_uuid,),
+            )
+            assert cur.fetchone() == (10, "deselected", "Provider disconnected")
+            cur.execute(
+                """
+                SELECT resource_type, generation, resource
+                FROM m_external_bridge_desired_resources_v1
+                WHERE resource_uuid = ANY(%s::uuid[])
+                ORDER BY resource_type
+                """,
+                (
+                    [
+                        account_uuid,
+                        chat_uuid,
+                        blocked_account_uuid,
+                        blocked_chat_uuid,
+                    ],
+                ),
+            )
+            resources = cur.fetchall()
+            assert len(resources) == 4
+            account_resources = {
+                row[1]: row[2] for row in resources if row[0] == "external_account"
+            }
+            assert account_resources[8]["generation"] == 8
+            assert account_resources[8]["projection_reset_generation"] == 4
+            assert account_resources[5]["generation"] == 5
+            assert account_resources[5]["projection_reset_generation"] == 1
+            chat_resources = {
+                row[1]: row[2]
+                for row in resources
+                if row[0] == "external_chat_assignment"
+            }
+            assert chat_resources[14]["generation"] == 14
+            assert chat_resources[10]["generation"] == 10
+            cur.execute(
+                """
+                SELECT resource_type, generation, resource
+                FROM m_external_bridge_desired_changes_v1
+                WHERE resource_uuid = ANY(%s::uuid[])
+                ORDER BY resource_type
+                """,
+                (
+                    [
+                        account_uuid,
+                        chat_uuid,
+                        blocked_account_uuid,
+                        blocked_chat_uuid,
+                    ],
+                ),
+            )
+            changes = cur.fetchall()
+            assert len(changes) == changes_before + 4
+            changed_generations = {(row[0], row[1]) for row in changes}
+            assert ("external_account", 8) in changed_generations
+            assert ("external_account", 5) in changed_generations
+            assert ("external_chat_assignment", 14) in changed_generations
+            assert ("external_chat_assignment", 10) in changed_generations
+    finally:
+        connection.rollback()
+        connection.close()
 
 
 def test_legacy_gap_fence_is_active_before_online_index_build(_database):

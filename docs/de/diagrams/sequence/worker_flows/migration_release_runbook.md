@@ -157,6 +157,36 @@ Referenzen stehen als `urn:file|image|video:<uuid>` im Markdown. Die Migration
 prüft vor der Auswahl eines Dateikandidaten alle verbleibenden Payloads und kann
 dadurch weder einen hängenden Link erzeugen noch auf einen erfundenen FK bauen.
 
+## Migrationstopologie und Rolling-Reparatur der Identität
+
+Die veröffentlichte Datei `0152` darf nicht geändert werden; vor dem Release
+ist ihre Prüfsumme zu verifizieren. Es wird nur der aktuelle Head `0156`
+angewendet. Seine Abhängigkeitsreihenfolge bietet zwei sichere Wege:
+
+- frische v1-Datenbank: `0155` bereitet die Herkunft vor, danach läuft die
+  unveränderliche Kette `0152` → `0153` → `0154`, und `0156` beendet die
+  Bereinigung;
+- Datenbank mit bereits angewendeten `0152`–`0154`: `0155` wird als No-op
+  verbucht und `0156` repariert die erhaltenen Provider-Identitäten vorwärts.
+
+Für nachgewiesene Aliase derselben physischen Provider-Nachricht bewahrt `0156`
+jede interne Nachricht, jedes Placement, jede Inhaltsrevision und jede
+öffentliche UUID. Die Provider-Verknüpfung bleibt bei einem deterministischen
+Gewinner; bei den übrigen Aliasen werden nur
+`external_account_uuid`/`provider_external_id` geleert. Vorrang haben eine
+terminale lokale Operation, danach eine verlustfreie Kopie und danach die
+neueste Kopie. Eine bereits realm-globale Importzeile gewinnt immer gegen einen
+sonst passenden erhaltenen Alias. Der Nachweis verlangt identische
+Realm/Message-ID, Projekt, Autor, Provider-URL und Metadatenidentität sowie
+getrennte Alias-Accounts. Jeder schwächere Konflikt erfordert einen Rollback.
+
+Nach der Migration müssen genau ein Migration-Head, keine doppelten
+`(provider_realm_uuid, provider_message_id)`, keine geeignete Provider-Zeile
+ohne Realm-Key, keine temporären Herkunftsmarker oder Vorbereitungsindizes und
+beide aktivierten Rolling-Legacy-Reparaturtrigger nachgewiesen werden. Die Zahl
+der Nachrichten, Placements und öffentlichen UUIDs des erhaltenen Bestands
+muss unverändert bleiben.
+
 ## Vollständiger frischer Zulip-Neuimport
 
 Der Neuimport vergibt eine neue kanonische `MESSAGE.uuid`; die öffentliche
@@ -183,6 +213,22 @@ Checkpoints, Retry/Backoff, Fortschrittsprotokoll und Abgleich. Die
 Provider-Integration bleibt eingefroren, bis der finale Source-Cursor/High-Water
 Mark gespeichert ist; so entstehen an der Freeze-Grenze weder Verluste noch
 Duplikate.
+
+## Wiederherstellung nach einem unvollständigen v2-Import
+
+Hat ein bereitgestellter v2-Server nur einen Teil der Zulip-Historie angenommen,
+wird die Bridge angehalten und der Server-Build mit Migration `0154`
+bereitgestellt. Die Migration erhöht die Reset-Generation jedes Zulip-Accounts
+einmal und veröffentlicht alle ausgewählten Zuweisungen erneut. Die Bridge darf
+erst starten, wenn das Backend gesund ist.
+
+Prüfen, dass jeder Account die neue Generation beobachtet, alte unter
+Quarantäne gestellte Lieferungen entfernt sind, Backfill-Jobs neu starten und
+keine neuen Provider-API-Ablehnungen auftreten. Ein gemeinsamer realm-globaler
+Stream ist nur gültig, wenn jeder zusätzliche Eigentümer eine ausgewählte
+Peer-Zuweisung für dasselbe Projekt und denselben Stream besitzt. Das Backup vor
+der Migration bleibt erhalten, bis Neuimport und alle Abnahmekriterien
+erfolgreich sind.
 
 ## Rebuild- und Abnahmekriterien
 
