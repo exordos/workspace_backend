@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/stream_bindings/[binding_uuid]
+actor "Der Client" as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: DELETE /api/workspace/v1/messenger/stream_bindings/{binding_uuid}
+API -> DB: lock persistent USER_STREAM_BINDING\nactive=false; membership_generation++
+API -> DB: immutable outbox event für jede typed task
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: topic_membership_policy_rebuild / read_counters /\nfolder_projection / delivery_snapshot_event\njede task hat seine outbox_event_uuid
+Worker -> Worker: topic scope: Verbergen placement access;\nuser-stream/user-folder: shared projections
+Worker -> DB: conditional by active=false + new generation;\nstale generation = no-op
+Worker -> Projection: Restliche Zugriffsbindungen/Container
+Worker -> Events: Streaming/Verknüpfung/Ordner-Entfernung\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Nachher commit - Das ist alles. message/reaction paths Sie verlangen active membership
+  und generation equality; cleanup Die alten rows Nein . security boundary.
+  Task lifecycle: lease expiry/fencing, retry/backoff, DLQ/reaper.
+end note
+@enduml

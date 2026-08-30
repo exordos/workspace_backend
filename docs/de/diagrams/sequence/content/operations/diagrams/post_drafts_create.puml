@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/drafts/
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Zeile der Entwürfe in PostgreSQL" as DB
+queue "Internes Domänenname outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: POST JSON Entwurf
+API -> DB: BEGIN; Eigentümer + Thema überprüfen
+API -> DB: Einfügen oder vergleichen von Client- UUID
+API -> OUT: Hinzufügen von draft.created
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; ohne zu beenden public event row
+API --> Client: 201 oder impotent 200 + ETag
+@enduml

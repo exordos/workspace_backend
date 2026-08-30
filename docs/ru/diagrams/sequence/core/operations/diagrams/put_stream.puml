@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/streams/[stream_uuid]
+actor "Клиент" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "PostgreSQL\nканонические строки + привязки" as DB
+queue "Transactional outbox\n+ вывод типизированных задач" as Outbox
+participant "Фоновые исполнители\nexact scope leases + fencing" as Worker
+database "Готовые проекции\nпривязки контейнеров" as Projection
+database "Хранилище публичных событий" as Events
+participant "Диспетчер WebSocket" as Dispatcher
+actor "Клиент WebSocket" as WS
+Client -> API: PUT /api/workspace/v1/messenger/streams/{stream_uuid}
+API -> DB: начало транзакции; канонические поля STREAM + transactional outbox
+API -> DB: добавить неизменяемую запись в transactional outbox
+DB --> API: фиксация транзакции
+API --> Client: успешный публичный ответ
+DB ->> Outbox: зафиксированное событие
+Outbox ->> Worker: topic_membership_policy_rebuild / folder_projection /\ndelivery_snapshot_event\nкаждая task имеет своё outbox_event_uuid
+Worker -> Worker: claim exact scope; для topic work\nMESSAGE.created_at DESC
+Worker -> Projection: представления потоков пользователя из готовых привязок
+Worker -> Events: stream.updated\nатомарно в одной DB transaction с проекцией
+Events ->> Dispatcher: зафиксированная готовая строка
+Dispatcher ->> WS: отправка / повтор / воспроизведение
+@enduml

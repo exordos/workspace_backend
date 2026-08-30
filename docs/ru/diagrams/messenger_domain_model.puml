@@ -1,0 +1,263 @@
+@startuml messenger_domain_model
+!pragma layout smetana
+
+title Проектная доменная модель Messenger
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam entity {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+entity MESSAGE {
+    uuid <<внутренний канонический ID>>
+    --
+    author_uuid
+    content
+    created_at
+    updated_at
+}
+
+entity MESSAGE_PLACEMENT {
+    uuid <<публичный placement ID, UUIDv5>>
+    --
+    message_uuid
+    stream_uuid
+    topic_uuid
+}
+
+entity USER_MESSAGE_BINDING {
+    binding_uuid <<скрытый ключ ORM>>
+    --
+    placement_uuid
+    user_uuid
+    --
+    relation_role
+    visibility
+    permissions
+    membership_generation snapshot
+}
+
+entity USER_MESSAGE_STATE {
+    placement_uuid
+    user_uuid
+    membership_generation snapshot
+    --
+    read
+    mentioned
+    starred
+    pinned
+}
+
+entity DOMAIN_OUTBOX_EVENT {
+    event_uuid
+    scope_kind
+    exact scope_key
+    payload
+    immutable
+}
+
+entity PROJECTION_TASK {
+    outbox_event_uuid <<unique derivation key>>
+    task_kind
+    scope_kind
+    exact scope_key
+    pending / leased / running / completed / failed / DLQ
+    lease / fencing / attempts / next_retry_at
+}
+
+entity PROJECTION_SCOPE_LEASE {
+    project_id
+    scope_kind
+    exact scope_key
+    --
+    owner / expiry / fencing_token
+}
+
+entity USER {
+    user_uuid
+}
+
+entity STREAM {
+    stream_uuid
+    owner_uuid <<индексированный FK на user>>
+    direct_user_uuid <<nullable FK на user>>
+    private
+}
+
+entity TOPIC {
+    topic_uuid
+}
+
+entity FOLDER {
+    folder_uuid
+}
+
+entity USER_STREAM_BINDING {
+    stream_uuid
+    user_uuid
+    --
+    active / membership_generation
+    доступ / уведомления
+    счётчики непрочитанных / last_message_uuid
+}
+
+entity USER_TOPIC_BINDING {
+    topic_uuid
+    user_uuid
+    --
+    флаги / уведомления / счётчики непрочитанных
+}
+
+entity USER_FOLDER_BINDING {
+    folder_uuid
+    user_uuid
+    --
+    rule / type
+    unread_count / mention_count
+    folder_items_snapshot : JSONB (read-only public source)
+    snapshot_version / snapshot_updated_at (internal)
+}
+
+entity FOLDER_ITEM {
+    folder_item_uuid
+    folder_uuid
+    stream_uuid
+    --
+    automatic
+}
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : "явные контексты"
+STREAM ||--o{ MESSAGE_PLACEMENT : размещение
+TOPIC ||--o{ MESSAGE_PLACEMENT : "обязательный контекст / namespace UUIDv5"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : "доступ получателя"
+USER ||--o{ USER_MESSAGE_BINDING : "уникально на размещение"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : "уникально на user/placement"
+USER ||--o{ USER_MESSAGE_STATE
+STREAM ||--o{ USER_STREAM_BINDING
+USER ||--o{ USER_STREAM_BINDING
+TOPIC ||--o{ USER_TOPIC_BINDING
+USER ||--o{ USER_TOPIC_BINDING
+FOLDER ||--o{ USER_FOLDER_BINDING
+USER ||--o{ USER_FOLDER_BINDING
+FOLDER ||--o{ FOLDER_ITEM : "состав папки"
+
+note right of USER_FOLDER_BINDING
+  Normalized FOLDER_ITEM = source of truth.
+  Public folder_items <- ready JSONB snapshot; empty = [].
+  folder_projection(user-folder scope) atomically writes
+  snapshot + counts + version/time + ready event rows.
+  API read: one indexed row/page; no N+1/json_agg/COUNT/custom SQL.
+end note
+STREAM ||--o{ FOLDER_ITEM : "канонический объект"
+DOMAIN_OUTBOX_EVENT --> PROJECTION_TASK : "ровно 1 immutable task на event"
+PROJECTION_TASK --> PROJECTION_SCOPE_LEASE : "claim exact scope"
+PROJECTION_TASK ..> FOLDER_ITEM : "материализовать automatic items"
+PROJECTION_TASK ..> USER_FOLDER_BINDING : "обновить готовые агрегаты"
+
+note top of MESSAGE
+  Одна физическая каноническая запись.
+  Содержимое не копируется для пользователей.
+  MESSAGE.uuid — внутренний стабильный ID.
+end note
+
+note top of MESSAGE_PLACEMENT
+  Публичный uuid = UUIDv5(
+    namespace = TOPIC.uuid,
+    name = MESSAGE.uuid
+  ).
+  Name — lowercase hyphenated canonical UUID.
+  Name не содержит project/stream, braces или префиксы.
+  Авторитетная уникальность:
+  (project, message, stream, topic).
+  TOPIC обязателен, глобально уникален и неизменно
+  принадлежит ровно одному STREAM/PROJECT.
+end note
+
+note right of USER_MESSAGE_BINDING
+  Физическая индексированная запись доступа.
+  Уникально по (project, placement, user).
+  binding_uuid скрыт из публичного JSON,
+  но может быть технической identity строки ORM.
+  Нет revision или версии binding.
+end note
+
+note bottom of USER_MESSAGE_STATE
+  Placement-scoped read/starred/pinned/etc.
+  Одна строка на (project, user, placement).
+  Для автора создаётся синхронно вместе с binding.
+  Для получателя worker создаёт state вместе с binding.
+  Re-add: conditional upsert нового generation
+  и полный reset персональных flags к defaults.
+end note
+
+note bottom of STREAM
+  Публичные owner/direct ссылки — UUID;
+  физические столбцы — индексированные FK.
+  direct_user_uuid задан => private = true.
+  Self-chat имеет одну привязку владельца и не имеет
+  дополнительных привязок сообщений получателей.
+end note
+
+note right of USER_STREAM_BINDING
+  Persistent lifecycle row.
+  Revoke: active=false + generation++ в API transaction.
+  Re-add: новое generation; старые message binding/state невидимы.
+  Каждый read/action проверяет active + совпадение generation.
+  Cleanup не security-critical.
+end note
+
+note bottom of USER_FOLDER_BINDING
+  Канонические stream/topic/folder хранятся один раз.
+  Готовые агрегаты находятся в уникальной привязке
+  соответствующего user/container scope.
+  Системная binding имеет фиксированный rule/type.
+  Общий предикат: активная USER_STREAM_BINDING
+  + каноническая STREAM.is_archived = false.
+  All chats: все; Personal: STREAM.private = true;
+  Channels: STREAM.private = false.
+  Message binding не хранит счётчики контейнера.
+end note
+
+note bottom of FOLDER_ITEM
+  Элементы с automatic = true — перестраиваемая проекция.
+  Источник истины: активные USER_STREAM_BINDING
+  и атрибуты канонического STREAM.
+  API читает готовые строки простыми индексированными соединениями.
+end note
+
+note bottom of PROJECTION_TASK
+  Изменения пишут неизменяемые события outbox.
+  GET/list не создают задачи.
+  Initial design: без coalescing.
+  Unique outbox_event_uuid; lease expiry + fencing;
+  retry/backoff, max attempts/DLQ, reaper/reconciliation.
+  Worker получает явную работу по placement;
+  он не сканирует отсутствующие bindings.
+  Topic scope владеет только placements/bindings.
+  Canonical snapshots: message scope.
+  Aggregates: user-stream/user-topic/user-folder.
+  Fallback shared row -> topic запрещён.
+  Atomic delta требует exactly-once effect guard;
+  иначе scope worker recomputes/writes.
+end note
+
+note bottom of DOMAIN_OUTBOX_EVENT
+  Синхронная отправка в одной транзакции:
+  MESSAGE + MESSAGE_PLACEMENT + авторские
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + outbox.
+  Fan-out создаёт binding/state получателя вместе;
+  self-chat не создаёт дополнительных пар.
+end note
+
+@enduml

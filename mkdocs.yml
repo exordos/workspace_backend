@@ -1,0 +1,202 @@
+site_name: Workspace Backend
+site_url: https://exordos.github.io/workspace_backend/
+site_description: Workspace Server architecture, contracts, and operations
+repo_name: workspace_backend
+repo_url: https://github.com/exordos/workspace_backend
+edit_uri: edit/master/docs/
+copyright: Copyright &copy; 2025-2026 Genesis Corporation
+
+theme:
+  name: zensical
+  variant: modern
+  language: en
+  features:
+    - search.suggest
+    - search.highlight
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - toc.integrate
+    - content.code.copy
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: lucide/sun
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: lucide/moon
+        name: Switch to light mode
+
+plugins:
+  - search
+
+# Zensical does not implement mkdocs-static-i18n yet. As in RESTAlchemy, each
+# language therefore has a complete tree and its own navigation section.
+extra:
+  repo_icon: github
+  alternate:
+    - name: English
+      link: en/
+      lang: en
+    - name: Русский
+      link: ru/
+      lang: ru
+    - name: Deutsch
+      link: de/
+      lang: de
+    - name: 中文
+      link: zh/
+      lang: zh
+
+markdown_extensions:
+  - meta
+  - admonition
+  - footnotes
+  - attr_list
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - toc:
+      slugify: !!python/name:pymdownx.slugs.uslugify
+      permalink: "#"
+  - pymdownx.arithmatex
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.keys
+  - pymdownx.emoji:
+      emoji_index: !!python/name:zensical.extensions.emoji.twemoji
+      emoji_generator: !!python/name:zensical.extensions.emoji.to_svg
+  - pymdownx.caret
+  - pymdownx.critic
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.magiclink
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences:
+      preserve_tabs: true
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - English:
+    - en/index.md
+    - Architecture and contracts:
+      - en/architecture.md
+      - en/workspace_api.md
+      - en/workspace_ui_realtime_integration.md
+      - en/workspace_server_v2_decisions.md
+    - Messenger design:
+      - en/messenger_domain_model.md
+      - en/messenger_api_domain_model.md
+      - en/messenger_restalchemy_api_spec.md
+      - en/messenger_architecture_inventory.md
+    - Sequence diagrams:
+      - en/diagrams/sequence/README.md
+      - en/diagrams/sequence/core/README.md
+      - en/diagrams/sequence/content/README.md
+      - en/diagrams/sequence/external/README.md
+      - en/diagrams/sequence/worker_flows/README.md
+    - Zulip bridge:
+      - en/zulip_bridge/README.md
+      - en/zulip_bridge/architecture_overview.md
+      - en/zulip_bridge/history_importer.md
+      - en/zulip_bridge/realtime_connector.md
+    - Operations and testing:
+      - en/diagrams/sequence/worker_flows/migration_release_runbook.md
+      - en/messenger_regression_test_plan.md
+      - en/zulip_bridge_v1_test_plan.md
+  - Русский:
+    - ru/index.md
+    - Архитектура и контракты:
+      - ru/architecture.md
+      - ru/workspace_api.md
+      - ru/workspace_ui_realtime_integration.md
+      - ru/workspace_server_v2_decisions.md
+    - Проектирование Messenger:
+      - ru/messenger_domain_model.md
+      - ru/messenger_api_domain_model.md
+      - ru/messenger_restalchemy_api_spec.md
+      - ru/messenger_architecture_inventory.md
+    - Диаграммы последовательностей:
+      - ru/diagrams/sequence/README.md
+      - ru/diagrams/sequence/core/README.md
+      - ru/diagrams/sequence/content/README.md
+      - ru/diagrams/sequence/external/README.md
+      - ru/diagrams/sequence/worker_flows/README.md
+    - Zulip Bridge:
+      - ru/zulip_bridge/README.md
+      - ru/zulip_bridge/architecture_overview.md
+      - ru/zulip_bridge/history_importer.md
+      - ru/zulip_bridge/realtime_connector.md
+    - Эксплуатация и тестирование:
+      - ru/diagrams/sequence/worker_flows/migration_release_runbook.md
+      - ru/messenger_regression_test_plan.md
+      - ru/zulip_bridge_v1_test_plan.md
+  - Deutsch:
+    - de/index.md
+    - Architektur und Verträge:
+      - de/architecture.md
+      - de/workspace_api.md
+      - de/workspace_ui_realtime_integration.md
+      - de/workspace_server_v2_decisions.md
+    - Messenger-Entwurf:
+      - de/messenger_domain_model.md
+      - de/messenger_api_domain_model.md
+      - de/messenger_restalchemy_api_spec.md
+      - de/messenger_architecture_inventory.md
+    - Sequenzdiagramme:
+      - de/diagrams/sequence/README.md
+      - de/diagrams/sequence/core/README.md
+      - de/diagrams/sequence/content/README.md
+      - de/diagrams/sequence/external/README.md
+      - de/diagrams/sequence/worker_flows/README.md
+    - Zulip Bridge:
+      - de/zulip_bridge/README.md
+      - de/zulip_bridge/architecture_overview.md
+      - de/zulip_bridge/history_importer.md
+      - de/zulip_bridge/realtime_connector.md
+    - Betrieb und Tests:
+      - de/diagrams/sequence/worker_flows/migration_release_runbook.md
+      - de/messenger_regression_test_plan.md
+      - de/zulip_bridge_v1_test_plan.md
+  - 中文:
+    - zh/index.md
+    - 架构和契约:
+      - zh/architecture.md
+      - zh/workspace_api.md
+      - zh/workspace_ui_realtime_integration.md
+      - zh/workspace_server_v2_decisions.md
+    - Messenger 设计:
+      - zh/messenger_domain_model.md
+      - zh/messenger_api_domain_model.md
+      - zh/messenger_restalchemy_api_spec.md
+      - zh/messenger_architecture_inventory.md
+    - 时序图:
+      - zh/diagrams/sequence/README.md
+      - zh/diagrams/sequence/core/README.md
+      - zh/diagrams/sequence/content/README.md
+      - zh/diagrams/sequence/external/README.md
+      - zh/diagrams/sequence/worker_flows/README.md
+    - Zulip Bridge:
+      - zh/zulip_bridge/README.md
+      - zh/zulip_bridge/architecture_overview.md
+      - zh/zulip_bridge/history_importer.md
+      - zh/zulip_bridge/realtime_connector.md
+    - 运维和测试:
+      - zh/diagrams/sequence/worker_flows/migration_release_runbook.md
+      - zh/messenger_regression_test_plan.md
+      - zh/zulip_bridge_v1_test_plan.md

@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/folder_items/{folder_item_uuid}/actions/pin/invoke
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL\nFOLDER_ITEM + The container is tied up ." as DB
+queue "It 's a transaction . outbox" as OUT
+queue "Typed projected folder task" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "Signed client" as WS
+Client -> API: POST The fixation (Without a body.)
+note right of API
+  Changing the placement layer (placement), not automatic rule/membership.
+  The projection: active USER_STREAM_BINDING + It 's canonical . STREAM.is_archived = false.
+  All chats = All of them .; Personal = STREAM.private = true; Channels = STREAM.private = false.
+end note
+API -> DB: BEGIN; block the element in the specified area
+API -> DB: set it up pinned_at = now
+API -> OUT: I 'm going to add folder_item.pin
+API -> DB: COMMIT
+API --> Client: 200 JSON The element
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; without coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: I 'm going to read it . normalized items + ready stream counts
+group One . worker DB transaction
+  WORKER -> DB: replace deterministic snapshot + counts\nversion/updated_at
+  WORKER -> EVENT: ready folder.updated + unique effect guard
+end
+DISP -> EVENT: read/repeat/play
+DISP -> WS: folder.updated
+@enduml

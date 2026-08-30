@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/streams/[stream_uuid]
+actor "客户端" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "PostgreSQL\n规则行 + 绑定" as DB
+queue "Transactional outbox\n+ 类型化任务的输出" as Outbox
+participant "背景表演者\nexact scope leases + fencing" as Worker
+database "已准备的投影\n连接容器" as Projection
+database "公众活动存储器" as Events
+participant "控制器 WebSocket" as Dispatcher
+actor "客户端 WebSocket" as WS
+Client -> API: DELETE /api/workspace/v1/messenger/streams/{stream_uuid}
+API -> DB: 交易开始; 删除根 STREAM + 听众录音 transactional outbox
+API -> DB: 在此中添加不可更改的记录 transactional outbox
+DB --> API: 交易的固定
+API --> Client: 成功的公开回复
+DB ->> Outbox: 已记录的事件
+Outbox ->> Worker: topic_membership_policy_rebuild / read_counters /\nfolder_projection / delivery_snapshot_event\n每一个 task 有自己的 outbox_event_uuid
+Worker -> Worker: claim exact scope; 为了 topic work\nMESSAGE.created_at DESC
+Worker -> Projection: 剩下的文件/容器绑定
+Worker -> Events: stream.deleted + folder.updated\n原子在一个 DB transaction 投影
+Events ->> Dispatcher: 已固定的准备行
+Dispatcher ->> WS: 发送 / 重复 / 复制
+@enduml

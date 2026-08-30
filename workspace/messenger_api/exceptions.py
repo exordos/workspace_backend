@@ -174,6 +174,20 @@ class ExternalAccountConflictError(ra_exc.RestAlchemyException):
     code = 409
 
 
+class ExternalProviderScopeConflictError(ra_exc.RestAlchemyException):
+    message = "This provider chat is already assigned to another project"
+    code = 409
+
+    def as_dict(self) -> dict[str, typing.Any]:
+        return {
+            "type": self.__class__.__name__,
+            "code": self.code,
+            "error": "provider_scope_conflict",
+            "message": self.msg,
+            "retryable": False,
+        }
+
+
 class ExternalProjectionMoveConflictError(ra_exc.RestAlchemyException):
     message = "Provider read delivery is in progress; retry the projection move"
     code = 409

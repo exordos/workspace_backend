@@ -1,0 +1,52 @@
+@startuml task_topic_membership_policy_rebuild
+!pragma layout smetana
+title 标式化投影任务: topic_membership_policy_rebuild
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Outbox 成员/政治" as OUTBOX
+participant "任务投影器" as PROJECTOR
+database "类型任务" as TASKS
+database "题目捕捉" as CLAIM
+participant "工人机" as WORKER
+database "最近的会员/政策" as POLICY
+database "MESSAGE_PLACEMENT" as PLACEMENTS
+database "USER_TOPIC_BINDING\nUSER_MESSAGE_BINDING" as BINDINGS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket" as DISPATCHER
+actor "客户端" as Client
+
+OUTBOX -> PROJECTOR : 记录的会员/政策事件
+PROJECTOR -> TASKS : immutable topic_membership_policy_rebuild\n(outbox_event_uuid, scope=topic)\nunique derivation; 没有 coalescing
+TASKS -> WORKER : 显而易见的主题领域
+WORKER -> CLAIM : 独占的 (项目,主题)
+WORKER -> POLICY : active membership + expected generation
+WORKER -> PLACEMENTS : 阅读显式的位置
+note right of PLACEMENTS
+  按 MESSAGE.created_at DESC:
+  14:20 -> 14:19 -> 14:15
+end note
+group 一个 DB transaction
+  loop 影响到的用户/位置
+    WORKER -> BINDINGS : conditional upsert 在 generation equality;\nstale task = no-op
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events exact scopes:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : 让我们安全地释放
+EVENTS -> DISPATCHER : 稳定的记录
+DISPATCHER -> Client : 发送 / 重复 / 播放
+
+note over TASKS,BINDINGS
+  这就是 exact topic-scope protocol 服务于单独的
+  TASK_KIND topic_state_projection 为了 ready topic.updated;
+  authoritative TOPIC.is_done 只有同步命令才能改变.
+  Revoke active=false + generation++ 时间同步;
+  stale rows 没有允许访问, cleanup 没有 security boundary.
+  Topic worker shared rows 他没有写.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper 必须.
+end note
+
+@enduml

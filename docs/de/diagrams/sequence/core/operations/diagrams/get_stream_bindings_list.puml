@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/stream_bindings/
+actor "Der Client" as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "Indexed öffentliche Darstellung\n+ physische Zeilen externer Schlüssel" as DB
+Client -> API: GET /api/workspace/v1/messenger/stream_bindings/
+note right of API: Target page_limit: omitted/0=100; 1..500 exact; invalid/>500=400
+API -> DB: Projektbereich und aktueller Benutzer\nSkalierfilter UUID
+DB --> API: Zeilen ohne Berechnungen
+API --> Client: 200, öffentlich JSON
+note over API,DB
+Keine Aufzeichnungen / transactional outbox / Aufgaben / Hintergrund-Aussteller / Ereignisse
+Keine Aggregation oder Wiederherstellung während der Anfrage
+end note
+@enduml

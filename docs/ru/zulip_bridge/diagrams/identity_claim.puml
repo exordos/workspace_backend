@@ -1,0 +1,41 @@
+@startuml
+!pragma layout smetana
+title Verified claim unmanaged Zulip identity
+
+autonumber
+actor "Workspace user" as User
+participant "Current external account API" as PublicAPI
+participant "Private Workspace identity service" as Identity
+participant "Zulip" as Zulip
+database "Workspace users / provider mappings" as DB
+
+User -> PublicAPI : connect/reconnect(HTTPS server_url, email, api_key)
+PublicAPI -> Zulip : validate credential
+Zulip --> PublicAPI : verified realm_uuid, user_id, delivery_email
+PublicAPI -> PublicAPI : reconnect: compare all three\nwith expected linked identity
+PublicAPI -> Identity : claim verified provider identity
+Identity -> DB : find realm+typed user_id
+
+alt Existing unmanaged external user
+  Identity -> DB : atomically link verified owner
+  note right of DB
+    Messages, memberships и reactions
+    сохраняют тот же user UUID.
+  end note
+else No provider identity
+  Identity -> DB : create provider mapping + link owner
+else Conflicting verified owner
+  Identity --> PublicAPI : fail-closed / admin resolution
+end
+
+PublicAPI --> User : current sanitized account response
+
+note over User,DB
+  Normalized delivery_email -> Workspace email только candidate.
+  Proof = успешная validation API key against Zulip.
+  api_key encrypted, write-only, never returned/logged.
+  Failed reconnect validation preserves old secret,
+  connection, lease and running sync unchanged.
+end note
+
+@enduml

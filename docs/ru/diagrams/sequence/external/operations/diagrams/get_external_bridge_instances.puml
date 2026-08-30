@@ -1,0 +1,32 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title GET /api/workspace/v1/messenger/external_bridge_instances/
+actor "Клиент" as C
+participant "REST / RestAlchemy\nконтроллер" as API
+database "PostgreSQL\nканонические строки/строки чтения" as DB
+
+C -> API: запрос GET + токен Bearer IAM
+activate API
+API -> DB: индексированное чтение в заданной области
+DB --> API: санитизированные канонические/материализованные строки
+note right of API
+  Нет записей, outbox, задач, fan-out,
+  вызова провайдера, COUNT/GROUP BY
+  или исправления в пути запроса.
+end note
+note left of API
+  Текущий page_limit: отсутствует/0 = без ограничения;
+  отрицательный/нецелый = 400; положительный без максимума.
+  Переопределение ответа обходит X-Pagination-*.
+  Target: отсутствует/0 => 100; 1..500 точно; иначе 400; unlimited нет.
+end note
+API --> C: публичный ответ 200
+deactivate API
+
+note over API,DB
+  Публичные ссылки UUID являются скалярными UUID-свойствами.
+  Физические столбцы *_uuid остаются индексированными FK.
+end note
+@enduml

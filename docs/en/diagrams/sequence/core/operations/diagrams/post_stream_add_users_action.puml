@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/[stream_uuid]/actions/add_users/invoke
+actor "The client ." as Client
+participant "WorkspaceStreamBindingController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke
+API -> DB: create/reactivate persistent USER_STREAM_BINDING\nactive=true; membership_generation++
+API -> DB: immutable outbox event For each typed task
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: topic_membership_policy_rebuild / fanout /\nread_counters / folder_projection\neach task It has its own outbox_event_uuid + expected generation
+Worker -> Worker: topic scope: catch-up MESSAGE.created_at DESC;\nshared aggregates: user-stream/user-folder
+Worker -> DB: conditional active + generation equality
+Worker -> Projection: fresh binding + placement state;\nReady shared projections
+Worker -> Events: the event stream/bind/folder\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Worker
+  Grant active I 'm going to get it .; historical appearance eventual.
+  Old ones binding/state The former generation They 're not coming back ..
+  Lease expiry/fencing, retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+@enduml

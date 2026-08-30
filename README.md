@@ -11,20 +11,31 @@ same public API used by the UI. Messenger attachments continue to use the
 configured S3-compatible file storage and IAM remains the source of users and
 authentication.
 
-Current contracts and integration guidance:
+The rendered documentation is published at
+https://exordos.github.io/workspace_backend/ and is available in four
+languages with the same file and section structure:
 
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/workspace_api.md`](docs/workspace_api.md)
-- [`docs/workspace_ui_realtime_integration.md`](docs/workspace_ui_realtime_integration.md)
+- [English](docs/en/index.md)
+- [Русский](docs/ru/index.md)
+- [Deutsch](docs/de/index.md)
+- [中文](docs/zh/index.md)
+
+English contracts and integration guidance:
+
+- [`docs/en/architecture.md`](docs/en/architecture.md)
+- [`docs/en/workspace_api.md`](docs/en/workspace_api.md)
+- [`docs/en/workspace_ui_realtime_integration.md`](docs/en/workspace_ui_realtime_integration.md)
 - [`docs/workspace_provider_api_v1.yaml`](docs/workspace_provider_api_v1.yaml)
+- [`docs/workspace_provider_api_v2.yaml`](docs/workspace_provider_api_v2.yaml)
+- [`docs/en/workspace_server_v2_decisions.md`](docs/en/workspace_server_v2_decisions.md)
 
 Provider product, control-plane, file-boundary, and reusable acceptance
 contracts:
 
-- [`docs/zulip_bridge_v1_product_and_api.md`](docs/zulip_bridge_v1_product_and_api.md)
+- [`docs/en/zulip_bridge_v1_product_and_api.md`](docs/en/zulip_bridge_v1_product_and_api.md)
 - [`docs/zulip_bridge_control_api_v1.yaml`](docs/zulip_bridge_control_api_v1.yaml)
 - [`docs/zulip_bridge_file_api_v1.yaml`](docs/zulip_bridge_file_api_v1.yaml)
-- [`docs/zulip_bridge_v1_test_plan.md`](docs/zulip_bridge_v1_test_plan.md)
+- [`docs/en/zulip_bridge_v1_test_plan.md`](docs/en/zulip_bridge_v1_test_plan.md)
 
 The private Provider, control, and file specifications are not browser routes.
 The generated public Workspace and Messenger specification remains OpenAPI

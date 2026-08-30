@@ -1,0 +1,20 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/users/{user_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+participant "Die Introspektion IAM" as IAM
+database "Benutzer Workspace in PostgreSQL" as DB
+Client -> API: GET UUID Benutzer
+alt UUID gehört dem aktuellen Benutzer
+API -> IAM: Lesen Sie die gültigen Identitätsfelder
+IAM --> API: username/name/email
+API -> DB: die Projektion des aktuellen Benutzers aktualisieren
+else ein anderer Benutzer
+API -> DB: nur nach Projektion indexiert suchen
+end
+DB --> API: Kanonischen Benutzer
+note right of API: Ohne outbox / Aufgaben / Ereignisse
+API --> Client: 200 JSON Benutzer
+@enduml

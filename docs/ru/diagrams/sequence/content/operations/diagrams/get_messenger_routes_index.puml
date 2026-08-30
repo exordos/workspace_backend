@@ -1,0 +1,11 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+Client -> API: GET /api/workspace/v1/messenger/
+API -> API: проверить зарегистрированные маршруты Messenger
+note right of API: без БД / outbox / задачи / события
+API --> Client: 200 массив строк JSON
+@enduml

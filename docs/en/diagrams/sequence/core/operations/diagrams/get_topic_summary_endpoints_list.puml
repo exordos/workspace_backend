@@ -1,0 +1,19 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/topic_summary_endpoints/
+actor "The client ." as Client
+participant "TopicSummaryEndpointController\nRestAlchemy" as API
+database "Indexed lines of the control plane of the summary" as DB
+Client -> API: GET /api/workspace/v1/messenger/topic_summary_endpoints/
+note right of API
+Target accepts page_limit/page_marker without JSON envelope change:
+omitted/0=100; 1..500 exact; invalid/>500=400; X-Pagination-* headers.
+end note
+API -> DB: Project area + scalar UUID
+DB --> API: Cleaned lines
+API --> Client: 200, public JSON
+note over API,DB
+No , I 'm not . transactional outbox / background performer / public event / WebSocket
+Account data and token applications are not serialized
+end note
+@enduml

@@ -1,0 +1,340 @@
+@startuml messenger_restalchemy_api_spec
+!pragma layout smetana
+
+title Project specification Messenger RestAlchemy API
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam package {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam class {
+    BackgroundColor #EFF6FF
+    BorderColor #2563EB
+    FontColor #1E3A8A
+}
+skinparam entity {
+    BackgroundColor #FFFFFF
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+package "1. Current public routes\n(The contract is not changed .)" as ROUTES {
+    class "/messages/ CRUD\nread/read_up_to/star/unstar" as R_MESSAGE
+    class "/message_reactions/ CRUD" as R_REACTION
+    class "/streams/ CRUD + actions" as R_STREAM
+    class "/stream_bindings/ R/U/D" as R_STREAM_BINDING
+    class "/stream_topics/ CRUD + actions" as R_TOPIC
+    class "/folders/ CRUD\n/folder_items/ CRUD + pin/unpin" as R_FOLDER
+    class "/users/ + /me/ + actions" as R_USER
+    class "GET /server_settings\ntrailing slash The same middleware" as R_SERVER
+}
+
+package "2. It 's standard . RestAlchemy resource/controller" as RA {
+    class "WorkspaceMessageController\nI 'm going to use the route adapter for placement UUID\nResourceByRAModel(WorkspaceUserMessage)" as C_MESSAGE
+    class "WorkspaceMessageReactionController\nResourceByRAModel(WorkspaceMessageReactionView)\nWith a page ." as C_REACTION
+    class "WorkspaceStreamController\nResourceByRAModel(WorkspaceUserStream)\nWith a page ." as C_STREAM
+    class "WorkspaceStreamBindingController\nResourceByRAModel(WorkspaceStreamBindingView)\nWith a page ." as C_STREAM_BINDING
+    class "WorkspaceStreamTopicController\nResourceByRAModel(WorkspaceUserTopic)\nWith a page ." as C_TOPIC
+    class "WorkspaceFolderController\nResourceByRAModel(WorkspaceUserFolder)\nWith a page ." as C_FOLDER
+    class "WorkspaceUserController / MeController\nResourceByRAModel(WorkspaceUser)\nPagination or direct access" as C_USER
+    class "ServerSettingsMiddleware\nA direct answer .\nwithout a model RestAlchemy" as C_SERVER
+}
+
+package "3. Read patterns without calculations" as VIEWS {
+    entity "messenger_api_user_messages_v1\nThe root: USER_MESSAGE_BINDING\nplacement.uuid -> public uuid\nbinding.uuid -> Hidden ORM-The key ." as V_MESSAGE
+    entity "messenger_api_message_reactions_v1\nThe root: The raw fact of the reaction" as V_REACTION
+    entity "messenger_api_user_streams_v1\nThe root: It 's a unique binding . user/stream" as V_STREAM
+    entity "messenger_api_stream_bindings_v1\nThe root: the visible line-The adapter . binding" as V_STREAM_BINDING
+    entity "messenger_api_user_topics_v1\nThe root: It 's a unique binding . user/topic" as V_TOPIC
+    entity "messenger_api_user_folders_v1\nThe root: It 's a unique binding . user/folder" as V_FOLDER
+}
+
+package "4. Proposal: physical SQL-storable The essence" as PHYSICAL {
+    entity "MESSAGE\nmessenger_messages" as MESSAGE {
+        uuid : UUID <<PK, The internal canonical ID>>
+        project_id
+        author
+        payload / source
+        external_account_uuid / provider_external_id <<hidden>>
+        provider / delivery
+        reactions / reaction_users
+        created_at / updated_at <<public>>
+    }
+
+    entity "MESSAGE_PLACEMENT\nmessenger_message_placements" as MESSAGE_PLACEMENT {
+        uuid <<public UUIDv5 placement>>
+        message_uuid <<FK>>
+        stream / topic <<FK>>
+        It 's unique .: project + message + stream + topic
+    }
+
+    entity "USER_MESSAGE_BINDING\nmessenger_user_message_bindings" as USER_MESSAGE_BINDING {
+        uuid <<Hidden identity ORM-- What ?>>
+        placement_uuid / user_uuid <<FK>>
+        relation_role / visibility / permissions
+        membership_generation snapshot
+        It 's unique .: project + placement + user
+        without revision
+    }
+
+    entity "USER_MESSAGE_STATE\nmessenger_user_message_states" as USER_MESSAGE_STATE {
+        placement_uuid / user_uuid <<FK>>
+        membership_generation <<snapshot>>
+        read / mentioned / starred / pinned
+        It 's unique .: project + user + placement
+    }
+
+    entity "MESSAGE_REACTION_FACT\nmessenger_message_reaction_facts\nIt 's unique .: project + message + user + emoji" as REACTION_FACT
+    entity "STREAM\nmessenger_streams" as STREAM {
+        owner_uuid <<indexed FK to user>>
+        direct_user_uuid <<nullable - It 's indexed . FK I 'm on user>>
+        private
+    }
+    entity "USER_STREAM_BINDING\nmessenger_stream_bindings" as STREAM_BINDING {
+        user_uuid / stream_uuid <<It 's unique ., FK>>
+        It 's unique .: project + user + stream
+        role / notification
+        active / membership_generation
+        Unread counters / last_message_uuid
+    }
+    entity "TOPIC\nmessenger_topics" as TOPIC
+    entity "USER_TOPIC_BINDING\nmessenger_user_topic_bindings" as TOPIC_BINDING {
+        user_uuid / topic_uuid <<It 's unique ., FK>>
+        It 's unique .: project + user + topic
+        The flags / notification / Unread counters
+    }
+    entity "FOLDER\nmessenger_folders" as FOLDER
+    entity "USER_FOLDER_BINDING\nmessenger_user_folder_bindings" as FOLDER_BINDING {
+        user_uuid / folder_uuid <<It 's unique ., FK>>
+        It 's unique .: project + user + folder
+        rule / type
+        unread_count / mention_count
+        folder_items_snapshot : JSONB <<read-only>>
+        snapshot_version / snapshot_updated_at <<internal>>
+    }
+    entity "FOLDER_ITEM\nmessenger_folder_items" as FOLDER_ITEM {
+        user_uuid / folder_uuid / stream_uuid <<FK>>
+        automatic
+        It 's unique .: project + user + folder + stream
+    }
+    entity "USER\nmessenger_users" as USER
+    entity "DOMAIN_OUTBOX_EVENT\nmessenger_domain_outbox_events\nIt 's unchanging ." as OUTBOX_EVENT
+    entity "PROJECTION_TASK\nmessenger_projection_tasks\n1 immutable task I 'm on outbox event" as PROJECTION_TASK {
+        unique outbox_event_uuid
+        scope_kind / exact scope_key
+        pending / leased / running / completed / failed / DLQ
+        lease expiry / owner / fencing token
+        attempts / next_retry_at
+    }
+    entity "SCOPE_LEASE\nmessenger_projection_scope_leases" as SCOPE_LEASE {
+        unique project + scope_kind + scope_key
+        lease owner / expiry / fencing token
+    }
+    entity "PUBLIC_EVENT_RECORD\nm_workspace_events\nIt 's formed atomically from state;\ndispatchable After commit" as PUBLIC_EVENT
+}
+
+package "5. The background material" as BACKGROUND {
+    class "The slot worker Exclusive ownership exact scope\nReads the last state of the original" as WORKER
+    class "I'm a dispatcher or a service person. WebSocket\nSend + repeat + play" as WS_DISPATCHER
+}
+
+R_MESSAGE --> C_MESSAGE
+R_REACTION --> C_REACTION
+R_STREAM --> C_STREAM
+R_STREAM_BINDING --> C_STREAM_BINDING
+R_TOPIC --> C_TOPIC
+R_FOLDER --> C_FOLDER
+R_USER --> C_USER
+R_SERVER --> C_SERVER
+
+C_MESSAGE --> V_MESSAGE : Receipt / list
+C_MESSAGE ..> MESSAGE : create / change / delete
+C_MESSAGE ..> MESSAGE_PLACEMENT : context of sending / copying
+C_MESSAGE ..> USER_MESSAGE_BINDING : author access
+C_MESSAGE ..> USER_MESSAGE_STATE : The author 's user flags
+C_MESSAGE ..> OUTBOX_EVENT : Every change state
+C_REACTION --> V_REACTION : Receipt / list
+C_REACTION ..> REACTION_FACT : Creating / changing / deleting one fact
+C_REACTION ..> USER_MESSAGE_BINDING : indexed access check
+C_REACTION ..> OUTBOX_EVENT : The reaction event
+C_STREAM --> V_STREAM : Receipt / list
+C_STREAM ..> STREAM : record / action
+C_STREAM_BINDING --> V_STREAM_BINDING : Receipt / list
+C_STREAM_BINDING ..> STREAM_BINDING : Change or delete / add_users
+C_TOPIC --> V_TOPIC : Receipt / list
+C_TOPIC ..> TOPIC : record / action
+C_TOPIC ..> TOPIC_BINDING : user actions
+C_FOLDER --> V_FOLDER : Receipt / list
+C_FOLDER ..> FOLDER : canonical records
+C_FOLDER ..> FOLDER_BINDING : Ready user unit
+C_USER --> USER : Direct receipt / list / own actions
+
+V_MESSAGE --> USER_MESSAGE_BINDING : Right . 1 The first line
+V_MESSAGE --> MESSAGE_PLACEMENT : Injected connection many-to-one
+V_MESSAGE --> USER_MESSAGE_STATE : Injected connection one-to-one\nuser + placement
+V_MESSAGE --> MESSAGE : Injected connection many-to-one
+V_REACTION --> REACTION_FACT : Right . 1 The leading fact
+V_REACTION --> MESSAGE : Injected LEFT JOIN\nThe projection many-to-one
+V_STREAM --> STREAM_BINDING : Right . 1 The first line
+V_STREAM --> STREAM : Injected connection\nmany-to-one
+V_STREAM_BINDING --> STREAM_BINDING : Injected connection many-to-one
+V_TOPIC --> TOPIC_BINDING : Right . 1 The first line
+V_TOPIC --> TOPIC : Injected connection\nmany-to-one
+V_FOLDER --> FOLDER_BINDING : Right . 1 The first line
+V_FOLDER --> FOLDER : Injected connection\nmany-to-one
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : Clearly located
+MESSAGE_PLACEMENT }o--|| STREAM
+MESSAGE_PLACEMENT }o--|| TOPIC
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : Access by recipient
+USER_MESSAGE_BINDING }o--|| USER
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : state user/placement
+USER_MESSAGE_STATE }o--|| USER
+REACTION_FACT }o--|| MESSAGE : FK The canonical message
+REACTION_FACT }o--|| USER : The author of the reaction
+STREAM_BINDING }o--|| STREAM
+STREAM_BINDING }o--|| USER
+TOPIC_BINDING }o--|| TOPIC
+TOPIC_BINDING }o--|| USER
+FOLDER_BINDING }o--|| FOLDER
+FOLDER_BINDING }o--|| USER
+FOLDER_ITEM }o--|| FOLDER
+FOLDER_ITEM }o--|| STREAM
+TOPIC }o--|| STREAM
+
+note bottom of V_MESSAGE
+  It 's public . uuid — MESSAGE_PLACEMENT.uuid.
+  get_id_property = Hidden binding_uuid
+  It 's just a unique technical identity ORM-- What ?.
+  Adapter is on URL-The resource/controller is used placement uuid.
+  Marker tuple: MESSAGE.created_at + placement.uuid.
+  The public created_at/updated_at They come from MESSAGE.
+  There are no units ., GROUP BY, The windows ./lateral-The expression,
+  correlated sub-searches or fan-out one-to-many.
+end note
+
+note top of MESSAGE_PLACEMENT
+  uuid = UUIDv5(namespace = TOPIC.uuid,
+                name = MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  Name without project/stream/braces/prefix.
+  TOPIC binding, globally unique and unchanging
+  It belongs to one person. STREAM/PROJECT.
+  Business key and composite FK They remain reputable..
+end note
+
+note bottom of STREAM_BINDING
+  Persistent membership row: revoke => active=false
+  and monotonic membership_generation++ - What ? API transaction.
+  Message/reaction read Always demands active and equality.
+  snapshot generation; stale task It does. no-op.
+end note
+
+note bottom of V_STREAM
+  It 's public . owner and others UUID-- What ? —
+  Scalar UUID properties, Not really . URI relationships.
+  Physical *_uuid columns remain indexed FK
+  with obvious reference integrity actions.
+  owner_uuid It 's coming out as public . owner.
+end note
+
+OUTBOX_EVENT --> PROJECTION_TASK : Right . 1 immutable task I 'm on event
+PROJECTION_TASK --> SCOPE_LEASE : claim exact scope key
+SCOPE_LEASE --> WORKER : lease + fencing token
+WORKER --> USER_MESSAGE_BINDING : fanout A tie for placement
+WORKER --> USER_MESSAGE_STATE : Ready state each recipient
+REACTION_FACT --> WORKER : The facts reaction_snapshot
+WORKER --> MESSAGE : I 'm going to make it real . reactions + reaction_users
+WORKER --> STREAM_BINDING : We 're going to have a ready-made meter .
+WORKER --> TOPIC_BINDING : We 're going to have a ready-made meter .
+WORKER --> FOLDER_ITEM : folder_projection: normalized source of truth
+WORKER --> FOLDER_BINDING : folder_projection: snapshot + counts + version/time
+WORKER --> PUBLIC_EVENT : It 's the same . DB transaction, What ? state
+PUBLIC_EVENT --> WS_DISPATCHER : Ready records
+
+note bottom of WORKER
+  Topic scope — I 'm just placements/bindings;
+  Inside the house. topic The newest one first. MESSAGE.created_at.
+  Message scope — canonical snapshots.
+  user-stream/user-topic/user-folder — shared aggregates.
+  One at a time. fenced owner exact key; - A lot of different ones . scopes parallel to each other.
+  Topic worker It doesn't. unsafe read-modify-write shared rows.
+  Atomic delta It requires exactly-once guard The outbox_event_uuid;
+  Otherwise scope worker recomputes/writes.
+  Raw facts  source of truth.
+  The images are rearranged and eventually reconciled.
+  API He never does. read-modify-write The picture . JSON.
+  The system folder elements are materialized from the active
+  user/stream bindings and STREAM I 'm with is_archived = false.
+  All chats: All of them .; Personal: private = true; Channels: private = false.
+end note
+
+note bottom of PROJECTION_TASK
+  fanout; content_mentions; reaction_snapshot;
+  read_counters; delivery_snapshot_event;
+  topic_membership_policy_rebuild; topic_state_projection;
+  folder_projection.
+  Initial design without coalescing.
+  Unique outbox_event_uuid; duplicate derivation = no-op.
+  Lease/fencing; retry/backoff; max attempts/DLQ;
+  reaper/reconciliation; idempotent handlers.
+  One . task I 'm on event, coalescing There is no.
+end note
+
+note right of FOLDER_BINDING
+  Public folder_items <- ready JSONB folder_items_snapshot; empty = [].
+  FOLDER_ITEM is normalized source of truth.
+  Stable serializer includes exact public item fields and ready stream counts.
+  API reads one indexed row/page: no N+1/json_agg/COUNT/custom SQL.
+  One user-folder worker transaction commits snapshot + counts
+  + version/updated_at + all ready event rows; dispatcher only after commit.
+end note
+
+note bottom of C_MESSAGE
+  Sending in sync:
+  MESSAGE + MESSAGE_PLACEMENT + The author 's
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + OUTBOX.
+  Pairs binding/state The receivers are created asynchronously.
+  GET/list They never create problems..
+  Currently custom SQL-The storage is not saved.
+end note
+
+note bottom of C_STREAM
+  If direct_user_uuid It 's set, private = true.
+  direct_user_uuid = current owner => self-chat:
+  One of a kind. binding Owner and one visible participant.
+  Sending to self-chat It only creates binding/state The author;
+  fanout The receiver creates 0 The additional lines.
+end note
+
+note bottom of WS_DISPATCHER
+  Worker The projection doesn 't have a network connection ..
+  The controller sends, repeats and plays ready events.
+end note
+
+note bottom of PHYSICAL
+  Names selected for proposal; There 's no migration in this phase ..
+  Container aggregates live in the unique user bindings.
+  There is no separate table by default state.
+  Message bindings Never keep container counters..
+end note
+
+note bottom of RA
+  Target list pagination: omitted/0 = 100; 1..500 It 's taken exactly .;
+  negative/non-integer/>500 = HTTP 400; unlimited mode There is no.
+  He 's missing ./0 It gives you unlimited reading, and too much value is not restricted.:
+  This is a confirmed gap in current implementation, not proposal.
+end note
+
+@enduml

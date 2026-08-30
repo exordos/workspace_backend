@@ -1,0 +1,39 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/
+actor "客户端" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\n规则行 + 绑定" as DB
+queue "Transactional outbox\n+ 类型化任务的输出" as Outbox
+participant "背景表演者\nexact scope leases + fencing" as Worker
+database "已准备的投影\n连接容器" as Projection
+database "公众活动存储器" as Events
+participant "控制器 WebSocket" as Dispatcher
+actor "客户端 WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/
+API -> DB: 一个交易: MESSAGE + 必须 TOPIC placement(UUIDv5)\n+ 创作权 USER_MESSAGE_BINDING + USER_MESSAGE_STATE
+API -> DB: immutable outbox event 每一个 typed task
+DB --> API: 交易的固定
+API --> Client: 成功的公开回复
+DB ->> Outbox: 记录的事件
+Outbox ->> Worker: fanout / content_mentions / read_counters /\nfolder_projection / delivery_snapshot_event\n每一个 task 有自己的 outbox_event_uuid
+Worker -> Worker: topic newest-first; recipient batches user_uuid ASC\ndefault 1000, max 5000; bounded fairness
+alt 流向与自己
+    Worker -> Projection: 没有额外的 USER_MESSAGE_BINDING\n或 USER_MESSAGE_STATE; 更新所有者投影
+else 常规/直接的位置
+    Worker -> DB: keyset batch; active membership + expected generation
+    group 一个 batch DB transaction
+      Worker -> Projection: bulk binding + state + downstream work
+      Worker -> Events: durable ready rows + checkpoint / next batch
+    end
+end
+Events ->> Dispatcher: 已固定的准备行
+Dispatcher ->> WS: 发送 / 重复 / 复制
+note over API,Projection
+  Public uuid = MESSAGE_PLACEMENT.uuid =
+  UUIDv5(namespace=TOPIC.uuid, name=MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  MESSAGE.uuid 其他 binding_uuid 隐藏的.
+  Lease/fencing, retry/backoff, DLQ/reaper 必须.
+end note
+@enduml

@@ -1,0 +1,17 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/push_devices/{registration_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Gerät push-die in PostgreSQL" as DB
+queue "Internes Domänenname outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: DELETE UUID - die Registrierung
+API -> DB: BEGIN; Löschen Sie in dem angegebenen Bereich, wenn es einen gibt
+API -> OUT: Nur wenn es eine Änderung gab, kann man eine interne Löschung hinzufügen.
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; ohne zu beenden public event row
+API --> Client: 204 Leere Antwort
+@enduml

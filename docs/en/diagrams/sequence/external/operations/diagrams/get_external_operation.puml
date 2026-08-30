@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title GET /api/workspace/v1/messenger/external_operations/{operation_uuid}
+actor "The client ." as C
+participant "REST / RestAlchemy\nThe controller ." as API
+database "PostgreSQL\ncanonical lines/read lines" as DB
+
+C -> API: The request GET + bearer-The token IAM
+activate API
+API -> DB: indexed reading in the given area
+DB --> API: Sanitized canonical/materialized lines
+note right of API
+  No recording ., outbox, The tasks, fan-out,
+  Calling the provider, COUNT/GROUP BY
+  or corrections in the request path.
+end note
+API --> C: A public response 200
+deactivate API
+
+note over API,DB
+  Public links UUID are scalar UUID-The properties.
+  Physical columns *_uuid remain indexed FK.
+end note
+@enduml

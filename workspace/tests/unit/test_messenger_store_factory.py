@@ -77,6 +77,26 @@ def test_all_message_snapshot_writers_register_reaction_options():
         assert result.returncode == 0, result.stderr
 
 
+def test_messenger_worker_registers_file_storage_options():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from oslo_config import cfg; "
+                "import workspace.cmd.messenger_worker; "
+                "assert cfg.CONF['messenger_files'].default_type == 'file'; "
+                "assert cfg.CONF['messenger_files_s3'].endpoint_url is None"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_projection_move_is_delegated_to_configured_storage_factory():
     calls = []
 

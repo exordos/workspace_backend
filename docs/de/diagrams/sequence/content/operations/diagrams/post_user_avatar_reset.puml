@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Einstellungen für den Dateispeicher" as STORE
+database "Benutzer Workspace in PostgreSQL" as DB
+queue "Transaktions- outbox" as OUT
+queue "delivery_snapshot_event\nexact user scope" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Kunden Workspace" as WS
+Client -> API: POST {}
+API -> DB: BEGIN; Überprüfen/Sperren eines eigenen Benutzers
+API -> DB: Kanonische URN Gravatar oder eine Reserve
+API -> OUT: Avatar-Rückwirkung hinzufügen
+API -> DB: COMMIT
+API --> Client: 200 JSON Benutzer
+API -> STORE: den benutzerdefinierten Avatar löschen
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: Lesen Sie den letzten Benutzer aus
+WORKER -> EVENT: bereit sein user.updated
+DISP -> EVENT: Senden/Wiederholen/Wiederholen
+DISP -> WS: user.updated
+@enduml

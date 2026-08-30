@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title GET /api/workspace/v1/messenger/external_accounts/{account_uuid}
+actor "Der Client" as C
+participant "REST / RestAlchemy\n- Das ist ein Controller ." as API
+database "PostgreSQL\nKanonische Zeilen/Lesezeilen" as DB
+
+C -> API: Anfrage GET + bearer-- Das ist ein Token . IAM
+activate API
+API -> DB: Indizierte Lektüre in einem bestimmten Bereich
+DB --> API: Sanitierte kanonische/materialisierte Zeilen
+note right of API
+  Keine Aufzeichnungen, outbox, Aufgaben, fan-out,
+  Anruf des Providers, COUNT/GROUP BY
+  oder Korrekturen im Anfrageweg.
+end note
+API --> C: öffentliche Antwort 200
+deactivate API
+
+note over API,DB
+  Öffentliche Verweise UUID sind skalar UUID-Eigenschaften.
+  Physische Spalten *_uuid bleiben indexiert FK.
+end note
+@enduml

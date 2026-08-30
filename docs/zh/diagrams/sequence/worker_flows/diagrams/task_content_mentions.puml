@@ -1,0 +1,47 @@
+@startuml task_content_mentions
+!pragma layout smetana
+title 标式化投影任务: content_mentions
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "没有变化 outbox" as OUTBOX
+participant "任务投影器" as PROJECTOR
+database "题目捕捉" as CLAIM
+participant "工人机" as WORKER
+database "MESSAGE.payload" as MESSAGE
+database "PLACEMENT + 用户链接" as ACCESS
+database "USER_MESSAGE_STATE" as STATE
+database "类型任务" as TASKS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket" as DISPATCHER
+actor "客户端" as Client
+
+OUTBOX -> PROJECTOR : 创建/更改消息的事件
+PROJECTOR -> TASKS : immutable content_mentions(outbox_event_uuid, scope=topic)\nunique derivation; 没有 coalescing
+TASKS -> WORKER : 显然有待工作
+WORKER -> CLAIM : 专有占据主题
+WORKER -> MESSAGE : 阅读最后一个正规加载
+WORKER -> ACCESS : 阅读已记录的位置/接收者
+group 一个 DB transaction
+  loop 影响用户/消息
+    WORKER -> STATE : 进度插入或更新提及状态
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : 释放
+EVENTS -> DISPATCHER : 稳定的记录
+DISPATCHER -> Client : 发送 / 重复 / 播放
+
+note over MESSAGE,STATE
+  实用负载只能在 MESSAGE.
+  状态只保存个人标志,
+  但不是流/主题/文件集群.
+  USER_MESSAGE_STATE key = (project,user,placement).
+  Shared rows 只有所有者才能更改 exact scope key.
+  Lease/fencing + retry/backoff + DLQ/reaper 必须.
+end note
+
+@enduml

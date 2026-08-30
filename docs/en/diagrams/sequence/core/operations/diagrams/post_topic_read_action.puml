@@ -1,0 +1,29 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/stream_topics/[topic_uuid]/actions/read/invoke
+actor "The client ." as Client
+participant "WorkspaceStreamTopicController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Scope workers\nlease + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/read/invoke
+API -> DB: Readings are in order . + immutable outbox event\nFor each exact-scope task
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: read_counters / folder_projection\neach exact-scope task It has its own outbox_event_uuid
+Worker -> Worker: One fenced owner exact scope; - A lot of different ones . scopes parallel to each other
+Worker -> Projection: The topic/stream/folder binding counters
+Worker -> Events: topic.read + container events\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over Worker,Projection
+  Topic worker shared counters He doesn 't write ..
+  Atomic delta It requires exactly-once guard; Otherwise recompute/write.
+  Retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+@enduml

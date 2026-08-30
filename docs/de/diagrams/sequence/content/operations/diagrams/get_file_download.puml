@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/files/{file_uuid}/actions/download
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Metadaten der Datei + ACL in PostgreSQL" as DB
+database "Einstellungen für den Dateispeicher" as STORE
+Client -> API: GET - Das ist ein Schlagzeug.
+API -> DB: Indizierte Metadaten + Überprüfung ACL
+DB --> API: locator - Die Speicher + hash
+API -> STORE: Nicht veränderbare Bytes lesen
+STORE --> API: Baiten
+note right of API: Ohne outbox / Aufgaben / Ereignisse
+API --> Client: 200 Baiten + ETag
+@enduml

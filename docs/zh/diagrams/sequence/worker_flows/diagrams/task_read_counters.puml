@@ -1,0 +1,64 @@
+@startuml task_read_counters
+!pragma layout smetana
+title 类型任务: read_counters / folder_projection
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "记录的事件 outbox\nfanout/read/hide/move/delete" as OUTBOX
+participant "任务投影器" as PROJECTOR
+database "Immutable tasks\n1 在 outbox event/scope" as TASKS
+database "租 exact scope key\nlease + fencing" as CLAIM
+participant "工人机" as WORKER
+database "信息的真相 + read_at\n访问 + 政策" as SOURCE
+database "活动 USER_STREAM_BINDING\n+ STREAM.is_archived/private" as STREAM_SOURCE
+database "FOLDER + normalized FOLDER_ITEM\nsource of truth" as FOLDERS
+database "USER_STREAM_BINDING" as STREAM_BINDING
+database "USER_TOPIC_BINDING" as TOPIC_BINDING
+database "USER_FOLDER_BINDING" as FOLDER_BINDING
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket" as DISPATCHER
+actor "客户端" as Client
+
+OUTBOX -> PROJECTOR : 已记录的影响事件
+PROJECTOR -> TASKS : immutable folder_projection 文件\nuser-folder scope; unique derivation; 没有 coalescing
+TASKS -> WORKER : 明显受影响的区域
+WORKER -> CLAIM : 独占的 user-stream / user-topic / user-folder
+WORKER -> SOURCE : 读取最后的初始状态
+WORKER -> STREAM_SOURCE : 阅读一个主动的绑定 + 规范 STREAM
+WORKER -> STREAM_BINDING : 电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池电池
+WORKER -> TOPIC_BINDING : 我们的主题是有能力的
+group 一个 worker DB transaction
+  WORKER -> FOLDERS : 我们可以添加/删除 automatic FOLDER_ITEM
+  WORKER -> FOLDER_BINDING : deterministic folder_items_snapshot + counts\nversion/snapshot_updated_at; empty=[]
+  WORKER -> EVENTS : ready stream.updated / topic.updated / folder.updated\n其他 folder_item.deleted, 宣布时 contract operation\nunique derivation/effect key
+end
+WORKER -> CLAIM : 释放
+EVENTS -> DISPATCHER : 只有在 commit: 稳定的记录
+DISPATCHER -> Client : 发送 / 重复 / 播放
+
+note over SOURCE,FOLDER_BINDING
+  容器组件不存储在绑定/消息状态.
+  USER_FOLDER_BINDING 保存访问权限,个人状态
+  及已成型的机组 + read-only folder_items_snapshot.
+  Public folder_items 显示的确 snapshot; empty=[].
+  API 阅读一个 indexed row/page, 没有 N+1/json_agg/COUNT/custom SQL.
+  修改/重组仅在背景下执行.
+  Topic-worker 没有写这些 shared rows.
+  Atomic delta 要求 exactly-once effect guard 根据 outbox_event_uuid;
+  否则 scope worker recomputes/writes.
+  Lifecycle: lease expiry/fencing, retry/backoff, DLQ/reaper.
+end note
+
+note over STREAM_SOURCE,FOLDERS
+  预言: 活跃的 USER_STREAM_BINDING + STREAM.is_archived=false.
+  All chats = 所有这些行.
+  Personal = 只有 STREAM.private=true.
+  Channels = 只有 STREAM.private=false.
+  客户端请求无法计算这个组合.
+  Stable order: pinned_at DESC first; then
+  order_index ASC NULLS LAST, created_at ASC, uuid ASC.
+  No silent truncation; exact count/byte hard limits remain required.
+end note
+
+@enduml

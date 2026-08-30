@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+title POST disconnect: stop sync, preserve frozen access/history
+
+autonumber
+actor "Клиент" as Client
+participant "REST / RestAlchemy controller" as API
+database "Account / credential / lease / mappings / outbox" as DB
+participant "Bridge instance" as Bridge
+database "Ready public events" as Events
+participant "WebSocket dispatcher" as WS
+
+Client -> API : POST disconnect
+API -> DB : lock account; status=disconnected
+API -> DB : revoke/increment lease generation + outbox
+API --> Client : 200 sanitized disconnected snapshot
+DB --> Bridge : stale generation; stop sync/provider calls
+DB -> Events : external_account.updated with projection transaction
+WS -> Events : replay/live
+WS -> Client : current-contract event
+
+note over API,DB
+  Credential/account, mappings, user bindings and visible history remain.
+  History is frozen/readable; new provider events stop.
+  Disconnect is not Delete.
+end note
+@enduml

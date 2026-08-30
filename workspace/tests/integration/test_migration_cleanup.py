@@ -19,6 +19,42 @@ from workspace.messenger_api.dm import helpers as messenger_dm_helpers
 from workspace.messenger_api.dm import read_state
 from workspace.tests.integration import conftest
 
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_latest_migration_after_module(_database):
+    """Return the shared integration database to the single current head."""
+    try:
+        yield
+    finally:
+        engine = ra_migrations.MigrationEngine(
+            migrations_path=str(conftest.MIGRATIONS_DIR)
+        )
+        # Some historical tests call migration-step downgrade methods directly,
+        # so their dependency rows can be false while the v2 head row remains
+        # true. Rewind the head first; applying it again then walks and restores
+        # the complete dependency graph before rebuilding the canonical model.
+        engine.rollback_migration("0153-page-external-bridge-snapshots-75ad6f.py")
+        engine.rollback_migration("0152-add-messenger-v2-canonical-model-b59d87.py")
+        with ra_contexts.Context().session_manager() as session:
+            session.execute(
+                """
+                TRUNCATE TABLE
+                    m_workspace_read_state_projects_v1,
+                    m_workspace_read_state_compaction_v1,
+                    m_workspace_user_read_chunks_v1,
+                    m_workspace_message_mentions_v1,
+                    m_workspace_user_topic_read_stats_v1,
+                    m_workspace_topic_message_stats_v1,
+                    m_external_provider_operations_v1,
+                    m_external_operations_v2
+                RESTART IDENTITY CASCADE
+                """
+            )
+        for migration_file in sorted(engine._load_migrations()):
+            if migration_file >= "0135-":
+                engine.apply_migration(migration_file)
+
+
 LEGACY_MIGRATION_UUIDS = (
     "e8e1b2c3-3739-4238-97cf-fa7613109917",
     "4b6e8031-28dd-4cb5-9bf6-37d75bb2da45",
@@ -153,6 +189,12 @@ COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID = "7433535e-646d-4557-8f7e-5688aae4
 COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_FILE = (
     "0151-index-detached-compact-read-memberships-743353.py"
 )
+MESSENGER_V2_MIGRATION_UUID = "b59d875a-561f-4166-8198-331c23bc89fb"
+MESSENGER_V2_MIGRATION_FILE = "0152-add-messenger-v2-canonical-model-b59d87.py"
+EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_UUID = "75ad6f73-4ed6-43b5-9cb2-f853a82957da"
+EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_FILE = (
+    "0153-page-external-bridge-snapshots-75ad6f.py"
+)
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -219,7 +261,9 @@ def _restore_current_provider_read_lease_fence(engine):
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_FILE
+    assert (
+        engine.get_latest_migration() == EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_FILE
+    )
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -264,6 +308,8 @@ def test_current_migrations_have_a_single_head(_database, db):
                     UNREAD_BRANCH_MIGRATION_UUID,
                     COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID,
                     COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID,
+                    MESSENGER_V2_MIGRATION_UUID,
+                    EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_UUID,
                 ],
             ),
         )
@@ -307,6 +353,8 @@ def test_current_migrations_have_a_single_head(_database, db):
             (UNREAD_BRANCH_MIGRATION_UUID, True),
             (COMPACT_READ_MEMBERSHIP_INDEX_MIGRATION_UUID, True),
             (COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID, True),
+            (MESSENGER_V2_MIGRATION_UUID, True),
+            (EXTERNAL_BRIDGE_SNAPSHOT_PAGING_MIGRATION_UUID, True),
         }
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
@@ -540,13 +588,14 @@ def test_legacy_gap_fence_is_active_before_online_index_build(_database):
     project_uuid = sys_uuid.uuid4()
     with ra_contexts.Context().session_manager() as session:
         try:
-            session.execute(
-                "DROP INDEX m_workspace_read_memberships_stream_user_idx"
+            session.execute("DROP INDEX m_workspace_read_memberships_stream_user_idx")
+            assert (
+                session.execute(
+                    "SELECT to_regclass(%s) AS relation",
+                    ("m_workspace_read_memberships_stream_user_idx",),
+                ).fetchone()["relation"]
+                is None
             )
-            assert session.execute(
-                "SELECT to_regclass(%s) AS relation",
-                ("m_workspace_read_memberships_stream_user_idx",),
-            ).fetchone()["relation"] is None
             session.execute(
                 """
                 INSERT INTO m_workspace_read_state_projects_v1 (
@@ -604,10 +653,13 @@ def test_online_index_downgrade_defers_drop_to_gap_fence(_database):
     ]
     with ra_contexts.Context().session_manager() as session:
         index_migration.downgrade(session)
-        assert session.execute(
-            "SELECT to_regclass(%s) AS relation",
-            ("m_workspace_read_memberships_stream_user_idx",),
-        ).fetchone()["relation"] == "m_workspace_read_memberships_stream_user_idx"
+        assert (
+            session.execute(
+                "SELECT to_regclass(%s) AS relation",
+                ("m_workspace_read_memberships_stream_user_idx",),
+            ).fetchone()["relation"]
+            == "m_workspace_read_memberships_stream_user_idx"
+        )
 
 
 def test_compact_legacy_gap_migration_leaves_completed_projects_unchanged(_database):
@@ -4136,7 +4188,12 @@ def test_compact_read_state_populated_downgrade_restores_legacy_flags(
             ("m_workspace_read_flags_project_message_idx", True),
             ("m_workspace_flags_project_message_user_idx", True),
         }
-    engine.apply_migration(engine.get_latest_migration())
+    # Rebuild every dependency removed by the historical rollback before the
+    # current head. Applying only HEAD is unsafe because RestAlchemy does not
+    # recursively reapply migrations whose bookkeeping row is now false.
+    for migration_file in sorted(engine._load_migrations()):
+        if migration_file >= LAZY_PROVIDER_READ_MIGRATION_FILE:
+            engine.apply_migration(migration_file)
 
 
 def test_multi_account_stream_access_migration_deduplicates_visibility_rows(

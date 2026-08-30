@@ -1,0 +1,17 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/push_devices/{registration_uuid}
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "设备 push-关于通知 PostgreSQL" as DB
+queue "内部域名 outbox" as OUT
+queue "delivery_snapshot_event\ninternal/no public derivative" as TASK
+Client -> API: DELETE UUID 登记情况
+API -> DB: BEGIN; 如果存在的话,请在指定区域中删除
+API -> OUT: 只要有变化,才可以添加内删除
+API -> DB: COMMIT
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+note right of TASK: effect guard; 没有完成 public event row
+API --> Client: 204 没有答案
+@enduml

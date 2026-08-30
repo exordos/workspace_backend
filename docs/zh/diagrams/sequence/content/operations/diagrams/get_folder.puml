@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folders/{folder_uuid}
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: 查询
+API -> DB: 已被索引 SELECT
+note right of DB
+  FOLDER 保存一次; USER_FOLDER_BINDING 保存访问,
+  计数器和 read-only JSONB folder_items_snapshot; empty=[]
+  FOLDER_ITEM = normalized source of truth; snapshot 建造 folder_projection
+  自动 FOLDER_ITEM — 恢复的预影
+  来源: 活跃的 USER_STREAM_BINDING + 规范性 STREAM.is_archived = false
+  All chats = 所有的; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+DB --> API: 一个 indexed row 没有 ready snapshot/counts
+note right of API: 没有 N+1 / json_agg / COUNT / custom SQL
+note right of API: 没有 outbox / 任务 / 事件
+API --> Client: 200 JSON
+@enduml

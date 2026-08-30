@@ -1,0 +1,35 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+title POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/revoke/invoke
+actor "Клиент" as C
+participant "REST / RestAlchemy\nконтроллер" as API
+database "PostgreSQL\nканонические строки/строки чтения" as DB
+queue "Immutable outbox event\n+ delivery_snapshot_event 1:1" as O
+participant "Воркер / управляющий\nобработчик провайдера" as W
+
+C -> API: запрос POST + bearer-токен IAM
+activate API
+API -> DB: заблокировать/проверить каноническую область
+API -> DB: зафиксировать изменение состояния
+API -> O: event -> delivery_snapshot_event(outbox_event_uuid)
+DB --> API: зафиксированное состояние
+O --> API: зафиксированная запись
+API --> C: санитизированный снимок 200
+deactivate API
+W -> O: claim exact scope; lease/fencing/retry/DLQ
+W -> DB: идемпотентно обновить проекцию или управление
+DB --> W: зафиксированное материализованное состояние
+note right of W
+  Если работа затрагивает размещение Messenger:
+  один слот монопольно владеет (project_id, topic_uuid)
+  и обрабатывает MESSAGE.created_at DESC.
+  Управляющая работа провайдера сохраняет собственный устойчивый порядок.
+end note
+
+note over API,DB
+  Публичные ссылки UUID являются скалярными UUID-свойствами.
+  Физические столбцы *_uuid остаются индексированными FK.
+end note
+@enduml

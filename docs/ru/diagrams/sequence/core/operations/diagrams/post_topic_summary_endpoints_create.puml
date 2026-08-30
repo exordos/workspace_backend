@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/topic_summary_endpoints/
+actor "Клиент" as Client
+participant "TopicSummaryEndpointController\nRestAlchemy" as API
+database "Строки плоскости управления сводками\n+ зашифрованные учётные данные" as DB
+queue "Transactional outbox\n1 immutable task на event" as Outbox
+participant "Фоновый исполнитель\nплоскости управления сводками" as Worker
+Client -> API: POST /api/workspace/v1/messenger/topic_summary_endpoints/
+API -> DB: начало транзакции; разрешение + изменение
+API -> DB: добавить неизменяемую внутреннюю запись в transactional outbox
+DB --> API: фиксация очищенного состояния
+API --> Client: успешный публичный ответ
+DB ->> Outbox: зафиксированная запись
+Outbox ->> Worker: immutable delivery_snapshot_event\n(outbox_event_uuid, registry scope)
+Worker -> DB: применить актуальное состояние планирования/аренды
+note over Worker
+Нет строки публичного события
+Нет диспетчера WebSocket
+Задания темы остаются эксклюзивными и идут от новых сообщений к старым
+end note
+@enduml

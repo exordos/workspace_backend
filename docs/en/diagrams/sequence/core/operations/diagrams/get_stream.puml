@@ -1,0 +1,15 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/streams/[stream_uuid]
+actor "The client ." as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "Indexed public presentation\n+ physical lines of external keys" as DB
+Client -> API: GET /api/workspace/v1/messenger/streams/{stream_uuid}
+API -> DB: Project area and current user\nScalar filters UUID
+DB --> API: lines without calculations
+API --> Client: 200, public JSON
+note over API,DB
+No recording . / transactional outbox / The background artist / the events
+No aggregating or restoring during query
+end note
+@enduml

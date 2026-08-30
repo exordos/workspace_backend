@@ -1,0 +1,52 @@
+@startuml task_topic_membership_policy_rebuild
+!pragma layout smetana
+title Типизированная задача проекции: topic_membership_policy_rebuild
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Outbox членства/политики" as OUTBOX
+participant "Проектор задач" as PROJECTOR
+database "Типизированные задачи" as TASKS
+database "Захват темы" as CLAIM
+participant "Слот воркера" as WORKER
+database "Последнее членство/политика" as POLICY
+database "MESSAGE_PLACEMENT" as PLACEMENTS
+database "USER_TOPIC_BINDING\nUSER_MESSAGE_BINDING" as BINDINGS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "Хранилище публичных событий" as EVENTS
+participant "Диспетчер WebSocket" as DISPATCHER
+actor "Клиент" as Client
+
+OUTBOX -> PROJECTOR : зафиксированное событие членства/политики
+PROJECTOR -> TASKS : immutable topic_membership_policy_rebuild\n(outbox_event_uuid, scope=topic)\nunique derivation; без coalescing
+TASKS -> WORKER : явная область темы
+WORKER -> CLAIM : монопольно (проект, тема)
+WORKER -> POLICY : active membership + expected generation
+WORKER -> PLACEMENTS : прочитать явные размещения
+note right of PLACEMENTS
+  Массовый порядок по MESSAGE.created_at DESC:
+  14:20 -> 14:19 -> 14:15
+end note
+group одна DB transaction
+  loop затронутые пользователи/размещения
+    WORKER -> BINDINGS : conditional upsert при generation equality;\nstale task = no-op
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events exact scopes:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : безопасно освободить
+EVENTS -> DISPATCHER : устойчивые записи
+DISPATCHER -> Client : отправить / повторить / воспроизвести
+
+note over TASKS,BINDINGS
+  Тот же exact topic-scope protocol обслуживает отдельный
+  TASK_KIND topic_state_projection для ready topic.updated;
+  authoritative TOPIC.is_done меняется только синхронной командой.
+  Revoke active=false + generation++ синхронен;
+  stale rows не дают доступ и cleanup не security boundary.
+  Topic worker shared rows не пишет.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper обязательны.
+end note
+
+@enduml

@@ -310,6 +310,11 @@ def test_external_chat_select_materialized_reuses_the_caller_session(
     )
     monkeypatch.setattr(application_services.models, "WorkspaceStream", Stream)
     monkeypatch.setattr(
+        application_services.ExternalChatApplicationService,
+        "require_project_scope",
+        staticmethod(lambda *_args: None),
+    )
+    monkeypatch.setattr(
         application_services,
         "require_external_provider_enabled",
         lambda current_session, *args: (
@@ -373,3 +378,76 @@ def test_external_chat_select_materialized_reuses_the_caller_session(
     assert ("property.project_id", project_uuid) in calls
     assert ("property.history_depth", expected_history_depth) in calls
     assert ("property.revision", 5) in calls
+
+
+def test_external_chat_project_scope_conflict_is_explicit():
+    provider_realm_uuid = sys_uuid.uuid4()
+    account = types.SimpleNamespace(uuid=sys_uuid.uuid4(), provider="zulip")
+    chat = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        provider="zulip",
+        provider_chat_id="channel:42",
+    )
+    project_uuid = sys_uuid.uuid4()
+    calls = []
+
+    class Result:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return self.row
+
+    class Session:
+        def execute(self, statement, params):
+            calls.append((statement, params))
+            if len(calls) == 1:
+                return Result(
+                    {
+                        "provider_realm_uuid": provider_realm_uuid,
+                        "provider_server_url": "HTTPS://ZULIP.EXAMPLE.INVALID:443/",
+                    }
+                )
+            if "pg_advisory_xact_lock" in statement:
+                return Result()
+            return Result(
+                [
+                    {
+                        "uuid": sys_uuid.uuid4(),
+                        "provider_realm_uuid": provider_realm_uuid,
+                        "provider_server_url": "https://alias.example.invalid",
+                    }
+                ]
+            )
+
+    with pytest.raises(exceptions.ExternalProviderScopeConflictError) as error:
+        application_services.ExternalChatApplicationService.require_project_scope(
+            Session(),
+            account,
+            chat,
+            project_uuid,
+        )
+
+    assert error.value.as_dict()["error"] == "provider_scope_conflict"
+    assert "provider_realm_uuid" in calls[0][0]
+    assert "pg_advisory_xact_lock" in calls[1][0]
+    assert "conflicting.project_id IS DISTINCT FROM" in calls[-1][0]
+
+
+@pytest.mark.parametrize(
+    ("server_url", "origin"),
+    [
+        ("HTTPS://ZULIP.Example.Invalid:443/", "https://zulip.example.invalid"),
+        ("http://zulip.example.invalid:80/path", "http://zulip.example.invalid"),
+        ("https://zulip.example.invalid:8443", "https://zulip.example.invalid:8443"),
+        ("https://[2001:db8::1]:443/", "https://[2001:db8::1]"),
+    ],
+)
+def test_provider_origin_normalization(server_url, origin):
+    assert (
+        application_services.identity_linking.normalize_provider_origin(server_url)
+        == origin
+    )

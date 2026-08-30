@@ -406,6 +406,7 @@ def add_external_bridge_public_contract(
         properties["capabilities"] = copy.deepcopy(EXTERNAL_CAPABILITIES_SCHEMA)
         properties.pop("owner_user_uuid", None)
         properties.pop("provider", None)
+        properties.pop("projection_reset_generation", None)
 
     create_settings = copy.deepcopy(EXTERNAL_ACCOUNT_SETTINGS_PROPERTIES)
     create_settings["api_key"] = {

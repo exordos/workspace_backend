@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/messenger/files/{file_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Einstellungen für den Dateispeicher" as STORE
+database "Metadaten der Datei + ACL in PostgreSQL" as DB
+queue "Transaktions- outbox" as OUT
+queue "delivery_snapshot_event\nexact file scope" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: DELETE -Datei
+API -> DB: BEGIN; Blockieren + Löschen von Eigentümer-Metadaten
+API -> OUT: Hinzufügen file.deleted
+API -> DB: COMMIT
+API --> Client: 204 Leere Antwort
+API -> STORE: Bytes ohne Verweise + zugehörige Metadaten löschen
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: Ich will die Arbeit ergreifen.
+WORKER -> EVENT: bereit sein file.deleted
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: file.deleted
+@enduml

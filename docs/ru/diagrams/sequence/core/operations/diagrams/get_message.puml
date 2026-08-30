@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/messages/[message_uuid]
+actor "Клиент" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "Индексированное публичное представление\n+ физические строки внешних ключей" as DB
+Client -> API: GET /api/workspace/v1/messenger/messages/{message_uuid}
+API -> DB: {message_uuid}=MESSAGE_PLACEMENT.uuid;\njoin active stream membership + generation
+DB --> API: строки без вычислений
+API --> Client: 200, публичный JSON
+note over API,DB
+Нет записей / transactional outbox / задач / фонового исполнителя / событий
+Нет агрегирования или восстановления во время запроса
+Canonical MESSAGE.uuid и binding_uuid скрыты.
+end note
+@enduml

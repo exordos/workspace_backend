@@ -1,0 +1,26 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/files/
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "Einstellungen für den Dateispeicher" as STORE
+database "Metadaten der Datei + ACL in PostgreSQL" as DB
+queue "Transaktions- outbox" as OUT
+queue "delivery_snapshot_event\nexact file scope" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: POST JSON oder multipart
+API -> STORE: Bytes + zugehörige Metadaten speichern (multipart)
+API -> DB: BEGIN; Metadaten einfügen + ACL
+API -> OUT: Hinzufügen file.created
+API -> DB: COMMIT
+API --> Client: 201 JSON Metadaten
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: Ich will die Arbeit ergreifen.
+WORKER -> EVENT: bereit sein file.created
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: file.created
+@enduml

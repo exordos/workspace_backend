@@ -1,0 +1,28 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/[message_uuid]/actions/unstar/invoke
+actor "Der Client" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Worker scope=user-message\nlease + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/{message_uuid}/actions/unstar/invoke
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: placement STATE.starred=false + immutable outbox event
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: immutable read_counters(outbox_event_uuid,\nproject+user+placement); Ohne coalescing
+Worker -> Worker: Einer fenced owner exact user-message scope
+Worker -> Projection: Nachricht des aktuellen Benutzers vorlegen
+Worker -> Events: message.updated - der aktuelle Benutzer\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Topic lock nicht verwendet. Retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+@enduml

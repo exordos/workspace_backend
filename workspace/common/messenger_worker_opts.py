@@ -64,6 +64,25 @@ messenger_worker_opts = [
         max=100,
         help="Maximum separately committed read-state batches per worker pass",
     ),
+    cfg.BoolOpt(
+        "v2-projection-enabled",
+        default=True,
+        help="Process native Messenger v2 outbox tasks",
+    ),
+    cfg.IntOpt(
+        "v2-projection-max-tasks-per-iteration",
+        default=100,
+        min=1,
+        max=1000,
+        help="Maximum separately committed Messenger v2 tasks per worker pass",
+    ),
+    cfg.IntOpt(
+        "v2-fanout-batch-size",
+        default=1000,
+        min=1,
+        max=5000,
+        help="Maximum stream recipients projected by one fanout task attempt",
+    ),
 ]
 
 

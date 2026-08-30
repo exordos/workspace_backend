@@ -1,0 +1,404 @@
+@startuml messenger_api_domain_model
+!pragma layout smetana
+
+title Проектная доменная модель Messenger API
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam package {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam entity {
+    BackgroundColor #FFFFFF
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam class {
+    BackgroundColor #EFF6FF
+    BorderColor #2563EB
+    FontColor #1E3A8A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+package "1. Публичный RestAlchemy API\n(действующий контракт неизменен)" as API {
+    class "WorkspaceUserMessage\nResourceByRAModel\nконтроллер с пагинацией" as API_MESSAGE
+    class "WorkspaceMessageReaction\nResourceByRAModel\nконтроллер с пагинацией" as API_REACTION
+    class "WorkspaceUserStream\nResourceByRAModel\nконтроллер с пагинацией" as API_STREAM
+    class "WorkspaceUserTopic\nResourceByRAModel\nконтроллер с пагинацией" as API_TOPIC
+    class "WorkspaceUserFolder\nResourceByRAModel\nконтроллер с пагинацией" as API_FOLDER
+    class "WorkspaceUser\nResourceByRAModel" as API_USER
+}
+
+package "2. Простые SQL-адаптеры формы только для чтения" as VIEWS {
+    entity "messenger_api_user_messages_v1" as VIEW_MESSAGE {
+        placement.uuid AS uuid <<публичный UUIDv5>>
+        user_binding.uuid AS binding_uuid <<скрытый ключ ORM>>
+        message.uuid AS canonical_message_uuid <<скрытый>>
+        --
+        доступ привязки / контекст размещения
+        флаги состояния пользователя
+        содержимое/автор/проекции сообщения
+        created_at/updated_at сообщения
+    }
+
+    entity "messenger_api_user_streams_v1" as VIEW_STREAM {
+        одна уникальная привязка пользователя к стриму
+        --
+        один канонический стрим
+        готовые счётчики непрочитанных сообщений
+    }
+
+    entity "messenger_api_user_topics_v1" as VIEW_TOPIC {
+        одна уникальная привязка пользователя к теме
+        --
+        одна каноническая тема
+        готовые счётчики непрочитанных сообщений
+    }
+
+    entity "messenger_api_user_folders_v1" as VIEW_FOLDER {
+        одна уникальная привязка пользователя к папке
+        --
+        одна каноническая папка
+        готовые unread_count / mention_count
+    }
+}
+
+package "3. Проектные физические SQL-сущности\n(будущая миграция)" as DOMAIN {
+    entity "MESSAGE\nWorkspaceMessage\nmessenger_messages" as MESSAGE {
+        uuid : UUID <<PK, внутренний канонический ID>>
+        project_id
+        author_uuid
+        payload
+        source / provider / delivery
+        provider_realm_uuid / provider_message_id <<hidden>>
+        reactions / reaction_users
+        created_at : публичная временная метка
+        updated_at : публичная временная метка
+    }
+
+    entity "MESSAGE_PLACEMENT\nWorkspaceMessagePlacement\nmessenger_message_placements" as MESSAGE_PLACEMENT {
+        uuid : UUID <<публичный UUIDv5>>
+        message_uuid : UUID <<FK>>
+        stream_uuid
+        topic_uuid
+        уникально: проект + сообщение + стрим + тема
+    }
+
+    entity "USER_MESSAGE_BINDING\nWorkspaceUserMessageBinding\nmessenger_user_message_bindings" as USER_MESSAGE_BINDING {
+        binding_uuid : UUID <<скрытый ключ ORM>>
+        placement_uuid : UUID <<FK>>
+        user_uuid : UUID <<FK>>
+        relation_role
+        visibility
+        permissions
+        membership_generation : int <<snapshot>>
+        уникально: проект + размещение + пользователь
+        --
+        без версии revision
+    }
+
+    entity "USER_MESSAGE_STATE\nWorkspaceUserMessageState\nmessenger_user_message_states" as USER_MESSAGE_STATE {
+        placement_uuid : UUID <<FK>>
+        user_uuid : UUID <<FK>>
+        membership_generation : int <<snapshot>>
+        read / mentioned / starred / pinned
+        уникально: проект + пользователь + размещение
+    }
+
+    entity "MESSAGE_REACTION_FACT\nWorkspaceMessageReactionFact" as REACTION_FACT {
+        uuid : UUID <<PK>>
+        project_id
+        canonical_message_uuid : UUID <<канонический FK>>
+        user_uuid : UUID <<FK автора реакции>>
+        emoji_name
+        --
+        уникально: проект + сообщение + пользователь + эмодзи
+    }
+
+    entity "WorkspaceUser\nmessenger_users" as USER {
+        user_uuid : UUID <<PK>>
+    }
+
+    entity "WorkspaceStream\nmessenger_streams" as STREAM {
+        stream_uuid : UUID <<PK>>
+        owner_uuid : UUID <<индексированный FK пользователя>>
+        direct_user_uuid : UUID <<допускающий null FK пользователя>>
+        private
+        is_archived
+        канонические поля стрима
+    }
+
+    entity "WorkspaceStreamBinding\nmessenger_stream_bindings" as STREAM_BINDING {
+        binding_uuid : UUID <<PK>>
+        user_uuid : UUID <<FK>>
+        stream_uuid : UUID <<FK>>
+        role / уведомления
+        active / membership_generation
+        счётчики непрочитанных сообщений / last_message_uuid
+    }
+
+    entity "WorkspaceStreamTopic\nmessenger_topics" as TOPIC {
+        topic_uuid : UUID <<PK>>
+        project_id
+        stream_uuid : UUID <<FK>>
+        канонические поля темы
+    }
+
+    entity "USER_TOPIC_BINDING\nmessenger_user_topic_bindings" as TOPIC_BINDING {
+        topic_uuid : UUID <<FK>>
+        user_uuid : UUID <<FK>>
+        флаги / уведомления / счётчики непрочитанных сообщений
+        уникально: проект + пользователь + тема
+    }
+
+    entity "FOLDER\nmessenger_folders" as FOLDER
+    entity "USER_FOLDER_BINDING\nmessenger_user_folder_bindings" as FOLDER_BINDING {
+        folder_uuid : UUID <<FK>>
+        user_uuid : UUID <<FK>>
+        rule / type
+        unread_count / mention_count
+        folder_items_snapshot : JSONB <<read-only>>
+        snapshot_version / snapshot_updated_at <<internal>>
+        уникально: проект + пользователь + папка
+    }
+
+    entity "FOLDER_ITEM\nmessenger_folder_items" as FOLDER_ITEM {
+        folder_uuid : UUID <<FK>>
+        stream_uuid : UUID <<FK>>
+        automatic
+        уникально: проект + пользователь + папка + стрим
+    }
+
+    entity "DOMAIN_OUTBOX_EVENT\nнеизменяемый" as OUTBOX_EVENT
+    entity "PROJECTION_TASK\n1 immutable task на outbox event" as PROJECTION_TASK {
+        unique outbox_event_uuid
+        scope_kind / exact scope_key
+        pending / leased / running / completed / failed / DLQ
+        lease expiry / owner / fencing token
+        attempts / next_retry_at
+    }
+    entity "PUBLIC_WS_EVENT_RECORD\nсоздаётся атомарно с состоянием;\ndispatchable после commit" as PUBLIC_EVENT
+}
+
+package "Пути записи и фоновой обработки" as PATHS {
+    class "Синхронная отправка API" as SEND
+    class "Конфигурация фонового исполнителя\nнастраиваемое ограничение параллелизма = N\nимя параметра открыто" as WORKER_CONFIG
+    class "Асинхронный пул фоновых исполнителей\n0..N активных слотов\nмодель исполнения открыта" as WORKER_POOL
+    class "Слот фонового исполнителя 1" as SLOT_1
+    class "Слот фонового исполнителя 2" as SLOT_2
+    class "Слот фонового исполнителя ... N" as SLOT_N
+    class "Эксклюзивное владение темой A\n(project_id, topic_uuid=A)" as TOPIC_CLAIM_A
+    class "Эксклюзивное владение темой B\n(project_id, topic_uuid=B)" as TOPIC_CLAIM_B
+    class "Последовательная обработка темы A\n14:20 -> 14:19 -> 14:15\nMESSAGE.created_at DESC" as TOPIC_A_ORDER
+    class "Материализатор снимков реакций\nодин эксклюзивный владелец" as REACTION_MATERIALIZER
+    class "Аренда shared scope\nmessage / user-stream / user-topic / user-folder\nexact key + fencing token" as SHARED_SCOPE_CLAIM
+    class "Диспетчер/сервис WebSocket\nотправка + повтор + воспроизведение" as WS_DISPATCHER
+}
+
+note top of MESSAGE
+  Целевое предложение: WorkspaceMessage / messenger_messages.
+  Остальные целевые таблицы разделения:
+  messenger_message_placements, messenger_user_message_bindings,
+  messenger_user_message_states.
+  Эти физические имена относятся только к будущей миграции.
+end note
+
+API_MESSAGE --> VIEW_MESSAGE : стандартные objects / filters
+API_REACTION --> REACTION_FACT : создание / обновление / удаление одного факта
+API_STREAM --> VIEW_STREAM : стандартные objects / filters
+API_TOPIC --> VIEW_TOPIC : стандартные objects / filters
+API_FOLDER --> VIEW_FOLDER : стандартные objects / filters
+API_USER --> USER : прямой стандартный ресурс
+
+VIEW_MESSAGE --> USER_MESSAGE_BINDING : "корень: ровно 1 привязка"
+VIEW_MESSAGE --> MESSAGE_PLACEMENT : "индексированная связь многие-к-одному"
+VIEW_MESSAGE --> USER_MESSAGE_STATE : "индексированная связь один-к-одному\nпользователь + размещение"
+VIEW_MESSAGE --> MESSAGE : "индексированный LEFT JOIN\nмногие-к-одному"
+VIEW_STREAM --> STREAM_BINDING : "корень: ровно 1 привязка пользователя"
+VIEW_STREAM --> STREAM : "индексированное соединение\nмногие-к-одному"
+VIEW_TOPIC --> TOPIC_BINDING : "корень: ровно 1 привязка пользователя"
+VIEW_TOPIC --> TOPIC : "индексированное соединение\nмногие-к-одному"
+VIEW_FOLDER --> FOLDER_BINDING : "корень: ровно 1 привязка пользователя"
+VIEW_FOLDER --> FOLDER : "индексированное соединение\nмногие-к-одному"
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : "явные размещения"
+MESSAGE ||--o{ REACTION_FACT : "одно каноническое сообщение\nисходные факты реакций"
+USER ||--o{ REACTION_FACT : автор реакции
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : доступ получателя
+USER ||--o{ USER_MESSAGE_BINDING : "уникальна для размещения"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : "состояние пользователя/размещения"
+USER ||--o{ USER_MESSAGE_STATE
+STREAM ||--o{ MESSAGE_PLACEMENT : размещения
+TOPIC ||--o{ MESSAGE_PLACEMENT : "обязательный namespace UUIDv5"
+
+USER ||--o{ STREAM_BINDING
+STREAM ||--o{ STREAM_BINDING
+USER ||--o{ TOPIC_BINDING
+TOPIC ||--o{ TOPIC_BINDING
+USER ||--o{ FOLDER_BINDING
+FOLDER ||--o{ FOLDER_BINDING
+STREAM ||--o{ TOPIC
+
+SEND --> MESSAGE : "синхронно: создать 1"
+SEND --> MESSAGE_PLACEMENT : "синхронно: создать 1 размещение"
+SEND --> USER_MESSAGE_BINDING : "синхронно: 1 привязка автора"
+SEND --> USER_MESSAGE_STATE : "синхронно: 1 состояние автора"
+SEND --> OUTBOX_EVENT : "в той же транзакции"
+OUTBOX_EVENT --> PROJECTION_TASK : "ровно 1 immutable task на event"
+WORKER_CONFIG --> WORKER_POOL : "максимум активных слотов = N"
+WORKER_POOL --> SLOT_1
+WORKER_POOL --> SLOT_2
+WORKER_POOL --> SLOT_N
+SLOT_1 --> TOPIC_CLAIM_A : "эксклюзивный динамический захват"
+SLOT_2 --> TOPIC_CLAIM_B : "эксклюзивный динамический захват"
+TOPIC_CLAIM_A --> TOPIC_A_ORDER : "последовательно внутри темы"
+TOPIC_A_ORDER ..> MESSAGE : "выбрать канонические сообщения"
+TOPIC_CLAIM_B ..> MESSAGE : "выборка темы B\nMESSAGE.created_at DESC"
+PROJECTION_TASK ..> TOPIC_CLAIM_A : "явная область размещения; без сканирования"
+TOPIC_A_ORDER ..> USER_MESSAGE_BINDING : "асинхронные привязки получателей 0..*\nдля каждого размещения"
+TOPIC_CLAIM_B ..> USER_MESSAGE_BINDING : "асинхронные привязки получателей 0..*\nдля каждого размещения"
+TOPIC_A_ORDER ..> USER_MESSAGE_STATE : "создать/обеспечить состояние получателя\nвместе с привязкой"
+TOPIC_CLAIM_B ..> USER_MESSAGE_STATE : "создать/обеспечить состояние получателя\nвместе с привязкой"
+PROJECTION_TASK ..> SHARED_SCOPE_CLAIM : "маршрутизация по фактическому scope"
+SHARED_SCOPE_CLAIM ..> REACTION_MATERIALIZER : "scope=message"
+REACTION_FACT --> REACTION_MATERIALIZER : "читать факты для сообщения"
+REACTION_MATERIALIZER --> MESSAGE : "записать reactions + reaction_users"
+REACTION_MATERIALIZER --> PUBLIC_EVENT : "в одной DB transaction с materialized state"
+PUBLIC_EVENT --> WS_DISPATCHER : готовые записи
+SHARED_SCOPE_CLAIM ..> STREAM_BINDING : "user-stream: счётчики/состояние"
+SHARED_SCOPE_CLAIM ..> TOPIC_BINDING : "user-topic: счётчики/состояние"
+SHARED_SCOPE_CLAIM ..> FOLDER_BINDING : "user-folder: unread_count"
+SHARED_SCOPE_CLAIM ..> FOLDER_ITEM : "user-folder: automatic projection"
+
+note right of FOLDER_BINDING
+  FOLDER_ITEM rows remain normalized source of truth.
+  folder_projection exact user-folder scope atomically writes
+  deterministic folder_items_snapshot + ready counts + version/time
+  + all ready event rows. Dispatcher reads only after commit.
+  Public folder_items maps directly from snapshot; empty = [].
+end note
+
+note bottom of VIEW_MESSAGE
+  Одна пользовательская привязка -> одно размещение -> одно сообщение/состояние.
+  Публичный uuid приходит из MESSAGE_PLACEMENT.
+  get_id_property может использовать скрытый binding_uuid
+  только как уникальный технический ORM-ключ строки.
+  MESSAGE.uuid скрыт как канонический FK содержимого.
+  binding_uuid не входит в текущий публичный JSON.
+  Адаптер/маршруты используют MESSAGE_PLACEMENT.uuid.
+  Разные размещения имеют разные публичные uuid.
+  Публичные created_at/updated_at приходят из MESSAGE.
+  is_own — скалярное сравнение присоединённых идентификаторов.
+  Нет агрегатов, GROUP BY, боковых/оконных выражений,
+  коррелированных подзапросов или веерного распространения один-ко-многим.
+end note
+
+note top of MESSAGE_PLACEMENT
+  uuid = UUIDv5(namespace = TOPIC.uuid,
+                name = MESSAGE.uuid).
+  Name — lowercase hyphenated canonical UUID.
+  Name не содержит project/stream, braces или префиксы.
+  TOPIC обязателен, глобально уникален и неизменно
+  принадлежит ровно одному STREAM/PROJECT.
+  Business key и составные FK остаются авторитетными.
+end note
+
+note bottom of VIEW_STREAM
+  Публичные UUID-ссылки — скалярные UUID-свойства,
+  а не URI отношения RestAlchemy.
+  Физические столбцы *_uuid остаются индексированными FK
+  с явными ссылочными действиями.
+  owner_uuid выходит как публичное поле owner с UUID.
+end note
+
+note bottom of FOLDER_BINDING
+  Агрегаты стрима/темы/папки хранятся в уникальной привязке
+  той же области пользователя/контейнера.
+  Привязки отдельных сообщений не хранят счётчики контейнеров.
+  Обновления идемпотентны и согласованы в конечном счёте;
+  восстановление/перестроение выполняются только фоново.
+  Системные привязки имеют фиксированные rule/type;
+  автоматические FOLDER_ITEM материализует фоновый исполнитель.
+  Источник: активные USER_STREAM_BINDING и STREAM.is_archived = false.
+  All chats: все; Personal: private = true; Channels: private = false.
+end note
+
+note bottom of REACTION_MATERIALIZER
+  API меняет ровно одну исходную строку факта.
+  API никогда не выполняет цикл «чтение — изменение — запись» снимков.
+  Факты — источник истины; снимки можно перестроить.
+  Оба снимка пишет только один fenced owner scope=message.
+  Topic lock для canonical snapshot не используется.
+end note
+
+note bottom of PROJECTION_TASK
+  Виды задач: fanout; content_mentions; reaction_snapshot;
+  read_counters; delivery_snapshot_event;
+  topic_membership_policy_rebuild; topic_state_projection;
+  folder_projection.
+  Initial design: без coalescing.
+  Unique outbox_event_uuid; retry derivation = no-op.
+  Lease expiry + fencing; retry/backoff; max attempts/DLQ;
+  reaper/reconciliation; idempotent handler.
+  Routing: topic только для placements/bindings;
+  message для snapshots; user-stream/user-topic/user-folder для aggregates.
+  Shared scope не имеет fallback на topic.
+  Atomic delta требует exactly-once guard по outbox_event_uuid;
+  иначе scope worker recomputes/writes.
+end note
+
+note bottom of STREAM_BINDING
+  Persistent lifecycle row.
+  Revoke: active=false + generation++ синхронно.
+  Re-add: fresh generation; stale fanout/history no-op.
+  Message/reaction read требует active + generation equality.
+end note
+
+note bottom of SEND
+  Привязка автора и его USER_MESSAGE_STATE создаются синхронно.
+  Нет веерного распространения получателям.
+  Нет пересчёта агрегатов.
+  Неизменяемое событие журнала исходящих событий (outbox) входит в транзакцию.
+  GET/операция списка не создают задач.
+  Автор видит сообщение немедленно.
+end note
+
+note bottom of STREAM
+  Если direct_user_uuid задан, private = true.
+  direct_user_uuid, равный UUID текущего owner, означает чат с собой:
+  одна привязка owner, один видимый участник.
+  Веерное распространение получателям не добавляет пользовательских привязок,
+  поэтому каноническое сообщение видно один раз.
+end note
+
+note bottom of WS_DISPATCHER
+  Фоновый исполнитель не владеет сетевыми соединениями.
+  Диспетчер отправляет, повторяет и воспроизводит готовые события.
+end note
+
+note bottom of TOPIC_CLAIM_A
+  Разные темы могут обрабатываться параллельно.
+  У одного (project_id, topic_uuid) не более одного слота.
+  Внутри каждой захваченной темы сначала выбираются новые:
+  MESSAGE.created_at DESC.
+  Пример: 14:20 -> 14:19 -> 14:15.
+  Временные метки задачи и привязки не определяют порядок.
+  Дополнительный ключ/курсор для равных меток остаётся открытым.
+  Видимость для получателя может запаздывать примерно на секунду.
+  Это запланированная согласованность в конечном счёте.
+  Порядок «сначала новые» не должен приводить к голоданию старых сообщений;
+  ограниченная справедливость действует в пределах захвата темы.
+  Механизм захвата/освобождения/повторного захвата остаётся открытым.
+  Неявного резервного секционирования по стриму нет.
+end note
+
+@enduml

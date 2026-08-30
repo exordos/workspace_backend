@@ -1040,6 +1040,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         assert account["uuid"] == str(account_uuid)
         assert account["credential_present"] is True
         assert "api_key" not in account["settings"]
+        assert "projection_reset_generation" not in account
         assert create.headers["ETag"] == '"1"'
 
         duplicate = api.post(
@@ -1094,6 +1095,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         assert reconnect.status_code == 200, reconnect.text
         assert reconnect.headers["ETag"] == '"2"'
         assert "api_key" not in reconnect.text
+        assert "projection_reset_generation" not in reconnect.json()
 
         disconnect = api.post(
             f"{EXTERNAL_ACCOUNTS}{account_uuid}/actions/disconnect/invoke",
@@ -1101,6 +1103,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         )
         assert disconnect.status_code == 200, disconnect.text
         assert disconnect.json()["status"] == "disconnected"
+        assert "projection_reset_generation" not in disconnect.json()
 
         with db.cursor() as cursor:
             cursor.execute(
@@ -1154,6 +1157,10 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
             ("external_account", "updated"),
         ]
         assert all("api_key" not in json.dumps(row[2]) for row in events)
+        assert all(
+            "projection_reset_generation" not in json.dumps(row[2])
+            for row in events
+        )
 
         deleted = api.delete(
             f"{EXTERNAL_ACCOUNTS}{account_uuid}",
@@ -1479,7 +1486,11 @@ def test_external_chat_can_be_selected_again_after_deselect(
     }
     account_settings = {
         "kind": "zulip",
-        "server_url": "https://zulip.example.invalid",
+        # Each parameter case represents an independent provider realm.  Keep
+        # its pre-discovery origin unique so the realm-global chat invariant
+        # does not intentionally treat the two persistent fixtures as one
+        # provider chat assigned to different projects.
+        "server_url": f"https://{account_uuid}.zulip.example.invalid",
         "selection_mode": "explicit",
         "default_project_id": api.project_id,
     }
@@ -1664,7 +1675,9 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
                 json.dumps(
                     {
                         "kind": "zulip",
-                        "server_url": "https://zulip.example.invalid",
+                        "server_url": (
+                            f"https://{account_uuid}.zulip.example.invalid"
+                        ),
                         "selection_mode": "explicit",
                         "default_project_id": api.project_id,
                     }
@@ -3223,7 +3236,9 @@ def test_external_projection_move_is_request_atomic_after_each_phase(
                 json.dumps(
                     {
                         "kind": "zulip",
-                        "server_url": "https://zulip.example.invalid",
+                        "server_url": (
+                            f"https://{account_uuid}.zulip.example.invalid"
+                        ),
                         "selection_mode": "explicit",
                         "history_depth": "30_days",
                         "default_project_id": str(old_project),
@@ -4480,11 +4495,11 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
         access_user_uuids = {str(row[0]) for row in cur.fetchall()}
     assert access_user_uuids == {str(api.user_uuid), str(stream_user)}
 
-    resp = api.get(FILES)
+    resp = api.get(FILES, params={"stream_uuid": stream_uuid})
     assert resp.status_code == 200, resp.text
     assert [item["uuid"] for item in resp.json()] == [file_uuid]
 
-    resp = api.get(FILES, user=stream_user)
+    resp = api.get(FILES, user=stream_user, params={"stream_uuid": stream_uuid})
     assert resp.status_code == 200, resp.text
     assert [item["uuid"] for item in resp.json()] == [file_uuid]
 
@@ -4492,7 +4507,7 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
     assert resp.status_code == 200, resp.text
     assert resp.json()["uuid"] == file_uuid
 
-    resp = api.get(FILES, user=outsider_user)
+    resp = api.get(FILES, user=outsider_user, params={"stream_uuid": stream_uuid})
     assert resp.status_code == 200, resp.text
     assert resp.json() == []
 
@@ -4599,7 +4614,7 @@ def test_non_public_files_are_scoped_to_the_request_project(api, db):
     assert other_response.status_code in (200, 201), other_response.text
     other_file_uuid = other_response.json()["uuid"]
 
-    response = api.get(FILES)
+    response = api.get(FILES, params={"stream_uuid": current_stream_uuid})
     assert response.status_code == 200, response.text
     assert [item["uuid"] for item in response.json()] == [current_file_uuid]
 
@@ -5962,7 +5977,7 @@ def test_concurrent_self_direct_ensure_creates_one_canonical_stream(api, db):
         assert cur.fetchone() == (1, 1, 1, 1)
 
 
-def test_stream_binding_create_notifies_added_user(api, db):
+def test_stream_binding_create_notifies_added_user(api, workspace_api, db):
     stream_uuid = conftest.seed_user_stream(
         db,
         api.project_id,
@@ -6026,18 +6041,14 @@ def test_stream_binding_create_notifies_added_user(api, db):
         assert resp.json()["uuid"] == file_uuid
 
     for target_uuid in (target_user_uuid, second_target_user_uuid):
-        with db.cursor() as cur:
-            cur.execute(
-                """
-                SELECT payload
-                FROM m_workspace_events
-                WHERE project_id = %s
-                    AND user_uuid = %s
-                ORDER BY epoch_version
-                """,
-                (api.project_id, target_uuid),
-            )
-            events = [row[0] for row in cur.fetchall()]
+        workspace_api.project_id = api.project_id
+        workspace_api.user_uuid = str(target_uuid)
+        response = workspace_api.get(
+            EVENTS,
+            params={"page_limit": 100},
+        )
+        assert response.status_code == 200, response.text
+        events = [event["payload"] for event in response.json()]
 
         assert [event["kind"] for event in events] == [
             "stream.created",
@@ -6889,6 +6900,12 @@ def test_external_member_removal_revokes_duplicate_chat_projections(
 
     first_message_uuid = sys_uuid.uuid4()
     second_message_uuid = sys_uuid.uuid4()
+    first_public_message_uuid = sys_uuid.uuid5(
+        sys_uuid.UUID(first_topic_uuid), str(first_message_uuid).lower()
+    )
+    second_public_message_uuid = sys_uuid.uuid5(
+        sys_uuid.UUID(second_topic_uuid), str(second_message_uuid).lower()
+    )
 
     def create_messages(session):
         for message_uuid, stream_uuid, topic_uuid, author_uuid in (
@@ -6941,8 +6958,8 @@ def test_external_member_removal_revokes_duplicate_chat_projections(
         for event in events_before.json()
         if event["payload"]["kind"] == "message.created"
     }
-    assert str(first_message_uuid) in visible_message_uuids
-    assert str(second_message_uuid) not in visible_message_uuids
+    assert str(first_public_message_uuid) in visible_message_uuids
+    assert str(second_public_message_uuid) not in visible_message_uuids
 
     deleted = api.delete(f"{STREAM_BINDINGS}{first_binding_uuid}")
     assert deleted.status_code in (200, 204), deleted.text
@@ -6961,8 +6978,8 @@ def test_external_member_removal_revokes_duplicate_chat_projections(
         for event in events_after.json()
         if event["payload"]["kind"] == "message.created"
     }
-    assert str(first_message_uuid) not in visible_message_uuids
-    assert str(second_message_uuid) not in visible_message_uuids
+    assert str(first_public_message_uuid) not in visible_message_uuids
+    assert str(second_public_message_uuid) not in visible_message_uuids
 
     with db.cursor() as cur:
         cur.execute(
@@ -8275,6 +8292,9 @@ def test_stream_topic_summary_tracks_new_messages_and_emits_snapshots(api, db):
     )
     assert first_message.status_code == 201, first_message.text
     first_message_uuid = first_message.json()["uuid"]
+    first_public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), first_message_uuid.lower())
+    )
 
     topic = _run_database_operation(
         lambda session: messenger_dm_helpers.set_workspace_user_stream_topic_summary(
@@ -8346,7 +8366,7 @@ def test_stream_topic_summary_tracks_new_messages_and_emits_snapshots(api, db):
         str(other_user),
     }
     assert all(
-        payload["summary_last_message_uuid"] == first_message_uuid
+        payload["summary_last_message_uuid"] == first_public_message_uuid
         and payload["summary_has_new_messages"] is False
         for _, payload in event_rows
     )
@@ -8497,7 +8517,12 @@ def test_hard_delete_restores_topic_summary_journal_and_resets_work(api, db):
         )
         deletion_event = cursor.fetchone()[0]
     assert deletion_event["summary"] == "Summary at one."
-    assert deletion_event["summary_last_message_uuid"] == earlier_messages[0]
+    assert deletion_event["summary_last_message_uuid"] == str(
+        sys_uuid.uuid5(
+            sys_uuid.UUID(earlier_topic),
+            earlier_messages[0].lower(),
+        )
+    )
     assert deletion_event["summary_has_new_messages"] is True
 
 
@@ -9832,6 +9857,9 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     assert resp.status_code == 201, resp.text
     message = resp.json()
     message_uuid = message["uuid"]
+    public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), message_uuid.lower())
+    )
     assert message["read"] is True
     assert message["is_own"] is True
     assert message["reactions"] == {}
@@ -9929,7 +9957,7 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     author_payload = events_by_user[str(api.user_uuid)][0]
     other_payload = events_by_user[str(other_user)][0]
     assert author_payload["kind"] == "message.created"
-    assert author_payload["uuid"] == message_uuid
+    assert author_payload["uuid"] == public_message_uuid
     assert author_payload["stream_uuid"] == stream_uuid
     assert author_payload["topic_uuid"] == topic_uuid
     assert author_payload["author_uuid"] == str(api.user_uuid)
@@ -9969,10 +9997,10 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     assert packed_other_payload["kind"] == "message.created"
     assert {
         key: value for key, value in packed_author_payload.items() if key != "kind"
-    } == message
+    } == {**message, "uuid": public_message_uuid}
     assert {
         key: value for key, value in packed_other_payload.items() if key != "kind"
-    } == other_message
+    } == {**other_message, "uuid": public_message_uuid}
 
     author_resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert author_resp.status_code == 200, author_resp.text
@@ -9982,7 +10010,7 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     assert event["project_id"] == str(api.project_id)
     assert event["user_uuid"] == str(api.user_uuid)
     assert event["payload"]["kind"] == "message.created"
-    assert event["payload"]["uuid"] == message_uuid
+    assert event["payload"]["uuid"] == public_message_uuid
     assert event["payload"]["stream_uuid"] == stream_uuid
     assert event["payload"]["topic_uuid"] == topic_uuid
     assert event["payload"]["author_uuid"] == str(api.user_uuid)
@@ -10004,15 +10032,15 @@ def test_message_create_writes_compact_read_state_and_visible_events(
         "stream.updated",
     ]
     other_event = other_events[0]
-    assert other_event["payload"]["uuid"] == message_uuid
+    assert other_event["payload"]["uuid"] == public_message_uuid
     assert other_event["payload"]["kind"] == "message.created"
     assert other_event["payload"]["user_uuid"] == str(other_user)
     assert other_event["payload"]["project_id"] == str(api.project_id)
     assert other_event["payload"]["read"] is False
     assert other_event["payload"]["is_own"] is False
     assert other_event["payload"]["reactions"] == {}
-    assert other_events[1]["payload"]["last_message_uuid"] == message_uuid
-    assert other_events[2]["payload"]["last_message_uuid"] == message_uuid
+    assert other_events[1]["payload"]["last_message_uuid"] == public_message_uuid
+    assert other_events[2]["payload"]["last_message_uuid"] == public_message_uuid
 
     outsider_events = workspace_api.get(
         EVENTS,
@@ -10178,6 +10206,9 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
     )
     assert response.status_code == 201, response.text
     message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    public_message_uuid = sys_uuid.uuid5(
+        sys_uuid.UUID(topic_uuid), str(message_uuid).lower()
+    )
     project_uuid = sys_uuid.UUID(api.project_id)
     session_factory = ra_engines.engine_factory.get_engine().session_manager
 
@@ -10205,7 +10236,12 @@ def test_message_star_update_is_serialized_and_concurrently_idempotent(api, db):
                   AND payload->>'uuid' = %s
                 ORDER BY epoch_version
                 """,
-                (project_uuid, other_user, epoch_version, str(message_uuid)),
+                (
+                    project_uuid,
+                    other_user,
+                    epoch_version,
+                    str(public_message_uuid),
+                ),
             )
             return [row[0] for row in cursor.fetchall()]
 
@@ -10428,6 +10464,9 @@ def test_message_update_read_delete_write_realtime_events(api, db):
     assert resp.status_code == 201, resp.text
     created_message = resp.json()
     message_uuid = created_message["uuid"]
+    public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), message_uuid.lower())
+    )
     message_created_at = created_message["created_at"]
 
     with db.cursor() as cur:
@@ -10480,7 +10519,7 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         "folder.updated",
         "folder.updated",
     ]
-    assert read_events[0]["uuid"] == message_uuid
+    assert read_events[0]["uuid"] == public_message_uuid
     assert read_events[0]["read"] is True
     assert read_events[1]["unread_count"] == 0
     assert read_events[2]["unread_count"] == 0
@@ -10611,7 +10650,7 @@ def test_message_update_read_delete_write_realtime_events(api, db):
         "message.deleted",
         "message.deleted",
     ]
-    assert all(row[1]["uuid"] == message_uuid for row in delete_rows)
+    assert all(row[1]["uuid"] == public_message_uuid for row in delete_rows)
     assert all(row[1]["stream_uuid"] == stream_uuid for row in delete_rows)
     assert all(row[1]["topic_uuid"] == topic_uuid for row in delete_rows)
 
@@ -10763,6 +10802,9 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
     )
     assert message_resp.status_code == 201, message_resp.text
     message_uuid = message_resp.json()["uuid"]
+    public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), message_uuid.lower())
+    )
     assert message_resp.json()["reaction_users"] == {}
 
     with db.cursor() as cur:
@@ -11005,7 +11047,8 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         payload["kind"] == "message.updated" for _, _, _, payload in message_event_rows
     )
     assert all(
-        payload["uuid"] == message_uuid for _, _, _, payload in message_event_rows
+        payload["uuid"] == public_message_uuid
+        for _, _, _, payload in message_event_rows
     )
     for index, expected_reactions in enumerate(expected_reaction_snapshots):
         group = message_event_rows[index * 2 : index * 2 + 2]
@@ -11036,13 +11079,13 @@ def test_message_reaction_crud_is_user_scoped_and_writes_message_events(api, db)
         assert event_user_uuid == expected_user_uuid
         assert payload["kind"] == f"message_reaction.{expected_action}"
         assert payload["uuid"] == expected_uuid
-        assert payload["message_uuid"] == message_uuid
+        assert payload["message_uuid"] == public_message_uuid
         assert payload["user_uuid"] == expected_user_uuid
         assert payload["emoji_name"] == expected_emoji
         assert payload["source_name"] == "native"
         assert payload["source"]["kind"] == "native"
         if expected_action == "updated":
-            assert payload["old_message_uuid"] == message_uuid
+            assert payload["old_message_uuid"] == public_message_uuid
             assert payload["old_emoji_name"] == "thumbs_up"
             assert payload["old_source_name"] == "native"
             assert payload["old_source"]["kind"] == "native"
@@ -11092,6 +11135,9 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
     )
     assert message_resp.status_code == 201, message_resp.text
     message_uuid = message_resp.json()["uuid"]
+    public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), message_uuid.lower())
+    )
 
     for user_uuid in users[:4]:
         response = api.post(
@@ -11159,7 +11205,7 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
             ORDER BY epoch_version DESC
             LIMIT 1
             """,
-            (api.project_id, api.user_uuid, message_uuid),
+            (api.project_id, api.user_uuid, public_message_uuid),
         )
         event_payload = cursor.fetchone()[0]
         cursor.execute(
@@ -11174,7 +11220,7 @@ def test_message_reaction_users_are_complete_at_limit_and_omit_large_groups(
             ORDER BY epoch_version DESC
             LIMIT 1
             """,
-            (api.project_id, users[-1], message_uuid),
+            (api.project_id, users[-1], public_message_uuid),
         )
         read_event_payload = cursor.fetchone()[0]
     assert stored_reaction_users == expected_reaction_users
@@ -12711,6 +12757,9 @@ def test_message_create_uses_stream_default_topic(api, db):
         is_default=True,
     )
     message_uuid = str(sys_uuid.uuid4())
+    public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), message_uuid.lower())
+    )
 
     resp = api.post(
         MESSAGES,
@@ -12744,7 +12793,7 @@ def test_message_create_uses_stream_default_topic(api, db):
                 AND payload->>'kind' = 'message.created'
                 AND payload->>'uuid' = %s
             """,
-            (api.project_id, message_uuid),
+            (api.project_id, public_message_uuid),
         )
         event_payload = cur.fetchone()[0]
 
@@ -12784,6 +12833,9 @@ def test_projection_helper_does_not_bypass_canonical_event_journal(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
     message_uuid = sys_uuid.uuid4()
+    public_message_uuid = sys_uuid.uuid5(
+        sys_uuid.UUID(topic_uuid), str(message_uuid).lower()
+    )
     _run_database_operation(
         lambda session: messenger_dm_helpers.create_workspace_user_message(
             uuid=message_uuid,
@@ -12803,7 +12855,7 @@ def test_projection_helper_does_not_bypass_canonical_event_journal(
     assert events[0]["object_type"] == "message"
     assert events[0]["action"] == "created"
     assert events[0]["payload"]["kind"] == "message.created"
-    assert events[0]["payload"]["uuid"] == str(message_uuid)
+    assert events[0]["payload"]["uuid"] == str(public_message_uuid)
 
 
 def test_zulip_message_flag_sync_can_keep_author_unread(api, db):
@@ -12927,11 +12979,15 @@ def test_events_filter_by_epoch_range(api, workspace_api, db):
         )
         assert create_resp.status_code == 201, create_resp.text
         message_uuids.append(create_resp.json()["uuid"])
+    public_message_uuids = [
+        str(sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), value.lower()))
+        for value in message_uuids
+    ]
 
     resp = workspace_api.get(EVENTS, params={"page_limit": 100})
     assert resp.status_code == 200, resp.text
     events = resp.json()
-    assert [event["payload"]["uuid"] for event in events] == message_uuids
+    assert [event["payload"]["uuid"] for event in events] == public_message_uuids
     first_epoch = events[0]["epoch_version"]
     second_epoch = events[1]["epoch_version"]
     epoch_generation = workspace_api.get(EPOCH).json()["epoch_generation"]

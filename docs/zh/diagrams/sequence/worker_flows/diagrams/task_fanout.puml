@@ -1,0 +1,63 @@
+@startuml task_fanout
+!pragma layout smetana
+title 标式化投影任务: fanout
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+participant "投影机 outbox" as PROJECTOR
+database "类型任务" as TASKS
+database "题目捕捉" as CLAIM
+participant "工人机" as WORKER
+database "MESSAGE + PLACEMENT" as SOURCE
+database "成员 / 政策" as POLICY
+database "USER_MESSAGE_BINDING\n+ USER_MESSAGE_STATE" as RECIPIENT_ROWS
+database "投影的后续任务" as FOLLOWUPS
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket" as DISPATCHER
+actor "客户端" as Client
+
+PROJECTOR -> TASKS : immutable fanout(outbox_event_uuid, scope=topic)\nunique derivation; 没有 coalescing
+TASKS -> WORKER : 显而易见的工作
+WORKER -> CLAIM : 独占的 (project_id, topic_uuid)
+CLAIM --> WORKER : 拥有
+WORKER -> SOURCE : 阅读位置 + 规范消息
+note right of SOURCE
+  主题内排序:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+end note
+loop immutable batches: user_uuid ASC; default 1000, max 5000
+  WORKER -> POLICY : keyset recipients; active + expected generation
+  group 一个短暂的 DB transaction
+    WORKER -> RECIPIENT_ROWS : bulk conditional upsert binding + state
+    WORKER -> FOLLOWUPS : immutable downstream outbox events + tasks 1:1
+    WORKER -> EVENTS : durable ready rows + checkpoint/next batch
+  end
+end
+alt membership inactive / generation mismatch
+  note over WORKER,RECIPIENT_ROWS
+    Stale task 完成 no-op 并且永远不会恢复访问..
+  end note
+end
+alt 和自己聊天
+  note over WORKER,RECIPIENT_ROWS
+    绑定和作者状态已经存在.
+    没有创建接收器的额外行.
+  end note
+end
+WORKER -> CLAIM : 释放
+EVENTS -> DISPATCHER : 稳定的记录
+DISPATCHER -> Client : 发送 / 重复 / 播放
+
+note over SOURCE,RECIPIENT_ROWS
+  公开的 UUID = MESSAGE_PLACEMENT.uuid =
+  UUIDv5(namespace=TOPIC.uuid, name=MESSAGE.uuid).
+  UUID 个人使用 binding 留下来 hidden.
+  Task: lease/fencing, retry/backoff, DLQ/reaper,
+  idempotent effect guard 根据 outbox_event_uuid.
+  Retry 只有重复 batch; OFFSET 其他 unbounded transaction 禁止使用.
+  在之后 batch scheduler 给了 bounded fairness 旧的工作.
+end note
+
+@enduml

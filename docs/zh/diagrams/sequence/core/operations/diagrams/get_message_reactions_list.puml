@@ -1,0 +1,18 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/message_reactions/
+actor "客户端" as Client
+participant "WorkspaceMessageReactionController\nRestAlchemy" as API
+database "索引式公众展示\n+ 外键的物理行" as DB
+Client -> API: GET /api/workspace/v1/messenger/message_reactions/
+note right of API: Target page_limit: omitted/0=100; 1..500 exact; invalid/>500=400
+API -> DB: message_uuid = public placement UUID;\njoin active stream membership + generation
+DB --> API: 没有计算的行
+API --> Client: 200, 公开的 JSON
+note over API,DB
+没有记录 / transactional outbox / 任务 / 背景表演者 / 事件
+没有集成或恢复在查询时
+Canonical-global reaction audience 在 placements 已故意接受;
+placement UUID 仅用于 access check.
+end note
+@enduml

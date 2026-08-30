@@ -1,0 +1,47 @@
+@startuml task_content_mentions
+!pragma layout smetana
+title Typed projection task: content_mentions
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Unchanged outbox" as OUTBOX
+participant "Task projector" as PROJECTOR
+database "The subject line" as CLAIM
+participant "The worker's slot." as WORKER
+database "MESSAGE.payload" as MESSAGE
+database "PLACEMENT + Users are tied up ." as ACCESS
+database "USER_MESSAGE_STATE" as STATE
+database "Typed tasks" as TASKS
+database "Downstream outbox exact scopes" as FOLLOWUPS
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket" as DISPATCHER
+actor "The client ." as Client
+
+OUTBOX -> PROJECTOR : event of message creation/change
+PROJECTOR -> TASKS : immutable content_mentions(outbox_event_uuid, scope=topic)\nunique derivation; without coalescing
+TASKS -> WORKER : Clearly waiting work
+WORKER -> CLAIM : Monopoly capture of the topic
+WORKER -> MESSAGE : Read the last canonical load
+WORKER -> ACCESS : Read the recorded placements/receivers
+group One . DB transaction
+  loop the affected user/message
+    WORKER -> STATE : I 'mpotent to insert or update the mention status
+  end
+  WORKER -> FOLLOWUPS : immutable outbox events:\nuser-stream / user-topic / user-folder
+  WORKER -> EVENTS : durable ready topic-scoped rows
+end
+WORKER -> CLAIM : I 'm going to get out .
+EVENTS -> DISPATCHER : - I 'm not sure .
+DISPATCHER -> Client : Send / repeat / play
+
+note over MESSAGE,STATE
+  The payload remains in the only copy in MESSAGE.
+  Status only saves personal flags,
+  but not the stream/topic/folder aggregates.
+  USER_MESSAGE_STATE key = (project,user,placement).
+  Shared rows Only the owner can change it . exact scope key.
+  Lease/fencing + retry/backoff + DLQ/reaper - They 're compulsory ..
+end note
+
+@enduml

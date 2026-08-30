@@ -1,0 +1,15 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/streams/[stream_uuid]
+actor "Der Client" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "Indexed öffentliche Darstellung\n+ physische Zeilen externer Schlüssel" as DB
+Client -> API: GET /api/workspace/v1/messenger/streams/{stream_uuid}
+API -> DB: Projektbereich und aktueller Benutzer\nSkalierfilter UUID
+DB --> API: Zeilen ohne Berechnungen
+API --> Client: 200, öffentlich JSON
+note over API,DB
+Keine Aufzeichnungen / transactional outbox / Aufgaben / Hintergrund-Aussteller / Ereignisse
+Keine Aggregation oder Wiederherstellung während der Anfrage
+end note
+@enduml

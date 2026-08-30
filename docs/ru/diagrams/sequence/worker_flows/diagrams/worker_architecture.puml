@@ -1,0 +1,116 @@
+@startuml worker_architecture
+!pragma layout smetana
+
+title Архитектура воркера проекций Workspace
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequence {
+    ArrowColor #334155
+    LifeLineBorderColor #334155
+    ParticipantBorderColor #2563EB
+    ParticipantBackgroundColor #EFF6FF
+}
+
+actor "Клиент" as Client
+participant "REST / RestAlchemy\nконтроллер" as API
+database "Исходные таблицы\nканонические сущности + привязки + факты" as SOURCE
+database "Неизменяемый доменный\noutbox" as OUTBOX
+participant "Проектор задач\n1 task на outbox event" as PROJECTOR
+database "Типизированные задачи\nпроекций" as TASKS
+participant "Настроенный пул воркеров\n0..N активных слотов" as POOL
+database "Аренда exact scope key\nlease + fencing token" as CLAIM
+participant "Слот воркера" as WORKER
+database "Готовые проекции\nпривязки + состояния / снимки" as READY
+database "Хранилище публичных событий" as EVENTS
+participant "Диспетчер WebSocket\nповтор + воспроизведение" as DISPATCHER
+actor "Клиент WebSocket" as WS
+
+Client -> API : запрос, изменяющий состояние
+activate API
+API -> SOURCE : изменить строки — источники истины
+API -> OUTBOX : добавить неизменяемое событие\nв той же транзакции
+API --> Client : зафиксированный немедленный ответ
+deactivate API
+
+note over API,OUTBOX
+  POST сообщений синхронно создаёт:
+  MESSAGE + MESSAGE_PLACEMENT
+  + авторские USER_MESSAGE_BINDING
+  + USER_MESSAGE_STATE + outbox.
+  Привязка + состояние получателя создаются вместе через fanout.
+end note
+
+OUTBOX -> PROJECTOR : зафиксированные события
+PROJECTOR -> TASKS : immutable task(outbox_event_uuid, kind, scope)\nunique derivation; без coalescing
+TASKS -> POOL : ожидающая явная работа\n(без поиска отсутствующих строк)
+POOL -> CLAIM : захватить точный scope key
+CLAIM --> POOL : монопольная аренда/владение
+POOL -> WORKER : назначить в пределах настроенного лимита N
+activate WORKER
+WORKER -> SOURCE : прочитать последнее зафиксированное состояние
+note right of WORKER
+  Только для scope=topic:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+  fanout batch: user_uuid ASC, default 1000, max 5000
+  после batch — checkpoint и bounded fairness
+end note
+group одна DB transaction
+  WORKER -> READY : идемпотентная materialization / batch upsert
+  WORKER -> EVENTS : durable ready rows; unique derivation key
+end
+WORKER -> CLAIM : безопасно освободить
+deactivate WORKER
+
+EVENTS -> DISPATCHER : устойчивые готовые записи
+DISPATCHER -> WS : отправить / повторить / воспроизвести
+note over EVENTS,WS
+  Reconnect: cursor + high-watermark + replay + buffer/drain без gap.
+  At-least-once; client dedupe по event UUID.
+  Membership generation подавляет data events после revoke.
+end note
+
+note over SOURCE,READY
+  Публичные ссылки UUID являются скалярными UUID-свойствами.
+  Физические столбцы *_uuid остаются индексированными внешними ключами.
+  Агрегаты контейнеров хранятся на уникальных привязках
+  пользователя к контейнеру, но не в привязках сообщений.
+  MESSAGE_PLACEMENT.uuid — публичный UUID сообщения.
+  MESSAGE.uuid — внутренний canonical content UUID;
+  UUID USER_MESSAGE_BINDING остаётся скрытой row identity.
+  FOLDER хранится один раз; normalized FOLDER_ITEM = source of truth.
+  USER_FOLDER_BINDING хранит доступ, счётчики и read-only JSONB
+  folder_items_snapshot (empty=[]), version/updated_at.
+  Автоматические папки читают активную USER_STREAM_BINDING + STREAM.is_archived=false:
+  All chats = все; Personal = STREAM.private=true; Channels = STREAM.private=false.
+end note
+
+note over TASKS,READY
+  Маршрутизация владения:
+  fanout/placement state -> topic(project, topic)
+  reaction snapshot -> message(project, canonical message)
+  stream aggregates -> user-stream(project, user, stream)
+  folder_projection -> user-folder(project, user, folder)
+  topic aggregates -> user-topic(project, user, topic)
+  Иные shared rows требуют явного scope; fallback на topic запрещён.
+  Topic-worker не выполняет unsafe read-modify-write shared rows.
+  folder_projection пишет snapshot + counts + version/time
+  + все ready events в одной worker DB transaction.
+  API читает одну indexed row/page без N+1/json_agg/COUNT/custom SQL.
+end note
+
+note over PROJECTOR,CLAIM
+  Lifecycle: pending -> leased/running -> completed/failed -> DLQ.
+  Lease expiry, attempts/backoff, max attempts, reaper/reconciliation.
+  Atomic counter delta допустима только с exactly-once effect guard
+  по outbox_event_uuid; иначе scope worker recomputes/writes.
+end note
+
+note over API,OUTBOX
+  GET/список завершается после индексированного чтения
+  и не создаёт outbox/задачу.
+end note
+
+@enduml

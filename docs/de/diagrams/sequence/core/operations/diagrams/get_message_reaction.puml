@@ -1,0 +1,17 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/message_reactions/[reaction_uuid]
+actor "Der Client" as Client
+participant "WorkspaceMessageReactionController\nRestAlchemy" as API
+database "Indexed öffentliche Darstellung\n+ physische Zeilen externer Schlüssel" as DB
+Client -> API: GET /api/workspace/v1/messenger/message_reactions/{reaction_uuid}
+API -> DB: reaction_uuid + Anwendbar placement;\njoin active stream membership + generation
+DB --> API: Zeilen ohne Berechnungen
+API --> Client: 200, öffentlich JSON
+note over API,DB
+Keine Aufzeichnungen / transactional outbox / Aufgaben / Hintergrund-Aussteller / Ereignisse
+Keine Aggregation oder Wiederherstellung während der Anfrage
+Public message_uuid = placement UUID; Art und Weise zu wiederherstellen placement context
+für reaction_uuid bleibt zentralisiert OPEN-Entscheidung.
+end note
+@enduml

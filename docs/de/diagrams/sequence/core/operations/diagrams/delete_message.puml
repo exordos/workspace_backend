@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/messages/[message_uuid]
+actor "Der Client" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: DELETE /api/workspace/v1/messenger/messages/{message_uuid}
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: delete canonical MESSAGE root + immutable outbox events
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: read_counters / reaction_snapshot /\ndelivery_snapshot_event\njede task hat seine outbox_event_uuid
+Worker -> Worker: topic: placements; user-stream/user-folder: aggregates
+Worker -> Projection: Kontainerzähler nach der Reinigung nach äußeren Schlüsseln
+Worker -> Events: message.deleted + Ereignisse des Containers\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Public ID = MESSAGE_PLACEMENT.uuid; canonical root wird gelöscht
+  Nur nach permission check Über active membership.
+  Lease/fencing, retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+@enduml

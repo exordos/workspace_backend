@@ -245,6 +245,72 @@ def test_pending_identity_reconciliation_keeps_report_retryable(monkeypatch):
     )
 
 
+def test_verified_realm_scope_conflict_is_reported_explicitly(monkeypatch):
+    account_uuid = sys_uuid.uuid4()
+    chat_uuid = sys_uuid.uuid4()
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+    )
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    report = {
+        "report_uuid": str(sys_uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(chat_uuid),
+        "observed_generation": 1,
+        "status": "ready",
+        "progress": {
+            "phase": "catalog",
+            "completed": 1,
+            "total": 1,
+            "last_progress_at": observed_at,
+        },
+        "safe_error": None,
+        "observed_at": observed_at,
+        "catalog": {"external_account_uuid": str(account_uuid)},
+    }
+
+    class Session:
+        def execute(self, statement, params):
+            if 'SELECT "canonical_sha256"' in statement:
+                return _Result()
+            if 'SELECT "operation", "generation"' in statement:
+                return _Result({"operation": "upsert", "generation": 1})
+            if "SELECT MAX" in statement:
+                return _Result({"generation": None})
+            if "INSERT INTO" in statement:
+                return _Result({"canonical_sha256": "inserted"})
+            return _Result()
+
+    repository = sql_state.SQLControlState(sys_uuid.uuid4(), b"k" * 32)
+    monkeypatch.setattr(
+        repository,
+        "_reconcile_observed_report",
+        lambda *_args: (_ for _ in ()).throw(
+            identity_linking.ProviderScopeConflict("conflict")
+        ),
+    )
+
+    result = repository.reconcile_observed_reports(Session(), identity, [report])
+
+    assert result == {
+        "results": [
+            {
+                "report_uuid": report["report_uuid"],
+                "status": "rejected",
+                "safe_error": {
+                    "code": "provider_scope_conflict",
+                    "message": (
+                        "Provider chat is already selected in another "
+                        "Workspace project"
+                    ),
+                    "retryable": False,
+                },
+            }
+        ]
+    }
+
+
 def test_concurrent_observed_report_retry_is_idempotent(monkeypatch):
     bridge_uuid = sys_uuid.uuid4()
     report_uuid = sys_uuid.uuid4()

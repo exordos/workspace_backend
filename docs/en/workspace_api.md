@@ -1,0 +1,2087 @@
+# Workspace v1 API
+
+This document describes the browser-facing API contract composed by nginx from
+the preserved `workspace-messenger-api`, the common `workspace-api`, and the
+companion `workspace-messenger-events` websocket service. Public Messenger
+requests use the dedicated Messenger process; common users, client service
+settings, push-device registrations, and REST events use `workspace-api`.
+Standalone Mail, Calendar, and External Users endpoints are not part of this
+release. Provider-neutral external account, chat, operation, policy, health,
+and bridge-instance resources are part of the Messenger API.
+
+Native Messenger resources, membership, user state, events, provider mappings,
+and client settings are canonical in PostgreSQL. The existing provenance fields
+preserve provider identity without changing the browser API.
+
+## Runtime Entry Points
+
+Direct local services:
+
+```text
+Messenger REST API:  http://127.0.0.1:21081/v1
+Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
+Workspace REST API:  http://127.0.0.1:21084/v1
+Worker:              workspace-messenger-worker
+Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
+Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
+```
+
+The backend nginx manifest exposes these internal gateway routes. The public
+`workspace_ui` load balancer proxies `/api/` to this gateway without rewriting
+the path:
+
+```text
+Workspace REST root: /api/workspace/v1/...
+Messenger REST:      /api/workspace/v1/messenger/...
+Events REST:         /api/workspace/v1/events/...
+Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epoch_generation=<generation>
+OpenAPI spec:        /api/workspace/specifications/3.0.3
+```
+
+`/api/workspace/v1/messenger/` is proxied to the preserved Messenger REST
+service on `127.0.0.1:21081`; the remainder of `/api/workspace/` is proxied to
+the Workspace REST service on `127.0.0.1:21084`.
+The exact nginx location `/api/workspace/v1/events/ws` is proxied to the
+websocket service endpoint `/v1/events/ws` on `127.0.0.1:21082`.
+
+The backend nginx manifest sets `client_max_body_size 50m` for proxied requests.
+It does not serve the web UI; unmatched non-API paths return `404`.
+
+## General Rules {#general-rules}
+
+- Request and response bodies are JSON (`application/json`).
+- Resource identifiers are UUIDs unless a field explicitly says otherwise.
+- Timestamps are UTC datetimes serialized as ISO-8601 strings.
+- REST authentication uses a Genesis IAM bearer token:
+
+```http
+Authorization: Bearer <token>
+```
+
+To get a token in the local test environment, request it from Exordos Core IAM
+through the gateway and use the `access_token` field from the response:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+
+grant_type=login%2Bpassword&
+login=<test-user>&
+password=<test-password>&
+scope=openid+email+profile+project%3A<project-uuid>&
+ttl=3600&
+refresh_ttl=172800
+```
+
+The same token request can also be sent as JSON:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/json
+Accept: application/json
+
+{
+  "grant_type": "login+password",
+  "login": "<test-user>",
+  "password": "<test-password>",
+  "scope": "openid email profile project:<project-uuid>",
+  "ttl": 3600,
+  "refresh_ttl": 172800
+}
+```
+
+The UI client uses the IAM default client. No client credentials are required or
+sent from browser-side code. `ttl=3600` means the access token is issued for 1
+hour. `refresh_ttl=172800` means the refresh token is issued for 2 days.
+
+Example authenticated request:
+
+```http
+GET /api/workspace/v1/messenger/folders/
+Authorization: Bearer <access_token from IAM response>
+```
+
+To refresh an expired access token, send the refresh token to the same default
+client endpoint:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/x-www-form-urlencoded
+Accept: application/json
+
+grant_type=refresh_token&
+refresh_token=<refresh_token from IAM response>
+```
+
+JSON refresh body is also accepted:
+
+```http
+POST /api/core/v1/iam/clients/default/actions/get_token/invoke
+Content-Type: application/json
+Accept: application/json
+
+{
+  "grant_type": "refresh_token",
+  "refresh_token": "<refresh_token from IAM response>"
+}
+```
+
+Use the new `access_token` from the response for subsequent messenger API
+requests. If the refresh response includes a new `refresh_token`, replace the
+stored refresh token with it.
+
+`user_uuid` is taken from IAM token information. `project_id` is taken from IAM
+introspection information. User-scoped resources automatically filter and/or
+write the current `user_uuid`.
+
+Typical RESTAlchemy/IAM error response:
+
+```json
+{
+  "type": "ValidationErrorException",
+  "code": 400,
+  "message": "Validation error occurred."
+}
+```
+
+The HTTP response body is the error object itself; there is no outer `json`
+wrapper. Messenger validation errors use HTTP `400`. The following public
+operations provide a more specific application code in the same `code` field:
+
+| Application code | Type | Operation |
+| --- | --- | --- |
+| `400001004` | `InvalidStreamBindingRoleError` | Add users with an unsupported binding role. |
+| `400001005` | `StreamBindingUsersPayloadError` | Add users with a role value that is not a list of user UUIDs. |
+| `400001006` | `InvalidTopicNotificationModeError` | Select a topic notification mode that is incompatible with the stream mode. |
+| `400001007` | `StreamDefaultTopicNotConfiguredError` | Create a message without `topic_uuid` when the stream has no default topic. |
+
+Messenger resources keep a canonical provenance projection instead of exposing
+transport identifiers:
+
+```json
+{
+  "provider": {
+    "kind": "zulip",
+    "account_uuid": "account-uuid",
+    "external_id": "provider-entity-id",
+    "capabilities": {},
+    "delivery_class": "live",
+    "notification_eligible": true
+  },
+  "delivery": {
+    "external_operation_uuid": "operation-uuid",
+    "status": "pending",
+    "safe_error": null,
+    "can_retry": false,
+    "can_discard": false,
+    "duplicate_risk": false,
+    "retry_requires_confirmation": false,
+    "original_url": null,
+    "reconciliation_reason": null,
+    "updated_at": "2026-07-15T09:30:00.000000Z"
+  }
+}
+```
+
+`provider.capabilities` contains effective action descriptors. For inbound
+provider projections `delivery_class` is `live` or `backfill`, and
+`notification_eligible` freezes whether the message could notify when the
+backend accepted it. Backfill and live traffic accepted before the account
+notification gate opens are `false`; clients must suppress desktop
+notification, sound, and attention for those messages. Local resources have
+`provider: null` and `delivery: null`. Provider sync cursors, raw protocol
+payloads, credential material, and internal database state are not part of the
+UI contract.
+
+
+The browser client uses the same IAM bearer token and project scope for every
+domain. The public server-discovery endpoint is
+`GET /api/workspace/v1/messenger/server_settings`; it is the only
+unauthenticated Workspace endpoint used by the UI.
+
+This is a greenfield public layout. There are no compatibility aliases for
+`/api/messenger/**`, `/api/v1/**`,
+`/api/workspace/v1/messenger/events/**`, or the former messenger websocket
+path. There is no browser-facing Provider API. Independently deployed provider
+runtimes use the private bridge-authenticated API rooted at
+`/api/workspace-provider/v1`; its operations commit ordinary Messenger
+resources into PostgreSQL, so it does not change the browser contract described
+in this document. The private contract is defined in
+[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+
+## Pagination And Filters
+
+Collection endpoints use RESTAlchemy cursor pagination:
+
+| Query parameter | Type | Description |
+| --- | --- | --- |
+| `page_limit` | integer | Maximum number of items. `0` or an omitted value means no explicit limit. |
+| `page_marker` | UUID or integer | Marker for the next page. UUID resources use the previous page's last `uuid`; events use the previous page's last `epoch_version` and require the matching `epoch_generation` whenever that marker is non-zero. |
+
+If `page_limit` is provided, responses include `X-Pagination-Limit`. If another
+page exists, responses also include `X-Pagination-Marker`.
+
+`GET /api/workspace/v1/messenger/messages/` uses a stable composite keyset.
+Set `sort_key=created_at` and `sort_dir=asc` or `sort_dir=desc`; rows are ordered
+by `(created_at, uuid)` in that direction. `page_marker` remains the UUID of the
+last row returned to preserve the public client contract. The server resolves
+that UUID inside the same IAM project, authenticated-user view, and message
+filter scope, then continues strictly after its composite key. A marker outside
+that scope is not accepted. `X-Pagination-Marker` is emitted only when a
+`page_limit + 1` probe proves that another row exists, so a full final page does
+not advertise a nonexistent continuation.
+
+`GET /api/workspace/v1/messenger/drafts/` uses the same UUID-marker contract,
+ordered by `(updated_at, uuid)`. Set `sort_key=updated_at` and
+`sort_dir=asc|desc`; optional `stream_uuid` and `topic_uuid` filters remain
+inside the authenticated owner and project scope. A marker outside that exact
+scope returns `404`.
+
+Workspace collection controllers also support conditional filter suffixes:
+
+| Suffix | Meaning | Example |
+| --- | --- | --- |
+| `>` | strictly greater than | `epoch_version>123` |
+| `<` | strictly less than | `epoch_version<123` |
+| `=>` | greater than or equal | `epoch_version=>123` |
+| `=<` | less than or equal | `epoch_version=<123` |
+
+When a query parameter name contains `>` or `<`, URL-encode it if the HTTP
+client does not do that automatically:
+
+```http
+GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_limit=500
+```
+
+Event pagination and reconnect use the cursor pair
+`(epoch_generation, epoch_version)`, not an epoch number alone. A cold cursor
+of `0` may omit `epoch_generation`. If the retained event suffix no longer
+starts at epoch `1`, that cold request returns the same HTTP 410 gap response
+as any other cursor that cannot produce a complete delta; the client must load
+authoritative snapshots before starting a new cursor.
+
+## Endpoint Summary {#endpoint-summary}
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/api/workspace/v1/` | List routes below `/api/workspace/v1/`. |
+| `GET` | `/api/workspace/v1/messenger/` | List Messenger routes below `/api/workspace/v1/messenger/`. |
+| `GET` | `/api/workspace/v1/messenger/server_settings` | Return Zulip-like server settings. |
+| `GET` | `/api/workspace/v1/messenger/server_settings/` | Same as above; trailing slash is supported. |
+| `GET` | `/api/workspace/v1/messenger/folders/` | List folders for the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/folders/` | Create a folder. |
+| `GET` | `/api/workspace/v1/messenger/folders/{folder_uuid}` | Get a folder. |
+| `PUT` | `/api/workspace/v1/messenger/folders/{folder_uuid}` | Update a folder. |
+| `DELETE` | `/api/workspace/v1/messenger/folders/{folder_uuid}` | Delete a folder. |
+| `GET` | `/api/workspace/v1/messenger/folder_items/` | List folder items for the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/folder_items/` | Create a folder item. |
+| `GET` | `/api/workspace/v1/messenger/folder_items/{folder_item_uuid}` | Get a folder item. |
+| `DELETE` | `/api/workspace/v1/messenger/folder_items/{folder_item_uuid}` | Delete a folder item. |
+| `POST` | `/api/workspace/v1/messenger/folder_items/{folder_item_uuid}/actions/pin/invoke` | Pin a folder item. |
+| `POST` | `/api/workspace/v1/messenger/folder_items/{folder_item_uuid}/actions/unpin/invoke` | Unpin a folder item. |
+| `GET` | `/api/workspace/v1/messenger/streams/` | List streams visible to the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/streams/` | Create a stream. |
+| `GET` | `/api/workspace/v1/messenger/streams/{stream_uuid}` | Get a stream. |
+| `PUT` | `/api/workspace/v1/messenger/streams/{stream_uuid}` | Update a stream. |
+| `DELETE` | `/api/workspace/v1/messenger/streams/{stream_uuid}` | Delete a stream for all stream users. |
+| `POST` | `/api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke` | Add users to a stream by role. |
+| `POST` | `/api/workspace/v1/messenger/streams/{stream_uuid}/actions/archive/invoke` | Set `is_archived: true`. |
+| `POST` | `/api/workspace/v1/messenger/streams/{stream_uuid}/actions/unarchive/invoke` | Set `is_archived: false`. |
+| `POST` | `/api/workspace/v1/messenger/streams/{stream_uuid}/actions/notifications/invoke` | Set current user's stream notification mode. |
+| `POST` | `/api/workspace/v1/messenger/streams/{stream_uuid}/actions/read/invoke` | Mark all unread stream messages as read for the current user. |
+| `GET` | `/api/workspace/v1/messenger/stream_bindings/` | List stream bindings. |
+| `GET` | `/api/workspace/v1/messenger/stream_bindings/{binding_uuid}` | Get a stream binding. |
+| `PUT` | `/api/workspace/v1/messenger/stream_bindings/{binding_uuid}` | Update a stream binding. |
+| `DELETE` | `/api/workspace/v1/messenger/stream_bindings/{binding_uuid}` | Remove a user from a stream. |
+| `GET` | `/api/workspace/v1/messenger/stream_topics/` | List topics visible to the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/` | Create a topic. |
+| `GET` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}` | Get a topic. |
+| `PUT` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}` | Rename a topic; body must contain `name`. |
+| `DELETE` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}` | Delete a topic. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` | Toggle the shared `is_done` flag for all topic users. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/notifications/invoke` | Set current user's topic notification mode. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` | Make the topic its stream's default topic. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_summary_prompt/invoke` | Update owner/administrator-managed per-topic summary configuration, including enable/disable. |
+| `GET` | `/api/workspace/v1/messenger/topic_summary_endpoints/` | List global OpenAI-compatible summary endpoints; requires `workspace.topic_summary_endpoint.manage`. |
+| `POST` | `/api/workspace/v1/messenger/topic_summary_endpoints/` | Create a global summary endpoint with a write-only credential; requires `workspace.topic_summary_endpoint.manage`. |
+| `GET`, `PUT`, `DELETE` | `/api/workspace/v1/messenger/topic_summary_endpoints/{endpoint_uuid}` | Read, update, or delete a global summary endpoint; requires `workspace.topic_summary_endpoint.manage`. |
+| `GET`, `PUT` | `/api/workspace/v1/messenger/topic_summary_settings/{project_uuid}` | Read both summary gates or update both with `workspace.topic_summary_settings.manage`. |
+| `POST` | `/api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/read/invoke` | Mark all unread topic messages as read for the current user. |
+| `GET` | `/api/workspace/v1/messenger/messages/` | List messages visible to the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/messages/` | Create a message. |
+| `GET` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Get a message. |
+| `PUT` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Update a message payload. |
+| `DELETE` | `/api/workspace/v1/messenger/messages/{message_uuid}` | Delete a message. |
+| `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read/invoke` | Mark message as read for the current user. |
+| `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/read_up_to/invoke` | Mark unread messages in the same topic up to this message as read. |
+| `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/star/invoke` | Star message for the current user. |
+| `POST` | `/api/workspace/v1/messenger/messages/{message_uuid}/actions/unstar/invoke` | Unstar message for the current user. |
+| `GET` | `/api/workspace/v1/messenger/drafts/` | List the current user's drafts, optionally filtered by stream or topic. |
+| `POST` | `/api/workspace/v1/messenger/drafts/` | Create a draft with a client-generated UUID. |
+| `GET` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Get an owned draft and its strong revision ETag. |
+| `PUT` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Replace only the Markdown payload using `If-Match`. |
+| `DELETE` | `/api/workspace/v1/messenger/drafts/{draft_uuid}` | Hard-delete an owned draft using `If-Match`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/` | List the current user's realm-global external accounts; requires `workspace.external_account.read`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/` | Create an external account with a client-generated UUID and write-only credential; requires `workspace.external_account.create`. |
+| `GET` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Get the owner's sanitized external-account snapshot; requires `workspace.external_account.read`. |
+| `PUT` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Replace mutable non-secret settings using `If-Match`; requires `workspace.external_account.update`. |
+| `DELETE` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}` | Delete the account and its projection; requires `workspace.external_account.delete`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | Validate and replace the write-only credential, then resume synchronization; requires `workspace.external_account.reconnect`. |
+| `POST` | `/api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | Stop synchronization while retaining the read-only projection; requires `workspace.external_account.disconnect`. |
+| `GET` | `/api/workspace/v1/messenger/external_chats/` | List the owner's sanitized external chat catalog and assignment state. |
+| `GET` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}` | Get one sanitized external-chat snapshot. |
+| `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/select/invoke` | Select a chat and assign it to a project. |
+| `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/deselect/invoke` | Cancel work and remove the chat projection. |
+| `POST` | `/api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/move/invoke` | Atomically move a projection to another project using `If-Match`. |
+| `GET` | `/api/workspace/v1/messenger/external_operations/` | List the owner's external operations. |
+| `GET` | `/api/workspace/v1/messenger/external_operations/{operation_uuid}` | Get sanitized operation status. |
+| `DELETE` | `/api/workspace/v1/messenger/external_operations/{operation_uuid}` | Discard eligible work. |
+| `POST` | `/api/workspace/v1/messenger/external_operations/{operation_uuid}/actions/retry/invoke` | Retry an eligible failed operation. |
+| `POST` | `/api/workspace/v1/messenger/external_operations/actions/preflight/invoke` | Check capability and conversion loss before an outgoing mutation. |
+| `GET` | `/api/workspace/v1/messenger/external_bridge_instances/` | List sanitized bridge instances; requires the dedicated IAM read permission. |
+| `GET` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}` | Get sanitized bridge identity, health, capability, and certificate state. |
+| `POST` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/suspend/invoke` | Suspend a bridge identity. |
+| `POST` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/resume/invoke` | Resume a non-revoked bridge identity. |
+| `POST` | `/api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/revoke/invoke` | Revoke the active bridge certificate generation. |
+| `GET` | `/api/workspace/v1/messenger/external_provider_policies/{kind}` | Read the sanitized realm policy for a provider kind. |
+| `PUT` | `/api/workspace/v1/messenger/external_provider_policies/{kind}` | Update provider policy using `If-Match` and the dedicated IAM permission. |
+| `POST` | `/api/workspace/v1/messenger/external_provider_policies/{kind}/actions/suspend/invoke` | Suspend a provider kind realm-wide. |
+| `POST` | `/api/workspace/v1/messenger/external_provider_policies/{kind}/actions/resume/invoke` | Resume a provider kind after validation. |
+| `GET` | `/api/workspace/v1/messenger/external_provider_health/{kind}` | Read sanitized aggregate provider health. |
+| `GET` | `/api/workspace/v1/messenger/message_reactions/` | List reactions for messages visible to the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/message_reactions/` | Create a message reaction. |
+| `GET` | `/api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Get a message reaction visible through message access. |
+| `PUT` | `/api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Update the current user's reaction. |
+| `DELETE` | `/api/workspace/v1/messenger/message_reactions/{reaction_uuid}` | Delete the current user's reaction. |
+| `GET` | `/api/workspace/v1/messenger/files/` | List files visible to the current IAM user. |
+| `POST` | `/api/workspace/v1/messenger/files/` | Create file metadata or upload multipart file data. |
+| `GET` | `/api/workspace/v1/messenger/files/{file_uuid}` | Get a visible file metadata record. |
+| `PUT` | `/api/workspace/v1/messenger/files/{file_uuid}` | Update an owned file metadata record. |
+| `DELETE` | `/api/workspace/v1/messenger/files/{file_uuid}` | Delete an owned file and its access rows. |
+| `GET` | `/api/workspace/v1/messenger/files/{file_uuid}/actions/download` | Download visible file bytes. |
+| `GET` | `/api/workspace/v1/services/` | List available Workspace services. |
+| `GET` | `/api/workspace/v1/services/{service_uuid}` | Get one available Workspace service. |
+| `PUT` | `/api/workspace/v1/push_devices/{registration_uuid}` | Idempotently register or rotate the current user's push device. |
+| `DELETE` | `/api/workspace/v1/push_devices/{registration_uuid}` | Idempotently delete the current user's push device registration. |
+| `GET` | `/api/workspace/v1/events/` | List durable realtime events for the current IAM user. |
+| `GET` | `/api/workspace/v1/epoch/` | Return the current user's latest visible event epoch. |
+| `GET` | `/api/workspace/v1/users/` | List workspace users. |
+| `GET` | `/api/workspace/v1/users/{user_uuid}` | Get a workspace user. |
+| `POST` | `/api/workspace/v1/users/{user_uuid}/actions/presence/invoke` | Update current user's presence status and heartbeat timestamp. |
+| `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Upload and select the current user's avatar. |
+| `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Remove the current user's custom avatar and restore the canonical Gravatar URN. |
+| `GET` | `/api/workspace/v1/me/` | Return the current authenticated Workspace user. |
+
+### External integration contract boundary
+
+The endpoint table above is the canonical inventory of the current
+IAM-authenticated browser routes. The generated OpenAPI is authoritative for
+the request and response schemas of controller-backed HTTP operations, subject
+to the message-reaction projection exception documented below. The
+`server_settings` middleware aliases and the Events WebSocket are runtime entry
+points documented in this file but are not generated OpenAPI operations.
+
+External account settings, chat source metadata, and operation details use
+dynamic kind models. Zulip is the first registered kind; adding another kind
+does not add provider-specific collection routes. Detailed sanitized resource
+examples, ETag and `If-Match` rules, action permissions, lifecycle semantics,
+and administration behavior for accounts, chats, operations, bridge instances,
+provider policies, and provider health are defined in sections 5 and 6 of
+[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+Its private control, provider data-plane, and file-transfer sections describe
+backend-to-bridge contracts and are not part of the public browser API.
+
+## Server Settings {#server-settings}
+
+`GET /api/workspace/v1/messenger/server_settings` is public and does not require `Authorization`. It is
+implemented by middleware and does not use the resource router. Unsupported
+query parameters are reported in
+`ignored_parameters_unsupported`. `realm_url` and `realm_uri` use the request
+`Host` header and default to the public HTTPS scheme. A trusted reverse proxy
+may explicitly provide `X-Forwarded-Proto`; the packaged Workspace nginx
+configuration sets it to `https` because TLS is terminated before the internal
+HTTP hop. `realm_icon` uses `urn:url:<https-url>` for an anonymously
+retrievable organization emblem. Clients unwrap the URN and use its HTTPS URL
+directly. The value is derived from the canonical request realm as
+`urn:url:<realm>/logo-512x512.png`; nginx serves that path from the packaged
+512×512 organization emblem.
+
+Example response:
+
+```json
+{
+  "result": "success",
+  "msg": "Welcome to Exordos Workspace",
+  "authentication_methods": {
+    "password": true,
+    "dev": false,
+    "email": true,
+    "ldap": false,
+    "remoteuser": false,
+    "github": false,
+    "azuread": false,
+    "gitlab": false,
+    "google": false,
+    "apple": false,
+    "saml": false,
+    "openid connect": false
+  },
+  "push_notifications_enabled": true,
+  "email_auth_enabled": true,
+  "require_email_format_usernames": true,
+  "realm_url": "https://workspace.example.com",
+  "realm_name": "Exordos Workspace",
+  "realm_icon": "urn:url:https://workspace.example.com/logo-512x512.png",
+  "realm_description": "<p>Exordos Workspace messenger.</p>",
+  "realm_web_public_access_enabled": false,
+  "meet_url": "https://meet.genesis-core.tech",
+  "external_authentication_methods": [],
+  "realm_uri": "https://workspace.example.com"
+}
+```
+
+## Push Devices {#push-devices}
+
+`PUT /api/workspace/v1/push_devices/{registration_uuid}` is a replacement-style
+upsert. The client generates a stable UUID per application installation. The
+first registration returns `201`; replacing its FCM token or encryption key
+returns `200`. The registration is always scoped to both the authenticated
+`user_uuid` and the IAM `project_id`.
+
+```json
+{
+  "transport": "fcm",
+  "platform": "ios",
+  "registration_token": "<FCM registration token>",
+  "encryption": {
+    "kind": "HPKE",
+    "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+    "key_uuid": "248305f4-ecdf-4206-8e93-95f830ea8ad6",
+    "public_key": "<unpadded base64url X25519 public key>"
+  }
+}
+```
+
+`encryption` is a RESTAlchemy kind model. The only supported kind is `HPKE`,
+using Base mode with X25519, HKDF-SHA256, and AES-256-GCM. `public_key` must be
+the canonical unpadded base64url encoding of exactly 32 bytes. For the initial
+API version, the response mirrors `registration_token` and `public_key` from
+the stored model. The supported platforms are currently `android` and `ios`.
+
+```json
+{
+  "uuid": "7c1af344-95e1-487e-8b51-d1af0370cdb5",
+  "transport": "fcm",
+  "platform": "ios",
+  "encryption": {
+    "kind": "HPKE",
+    "algorithm": "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM",
+    "key_uuid": "248305f4-ecdf-4206-8e93-95f830ea8ad6",
+    "public_key": "<unpadded base64url X25519 public key>"
+  },
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "registration_token": "<FCM registration token>",
+  "created_at": "2026-07-26T05:30:00Z",
+  "updated_at": "2026-07-26T05:40:00Z"
+}
+```
+
+`DELETE` returns `204` both when it removes the owned registration and when that
+registration is already absent. This contract only manages registrations; push
+payload encryption and delivery are outside this API change.
+
+## Folders {#folders}
+
+`POST /api/workspace/v1/messenger/folders/` writes to `m_folders`. Reads use `m_folders_view`.
+Responses hide `project_id` and `user_uuid`.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Folder identifier. |
+| `title` | string, 1..64 | yes | no | Folder title. |
+| `background_color_value` | integer `0..2^32-1` or `null` | no | no | ARGB color value. |
+| `unread_count` | integer | no | yes | Aggregated active unread count. Muted traffic is excluded. |
+| `system_type` | `all`, `created`, or `null` | no | yes | System folder type; defaults to `created`. |
+| `folder_items` | array | no | yes | Nested folder items from the view. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Create request:
+
+```json
+{
+  "title": "Inbox",
+  "background_color_value": 4280391411
+}
+```
+
+Example:
+
+```http
+POST /api/workspace/v1/messenger/folders/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "title": "Inbox",
+  "background_color_value": 4280391411
+}
+```
+
+Response example:
+
+```json
+{
+  "uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "title": "Inbox",
+  "background_color_value": 4280391411,
+  "unread_count": 3,
+  "system_type": "created",
+  "folder_items": [
+    {
+      "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+      "project_id": "22222222-2222-2222-2222-222222222222",
+      "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+      "user_uuid": "11111111-1111-1111-1111-111111111111",
+      "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+      "chat_type": "stream",
+      "order_index": 10,
+      "pinned_at": null,
+      "unread_count": 3,
+      "active_unread_count": 3,
+      "passive_unread_count": 0,
+      "created_at": "2026-06-22T09:30:00Z",
+      "updated_at": "2026-06-22T09:30:00Z"
+    }
+  ],
+  "created_at": "2026-06-22T09:30:00Z",
+  "updated_at": "2026-06-22T09:30:00Z"
+}
+```
+
+Update example:
+
+```http
+PUT /api/workspace/v1/messenger/folders/50ecadd0-9823-4d97-b54c-806cc672c210
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "title": "Archive",
+  "background_color_value": 4289352960
+}
+```
+
+Delete example:
+
+```http
+DELETE /api/workspace/v1/messenger/folders/50ecadd0-9823-4d97-b54c-806cc672c210
+Authorization: Bearer <access_token>
+```
+
+Realtime side effects:
+
+| Operation | payload.kind | object_type | Payload |
+| --- | --- | --- | --- |
+| create folder | `folder.created` | `folder` | Full folder snapshot. |
+| update folder | `folder.updated` | `folder` | Full folder snapshot. |
+| delete folder | `folder.deleted` | `folder` | Only `folder.uuid`. |
+
+## Folder Items {#folder-items}
+
+`POST /api/workspace/v1/messenger/folder_items/` writes to `m_folder_items`. Reads use
+`m_folder_items_created_view`.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Folder item identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `folder_uuid` | UUID | yes | no | Folder UUID. |
+| `user_uuid` | UUID | no | yes | IAM user scope. |
+| `stream_uuid` | UUID | yes | no | Stream UUID. |
+| `chat_type` | `stream`, `group`, `private` | yes | no | Chat type. |
+| `order_index` | integer or `null` | no | no | Manual sort index. |
+| `pinned_at` | datetime or `null` | no | action-managed | Pin timestamp. |
+| `unread_count` | integer | no | yes | Raw unread count for this stream and user. |
+| `active_unread_count` | integer | no | yes | Unread messages eligible under the effective stream/topic notification modes. |
+| `passive_unread_count` | integer | no | yes | Remaining unread messages from muted notification traffic. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Create request:
+
+```json
+{
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10
+}
+```
+
+Create example:
+
+```http
+POST /api/workspace/v1/messenger/folder_items/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10
+}
+```
+
+Response example:
+
+```json
+{
+  "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10,
+  "pinned_at": null,
+  "unread_count": 0,
+  "active_unread_count": 0,
+  "passive_unread_count": 0,
+  "created_at": "2026-06-22T09:30:00Z",
+  "updated_at": "2026-06-22T09:30:00Z"
+}
+```
+
+Pin and unpin return the same folder item shape. `pin` sets `pinned_at` to the
+current UTC time; `unpin` sets it to `null`.
+
+Pin example:
+
+```http
+POST /api/workspace/v1/messenger/folder_items/9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50/actions/pin/invoke
+Authorization: Bearer <access_token>
+```
+
+Pin response example:
+
+```json
+{
+  "uuid": "9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "folder_uuid": "50ecadd0-9823-4d97-b54c-806cc672c210",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "chat_type": "stream",
+  "order_index": 10,
+  "pinned_at": "2026-06-22T09:31:00Z",
+  "unread_count": 0,
+  "active_unread_count": 0,
+  "passive_unread_count": 0,
+  "created_at": "2026-06-22T09:30:00Z",
+  "updated_at": "2026-06-22T09:31:00Z"
+}
+```
+
+Unpin example:
+
+```http
+POST /api/workspace/v1/messenger/folder_items/9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50/actions/unpin/invoke
+Authorization: Bearer <access_token>
+```
+
+Delete example:
+
+```http
+DELETE /api/workspace/v1/messenger/folder_items/9f41b1a7-77f9-4c12-bdc6-d3cebc5dbf50
+Authorization: Bearer <access_token>
+```
+
+Realtime side effects:
+
+| Operation | payload.kind | object_type | Payload |
+| --- | --- | --- | --- |
+| add stream to folder | `folder.updated` | `folder` | Full parent folder snapshot with `folder_items`. |
+| pin stream in folder | `folder.updated` | `folder` | Full parent folder snapshot with updated `pinned_at`. |
+| unpin stream in folder | `folder.updated` | `folder` | Full parent folder snapshot with `pinned_at: null`. |
+| remove stream from folder | `folder_item.deleted` | `folder_item` | Only `folder_item.uuid`. |
+
+## Streams
+
+`POST /api/workspace/v1/messenger/streams/` commits the canonical stream,
+binding, default topic, and realtime side effects in PostgreSQL. It creates a
+default topic named `General Topic` and stores its UUID as
+`default_topic_uuid`.
+The reference is nullable and becomes `null` when the current default topic is
+deleted. REST resource responses follow the standard RestAlchemy JSON packer
+and omit nullable fields whose value is `null`, so clients must also treat a
+missing `default_topic_uuid` as `null`. Durable `stream.updated` events are full
+snapshots and keep `default_topic_uuid: null` explicitly.
+
+If `direct_user_uuid` is provided, the backend creates an ordinary stream with
+the same bindings, roles, topics, events, and file ACL rules as every other
+chat. Its only additional invariants are `private: true`, a deterministic
+project-scoped stream UUID for the unordered identity pair, and `owner`
+bindings for the unique users in that pair. An ordinary direct chat has two
+different participants. A self chat uses the repeated pair `(user, user)`,
+contains exactly one binding for the current user, and returns the current user
+UUID in `direct_user_uuid`. Repeating or concurrently sending the same request
+for one pair returns the existing stream. Reusing the pair with conflicting
+source or direct identity fields returns HTTP `400` instead of changing or
+silently ignoring the requested identity.
+
+Supported source payloads:
+
+```json
+{
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  }
+}
+```
+
+```json
+{
+  "source_name": "zulip",
+  "source": {
+    "kind": "zulip",
+    "stream_id": 123,
+    "server_url": "https://zulip.example.com",
+    "topic_name": null,
+    "message_id": null
+  }
+}
+```
+
+The `zulip` payload shape is provider provenance. An enrolled Zulip runtime
+populates it through the private Provider HTTP API; the browser contract hides
+raw provider protocol identifiers, credentials, and synchronization state.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Stream identifier. |
+| `name` | string, max 255 | yes | no | Stream name. |
+| `description` | string, max 255 | no | no | Stream description; defaults to an empty string. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `owner` | UUID | no | yes | Owner from the user stream view. |
+| `user_uuid` | UUID | no | yes | Current user in the user stream view. |
+| `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | yes | Current user's role. |
+| `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | user-scoped action-managed | Current user's stream notification mode; defaults to `all_messages`. |
+| `unread_count` | integer | no | yes | Current user's raw unread count. |
+| `active_unread_count` | integer | no | yes | Current user's unread count eligible under the effective stream/topic notification modes. |
+| `passive_unread_count` | integer | no | yes | Current user's remaining unread count from muted notification traffic. |
+| `source_name` | `native`, `zulip` | no | no | Source name; defaults to `native`. |
+| `source` | object | no | no | Source payload; defaults to `{"kind": "native"}`. |
+| `invite_only` | boolean | no | no | Invite-only stream flag. |
+| `announce` | boolean | no | no | Announcement stream flag. |
+| `direct_user_uuid` | UUID | no | no | Direct-chat counterpart. Equals the current user UUID only for a self chat. |
+| `private` | boolean | no | yes | Private stream flag. |
+| `is_archived` | boolean | no | action-managed | Archived flag. |
+| `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
+| `last_message_uuid` | UUID or `null` | no | yes | Latest message in the stream, or `null` when empty. |
+| `default_topic_uuid` | UUID or `null` | no | yes | Current default topic UUID, or `null` when no default is configured. |
+| `provider` | object or `null` | no | yes | Provider badge for provider-backed streams; `null` for native streams. |
+| `delivery` | object or `null` | no | yes | Current provider command delivery projection. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Create request:
+
+```json
+{
+  "name": "Engineering",
+  "description": "Engineering workspace",
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  },
+  "invite_only": false,
+  "announce": false
+}
+```
+
+Direct chat create request:
+
+```json
+{
+  "name": "Direct",
+  "description": "Private workspace",
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  },
+  "direct_user_uuid": "33333333-3333-3333-3333-333333333333"
+}
+```
+
+Self chat create request:
+
+```json
+{
+  "name": "Personal notes",
+  "description": "",
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  },
+  "direct_user_uuid": "11111111-1111-1111-1111-111111111111"
+}
+```
+
+For a self chat, `direct_user_uuid` must equal the current IAM user UUID,
+including the token subject UUID. Self chats are native-only. The response is
+the standard stream resource with `private: true`, one current-user `owner`
+binding, and the same current-user UUID in `direct_user_uuid`; no separate chat
+type or self-chat flag is exposed. This makes
+`private && direct_user_uuid == current_user_uuid` the stable client-side
+identity check while preserving ordinary private-group streams, whose
+`direct_user_uuid` remains `null`.
+
+Direct membership is immutable. Its bindings must equal the unique users in
+the identity pair: one binding for a self chat and two for an ordinary direct
+chat. Adding or removing participants and updating a binding role returns HTTP
+`400`. Deleting a self-chat stream also returns HTTP `400` so message history
+cannot be replaced by deleting and recreating the deterministic identity.
+`source_name` must match `source.kind` when a stream is created. Both source
+fields are immutable for every stream. For a direct chat, `direct_user_uuid`,
+`private`, and the internal `private_index` are also immutable; attempts to
+change any of these identity fields return HTTP `400`.
+
+Stream notification mode request:
+
+```http
+POST /api/workspace/v1/messenger/streams/75309057-419c-4b12-a7c1-3932429ec4a6/actions/notifications/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "notification_mode": "mentions_only"
+}
+```
+
+Native stream mutations update canonical PostgreSQL state and their realtime
+side effects in the request transaction. The nullable `provider` and
+`delivery` fields describe an external projection and operation state; both are
+`null` for native streams.
+
+Stream read action:
+
+```http
+POST /api/workspace/v1/messenger/streams/75309057-419c-4b12-a7c1-3932429ec4a6/actions/read/invoke
+Authorization: Bearer <access_token>
+```
+
+`read` marks all unread messages in the stream as read for the current user and
+returns the updated stream view.
+
+Realtime side effects:
+
+| Operation | payload.kind | object_type | Payload |
+| --- | --- | --- | --- |
+| create stream | `stream.created` | `stream` | Full user stream snapshot. |
+| create stream | `folder.updated` | `folder` | Updated `All chats` and `Channels`/`Personal` system folder snapshots. |
+| update stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
+| archive or unarchive stream | `stream.updated` | `stream` | Full user stream snapshot for every stream user. |
+| change stream notification mode | `stream.updated` | `stream` | Full user stream snapshot for the current user only. |
+| read stream messages | `stream.read` | `stream` | Full user stream snapshot returned by the action. |
+| read stream messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
+| delete stream | `stream.deleted` | `stream` | Only deleted stream `uuid`, sent to every stream user. |
+| delete stream | `folder.updated` | `folder` | Updated affected users' system/custom folder snapshots after the stream is removed. |
+| add stream binding | `stream.created` | `stream` | Added user's full user stream snapshot. |
+| add stream bindings | `stream_bindings.created` | `stream_binding` | New stream binding snapshots for existing stream participants. |
+| add stream binding | `folder.updated` | `folder` | Updated added user's `All chats` and `Channels`/`Personal` system folder snapshots. |
+| delete stream binding | `stream.deleted` | `stream` | Only stream `uuid`, sent to the removed user. |
+| delete stream binding | `stream_binding.deleted` | `stream_binding` | Removed binding `uuid`, `stream_uuid`, and `user_uuid`, sent to every remaining stream participant. |
+| delete stream binding | `folder.updated` | `folder` | Updated removed user's system/custom folder snapshots after access is removed. |
+
+For direct private streams, one `stream.created` event is written for each
+participant. Stream creation also writes `folder.updated` events for each
+participant's `All chats` folder and for `Personal` when the stream is private,
+or `Channels` when it is not private.
+
+## Stream Bindings
+
+Stream bindings are canonical PostgreSQL chat-membership records. New bindings
+are created through
+`POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/add_users/invoke`, where
+the request body groups added users by role. `who_uuid` is always overwritten
+with the current IAM user's UUID.
+When a new binding is created, the added user receives a `stream.created`
+event for the newly visible stream and `folder.updated` events for `All chats`
+and either `Personal` or `Channels`, depending on the stream privacy. Existing
+stream participants receive one `stream_bindings.created` event containing the
+new binding snapshots for the whole added batch. Every message committed before
+the binding is created is visible to the new member with `read=true`, so both
+the stream and topic unread counters start at zero. Messages committed after
+the binding are unread until the new member reads them.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Binding identifier. |
+| `project_id` | UUID | yes | no | Project scope. |
+| `stream_uuid` | UUID | yes | no | Stream UUID. |
+| `user_uuid` | UUID | yes | no | User receiving access. |
+| `who_uuid` | UUID | no | yes | User that performed the action. |
+| `role` | `guest`, `member`, `moderator`, `administrator`, `owner` | no | no | Role; defaults to `member`. |
+| `notification_mode` | `mentions_only`, `muted`, `all_messages` | no | no | User's stream notification mode; defaults to `all_messages`. |
+| `notification_updated_at` | datetime | no | no | Last-write-wins timestamp paired with `notification_mode`; defaults to the Unix epoch, and the notification action sets it to the current server time. It is included in REST and realtime binding snapshots. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Add users request:
+
+```json
+{
+  "member": [
+    "33333333-3333-3333-3333-333333333333",
+    "44444444-4444-4444-4444-444444444444"
+  ],
+  "owner": [
+    "55555555-5555-5555-5555-555555555555"
+  ]
+}
+```
+
+Deleting a binding removes that user's access to the stream. The removed user
+receives `stream.deleted` and then `folder.updated` for affected system and
+custom folders. Every remaining stream participant receives
+`stream_binding.deleted` with the removed binding `uuid`, `stream_uuid`, and
+`user_uuid`. For a provider-backed stream, adding and deleting bindings also
+enqueue durable, capability-gated `membership.add` and `membership.remove`
+operations. The provider bridge resolves the mapped provider identity and
+subscribes or unsubscribes it; native streams perform no provider operation.
+
+## Stream Topics
+
+`POST /api/workspace/v1/messenger/stream_topics/` commits the canonical topic,
+its per-user flags, and realtime side effects in PostgreSQL. Reads are scoped
+to the current IAM user through current stream membership.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Topic identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `name` | string, max 128 | yes | no | Topic name. |
+| `stream_uuid` | UUID | yes | no | Stream UUID. |
+| `user_uuid` | UUID | no | yes | Current user in the topic view. |
+| `color` | integer `0..0xFFFFFF` | no | no | Topic color; generated randomly when omitted or `null`. |
+| `last_message_uuid` | UUID or `null` | no | yes | Latest message in the topic, or `null` when empty. |
+| `unread_count` | integer | no | yes | Current user's raw unread count for the topic. |
+| `active_unread_count` | integer | no | yes | Current user's unread mentions for `unmute`, all unread for `follow`, or the inherited active count for `default`. |
+| `passive_unread_count` | integer | no | yes | Current user's remaining unread count after applying the effective notification mode. |
+| `is_default` | boolean | no | yes | Whether this topic UUID equals the stream's `default_topic_uuid`. |
+| `is_done` | boolean | no | action-managed | Current user's done flag. |
+| `notification_mode` | `mute`, `default`, `unmute`, `follow` | no | user-scoped action-managed | Current user's topic notification mode; defaults to `default`. |
+| `summary` | string, max 4096, or `null` | no | yes | Latest LLM-generated summary, written by the server-side summary agent. |
+| `summary_last_message_uuid` | UUID or `null` | no | yes | Latest topic message actually included in `summary`; written by the server-side summary agent, and `null` is valid for an empty topic. |
+| `summary_has_new_messages` | boolean or `null` | no | yes | `null` without a summary; otherwise whether the current latest message differs from `summary_last_message_uuid`. |
+| `summary_enabled` | boolean | no | action-managed | Whether the server-side worker may refresh this topic; defaults to `true`. Disabling preserves the current summary and staleness metadata. |
+| `summary_system_prompt` | string, max 16384, or `null` | no | action-managed | Topic-specific LLM system prompt; `null` selects the application default. |
+| `summary_reasoning_effort` | `off`, `minimal`, `low`, `medium`, `high`, or `null` | no | action-managed | Per-summary reasoning choice; `off` explicitly disables reasoning, while `null` omits the provider option. Used only when the selected endpoint declares reasoning support. |
+| `source_name` | `native`, `zulip` | no | no | Topic source name; defaults to `native` when omitted. |
+| `source` | object | no | no | Topic source payload. |
+| `provider` | object or `null` | no | yes | Provider badge for provider-backed topics; `null` for native topics. |
+| `delivery` | object or `null` | no | yes | Current provider command delivery projection. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+When `summary_system_prompt` is `null`, the application default asks for a
+brief summary that preserves decisions, owners, unresolved questions, and
+important constraints, written in the primary language used in the topic.
+
+Create request:
+
+```json
+{
+  "name": "Releases",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6"
+}
+```
+
+`PUT /api/workspace/v1/messenger/stream_topics/{topic_uuid}` requires a body with `name`. The backend
+checks that the current user has a binding to the topic's stream before
+renaming the topic. Native changes update canonical PostgreSQL state and their
+realtime side effects atomically. Provenance remains unchanged by a rename.
+
+`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/toggle_done/invoke` flips
+`is_done` for all topic users and returns the current user's updated topic view.
+
+`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_default/invoke` sets the
+topic as its stream's default and returns the current user's updated topic
+view. The operation is idempotent. A changed default emits `stream.updated`
+for every stream user and `topic.updated` for the previous and new default
+topics.
+
+Topic summaries are written only by the server-side summary agent through an
+internal helper; there is no public REST action for writing `summary` or
+`summary_last_message_uuid`. The helper stores both fields atomically,
+validates that a non-null boundary identifies a message in the topic, rejects
+an older boundary when a newer one is already stored, and emits
+`topic.updated` snapshots for the stream participants. Every successful write
+also appends a private server-side journal entry containing the summary,
+boundary UUID and ordering timestamp, and generation timestamp. If a covered
+message is hard-deleted, journal entries at or after that message are
+invalidated, the newest earlier entry is restored (or the summary is cleared),
+the stale worker job is discarded, and the restored snapshot is emitted in the
+same transaction.
+
+`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/set_summary_prompt/invoke`
+updates the topic-specific summary configuration:
+
+```json
+{
+  "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
+  "summary_reasoning_effort": "medium",
+  "summary_enabled": true
+}
+```
+
+Setting `summary_system_prompt` to `null` restores the application default.
+Every field is optional, but the request must contain at least one field.
+Omitting a field preserves its current value. Sending
+`summary_reasoning_effort` as `null` clears the reasoning request. Reasoning
+effort belongs to the topic request, not to endpoint configuration. Setting it
+to `off` sends the OpenAI-compatible provider value `none`, explicitly
+disabling model reasoning instead of relying on the provider default. Setting
+`summary_enabled` to `false` cancels pending work for this topic and prevents
+new claims while preserving the current summary; setting it back to `true`
+allows the worker to refresh any stale content.
+Only stream owners and administrators may update this configuration; other roles,
+including moderators, receive `403 Forbidden`.
+
+### Topic summary client workflow
+
+The client reads the summary as part of the ordinary topic snapshot:
+
+```http
+GET /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047
+Authorization: Bearer <access_token>
+```
+
+```json
+{
+  "uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "last_message_uuid": "b5ff6f76-bcfe-4fb9-9c28-e0cb790d2e52",
+  "summary": "The team approved the release scope; two follow-ups remain open.",
+  "summary_last_message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "summary_has_new_messages": true,
+  "summary_enabled": true,
+  "summary_system_prompt": "Summarize decisions and open questions.",
+  "summary_reasoning_effort": "medium"
+}
+```
+
+The UI displays `summary` and can mark it as stale while
+`summary_has_new_messages` is `true`. It does not send messages to an LLM or
+write summary fields. A `topic.updated` event carries the full updated topic
+snapshot, so connected clients replace their local topic state without
+polling or a dedicated summary endpoint.
+
+An owner or administrator may change the prompt used by the server-side agent:
+
+```http
+POST /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047/actions/set_summary_prompt/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "summary_system_prompt": "Summarize decisions, owners, and unresolved risks.",
+  "summary_reasoning_effort": "high",
+  "summary_enabled": true
+}
+```
+
+The action returns the full topic snapshot and emits `topic.updated` to the
+stream participants. Setting `summary_system_prompt` to `null` selects the
+application default again. Scheduling or restarting LLM work remains a
+server-side agent responsibility.
+
+To pause automatic refresh for one topic without removing its existing
+summary, the same action may send only the topic gate:
+
+```http
+POST /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047/actions/set_summary_prompt/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "summary_enabled": false
+}
+```
+
+### Topic summary administration {#topic-summary-administration}
+
+Topic summarization has two independent database-backed gates. The worker runs
+only when both `global_enabled` and the current project's `project_enabled` are
+true. A settings update supplies both values:
+
+```http
+PUT /api/workspace/v1/messenger/topic_summary_settings/12345678-1234-4234-8234-123456789abc
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "global_enabled": true,
+  "project_enabled": true
+}
+```
+
+The path UUID must equal the IAM project in the request context. Reads are
+available to project users; updates require
+`workspace.topic_summary_settings.manage`.
+
+LLM endpoints are global rather than project- or stream-scoped. Create one with
+`workspace.topic_summary_endpoint.manage`:
+
+```http
+POST /api/workspace/v1/messenger/topic_summary_endpoints/
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "uuid": "e4ad6d80-6bc7-4a91-864c-8e97319a82bd",
+  "name": "primary-summary-model",
+  "base_url": "https://llm.example.com/v1",
+  "model": "summary-model",
+  "api_key": "<write-only credential>",
+  "enabled": true,
+  "priority": 10,
+  "supports_vision": true,
+  "supports_reasoning": true,
+  "temperature": 0.2,
+  "max_output_tokens": 512,
+  "top_p": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0
+}
+```
+
+All endpoints implement OpenAI-compatible `POST {base_url}/chat/completions`;
+there are no provider-specific branches. Lower `priority` values run first and
+UUID is the deterministic tie-breaker. Enabled endpoints are claimed with a
+bounded lease. A retryable network, rate-limit, or server failure releases the
+lease and tries the next endpoint in that order, up to three attempts. The
+registry exposes bounded health data (`last_success_at`, `last_failure_at`,
+`failure_count`, and `last_error_code`) but never exposes an active claim token.
+
+`api_key` is accepted only on create or credential replacement. It is encrypted
+with a deployment secret before storage and is never returned by create, list,
+get, or update, written to Workspace events, copied into topic snapshots, or
+included in worker logs. Registry updates and deletes are ordinary
+permission-checked administrative mutations; the registry intentionally has no
+revision, `ETag`, or `If-Match` contract.
+
+Generation settings have these defaults and accepted ranges:
+
+| Field | Default | Range |
+| --- | --- | --- |
+| `temperature` | `0.2` | `0.0..2.0` |
+| `max_output_tokens` | `512` | `1..32768` |
+| `top_p` | `1.0` | `0.0..1.0` |
+| `presence_penalty` | `0.0` | `-2.0..2.0` |
+| `frequency_penalty` | `0.0` | `-2.0..2.0` |
+
+The Messenger worker claims one stale topic and at most 100 new messages in a
+step, snapshots the boundary and effective prompt, commits the claim, performs
+the LLM request outside every database transaction, and persists the result in
+a new transaction through the existing internal summary helper. Failed jobs,
+retry delays, endpoint leases, and claim expiry are stored so retries remain
+bounded and observable.
+
+Long reasoning is a normal provider response, not a worker failure. The default
+connection timeout is 30 seconds, while the response timeout is 25 minutes so a
+model may reason for 20 minutes without racing the client deadline. The default
+endpoint lease is 30 minutes and the topic-job lease is 90 minutes. At runtime,
+the worker also enforces an endpoint lease of at least the response timeout plus
+60 seconds and a topic lease of at least three such request windows, so another
+worker cannot reclaim live work during a slow response or immediate failover.
+
+When the bounded message batch contains a Workspace image and any enabled
+vision endpoint exists, only a vision endpoint may be selected. If every vision
+endpoint is busy, the job waits; it does not fall back to a free text endpoint.
+Text-only summarization is allowed for an image-bearing batch only when no
+enabled vision endpoint exists. Images are encoded only in user message
+content, while the system prompt always remains text-only.
+
+`POST /api/workspace/v1/messenger/stream_topics/{topic_uuid}/actions/notifications/invoke` sets the
+current user's topic notification mode:
+
+```json
+{
+  "notification_mode": "follow"
+}
+```
+
+Allowed topic notification modes are `mute`, `default`, and `follow`. `unmute`
+is allowed only when the current user's stream notification mode is `muted`.
+Unread classification is evaluated from the current settings, so changing a
+mode immediately reclassifies existing unread messages. `follow` makes every
+topic unread active, `unmute` makes only direct mentions of the current user
+active, `mute` makes every topic unread passive, and `default` inherits the
+stream mode. A stream in `mentions_only` likewise places only direct mentions
+in `active_unread_count`; all remaining raw unread messages stay in
+`passive_unread_count`.
+
+For provider-backed Zulip streams and topics, notification actions are queued
+for the provider in the same transaction. Provider updates are applied back to
+Workspace with a per-setting timestamp, so an older update cannot replace a
+newer one.
+
+Topic read action:
+
+```http
+POST /api/workspace/v1/messenger/stream_topics/4ec0b996-b778-45f8-8ef4-ef863be0c047/actions/read/invoke
+Authorization: Bearer <access_token>
+```
+
+`read` marks all unread messages in the topic as read for the current user and
+returns the updated topic view.
+
+Realtime side effects:
+
+| Operation | payload.kind | object_type | Payload |
+| --- | --- | --- | --- |
+| create topic | `topic.created` | `topic` | Full user topic snapshot for every stream user. |
+| rename topic | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| toggle done | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| set default topic | `stream.updated`, `topic.updated` | `stream`, `topic` | Updated stream snapshot and previous/new default topic snapshots for every stream user. |
+| server summary update | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| set summary prompt | `topic.updated` | `topic` | Full user topic snapshot for every stream user. |
+| change topic notification mode | `topic.updated`, `stream.updated` | `topic`, `stream` | Reclassified topic and stream unread snapshots for the current user only. |
+| read topic messages | `topic.read` | `topic` | Full user topic snapshot returned by the action. |
+| read topic messages | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
+| delete topic | `topic.deleted` | `topic` | Deleted topic `uuid` and `stream_uuid`, sent to every stream user. Deleting the default topic also emits `stream.updated` with `default_topic_uuid: null`. |
+
+## Messages {#messages}
+
+`POST /api/workspace/v1/messenger/messages/` validates current PostgreSQL stream
+membership and commits the canonical UTF-8 markdown message, flags, one shared
+recipient-audience snapshot, and compact message/topic/stream events in the
+request transaction. It does not create one canonical event row per recipient.
+Reads remain scoped to the current IAM user and keep the existing response.
+
+The only supported message payload in v1 is markdown:
+
+```json
+{
+  "kind": "markdown",
+  "content": "Hello, workspace"
+}
+```
+
+Workspace entity references inside markdown content use regular markdown link
+syntax. The URL part is a Workspace URN:
+
+| Entity | Markdown form | Notes |
+| --- | --- | --- |
+| user mention | `[Jane Doe](urn:user:<user-uuid>)` | Treated as a user tag/mention. |
+| message link | `[See message](urn:message:<message-uuid>)` | Points to a Workspace message. |
+| stream link | `[general](urn:stream:<stream-uuid>)` | Points to a Workspace stream. |
+| topic link | `[deploys](urn:topic:<topic-uuid>)` | Points to a Workspace topic. |
+| file link | `[report.pdf](urn:file:<file-uuid>?name=report.pdf)` | File/media URNs may include metadata query parameters. |
+| image/video link | `![photo.png](urn:image:<file-uuid>?name=photo.png)` | Images and videos use `urn:image` / `urn:video`. |
+| avatar/default image | `[avatar](urn:gravatar:<hash>)` | Same canonical Gravatar URN format as Workspace users; the hash is 32 or 64 hexadecimal characters. |
+| external URL | `[site](urn:url:https://example.com)` | External `http` / `https` links are stored through `urn:url`. |
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Message identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `stream_uuid` | UUID | yes | no | Stream UUID. |
+| `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. The request fails with code `400001007` when the stream has no default. |
+| `author_uuid` | UUID | no | yes | Message author. |
+| `payload` | object | yes | no | Markdown message payload; trimmed content must be 1..40,000 characters. |
+| `user_uuid` | UUID | no | yes | Current user in the user message view. |
+| `read` | boolean | no | yes | Current user's read flag. Authors are created as read. |
+| `pinned` | boolean | no | yes | Current user's pinned flag. |
+| `starred` | boolean | no | yes | Current user's starred flag. |
+| `is_own` | boolean | no | yes | Whether `author_uuid` equals the current user. |
+| `mentioned` | boolean | no | yes | Whether the markdown payload mentions the current user; defaults to `false`. |
+| `reactions` | object | no | yes | Aggregated reaction counts keyed by `emoji_name`. |
+| `reaction_users` | object | no | yes | Complete persisted user UUID lists for bounded reaction groups, keyed by `emoji_name`. An empty object or missing key means count-only; lists are never partial. |
+| `source_name` | `native`, `zulip` | no | no | Message source name; the public API defaults it to `native` when omitted. |
+| `source` | object | no | no | Message source payload; defaults to `{"kind": "native"}`. Zulip `message_id` can be `null` until outbound sync succeeds. |
+| `provider` | object or `null` | no | yes | Provider badge inherited from the selected provider-backed stream. |
+| `delivery` | object or `null` | no | yes | Current create/update/delete delivery projection. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+Create request:
+
+```json
+{
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "payload": {
+    "kind": "markdown",
+    "content": "Hello, workspace"
+  }
+}
+```
+
+Response example:
+
+```json
+{
+  "uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "author_uuid": "11111111-1111-1111-1111-111111111111",
+  "payload": {
+    "kind": "markdown",
+    "content": "Hello, workspace"
+  },
+  "source_name": "native",
+  "source": {
+    "kind": "native"
+  },
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "read": true,
+  "pinned": false,
+  "starred": false,
+  "is_own": true,
+  "mentioned": false,
+  "reactions": {},
+  "reaction_users": {},
+  "provider": null,
+  "delivery": null,
+  "created_at": "2026-06-22T10:10:00Z",
+  "updated_at": "2026-06-22T10:10:00Z"
+}
+```
+
+Update request:
+
+```json
+{
+  "payload": {
+    "kind": "markdown",
+    "content": "Edited text"
+  }
+}
+```
+
+`PUT /api/workspace/v1/messenger/messages/{message_uuid}` commits the updated canonical message payload and returns
+the current user's message view. Only the message author can update the root
+message. `DELETE /api/workspace/v1/messenger/messages/{message_uuid}` performs
+an immediate hard delete of the canonical message and its per-user state. The
+same transaction emits a minimal `message.deleted` event for the original
+audience that preserves the required message identity and provenance fields.
+
+Read action:
+
+```http
+POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/read/invoke
+Authorization: Bearer <access_token>
+```
+
+`read` sets the current user's message flag to `true` and returns the updated
+message view. If the message was unread, the backend emits `message.read` with
+the full message snapshot and aggregate unread-count updates.
+
+Read up to action:
+
+```http
+POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/read_up_to/invoke
+Authorization: Bearer <access_token>
+```
+
+`read_up_to` marks unread messages in the same topic through the selected
+message's inclusive `(created_at, uuid)` boundary, then returns the selected
+message view. For an external chat, Workspace sends the already resolved UUID
+prefix as an exact selector; provider-specific message ordering cannot change
+which messages become read.
+
+Star and unstar actions:
+
+```http
+POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/star/invoke
+Authorization: Bearer <access_token>
+```
+
+```http
+POST /api/workspace/v1/messenger/messages/a93dca35-3061-4748-bda4-7f6f8c660ea5/actions/unstar/invoke
+Authorization: Bearer <access_token>
+```
+
+`star` and `unstar` set the current user's `starred` flag and return the
+updated message view. Both actions are idempotent. When the flag changes, the
+backend emits `message.updated` only for the current user. Star state is owned
+by Workspace and is not synchronized to an external provider.
+
+Realtime side effects:
+
+| Operation | payload.kind | object_type | Payload |
+| --- | --- | --- | --- |
+| create message | `message.created` | `message` | Full user message snapshot for every stream user. |
+| create unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the new message is unread; UI derives folder aggregates from the stream snapshot. |
+| update message payload | `message.updated` | `message` | Full user message snapshot for every stream user. |
+| create/update/delete reaction | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` | `message_reaction` | Reaction snapshot for the acting user. |
+| create/update/delete reaction aggregate update | `message.updated` | `message` | Full user message snapshot with updated `reactions` and `reaction_users` for every stream user. |
+| read message or read up to message | `message.read` | `message` | Full user message snapshot returned by the action. |
+| read unread message | `topic.updated`, `stream.updated`, `folder.updated` | `topic`, `stream`, `folder` | Updated unread-count snapshots for the current user. |
+| star or unstar message | `message.updated` | `message` | Full user message snapshot for the current user when the flag changes. |
+| delete message | `message.deleted` | `message` | Deleted message `uuid`, `stream_uuid`, `topic_uuid`, `author_uuid`, `source_name`, and `source`, sent to every stream user. |
+| delete unread message | `topic.updated`, `stream.updated` | `topic`, `stream` | Updated unread-count snapshots for users where the deleted message was unread; UI derives folder aggregates from the stream snapshot. |
+
+## Drafts {#drafts}
+
+Drafts are PostgreSQL-owned client state and never create or modify canonical
+messages, unread counters, reactions, or file references. Each
+draft belongs to exactly one IAM project, owner, stream, and topic. The
+`stream_uuid` and `topic_uuid` are immutable, the topic must belong to the
+stream, and the owner must currently be a stream participant. Multiple drafts
+may exist for the same stream/topic pair.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | yes | after create | Client-generated idempotency key and draft identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `user_uuid` | UUID | no | yes | Draft owner from the IAM token. |
+| `stream_uuid` | UUID | yes | after create | Stream containing the draft. |
+| `topic_uuid` | UUID | yes | after create | Topic containing the draft; it must belong to `stream_uuid`. |
+| `payload` | object | yes | no | Markdown draft payload. It is the only field accepted by `PUT`. |
+| `revision` | integer, minimum 1 | no | yes | Strong ETag revision, starting at `1`. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Last update time. |
+
+Create request:
+
+```json
+{
+  "uuid": "ca14d274-0057-4a9a-a34b-fb1174be6a17",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "payload": {
+    "kind": "markdown",
+    "content": "Draft message"
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "uuid": "ca14d274-0057-4a9a-a34b-fb1174be6a17",
+  "project_id": "22222222-2222-2222-2222-222222222222",
+  "user_uuid": "11111111-1111-1111-1111-111111111111",
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "topic_uuid": "4ec0b996-b778-45f8-8ef4-ef863be0c047",
+  "payload": {
+    "kind": "markdown",
+    "content": "Draft message"
+  },
+  "revision": 1,
+  "created_at": "2026-07-17T08:00:00Z",
+  "updated_at": "2026-07-17T08:00:00Z"
+}
+```
+
+Update request:
+
+```http
+PUT /api/workspace/v1/messenger/drafts/ca14d274-0057-4a9a-a34b-fb1174be6a17
+Authorization: Bearer <access_token>
+Content-Type: application/json
+If-Match: "1"
+
+{
+  "payload": {
+    "kind": "markdown",
+    "content": "Updated draft message"
+  }
+}
+```
+
+Create requests require `uuid`, `stream_uuid`, `topic_uuid`, and a Markdown
+payload. Markdown content is trimmed, must remain non-empty, and is limited to
+40,000 characters. Retrying the exact same canonical create UUID returns the
+existing draft without another mutation; reusing the UUID with different fields
+returns `409`.
+
+`GET`, `POST`, and `PUT` single-resource responses return a strong ETag such as
+`ETag: "3"`. `PUT` accepts only `payload`; `PUT` and `DELETE` require the exact
+current value in `If-Match`. Missing preconditions return `428`. A stale or
+invalid value returns `412` with the current draft snapshot and current ETag.
+Successful updates increment `revision`; successful deletes return `204`.
+
+Draft CRUD emits no Workspace events, websocket notifications, desktop
+notifications, provider commands, or ordinary Messenger messages. Another
+client observes changes on reload or an explicit drafts API refetch. Removing
+the owner from the stream or deleting the topic/stream hard-deletes affected
+drafts through PostgreSQL foreign-key cascades, without tombstones or
+notification side effects.
+
+## Message Reactions
+
+Message reactions are canonical PostgreSQL resources. Reads are scoped to
+messages visible to the current IAM user.
+Creating, updating, or deleting a reaction emits a `message_reaction.*` event
+for the acting user and `message.updated` events for every user that can see
+the message; the message snapshot contains aggregated `reactions` and the same
+persisted `reaction_users` projection as REST reads.
+
+| Field | Type | Required on create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | Reaction identifier. |
+| `project_id` | UUID | no | yes | IAM project scope. |
+| `message_uuid` | UUID | yes | no | Message being reacted to; must be visible to the current user. |
+| `user_uuid` | UUID | no | yes | User that owns the reaction. |
+| `emoji_name` | string, max 128 | yes | no | Emoji/reaction name. |
+| `provider` | object or `null` | no | yes | Provider badge inherited from the target message. |
+| `delivery` | object or `null` | no | yes | Current create/update/delete delivery projection. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+`provider_metadata` and `delivery_metadata` are raw DM storage fields, not
+public response fields. They currently appear in the generated
+`WorkspaceMessageReactions` OpenAPI schemas, but the runtime
+`resource_projection.as_dict(..., "message_reactions")` serializer removes
+them before response packing and exposes only the sanitized `provider` and
+`delivery` projections above. Clients must not consume the raw fields from the
+generated schema.
+
+Create request:
+
+```json
+{
+  "message_uuid": "a93dca35-3061-4748-bda4-7f6f8c660ea5",
+  "emoji_name": "thumbs_up"
+}
+```
+
+The same user cannot create duplicate reactions with the same `message_uuid`
+and `emoji_name`. Any user that can see the message can list or get its
+reactions. Only the reaction owner can update or delete that reaction.
+These operations commit the reaction and corresponding realtime side effects
+in PostgreSQL. Native responses retain `provider: null` and `delivery: null`.
+
+The `reactions` field on message views is an aggregate map:
+
+```json
+{
+  "thumbs_up": 2,
+  "eyes": 1
+}
+```
+
+The `reaction_users` field exposes complete UUID lists only for small groups
+selected by server configuration. The default per-group threshold is four
+users (`[messenger_reactions] user_list_limit`). The client does not send or
+infer the limit:
+
+```json
+{
+  "reactions": {
+    "eyes": 12,
+    "heart": 3
+  },
+  "reaction_users": {
+    "heart": [
+      "11111111-1111-1111-1111-111111111111",
+      "22222222-2222-2222-2222-222222222222",
+      "33333333-3333-3333-3333-333333333333"
+    ]
+  }
+}
+```
+
+Presence of an emoji key guarantees that the list was complete when the
+reaction group was last mutated. If the current count exceeds the configured
+limit, the write removes that key instead of storing a prefix. Historical
+messages are not backfilled and therefore return `reaction_users: {}` until a
+reaction mutation materializes an affected key. Changing the configured limit
+does not rewrite existing snapshots; the next mutation of a group applies the
+new limit. Clients replace the whole map on every REST or realtime message
+snapshot; they must not merge it with a previous value.
+
+Reaction realtime payloads include `uuid`, `project_id`, `message_uuid`,
+`user_uuid`, `emoji_name`, `source_name`, `source`, `provider`, and `delivery`.
+They never expose raw `provider_metadata` or `delivery_metadata`. For
+`message_reaction.updated`, `old_message_uuid`, `old_emoji_name`,
+`old_source_name`, and `old_source` describe the previous reaction target.
+
+## Files {#files}
+
+File bytes and a separate JSON sidecar are stored through the configured
+messenger file storage backend. S3 is the deployed backend; the local backend
+implements the same layout for tests. The backend is selected by server
+configuration and cannot be chosen by a browser request. PostgreSQL stores the
+canonical file metadata and ACL/access state; S3 stores the binary and its JSON
+sidecar.
+
+The sidecar contains the file UUID, project UUID, owner UUID, display metadata,
+content type, size, SHA-256, creation time, and an ACL rule. Chat files include
+their stream UUID and use the dynamic stream-membership rule:
+
+```json
+{
+  "acl": {
+    "mode": "stream_members",
+    "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6"
+  }
+}
+```
+
+The sidecar never contains a participant snapshot. Every chat-file list,
+metadata, and download request checks the authenticated user against the
+current canonical PostgreSQL stream bindings. A newly added
+participant gains access immediately; a removed participant loses it
+immediately without an S3 rewrite.
+
+Files intentionally visible throughout the authenticated Workspace use this
+ACL instead:
+
+```json
+{
+  "acl": {
+    "mode": "public"
+  }
+}
+```
+
+`public` is not anonymous access. Metadata and bytes remain behind the
+Workspace IAM middleware, and any request without a valid Workspace bearer
+token is rejected. A valid Workspace bearer token may read or download a
+`public` file regardless of project or stream membership. A `public` sidecar
+must not contain `stream_uuid`; it retains `owner_uuid` and all integrity
+metadata. Nginx rejects multipart requests larger than `50m` before they reach
+`workspace-messenger-api`.
+
+| Field | Type | Required on JSON create | Read-only | Description |
+| --- | --- | --- | --- | --- |
+| `uuid` | UUID | no | yes | File identifier. |
+| `project_id` | UUID | no | yes | IAM project scope; hidden in API responses. |
+| `user_uuid` | UUID | no | yes | Owner/uploader. |
+| `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. Required for JSON create and `stream_members` multipart uploads; omitted for multipart uploads with `acl.mode=public`. |
+| `name` | string, max 255 | yes | no | File display name. |
+| `description` | string, max 255 | no | no | File description; defaults to an empty string. |
+| `content_type` | string | yes | no | MIME content type. |
+| `size_bytes` | integer | yes | no | File size in bytes. |
+| `hash` | string | yes | no | File hash, currently SHA-256 for multipart uploads. |
+| `created_at` | datetime | no | yes | Creation time. |
+| `updated_at` | datetime | no | yes | Update time. |
+
+JSON metadata create request:
+
+```json
+{
+  "stream_uuid": "75309057-419c-4b12-a7c1-3932429ec4a6",
+  "name": "example.txt",
+  "description": "Example",
+  "content_type": "text/plain",
+  "size_bytes": 12,
+  "hash": "abc"
+}
+```
+
+Multipart upload request:
+
+```http
+POST /api/workspace/v1/messenger/files/
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data
+
+file=<binary file part>
+stream_uuid=75309057-419c-4b12-a7c1-3932429ec4a6
+name=example.txt
+description=Example
+```
+
+An ordinary authenticated client uploads a Workspace-wide public file through
+the same endpoint by sending the existing ACL object as JSON and omitting
+`stream_uuid`:
+
+```http
+POST /api/workspace/v1/messenger/files/
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data
+
+file=<binary file part>
+acl={"mode":"public"}
+name=public-example.txt
+description=Authenticated Workspace-wide file
+```
+
+For multipart uploads, `file` is required and exactly one scope must be
+provided: either `stream_uuid`, or the JSON form field
+`acl={"mode":"public"}`. Public uploads reject `stream_uuid`; stream uploads
+retain the `stream_members` ACL. `name` defaults to the uploaded filename and
+`description` defaults to an empty string. The backend stores the bytes, sets
+`content_type` from the uploaded part, calculates `size_bytes`, and writes a
+SHA-256 `hash`. Both modes preserve the same binary plus JSON sidecar layout and
+the same `urn:file`, `urn:image`, or `urn:video` client contract.
+
+`GET /api/workspace/v1/messenger/files/`, `GET /api/workspace/v1/messenger/files/{file_uuid}`, and
+`GET /api/workspace/v1/messenger/files/{file_uuid}/actions/download` require file access. `PUT` and
+`DELETE` require file ownership. Downloads return raw bytes with the stored
+`Content-Type`, a `Content-Disposition` attachment filename, and a strong
+`ETag` equal to the quoted SHA-256 `hash` exposed by file metadata. The binary
+is immutable for its file UUID; metadata changes emit `file.updated`. Deleting an
+owned file removes both its binary object and JSON sidecar after the canonical
+file deletion is committed.
+
+
+## Services {#services}
+
+Services are read-only catalog entries exposed by the common Workspace API.
+`GET /api/workspace/v1/services/` lists the available services and
+`GET /api/workspace/v1/services/{service_uuid}` returns one service.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `uuid` | UUID | Service identifier. |
+| `name` | string, max 255 | Service name. |
+| `description` | string, max 255 | Service description; defaults to an empty string. |
+| `service_url` | URL | Service entry URL. |
+| `icon` | URL or `null` | Optional icon URL. |
+| `created_at` | datetime | Creation time. |
+| `updated_at` | datetime | Last update time. |
+
+Response example:
+
+```json
+{
+  "uuid": "608919f5-ae0f-44fb-85bf-f1bf56534238",
+  "name": "Messenger",
+  "description": "Workspace Messenger",
+  "service_url": "https://workspace.example.com/",
+  "icon": "https://workspace.example.com/icon.svg",
+  "created_at": "2026-07-17T08:00:00Z",
+  "updated_at": "2026-07-17T08:00:00Z"
+}
+```
+
+
+## Events And Epoch {#events-and-epoch}
+
+Events are durable PostgreSQL records scoped to their audience. Recipient
+events carry `user_uuid`; compact broadcast events use a stored audience so
+each visible client observes the same public event contract without requiring
+one canonical event row per recipient. Only event records are retained for the
+configured interval, 72 hours by default; messages, files, stream/topic state,
+provider mappings, and other canonical resources are never removed by this
+policy. Pruning advances the stored retained floor so the remaining events form
+a complete visible suffix.
+`epoch_version` is monotonic within one PostgreSQL-owned
+`epoch_generation`.
+
+`GET /api/workspace/v1/events/` returns events sorted by `epoch_version` ascending by default.
+REST `/events/` and websocket delivery use the same flat schema and both read
+from the current user's visible PostgreSQL event surface.
+`GET /api/workspace/v1/epoch/` uses that same surface.
+
+```json
+{
+  "schema_version": 1,
+  "uuid": "event-uuid",
+  "epoch_version": 124,
+  "project_id": "project-uuid",
+  "user_uuid": "recipient-user-uuid",
+  "object_type": "message",
+  "action": "created",
+  "created_at": "2026-07-02T16:37:49.552044Z",
+  "updated_at": "2026-07-02T16:37:49.552047Z",
+  "payload": {
+    "kind": "message.created",
+    "uuid": "message-uuid",
+    "project_id": "project-uuid",
+    "user_uuid": "recipient-user-uuid",
+    "stream_uuid": "stream-uuid",
+    "topic_uuid": "topic-uuid",
+    "author_uuid": "author-user-uuid",
+    "payload": {"kind": "markdown", "content": "Hello"},
+    "source_name": "native",
+    "source": {"kind": "native"},
+    "read": true,
+    "pinned": false,
+    "starred": false,
+    "is_own": true,
+    "mentioned": false,
+    "reactions": {},
+    "reaction_users": {},
+    "provider": null,
+    "delivery": null,
+    "created_at": "2026-07-02T16:37:49.552044Z",
+    "updated_at": "2026-07-02T16:37:49.552047Z"
+  }
+}
+```
+
+Top-level fields describe the event row only. `payload.kind` is the only `kind`.
+Do not expect top-level `type`, `kind`, `stream_uuid`, or `topic_uuid`.
+
+Message create/update events carry the same markdown payload stored on the
+message. Entity links remain regular markdown links with `urn:user`,
+`urn:message`, `urn:stream`, `urn:topic`, file/media, avatar, or URL URNs.
+
+Messenger entity create, update, read, and action events carry the same full
+object snapshot that the current user receives from the corresponding REST
+endpoint or action response, plus `payload.kind`. External account, chat, and
+operation events instead use an envelope containing `kind`, the resource
+`uuid`, and a sanitized full resource under `snapshot`. This envelope is used
+for external create, update, and delete events.
+
+Messenger entity delete events are minimal:
+
+- `stream.deleted`, `folder.deleted`, `folder_item.deleted`: `kind`, `uuid`
+- `topic.deleted`: `kind`, `uuid`, `stream_uuid`
+- `message.deleted`: `kind`, `uuid`, `stream_uuid`, `topic_uuid`,
+  `author_uuid`, `source_name`, `source`
+
+`stream_bindings.created` is a batch action payload:
+
+```json
+{
+  "kind": "stream_bindings.created",
+  "uuid": "stream-uuid",
+  "items": [
+    {
+      "uuid": "binding-uuid",
+      "project_id": "project-uuid",
+      "stream_uuid": "stream-uuid",
+      "user_uuid": "added-user-uuid",
+      "who_uuid": "owner-user-uuid",
+      "role": "member",
+      "notification_mode": "all_messages",
+      "notification_updated_at": "2026-07-02T16:37:49.552044Z",
+      "created_at": "2026-07-02T16:37:49.552044Z",
+      "updated_at": "2026-07-02T16:37:49.552047Z"
+    }
+  ]
+}
+```
+
+Read actions emit `message.read`, `topic.read`, or `stream.read` with the full
+action response object in `payload`. Read reconciliation emits
+`topic.updated`, `stream.updated`, and `folder.updated`. Message create/delete
+uses compact `topic.updated` and `stream.updated` events; the UI projects folder
+aggregates from the stream snapshot instead of receiving a potentially large
+user-specific folder snapshot per message.
+
+Supported values:
+
+| object_type | action | payload.kind examples |
+| --- | --- | --- |
+| `message` | `created`, `updated`, `deleted`, `read` | `message.created`, `message.updated`, `message.deleted`, `message.read`, `messages.read` |
+| `message_reaction` | `created`, `updated`, `deleted` | `message_reaction.created`, `message_reaction.updated`, `message_reaction.deleted` |
+| `stream` | `created`, `updated`, `deleted`, `read` | `stream.created`, `stream.updated`, `stream.deleted`, `stream.read` |
+| `stream_binding` | `created`, `updated`, `deleted` | `stream_bindings.created`, `stream_binding.updated`, `stream_binding.deleted` |
+| `topic` | `created`, `updated`, `deleted`, `read` | `topic.created`, `topic.updated`, `topic.deleted`, `topic.read` |
+| `user` | `updated` | `user.updated` |
+| `folder` | `created`, `updated`, `deleted` | `folder.created`, `folder.updated`, `folder.deleted` |
+| `folder_item` | `deleted` | `folder_item.deleted` |
+| `file` | `created`, `updated`, `deleted` | `file.created`, `file.updated`, `file.deleted` |
+| `external_account` | `created`, `updated`, `deleted` | `external_account.created`, `external_account.updated`, `external_account.deleted` |
+| `external_chat` | `created`, `updated`, `deleted` | `external_chat.created`, `external_chat.updated`, `external_chat.deleted` |
+| `external_operation` | `created`, `updated`, `deleted` | `external_operation.created`, `external_operation.updated`, `external_operation.deleted` |
+
+All external values in the table are registered public event kinds. Current
+account and operation workflows emit all three actions. Current external-chat
+call sites emit `external_chat.updated` for catalog and assignment changes and
+`external_chat.deleted` when a projection is removed;
+`external_chat.created` remains a registered schema kind.
+
+For strict catch-up after a processed cursor, use:
+
+```http
+GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_generation=<saved_generation>&page_limit=500
+```
+
+`GET /api/workspace/v1/epoch/` returns the latest visible event cursor and the
+oldest retained epoch for the current IAM user. `epoch_version` is the direct
+alias of `current_epoch_version`:
+
+```json
+{
+  "epoch_version": 124,
+  "epoch_generation": "781203",
+  "current_epoch_version": 124,
+  "minimum_epoch_version": 37
+}
+```
+
+For a newly created empty event stream, `epoch_version` and
+`current_epoch_version` are `0`, `minimum_epoch_version` is `1`, and
+`epoch_generation` is still a non-empty PostgreSQL-owned generation. A cold
+`GET /api/workspace/v1/events/?epoch_version%3E=0` returns an empty list rather
+than a cursor-gap error.
+
+Clients persist `epoch_generation` together with `epoch_version`. A resume
+cursor above zero without a generation, a changed generation, a future epoch,
+or an epoch older than the retained suffix returns HTTP `410` with
+`type=EventsCursorExpiredError`, `error=epoch_pruned`, the reason, and the
+current/minimum cursor fields. The response is `Cache-Control: no-store`.
+Clients then clear derived entity/blob caches, load authoritative snapshots,
+and restart tracking from the returned generation; server messages and domain
+data are not deleted.
+
+## Workspace Users
+
+Workspace users are stored in `m_workspace_users`. The route is global rather
+than project-scoped.
+
+`GET /api/workspace/v1/me/` returns the same `WorkspaceUser_Get` object as
+`GET /api/workspace/v1/users/{user_uuid}`, using the user UUID from the IAM
+token. The client does not send or derive a user UUID for this request. The
+backend takes `project_id` from IAM introspection, refreshes the IAM-owned
+username, first name, last name, and email projection, and returns the local
+Workspace status, avatar, and presence fields.
+
+IAM identities are projected lazily. Calling `/me/` or requesting the current
+user through `/users/{user_uuid}` creates or refreshes that user's Workspace
+projection; listing `/users/` does not eagerly import every IAM account. A
+`GET /users/{other_user_uuid}` lookup is projection-only: it does not import
+that IAM identity and returns not found until the other user has been
+materialized by their own authenticated Workspace activity.
+
+When the current IAM user requests their own UUID, the API materializes or
+refreshes the IAM identity projection before returning it. The browser cannot
+submit source ownership fields. The `zulip` source literal identifies an
+external identity projected by the Zulip runtime through the private Provider
+API. Provider credentials and raw identifiers are not part of this browser
+resource.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `uuid` | UUID | User identifier. |
+| `username` | string, 1..128 | Username. |
+| `source` | `iam`, `zulip` | User source. |
+| `identity_kind` | `external` or omitted | Read-only marker present only for an external provider identity. |
+| `display_name` | string or omitted | Read-only provider display name for an external identity. |
+| `provider` | object or omitted | Read-only external identity envelope containing `kind` and `account_uuid`; raw provider identifiers and credentials are never exposed. |
+| `status` | `active`, `idle`, `offline`, `do_not_disturb` | Presence status. |
+| `status_emoji` | string or `null`, max 64 | Custom presence emoji. |
+| `status_text` | string or `null`, max 256 | Custom presence text. |
+| `first_name` | string or `null` | First name. |
+| `last_name` | string or `null` | Last name. |
+| `email` | string or `null` | Email address. |
+| `avatar` | URN string | User avatar. Supported values are `urn:gravatar:<32-or-64-hex-hash>`, `urn:image:<uuid>`, and `urn:url:http(s)://...`. When omitted, Workspace hashes the normalized email with MD5; users without an email receive a non-reversible MD5 fallback derived from their UUID. |
+| `last_ping_at` | datetime | Last ping timestamp. |
+| `created_at` | datetime | Creation time. |
+| `updated_at` | datetime | Update time. |
+
+An external provider may project a Gravatar-compatible avatar as
+`urn:gravatar:<md5(trim(lower(delivery_email)))>`. Raw provider identifiers and
+provider-only delivery addresses are not exposed in this contract.
+
+Presence update:
+
+```http
+POST /api/workspace/v1/users/11111111-1111-1111-1111-111111111111/actions/presence/invoke
+Content-Type: application/json
+
+{
+  "status": "active",
+  "emoji": "coffee",
+  "text": "Focusing"
+}
+```
+
+The authenticated user may update only their own `user_uuid`. The request stores
+the supplied status and the current time in `last_ping_at`. Optional `emoji` and
+`text` fields are stored as `status_emoji` and `status_text`; omitted optional
+fields keep previous values, and explicit `null` clears them. The Workspace messenger worker marks stale users offline and emits `user.updated` events with full user
+snapshots, including `avatar`, to all Workspace users in every project.
+
+Avatar upload is an atomic own-user action:
+
+```http
+POST /api/workspace/v1/users/11111111-1111-1111-1111-111111111111/actions/avatar_upload/invoke
+Authorization: Bearer <access_token>
+Content-Type: multipart/form-data
+
+file=<PNG, JPEG, GIF, or WebP binary part>
+```
+
+Only the authenticated user's own UUID is accepted. The maximum avatar size is
+25 MiB. The backend validates the declared MIME type and binary signature,
+stores the bytes and JSON sidecar through the configured file backend, sets
+`acl.mode` to `public`, omits `stream_uuid`, and updates only `user.avatar` to
+`urn:image:<file-uuid>`. IAM-owned username, name, and email fields remain
+read-only. The action emits the full `user.updated` snapshot in every Workspace
+project.
+
+Resetting the avatar uses the same own-user authorization:
+
+```http
+POST /api/workspace/v1/users/11111111-1111-1111-1111-111111111111/actions/avatar_reset/invoke
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{}
+```
+
+Reset replaces `user.avatar` with
+`urn:gravatar:<md5(trim(lower(email)))>` or the canonical non-reversible UUID
+fallback for a user without email. A replaced custom avatar loses public access
+as soon as the user reference and projection row are updated; its binary and
+sidecar are then removed from object storage.
+
+## WebSocket Realtime Summary {#websocket-realtime-summary}
+
+The common websocket service uses subprotocol `workspace.events.v1` and authenticates
+the bearer token from `Sec-WebSocket-Protocol`:
+
+```ts
+const ws = new WebSocket(
+  "/api/workspace/v1/events/ws?last_epoch_version=124&epoch_generation=781203",
+  ["workspace.events.v1", `bearer.${accessToken}`],
+);
+```
+
+After the connection is accepted, the server sends missed events newer than
+the saved cursor. It then sends exactly one control frame
+`{"type":"ready","epoch_generation":"...","epoch_version":124}` before any
+live event can be delivered. UI notification gates remain closed until this
+frame. Each event message is the same flat event object returned by REST
+`/api/workspace/v1/events/`. The websocket service does not send
+application-level JSON `hello` or `ping` messages and does not process client
+JSON `pong` or `ack` messages. It sends protocol-level WebSocket ping control
+frames at the configured heartbeat interval. Reconnect and catch-up are driven
+by the persisted cursor pair. An expired cursor sends the same typed
+`epoch_pruned` JSON error as REST and closes with code `4410` and reason
+`epoch_pruned`.
+
+For protected file caches, `file.created/updated/deleted` invalidates one UUID.
+On membership removal the removed user receives `stream.deleted`; clients
+immediately evict every protected blob whose cached metadata has that
+`stream_uuid`. Remaining participants receive `stream_binding.deleted` (and
+role/settings changes produce `stream_binding.updated`) to update participant
+state. A 410 gap clears all derived protected-blob cache entries.
+
+Detailed UI integration rules are documented in
+`docs/workspace_ui_realtime_integration.md`.
+
+## OpenAPI And Deployment
+
+The runtime Workspace OpenAPI document is available at
+`/api/workspace/specifications/3.0.3`. It describes the controller-backed
+IAM-authenticated HTTP surface and contains no Provider, Mail, or Calendar
+browser routes. The middleware-provided `server_settings` aliases and the
+separate Events WebSocket are documented runtime interfaces but do not appear
+as generated OpenAPI paths. The private Provider contract is maintained
+separately in
+[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+
+The Workspace backend element installs independent `workspace-messenger-api`,
+`workspace-api`, `workspace-messenger-events`, and
+`workspace-messenger-worker` processes plus the private
+`workspace-external-bridge-api` service. The PostgreSQL-canonical runtime does
+not start or connect to a mail service. The element requires S3aaS for binary
+objects and JSON sidecars and DBaaS for canonical Messenger and provider state.
+It builds the existing Workspace UI in Messenger-only mode and serves it from
+nginx.
+
+Related documents:
+
+- [Workspace architecture](architecture.md)
+- [Workspace UI realtime integration](workspace_ui_realtime_integration.md)
+- [Private Workspace Provider API](../workspace_provider_api_v1.yaml)
+- [Zulip provider product and public API contract](zulip_bridge_v1_product_and_api.md)

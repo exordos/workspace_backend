@@ -1,0 +1,21 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folder_items/{folder_item_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: Anfrage
+API -> DB: - und nicht SELECT
+note right of DB
+  Kanonischer Fluss wird nicht kopiert
+  Normalized FOLDER_ITEM = source of truth; folder_projection Bauen snapshot
+  Automatisch FOLDER_ITEM — Wiederherstellbare Vorhersage
+  Quelle: Aktiv USER_STREAM_BINDING + Kanonische STREAM.is_archived = false
+  All chats = - Das ist alles.; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Einer indexed join - und ready USER_STREAM_BINDING; Ohne N+1/COUNT/custom SQL
+end note
+DB --> API: öffentliche Zeilen
+note right of API: Ohne outbox / Aufgaben / Ereignisse
+API --> Client: 200 JSON
+@enduml

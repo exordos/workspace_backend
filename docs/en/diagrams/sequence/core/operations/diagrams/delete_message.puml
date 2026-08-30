@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title DELETE /api/workspace/v1/messenger/messages/[message_uuid]
+actor "The client ." as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\ncanonical lines + brackets" as DB
+queue "Transactional outbox\n+ Typed tasks" as Outbox
+participant "Background performers\nexact scope leases + fencing" as Worker
+database "Ready projections\nThe container is tied up ." as Projection
+database "The public events repository" as Events
+participant "The controller . WebSocket" as Dispatcher
+actor "The client . WebSocket" as WS
+Client -> API: DELETE /api/workspace/v1/messenger/messages/{message_uuid}
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: delete canonical MESSAGE root + immutable outbox events
+DB --> API: The transaction is recorded
+API --> Client: A successful public response
+DB ->> Outbox: the event that was recorded
+Outbox ->> Worker: read_counters / reaction_snapshot /\ndelivery_snapshot_event\neach task It has its own outbox_event_uuid
+Worker -> Worker: topic: placements; user-stream/user-folder: aggregates
+Worker -> Projection: Container counters after cleaning by external keys
+Worker -> Events: message.deleted + container events\natomically in one. DB transaction with a projection
+Events ->> Dispatcher: fixed ready line
+Dispatcher ->> WS: I 'm going to send / repeat / reproduce
+note over API,Worker
+  Public ID = MESSAGE_PLACEMENT.uuid; canonical root It 's being deleted .
+  Only after permission check through active membership.
+  Lease/fencing, retry/backoff, DLQ/reaper - They 're compulsory ..
+end note
+@enduml

@@ -1,0 +1,61 @@
+@startuml migration_release_runbook
+!pragma layout smetana
+
+title Migration und Freigabe des Messenger-Zielmodells
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+actor "Operator" as Operator
+database "Backup DB + Objektspeicher" as Backup
+participant "Versionierte DB-Migration" as Migration
+database "Zieldatenbank" as DB
+participant "Dateibereinigungs-Worker" as Worker
+participant "Zulip Bridge" as Bridge
+participant "Workspace API/Worker/Dispatcher" as Runtime
+participant "Zulip-Quelle" as Zulip
+
+Operator -> Backup : vollständiger konsistenter Snapshot
+Operator -> Backup : geprüfte Wiederherstellung und vollständiger Probelauf
+Operator -> Runtime : Schreibzugriffe/Worker/Dispatcher/Integrationen einfrieren
+Operator -> Migration : geprüfte Migration anwenden
+Migration -> DB : begrenzte Größen- und Writer-Lock-Prüfungen
+Migration -> DB : fehlersichere Herkunftsvorprüfung
+
+alt unklare Herkunft oder nicht geprobter großer Cutover
+  Migration --> Operator : vor destruktiven Arbeiten abbrechen
+  Operator -> Runtime : eingefroren lassen; klären oder wiederherstellen
+else alle Vorprüfungen bestanden
+  Migration -> DB : Zielschema anlegen
+  Migration -> DB : native Daten erhalten und konvertieren
+  Migration -> DB : nachgewiesene Zulip-Projektion atomar entfernen
+  Migration -> DB : Projektions-Reset-Generation erhöhen
+  Migration --> Operator : Commit
+end
+
+loop begrenzte idempotente physische Bereinigung
+  Worker -> DB : Task für gelöschte Datei ohne Referenzen leasen
+  Worker -> DB : vollständigen Storage-Tupel-Refcount erneut prüfen
+  Worker -> Backup : Providerobjekt und Sidecar löschen
+end
+
+Bridge -> DB : neue Reset-Generation erkennen
+Bridge -> Bridge : wiederaufbaubaren Cache/Mappings einmal löschen
+loop begrenzter Keyset-Import mit dauerhaftem Checkpoint
+  Bridge -> Zulip : bis zur finalen High-Water Mark lesen
+  Zulip --> Bridge : maßgebliche Nachrichten/Dateien/Anhänge
+  Bridge -> DB : idempotenter kanonischer Upsert nach Provideridentität
+end
+
+Operator -> DB : native und importierte Zähler/Zustände/FKs/Cursors abgleichen
+Operator -> Backup : unveränderte native Objekte und vollständige Links prüfen
+
+alt alle Abnahmekriterien bestanden
+  Operator -> Runtime : Laufzeit/Integrationen wieder öffnen
+else Migration/Import/Abnahme fehlgeschlagen
+  Operator -> Runtime : System gestoppt lassen
+  Operator -> Backup : DB + Storage + vorherige Anwendungsversion wiederherstellen
+end
+
+@enduml

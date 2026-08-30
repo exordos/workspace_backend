@@ -1,0 +1,116 @@
+@startuml worker_architecture
+!pragma layout smetana
+
+title 投影工作组架构 Workspace
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequence {
+    ArrowColor #334155
+    LifeLineBorderColor #334155
+    ParticipantBorderColor #2563EB
+    ParticipantBackgroundColor #EFF6FF
+}
+
+actor "客户端" as Client
+participant "REST / RestAlchemy\n控制器" as API
+database "源表\n规范性实质 + 联系 + 事实" as SOURCE
+database "永久域名\noutbox" as OUTBOX
+participant "任务投影器\n1 task 在 outbox event" as PROJECTOR
+database "类型任务\n投影" as TASKS
+participant "调整的工作组\n0..N 活跃的插槽" as POOL
+database "租 exact scope key\nlease + fencing token" as CLAIM
+participant "工人机" as WORKER
+database "已准备的投影\n绑定 + 状态 / 图片" as READY
+database "公众活动存储器" as EVENTS
+participant "控制器 WebSocket\n重复 + 播放" as DISPATCHER
+actor "客户端 WebSocket" as WS
+
+Client -> API : 改变状态的请求
+activate API
+API -> SOURCE : 修改 真理来源行
+API -> OUTBOX : 添加一个不变的事件\n在同一交易中
+API --> Client : 已注定的即时回复
+deactivate API
+
+note over API,OUTBOX
+  POST 创建消息:
+  MESSAGE + MESSAGE_PLACEMENT
+  + 创作权 USER_MESSAGE_BINDING
+  + USER_MESSAGE_STATE + outbox.
+  接收者状态通过 fanout.
+end note
+
+OUTBOX -> PROJECTOR : 记录的事件
+PROJECTOR -> TASKS : immutable task(outbox_event_uuid, kind, scope)\nunique derivation; 没有 coalescing
+TASKS -> POOL : 期待着一个明显的工作\n(没有搜索缺失的行)
+POOL -> CLAIM : 抓住一个精确的 scope key
+CLAIM --> POOL : 独占租/所有权
+POOL -> WORKER : 在设置的限制范围内指定 N
+activate WORKER
+WORKER -> SOURCE : 读取最后一个记录状态
+note right of WORKER
+  只有 scope=topic:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+  fanout batch: user_uuid ASC, default 1000, max 5000
+  在之后 batch — checkpoint 其他 bounded fairness
+end note
+group 一个 DB transaction
+  WORKER -> READY : 没有任何可能的 materialization / batch upsert
+  WORKER -> EVENTS : durable ready rows; unique derivation key
+end
+WORKER -> CLAIM : 让我们安全地释放
+deactivate WORKER
+
+EVENTS -> DISPATCHER : 稳定的准备记录
+DISPATCHER -> WS : 发送 / 重复 / 播放
+note over EVENTS,WS
+  Reconnect: cursor + high-watermark + replay + buffer/drain 没有 gap.
+  At-least-once; client dedupe 根据 event UUID.
+  Membership generation 压抑 data events 在之后 revoke.
+end note
+
+note over SOURCE,READY
+  公开链接 UUID 是一个直角 UUID-属性.
+  物理列 *_uuid 仍然是索引外键.
+  集装箱的组件将在唯一的绑定上存储
+  用户的容器,但不是在消息绑定.
+  MESSAGE_PLACEMENT.uuid — 公开的 UUID 信息.
+  MESSAGE.uuid — 国内 canonical content UUID;
+  UUID USER_MESSAGE_BINDING 保持隐藏 row identity.
+  FOLDER 保存一次; normalized FOLDER_ITEM = source of truth.
+  USER_FOLDER_BINDING 存储访问,计数器和 read-only JSONB
+  folder_items_snapshot (empty=[]), version/updated_at.
+  文件自动读取活动文件 USER_STREAM_BINDING + STREAM.is_archived=false:
+  All chats = 所有的; Personal = STREAM.private=true; Channels = STREAM.private=false.
+end note
+
+note over TASKS,READY
+  拥有路由:
+  fanout/placement state -> topic(project, topic)
+  reaction snapshot -> message(project, canonical message)
+  stream aggregates -> user-stream(project, user, stream)
+  folder_projection -> user-folder(project, user, folder)
+  topic aggregates -> user-topic(project, user, topic)
+  其他 shared rows 他们要求明确的 scope; fallback 在 topic 禁止使用.
+  Topic-worker 没有执行 unsafe read-modify-write shared rows.
+  folder_projection 他写道 snapshot + counts + version/time
+  + 所有的 ready events 在一个 worker DB transaction.
+  API 阅读一个 indexed row/page 没有 N+1/json_agg/COUNT/custom SQL.
+end note
+
+note over PROJECTOR,CLAIM
+  Lifecycle: pending -> leased/running -> completed/failed -> DLQ.
+  Lease expiry, attempts/backoff, max attempts, reaper/reconciliation.
+  Atomic counter delta 只有在 exactly-once effect guard
+  根据 outbox_event_uuid; 否则 scope worker recomputes/writes.
+end note
+
+note over API,OUTBOX
+  GET/列表在索引读取后结束
+  他没有创造任何东西. outbox/任务.
+end note
+
+@enduml

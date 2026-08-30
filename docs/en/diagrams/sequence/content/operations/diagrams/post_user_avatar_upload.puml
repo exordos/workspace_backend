@@ -1,0 +1,28 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "Configure the file storage" as STORE
+database "User name Workspace - What ? PostgreSQL" as DB
+queue "It 's a transaction . outbox" as OUT
+queue "delivery_snapshot_event\nexact user scope" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "The customers Workspace" as WS
+Client -> API: POST multipart with an avatar
+API -> API: I 'm going to check . MIME/Signature and size
+API -> STORE: Save bytes + public associated metadata
+API -> DB: BEGIN; insert the file metadata + update the avatar
+API -> OUT: add domain changes to the avatar/file
+API -> DB: COMMIT
+API --> Client: 201 JSON The user
+API -> STORE: delete the replaced avatar if it doesn't have a link
+OUT -> TASK: - Some of them . immutable delivery_snapshot_event\nEach one has its own outbox_event_uuid + exact scope
+TASK -> WORKER: Read the last user
+WORKER -> EVENT: Get ready to insert user.updated
+DISP -> EVENT: Send/repeat/play
+DISP -> WS: user.updated
+@enduml

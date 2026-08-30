@@ -1,0 +1,63 @@
+@startuml task_fanout
+!pragma layout smetana
+title Typisierte Projektionsvorgabe: fanout
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+participant "Projektor outbox" as PROJECTOR
+database "Typisierte Aufgaben" as TASKS
+database "Thema-Aufnahme" as CLAIM
+participant "Ein Schlitz für den Worker" as WORKER
+database "MESSAGE + PLACEMENT" as SOURCE
+database "Mitgliedschaft / Politik" as POLICY
+database "USER_MESSAGE_BINDING\n+ USER_MESSAGE_STATE" as RECIPIENT_ROWS
+database "Weitere Projektionsarbeiten" as FOLLOWUPS
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket" as DISPATCHER
+actor "Der Client" as Client
+
+PROJECTOR -> TASKS : immutable fanout(outbox_event_uuid, scope=topic)\nunique derivation; Ohne coalescing
+TASKS -> WORKER : offensichtliche Arbeiten zur Platzierung
+WORKER -> CLAIM : Monopol (project_id, topic_uuid)
+CLAIM --> WORKER : Besitz
+WORKER -> SOURCE : Lesen Sie die Platzierung + die kanonische Nachricht
+note right of SOURCE
+  Reihenfolge innerhalb des Themas:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+end note
+loop immutable batches: user_uuid ASC; default 1000, max 5000
+  WORKER -> POLICY : keyset recipients; active + expected generation
+  group Einer ist kurz. DB transaction
+    WORKER -> RECIPIENT_ROWS : bulk conditional upsert binding + state
+    WORKER -> FOLLOWUPS : immutable downstream outbox events + tasks 1:1
+    WORKER -> EVENTS : durable ready rows + checkpoint/next batch
+  end
+end
+alt membership inactive / generation mismatch
+  note over WORKER,RECIPIENT_ROWS
+    Stale task Sie ist fertig. no-op Und es gibt nie wieder Zugriff..
+  end note
+end
+alt mit sich selbst chatten
+  note over WORKER,RECIPIENT_ROWS
+    Verknüpfung und Status des Autors existieren bereits.
+    Zusätzliche Zeilen des Empfängers werden nicht erstellt.
+  end note
+end
+WORKER -> CLAIM : Sie sollen entlassen werden.
+EVENTS -> DISPATCHER : Nachhaltige Aufzeichnungen
+DISPATCHER -> Client : Senden / Wiederholen / Wiedergeben
+
+note over SOURCE,RECIPIENT_ROWS
+  Öffentlich UUID = MESSAGE_PLACEMENT.uuid =
+  UUIDv5(namespace=TOPIC.uuid, name=MESSAGE.uuid).
+  UUID Benutzer- binding Bleibt. hidden.
+  Task: lease/fencing, retry/backoff, DLQ/reaper,
+  idempotent effect guard Nach outbox_event_uuid.
+  Retry Wiederholt nur batch; OFFSET und unbounded transaction Verboten.
+  Nachher batch scheduler Gibt bounded fairness Ich habe einen alten Job..
+end note
+
+@enduml

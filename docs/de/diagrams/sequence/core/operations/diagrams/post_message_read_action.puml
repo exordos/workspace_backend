@@ -1,0 +1,30 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/[message_uuid]/actions/read/invoke
+actor "Der Client" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Scope workers\nlease + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/{message_uuid}/actions/read/invoke
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: placement USER_MESSAGE_STATE.read + immutable outbox events
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: read_counters / folder_projection\njede exact-scope task hat seine outbox_event_uuid
+Worker -> Worker: Einer fenced owner exact scope; - verschiedene scopes Parallel
+Worker -> Projection: Die Zählreihen für die Verknüpfung von Themen/Flow/Ordnern
+Worker -> Events: message.read + Ereignisse des Containers\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+note over API,Worker
+  Topic worker shared counters nicht verändert.
+  Atomic delta Nur mit exactly-once guard; - Nein, sonst nicht. recompute/write.
+  Retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+@enduml

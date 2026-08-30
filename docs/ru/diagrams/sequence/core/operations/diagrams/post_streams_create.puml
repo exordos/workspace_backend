@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/
+actor "Клиент" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "PostgreSQL\nканонические строки + привязки" as DB
+queue "Transactional outbox\n+ вывод типизированных задач" as Outbox
+participant "Фоновые исполнители\nexact scope leases + fencing" as Worker
+database "Готовые проекции\nпривязки контейнеров" as Projection
+database "Хранилище публичных событий" as Events
+participant "Диспетчер WebSocket" as Dispatcher
+actor "Клиент WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/
+alt обычный поток (без direct_user_uuid)
+    API -> DB: STREAM + TOPIC по умолчанию + привязки владельца
+else прямой поток (другой пользователь)
+    API -> DB: принудительно private=true\nдетерминированная пара + две уникальные привязки пользователей
+else поток с самим собой (direct_user_uuid == owner)
+    API -> DB: принудительно private=true\nтолько одна привязка владельца к потоку/теме
+end
+API -> DB: добавить неизменяемую запись в transactional outbox
+DB --> API: фиксация транзакции
+API --> Client: успешный публичный ответ
+DB ->> Outbox: зафиксированное событие
+Outbox ->> Worker: immutable topic_membership_policy_rebuild /\nfolder_projection / read_counters\nотдельное outbox event -> одна task
+Worker -> Worker: claim exact scope; для topic work\nMESSAGE.created_at DESC
+Worker -> Projection: привязки пользователя к потоку/теме/папке
+Worker -> Events: stream.created + folder.updated\nатомарно в одной DB transaction с проекцией
+Events ->> Dispatcher: зафиксированная готовая строка
+Dispatcher ->> WS: отправка / повтор / воспроизведение
+@enduml

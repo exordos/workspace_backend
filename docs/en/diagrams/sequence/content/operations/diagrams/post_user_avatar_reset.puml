@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "Configure the file storage" as STORE
+database "User name Workspace - What ? PostgreSQL" as DB
+queue "It 's a transaction . outbox" as OUT
+queue "delivery_snapshot_event\nexact user scope" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "The customers Workspace" as WS
+Client -> API: POST {}
+API -> DB: BEGIN; check/block your own user
+API -> DB: Set up the canonical URN Gravatar or a backup
+API -> OUT: Adding an avatar drop .
+API -> DB: COMMIT
+API --> Client: 200 JSON The user
+API -> STORE: Remove the replaced user avatar
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: Read the last user
+WORKER -> EVENT: Get ready to insert user.updated
+DISP -> EVENT: Send/repeat/play
+DISP -> WS: user.updated
+@enduml

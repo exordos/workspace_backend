@@ -1,0 +1,41 @@
+@startuml task_reaction_snapshot
+!pragma layout smetana
+title Typisierte Projektionsvorgabe: reaction_snapshot
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Ereignis outbox über den Reaktionsfall" as OUTBOX
+participant "Aufgabenprojektor" as PROJECTOR
+database "Typisierte Aufgaben" as TASKS
+database "Scope message\nlease + fencing" as CLAIM
+participant "Ein Schlitz für den Worker\n(Einziger Autor des Bildes)" as WORKER
+database "MESSAGE_REACTION_FACT" as FACTS
+database "MESSAGE\nreactions + reaction_users" as MESSAGE
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket" as DISPATCHER
+actor "Der Client" as Client
+
+OUTBOX -> PROJECTOR : Tatsache erstellt/geändert/gelöscht
+PROJECTOR -> TASKS : immutable reaction_snapshot(outbox_event_uuid)\nscope=message; Ohne coalescing
+TASKS -> WORKER : (project_id, canonical_message_uuid)
+WORKER -> CLAIM : monopolisiertes Eigentum zu erwerben exact key
+WORKER -> FACTS : Lesen Sie die letzten Informationen aus der Nachricht
+FACTS --> WORKER : Kanonische Reaktions-Fakten-Sammlung
+group Einer DB transaction
+  WORKER -> MESSAGE : Beide Bilder atomar ersetzen
+  WORKER -> EVENTS : durable ready message.updated; unique derivation
+end
+WORKER -> CLAIM : Sie sollen entlassen werden.
+EVENTS -> DISPATCHER : - ein stabiler , bereit zu schreiben
+DISPATCHER -> Client : Senden / Wiederholen / Wiedergeben
+
+note over FACTS,MESSAGE
+  Die Fakten sind die Quelle der Wahrheit.
+  API Lesezyklus nicht ausgeführt-Änderung-Aufzeichnung JSON-Das ist ein Bild..
+  API Die Lesung wird nicht zusammengefasst.
+  Topic lock wird nicht für canonical MESSAGE snapshot.
+  Lease expiry/fencing, retry/backoff, DLQ/reaper - Sie sind verpflichtend.
+end note
+
+@enduml

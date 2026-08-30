@@ -1,0 +1,61 @@
+@startuml migration_release_runbook
+!pragma layout smetana
+
+title Messenger target-model migration and release
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+actor "Operator" as Operator
+database "Backup DB + object storage" as Backup
+participant "Versioned DB migration" as Migration
+database "Target DB" as DB
+participant "File cleanup worker" as Worker
+participant "Zulip Bridge" as Bridge
+participant "Workspace API/workers/dispatcher" as Runtime
+participant "Zulip source" as Zulip
+
+Operator -> Backup : complete consistent snapshot
+Operator -> Backup : verified restore and full rehearsal
+Operator -> Runtime : freeze writes/workers/dispatcher/integrations
+Operator -> Migration : apply reviewed migration
+Migration -> DB : bounded size and writer-lock gates
+Migration -> DB : fail-closed provenance preflight
+
+alt ambiguous/conflicting provenance or unrehearsed large cutover
+  Migration --> Operator : abort before destructive work
+  Operator -> Runtime : remain frozen; resolve or restore
+else every preflight gate passes
+  Migration -> DB : create target schema
+  Migration -> DB : preserve and convert native data
+  Migration -> DB : atomically remove proven Zulip projection
+  Migration -> DB : advance projection reset generation
+  Migration --> Operator : commit
+end
+
+loop bounded idempotent physical cleanup
+  Worker -> DB : lease deleted zero-reference file task
+  Worker -> DB : recheck complete storage tuple refcount
+  Worker -> Backup : delete provider object and sidecar
+end
+
+Bridge -> DB : observe new reset generation
+Bridge -> Bridge : clear rebuildable cache/mappings once
+loop bounded keyset import with durable checkpoint
+  Bridge -> Zulip : read through final high-water mark
+  Zulip --> Bridge : authoritative messages/files/attachments
+  Bridge -> DB : idempotent canonical upsert by provider identity
+end
+
+Operator -> DB : reconcile native and reimported counts/state/FKs/cursors
+Operator -> Backup : verify native objects unchanged and links complete
+
+alt every acceptance gate passes
+  Operator -> Runtime : reopen runtime/integrations
+else any migration/import/acceptance gate fails
+  Operator -> Runtime : remain stopped
+  Operator -> Backup : restore DB + storage + previous app version
+end
+
+@enduml

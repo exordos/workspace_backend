@@ -1,0 +1,15 @@
+@startuml
+!pragma layout smetana
+title GET /api/workspace/v1/messenger/topic_summary_endpoints/[endpoint_uuid]
+actor "Клиент" as Client
+participant "TopicSummaryEndpointController\nRestAlchemy" as API
+database "Индексированные строки плоскости управления сводками" as DB
+Client -> API: GET /api/workspace/v1/messenger/topic_summary_endpoints/{endpoint_uuid}
+API -> DB: разрешение/область проекта + скалярный UUID
+DB --> API: очищенные строки
+API --> Client: 200, публичный JSON
+note over API,DB
+Нет transactional outbox / фонового исполнителя / публичного события / WebSocket
+Учётные данные и токен заявки не сериализуются
+end note
+@enduml

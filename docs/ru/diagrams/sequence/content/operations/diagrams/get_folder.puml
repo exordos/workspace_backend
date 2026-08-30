@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folders/{folder_uuid}
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: запрос
+API -> DB: индексированный SELECT
+note right of DB
+  FOLDER хранится один раз; USER_FOLDER_BINDING хранит доступ,
+  счётчики и read-only JSONB folder_items_snapshot; empty=[]
+  FOLDER_ITEM = normalized source of truth; snapshot строит folder_projection
+  Автоматические FOLDER_ITEM — восстанавливаемая проекция воркера
+  Источник: активная USER_STREAM_BINDING + каноническая STREAM.is_archived = false
+  All chats = все; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+DB --> API: одна indexed row с ready snapshot/counts
+note right of API: без N+1 / json_agg / COUNT / custom SQL
+note right of API: без outbox / задачи / события
+API --> Client: 200 JSON
+@enduml

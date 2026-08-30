@@ -1,0 +1,44 @@
+@startuml
+!pragma layout smetana
+title Durable topic mapping: rename und partial message move
+
+autonumber
+participant "Bridge" as Bridge
+participant "Private Workspace API" as API
+database "Provider topic mapping + alias history" as Mapping
+database "MESSAGE / TOPIC / PLACEMENT" as DB
+database "Durable ready events" as Events
+
+Bridge -> API : resolve(realm, channel, current/old topic name)
+API -> Mapping : atomic lookup/create/alias resolution
+Mapping --> API : stable TOPIC.uuid
+
+alt Whole-topic rename
+  Bridge -> API : topic.rename(old, new, propagate whole topic)
+  API -> Mapping : update current name + preserve alias history
+  API -> DB : update canonical TOPIC name; same UUID
+  note right of DB
+    Placement UUIDs remain unchanged.
+    Late old-name event resolves via alias history.
+  end note
+else Partial message move
+  Bridge -> API : message.move(provider message, target topic)
+  API -> Mapping : create/reuse target TOPIC.uuid
+  API -> DB : resolve canonical MESSAGE
+  API -> DB : delete old placement
+  API -> DB : create target placement
+  note right of DB
+    public uuid = UUIDv5(namespace=target TOPIC.uuid,
+    name=canonical MESSAGE.uuid)
+    old public URL -> 404; no redirect
+  end note
+  API -> Events : old placement delete + target create/update
+end
+
+note over Bridge,Mapping
+  Zulip topic name mutable, numeric topic ID absent.
+  Workspace mapping authoritative and shared by all accounts/instances;
+  Bridge may cache but owns no durable mapping DB.
+end note
+
+@enduml

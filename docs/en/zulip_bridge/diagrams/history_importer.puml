@@ -1,0 +1,73 @@
+@startuml
+!pragma layout smetana
+title History Importer: root, per-stream tasks and restart range
+
+autonumber
+participant "History Importer" as History
+participant "Private Workspace API" as API
+database "Workspace history tasks / mappings" as Tasks
+participant "Zulip History API" as Zulip
+database "Canonical state + outbox" as DB
+
+History -> API : mTLS claim history root(account, boundary, selection)
+API -> Tasks : authorize current certificate identity;\nthen account lease/fencing root
+History -> Zulip : discover users/chats/topics/memberships
+History -> API : ensure unmanaged identities + streams/topics/memberships
+API -> DB : idempotent canonical mutations + outbox
+History -> API : create immutable per-stream tasks
+API -> Tasks : unique(account, boundary, range, stream)
+
+note over Tasks
+  Bridge-wide history pool default = 4.
+  Accounts fair round-robin; within account newest stream first.
+  All account workers share one rate limiter; realtime priority.
+end note
+
+par Stream A worker
+  History -> API : claim stream A task
+  loop topics/messages sequential, newest-first
+    History -> Zulip : bounded keyset page
+    History -> API : one idempotent message command
+    API -> DB : MESSAGE + PLACEMENT + author binding/state + outbox
+    History -> API : file/link/reaction or deferred reference
+  end
+  History -> API : complete stream A task
+else Stream B worker (Until then configured limit)
+  History -> API : claim stream B task
+  History -> Zulip : independent stream range
+  History -> API : same commands/provider keys
+end
+
+alt Zulip Retry-After For the account
+  Zulip --> History : Retry-After
+  History -> Tasks : pause account history until deadline
+  note right of History
+    Realtime resumes first; then fair history scheduling.
+    Exact upper pool limit remains load-test decision.
+  end note
+end
+
+alt crash/retry Until then completion stream B
+  Tasks -> History : lease expires; re-claim stream B
+  History -> Zulip : restart entire selected stream B range
+  History -> API : same provider keys
+  API --> History : duplicate/no-op for committed rows
+  note right of History
+    Message-level checkpoint v1 There is no.
+    Completed stream A It won 't start again ..
+  end note
+end
+
+History -> API : reconcile children/deferred/DLQ/totals
+API -> Tasks : complete root after all gates
+
+note over History,DB
+  mTLS authenticates realm/provider/Bridge generation;
+  account/task leases separately authorize current work.
+  One . history worker I 'm on stream; topics/messages Inside in sequence.
+  Zulip topic — The attribute message, Not separate parallel work unit.
+  Files/reactions They're coming after. base message or durable deferred resolution.
+  Bridge Does not perform Workspace projections/WebSocket delivery.
+end note
+
+@enduml

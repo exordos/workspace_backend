@@ -1,0 +1,34 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title DELETE /api/workspace/v1/messenger/folder_items/{folder_item_uuid}
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL\nFOLDER_ITEM + Kontainerbindungen" as DB
+queue "Transaktions- outbox" as OUT
+queue "Typisierte Aufgabe für die Ordnerprojektion" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: DELETE Ordnerelement
+note right of API
+  Die manuelle Verbindung wird gelöscht
+  Die automatische Mitgliedschaft ändert nur die Vorlage des Worker
+  Quelle: Aktiv USER_STREAM_BINDING + Kanonische STREAM.is_archived = false
+  All chats = - Das ist alles.; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+API -> DB: BEGIN; Elemente aus dem angegebenen Bereich löschen
+API -> OUT: Hinzufügen folder_item.deleted
+API -> DB: COMMIT
+API --> Client: 204 Leere Antwort
+OUT -> TASK: immutable folder_projection(outbox_event_uuid, scope=user-folder)
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: Lesen Sie die anderen normalized items + ready counts
+group Einer worker DB transaction
+  WORKER -> DB: replace snapshot + counts + version/updated_at
+  WORKER -> EVENT: ready folder_item.deleted {uuid} + effect guard
+end
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: folder_item.deleted
+@enduml

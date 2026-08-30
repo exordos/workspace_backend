@@ -1,0 +1,263 @@
+@startuml messenger_domain_model
+!pragma layout smetana
+
+title Projekt-Domainmodell Messenger
+
+hide methods
+hide stereotypes
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam linetype ortho
+skinparam entity {
+    BackgroundColor #F8FAFC
+    BorderColor #334155
+    FontColor #0F172A
+}
+skinparam note {
+    BackgroundColor #FFF7ED
+    BorderColor #C2410C
+    FontColor #7C2D12
+}
+
+entity MESSAGE {
+    uuid <<Innenkanon ID>>
+    --
+    author_uuid
+    content
+    created_at
+    updated_at
+}
+
+entity MESSAGE_PLACEMENT {
+    uuid <<öffentlich placement ID, UUIDv5>>
+    --
+    message_uuid
+    stream_uuid
+    topic_uuid
+}
+
+entity USER_MESSAGE_BINDING {
+    binding_uuid <<versteckter Schlüssel ORM>>
+    --
+    placement_uuid
+    user_uuid
+    --
+    relation_role
+    visibility
+    permissions
+    membership_generation snapshot
+}
+
+entity USER_MESSAGE_STATE {
+    placement_uuid
+    user_uuid
+    membership_generation snapshot
+    --
+    read
+    mentioned
+    starred
+    pinned
+}
+
+entity DOMAIN_OUTBOX_EVENT {
+    event_uuid
+    scope_kind
+    exact scope_key
+    payload
+    immutable
+}
+
+entity PROJECTION_TASK {
+    outbox_event_uuid <<unique derivation key>>
+    task_kind
+    scope_kind
+    exact scope_key
+    pending / leased / running / completed / failed / DLQ
+    lease / fencing / attempts / next_retry_at
+}
+
+entity PROJECTION_SCOPE_LEASE {
+    project_id
+    scope_kind
+    exact scope_key
+    --
+    owner / expiry / fencing_token
+}
+
+entity USER {
+    user_uuid
+}
+
+entity STREAM {
+    stream_uuid
+    owner_uuid <<- und nicht FK - Auf user>>
+    direct_user_uuid <<nullable FK - Auf user>>
+    private
+}
+
+entity TOPIC {
+    topic_uuid
+}
+
+entity FOLDER {
+    folder_uuid
+}
+
+entity USER_STREAM_BINDING {
+    stream_uuid
+    user_uuid
+    --
+    active / membership_generation
+    Zugriff / Benachrichtigung
+    Nichtgelesenen-Zähler / last_message_uuid
+}
+
+entity USER_TOPIC_BINDING {
+    topic_uuid
+    user_uuid
+    --
+    Flaggen / Benachrichtigungen / Nichtgelesenen-Zählgeräte
+}
+
+entity USER_FOLDER_BINDING {
+    folder_uuid
+    user_uuid
+    --
+    rule / type
+    unread_count / mention_count
+    folder_items_snapshot : JSONB (read-only public source)
+    snapshot_version / snapshot_updated_at (internal)
+}
+
+entity FOLDER_ITEM {
+    folder_item_uuid
+    folder_uuid
+    stream_uuid
+    --
+    automatic
+}
+
+MESSAGE ||--o{ MESSAGE_PLACEMENT : "offensichtliche Kontexte"
+STREAM ||--o{ MESSAGE_PLACEMENT : - die Platzierung
+TOPIC ||--o{ MESSAGE_PLACEMENT : "Zwangsverhältnis / namespace UUIDv5"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_BINDING : "Zugang des Empfängers"
+USER ||--o{ USER_MESSAGE_BINDING : "Einzigartig für die Platzierung"
+MESSAGE_PLACEMENT ||--o{ USER_MESSAGE_STATE : "Einzigartig auf user/placement"
+USER ||--o{ USER_MESSAGE_STATE
+STREAM ||--o{ USER_STREAM_BINDING
+USER ||--o{ USER_STREAM_BINDING
+TOPIC ||--o{ USER_TOPIC_BINDING
+USER ||--o{ USER_TOPIC_BINDING
+FOLDER ||--o{ USER_FOLDER_BINDING
+USER ||--o{ USER_FOLDER_BINDING
+FOLDER ||--o{ FOLDER_ITEM : "Ordner zusammensetzen"
+
+note right of USER_FOLDER_BINDING
+  Normalized FOLDER_ITEM = source of truth.
+  Public folder_items <- ready JSONB snapshot; empty = [].
+  folder_projection(user-folder scope) atomically writes
+  snapshot + counts + version/time + ready event rows.
+  API read: one indexed row/page; no N+1/json_agg/COUNT/custom SQL.
+end note
+STREAM ||--o{ FOLDER_ITEM : "Kanonisches Objekt"
+DOMAIN_OUTBOX_EVENT --> PROJECTION_TASK : "- Genau so. 1 immutable task - Auf event"
+PROJECTION_TASK --> PROJECTION_SCOPE_LEASE : "claim exact scope"
+PROJECTION_TASK ..> FOLDER_ITEM : "- Ich habe es nicht verstanden. automatic items"
+PROJECTION_TASK ..> USER_FOLDER_BINDING : "Bereite Aggregate aktualisieren"
+
+note top of MESSAGE
+  Ein physischer Kanonik-Eintrag.
+  Der Inhalt wird nicht für Benutzer kopiert.
+  MESSAGE.uuid — - Das ist ein stabiler ID.
+end note
+
+note top of MESSAGE_PLACEMENT
+  Öffentlich uuid = UUIDv5(
+    namespace = TOPIC.uuid,
+    name = MESSAGE.uuid
+  ).
+  Name — lowercase hyphenated canonical UUID.
+  Name enthält keine project/stream, braces oder Vorlagen.
+  Autorität und Einzigartigkeit:
+  (project, message, stream, topic).
+  TOPIC verbindlich, global einzigartig und unveränderlich
+  Gehört genau einem STREAM/PROJECT.
+end note
+
+note right of USER_MESSAGE_BINDING
+  Physischer , indizierter Zugriff.
+  Einzigartig (project, placement, user).
+  binding_uuid Verborgen von öffentlichem JSON,
+  Aber es könnte technisch sein. identity Zeilen ORM.
+  Nein, nicht revision oder Versionen binding.
+end note
+
+note bottom of USER_MESSAGE_STATE
+  Placement-scoped read/starred/pinned/etc.
+  Eine Zeile auf (project, user, placement).
+  Für den Autor wird synchron mit binding.
+  Für den Empfänger worker Erstellt state zusammen mit binding.
+  Re-add: conditional upsert - Das ist neu. generation
+  und vollständig reset - persönliche flags - und defaults.
+end note
+
+note bottom of STREAM
+  Öffentliche owner/direct Verweise — UUID;
+  physische Spalten  indexisiert FK.
+  direct_user_uuid - Das ist es. => private = true.
+  Self-chat hat einen Eigentümer und hat keine
+  Zusätzliche Verbindung von Empfängern.
+end note
+
+note right of USER_STREAM_BINDING
+  Persistent lifecycle row.
+  Revoke: active=false + generation++ in API transaction.
+  Re-add: Neues generation; Die alten message binding/state Unsichtbar.
+  Jeder read/action Überprüft active + - Das stimmt . generation.
+  Cleanup Nein . security-critical.
+end note
+
+note bottom of USER_FOLDER_BINDING
+  Kanonische stream/topic/folder Einmal aufbewahrt.
+  Die fertigen Aggregate befinden sich in einer einzigartigen Verbindung
+  der zuständigen Behörde user/container scope.
+  Systemische binding hat eine feste rule/type.
+  Allgemeine Predigt: Aktiv USER_STREAM_BINDING
+  + Kanonische STREAM.is_archived = false.
+  All chats: - Das ist alles.; Personal: STREAM.private = true;
+  Channels: STREAM.private = false.
+  Message binding nicht für Containerzählungen verwendet.
+end note
+
+note bottom of FOLDER_ITEM
+  Elemente mit automatic = true — Projektion , die umgebaut wird.
+  Die Quelle der Wahrheit: Aktiv USER_STREAM_BINDING
+  und Attribute der kanonischen STREAM.
+  API Liest die bereitgestellten Zeilen mit einfachen indexierten Verbindungen.
+end note
+
+note bottom of PROJECTION_TASK
+  Änderungen schreiben unveränderliche Ereignisse. outbox.
+  GET/list keine Aufgaben erstellen.
+  Initial design: Ohne coalescing.
+  Unique outbox_event_uuid; lease expiry + fencing;
+  retry/backoff, max attempts/DLQ, reaper/reconciliation.
+  Worker Erhält offensichtliche Arbeit nach placement;
+  Er scannt keine fehlenden. bindings.
+  Topic scope Besitzt nur placements/bindings.
+  Canonical snapshots: message scope.
+  Aggregates: user-stream/user-topic/user-folder.
+  Fallback shared row -> topic Verboten.
+  Atomic delta Erfordert exactly-once effect guard;
+  - Nein, sonst nicht. scope worker recomputes/writes.
+end note
+
+note bottom of DOMAIN_OUTBOX_EVENT
+  Synchronisierte Übermittlung in einer Transaktion:
+  MESSAGE + MESSAGE_PLACEMENT + Autoren
+  USER_MESSAGE_BINDING + USER_MESSAGE_STATE + outbox.
+  Fan-out Erstellt binding/state Empfänger zusammen;
+  self-chat Erstellt keine zusätzlichen Paare.
+end note
+
+@enduml

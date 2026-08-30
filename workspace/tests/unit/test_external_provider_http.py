@@ -943,6 +943,38 @@ def test_provider_http_service_dispatches_only_private_provider_routes():
         )
 
 
+def test_provider_http_service_dispatches_v2_provider_commands(monkeypatch):
+    identity = _identity()
+    session = object()
+    commands = [{"provider_event_key": "state-key"}]
+    calls = []
+    expected = {"results": [{"provider_event_key": "state-key"}]}
+
+    def apply(current_session, current_identity, current_commands):
+        calls.append((current_session, current_identity, current_commands))
+        return expected
+
+    monkeypatch.setattr(
+        provider_service.provider_v2,
+        "apply_provider_command_batch",
+        apply,
+    )
+    api = provider_service.ProviderDataService(apply_event=lambda *_args: None)
+
+    assert (
+        api.handle(
+            session,
+            identity,
+            "POST",
+            f"{provider_service.API_ROOT_V2}/commands",
+            {},
+            {"commands": commands},
+        )
+        == expected
+    )
+    assert calls == [(session, identity, commands)]
+
+
 def test_rejected_result_rolls_back_savepoint_without_queue_mutation():
     identity = _identity()
     session = Session([])

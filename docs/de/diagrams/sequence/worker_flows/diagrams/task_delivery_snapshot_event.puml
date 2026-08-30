@@ -1,0 +1,39 @@
+@startuml task_delivery_snapshot_event
+!pragma layout smetana
+title Typisierte Projektionsvorgabe: delivery_snapshot_event
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Anfangsstand exact resource scope" as SOURCE
+database "Unveränderlich outbox" as OUTBOX
+participant "Aufgabenprojektor" as PROJECTOR
+database "Typisierte Aufgaben" as TASKS
+participant "Ein Schlitz für den Worker" as WORKER
+database "Sanitierte öffentliche Projektion" as PROJECTION
+database "Speicher für öffentliche Veranstaltungen" as EVENTS
+participant "- Das ist der Controller . WebSocket" as DISPATCHER
+actor "Der Client" as Client
+
+SOURCE -> OUTBOX : festgelegte Domänenereignis
+OUTBOX -> PROJECTOR : ein unveränderliches Ereignis
+PROJECTOR -> TASKS : immutable delivery_snapshot_event\n(outbox_event_uuid, exact scope)\nunique derivation; Ohne coalescing
+TASKS -> WORKER : exact scope lease + fencing
+WORKER -> SOURCE : Lesen Sie das letzte exact-scope - Der Zustand
+group Einer DB transaction
+  WORKER -> PROJECTION : Impotent gesundheitsgepflegte Aufnahme
+  WORKER -> EVENTS : durable ready event, wenn sie ausgerufen wurde contract kind
+end
+EVENTS -> DISPATCHER : Festplatten
+DISPATCHER -> Client : Senden / Wiederholen / Wiedergeben
+
+note over SOURCE,PROJECTION
+  Provider JSON Eröffnet nur provider/delivery.
+  Für draft/push Ohne public event task Sie wird festgehalten. effect guard
+  und endet ohne event row.
+  Die Rohprotokolle und die Konto-Daten bleiben versteckt.
+  Lifecycle: lease expiry, retry/backoff, DLQ/reaper;
+  idempotent effect guard Nach outbox_event_uuid.
+end note
+
+@enduml

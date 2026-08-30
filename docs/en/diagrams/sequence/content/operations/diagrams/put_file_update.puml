@@ -1,0 +1,27 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title PUT /api/workspace/v1/messenger/files/{file_uuid}
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "Configure the file storage" as STORE
+database "Metadata from the file + ACL - What ? PostgreSQL" as DB
+queue "It 's a transaction . outbox" as OUT
+queue "delivery_snapshot_event\nexact file scope" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "Signed client" as WS
+Client -> API: PUT JSON metadata from
+API -> DB: BEGIN; block the owner file
+API -> DB: I want to update the metadata .
+API -> STORE: update the associated metadata
+API -> OUT: I 'm going to add file.updated
+API -> DB: COMMIT
+API --> Client: 200 JSON metadata from
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: I 'm gonna take the job .
+WORKER -> EVENT: Get ready to insert file.updated
+DISP -> EVENT: read/repeat/play
+DISP -> WS: file.updated
+@enduml

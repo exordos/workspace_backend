@@ -1,0 +1,22 @@
+@startuml
+!pragma layout smetana
+title PUT /api/workspace/v1/messenger/topic_summary_endpoints/[endpoint_uuid]
+actor "The client ." as Client
+participant "TopicSummaryEndpointController\nRestAlchemy" as API
+database "Lines of the control plane of the summary\n+ encrypted accounting data" as DB
+queue "Transactional outbox\n1 immutable task I 'm on event" as Outbox
+participant "Background player\nThe control plane of the summaries" as Worker
+Client -> API: PUT /api/workspace/v1/messenger/topic_summary_endpoints/{endpoint_uuid}
+API -> DB: The start of the transaction; Permission + change
+API -> DB: Add an unchanged internal record to transactional outbox
+DB --> API: fixing the purified state
+API --> Client: A successful public response
+DB ->> Outbox: the recording is fixed
+Outbox ->> Worker: immutable delivery_snapshot_event\n(outbox_event_uuid, registry scope)
+Worker -> DB: apply the current state of planning/leasing
+note over Worker
+There is no public event line
+There 's no dispatcher . WebSocket
+The topic tasks remain exclusive and go from new posts to old ones
+end note
+@enduml

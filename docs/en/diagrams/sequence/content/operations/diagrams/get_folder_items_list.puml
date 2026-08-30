@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folder_items/
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: The request
+note right of API
+  Currently implemented: page_limit There is no/0 => without limitation
+  Negative/not clear => 400; positive without maximum/limitation from above
+  Target: There is no/0 => 100; 1..500 That 's right .; Otherwise 400; unlimited No , I 'm not .
+end note
+API -> DB: - It 's indexed . SELECT
+note right of DB
+  FOLDER_ITEM It connects FOLDER with a canonical flow
+  Normalized FOLDER_ITEM = source of truth; folder_projection He 's building . snapshot
+  Automated elements: active USER_STREAM_BINDING + It 's canonical . STREAM.is_archived = false
+  All chats = All of them .; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Indexed page + ready USER_STREAM_BINDING; without N+1/COUNT/custom SQL
+end note
+DB --> API: public lines
+note right of API: without outbox / tasks / events
+API --> Client: 200 JSON
+@enduml

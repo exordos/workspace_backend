@@ -1,0 +1,31 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/
+actor "Der Client" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/
+alt Normaler Fluss (Ohne direct_user_uuid)
+    API -> DB: STREAM + TOPIC Standardmäßig + Eigentümerbindung
+else Gerader Strom (ein anderer Benutzer)
+    API -> DB: Zwangsweise private=true\nBestimmtes Paar + zwei eindeutige Nutzerbindungen
+else Der Fluss mit sich selbst (direct_user_uuid == owner)
+    API -> DB: Zwangsweise private=true\nNur ein Eigentümerbindung an den Stream/Theme
+end
+API -> DB: ein unveränderliches Eintrag in transactional outbox
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: immutable topic_membership_policy_rebuild /\nfolder_projection / read_counters\nEinzelne outbox event -> Einer task
+Worker -> Worker: claim exact scope; für topic work\nMESSAGE.created_at DESC
+Worker -> Projection: Benutzerbindungen an den Stream/Themen/Ordner
+Worker -> Events: stream.created + folder.updated\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+@enduml

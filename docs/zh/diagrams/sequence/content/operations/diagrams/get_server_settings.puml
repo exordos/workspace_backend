@@ -1,0 +1,16 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/server_settings
+actor "客户端" as Client
+participant "ServerSettingsMiddleware" as API
+Client -> API: GET /api/workspace/v1/messenger/server_settings
+API -> API: 正常化路径并计算 realm
+note right of API
+  规则终点显示在上面
+  完成/接受相同操作: 200 没有重定向
+end note
+API -> API: 建立固定设置对象
+note right of API: 匿名; 没有DB / outbox / 任务 / 事件
+API --> Client: 200 JSON 设置
+@enduml

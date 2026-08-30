@@ -1,0 +1,39 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/messenger/folder_items/
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL\nFOLDER_ITEM + Kontainerbindungen" as DB
+queue "Transaktions- outbox" as OUT
+queue "Typisierte Aufgabe für die Ordnerprojektion" as TASK
+participant "Ein Wurkerpool" as WORKER
+database "Speicher für öffentliche Veranstaltungen" as EVENT
+participant "- Das ist der Controller . WebSocket" as DISP
+participant "Unterzeichneter Kunde" as WS
+Client -> API: POST JSON Ordnerelement
+note right of API
+  Nur für Benutzerordner manuell verbinden
+  Automatische Mitgliedschaft unterstützt von Worker
+  Quelle: Aktiv USER_STREAM_BINDING + Kanonische STREAM.is_archived = false
+  All chats = - Das ist alles.; Personal = STREAM.private = true; Channels = STREAM.private = false
+end note
+API -> DB: BEGIN; Finden Sie die Verknüpfungen des Ordners/Streams
+API -> DB: Einzigartiges einfügen FOLDER_ITEM
+API -> OUT: Hinzufügen folder_item.created
+API -> DB: COMMIT
+API --> Client: 201 JSON Ein Element
+OUT -> TASK: immutable folder_projection(outbox_event_uuid)\nscope=user-folder; Ohne coalescing
+TASK -> WORKER: claim user-folder(project,user,folder)\nlease + fencing
+WORKER -> DB: Lesen normalized items + ready stream counts
+note right of WORKER
+  USER_STREAM_BINDING C/U/D -> outbox -> immutable folder_projection(outbox_event_uuid)
+  -> Wird potenziell hinzugefügt/abgezogen + unread_count/mention_count Ordner
+end note
+group Einer worker DB transaction
+  WORKER -> DB: replace folder_items_snapshot + counts\nversion/updated_at; stable order; empty=[]
+  WORKER -> EVENT: ready folder.updated + unique effect guard
+end
+DISP -> EVENT: Lesen/Wiederholen/Wiederholen
+DISP -> WS: folder.updated
+@enduml

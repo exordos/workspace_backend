@@ -1,0 +1,116 @@
+@startuml worker_architecture
+!pragma layout smetana
+
+title The architecture of the projection worker Workspace
+
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequence {
+    ArrowColor #334155
+    LifeLineBorderColor #334155
+    ParticipantBorderColor #2563EB
+    ParticipantBackgroundColor #EFF6FF
+}
+
+actor "The client ." as Client
+participant "REST / RestAlchemy\nThe controller ." as API
+database "The original tables\ncanonical entities + connections + facts" as SOURCE
+database "Unchanged domain\noutbox" as OUTBOX
+participant "Task projector\n1 task I 'm on outbox event" as PROJECTOR
+database "Typed tasks\nProjections" as TASKS
+participant "A custom worker pool\n0..N active slots" as POOL
+database "Rented exact scope key\nlease + fencing token" as CLAIM
+participant "The worker's slot." as WORKER
+database "Ready projections\n+ links + status / photos" as READY
+database "The public events repository" as EVENTS
+participant "The controller . WebSocket\nRepeat + play" as DISPATCHER
+actor "The client . WebSocket" as WS
+
+Client -> API : A request that changes the state
+activate API
+API -> SOURCE : Change the lines  truth sources
+API -> OUTBOX : Add a non-changing event\nin the same transaction
+API --> Client : The fixed immediate response
+deactivate API
+
+note over API,OUTBOX
+  POST Creates messages in sync:
+  MESSAGE + MESSAGE_PLACEMENT
+  + The author 's USER_MESSAGE_BINDING
+  + USER_MESSAGE_STATE + outbox.
+  The binding + the receiver state are created together through fanout.
+end note
+
+OUTBOX -> PROJECTOR : The events that have been recorded
+PROJECTOR -> TASKS : immutable task(outbox_event_uuid, kind, scope)\nunique derivation; without coalescing
+TASKS -> POOL : Waiting for a job\n(without searching for missing lines)
+POOL -> CLAIM : I 'm gonna get the right one . scope key
+CLAIM --> POOL : monopoly lease/ownership
+POOL -> WORKER : Set the limit within the limit set N
+activate WORKER
+WORKER -> SOURCE : Read the last recorded state
+note right of WORKER
+  Only for scope=topic:
+  MESSAGE.created_at DESC
+  14:20 -> 14:19 -> 14:15
+  fanout batch: user_uuid ASC, default 1000, max 5000
+  After batch — checkpoint and bounded fairness
+end note
+group One . DB transaction
+  WORKER -> READY : I 'm a powerhouse . materialization / batch upsert
+  WORKER -> EVENTS : durable ready rows; unique derivation key
+end
+WORKER -> CLAIM : I 'm gonna get you out of here .
+deactivate WORKER
+
+EVENTS -> DISPATCHER : - I 'm not sure .
+DISPATCHER -> WS : Send / repeat / play
+note over EVENTS,WS
+  Reconnect: cursor + high-watermark + replay + buffer/drain without gap.
+  At-least-once; client dedupe The event UUID.
+  Membership generation It 's suppressing . data events After revoke.
+end note
+
+note over SOURCE,READY
+  Public links UUID are scalar UUID-The properties.
+  Physical columns *_uuid remain indexed external keys.
+  Container aggregates are stored in unique bindings
+  user to the container, but not in message bindings.
+  MESSAGE_PLACEMENT.uuid — public UUID The message.
+  MESSAGE.uuid — The internal canonical content UUID;
+  UUID USER_MESSAGE_BINDING It 's still hidden . row identity.
+  FOLDER It 's only kept once .; normalized FOLDER_ITEM = source of truth.
+  USER_FOLDER_BINDING It keeps access, meters and read-only JSONB
+  folder_items_snapshot (empty=[]), version/updated_at.
+  Automatically read active folders USER_STREAM_BINDING + STREAM.is_archived=false:
+  All chats = All of them .; Personal = STREAM.private=true; Channels = STREAM.private=false.
+end note
+
+note over TASKS,READY
+  Ownership routing:
+  fanout/placement state -> topic(project, topic)
+  reaction snapshot -> message(project, canonical message)
+  stream aggregates -> user-stream(project, user, stream)
+  folder_projection -> user-folder(project, user, folder)
+  topic aggregates -> user-topic(project, user, topic)
+  Other shared rows They demand a clear scope; fallback I 'm on topic It 's forbidden ..
+  Topic-worker Does not perform unsafe read-modify-write shared rows.
+  folder_projection He writes snapshot + counts + version/time
+  + All of them . ready events In one worker DB transaction.
+  API He 's reading one . indexed row/page without N+1/json_agg/COUNT/custom SQL.
+end note
+
+note over PROJECTOR,CLAIM
+  Lifecycle: pending -> leased/running -> completed/failed -> DLQ.
+  Lease expiry, attempts/backoff, max attempts, reaper/reconciliation.
+  Atomic counter delta Only allowed with exactly-once effect guard
+  The outbox_event_uuid; Otherwise scope worker recomputes/writes.
+end note
+
+note over API,OUTBOX
+  GET/The list ends after the indexed reading
+  And does not create. outbox/The task.
+end note
+
+@enduml

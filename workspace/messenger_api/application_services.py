@@ -17,6 +17,7 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 
 from workspace.external_bridge_control import sql_state
+from workspace.external_bridge_control import identity_linking
 from workspace.messenger_api import credential_crypto
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
@@ -72,6 +73,9 @@ def desired_external_account_resource(
         "resource_type": "external_account",
         "uuid": str(account.uuid),
         "generation": account.desired_generation,
+        "projection_reset_generation": getattr(
+            account, "projection_reset_generation", 0
+        ),
         "owner_user_uuid": str(account.owner_user_uuid),
         "settings": settings,
         "synchronization_enabled": synchronization_enabled,
@@ -195,7 +199,11 @@ class ExternalAccountApplicationService:
             actor.user_uuid,
             account,
             messenger_events.EXTERNAL_ACCOUNT_CREATED_EVENT,
-            hidden_fields=("owner_user_uuid", "provider"),
+            hidden_fields=(
+                "owner_user_uuid",
+                "provider",
+                "projection_reset_generation",
+            ),
             session=session,
         )
         return account
@@ -203,6 +211,88 @@ class ExternalAccountApplicationService:
 
 class ExternalChatApplicationService:
     """Session-oriented bridge projection actions shared by API and workers."""
+
+    @staticmethod
+    def require_project_scope(
+        session: typing.Any,
+        account: external_models.ExternalAccount,
+        chat: external_models.ExternalChat,
+        project_id: object,
+    ) -> None:
+        """Serialize the realm-global one-provider-chat/one-project invariant."""
+        provider_identity = session.execute(
+            """
+            SELECT provider_realm_uuid,
+                   settings->>'server_url' AS provider_server_url
+            FROM m_external_accounts_v2
+            WHERE uuid = %s AND provider = %s
+            """,
+            (account.uuid, account.provider),
+        ).fetchone()
+        if provider_identity is None:
+            raise ra_exc.ValidationErrorException()
+        provider_realm_uuid = provider_identity.get("provider_realm_uuid")
+        try:
+            provider_origin = identity_linking.normalize_provider_origin(
+                provider_identity.get("provider_server_url")
+            )
+        except ValueError as error:
+            raise ra_exc.ValidationErrorException() from error
+        # The realm UUID arrives from provider discovery after an account has
+        # been created.  Keep pre-discovery selection compatible and fenced by
+        # the normalized provider origin; once discovery completes, take both
+        # locks so known and not-yet-known accounts cannot race one another.
+        scope_keys = []
+        scope_keys.append(f"url:{provider_origin}")
+        if provider_realm_uuid is not None:
+            scope_keys.append(f"realm:{provider_realm_uuid}")
+        for scope_key in sorted(scope_keys):
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    "provider-chat-project-v1:"
+                    f"{scope_key}:{chat.provider}:{chat.provider_chat_id}",
+                ),
+            )
+        candidates = session.execute(
+            """
+            SELECT conflicting.uuid,
+                   conflicting_account.provider_realm_uuid,
+                   conflicting_account.settings->>'server_url'
+                       AS provider_server_url
+            FROM m_external_chats_v2 AS conflicting
+            JOIN m_external_accounts_v2 AS conflicting_account
+              ON conflicting_account.uuid = conflicting.external_account_uuid
+            WHERE conflicting.provider = %s
+              AND conflicting.provider_chat_id = %s
+              AND conflicting.selected
+              AND conflicting.project_id IS DISTINCT FROM %s
+              AND conflicting.uuid <> %s
+            ORDER BY conflicting.uuid
+            """,
+            (
+                chat.provider,
+                chat.provider_chat_id,
+                project_id,
+                chat.uuid,
+            ),
+        ).fetchall()
+        for candidate in candidates:
+            same_realm = (
+                provider_realm_uuid is not None
+                and candidate["provider_realm_uuid"] == provider_realm_uuid
+            )
+            try:
+                same_origin = (
+                    identity_linking.normalize_provider_origin(
+                        candidate["provider_server_url"]
+                    )
+                    == provider_origin
+                )
+            except ValueError:
+                same_origin = False
+            if same_realm or same_origin:
+                raise messenger_exc.ExternalProviderScopeConflictError()
 
     @staticmethod
     def select_materialized(
@@ -228,6 +318,12 @@ class ExternalChatApplicationService:
         )
         if actor.project_id is None or chat.projection_stream_uuid is None:
             raise ra_exc.ValidationErrorException()
+        ExternalChatApplicationService.require_project_scope(
+            session,
+            account,
+            chat,
+            actor.project_id,
+        )
         models.WorkspaceStream.objects.get_one(
             filters={
                 "project_id": dm_filters.EQ(actor.project_id),

@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folder_items/
+actor "客户端" as Client
+participant "控制器 RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: 查询
+note right of API
+  目前的实现: page_limit 没有/0 => 没有限制
+  负数/不准数 => 400; 没有上限/极限的正值
+  Target: 没有/0 => 100; 1..500 确实是这样; 否则 400; unlimited 没有
+end note
+API -> DB: 已被索引 SELECT
+note right of DB
+  FOLDER_ITEM 连接 FOLDER 有规律流量
+  Normalized FOLDER_ITEM = source of truth; folder_projection 建造 snapshot
+  自动元素: 活跃的 USER_STREAM_BINDING + 规范性 STREAM.is_archived = false
+  All chats = 所有的; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Indexed page + ready USER_STREAM_BINDING; 没有 N+1/COUNT/custom SQL
+end note
+DB --> API: 公开行
+note right of API: 没有 outbox / 任务 / 事件
+API --> Client: 200 JSON
+@enduml

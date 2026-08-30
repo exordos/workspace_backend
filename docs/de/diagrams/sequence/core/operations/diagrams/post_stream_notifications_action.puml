@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/streams/[stream_uuid]/actions/notifications/invoke
+actor "Der Client" as Client
+participant "WorkspaceStreamController\nRestAlchemy" as API
+database "PostgreSQL\nKanonische Zeilen + Anschlüsse" as DB
+queue "Transactional outbox\n+ Typisierte Aufgaben ausführen" as Outbox
+participant "Hintergrund-Bauern\nexact scope leases + fencing" as Worker
+database "Fertige Projektionen\nKontainerbindungen" as Projection
+database "Speicher für öffentliche Veranstaltungen" as Events
+participant "- Das ist der Controller . WebSocket" as Dispatcher
+actor "Der Client WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/streams/{stream_uuid}/actions/notifications/invoke
+API -> DB: Beginn der Transaktion; - Das ist das . USER_STREAM_BINDING + transactional outbox
+API -> DB: ein unveränderliches Eintrag in transactional outbox
+DB --> API: Transaktion festzulegen
+API --> Client: eine erfolgreiche öffentliche Antwort
+DB ->> Outbox: festgehaltenes Ereignis
+Outbox ->> Worker: immutable read_counters(outbox_event_uuid)\nEinzelne task für jeden event
+Worker -> Worker: claim exact scope; für topic work\nMESSAGE.created_at DESC
+Worker -> Projection: Bereite Zählgeräte für den Strom/Thema-Bindung
+Worker -> Events: Ereignisse des aktuellen Benutzers\nAtomisch in einer DB transaction mit einer Projektion
+Events ->> Dispatcher: festgelegte bereitgestellte Zeile
+Dispatcher ->> WS: Versenden / Wiederholen / Wiederholen
+@enduml

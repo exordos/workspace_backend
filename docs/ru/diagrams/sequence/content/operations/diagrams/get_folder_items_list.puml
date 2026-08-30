@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folder_items/
+actor "Клиент" as Client
+participant "Контроллер RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: запрос
+note right of API
+  Текущая реализация: page_limit отсутствует/0 => без ограничения
+  отрицательное/нецелое => 400; положительное без максимума/ограничения сверху
+  Target: отсутствует/0 => 100; 1..500 точно; иначе 400; unlimited нет
+end note
+API -> DB: индексированный SELECT
+note right of DB
+  FOLDER_ITEM связывает FOLDER с каноническим потоком
+  Normalized FOLDER_ITEM = source of truth; folder_projection строит snapshot
+  Автоматические элементы: активная USER_STREAM_BINDING + каноническая STREAM.is_archived = false
+  All chats = все; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Indexed page + ready USER_STREAM_BINDING; без N+1/COUNT/custom SQL
+end note
+DB --> API: публичные строки
+note right of API: без outbox / задачи / события
+API --> Client: 200 JSON
+@enduml

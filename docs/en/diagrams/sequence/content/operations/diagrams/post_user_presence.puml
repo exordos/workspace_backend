@@ -1,0 +1,32 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title POST /api/workspace/v1/users/{user_uuid}/actions/presence/invoke
+actor "The client ." as Client
+participant "Controller is RestAlchemy" as API
+database "User name Workspace - What ? PostgreSQL" as DB
+queue "It 's a transaction . outbox" as OUT
+queue "delivery_snapshot_event\nexact user scope" as TASK
+participant "The worker pool ." as WORKER
+database "The public events repository" as EVENT
+participant "The controller . WebSocket" as DISP
+participant "The customers Workspace" as WS
+participant "Zulip Bridge / Zulip" as ZULIP
+Client -> API: POST JSON Attendance
+API -> DB: BEGIN; check/block your own user
+API -> DB: I 'm going to update the presence . + last_ping_at
+API -> OUT: Add a change of presence
+API -> DB: COMMIT
+API --> Client: 200 JSON The user
+OUT -> TASK: immutable delivery_snapshot_event(outbox_event_uuid)
+TASK -> WORKER: Read the last user
+WORKER -> EVENT: Get ready to insert user.updated for each project
+DISP -> EVENT: Send/repeat/play
+DISP -> WS: user.updated
+OUT -> ZULIP: durable mapped presence operation
+note right of ZULIP
+  The last one . confirmed Change is winning ..
+  origin/causation It 's suppressing . echo,
+  But he doesn't choose. winner.
+end note
+@enduml

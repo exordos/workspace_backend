@@ -1,0 +1,170 @@
+# Workspace Messenger Architecture
+
+This document defines the current Workspace backend service boundaries and
+data ownership. The browser contract remains in
+[`workspace_api.md`](workspace_api.md), the private provider data plane is
+defined by
+[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml), and
+realtime client behavior is documented in
+[`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md).
+
+## Architectural invariants
+
+- Workspace UI communicates only with IAM-authenticated Workspace and
+  Messenger REST APIs and the common Workspace event websocket.
+- PostgreSQL is canonical for Messenger resources, membership, user state,
+  events, provider mappings, external-account state, commands, and client
+  settings.
+- Messenger does not read or write SMTP, IMAP, Maildir, Exim, or Dovecot.
+- IAM is the source of Workspace users, projects, bearer-token authentication,
+  and authorization scope.
+- File metadata and ACL state are represented in PostgreSQL. File bytes and
+  JSON sidecars use the configured S3-compatible storage backend.
+- External provider runtimes are independently deployable services. They use a
+  private, bridge-authenticated Provider HTTP API and project ordinary
+  Messenger resources into PostgreSQL; browsers never call that API.
+- The public Messenger REST and websocket shapes are independent of the
+  persistence and provider implementations.
+- The backend image contains no UI source or bundle. The independently
+  versioned `workspace_ui` element owns the public load balancer, serves the
+  immutable web artifact, and proxies `/api/` to the exported backend node.
+
+## Components and trust boundaries
+
+```mermaid
+flowchart LR
+    UI["Workspace UI"]
+    LB["Workspace UI load balancer"]
+    IAM["Exordos Core IAM"]
+    API["Workspace and Messenger APIs"]
+    EVENTS["Event REST catch-up and WebSocket"]
+    WORKER["Messenger worker"]
+    BRIDGEAPI["Private bridge control and Provider API"]
+    PROVIDER["External provider runtime"]
+    PG[("Canonical PostgreSQL")]
+    S3[("S3-compatible file storage")]
+
+    UI --> LB
+    LB -->|"interactive login"| IAM
+    LB -->|"Bearer token"| API
+    LB <--> EVENTS
+    API --> PG
+    EVENTS --> PG
+    WORKER --> PG
+    API --> S3
+    BRIDGEAPI --> PG
+    BRIDGEAPI --> S3
+    PROVIDER <-->|"private authenticated HTTP"| BRIDGEAPI
+```
+
+The browser-facing HTTP and websocket interfaces form the public application
+boundary. The bridge control, Provider, and file-transfer APIs use a separate
+private listener and bridge identity. Provider credentials, raw provider
+payloads, internal cursors, database rows, and file-allocation details do not
+cross the browser boundary.
+
+## Public and private API boundaries
+
+The deployment exposes these stable browser paths:
+
+- `/api/workspace/v1/messenger/...` for the Messenger REST contract;
+- `/api/workspace/v1/events/` for durable event catch-up;
+- `/api/workspace/v1/events/ws` for live events;
+- `/api/workspace/v1/{users,services,me,epoch}/...` for common
+  IAM-scoped Workspace resources;
+- `/api/workspace/specifications/3.0.3` for the public Workspace OpenAPI
+  document.
+
+There is no browser-facing Provider, calendar, or standalone mail API.
+Independently deployed provider runtimes use the private
+`/api/workspace-provider/v1` data plane. The private control and file contracts
+are likewise not routed through the browser-facing nginx locations.
+
+## Identity and authorization
+
+Public REST requests use an IAM bearer token. `user_uuid` comes from IAM token
+information and `project_id` comes from IAM introspection. Messenger operations
+apply the resulting project, user, membership, ownership, and action checks
+before canonical state is read or changed.
+
+The private provider boundary authenticates an enrolled bridge instance and
+binds it to one provider kind and realm. Provider event batches and operation
+results are checked against that identity and the corresponding account,
+project, chat assignment, capability, and lease state before they change
+canonical Messenger resources.
+
+## Data ownership
+
+| Data | Source of truth |
+| --- | --- |
+| Users, projects, authentication, and IAM permissions | Exordos Core IAM |
+| Messages, streams, topics, bindings, folders, drafts, reactions, read state, and events | PostgreSQL |
+| Provider accounts, policies, bridge state, mappings, commands, results, and deduplication | PostgreSQL |
+| File metadata and access-control state | PostgreSQL and the canonical JSON sidecar |
+| File bytes and JSON sidecars | S3-compatible storage |
+
+Workspace UUIDs and typed URNs remain the identifiers visible through the
+public contract. Stable provider identifiers and conversion metadata are
+stored behind the provider projection and are exposed only through sanitized
+public `provider` and `delivery` fields where the contract allows them.
+
+## Native Messenger flow
+
+For a native write, the backend authenticates the caller with IAM, validates
+the current PostgreSQL membership and permissions, and commits the canonical
+resource changes and their realtime side effects in the request transaction.
+Reads use the same canonical tables and user/project visibility rules.
+
+File payloads stay in S3-compatible storage. Messages contain only authorized
+file or media URNs; the Messenger API never places binary attachments in a
+secondary message transport.
+
+## Provider flow
+
+Workspace-to-provider actions create durable provider operations in
+PostgreSQL. An enrolled provider runtime leases compatible operations over the
+private Provider HTTP API and reports terminal outcomes with idempotent,
+per-item results. Provider-to-Workspace changes arrive as authenticated event
+batches. A batch is validated and applied atomically to ordinary canonical
+Messenger resources; an invalid item rolls back the complete batch so the
+provider can retry it unchanged.
+
+Provider projections are returned through the same public Messenger endpoints
+as native resources. Their sanitized `provider` metadata identifies the
+external source and effective capabilities, while `delivery` describes the
+corresponding external operation state. Provider-specific control data remains
+private.
+
+## Realtime model
+
+REST catch-up and websocket delivery carry the same flat `schema_version: 1`
+event object. PostgreSQL maintains the generation and monotonic epoch cursor.
+Clients persist `(epoch_generation, epoch_version)`, deduplicate by that cursor,
+and apply both transports through one dispatcher.
+
+The websocket worker coalesces PostgreSQL notification bursts and fallback
+polls into independent per-connection catch-up tasks. Each connection has at
+most one active task, so a slow client cannot delay delivery to healthy clients.
+A transient storage read failure keeps established sockets ready and retries
+with bounded jittered backoff; send or protocol failures close only the affected
+socket.
+A notification is only a wake-up hint; the durable per-user cursor remains the
+source of truth, so coalescing does not change event payloads, ordering, or
+recovery semantics.
+
+Only event rows are subject to the configurable retention policy, which
+defaults to 72 hours. Messages and other canonical resources are not removed
+when old events are pruned. A cursor outside the retained suffix receives the
+typed `epoch_pruned` response and the client reloads authoritative snapshots
+before resuming realtime updates.
+
+## Persistence and recovery
+
+PostgreSQL and S3-compatible storage must survive service and node replacement.
+Recovery restores the database and object storage, applies database migrations,
+and then starts the API, event, worker, and private provider services. Derived
+indexes and caches may be rebuilt from canonical PostgreSQL rows without
+changing public resource identities.
+
+The deployment always starts the PostgreSQL-backed Messenger runtime. There is
+no persistence-mode switch or secondary Messenger journal.

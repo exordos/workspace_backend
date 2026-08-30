@@ -1,0 +1,28 @@
+@startuml
+!pragma layout smetana
+title POST /api/workspace/v1/messenger/messages/[message_uuid]/actions/star/invoke
+actor "客户端" as Client
+participant "WorkspaceMessageController\nRestAlchemy" as API
+database "PostgreSQL\n规则行 + 绑定" as DB
+queue "Transactional outbox\n+ 类型化任务的输出" as Outbox
+participant "Worker scope=user-message\nlease + fencing" as Worker
+database "已准备的投影\n连接容器" as Projection
+database "公众活动存储器" as Events
+participant "控制器 WebSocket" as Dispatcher
+actor "客户端 WebSocket" as WS
+Client -> API: POST /api/workspace/v1/messenger/messages/{message_uuid}/actions/star/invoke
+API -> DB: resolve public placement; check active membership + generation
+API -> DB: placement STATE.starred=true + immutable outbox event
+DB --> API: 交易的固定
+API --> Client: 成功的公开回复
+DB ->> Outbox: 已记录的事件
+Outbox ->> Worker: immutable read_counters(outbox_event_uuid,\nproject+user+placement); 没有 coalescing
+Worker -> Worker: 一个 fenced owner exact user-message scope
+Worker -> Projection: 提交当前用户的消息
+Worker -> Events: message.updated 目前的用户\n原子在一个 DB transaction 投影
+Events ->> Dispatcher: 已固定的准备行
+Dispatcher ->> WS: 发送 / 重复 / 复制
+note over API,Worker
+  Topic lock 没有使用. Retry/backoff, DLQ/reaper 必须.
+end note
+@enduml

@@ -1,0 +1,25 @@
+@startuml
+!pragma layout smetana
+skinparam shadowing false
+title GET /api/workspace/v1/messenger/folder_items/
+actor "Der Client" as Client
+participant "- Überwacher RestAlchemy" as API
+database "PostgreSQL" as DB
+Client -> API: Anfrage
+note right of API
+  Aktuelle Umsetzung: page_limit nicht vorhanden/0 => ohne Einschränkung
+  Negativ/nicht-zielmäßig => 400; Positiv ohne Höchst-/Oberbegrenzung
+  Target: nicht vorhanden/0 => 100; 1..500 Das ist es.; - Nein, sonst nicht. 400; unlimited Nein , nicht
+end note
+API -> DB: - und nicht SELECT
+note right of DB
+  FOLDER_ITEM Sie verbindet FOLDER mit kanonischem Fluss
+  Normalized FOLDER_ITEM = source of truth; folder_projection Bauen snapshot
+  Automatische Elemente: Aktiv USER_STREAM_BINDING + Kanonische STREAM.is_archived = false
+  All chats = - Das ist alles.; Personal = STREAM.private = true; Channels = STREAM.private = false
+  Indexed page + ready USER_STREAM_BINDING; Ohne N+1/COUNT/custom SQL
+end note
+DB --> API: öffentliche Zeilen
+note right of API: Ohne outbox / Aufgaben / Ereignisse
+API --> Client: 200 JSON
+@enduml

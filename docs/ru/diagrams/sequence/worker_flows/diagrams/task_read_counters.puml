@@ -1,0 +1,64 @@
+@startuml task_read_counters
+!pragma layout smetana
+title Типизированные задачи: read_counters / folder_projection
+hide footbox
+skinparam backgroundColor white
+skinparam shadowing false
+
+database "Зафиксированные события outbox\nfanout/read/hide/move/delete" as OUTBOX
+participant "Проектор задач" as PROJECTOR
+database "Immutable tasks\n1 на outbox event/scope" as TASKS
+database "Аренда exact scope key\nlease + fencing" as CLAIM
+participant "Слот воркера" as WORKER
+database "Факты сообщений + read_at\nдоступ + политика" as SOURCE
+database "Активные USER_STREAM_BINDING\n+ STREAM.is_archived/private" as STREAM_SOURCE
+database "FOLDER + normalized FOLDER_ITEM\nsource of truth" as FOLDERS
+database "USER_STREAM_BINDING" as STREAM_BINDING
+database "USER_TOPIC_BINDING" as TOPIC_BINDING
+database "USER_FOLDER_BINDING" as FOLDER_BINDING
+database "Хранилище публичных событий" as EVENTS
+participant "Диспетчер WebSocket" as DISPATCHER
+actor "Клиент" as Client
+
+OUTBOX -> PROJECTOR : зафиксированные влияющие события
+PROJECTOR -> TASKS : immutable folder_projection для папки\nuser-folder scope; unique derivation; без coalescing
+TASKS -> WORKER : явные затронутые области
+WORKER -> CLAIM : монопольный user-stream / user-topic / user-folder
+WORKER -> SOURCE : прочитать последнее исходное состояние
+WORKER -> STREAM_SOURCE : прочитать активную привязку + канонический STREAM
+WORKER -> STREAM_BINDING : идемпотентные готовые счётчики/последнее сообщение
+WORKER -> TOPIC_BINDING : идемпотентные готовые счётчики темы
+group одна worker DB transaction
+  WORKER -> FOLDERS : идемпотентно добавить/удалить automatic FOLDER_ITEM
+  WORKER -> FOLDER_BINDING : deterministic folder_items_snapshot + counts\nversion/snapshot_updated_at; empty=[]
+  WORKER -> EVENTS : ready stream.updated / topic.updated / folder.updated\nи folder_item.deleted, когда объявлено contract operation\nunique derivation/effect key
+end
+WORKER -> CLAIM : освободить
+EVENTS -> DISPATCHER : только после commit: устойчивые записи
+DISPATCHER -> Client : отправить / повторить / воспроизвести
+
+note over SOURCE,FOLDER_BINDING
+  Агрегаты контейнера не хранятся в привязке/состоянии сообщения.
+  USER_FOLDER_BINDING хранит доступ, персональное состояние
+  и готовые агрегаты + read-only folder_items_snapshot.
+  Public folder_items точно отображает snapshot; empty=[].
+  API читает одну indexed row/page, без N+1/json_agg/COUNT/custom SQL.
+  Исправление/перестроение выполняется только в фоне.
+  Topic-worker не пишет эти shared rows.
+  Atomic delta требует exactly-once effect guard по outbox_event_uuid;
+  иначе scope worker recomputes/writes.
+  Lifecycle: lease expiry/fencing, retry/backoff, DLQ/reaper.
+end note
+
+note over STREAM_SOURCE,FOLDERS
+  Предикат: активная USER_STREAM_BINDING + STREAM.is_archived=false.
+  All chats = все такие строки.
+  Personal = только STREAM.private=true.
+  Channels = только STREAM.private=false.
+  Клиентский запрос не вычисляет этот состав.
+  Stable order: pinned_at DESC first; then
+  order_index ASC NULLS LAST, created_at ASC, uuid ASC.
+  No silent truncation; exact count/byte hard limits remain required.
+end note
+
+@enduml

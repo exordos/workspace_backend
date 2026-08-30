@@ -847,6 +847,17 @@ def test_actual_inventory_fails_on_tampered_missing_and_extra_database_and_stora
                 "DELETE FROM m_workspace_streams WHERE project_id = %s",
                 (project_uuid,),
             )
+            # The v2 rolling trigger keeps a canonical tombstone when the
+            # legacy stream disappears. Remove the isolated fixture's
+            # canonical history before deleting its synthetic IAM user.
+            session.execute(
+                "DELETE FROM messenger_messages WHERE project_id = %s",
+                (project_uuid,),
+            )
+            session.execute(
+                "DELETE FROM messenger_streams WHERE project_id = %s",
+                (project_uuid,),
+            )
             session.execute(
                 "DELETE FROM m_workspace_users WHERE uuid = %s", (iam_user_uuid,)
             )
