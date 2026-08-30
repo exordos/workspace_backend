@@ -1463,7 +1463,13 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
 class ExternalAccountController(ExternalResourceController):
     __resource__ = ra_resources.ResourceByRAModel(
         model_class=external_models.ExternalAccount,
-        hidden_fields=["owner_user_uuid", "provider"],
+        hidden_fields=[
+            "owner_user_uuid",
+            "provider",
+            "projection_reset_generation",
+            "provider_realm_uuid",
+            "provider_owner_user_id",
+        ],
         convert_underscore=False,
         process_filters=True,
     )
@@ -1603,7 +1609,11 @@ class ExternalAccountController(ExternalResourceController):
         self._emit_event(
             account,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
-            hidden_fields=("owner_user_uuid", "provider"),
+            hidden_fields=(
+                "owner_user_uuid",
+                "provider",
+                "projection_reset_generation",
+            ),
             session=session,
         )
         return account
@@ -1665,7 +1675,11 @@ class ExternalAccountController(ExternalResourceController):
         self._emit_event(
             resource,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
-            hidden_fields=("owner_user_uuid", "provider"),
+            hidden_fields=(
+                "owner_user_uuid",
+                "provider",
+                "projection_reset_generation",
+            ),
             session=session,
         )
         return resource
@@ -1692,7 +1706,11 @@ class ExternalAccountController(ExternalResourceController):
         self._emit_event(
             resource,
             messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
-            hidden_fields=("owner_user_uuid", "provider"),
+            hidden_fields=(
+                "owner_user_uuid",
+                "provider",
+                "projection_reset_generation",
+            ),
             session=session,
         )
         return resource
@@ -1714,6 +1732,79 @@ class ExternalAccountController(ExternalResourceController):
             filters={"external_account_uuid": dm_filters.EQ(account.uuid)},
             session=session,
         )
+        sql_state.lock_realm_global_chat_scopes(
+            session, external_account_uuid=account.uuid
+        )
+        # A realm-global projection has one routing owner.  Resolve every
+        # shared alias in one query so deleting an account stays bounded even
+        # after a large provider catalog import.
+        shared_rows = session.execute(
+            """
+            SELECT current.uuid,
+                   (array_agg(peer.uuid ORDER BY peer.uuid))[1]
+                       AS peer_chat_uuid,
+                   stream.external_account_uuid AS routing_account_uuid,
+                   current.project_id, current.projection_stream_uuid
+            FROM m_external_chats_v2 AS current
+            JOIN m_external_accounts_v2 AS current_account
+              ON current_account.uuid = current.external_account_uuid
+            JOIN m_external_accounts_v2 AS peer_account
+              ON peer_account.provider = current_account.provider
+             AND peer_account.provider_realm_uuid =
+                 current_account.provider_realm_uuid
+            JOIN m_external_chats_v2 AS peer
+              ON peer.external_account_uuid = peer_account.uuid
+             AND peer.provider = current.provider
+             AND peer.provider_chat_id = current.provider_chat_id
+             AND peer.project_id = current.project_id
+             AND peer.uuid <> current.uuid
+             AND peer.selected
+            LEFT JOIN m_workspace_streams AS stream
+              ON stream.project_id = current.project_id
+             AND stream.uuid = current.projection_stream_uuid
+            WHERE current.external_account_uuid = %s
+              AND current.selected
+              AND current.project_id IS NOT NULL
+              AND current.projection_stream_uuid IS NOT NULL
+              AND current_account.provider_realm_uuid IS NOT NULL
+            GROUP BY current.uuid, stream.external_account_uuid,
+                     current.project_id, current.projection_stream_uuid
+            """,
+            (account.uuid,),
+        ).fetchall()
+        shared_chat_uuids = {row["uuid"] for row in shared_rows}
+        remaining_streams = session.execute(
+            """
+            SELECT project_id, uuid AS stream_uuid
+            FROM m_workspace_streams
+            WHERE external_account_uuid = %s
+            ORDER BY project_id, uuid
+            """,
+            (account.uuid,),
+        ).fetchall()
+        affected_project_ids = {
+            chat.project_id for chat in chats if chat.project_id is not None
+        }
+        affected_project_ids.update(
+            stream["project_id"] for stream in remaining_streams
+        )
+        read_state.lock_message_structure(
+            session,
+            affected_project_ids,
+            cross_project=len(affected_project_ids) > 1,
+        )
+        read_state.lock_projects(session, affected_project_ids)
+        for row in shared_rows:
+            if row["routing_account_uuid"] != account.uuid:
+                continue
+            external_projection.handoff_shared_projection_route(
+                session,
+                project_id=row["project_id"],
+                stream_uuid=row["projection_stream_uuid"],
+                old_external_account_uuid=account.uuid,
+                peer_chat_uuid=row["peer_chat_uuid"],
+            )
+        # Handoff removes shared rows from the account-scoped cleanup set.
         remaining_streams = session.execute(
             """
             SELECT project_id, uuid AS stream_uuid
@@ -1731,20 +1822,9 @@ class ExternalAccountController(ExternalResourceController):
             """,
             (account.uuid,),
         ).fetchall()
-        affected_project_ids = {
-            chat.project_id for chat in chats if chat.project_id is not None
-        }
-        affected_project_ids.update(
-            stream["project_id"] for stream in remaining_streams
-        )
-        read_state.lock_message_structure(
-            session,
-            affected_project_ids,
-            cross_project=len(affected_project_ids) > 1,
-        )
-        read_state.lock_projects(session, affected_project_ids)
         removed_streams: set[tuple[object, object]] = set()
         for chat in chats:
+            shared_alias = chat.uuid in shared_chat_uuids
             sql_state.append_delete(
                 session,
                 bridge_instance_uuid,
@@ -1754,7 +1834,8 @@ class ExternalAccountController(ExternalResourceController):
                 chat.revision + 1,
             )
             if (
-                chat.projection_stream_uuid is not None
+                not shared_alias
+                and chat.projection_stream_uuid is not None
                 and chat.project_id is not None
                 and (chat.project_id, chat.projection_stream_uuid)
                 not in removed_streams
@@ -1828,7 +1909,11 @@ class ExternalAccountController(ExternalResourceController):
         self._emit_event(
             account,
             messenger_events.EXTERNAL_ACCOUNT_DELETED_EVENT,
-            hidden_fields=("owner_user_uuid", "provider"),
+            hidden_fields=(
+                "owner_user_uuid",
+                "provider",
+                "projection_reset_generation",
+            ),
             session=session,
         )
         account.delete(session=session)
@@ -1901,9 +1986,7 @@ class ExternalChatController(ExternalResourceController):
             resource.uuid
         )
         file_stream_uuids = list(
-            dict.fromkeys(
-                (resource.projection_stream_uuid, carrier_stream_uuid)
-            )
+            dict.fromkeys((resource.projection_stream_uuid, carrier_stream_uuid))
         )
         files = session.execute(
             """
@@ -2133,6 +2216,18 @@ class ExternalChatController(ExternalResourceController):
             session,
             (resource.external_account_uuid,),
         )
+        account = external_models.ExternalAccount.objects.get_one(
+            filters={
+                "uuid": dm_filters.EQ(resource.external_account_uuid),
+                "owner_user_uuid": dm_filters.EQ(self._get_user_uuid()),
+            },
+            session=session,
+        )
+        sql_state.lock_realm_global_chat_scopes(
+            session,
+            external_account_uuid=resource.external_account_uuid,
+            chat_uuid=resource.uuid,
+        )
         unchanged = (
             not resource.transition_pending
             and resource.selected == selected
@@ -2141,6 +2236,7 @@ class ExternalChatController(ExternalResourceController):
         if unchanged and not selected:
             return resource
         transition_action = None
+        shared_alias_deselect = False
         if (
             resource.projection_stream_uuid is not None
             and resource.project_id is not None
@@ -2155,6 +2251,37 @@ class ExternalChatController(ExternalResourceController):
                 ):
                     raise messenger_exc.ExternalResourceForbiddenError()
                 transition_action = "move"
+        if transition_action is not None:
+            peers = sql_state.realm_global_selected_chat_peers(
+                session, chat_uuid=resource.uuid
+            )
+            if peers:
+                if transition_action == "move":
+                    raise messenger_exc.ExternalProviderScopeConflictError()
+                routing = session.execute(
+                    """
+                    SELECT external_account_uuid
+                    FROM m_workspace_streams
+                    WHERE project_id = %s AND uuid = %s
+                    """,
+                    (resource.project_id, resource.projection_stream_uuid),
+                ).fetchone()
+                if (
+                    routing is not None
+                    and routing["external_account_uuid"]
+                    == resource.external_account_uuid
+                ):
+                    external_projection.handoff_shared_projection_route(
+                        session,
+                        project_id=resource.project_id,
+                        stream_uuid=resource.projection_stream_uuid,
+                        old_external_account_uuid=resource.external_account_uuid,
+                        peer_chat_uuid=peers[0]["uuid"],
+                    )
+                # Removing a non-routing alias is control-plane-only.  The
+                # shared stream remains selected through its routing owner.
+                transition_action = None
+                shared_alias_deselect = True
         if resource.transition_pending:
             pending = session.execute(
                 """
@@ -2175,13 +2302,6 @@ class ExternalChatController(ExternalResourceController):
                 session,
             )
             return self._resume_transition(transition_uuid, resource, session)
-        account = external_models.ExternalAccount.objects.get_one(
-            filters={
-                "uuid": dm_filters.EQ(resource.external_account_uuid),
-                "owner_user_uuid": dm_filters.EQ(self._get_user_uuid()),
-            },
-            session=session,
-        )
         policy = self._require_provider_enabled(
             account.provider,
             session=session,
@@ -2197,28 +2317,53 @@ class ExternalChatController(ExternalResourceController):
             )
             if not isinstance(maximum, int) or len(selected_chats) >= maximum:
                 raise messenger_exc.ExternalResourceForbiddenError()
+        if selected:
+            application_services.ExternalChatApplicationService.require_project_scope(
+                session,
+                account,
+                resource,
+                project_id,
+            )
         credential = application_services.external_credential(account, session)
         bridge_instance_uuid = credential.envelope["associated_data"][
             "bridge_instance_uuid"
         ]
-        projection_stream_uuid = resource.projection_stream_uuid
+        projection_stream_uuid = (
+            resource.projection_stream_uuid
+            or sql_state.external_chat_projection_stream_uuid(resource.uuid)
+        )
         projection_source = resource.source
-        if selected and not resource.selected:
-            projection_stream_uuid = sql_state.external_chat_projection_stream_uuid(
-                resource.uuid
-            )
+        shared_projection = False
+        if selected and account.provider_realm_uuid is not None:
             (
                 projection_stream_uuid,
                 projection_source,
-                projection_changed,
-            ) = external_projection.reconcile_personal_chat_projection(
+                shared_projection,
+            ) = sql_state.realm_global_chat_projection(
                 session,
-                project_id=sys_uuid.UUID(str(project_id)),
-                owner_user_uuid=resource.owner_user_uuid,
-                provider_kind=resource.provider,
-                source=resource.source,
-                projection_stream_uuid=projection_stream_uuid,
+                provider=resource.provider,
+                provider_realm_uuid=account.provider_realm_uuid,
+                provider_chat_key=resource.provider_chat_id,
+                project_id=project_id,
+                chat_uuid=resource.uuid,
+                fallback_stream_uuid=projection_stream_uuid,
+                source=projection_source,
             )
+        if selected and not resource.selected:
+            projection_changed = False
+            if not shared_projection:
+                (
+                    projection_stream_uuid,
+                    projection_source,
+                    projection_changed,
+                ) = external_projection.reconcile_personal_chat_projection(
+                    session,
+                    project_id=sys_uuid.UUID(str(project_id)),
+                    owner_user_uuid=resource.owner_user_uuid,
+                    provider_kind=resource.provider,
+                    source=projection_source,
+                    projection_stream_uuid=projection_stream_uuid,
+                )
             if projection_changed:
                 identity_linking.invalidate_direct_event_history(
                     session,
@@ -2240,6 +2385,7 @@ class ExternalChatController(ExternalResourceController):
                 capabilities=resource.capabilities,
                 account_settings=account.settings,
                 reconcile_participants="participants" in projection_source,
+                shared_projection=shared_projection,
             )
         if unchanged:
             return resource
@@ -2257,6 +2403,8 @@ class ExternalChatController(ExternalResourceController):
             values["projection_stream_uuid"] = projection_stream_uuid
             if projection_source != resource.source:
                 values["source"] = projection_source
+        elif shared_alias_deselect:
+            values["projection_stream_uuid"] = None
         _update_internal_fields(resource, values, session=session)
         if selected:
             sql_state.append_upsert(

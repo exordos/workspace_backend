@@ -212,6 +212,11 @@ class ExternalAccount(RevisionTimestampModel, orm.SQLStorableMixin):
         default=1,
         read_only=True,
     )
+    projection_reset_generation = properties.property(
+        types.Integer(min_value=0),
+        default=0,
+        read_only=True,
+    )
     applied_generation = properties.property(
         types.Integer(min_value=0),
         default=0,
@@ -219,6 +224,16 @@ class ExternalAccount(RevisionTimestampModel, orm.SQLStorableMixin):
     )
     last_progress_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()),
+        default=None,
+        read_only=True,
+    )
+    provider_realm_uuid = properties.property(
+        types.AllowNone(types.UUID()),
+        default=None,
+        read_only=True,
+    )
+    provider_owner_user_id = properties.property(
+        types.AllowNone(types.String(max_length=512)),
         default=None,
         read_only=True,
     )

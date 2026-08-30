@@ -23,6 +23,7 @@ from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
+from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
 from workspace.common import topic_summary_opts
@@ -36,6 +37,7 @@ TOPIC_SUMMARY_DOMAIN = topic_summary_opts.DOMAIN
 
 CONF = cfg.CONF
 ra_config_opts.register_posgresql_db_opts(CONF)
+file_storage_opts.register_opts(CONF)
 messenger_worker_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
 
@@ -64,6 +66,11 @@ def main() -> None:
         read_state_max_batches_per_iteration=(
             CONF[DOMAIN].read_state_max_batches_per_iteration
         ),
+        v2_projection_enabled=CONF[DOMAIN].v2_projection_enabled,
+        v2_projection_max_tasks_per_iteration=(
+            CONF[DOMAIN].v2_projection_max_tasks_per_iteration
+        ),
+        v2_fanout_batch_size=CONF[DOMAIN].v2_fanout_batch_size,
         summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
         summary_connect_timeout_seconds=(
             CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds

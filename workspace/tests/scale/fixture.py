@@ -295,7 +295,9 @@ def _stream_rows(profile, users, accounts):
                 "provider_chat_type": chat_type,
                 "catalog_participants": [
                     {
-                        "provider_user_id": f"zulip-user:{member_uuid}",
+                        "provider_user_id": str(
+                            int(sys_uuid.UUID(str(member_uuid)))
+                        ),
                         "display_name": f"fixture-user-{member_uuid[:8]}",
                         "is_owner": member_uuid == owner_uuid,
                     }

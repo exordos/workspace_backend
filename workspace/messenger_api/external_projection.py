@@ -6,6 +6,7 @@
 """Materialize backend-owned external chat streams in Messenger storage."""
 
 import collections.abc
+import json
 import typing
 import uuid as sys_uuid
 
@@ -513,6 +514,7 @@ def ensure_external_chat_stream(
     account_settings: collections.abc.Mapping[str, typing.Any],
     emit_events: bool = True,
     reconcile_participants: bool = True,
+    shared_projection: bool = False,
 ) -> None:
     """Create the canonical stream and materialize all participant bindings."""
     stream = models.WorkspaceStream.objects.get_one_or_none(
@@ -603,7 +605,7 @@ def ensure_external_chat_stream(
                 raise ValueError(
                     "Native direct stream participants do not match assignment"
                 )
-        elif stream.user_uuid != owner_user_uuid:
+        elif stream.user_uuid != owner_user_uuid and not shared_projection:
             raise ValueError(
                 "Provider stream projection owner does not match assignment"
             )
@@ -640,7 +642,11 @@ def ensure_external_chat_stream(
                 "Native direct stream participants do not match assignment"
             )
         return
-    if stream is not None and stream.user_uuid != owner_user_uuid:
+    if (
+        stream is not None
+        and stream.user_uuid != owner_user_uuid
+        and not shared_projection
+    ):
         raise ValueError("Provider stream projection owner does not match assignment")
     users = {
         user.uuid: user
@@ -694,7 +700,7 @@ def ensure_external_chat_stream(
         for binding in existing_bindings
         if binding.user_uuid not in participants
     ]
-    if not stale_bindings:
+    if not stale_bindings or shared_projection:
         return
     managed_user_uuids = {
         user.uuid
@@ -715,3 +721,111 @@ def ensure_external_chat_stream(
                 binding.uuid,
                 session=session,
             )
+
+
+def handoff_shared_projection_route(
+    session: typing.Any,
+    *,
+    project_id: object,
+    stream_uuid: object,
+    old_external_account_uuid: object,
+    peer_chat_uuid: object,
+) -> None:
+    """Move one shared stream's provider route to a selected account alias."""
+    route = session.execute(
+        """
+        SELECT chat.external_account_uuid, chat.owner_user_uuid,
+               chat.capabilities,
+               (credential.envelope #>>
+                    '{associated_data,bridge_instance_uuid}')::uuid
+                    AS bridge_instance_uuid
+        FROM m_external_chats_v2 AS chat
+        JOIN m_external_accounts_v2 AS account
+          ON account.uuid = chat.external_account_uuid
+        JOIN m_external_credentials_v2 AS credential
+          ON credential.external_account_uuid = account.uuid
+        WHERE chat.uuid = %s
+          AND chat.selected
+          AND chat.project_id = %s
+          AND chat.projection_stream_uuid = %s
+        FOR SHARE OF chat, account, credential
+        """,
+        (peer_chat_uuid, project_id, stream_uuid),
+    ).fetchone()
+    if route is None:
+        raise ValueError("Shared projection handoff route is unavailable")
+    account_uuid = route["external_account_uuid"]
+    owner_user_uuid = route["owner_user_uuid"]
+    bridge_uuid = route["bridge_instance_uuid"]
+    capabilities = route["capabilities"]
+    session.execute(
+        """
+        UPDATE m_workspace_streams
+        SET user_uuid = %s, external_account_uuid = %s, provider_uuid = %s,
+            source = CASE
+                WHEN source_name = 'zulip'
+                THEN jsonb_set(
+                    source, '{source_scope}', to_jsonb(%s::text), true
+                )
+                ELSE source END,
+            provider_metadata = jsonb_set(
+                jsonb_set(
+                    COALESCE(provider_metadata, '{}'::jsonb),
+                    '{account_uuid}', to_jsonb(%s::text), true
+                ),
+                '{capabilities}', %s::jsonb, true
+            ),
+            updated_at = NOW()
+        WHERE project_id = %s AND uuid = %s
+          AND external_account_uuid = %s
+        """,
+        (
+            owner_user_uuid,
+            account_uuid,
+            bridge_uuid,
+            account_uuid,
+            account_uuid,
+            json.dumps(capabilities),
+            project_id,
+            stream_uuid,
+            old_external_account_uuid,
+        ),
+    )
+    for table in ("m_workspace_stream_topics", "m_workspace_messages"):
+        session.execute(
+            f"""
+            UPDATE {table}
+            SET external_account_uuid = %s, provider_uuid = %s,
+                provider_metadata = jsonb_set(
+                    COALESCE(provider_metadata, '{{}}'::jsonb),
+                    '{{account_uuid}}', to_jsonb(%s::text), true
+                ),
+                updated_at = NOW()
+            WHERE project_id = %s AND stream_uuid = %s
+              AND external_account_uuid = %s
+            """,
+            (
+                account_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_id,
+                stream_uuid,
+                old_external_account_uuid,
+            ),
+        )
+    session.execute(
+        """
+        UPDATE m_workspace_files
+        SET external_account_uuid = %s, provider_uuid = %s,
+            updated_at = NOW()
+        WHERE project_id = %s AND stream_uuid = %s
+          AND external_account_uuid = %s
+        """,
+        (
+            account_uuid,
+            bridge_uuid,
+            project_id,
+            stream_uuid,
+            old_external_account_uuid,
+        ),
+    )

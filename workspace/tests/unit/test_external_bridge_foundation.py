@@ -5,6 +5,7 @@
 
 import ast
 import inspect
+import json
 import pathlib
 import types
 import uuid as sys_uuid
@@ -206,6 +207,10 @@ def test_zb_contract_001_public_openapi_exposes_exact_ui_boundary():
         "api_key"
         not in schemas["ExternalAccount_Get"]["properties"]["settings"]["properties"]
     )
+    for account_schema in ("ExternalAccount_Filter", "ExternalAccount_Get"):
+        assert "projection_reset_generation" not in json.dumps(
+            schemas[account_schema]
+        )
     reconnect = paths[
         "/v1/messenger/external_accounts/{ExternalAccountUuid}/actions/reconnect/invoke"
     ]["post"]
@@ -658,7 +663,11 @@ def test_external_account_delete_purges_projection_and_copied_files(monkeypatch)
     class Session:
         def execute(self, statement, params):
             statements.append((" ".join(statement.split()), params))
-            if "SELECT project_id, uuid AS stream_uuid" in statement:
+            if (
+                "SELECT project_id, uuid AS stream_uuid" in statement
+                or "SELECT DISTINCT chat.provider" in statement
+                or "SELECT current.uuid" in statement
+            ):
                 return Result([])
             return Result([file_row])
 

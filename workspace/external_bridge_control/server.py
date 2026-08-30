@@ -182,11 +182,10 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
                     if response.status >= 400:
                         raise _RollbackResponse(response)
                     commit_started_at = time.monotonic()
-                if (
-                    self.command == "POST"
-                    and urllib.parse.urlsplit(self.path).path
-                    == "/api/workspace-provider/v1/events"
-                ):
+                if self.command == "POST" and urllib.parse.urlsplit(self.path).path in {
+                    "/api/workspace-provider/v1/events",
+                    "/api/workspace-provider/v2/commands",
+                }:
                     commit_duration = time.monotonic() - commit_started_at
                     LOG.info(
                         "Committed provider event batch: duration_seconds=%.3f",

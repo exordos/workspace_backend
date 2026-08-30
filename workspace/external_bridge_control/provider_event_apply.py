@@ -177,6 +177,7 @@ def _resource(
     event: dict[str, typing.Any],
     identity: typing.Any,
     account_uuid: sys_uuid.UUID,
+    assignment: typing.Mapping[str, typing.Any] | None = None,
 ) -> dict[str, typing.Any]:
     resource = dict(event["payload"]["resource"])
     provider_external_id = resource["provider_external_id"]
@@ -191,6 +192,11 @@ def _resource(
             "provider_event_uuid": str(event["provider_event_uuid"]),
         }
     )
+    provider_realm_uuid = (
+        assignment.get("provider_realm_uuid") if assignment is not None else None
+    )
+    if provider_realm_uuid is not None:
+        provider_metadata["provider_realm_uuid"] = str(provider_realm_uuid)
     provider_metadata.setdefault("capabilities", {})
     if event.get("provider_sequence") is not None:
         provider_metadata["provider_sequence"] = event["provider_sequence"]
@@ -1112,10 +1118,12 @@ def _validate_provider_message_scope(
     message_uuids: collections.abc.Iterable[object],
     external_account_uuid: sys_uuid.UUID,
     owner_user_uuid: sys_uuid.UUID,
+    provider_kind: str,
+    assignment: typing.Mapping[str, typing.Any],
     *,
     allow_missing: bool = False,
 ) -> None:
-    """Keep shared native self-DM messages isolated by provider account."""
+    """Keep messages isolated outside an authorized realm-global chat graph."""
     expected = {sys_uuid.UUID(str(message_uuid)) for message_uuid in message_uuids}
     if not expected:
         return
@@ -1124,6 +1132,27 @@ def _validate_provider_message_scope(
         SELECT message.uuid,
                (
                     message.external_account_uuid = %s
+                    OR (
+                        message.external_account_uuid IS NOT NULL
+                        AND %s::uuid IS NOT NULL
+                        AND message.stream_uuid = %s
+                        AND EXISTS (
+                            SELECT 1
+                            FROM m_external_accounts_v2 AS source_account
+                            JOIN m_external_chats_v2 AS source_chat
+                              ON source_chat.external_account_uuid =
+                                    source_account.uuid
+                             AND source_chat.provider = source_account.provider
+                            WHERE source_account.uuid =
+                                    message.external_account_uuid
+                              AND source_account.provider = %s
+                              AND source_account.provider_realm_uuid = %s
+                              AND source_chat.project_id = message.project_id
+                              AND source_chat.projection_stream_uuid =
+                                    message.stream_uuid
+                              AND source_chat.provider_chat_id = %s
+                        )
+                    )
                     OR (
                         message.external_account_uuid IS NULL
                         AND EXISTS (
@@ -1159,6 +1188,11 @@ def _validate_provider_message_scope(
         """,
         (
             external_account_uuid,
+            assignment.get("provider_realm_uuid"),
+            assignment.get("projection_stream_uuid"),
+            provider_kind,
+            assignment.get("provider_realm_uuid"),
+            assignment.get("provider_chat_id"),
             external_account_uuid,
             owner_user_uuid,
             owner_user_uuid,
@@ -1229,6 +1263,7 @@ def _message_event(
     source_project_id = sys_uuid.UUID(str(getattr(existing, "project_id", project_id)))
     cross_project_move = existing is not None and source_project_id != project_id
     account_uuid = sys_uuid.UUID(str(event["external_account_uuid"]))
+    projection_account_uuid = account_uuid
     if existing is not None:
         _validate_provider_message_scope(
             session,
@@ -1236,7 +1271,16 @@ def _message_event(
             (message_uuid,),
             account_uuid,
             assignment["owner_user_uuid"],
+            identity.provider_kind,
+            assignment,
         )
+        projection_account_uuid = sys_uuid.UUID(
+            str(getattr(existing, "external_account_uuid", None) or account_uuid)
+        )
+        resource["external_account_uuid"] = projection_account_uuid
+        resource_metadata = dict(resource.get("provider_metadata") or {})
+        resource_metadata["account_uuid"] = str(projection_account_uuid)
+        resource["provider_metadata"] = resource_metadata
     elif _missing_provider_message_is_tombstoned(
         session,
         message_uuid,
@@ -1336,7 +1380,7 @@ def _message_event(
             "user_uuid",
             "uuid",
         },
-        sys_uuid.UUID(str(event["external_account_uuid"])),
+        projection_account_uuid,
     )
     if (
         existing is not None
@@ -1353,7 +1397,7 @@ def _message_event(
             assignment["provider_chat_id"],
             assignment_source.get("chat_type", "channel"),
             assignment.get("account_settings") or {},
-            sys_uuid.UUID(str(event["external_account_uuid"])),
+            projection_account_uuid,
         )
         values["source_name"] = source_name
         values["source"] = source
@@ -1441,7 +1485,7 @@ def _message_event(
                     project_id,
                     stream_uuid,
                     sys_uuid.UUID(str(event["external_chat_uuid"])),
-                    sys_uuid.UUID(str(event["external_account_uuid"])),
+                    projection_account_uuid,
                     not quiet_backfill,
                     native_source_payload=getattr(existing, "payload", None),
                 )
@@ -1652,7 +1696,19 @@ def _reaction_event(
         (message_uuid,),
         sys_uuid.UUID(str(event["external_account_uuid"])),
         typing.cast(sys_uuid.UUID, assignment.get("owner_user_uuid")),
+        identity.provider_kind,
+        assignment,
     )
+    projection_account_uuid = sys_uuid.UUID(
+        str(
+            getattr(message, "external_account_uuid", None)
+            or event["external_account_uuid"]
+        )
+    )
+    resource["external_account_uuid"] = projection_account_uuid
+    resource_metadata = dict(resource.get("provider_metadata") or {})
+    resource_metadata["account_uuid"] = str(projection_account_uuid)
+    resource["provider_metadata"] = resource_metadata
     actor_uuid = sys_uuid.UUID(str(resource["user_uuid"]))
     user_identity = resource.get("user_identity")
     if isinstance(user_identity, collections.abc.Mapping):
@@ -1929,12 +1985,20 @@ def _read_state_event(
     message_uuids = [sys_uuid.UUID(str(value)) for value in message_values]
     if len(set(message_uuids)) != len(message_uuids):
         raise ValueError("Provider read state message list contains duplicates")
+    provider_metadata = resource.get("provider_metadata")
+    provider_kind = (
+        str(provider_metadata.get("kind") or "")
+        if isinstance(provider_metadata, collections.abc.Mapping)
+        else ""
+    )
     _validate_provider_message_scope(
         session,
         project_id,
         message_uuids,
         external_account_uuid,
         assignment["owner_user_uuid"],
+        provider_kind,
+        assignment,
         allow_missing=True,
     )
     topic_value = resource.get("topic_uuid")
@@ -1969,7 +2033,7 @@ def apply_event(
         resource = _resource(event, identity, account_uuid)
         return _identity_event(session, event, identity, resource)
     account_uuid, project_id, assignment = _assignment(session, identity, event)
-    resource = _resource(event, identity, account_uuid)
+    resource = _resource(event, identity, account_uuid, assignment)
     if event["kind"] == "read_state.set":
         return _read_state_event(
             session,

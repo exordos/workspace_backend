@@ -8,6 +8,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import os
 import threading
 import time
 import uuid as sys_uuid
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from psycopg.types.json import Jsonb
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import engines
@@ -1011,6 +1013,10 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
                 (uuid, provider, enabled, limits)
             VALUES (%s, 'zulip', TRUE,
                     '{"max_selected_chats_per_account":10}'::jsonb)
+            ON CONFLICT (provider) DO UPDATE
+            SET enabled = EXCLUDED.enabled,
+                limits = EXCLUDED.limits,
+                updated_at = NOW()
             """,
             (sys_uuid.uuid4(),),
         )
@@ -1621,11 +1627,107 @@ def test_verified_direct_catalog_merges_existing_provider_chat_into_native_dm(
         )
 
 
+def test_verified_realm_binding_rejects_alias_scope_conflict(_database, db):
+    provider_realm_uuid = sys_uuid.uuid4()
+    owner_a_uuid = sys_uuid.uuid4()
+    owner_b_uuid = sys_uuid.uuid4()
+    account_a_uuid = sys_uuid.uuid4()
+    account_b_uuid = sys_uuid.uuid4()
+    project_a_uuid = sys_uuid.uuid4()
+    project_b_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_a_uuid, "scope-owner-a")
+    conftest.seed_workspace_user(db, owner_b_uuid, "scope-owner-b")
+    with db.cursor() as cursor:
+        for account_uuid, owner_uuid, project_uuid, server_url in (
+            (
+                account_a_uuid,
+                owner_a_uuid,
+                project_a_uuid,
+                "https://primary.zulip.example.test",
+            ),
+            (
+                account_b_uuid,
+                owner_b_uuid,
+                project_b_uuid,
+                "https://alias.zulip.example.test",
+            ),
+        ):
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    credential_present, status
+                ) VALUES (
+                    %s, %s, 'zulip', %s::jsonb, TRUE, 'connecting'
+                )
+                """,
+                (
+                    account_uuid,
+                    owner_uuid,
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "server_url": server_url,
+                            "default_project_id": str(project_uuid),
+                        }
+                    ),
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_external_chats_v2 (
+                    uuid, external_account_uuid, owner_user_uuid, provider,
+                    provider_chat_id, source, display_name, selected, project_id
+                ) VALUES (
+                    %s, %s, %s, 'zulip', 'channel:42',
+                    '{}'::jsonb, 'Shared channel', TRUE, %s
+                )
+                """,
+                (sys_uuid.uuid4(), account_uuid, owner_uuid, project_uuid),
+            )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        assert (
+            identity_linking.bind_verified_account_owner(
+                session,
+                provider="zulip",
+                account_uuid=account_a_uuid,
+                owner_user_uuid=owner_a_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_user_id="10",
+            )
+            is None
+        )
+    with session_factory() as session:
+        with pytest.raises(identity_linking.ProviderScopeConflict):
+            identity_linking.bind_verified_account_owner(
+                session,
+                provider="zulip",
+                account_uuid=account_b_uuid,
+                owner_user_uuid=owner_b_uuid,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_user_id="20",
+            )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, provider_realm_uuid
+            FROM m_external_accounts_v2
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            ([account_a_uuid, account_b_uuid],),
+        )
+        bindings = dict(cursor.fetchall())
+    assert bindings[account_a_uuid] == provider_realm_uuid
+    assert bindings[account_b_uuid] is None
+
+
 def test_verified_provider_identity_replaces_account_scoped_duplicates(
     _database,
     db,
 ):
-    provider_realm_uuid = sys_uuid.uuid4()
+    provider_realm_uuid = sys_uuid.UUID("11111111-2222-3333-4444-555555555555")
     owner_a_uuid = sys_uuid.uuid4()
     owner_b_uuid = sys_uuid.uuid4()
     conflicting_owner_uuid = sys_uuid.uuid4()
@@ -1833,6 +1935,9 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             provider_realm_uuid,
             "20",
         )
+        assert canonical_external_uuid == sys_uuid.UUID(
+            "78eb4f94-6149-5204-840f-7db321cadb1d"
+        )
         assert identity_linking.merge_account_scoped_provider_identities(
             session,
             provider="zulip",
@@ -1959,6 +2064,132 @@ def test_verified_provider_identity_replaces_account_scoped_duplicates(
             )
 
 
+def test_messenger_v2_identity_merge_reconciles_duplicate_stream_bindings(
+    _database,
+    db,
+):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    legacy_user_uuid = sys_uuid.uuid4()
+    canonical_user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(
+            db,
+            project_uuid,
+            owner_uuid,
+            "V2 identity binding merge",
+        )
+    )
+    conftest.seed_workspace_user(db, legacy_user_uuid, "v2-legacy-binding")
+    conftest.seed_workspace_user(db, canonical_user_uuid, "v2-canonical-binding")
+    with db.cursor() as cursor:
+        cursor.executemany(
+            """
+            INSERT INTO messenger_project_users (project_id, user_uuid)
+            VALUES (%s, %s)
+            """,
+            (
+                (project_uuid, legacy_user_uuid),
+                (project_uuid, canonical_user_uuid),
+            ),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO messenger_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid,
+                active, membership_generation, membership_started_at,
+                role, notification_mode, notification_updated_at,
+                unread_count, active_unread_count, passive_unread_count,
+                created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    stream_uuid,
+                    legacy_user_uuid,
+                    owner_uuid,
+                    True,
+                    7,
+                    "2026-01-01T00:00:00+00:00",
+                    "moderator",
+                    "mentions_only",
+                    "2026-03-01T00:00:00+00:00",
+                    9,
+                    6,
+                    3,
+                    "2026-01-01T00:00:00",
+                    "2026-03-01T00:00:00",
+                ),
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    stream_uuid,
+                    canonical_user_uuid,
+                    owner_uuid,
+                    False,
+                    9,
+                    "2026-02-01T00:00:00+00:00",
+                    "guest",
+                    "muted",
+                    "2026-02-01T00:00:00+00:00",
+                    2,
+                    1,
+                    1,
+                    "2026-02-01T00:00:00",
+                    "2026-02-01T00:00:00",
+                ),
+            ),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        identity_linking._merge_messenger_v2_identity(
+            session,
+            legacy_user_uuid,
+            canonical_user_uuid,
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT active, membership_generation, membership_started_at,
+                   role, notification_mode, notification_updated_at,
+                   unread_count, active_unread_count, passive_unread_count
+            FROM messenger_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, stream_uuid, canonical_user_uuid),
+        )
+        binding = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM messenger_stream_bindings
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, legacy_user_uuid),
+        )
+        legacy_count = cursor.fetchone()[0]
+
+    assert binding == (
+        True,
+        9,
+        datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        "moderator",
+        "mentions_only",
+        datetime.datetime(2026, 3, 1, tzinfo=datetime.UTC),
+        9,
+        6,
+        3,
+    )
+    assert legacy_count == 0
+
+
 def test_catalog_prelock_waits_for_changed_chat_account_before_project_locks(
     _database,
     db,
@@ -2033,11 +2264,11 @@ def test_catalog_prelock_waits_for_changed_chat_account_before_project_locks(
             "project_id": str(report_project_uuid),
             "source": {
                 "provider_realm_uuid": str(provider_realm_uuid),
-                "provider_owner_user_id": "report-owner",
+                "provider_owner_user_id": "10",
             },
             "participants": [
                 {
-                    "provider_user_id": "report-owner",
+                    "provider_user_id": "10",
                 }
             ],
         },
@@ -3157,6 +3388,260 @@ def test_sql_control_state_feed_snapshot_and_encryption_target(_database, db):
     assert target["identity_generation"] == 1
 
 
+def test_sql_control_state_snapshot_pages_resources_in_bounded_rows(_database, db):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2
+                (uuid, provider, identity_generation, status)
+            VALUES (%s, 'zulip', 1, 'active')
+            """,
+            (instance_uuid,),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    identity = _identity(instance_uuid, realm_uuid)
+    repository = sql_state.SQLControlState(realm_uuid, b"k" * 32)
+    resource_uuids = sorted(str(sys_uuid.uuid4()) for _index in range(15000))
+    with session_factory() as session:
+        sql_state.ensure_instance(session, instance_uuid, "zulip")
+    participants = [
+        {
+            "provider_user_id": str(offset),
+            "workspace_user_uuid": str(sys_uuid.UUID(int=offset + 1)),
+        }
+        for offset in range(16)
+    ]
+    topics = [
+        {
+            "provider_topic_id": f"topic-{offset}",
+            "workspace_topic_uuid": str(sys_uuid.UUID(int=offset + 101)),
+        }
+        for offset in range(16)
+    ]
+    with db.cursor() as cursor:
+        with cursor.copy(
+            """
+            COPY m_external_bridge_desired_resources_v1 (
+                bridge_instance_uuid, provider_kind, resource_type,
+                resource_uuid, operation, generation,
+                required_capabilities, resource
+            ) FROM STDIN
+            """
+        ) as copy:
+            for resource_uuid in reversed(resource_uuids):
+                resource = {
+                    "resource_type": "external_chat_assignment",
+                    "uuid": resource_uuid,
+                    "generation": 1,
+                    "participants": participants,
+                    "topics": topics,
+                }
+                copy.write_row(
+                    (
+                        instance_uuid,
+                        "zulip",
+                        "external_chat_assignment",
+                        resource_uuid,
+                        "upsert",
+                        1,
+                        Jsonb({}),
+                        Jsonb(resource),
+                    )
+                )
+
+    rss_samples = []
+    stop_sampling = threading.Event()
+
+    def sample_rss():
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        while not stop_sampling.is_set():
+            resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+            rss_samples.append(resident_pages * page_size)
+            stop_sampling.wait(0.002)
+
+    sampler = threading.Thread(target=sample_rss, daemon=True)
+    sampler.start()
+    while not rss_samples:
+        time.sleep(0.001)
+    try:
+        snapshot, created = _request_call(
+            repository.create_snapshot,
+            identity,
+            sys_uuid.uuid4(),
+            ("external_chat_assignment",),
+        )
+    finally:
+        stop_sampling.set()
+        sampler.join(timeout=1)
+    assert created is True
+    assert rss_samples
+    assert max(rss_samples) - rss_samples[0] < 64 * 1024 * 1024
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT jsonb_array_length(snapshot.resources), COUNT(resource.*)
+            FROM m_external_bridge_snapshots_v1 AS snapshot
+            LEFT JOIN m_external_bridge_snapshot_resources_v2 AS resource
+              ON resource.snapshot_token = snapshot.snapshot_token
+            WHERE snapshot.snapshot_token = %s
+            GROUP BY snapshot.resources
+            """,
+            (snapshot["snapshot_token"],),
+        )
+        assert cursor.fetchone() == (0, len(resource_uuids))
+
+    page_cursor = None
+    page_sizes = []
+    actual_uuids = []
+    while True:
+        page = _request_call(
+            repository.snapshot_page,
+            identity,
+            snapshot["snapshot_token"],
+            page_cursor,
+            200,
+        )
+        page_sizes.append(len(page["resources"]))
+        actual_uuids.extend(resource["uuid"] for resource in page["resources"])
+        page_cursor = page["next_page_cursor"]
+        if page_cursor is None:
+            assert page["complete"] is True
+            break
+        assert page["complete"] is False
+
+    assert len(page_sizes) == 75
+    assert set(page_sizes) == {200}
+    assert actual_uuids == resource_uuids
+
+
+def test_sql_control_snapshot_waits_for_pre_anchor_change_commit(
+    _database, db, monkeypatch
+):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2
+                (uuid, provider, identity_generation, status)
+            VALUES (%s, 'zulip', 1, 'active')
+            """,
+            (instance_uuid,),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        sql_state.ensure_instance(session, instance_uuid, "zulip")
+
+    identity = _identity(instance_uuid, realm_uuid)
+    repository = sql_state.SQLControlState(realm_uuid, b"k" * 32)
+    first_uuid = sys_uuid.uuid4()
+    second_uuid = sys_uuid.uuid4()
+
+    def resource(resource_uuid, name):
+        return {
+            "resource_type": "custom_ca_bundle",
+            "uuid": str(resource_uuid),
+            "generation": 1,
+            "name": name,
+            "pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+        }
+
+    first_staged = threading.Event()
+    release_first = threading.Event()
+    snapshot_lock_attempted = threading.Event()
+
+    def stage_first_change():
+        with psycopg.connect(
+            conftest.TEST_DB_URL,
+            row_factory=psycopg.rows.dict_row,
+        ) as connection:
+            connection.execute("SET LOCAL statement_timeout = '8s'")
+            sql_state.append_upsert(
+                connection,
+                instance_uuid,
+                "zulip",
+                resource(first_uuid, "first"),
+            )
+            first_staged.set()
+            if not release_first.wait(timeout=10):
+                raise TimeoutError("first desired change was not released")
+
+    original_current_session = repository._current_session
+
+    class ObservedSession:
+        def __init__(self, session):
+            self._session = session
+
+        def execute(self, statement, params=()):
+            if "LOCK TABLE" in statement:
+                snapshot_lock_attempted.set()
+            return self._session.execute(statement, params)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    @contextlib.contextmanager
+    def observed_current_session():
+        with original_current_session() as session:
+            yield ObservedSession(session)
+
+    monkeypatch.setattr(repository, "_current_session", observed_current_session)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(stage_first_change)
+        assert first_staged.wait(timeout=5)
+
+        # This later sequence commits first, reproducing the allocation/commit
+        # inversion that used to let the earlier sequence fall through both
+        # the frozen snapshot and its post-anchor feed.
+        with psycopg.connect(
+            conftest.TEST_DB_URL,
+            row_factory=psycopg.rows.dict_row,
+        ) as connection:
+            sql_state.append_upsert(
+                connection,
+                instance_uuid,
+                "zulip",
+                resource(second_uuid, "second"),
+            )
+
+        snapshot_future = executor.submit(
+            _request_call,
+            repository.create_snapshot,
+            identity,
+            sys_uuid.uuid4(),
+            ("custom_ca_bundle",),
+        )
+        assert snapshot_lock_attempted.wait(timeout=5)
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                snapshot_future.result(timeout=0.2)
+        finally:
+            release_first.set()
+        first_future.result(timeout=5)
+        snapshot, created = snapshot_future.result(timeout=5)
+
+    assert created is True
+    page = _request_call(
+        repository.snapshot_page,
+        identity,
+        snapshot["snapshot_token"],
+    )
+    assert {item["uuid"] for item in page["resources"]} == {
+        str(first_uuid),
+        str(second_uuid),
+    }
+    batch = _request_call(
+        repository.changes,
+        identity,
+        snapshot["anchor_cursor"],
+        ("custom_ca_bundle",),
+    )
+    assert batch["changes"] == []
+
+
 def test_bridge_bootstrap_creates_parent_and_authorization_tracks_current_state(
     _database, db
 ):
@@ -4000,6 +4485,10 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
                 (uuid, provider, enabled, limits)
             VALUES (%s, 'zulip', TRUE,
                     '{"max_selected_chats_per_account":2}'::jsonb)
+            ON CONFLICT (provider) DO UPDATE
+            SET enabled = EXCLUDED.enabled,
+                limits = EXCLUDED.limits,
+                updated_at = NOW()
             """,
             (sys_uuid.uuid4(),),
         )
@@ -4506,6 +4995,279 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
             (selected_uuid,),
         )
         assert cursor.fetchone() == (3, "all")
+
+
+def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
+    _database, db, api
+):
+    realm_uuid = sys_uuid.uuid4()
+    instance_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.UUID(api.project_id)
+    account_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    owner_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    chat_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    provider_owner_ids = ("7", "8")
+    for owner_uuid in owner_uuids:
+        conftest.seed_user_stream(db, project_uuid, owner_uuid, "Realm alias owner")
+    settings = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.test",
+        "selection_mode": "all",
+        "history_depth": "all",
+        "default_project_id": str(project_uuid),
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2
+                (uuid, provider, identity_generation, status)
+            VALUES (%s, 'zulip', 1, 'active')
+            """,
+            (instance_uuid,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_policies_v1
+                (uuid, provider, enabled, limits)
+            VALUES (%s, 'zulip', TRUE,
+                    '{"max_selected_chats_per_account":10}'::jsonb)
+            ON CONFLICT (provider) DO UPDATE
+            SET enabled = EXCLUDED.enabled,
+                limits = EXCLUDED.limits,
+                updated_at = NOW()
+            """,
+            (sys_uuid.uuid4(),),
+        )
+        for account_uuid, owner_uuid in zip(account_uuids, owner_uuids):
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    desired_generation
+                ) VALUES (%s, %s, 'zulip', %s::jsonb, 1)
+                """,
+                (account_uuid, owner_uuid, sql_state._json(settings)),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_external_credentials_v2 (
+                    uuid, external_account_uuid, key_version, envelope
+                ) VALUES (%s, %s, 1, %s::jsonb)
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    account_uuid,
+                    sql_state._json(
+                        {
+                            "associated_data": {
+                                "bridge_instance_uuid": str(instance_uuid),
+                            }
+                        }
+                    ),
+                ),
+            )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    repository = sql_state.SQLControlState(realm_uuid, b"k" * 32)
+    identity = _identity(instance_uuid, realm_uuid)
+    with session_factory() as session:
+        for account_uuid in account_uuids:
+            sql_state.append_upsert(
+                session,
+                instance_uuid,
+                "zulip",
+                {
+                    "resource_type": "external_account",
+                    "uuid": str(account_uuid),
+                    "generation": 1,
+                },
+            )
+
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    def catalog_report(index):
+        account_uuid = account_uuids[index]
+        owner_uuid = owner_uuids[index]
+        chat_uuid = chat_uuids[index]
+        provider_owner_id = provider_owner_ids[index]
+        return {
+            "report_uuid": str(sys_uuid.uuid4()),
+            "resource_type": "external_chat_catalog",
+            "resource_uuid": str(chat_uuid),
+            "observed_generation": 1,
+            "status": "ready",
+            "progress": {
+                "phase": "discovery",
+                "completed": 1,
+                "total": 1,
+                "last_progress_at": observed_at,
+            },
+            "safe_error": None,
+            "observed_at": observed_at,
+            "catalog": {
+                "operation": "upsert",
+                "external_account_uuid": str(account_uuid),
+                "owner_user_uuid": str(owner_uuid),
+                "provider_kind": "zulip",
+                "project_id": str(project_uuid),
+                "source": {
+                    "kind": "zulip",
+                    "chat_type": "channel",
+                    "provider_chat_key": "channel:42",
+                    "provider_realm_uuid": str(realm_uuid),
+                    "provider_owner_user_id": provider_owner_id,
+                },
+                "display_name": "Shared Engineering",
+                "description": "One realm-global channel",
+                "participants": [
+                    {
+                        "provider_user_id": provider_owner_id,
+                        "display_name": f"Owner {provider_owner_id}",
+                        "email": None,
+                        "avatar_urn": None,
+                        "is_owner": True,
+                    }
+                ],
+                "topics": [
+                    {
+                        "provider_topic_id": "42:deploys",
+                        "name": "deploys",
+                        "is_default": False,
+                    }
+                ],
+                "capabilities": {"messenger.message.send": {"available": True}},
+            },
+        }
+
+    for index in range(2):
+        result = _request_call(
+            repository.observed_reports,
+            identity,
+            [catalog_report(index)],
+        )["results"][0]
+        assert result["status"] == "applied"
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT projection_stream_uuid,
+                   source#>>'{topics,0,topic_uuid}' AS topic_uuid
+            FROM m_external_chats_v2
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            (list(chat_uuids),),
+        )
+        projections = cursor.fetchall()
+        assert len({row[0] for row in projections}) == 1
+        assert len({row[1] for row in projections}) == 1
+        projection_stream_uuid = projections[0][0]
+        topic_uuid = projections[0][1]
+        cursor.execute(
+            """
+            SELECT resource->'workspace_projection'->'stream'->>'uuid',
+                   resource->'workspace_projection'->'topics'->0->>'topic_uuid'
+            FROM m_external_bridge_desired_resources_v1
+            WHERE resource_type = 'external_chat_assignment'
+              AND resource_uuid = ANY(%s::uuid[])
+            ORDER BY resource_uuid
+            """,
+            (list(chat_uuids),),
+        )
+        desired_projections = cursor.fetchall()
+        assert desired_projections == [
+            (str(projection_stream_uuid), topic_uuid),
+            (str(projection_stream_uuid), topic_uuid),
+        ]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+        cursor.execute(
+            """
+            SELECT user_uuid
+            FROM m_workspace_stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+              AND user_uuid = ANY(%s::uuid[])
+            ORDER BY user_uuid
+            """,
+            (project_uuid, projection_stream_uuid, list(owner_uuids)),
+        )
+        assert {row[0] for row in cursor.fetchall()} == set(owner_uuids)
+
+        cursor.execute(
+            """
+            SELECT external_account_uuid, user_uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert cursor.fetchone() == (account_uuids[0], owner_uuids[0])
+
+    deselected = api.post(
+        f"/v1/external_chats/{chat_uuids[0]}/actions/deselect/invoke",
+        json={},
+        user=owner_uuids[0],
+    )
+    assert deselected.status_code == 200, deselected.text
+    assert deselected.json()["selected"] is False
+    assert deselected.json()["projection_stream_uuid"] is None
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT external_account_uuid, user_uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert cursor.fetchone() == (account_uuids[1], owner_uuids[1])
+        cursor.execute(
+            """
+            SELECT selected, projection_stream_uuid
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuids[1],),
+        )
+        assert cursor.fetchone() == (True, projection_stream_uuid)
+
+    reselected = api.post(
+        f"/v1/external_chats/{chat_uuids[0]}/actions/select/invoke",
+        json={"project_id": str(project_uuid)},
+        user=owner_uuids[0],
+    )
+    assert reselected.status_code == 200, reselected.text
+    assert reselected.json()["projection_stream_uuid"] == str(projection_stream_uuid)
+
+    deleted = api.delete(
+        f"/v1/external_accounts/{account_uuids[1]}",
+        user=owner_uuids[1],
+        permissions=("workspace.external_account.delete",),
+    )
+    assert deleted.status_code == 204, deleted.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT external_account_uuid, user_uuid
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert cursor.fetchone() == (account_uuids[0], owner_uuids[0])
+        cursor.execute(
+            """
+            SELECT selected, projection_stream_uuid
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuids[0],),
+        )
+        assert cursor.fetchone() == (True, projection_stream_uuid)
 
 
 def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(

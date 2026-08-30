@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import base64
+import copy
 import collections.abc
 import contextlib
 import datetime
@@ -114,6 +115,157 @@ def external_chat_projection_stream_uuid(
 ) -> sys_uuid.UUID:
     """Return the stable Workspace stream UUID for an external chat."""
     return _projection_uuid(chat_uuid, "stream", "canonical")
+
+
+def realm_global_chat_projection(
+    session: Any,
+    *,
+    provider: str,
+    provider_realm_uuid: object,
+    provider_chat_key: str,
+    project_id: object,
+    chat_uuid: object,
+    fallback_stream_uuid: object,
+    source: collections.abc.Mapping[str, Any],
+) -> tuple[sys_uuid.UUID, dict[str, Any], bool]:
+    """Reuse one selected realm/chat projection within its owning project."""
+    realm_uuid = sys_uuid.UUID(str(provider_realm_uuid))
+    current_chat_uuid = sys_uuid.UUID(str(chat_uuid))
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (
+            "provider-chat-project-v1:"
+            f"realm:{realm_uuid}:{provider}:{provider_chat_key}",
+        ),
+    )
+    canonical = session.execute(
+        """
+        WITH candidates AS (
+            SELECT chat.uuid, chat.projection_stream_uuid, chat.source,
+                   bool_or(chat.uuid <> %s) OVER () AS has_peer
+            FROM m_external_chats_v2 AS chat
+            JOIN m_external_accounts_v2 AS account
+              ON account.uuid = chat.external_account_uuid
+             AND account.provider = chat.provider
+            WHERE chat.provider = %s
+              AND account.provider_realm_uuid = %s
+              AND chat.provider_chat_id = %s
+              AND chat.selected
+              AND chat.project_id = %s
+              AND chat.projection_stream_uuid IS NOT NULL
+        )
+        SELECT uuid, projection_stream_uuid, source, has_peer
+        FROM candidates
+        ORDER BY uuid
+        LIMIT 1
+        """,
+        (
+            current_chat_uuid,
+            provider,
+            realm_uuid,
+            provider_chat_key,
+            project_id,
+        ),
+    ).fetchone()
+    normalized_source = copy.deepcopy(dict(source))
+    if canonical is None:
+        return (
+            sys_uuid.UUID(str(fallback_stream_uuid)),
+            normalized_source,
+            False,
+        )
+    canonical_source = canonical["source"]
+    canonical_topics = {
+        topic["provider_topic_id"]: topic["topic_uuid"]
+        for topic in (
+            canonical_source.get("topics", [])
+            if isinstance(canonical_source, dict)
+            else []
+        )
+        if isinstance(topic, dict)
+        and isinstance(topic.get("provider_topic_id"), str)
+        and isinstance(topic.get("topic_uuid"), str)
+    }
+    for topic in normalized_source.get("topics", []):
+        if not isinstance(topic, dict):
+            continue
+        canonical_topic_uuid = canonical_topics.get(topic.get("provider_topic_id"))
+        if canonical_topic_uuid is not None:
+            topic["topic_uuid"] = canonical_topic_uuid
+    return (
+        sys_uuid.UUID(str(canonical["projection_stream_uuid"])),
+        normalized_source,
+        bool(canonical["has_peer"]),
+    )
+
+
+def realm_global_selected_chat_peers(
+    session: Any,
+    *,
+    chat_uuid: object,
+) -> tuple[dict[str, Any], ...]:
+    """Return selected aliases for the same verified realm/chat/project."""
+    rows = session.execute(
+        """
+        SELECT peer.uuid, peer.external_account_uuid, peer.owner_user_uuid,
+               peer.projection_stream_uuid
+        FROM m_external_chats_v2 AS current
+        JOIN m_external_accounts_v2 AS current_account
+          ON current_account.uuid = current.external_account_uuid
+        JOIN m_external_accounts_v2 AS peer_account
+          ON peer_account.provider = current_account.provider
+         AND peer_account.provider_realm_uuid =
+             current_account.provider_realm_uuid
+        JOIN m_external_chats_v2 AS peer
+          ON peer.external_account_uuid = peer_account.uuid
+         AND peer.provider = current.provider
+         AND peer.provider_chat_id = current.provider_chat_id
+         AND peer.project_id = current.project_id
+        WHERE current.uuid = %s
+          AND current.selected
+          AND current.project_id IS NOT NULL
+          AND current_account.provider_realm_uuid IS NOT NULL
+          AND peer.uuid <> current.uuid
+          AND peer.selected
+        ORDER BY peer.uuid
+        """,
+        (chat_uuid,),
+    ).fetchall()
+    return tuple(dict(row) for row in rows)
+
+
+def lock_realm_global_chat_scopes(
+    session: Any,
+    *,
+    external_account_uuid: object,
+    chat_uuid: object | None = None,
+) -> None:
+    """Serialize lifecycle changes for verified realm-global chat aliases."""
+    rows = session.execute(
+        """
+        SELECT DISTINCT chat.provider, account.provider_realm_uuid,
+                        chat.provider_chat_id
+        FROM m_external_chats_v2 AS chat
+        JOIN m_external_accounts_v2 AS account
+          ON account.uuid = chat.external_account_uuid
+         AND account.provider = chat.provider
+        WHERE chat.external_account_uuid = %s
+          AND (%s::uuid IS NULL OR chat.uuid = %s::uuid)
+          AND account.provider_realm_uuid IS NOT NULL
+        ORDER BY chat.provider, account.provider_realm_uuid,
+                 chat.provider_chat_id
+        """,
+        (external_account_uuid, chat_uuid, chat_uuid),
+    ).fetchall()
+    for row in rows:
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (
+                "provider-chat-project-v1:"
+                f"realm:{row['provider_realm_uuid']}:"
+                f"{row['provider']}:{row['provider_chat_id']}",
+            ),
+        )
 
 
 def external_chat_assignment_desired(chat: Any, session: Any = None) -> dict[str, Any]:
@@ -1130,7 +1282,11 @@ def refresh_effective_capabilities(
                 account["owner_user_uuid"],
                 resource,
                 messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
-                hidden_fields=("owner_user_uuid", "provider"),
+                hidden_fields=(
+                    "owner_user_uuid",
+                    "provider",
+                    "projection_reset_generation",
+                ),
                 session=session,
             )
         chats = session.execute(
@@ -1833,13 +1989,28 @@ class SQLControlState:
         request_uuid = sys_uuid.UUID(str(request_uuid))
         types = self._normalize_types(resource_types)
         with self._current_session() as session:
+            # BIGSERIAL values are allocated before commit, so MAX(sequence)
+            # alone is not a safe snapshot watermark.  This lock waits for
+            # every transaction that has appended a change and prevents a new
+            # append until the desired rows and anchor are frozen together.
+            # Snapshot creation is rare and bounded to control-plane rows; the
+            # stronger mode also serializes concurrent snapshot creators.
+            self._instance(session, identity)
+            session.execute(
+                'LOCK TABLE "m_external_bridge_desired_changes_v1" '
+                "IN SHARE ROW EXCLUSIVE MODE"
+            )
             session.execute(
                 'DELETE FROM "m_external_bridge_snapshots_v1" WHERE "expires_at" <= %s',
                 (now,),
             )
             existing = session.execute(
                 """
-                SELECT * FROM "m_external_bridge_snapshots_v1"
+                SELECT "snapshot_token", "request_uuid",
+                       "bridge_instance_uuid", "provider_kind",
+                       "resource_types", "snapshot_generation",
+                       "anchor_sequence", "anchor_cursor", "expires_at"
+                FROM "m_external_bridge_snapshots_v1"
                 WHERE "request_uuid" = %s AND "bridge_instance_uuid" = %s
                   AND "provider_kind" = %s AND "resource_types" = %s
                   AND "expires_at" > %s
@@ -1866,23 +2037,6 @@ class SQLControlState:
                 anchor_sequence,
                 instance["snapshot_generation"],
             )
-            rows = session.execute(
-                """
-                SELECT "required_capabilities", "resource"
-                FROM "m_external_bridge_desired_resources_v1"
-                WHERE "bridge_instance_uuid" = %s AND "provider_kind" = %s
-                  AND "resource_type" = ANY(%s) AND "operation" = 'upsert'
-                ORDER BY "resource_type", "resource_uuid"
-                """,
-                (identity.bridge_instance_uuid, identity.provider_kind, list(types)),
-            ).fetchall()
-            resources = [
-                {
-                    **row["resource"],
-                    "required_capabilities": row["required_capabilities"],
-                }
-                for row in rows
-            ]
             token = secrets.token_urlsafe(32)
             expires_at = now + state.SNAPSHOT_LIFETIME
             session.execute(
@@ -1891,7 +2045,7 @@ class SQLControlState:
                     "snapshot_token", "request_uuid", "bridge_instance_uuid",
                     "provider_kind", "resource_types", "snapshot_generation",
                     "anchor_sequence", "anchor_cursor", "resources", "expires_at"
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '[]'::jsonb, %s)
                 """,
                 (
                     token,
@@ -1902,8 +2056,30 @@ class SQLControlState:
                     instance["snapshot_generation"],
                     anchor_sequence,
                     anchor_cursor,
-                    _json(resources),
                     expires_at,
+                ),
+            )
+            session.execute(
+                """
+                INSERT INTO "m_external_bridge_snapshot_resources_v2" (
+                    "snapshot_token", "ordinal", "resource"
+                )
+                SELECT %s,
+                       ROW_NUMBER() OVER (
+                           ORDER BY "resource_type", "resource_uuid"
+                       ) - 1,
+                       "resource" || jsonb_build_object(
+                           'required_capabilities', "required_capabilities"
+                       )
+                FROM "m_external_bridge_desired_resources_v1"
+                WHERE "bridge_instance_uuid" = %s AND "provider_kind" = %s
+                  AND "resource_type" = ANY(%s) AND "operation" = 'upsert'
+                """,
+                (
+                    token,
+                    identity.bridge_instance_uuid,
+                    identity.provider_kind,
+                    list(types),
                 ),
             )
         return {
@@ -1924,32 +2100,59 @@ class SQLControlState:
         now: datetime.datetime | None = None,
     ) -> dict[str, Any]:
         now = now or _utcnow()
+        if not 1 <= limit <= 500:
+            raise ValueError("Snapshot page limit is invalid")
         with self._current_session() as session:
             snapshot = session.execute(
-                'SELECT * FROM "m_external_bridge_snapshots_v1" '
-                'WHERE "snapshot_token" = %s',
+                """
+                SELECT "snapshot_token", "bridge_instance_uuid",
+                       "provider_kind", "snapshot_generation",
+                       "anchor_cursor", "expires_at"
+                FROM "m_external_bridge_snapshots_v1"
+                WHERE "snapshot_token" = %s
+                """,
                 (token,),
             ).fetchone()
-        if snapshot is None:
-            raise state.SnapshotExpiredError("unknown")
-        if snapshot["expires_at"] <= now:
-            raise state.SnapshotExpiredError("expired")
-        if (
-            snapshot["bridge_instance_uuid"] != identity.bridge_instance_uuid
-            or snapshot["provider_kind"] != identity.provider_kind
-        ):
-            raise state.SnapshotExpiredError("scope_mismatch")
-        offset = 0
-        if page_cursor is not None:
-            payload = self._verify(page_cursor)
-            if payload.get("kind") != "snapshot_page" or payload.get("token") != token:
+            if snapshot is None:
+                raise state.SnapshotExpiredError("unknown")
+            if snapshot["expires_at"] <= now:
+                raise state.SnapshotExpiredError("expired")
+            if (
+                snapshot["bridge_instance_uuid"] != identity.bridge_instance_uuid
+                or snapshot["provider_kind"] != identity.provider_kind
+            ):
                 raise state.SnapshotExpiredError("scope_mismatch")
-            offset = payload["offset"]
-        resources = snapshot["resources"][offset : offset + limit]
+            offset = 0
+            if page_cursor is not None:
+                payload = self._verify(page_cursor)
+                if (
+                    payload.get("kind") != "snapshot_page"
+                    or payload.get("token") != token
+                ):
+                    raise state.SnapshotExpiredError("scope_mismatch")
+                offset = payload["offset"]
+                if (
+                    not isinstance(offset, int)
+                    or isinstance(offset, bool)
+                    or offset < 0
+                ):
+                    raise state.SnapshotExpiredError("scope_mismatch")
+            rows = session.execute(
+                """
+                SELECT "resource"
+                FROM "m_external_bridge_snapshot_resources_v2"
+                WHERE "snapshot_token" = %s AND "ordinal" >= %s
+                ORDER BY "ordinal"
+                LIMIT %s
+                """,
+                (token, offset, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        resources = [row["resource"] for row in rows[:limit]]
         next_offset = offset + len(resources)
         next_cursor = (
             None
-            if next_offset >= len(snapshot["resources"])
+            if not has_more
             else self._sign(
                 {"kind": "snapshot_page", "token": token, "offset": next_offset}
             )
@@ -2458,20 +2661,37 @@ class SQLControlState:
             (account_uuid, chat_uuid),
         ).fetchone()["count"]
         select_discovered = selection_all and selected_count < maximum
+        shared_projection = False
         if (existing is not None and existing["selected"]) or select_discovered:
             (
                 projection_stream_uuid,
                 normalized_source,
-                projection_changed,
-            ) = external_projection.reconcile_personal_chat_projection(
+                shared_projection,
+            ) = realm_global_chat_projection(
                 session,
+                provider=identity.provider_kind,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_chat_key=source["provider_chat_key"],
                 project_id=projection_project_uuid,
-                owner_user_uuid=owner_uuid,
-                provider_kind=identity.provider_kind,
+                chat_uuid=chat_uuid,
+                fallback_stream_uuid=projection_stream_uuid,
                 source=normalized_source,
-                projection_stream_uuid=projection_stream_uuid,
-                emit_events=bool(account["live_ready"]),
             )
+            projection_changed = False
+            if not shared_projection:
+                (
+                    projection_stream_uuid,
+                    normalized_source,
+                    projection_changed,
+                ) = external_projection.reconcile_personal_chat_projection(
+                    session,
+                    project_id=projection_project_uuid,
+                    owner_user_uuid=owner_uuid,
+                    provider_kind=identity.provider_kind,
+                    source=normalized_source,
+                    projection_stream_uuid=projection_stream_uuid,
+                    emit_events=bool(account["live_ready"]),
+                )
             if projection_changed:
                 identity_linking.invalidate_direct_event_history(
                     session,
@@ -2552,6 +2772,7 @@ class SQLControlState:
                 capabilities=chat.capabilities,
                 account_settings=account["settings"],
                 emit_events=bool(account["live_ready"]),
+                shared_projection=shared_projection,
             )
             append_upsert(
                 session,
@@ -2709,7 +2930,11 @@ class SQLControlState:
                 account.owner_user_uuid,
                 account,
                 messenger_events.EXTERNAL_ACCOUNT_UPDATED_EVENT,
-                hidden_fields=("owner_user_uuid", "provider"),
+                hidden_fields=(
+                    "owner_user_uuid",
+                    "provider",
+                    "projection_reset_generation",
+                ),
                 session=session,
             )
             return
@@ -2894,6 +3119,16 @@ class SQLControlState:
                                 "is still in progress"
                             ),
                             "retryable": True,
+                        }
+                    except identity_linking.ProviderScopeConflict:
+                        status = "rejected"
+                        result_safe_error = {
+                            "code": "provider_scope_conflict",
+                            "message": (
+                                "Provider chat is already selected in another "
+                                "Workspace project"
+                            ),
+                            "retryable": False,
                         }
                     except ValueError:
                         status = "rejected"

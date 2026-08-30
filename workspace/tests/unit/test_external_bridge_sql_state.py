@@ -152,7 +152,7 @@ def test_catalog_prelock_includes_report_existing_and_changed_chat_projects(
     def canonical_uuid(_provider, _realm_uuid, provider_user_id):
         return (
             canonical_participant_uuid
-            if provider_user_id == "participant"
+            if provider_user_id == "20"
             else canonical_legacy_uuid
         )
 
@@ -178,9 +178,9 @@ def test_catalog_prelock_includes_report_existing_and_changed_chat_projects(
             "project_id": str(report_project_uuid),
             "source": {
                 "provider_realm_uuid": str(realm_uuid),
-                "provider_owner_user_id": "owner",
+                "provider_owner_user_id": "10",
             },
-            "participants": [{"provider_user_id": "participant"}],
+            "participants": [{"provider_user_id": "20"}],
         },
     }
 

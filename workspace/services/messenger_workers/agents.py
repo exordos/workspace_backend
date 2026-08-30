@@ -20,6 +20,7 @@ import logging
 import random
 import time
 import typing
+import uuid as sys_uuid
 
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
@@ -34,6 +35,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import events as messenger_events
 from workspace.external_bridge_control import sql_state
+from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
 EVENT_PRUNE_INTERVAL_SECONDS = 5 * 60
@@ -89,6 +91,9 @@ class MessengerWorkerAgent(basic.BasicService):
         read_state_cleanup_enabled: bool = False,
         read_state_batch_size: int = read_state.COMPACTION_BATCH_SIZE,
         read_state_max_batches_per_iteration: int = 1,
+        v2_projection_enabled: bool = False,
+        v2_projection_max_tasks_per_iteration: int = 100,
+        v2_fanout_batch_size: int = v2_projection.DEFAULT_FANOUT_BATCH_SIZE,
         summary_secret_key: str | None = None,
         summary_connect_timeout_seconds: int = (
             topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -116,6 +121,12 @@ class MessengerWorkerAgent(basic.BasicService):
             read_state_max_batches_per_iteration
         )
         self._read_state_failures: dict[object, tuple[int, float]] = {}
+        self._v2_projection_enabled = v2_projection_enabled
+        self._v2_projection_max_tasks_per_iteration = (
+            v2_projection_max_tasks_per_iteration
+        )
+        self._v2_fanout_batch_size = v2_fanout_batch_size
+        self._v2_worker_id = f"workspace-messenger:{sys_uuid.uuid4()}"
         self._summary_secret_key = summary_secret_key
         self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
         self._summary_request_timeout_seconds = summary_request_timeout_seconds
@@ -147,6 +158,8 @@ class MessengerWorkerAgent(basic.BasicService):
         )
 
     def _iteration(self) -> None:
+        if self._v2_projection_enabled:
+            self._run_v2_projection_tasks()
         now = datetime.datetime.now(datetime.timezone.utc)
         monotonic_now = time.monotonic()
         prune_due = (
@@ -268,6 +281,26 @@ class MessengerWorkerAgent(basic.BasicService):
             LOG.exception("Failed to repair external projection transitions")
 
         self._summarize_one_topic()
+
+    def _run_v2_projection_tasks(self) -> None:
+        for _task in range(self._v2_projection_max_tasks_per_iteration):
+            try:
+                with database_session_context() as session:
+                    cleaned = v2_projection.process_one_provider_file_cleanup_task(
+                        session,
+                        self._v2_worker_id,
+                    )
+                    v2_projection.derive_projection_tasks(session)
+                    processed = v2_projection.process_one_projection_task(
+                        session,
+                        self._v2_worker_id,
+                        fanout_batch_size=self._v2_fanout_batch_size,
+                    )
+            except Exception:
+                LOG.exception("Failed to run the Messenger v2 projection queue")
+                return
+            if not cleaned and not processed:
+                return
 
     def _summarize_one_topic(self) -> bool:
         if self._summary_secret_key is None:

@@ -6,13 +6,13 @@
 """Verified provider-identity linking for external Messenger projections."""
 
 import typing
+import urllib.parse
 import uuid as sys_uuid
 
 from workspace.messenger_api import reaction_users
 from workspace.messenger_api.dm import read_state
 
 
-_PROVIDER_IDENTITY_NAMESPACE = sys_uuid.UUID("fda6f96e-c86d-5c94-976d-4e813e3f3655")
 _PAYLOAD_REFERENCE_TABLES = (
     "m_workspace_broadcast_message_events_v1",
     "m_workspace_event_recipient_payloads_v1",
@@ -20,10 +20,105 @@ _PAYLOAD_REFERENCE_TABLES = (
 _PAYLOAD_REWRITE_BATCH_SIZE = 100
 _PAYLOAD_REWRITE_ROW_BATCH_SIZE = 500
 _REFERENCE_UPDATE_ROW_BATCH_SIZE = 20_000
+_IDENTITY_RECONCILIATION_MAX_ATTEMPTS = 100_000
+
+
+class ProviderScopeConflict(ValueError):
+    """A verified provider realm would make one chat span projects."""
 
 
 class IdentityMergePending(RuntimeError):
     """Signal that a committed merge batch needs another report retry."""
+
+
+def normalize_provider_origin(server_url: object) -> str:
+    """Return a canonical HTTP origin for pre-discovery provider fencing."""
+    if not isinstance(server_url, str):
+        raise ValueError("External provider server URL is invalid")
+    try:
+        parsed = urllib.parse.urlsplit(server_url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("External provider server URL is invalid") from error
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname
+    if (
+        scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("External provider server URL is invalid")
+    try:
+        hostname = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as error:
+        raise ValueError("External provider server URL is invalid") from error
+    if not hostname:
+        raise ValueError("External provider server URL is invalid")
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is not None and not (
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        return f"{scheme}://{hostname}:{port}"
+    return f"{scheme}://{hostname}"
+
+
+def _lock_verified_realm_project_scope(
+    session: typing.Any,
+    *,
+    provider: str,
+    account_uuid: sys_uuid.UUID,
+    provider_realm_uuid: sys_uuid.UUID,
+) -> None:
+    """Serialize and reject conflicting selections before binding a realm."""
+    selected = session.execute(
+        """
+        SELECT provider_chat_id
+        FROM m_external_chats_v2
+        WHERE external_account_uuid = %s AND provider = %s
+          AND selected AND project_id IS NOT NULL
+        ORDER BY provider_chat_id
+        """,
+        (account_uuid, provider),
+    ).fetchall()
+    provider_chat_ids = [row["provider_chat_id"] for row in selected]
+    for provider_chat_id in provider_chat_ids:
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (
+                "provider-chat-project-v1:"
+                f"realm:{provider_realm_uuid}:{provider}:{provider_chat_id}",
+            ),
+        )
+    if not provider_chat_ids:
+        return
+    conflict = session.execute(
+        """
+        SELECT selected.provider_chat_id
+        FROM m_external_chats_v2 AS selected
+        JOIN m_external_chats_v2 AS conflicting
+          ON conflicting.provider = selected.provider
+         AND conflicting.provider_chat_id = selected.provider_chat_id
+         AND conflicting.selected
+         AND conflicting.project_id IS DISTINCT FROM selected.project_id
+        JOIN m_external_accounts_v2 AS conflicting_account
+          ON conflicting_account.uuid = conflicting.external_account_uuid
+        WHERE selected.external_account_uuid = %s
+          AND selected.provider = %s
+          AND selected.selected
+          AND selected.project_id IS NOT NULL
+          AND conflicting.external_account_uuid <> %s
+          AND conflicting_account.provider_realm_uuid = %s
+        LIMIT 1
+        """,
+        (account_uuid, provider, account_uuid, provider_realm_uuid),
+    ).fetchone()
+    if conflict is not None:
+        raise ProviderScopeConflict(
+            "Provider chat is already selected in another Workspace project"
+        )
 
 
 def _update_uuid_reference_batch(
@@ -57,6 +152,180 @@ def _update_uuid_reference_batch(
     ).fetchall()
     if len(rows) == _REFERENCE_UPDATE_ROW_BATCH_SIZE:
         raise IdentityMergePending
+
+
+def _merge_messenger_v2_identity(
+    session: typing.Any,
+    legacy_user_uuid: sys_uuid.UUID,
+    canonical_user_uuid: sys_uuid.UUID,
+) -> None:
+    """Merge v2 identity rows without violating user-scoped uniqueness."""
+    session.execute(
+        """
+        INSERT INTO messenger_project_users (project_id, user_uuid)
+        SELECT project_id, %s
+        FROM messenger_project_users
+        WHERE user_uuid = %s
+        ON CONFLICT (project_id, user_uuid) DO NOTHING
+        """,
+        (canonical_user_uuid, legacy_user_uuid),
+    )
+    session.execute(
+        """
+        UPDATE messenger_stream_bindings AS canonical
+        SET active = canonical.active OR legacy.active,
+            membership_generation = GREATEST(
+                canonical.membership_generation,
+                legacy.membership_generation
+            ),
+            membership_started_at = CASE
+                WHEN legacy.active AND NOT canonical.active
+                THEN legacy.membership_started_at
+                WHEN canonical.active AND NOT legacy.active
+                THEN canonical.membership_started_at
+                ELSE LEAST(
+                    canonical.membership_started_at,
+                    legacy.membership_started_at
+                )
+            END,
+            who_uuid = CASE
+                WHEN legacy.active AND NOT canonical.active THEN legacy.who_uuid
+                WHEN canonical.active AND NOT legacy.active THEN canonical.who_uuid
+                WHEN legacy.updated_at > canonical.updated_at THEN legacy.who_uuid
+                ELSE canonical.who_uuid
+            END,
+            role = CASE
+                WHEN legacy.active AND NOT canonical.active THEN legacy.role
+                WHEN canonical.active AND NOT legacy.active THEN canonical.role
+                WHEN legacy.updated_at > canonical.updated_at THEN legacy.role
+                ELSE canonical.role
+            END,
+            notification_mode = CASE
+                WHEN legacy.notification_updated_at
+                    > canonical.notification_updated_at
+                THEN legacy.notification_mode
+                ELSE canonical.notification_mode
+            END,
+            notification_updated_at = GREATEST(
+                canonical.notification_updated_at,
+                legacy.notification_updated_at
+            ),
+            unread_count = GREATEST(
+                canonical.unread_count,
+                legacy.unread_count
+            ),
+            active_unread_count = GREATEST(
+                canonical.active_unread_count,
+                legacy.active_unread_count
+            ),
+            passive_unread_count = GREATEST(
+                canonical.passive_unread_count,
+                legacy.passive_unread_count
+            ),
+            last_message_uuid = COALESCE(
+                canonical.last_message_uuid,
+                legacy.last_message_uuid
+            ),
+            created_at = LEAST(canonical.created_at, legacy.created_at),
+            updated_at = GREATEST(canonical.updated_at, legacy.updated_at)
+        FROM messenger_stream_bindings AS legacy
+        WHERE legacy.user_uuid = %s AND canonical.user_uuid = %s
+          AND canonical.project_id = legacy.project_id
+          AND canonical.stream_uuid = legacy.stream_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    session.execute(
+        """
+        UPDATE messenger_user_message_states AS canonical
+        SET read_at = COALESCE(canonical.read_at, legacy.read_at),
+            mentioned = canonical.mentioned OR legacy.mentioned,
+            starred = canonical.starred OR legacy.starred,
+            pinned = canonical.pinned OR legacy.pinned,
+            updated_at = GREATEST(canonical.updated_at, legacy.updated_at)
+        FROM messenger_user_message_states AS legacy
+        WHERE legacy.user_uuid = %s AND canonical.user_uuid = %s
+          AND canonical.project_id = legacy.project_id
+          AND canonical.placement_uuid = legacy.placement_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    session.execute(
+        """
+        DELETE FROM messenger_folder_items AS legacy
+        USING messenger_folder_items AS canonical
+        WHERE legacy.user_uuid = %s AND canonical.user_uuid = %s
+          AND canonical.project_id = legacy.project_id
+          AND canonical.folder_uuid = legacy.folder_uuid
+          AND canonical.stream_uuid = legacy.stream_uuid
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    _update_uuid_reference_batch(
+        session,
+        table_name="messenger_folder_items",
+        column_name="user_uuid",
+        legacy_user_uuid=legacy_user_uuid,
+        canonical_user_uuid=canonical_user_uuid,
+    )
+    for table_name, identity_columns in (
+        ("messenger_stream_bindings", ("project_id", "stream_uuid")),
+        ("messenger_user_topic_bindings", ("project_id", "topic_uuid")),
+        ("messenger_user_message_bindings", ("project_id", "placement_uuid")),
+        ("messenger_user_message_states", ("project_id", "placement_uuid")),
+        ("messenger_user_folder_bindings", ("project_id", "folder_uuid")),
+        ("messenger_event_membership_guards", ("event_uuid",)),
+    ):
+        equality = " AND ".join(
+            f"canonical.{column} = legacy.{column}" for column in identity_columns
+        )
+        session.execute(
+            f"""
+            DELETE FROM {table_name} AS legacy
+            USING {table_name} AS canonical
+            WHERE legacy.user_uuid = %s AND canonical.user_uuid = %s
+              AND {equality}
+            """,
+            (legacy_user_uuid, canonical_user_uuid),
+        )
+    session.execute(
+        """
+        DELETE FROM messenger_message_reaction_facts AS legacy
+        USING messenger_message_reaction_facts AS canonical
+        WHERE legacy.user_uuid = %s AND canonical.user_uuid = %s
+          AND canonical.project_id = legacy.project_id
+          AND canonical.canonical_message_uuid = legacy.canonical_message_uuid
+          AND canonical.emoji_name = legacy.emoji_name
+        """,
+        (legacy_user_uuid, canonical_user_uuid),
+    )
+    for table_name, column_name in (
+        ("messenger_streams", "owner_uuid"),
+        ("messenger_streams", "direct_user_uuid"),
+        ("messenger_stream_bindings", "user_uuid"),
+        ("messenger_stream_bindings", "who_uuid"),
+        ("messenger_user_topic_bindings", "user_uuid"),
+        ("messenger_messages", "author_uuid"),
+        ("messenger_user_message_bindings", "user_uuid"),
+        ("messenger_user_message_states", "user_uuid"),
+        ("messenger_user_folder_bindings", "user_uuid"),
+        ("messenger_message_reaction_facts", "user_uuid"),
+        ("messenger_event_membership_guards", "user_uuid"),
+    ):
+        _update_uuid_reference_batch(
+            session,
+            table_name=table_name,
+            column_name=column_name,
+            legacy_user_uuid=legacy_user_uuid,
+            canonical_user_uuid=canonical_user_uuid,
+        )
+    session.execute(
+        """
+        DELETE FROM messenger_project_users
+        WHERE user_uuid = %s
+        """,
+        (legacy_user_uuid,),
+    )
 
 
 def _rewrite_payload_uuid_references(
@@ -158,10 +427,221 @@ def canonical_provider_identity_uuid(
     provider_user_id: str,
 ) -> sys_uuid.UUID:
     """Return one external UUID per provider identity inside a provider realm."""
-    return sys_uuid.uuid5(
-        _PROVIDER_IDENTITY_NAMESPACE,
-        f"{provider}:{provider_realm_uuid}:{provider_user_id}",
+    if provider != "zulip":
+        raise ValueError("Unsupported provider identity namespace")
+    if (
+        not provider_user_id.isascii()
+        or not provider_user_id.isdecimal()
+        or str(int(provider_user_id)) != provider_user_id
+    ):
+        raise ValueError("Provider user ID must use shortest unsigned decimal form")
+    return sys_uuid.uuid5(provider_realm_uuid, f"user:{provider_user_id}")
+
+
+def _rewrite_json_uuid_references(
+    session: typing.Any,
+    *,
+    table_name: str,
+    column_name: str,
+    replacements: list[tuple[sys_uuid.UUID, sys_uuid.UUID]],
+    touch_updated_at: bool = True,
+) -> None:
+    """Rewrite identity UUIDs in one provider-control JSONB column."""
+    for offset in range(0, len(replacements), _PAYLOAD_REWRITE_BATCH_SIZE):
+        batch = replacements[offset : offset + _PAYLOAD_REWRITE_BATCH_SIZE]
+        expression = f'"{column_name}"::text'
+        replacement_values: list[object] = []
+        patterns = []
+        for legacy_user_uuid, canonical_user_uuid in batch:
+            legacy_text = str(legacy_user_uuid)
+            expression = f"replace({expression}, %s, %s)"
+            replacement_values.extend((legacy_text, str(canonical_user_uuid)))
+            patterns.append(f"%{legacy_text}%")
+        session.execute(
+            f"""
+            UPDATE "{table_name}"
+            SET "{column_name}" = ({expression})::jsonb
+                {', updated_at = NOW()' if touch_updated_at else ''}
+            WHERE "{column_name}"::text LIKE ANY(%s::text[])
+            """,
+            (*replacement_values, patterns),
+        )
+
+
+def reconcile_legacy_provider_identity_links(session: typing.Any) -> int:
+    """Canonicalize pre-realm-scoped Zulip identity links during upgrade."""
+    rows = session.execute(
+        """
+        SELECT provider, provider_realm_uuid, provider_user_id,
+               workspace_user_uuid
+        FROM m_external_provider_identity_links_v1
+        WHERE provider = 'zulip' AND link_kind = 'provider_identity'
+        ORDER BY provider_realm_uuid, provider_user_id
+        """
+    ).fetchall()
+    replacements_by_legacy: dict[sys_uuid.UUID, sys_uuid.UUID] = {}
+    link_replacements: list[
+        tuple[str, sys_uuid.UUID, str, sys_uuid.UUID, sys_uuid.UUID]
+    ] = []
+    for row in rows:
+        provider = str(row["provider"])
+        provider_realm_uuid = sys_uuid.UUID(str(row["provider_realm_uuid"]))
+        provider_user_id = str(row["provider_user_id"])
+        legacy_user_uuid = sys_uuid.UUID(str(row["workspace_user_uuid"]))
+        canonical_user_uuid = canonical_provider_identity_uuid(
+            provider,
+            provider_realm_uuid,
+            provider_user_id,
+        )
+        if legacy_user_uuid == canonical_user_uuid:
+            continue
+        prior = replacements_by_legacy.setdefault(
+            legacy_user_uuid,
+            canonical_user_uuid,
+        )
+        if prior != canonical_user_uuid:
+            raise ValueError(
+                "Legacy provider identity maps to multiple canonical users"
+            )
+        link_replacements.append(
+            (
+                provider,
+                provider_realm_uuid,
+                provider_user_id,
+                legacy_user_uuid,
+                canonical_user_uuid,
+            )
+        )
+    if not link_replacements:
+        return 0
+
+    legacy_user_uuids = sorted(replacements_by_legacy, key=lambda value: value.int)
+    conflicting_owner = session.execute(
+        """
+        SELECT workspace_user_uuid
+        FROM m_external_provider_identity_links_v1
+        WHERE link_kind = 'verified_account_owner'
+          AND workspace_user_uuid = ANY(%s::uuid[])
+        LIMIT 1
+        """,
+        (legacy_user_uuids,),
+    ).fetchone()
+    if conflicting_owner is not None:
+        raise ValueError(
+            "Provider identity UUID is also bound to a verified IAM owner"
+        )
+    invalid_user = session.execute(
+        """
+        SELECT uuid, source
+        FROM m_workspace_users
+        WHERE (
+                uuid = ANY(%s::uuid[])
+                AND source <> 'zulip'
+              )
+           OR (
+                uuid = ANY(%s::uuid[])
+                AND source <> 'zulip'
+              )
+        LIMIT 1
+        """,
+        (
+            legacy_user_uuids,
+            list(replacements_by_legacy.values()),
+        ),
+    ).fetchone()
+    if invalid_user is not None:
+        raise ValueError("Provider identity collides with a non-provider user")
+
+    replacements = sorted(
+        replacements_by_legacy.items(),
+        key=lambda item: item[0].int,
     )
+    existing_legacy_user_uuids = {
+        sys_uuid.UUID(str(row["uuid"]))
+        for row in session.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_users
+            WHERE uuid = ANY(%s::uuid[])
+            """,
+            (legacy_user_uuids,),
+        ).fetchall()
+    }
+    for legacy_user_uuid, canonical_user_uuid in replacements:
+        if legacy_user_uuid not in existing_legacy_user_uuids:
+            continue
+        for _attempt in range(_IDENTITY_RECONCILIATION_MAX_ATTEMPTS):
+            try:
+                merge_workspace_user_identity(
+                    session,
+                    legacy_user_uuid,
+                    canonical_user_uuid,
+                    rewrite_payloads=False,
+                    rewrite_chats=False,
+                    delete_legacy=False,
+                )
+            except IdentityMergePending:
+                continue
+            break
+        else:
+            raise RuntimeError("Provider identity reconciliation did not converge")
+
+    for _attempt in range(_IDENTITY_RECONCILIATION_MAX_ATTEMPTS):
+        try:
+            _rewrite_payload_uuid_references(session, replacements)
+        except IdentityMergePending:
+            continue
+        break
+    else:
+        raise RuntimeError("Provider identity payload rewrite did not converge")
+    for table_name, column_name in (
+        ("m_external_chats_v2", "source"),
+        ("m_external_bridge_desired_resources_v1", "resource"),
+        ("m_external_bridge_desired_changes_v1", "resource"),
+    ):
+        _rewrite_json_uuid_references(
+            session,
+            table_name=table_name,
+            column_name=column_name,
+            replacements=replacements,
+            touch_updated_at=(
+                table_name != "m_external_bridge_desired_changes_v1"
+            ),
+        )
+    for (
+        provider,
+        provider_realm_uuid,
+        provider_user_id,
+        legacy_user_uuid,
+        canonical_user_uuid,
+    ) in link_replacements:
+        session.execute(
+            """
+            UPDATE m_external_provider_identity_links_v1
+            SET workspace_user_uuid = %s, updated_at = NOW()
+            WHERE provider = %s AND provider_realm_uuid = %s
+              AND provider_user_id = %s
+              AND link_kind = 'provider_identity'
+              AND workspace_user_uuid = %s
+            """,
+            (
+                canonical_user_uuid,
+                provider,
+                provider_realm_uuid,
+                provider_user_id,
+                legacy_user_uuid,
+            ),
+        )
+    if existing_legacy_user_uuids:
+        session.execute(
+            """
+            DELETE FROM m_workspace_users
+            WHERE source = 'zulip' AND uuid = ANY(%s::uuid[])
+            """,
+            (sorted(existing_legacy_user_uuids, key=lambda value: value.int),),
+        )
+        invalidate_direct_event_history(session)
+    return len(link_replacements)
 
 
 def bind_verified_account_owner(
@@ -195,6 +675,12 @@ def bind_verified_account_owner(
         or account["provider_owner_user_id"] != provider_user_id
     ):
         raise ValueError("External account provider identity changed")
+    _lock_verified_realm_project_scope(
+        session,
+        provider=provider,
+        account_uuid=account_uuid,
+        provider_realm_uuid=provider_realm_uuid,
+    )
     duplicate = session.execute(
         """
         SELECT uuid, owner_user_uuid
@@ -901,6 +1387,7 @@ def merge_workspace_user_identity(
         WHERE foreign_key.contype = 'f'
           AND foreign_key.confrelid = 'm_workspace_users'::regclass
           AND array_length(foreign_key.conkey, 1) = 1
+          AND left(child.relname, 10) <> 'messenger_'
         ORDER BY child.relname, child_column.attname
         """
     ).fetchall()
@@ -1008,6 +1495,11 @@ def merge_workspace_user_identity(
         WHERE workspace_user_uuid = %s
         """,
         (canonical_user_uuid, canonical_source, legacy_user_uuid),
+    )
+    _merge_messenger_v2_identity(
+        session,
+        legacy_user_uuid,
+        canonical_user_uuid,
     )
     if delete_legacy:
         invalidate_direct_event_history(session)
