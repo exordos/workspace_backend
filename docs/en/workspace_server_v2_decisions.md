@@ -371,6 +371,14 @@ counter rebuild even when the canonical rows are already read. This makes an
 idempotent retry repair a stale snapshot. Their projection tasks run ahead of
 bulk import work, while normal snapshot coalescing still bounds database load.
 
+## Provider read-page ordering
+
+A lazily materialized provider read page keeps the queue position of its source
+snapshot for same-lane ordering. A newer snapshot may be persisted before that
+page receives a physical operation sequence, but it cannot block the older page.
+Earlier snapshots still fence later writes in the same stream lane, and other
+lanes remain independent. Materialization and lease batch limits are unchanged.
+
 ## Compatibility and boundaries of first implementation
 
 - Public routes, replies and WebSocket events Workspace UI are not changed.

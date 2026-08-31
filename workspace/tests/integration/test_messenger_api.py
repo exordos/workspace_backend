@@ -19441,6 +19441,160 @@ def test_projection_move_rebinds_failed_provider_read_snapshot_retry(
     db.commit()
 
 
+def test_provider_read_page_precedes_a_later_snapshot_in_the_same_lane(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Interleaved provider reads"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = []
+    for content in ("first read snapshot", "second read snapshot"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    account_uuid = sys_uuid.uuid4()
+    capabilities = {
+        "messenger.message.read": {
+            "available": True,
+            "revision": 2,
+            "limits": {},
+        },
+        provider_data.PROVIDER_READ_PAGING_CAPABILITY: {
+            "available": True,
+            "revision": 1,
+            "limits": {},
+        },
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capabilities), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready, capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s::jsonb
+            )
+            """,
+            (account_uuid, api.user_uuid, json.dumps(capabilities)),
+        )
+    db.commit()
+
+    snapshot_uuids = []
+    for message_uuid in message_uuids:
+        snapshot_uuid = sys_uuid.uuid4()
+        snapshot_uuids.append(snapshot_uuid)
+        queued = _run_database_operation(
+            lambda session, current_snapshot=snapshot_uuid, current_message=message_uuid: (
+                provider_data.enqueue_provider_read_operation(
+                    session,
+                    operation_uuid=current_snapshot,
+                    bridge_instance_uuid=bridge_uuid,
+                    external_account_uuid=account_uuid,
+                    project_id=sys_uuid.UUID(str(api.project_id)),
+                    owner_user_uuid=sys_uuid.UUID(str(api.user_uuid)),
+                    target_type="stream",
+                    target_uuid=sys_uuid.UUID(str(stream_uuid)),
+                    payload={
+                        "stream_uuid": str(stream_uuid),
+                        "topic_uuid": None,
+                        "reader_uuid": str(api.user_uuid),
+                        "read": True,
+                    },
+                    candidate_sql="""
+                    SELECT uuid, created_at, ingest_sequence
+                    FROM m_workspace_messages
+                    WHERE project_id = %s AND uuid = %s
+                """,
+                    candidate_values=(api.project_id, current_message),
+                )
+            )
+        )
+        assert queued is not None
+
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+
+    def lease_one():
+        return _run_database_operation(
+            lambda session: provider_data.lease_provider_operations(
+                session,
+                identity,
+                request_uuid=sys_uuid.uuid4(),
+                limit=1,
+                lease_seconds=30,
+            )
+        )["operations"]
+
+    def report(operation):
+        return _run_database_operation(
+            lambda session: provider_data.report_provider_result(
+                session,
+                identity,
+                {
+                    "result_uuid": str(sys_uuid.uuid4()),
+                    "provider_operation_uuid": operation["provider_operation_uuid"],
+                    "lease_uuid": operation["lease_uuid"],
+                    "status": "succeeded",
+                    "safe_error": None,
+                },
+            )
+        )
+
+    first_page = lease_one()
+    assert len(first_page) == 1
+    assert first_page[0]["payload"]["message_uuids"] == [str(message_uuids[0])]
+    assert report(first_page[0])["status"] == "applied"
+
+    second_page = lease_one()
+    assert len(second_page) == 1
+    assert second_page[0]["payload"]["message_uuids"] == [str(message_uuids[1])]
+    assert report(second_page[0])["status"] == "applied"
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = ANY(%s::uuid[])
+            """,
+            (snapshot_uuids,),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+    db.commit()
+
+
 def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypatch):
     first_stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "Provider lane first"

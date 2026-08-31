@@ -387,6 +387,16 @@ bereits gelesen sind. So repariert ein idempotenter Wiederholungsversuch einen
 veralteten Snapshot. Diese Projektionsaufgaben laufen vor Massenimporten; die
 normale Snapshot-Zusammenfassung begrenzt weiterhin die Datenbanklast.
 
+## Reihenfolge der Provider-Leseseiten
+
+Eine verzögert materialisierte Provider-Leseseite verwendet für die Reihenfolge
+innerhalb derselben Lane die Queue-Position ihres Quell-Snapshots. Ein neuerer
+Snapshot kann gespeichert werden, bevor die Seite eine physische
+Operationssequenz erhält, darf die ältere Seite aber nicht blockieren. Frühere
+Snapshots sperren weiterhin spätere Schreibvorgänge derselben Stream-Lane;
+andere Lanes bleiben unabhängig. Die Grenzen für Materialisierung und
+Lease-Batches ändern sich nicht.
+
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 
 - Öffentliche Routen, Antworten und WebSocket events Workspace UI nicht geändert.

@@ -1354,7 +1354,16 @@ def lease_provider_operations(
                             operation.bridge_instance_uuid
                       AND barrier.external_account_uuid =
                             operation.external_account_uuid
-                      AND barrier.queue_sequence < operation.sequence
+                      AND barrier.queue_sequence < COALESCE(
+                            (
+                                SELECT page_snapshot.queue_sequence
+                                FROM m_external_provider_read_snapshots_v1
+                                    AS page_snapshot
+                                WHERE page_snapshot.external_operation_uuid =
+                                        operation.external_operation_uuid
+                            ),
+                            operation.sequence
+                      )
                       AND (
                             -- Fail closed for rows written by an old process
                             -- during a rolling migration.

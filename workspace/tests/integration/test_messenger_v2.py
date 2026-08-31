@@ -48,6 +48,9 @@ PROJECTION_CLAIM_INDEX_MIGRATION = (
 INTERACTIVE_READ_INDEX_MIGRATION = (
     "0160-repair-native-read-state-and-prioritize-reads-259cc2.py"
 )
+PROVIDER_READ_PAGE_UNBLOCK_MIGRATION = (
+    "0161-Unblock-interleaved-provider-read-pages-d06433.py"
+)
 
 
 def _truncate_messenger_test_data():
@@ -107,7 +110,7 @@ def _isolate_v2_module(_database):
         engine = ra_migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)
         )
-        engine.apply_migration(INTERACTIVE_READ_INDEX_MIGRATION)
+        engine.apply_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
 
 
 @pytest.fixture(autouse=True)
@@ -1395,6 +1398,7 @@ def test_projection_claim_prioritizes_interactive_reads(api, db):
 
 def test_native_read_repair_migration_preserves_compact_reads(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
     engine.rollback_migration(INTERACTIVE_READ_INDEX_MIGRATION)
     try:
         peer_uuid = sys_uuid.uuid4()
@@ -1540,7 +1544,7 @@ def test_native_read_repair_migration_preserves_compact_reads(api, db):
             )
             assert cursor.fetchone() == (0, 0, 0)
     finally:
-        engine.apply_migration(INTERACTIVE_READ_INDEX_MIGRATION)
+        engine.apply_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
 
 
 def test_native_v2_keeps_folder_file_and_draft_contracts(api, db):
@@ -4362,6 +4366,7 @@ def test_zulip_projection_reset_preserves_internal_messages_and_clears_counters(
 
 def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
     engine.rollback_migration(INTERACTIVE_READ_INDEX_MIGRATION)
     engine.rollback_migration(PROJECTION_CLAIM_INDEX_MIGRATION)
     engine.rollback_migration(ZULIP_MESSAGE_RESET_MIGRATION)
@@ -4998,7 +5003,7 @@ def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
         ) == (1, 0, 1, "mute")
     finally:
         _truncate_messenger_test_data()
-        engine.apply_migration(INTERACTIVE_READ_INDEX_MIGRATION)
+        engine.apply_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
 
 
 def test_native_v2_migration_canonicalizes_legacy_provider_identity_links(api, db):
