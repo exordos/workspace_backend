@@ -3652,10 +3652,14 @@ def _existing_legacy_flag_coordinates(
         SELECT flags.uuid, flags.user_uuid
         FROM unnest(%s::uuid[], %s::uuid[])
             AS coordinate(uuid, user_uuid)
-        JOIN m_workspace_user_message_flags AS flags
-          ON flags.project_id = %s
-         AND flags.uuid = coordinate.uuid
-         AND flags.user_uuid = coordinate.user_uuid
+        CROSS JOIN LATERAL (
+            SELECT flags.uuid, flags.user_uuid
+            FROM m_workspace_user_message_flags AS flags
+            WHERE flags.project_id = %s
+              AND flags.uuid = coordinate.uuid
+              AND flags.user_uuid = coordinate.user_uuid
+            LIMIT 1
+        ) AS flags
         """,
         (
             [row["uuid"] for row in rows],

@@ -20,6 +20,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import v2_models
 
 
@@ -62,6 +63,30 @@ def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
 
 class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     """Use the v2 canonical schema for native Messenger resources."""
+
+    def _legacy_message_uuid(
+        self,
+        session: typing.Any,
+        placement_uuid: object,
+    ) -> sys_uuid.UUID:
+        """Resolve the rolling compatibility identity for a v2 placement."""
+        row = session.execute(
+            """
+            SELECT COALESCE(legacy_public_uuid, uuid) AS uuid
+            FROM messenger_message_placements
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (self.project_uuid, placement_uuid),
+        ).fetchone()
+        if row is None:
+            raise ra_exceptions.ValidationErrorException()
+        return sys_uuid.UUID(str(row["uuid"]))
+
+    def _syncs_compact_read_state(self, session: typing.Any) -> bool:
+        """Return whether v2 read actions must update compact compatibility state."""
+        return read_state.mode_uses_compact_state(
+            read_state.project_mode(session, self.project_uuid)
+        )
 
     def _v2_scope_filters(
         self,
@@ -1832,10 +1857,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         target_uuid: object,
         candidate_sql: str,
         candidate_values: typing.Sequence[object],
+        provider_candidate_sql: str | None = None,
+        provider_candidate_values: typing.Sequence[object] | None = None,
     ) -> bool:
         """Snapshot exact unread placements without materializing them in Python."""
         session = contexts.Context().get_session()
-        provider_account_uuids = self._lock_provider_account_for_stream(stream_uuid)
+        provider_account_uuids = self._lock_provider_read_accounts_for_stream(
+            stream_uuid
+        )
         changed = (
             session.execute(
                 f"SELECT 1 FROM ({candidate_sql}) AS candidate LIMIT 1",
@@ -1843,7 +1872,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             ).fetchone()
             is not None
         )
-        if not changed or not provider_account_uuids:
+        if not provider_account_uuids:
             return changed
         callback = self._provider_read_snapshot_callback(
             provider_account_uuids=provider_account_uuids,
@@ -1853,7 +1882,22 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             target_uuid=target_uuid,
         )
         if callback is not None:
-            callback(session, candidate_sql, candidate_values)
+            try:
+                callback(
+                    session,
+                    provider_candidate_sql or candidate_sql,
+                    (
+                        provider_candidate_values
+                        if provider_candidate_values is not None
+                        else candidate_values
+                    ),
+                )
+            except (
+                ra_exceptions.ValidationErrorException,
+                storage_exceptions.RecordNotFound,
+            ):
+                if changed:
+                    raise
         return changed
 
     def perform_action(
@@ -2085,7 +2129,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             ]
         if resource == "messages" and action == "read":
             message = self._message(resource_uuid)
-            provider_account_uuids = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
                 message.stream_uuid
             )
             changed = session.execute(
@@ -2098,21 +2142,36 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, message.uuid, self.user_uuid),
             ).fetchone()
-            if changed is not None:
+            if self._syncs_compact_read_state(session):
+                read_state.set_message_read(
+                    session,
+                    self.project_uuid,
+                    self.user_uuid,
+                    self._legacy_message_uuid(session, message.uuid),
+                    True,
+                )
+            try:
                 provider_targets = self._message_provider_targets(
                     message,
                     "read_state.set",
                     account_locked=bool(provider_account_uuids),
                 )
-                for provider_target in provider_targets:
-                    self._queue_provider_read(
-                        stream_uuid=message.stream_uuid,
-                        topic_uuid=message.topic_uuid,
-                        message_uuids=(message.uuid,),
-                        target_type="message",
-                        target_uuid=resource_uuid,
-                        provider_target=provider_target,
-                    )
+            except (
+                ra_exceptions.ValidationErrorException,
+                storage_exceptions.RecordNotFound,
+            ):
+                if changed is not None:
+                    raise
+                provider_targets = ()
+            for provider_target in provider_targets:
+                self._queue_provider_read(
+                    stream_uuid=message.stream_uuid,
+                    topic_uuid=message.topic_uuid,
+                    message_uuids=(message.uuid,),
+                    target_type="message",
+                    target_uuid=resource_uuid,
+                    provider_target=provider_target,
+                )
             self._enqueue_counter_projections(
                 source_kind="message.read",
                 placement_uuid=message.uuid,
@@ -2140,7 +2199,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                   ON boundary_message.project_id = boundary.project_id
                  AND boundary_message.uuid = boundary.message_uuid
                 WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND state.read_at IS NULL
+                  AND (%s::boolean OR state.read_at IS NULL)
                   AND placement.topic_uuid = %s
                   AND (canonical.created_at, placement.uuid)
                       <= (boundary_message.created_at, boundary.uuid)
@@ -2150,6 +2209,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 message.uuid,
                 self.project_uuid,
                 self.user_uuid,
+                False,
+                message.topic_uuid,
+            )
+            provider_candidate_values = (
+                message.uuid,
+                self.project_uuid,
+                self.user_uuid,
+                True,
                 message.topic_uuid,
             )
             changed = self._queue_v2_provider_read_snapshot(
@@ -2159,6 +2226,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 target_uuid=resource_uuid,
                 candidate_sql=candidate_sql,
                 candidate_values=candidate_values,
+                provider_candidate_values=provider_candidate_values,
             )
             session.execute(
                 """
@@ -2189,6 +2257,42 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     message.uuid,
                 ),
             )
+            if self._syncs_compact_read_state(session):
+                # Compatibility rows can be projected in a different physical
+                # order from canonical placements. Reuse the canonical tuple
+                # boundary instead of comparing legacy timestamps and UUIDs.
+                read_state._bulk_mark_read(
+                    session,
+                    self.project_uuid,
+                    self.user_uuid,
+                    """
+                    EXISTS (
+                        SELECT 1
+                        FROM messenger_message_placements AS placement
+                        JOIN messenger_messages AS canonical
+                          ON canonical.project_id = placement.project_id
+                         AND canonical.uuid = placement.message_uuid
+                        JOIN messenger_user_message_states AS state
+                          ON state.project_id = placement.project_id
+                         AND state.placement_uuid = placement.uuid
+                         AND state.user_uuid = %s
+                        WHERE placement.project_id = message.project_id
+                          AND COALESCE(
+                              placement.legacy_public_uuid,
+                              placement.uuid
+                          ) = message.uuid
+                          AND placement.topic_uuid = %s
+                          AND (canonical.created_at, placement.uuid)
+                              <= (%s, %s)
+                    )
+                    """,
+                    (
+                        self.user_uuid,
+                        message.topic_uuid,
+                        message.created_at,
+                        message.uuid,
+                    ),
+                )
             self._enqueue_counter_projections(
                 source_kind="messages.read",
                 placement_uuid=message.uuid,
@@ -2247,13 +2351,20 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                   ON canonical.project_id = placement.project_id
                  AND canonical.uuid = placement.message_uuid
                 WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND state.read_at IS NULL
+                  AND (%s::boolean OR state.read_at IS NULL)
                   AND placement.stream_uuid = %s
                 ORDER BY canonical.created_at, placement.uuid
             """
             stream_read_candidate_values = (
                 self.project_uuid,
                 self.user_uuid,
+                False,
+                stream.uuid,
+            )
+            stream_provider_candidate_values = (
+                self.project_uuid,
+                self.user_uuid,
+                True,
                 stream.uuid,
             )
             changed = self._queue_v2_provider_read_snapshot(
@@ -2263,6 +2374,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 target_uuid=resource_uuid,
                 candidate_sql=candidate_sql,
                 candidate_values=stream_read_candidate_values,
+                provider_candidate_values=stream_provider_candidate_values,
             )
             session.execute(
                 """
@@ -2277,6 +2389,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, self.user_uuid, stream.uuid),
             )
+            if self._syncs_compact_read_state(session):
+                read_state.read_stream(
+                    session,
+                    self.project_uuid,
+                    self.user_uuid,
+                    stream.uuid,
+                    collect_message_rows=False,
+                )
             topics = session.execute(
                 """
                 SELECT uuid FROM messenger_topics
@@ -2383,9 +2503,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "stream_uuid": str(stream.uuid),
                     "user_uuid": str(self.user_uuid),
                     "notification_mode": notification["notification_mode"],
-                    "notification_updated_at": notification[
-                        "notification_updated_at"
-                    ],
+                    "notification_updated_at": notification["notification_updated_at"],
                 },
                 provider_target=provider_target,
             )
@@ -2420,13 +2538,20 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                   ON canonical.project_id = placement.project_id
                  AND canonical.uuid = placement.message_uuid
                 WHERE state.project_id = %s AND state.user_uuid = %s
-                  AND state.read_at IS NULL
+                  AND (%s::boolean OR state.read_at IS NULL)
                   AND placement.topic_uuid = %s
                 ORDER BY canonical.created_at, placement.uuid
             """
             topic_read_candidate_values = (
                 self.project_uuid,
                 self.user_uuid,
+                False,
+                topic.uuid,
+            )
+            topic_provider_candidate_values = (
+                self.project_uuid,
+                self.user_uuid,
+                True,
                 topic.uuid,
             )
             changed = self._queue_v2_provider_read_snapshot(
@@ -2436,6 +2561,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 target_uuid=resource_uuid,
                 candidate_sql=candidate_sql,
                 candidate_values=topic_read_candidate_values,
+                provider_candidate_values=topic_provider_candidate_values,
             )
             session.execute(
                 """
@@ -2450,6 +2576,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, self.user_uuid, topic.uuid),
             )
+            if self._syncs_compact_read_state(session):
+                read_state.read_topic(
+                    session,
+                    self.project_uuid,
+                    self.user_uuid,
+                    topic.stream_uuid,
+                    topic.uuid,
+                    collect_message_rows=False,
+                )
             self._enqueue_counter_projections(
                 source_kind="topic.read",
                 user_uuid=self.user_uuid,

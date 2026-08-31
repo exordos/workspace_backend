@@ -49,6 +49,7 @@ from workspace.common import messenger_reaction_opts
 from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_event_apply
+from workspace.external_bridge_control import provider_v2
 from workspace.external_bridge_control import sql_state
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exceptions
@@ -138,6 +139,26 @@ def _set_workspace_read_mode(db, project_id, mode):
             (project_id, mode),
         )
     db.commit()
+
+
+@pytest.fixture
+def preserve_current_external_access_views(db):
+    """Restore current views after an old migration replay test."""
+    view_names = (
+        "m_confirmed_external_account_access",
+        "m_workspace_visible_events",
+    )
+    with db.cursor() as cursor:
+        definitions = {}
+        for view_name in view_names:
+            cursor.execute("SELECT pg_get_viewdef(%s::regclass, TRUE)", (view_name,))
+            definitions[view_name] = cursor.fetchone()[0]
+    try:
+        yield
+    finally:
+        with db.cursor() as cursor:
+            for view_name, definition in definitions.items():
+                cursor.execute(f'CREATE OR REPLACE VIEW "{view_name}" AS {definition}')
 
 
 def _advance_read_compaction_to_phase(db, project_id, phase):
@@ -1158,8 +1179,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         ]
         assert all("api_key" not in json.dumps(row[2]) for row in events)
         assert all(
-            "projection_reset_generation" not in json.dumps(row[2])
-            for row in events
+            "projection_reset_generation" not in json.dumps(row[2]) for row in events
         )
 
         deleted = api.delete(
@@ -1675,9 +1695,7 @@ def test_provider_self_dm_selection_materializes_or_reuses_canonical_self_chat(
                 json.dumps(
                     {
                         "kind": "zulip",
-                        "server_url": (
-                            f"https://{account_uuid}.zulip.example.invalid"
-                        ),
+                        "server_url": (f"https://{account_uuid}.zulip.example.invalid"),
                         "selection_mode": "explicit",
                         "default_project_id": api.project_id,
                     }
@@ -3236,9 +3254,7 @@ def test_external_projection_move_is_request_atomic_after_each_phase(
                 json.dumps(
                     {
                         "kind": "zulip",
-                        "server_url": (
-                            f"https://{account_uuid}.zulip.example.invalid"
-                        ),
+                        "server_url": (f"https://{account_uuid}.zulip.example.invalid"),
                         "selection_mode": "explicit",
                         "history_depth": "30_days",
                         "default_project_id": str(old_project),
@@ -6754,6 +6770,7 @@ def test_external_member_removal_revokes_duplicate_chat_projections(
     api,
     workspace_api,
     db,
+    preserve_current_external_access_views,
 ):
     removed_user_uuid = sys_uuid.uuid4()
     second_owner_uuid = sys_uuid.uuid4()
@@ -7378,6 +7395,8 @@ def test_mentioned_unread_messages_use_scoped_keyset_page(api, db):
     assert [item["uuid"] for item in first_page.json()] == [message_uuids[2]]
     assert first_page.json()[0]["mentioned"] is True
     assert first_page.json()[0]["read"] is False
+    assert first_page.json()[0]["created_at"].endswith("Z")
+    assert first_page.json()[0]["updated_at"].endswith("Z")
     marker = first_page.headers["X-Pagination-Marker"]
 
     second_page = api.get(
@@ -8478,11 +8497,29 @@ def test_hard_delete_restores_topic_summary_journal_and_resets_work(api, db):
     assert cleared["summary_last_message_uuid"] is None
     assert cleared["summary_has_new_messages"] is None
 
+    stale_topic, stale_messages = create_topic(
+        "delete-stale-journal-boundary",
+        ("stale boundary", "current boundary"),
+    )
+    store_summary(stale_topic, stale_messages[0], "Stale summary.")
+    store_summary(stale_topic, stale_messages[1], "Current summary.")
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM m_workspace_messages WHERE uuid = %s",
+            (stale_messages[0],),
+        )
+    deleted = api.delete(f"{MESSAGES}{stale_messages[1]}")
+    assert deleted.status_code == 204, deleted.text
+    cleared = api.get(f"{STREAM_TOPICS}{stale_topic}").json()
+    assert cleared["summary"] is None
+    assert cleared["summary_last_message_uuid"] is None
+    assert cleared["summary_has_new_messages"] is None
+
     with db.cursor() as cursor:
         cursor.execute(
             "SELECT COUNT(*) FROM m_workspace_topic_summary_jobs "
             "WHERE topic_uuid = ANY(%s)",
-            ([boundary_topic, earlier_topic, only_topic],),
+            ([boundary_topic, earlier_topic, only_topic, stale_topic],),
         )
         assert cursor.fetchone()[0] == 0
         cursor.execute(
@@ -8493,7 +8530,7 @@ def test_hard_delete_restores_topic_summary_journal_and_resets_work(api, db):
               AND topic_uuid = ANY(%s)
             GROUP BY topic_uuid
             """,
-            ([boundary_topic, earlier_topic, only_topic],),
+            ([boundary_topic, earlier_topic, only_topic, stale_topic],),
         )
         invalidated_counts = {
             str(topic_uuid): count for topic_uuid, count in cursor.fetchall()
@@ -8502,6 +8539,7 @@ def test_hard_delete_restores_topic_summary_journal_and_resets_work(api, db):
             boundary_topic: 1,
             earlier_topic: 1,
             only_topic: 1,
+            stale_topic: 1,
         }
         cursor.execute(
             """
@@ -10059,6 +10097,144 @@ def test_message_create_writes_compact_read_state_and_visible_events(
         },
     ).json()
     assert next_page == []
+
+
+def test_events_keep_native_message_visible_through_confirmed_external_stream_access(
+    api, workspace_api, db
+):
+    """A native outgoing message inherits the visibility of its external stream."""
+    account_owner_uuid = sys_uuid.uuid4()
+    external_account_uuid = sys_uuid.uuid4()
+    external_chat_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "shared external event stream"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
+    )
+    conftest.seed_workspace_user(
+        db, account_owner_uuid, f"external-owner-{account_owner_uuid}"
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (
+                %s, %s, 'zulip', %s::jsonb, TRUE, 'live', TRUE
+            )
+            """,
+            (
+                str(external_account_uuid),
+                str(account_owner_uuid),
+                '{"kind":"zulip","server_url":"https://zulip.example.test"}',
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_chats_v2 (
+                uuid, external_account_uuid, owner_user_uuid, provider,
+                provider_chat_id, source, display_name, selected, project_id,
+                projection_stream_uuid
+            ) VALUES (
+                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
+                'shared external event stream', TRUE, %s, %s
+            )
+            """,
+            (
+                str(external_chat_uuid),
+                str(external_account_uuid),
+                str(account_owner_uuid),
+                '{"provider_realm_uuid":"realm-42"}',
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.test",
+                        # A legacy projection can retain a source scope that is
+                        # not the selected account UUID. Visibility must use
+                        # the selected canonical stream instead.
+                        "source_scope": "legacy-shared-scope",
+                    }
+                ),
+                str(external_account_uuid),
+                api.project_id,
+                stream_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT
+                EXISTS (
+                    SELECT 1
+                    FROM m_confirmed_external_account_access AS access
+                    WHERE access.project_id = %s AND access.user_uuid = %s
+                      AND access.account_type = 'zulip'
+                      AND access.source_scope = 'legacy-shared-scope'
+                ) AS account_access,
+                EXISTS (
+                    SELECT 1
+                    FROM m_confirmed_external_stream_access AS access
+                    WHERE access.project_id = %s AND access.user_uuid = %s
+                      AND access.stream_uuid = %s
+                ) AS stream_access
+            """,
+            (
+                api.project_id,
+                api.user_uuid,
+                api.project_id,
+                api.user_uuid,
+                stream_uuid,
+            ),
+        )
+        assert cursor.fetchone() == (False, True)
+
+    message_uuid = sys_uuid.uuid4()
+    _run_database_operation(
+        lambda session: messenger_dm_helpers.create_workspace_user_message(
+            uuid=message_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(
+                content="native message in shared external stream"
+            ),
+            source_name=messenger_models.SourceName.NATIVE.value,
+            source=messenger_models.NativeSource(),
+            session=session,
+            compact_events=True,
+        )
+    )
+    public_message_uuid = str(
+        sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), str(message_uuid).lower())
+    )
+
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    events = workspace_api.get(EVENTS, params={"page_limit": 100})
+    assert events.status_code == 200, events.text
+    visible_messages = {
+        event["payload"]["uuid"]
+        for event in events.json()
+        if event["payload"]["kind"] == "message.created"
+    }
+    assert public_message_uuid in visible_messages
 
 
 def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
@@ -11697,7 +11873,7 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
             """,
             (
                 str(account_uuid),
-                api.user_uuid,
+                str(reader_uuid),
                 json.dumps(
                     {
                         "kind": "zulip",
@@ -11742,7 +11918,7 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
             (
                 str(chat_uuid),
                 str(account_uuid),
-                api.user_uuid,
+                str(reader_uuid),
                 json.dumps(source),
                 api.project_id,
                 str(stream_uuid),
@@ -11873,20 +12049,13 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
             flags = cursor.fetchall()
             cursor.execute(
                 """
-                SELECT array_agg(message.uuid ORDER BY message.created_at, message.uuid)
+                SELECT candidate.candidate_uuids
                 FROM m_external_provider_read_snapshots_v1 AS snapshot
-                JOIN m_external_provider_read_candidate_chunks_v1 AS candidate
+                JOIN m_external_provider_read_candidate_packs_v1 AS candidate
                   ON candidate.external_operation_uuid =
                      snapshot.external_operation_uuid
-                CROSS JOIN LATERAL generate_series(0, 4095) AS bit_offset
-                JOIN m_workspace_messages AS message
-                  ON message.project_id = snapshot.project_id
-                 AND message.ingest_sequence =
-                        candidate.chunk_number * 4096 + bit_offset
                 WHERE snapshot.external_account_uuid = %s
-                  AND get_bit(candidate.candidate_bits, bit_offset) = 1
-                GROUP BY snapshot.queue_sequence
-                ORDER BY snapshot.queue_sequence DESC
+                ORDER BY snapshot.queue_sequence DESC, candidate.pack_number
                 LIMIT 1
                 """,
                 (str(account_uuid),),
@@ -11906,6 +12075,44 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
             (str(account_uuid),),
         )
         assert cursor.fetchone()[0] == 8
+
+    result = _run_database_operation(
+        lambda _session: sql_canonical_store.SQLCanonicalMessengerStore(
+            api.project_id,
+            reader_uuid,
+        ).perform_action(
+            "messages",
+            boundary_uuid,
+            "read_up_to",
+            {},
+        )
+    )
+    assert result["uuid"] == str(boundary_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT candidate.candidate_uuids
+            FROM m_external_provider_read_snapshots_v1 AS snapshot
+            JOIN m_external_provider_read_candidate_packs_v1 AS candidate
+              ON candidate.external_operation_uuid =
+                 snapshot.external_operation_uuid
+            WHERE snapshot.external_account_uuid = %s
+            ORDER BY snapshot.queue_sequence DESC, candidate.pack_number
+            LIMIT 1
+            """,
+            (str(account_uuid),),
+        )
+        candidate_uuids = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_account_uuid = %s
+            """,
+            (str(account_uuid),),
+        )
+        assert cursor.fetchone()[0] == 9
+    assert [str(value) for value in candidate_uuids] == expected_message_uuids
 
     with db.cursor() as cursor:
         cursor.execute(
@@ -11963,7 +12170,7 @@ def test_provider_read_up_to_and_capability_refresh_do_not_deadlock(api, db):
                 """,
             (str(account_uuid),),
         )
-        assert cursor.fetchone()[0] == 8
+        assert cursor.fetchone()[0] == 9
 
 
 def test_provider_read_prelocks_lane_before_project_during_page_lease(api, db):
@@ -12049,7 +12256,7 @@ def test_provider_read_prelocks_lane_before_project_during_page_lease(api, db):
             """,
             (
                 account_uuid,
-                api.user_uuid,
+                reader_uuid,
                 json.dumps(
                     {
                         "kind": "zulip",
@@ -12094,7 +12301,7 @@ def test_provider_read_prelocks_lane_before_project_during_page_lease(api, db):
             (
                 chat_uuid,
                 account_uuid,
-                api.user_uuid,
+                reader_uuid,
                 json.dumps(source),
                 api.project_id,
                 stream_uuid,
@@ -18609,6 +18816,521 @@ def test_provider_read_materializer_bounds_snapshot_backlog_by_lease_limit(api, 
     db.commit()
 
 
+@pytest.mark.parametrize("echo_before_result", (False, True))
+def test_provider_result_binds_native_message_before_cross_account_echo(
+    api,
+    db,
+    echo_before_result,
+):
+    conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    _enable_zulip_policy(db)
+    project_uuid = sys_uuid.UUID(str(api.project_id))
+    owner_uuid = sys_uuid.UUID(str(api.user_uuid))
+    stream_uuid = conftest.seed_user_stream(
+        db, project_uuid, owner_uuid, "Provider result binding stream"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        owner_uuid,
+        "Provider result binding topic",
+        is_default=True,
+    )
+    native = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "payload": {"kind": "markdown", "content": "outbound once"},
+        },
+    )
+    assert native.status_code == 201, native.text
+    native_uuid = sys_uuid.UUID(native.json()["uuid"])
+    account_uuid = sys_uuid.uuid4()
+    provider_realm_uuid = sys_uuid.uuid4()
+    capabilities = {"messenger.message.send": {"available": True, "revision": 1}}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE m_external_bridge_instances_v2
+            SET capabilities = %s::jsonb, last_heartbeat_at = NOW()
+            WHERE uuid = %s
+            """,
+            (json.dumps(capabilities), bridge_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings, credential_present,
+                status, live_ready, provider_realm_uuid, provider_owner_user_id,
+                capabilities
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb, FALSE,
+                'live', TRUE, %s, '1', %s::jsonb
+            )
+            """,
+            (account_uuid, owner_uuid, provider_realm_uuid, json.dumps(capabilities)),
+        )
+    db.commit()
+    public_operation_uuid = sys_uuid.uuid4()
+    _operation, provider_operation_uuid = _run_database_operation(
+        lambda session: provider_data.enqueue_provider_operation_in_lane(
+            session,
+            operation_uuid=public_operation_uuid,
+            bridge_instance_uuid=bridge_uuid,
+            external_account_uuid=account_uuid,
+            project_id=project_uuid,
+            owner_user_uuid=owner_uuid,
+            operation_kind="message.create",
+            target_type="message",
+            target_uuid=native_uuid,
+            payload={"stream_uuid": str(stream_uuid), "topic_uuid": str(topic_uuid)},
+            causal_lane=stream_uuid,
+        )
+    )
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    leased = _run_database_operation(
+        lambda session: provider_data.lease_provider_operations(
+            session,
+            identity,
+            request_uuid=sys_uuid.uuid4(),
+            limit=1,
+            lease_seconds=30,
+        )
+    )["operations"]
+    assert [item["provider_operation_uuid"] for item in leased] == [
+        str(provider_operation_uuid)
+    ]
+    echo_uuid = sys_uuid.uuid4()
+    echo_account_uuid = account_uuid
+    echo_canonical_uuid = None
+    echo_placement_uuid = None
+    retained_placement_uuid = None
+    native_reaction_uuid = None
+    echo_reaction_uuid = None
+    native_read_at = datetime.datetime(2026, 8, 31, 12, 0, tzinfo=datetime.timezone.utc)
+    if echo_before_result:
+        echo_owner_uuid = sys_uuid.uuid4()
+        echo_account_uuid = sys_uuid.uuid4()
+        conftest.seed_workspace_user(db, echo_owner_uuid, f"user-{echo_owner_uuid}")
+        retained_stream_uuid = conftest.seed_user_stream(
+            db,
+            project_uuid,
+            owner_uuid,
+            "Provider result retained stream",
+        )
+        retained_topic_uuid = conftest.seed_stream_topic(
+            db,
+            project_uuid,
+            retained_stream_uuid,
+            owner_uuid,
+            "Provider result retained topic",
+            is_default=True,
+        )
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO m_external_accounts_v2 (
+                    uuid, owner_user_uuid, provider, settings,
+                    credential_present, status, live_ready,
+                    provider_realm_uuid, provider_owner_user_id,
+                    capabilities
+                ) VALUES (
+                    %s, %s, 'zulip', '{}'::jsonb, FALSE,
+                    'live', TRUE, %s, '2', %s::jsonb
+                )
+                """,
+                (
+                    echo_account_uuid,
+                    echo_owner_uuid,
+                    provider_realm_uuid,
+                    json.dumps(capabilities),
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO m_workspace_messages (
+                    uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                    payload, source_name, source, provider_uuid,
+                    external_account_uuid, provider_external_id,
+                    provider_metadata, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    '{"kind":"markdown","content":"outbound once"}'::jsonb,
+                    'zulip', %s::jsonb, %s, %s, '14019', %s::jsonb,
+                    NOW(), NOW()
+                )
+                """,
+                (
+                    echo_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    topic_uuid,
+                    owner_uuid,
+                    json.dumps({"kind": "zulip", "message_id": "14019"}),
+                    bridge_uuid,
+                    echo_account_uuid,
+                    json.dumps(
+                        {
+                            "kind": "zulip",
+                            "account_uuid": str(echo_account_uuid),
+                            "external_id": "14019",
+                            "provider_realm_uuid": str(provider_realm_uuid),
+                            "capabilities": {},
+                        }
+                    ),
+                ),
+            )
+            cursor.execute(
+                """
+                SELECT placement.message_uuid, placement.uuid
+                FROM messenger_message_placements AS placement
+                WHERE placement.project_id = %s
+                  AND placement.legacy_public_uuid = %s
+                """,
+                (project_uuid, echo_uuid),
+            )
+            echo_canonical_uuid, echo_placement_uuid = cursor.fetchone()
+            retained_placement_uuid = sys_uuid.uuid4()
+            cursor.execute(
+                """
+                INSERT INTO messenger_message_placements (
+                    uuid, project_id, message_uuid, stream_uuid, topic_uuid
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    retained_placement_uuid,
+                    project_uuid,
+                    echo_canonical_uuid,
+                    retained_stream_uuid,
+                    retained_topic_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO messenger_user_message_bindings (
+                    uuid, project_id, placement_uuid, user_uuid,
+                    membership_generation, relation_role, visibility,
+                    permissions, created_at, updated_at
+                )
+                SELECT gen_random_uuid(), source.project_id, %s,
+                       source.user_uuid, membership.membership_generation,
+                       source.relation_role, source.visibility,
+                       source.permissions, source.created_at, source.updated_at
+                FROM messenger_user_message_bindings AS source
+                JOIN messenger_stream_bindings AS membership
+                  ON membership.project_id = source.project_id
+                 AND membership.stream_uuid = %s
+                 AND membership.user_uuid = source.user_uuid
+                 AND membership.active
+                WHERE source.project_id = %s
+                  AND source.placement_uuid = %s
+                """,
+                (
+                    retained_placement_uuid,
+                    retained_stream_uuid,
+                    project_uuid,
+                    echo_placement_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO messenger_user_message_states (
+                    uuid, project_id, placement_uuid, user_uuid,
+                    membership_generation, read_at, mentioned, starred,
+                    pinned, created_at, updated_at
+                )
+                SELECT gen_random_uuid(), source.project_id, %s,
+                       source.user_uuid, membership.membership_generation,
+                       source.read_at, source.mentioned, source.starred,
+                       source.pinned, source.created_at, source.updated_at
+                FROM messenger_user_message_states AS source
+                JOIN messenger_stream_bindings AS membership
+                  ON membership.project_id = source.project_id
+                 AND membership.stream_uuid = %s
+                 AND membership.user_uuid = source.user_uuid
+                 AND membership.active
+                WHERE source.project_id = %s
+                  AND source.placement_uuid = %s
+                """,
+                (
+                    retained_placement_uuid,
+                    retained_stream_uuid,
+                    project_uuid,
+                    echo_placement_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE messenger_user_message_states
+                SET read_at = NULL, updated_at = NOW()
+                WHERE project_id = %s AND user_uuid = %s
+                  AND placement_uuid = %s
+                """,
+                (project_uuid, owner_uuid, echo_placement_uuid),
+            )
+            cursor.execute(
+                """
+                UPDATE messenger_user_message_states
+                SET read_at = %s, updated_at = %s
+                WHERE project_id = %s AND user_uuid = %s
+                  AND placement_uuid = (
+                      SELECT uuid
+                      FROM messenger_message_placements
+                      WHERE project_id = %s AND legacy_public_uuid = %s
+                  )
+                """,
+                (
+                    native_read_at,
+                    native_read_at,
+                    project_uuid,
+                    owner_uuid,
+                    project_uuid,
+                    native_uuid,
+                ),
+            )
+        db.commit()
+        native_reaction_uuid = sys_uuid.uuid4()
+        echo_reaction_uuid = sys_uuid.uuid4()
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO messenger_message_reaction_facts (
+                    uuid, project_id, canonical_message_uuid, placement_uuid,
+                    user_uuid, emoji_name
+                )
+                SELECT %s, placement.project_id, placement.message_uuid,
+                       placement.uuid, %s, 'thumbs_up'
+                FROM messenger_message_placements AS placement
+                WHERE placement.project_id = %s
+                  AND placement.legacy_public_uuid = %s
+                """,
+                (
+                    native_reaction_uuid,
+                    owner_uuid,
+                    project_uuid,
+                    native_uuid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO messenger_message_reaction_facts (
+                    uuid, project_id, canonical_message_uuid, placement_uuid,
+                    user_uuid, emoji_name
+                ) VALUES (%s, %s, %s, %s, %s, 'thumbs_up')
+                """,
+                (
+                    echo_reaction_uuid,
+                    project_uuid,
+                    echo_canonical_uuid,
+                    echo_placement_uuid,
+                    owner_uuid,
+                ),
+            )
+        db.commit()
+        reaction_operation_uuid = sys_uuid.uuid4()
+        _run_database_operation(
+            lambda session: provider_data.enqueue_provider_operation_in_lane(
+                session,
+                operation_uuid=reaction_operation_uuid,
+                bridge_instance_uuid=bridge_uuid,
+                external_account_uuid=account_uuid,
+                project_id=project_uuid,
+                owner_user_uuid=owner_uuid,
+                operation_kind="reaction.create",
+                target_type="reaction",
+                target_uuid=native_reaction_uuid,
+                payload={
+                    "message_uuid": str(native_uuid),
+                    "emoji_name": "thumbs_up",
+                    "user_uuid": str(owner_uuid),
+                },
+                causal_lane=stream_uuid,
+            )
+        )
+    assert (
+        _run_database_operation(
+            lambda session: provider_data.report_provider_result(
+                session,
+                identity,
+                {
+                    "result_uuid": str(sys_uuid.uuid4()),
+                    "provider_operation_uuid": str(provider_operation_uuid),
+                    "lease_uuid": leased[0]["lease_uuid"],
+                    "status": "succeeded",
+                    "provider_entity_id": "14019",
+                },
+            )
+        )["status"]
+        == "applied"
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT external_account_uuid, provider_external_id,
+                   provider_metadata->>'provider_realm_uuid'
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, native_uuid),
+        )
+        assert cursor.fetchone() == (
+            account_uuid,
+            "14019",
+            str(provider_realm_uuid),
+        )
+        cursor.execute(
+            """
+            SELECT uuid, user_uuid
+            FROM m_workspace_messages
+            WHERE project_id = %s AND stream_uuid = %s AND topic_uuid = %s
+              AND payload->>'content' = 'outbound once'
+            ORDER BY uuid
+            """,
+            (project_uuid, stream_uuid, topic_uuid),
+        )
+        assert cursor.fetchall() == [(native_uuid, owner_uuid)]
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM messenger_messages
+            WHERE provider_realm_uuid = %s AND provider_message_id = '14019'
+            """,
+            (provider_realm_uuid,),
+        )
+        assert cursor.fetchone() == (1,)
+        cursor.execute(
+            """
+            SELECT provider_realm_uuid, provider_message_id
+            FROM messenger_messages
+            WHERE project_id = %s
+              AND uuid = (
+                  SELECT message_uuid
+                  FROM messenger_message_placements
+                  WHERE project_id = %s AND legacy_public_uuid = %s
+              )
+            """,
+            (project_uuid, project_uuid, native_uuid),
+        )
+        assert cursor.fetchone() == (provider_realm_uuid, "14019")
+        if echo_before_result:
+            cursor.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1 FROM messenger_messages
+                        WHERE project_id = %s AND uuid = %s
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM messenger_message_placements
+                        WHERE project_id = %s AND uuid = %s
+                    )
+                """,
+                (
+                    project_uuid,
+                    echo_canonical_uuid,
+                    project_uuid,
+                    echo_placement_uuid,
+                ),
+            )
+            assert cursor.fetchone() == (False, False)
+            cursor.execute(
+                """
+                SELECT read_at
+                FROM messenger_user_message_states
+                WHERE project_id = %s AND user_uuid = %s
+                  AND placement_uuid = (
+                      SELECT uuid
+                      FROM messenger_message_placements
+                      WHERE project_id = %s AND legacy_public_uuid = %s
+                  )
+                """,
+                (project_uuid, owner_uuid, project_uuid, native_uuid),
+            )
+            assert cursor.fetchone() == (native_read_at,)
+            cursor.execute(
+                """
+                SELECT retained.message_uuid = native.message_uuid
+                FROM messenger_message_placements AS retained
+                JOIN messenger_message_placements AS native
+                  ON native.project_id = retained.project_id
+                 AND native.legacy_public_uuid = %s
+                WHERE retained.project_id = %s AND retained.uuid = %s
+                """,
+                (native_uuid, project_uuid, retained_placement_uuid),
+            )
+            assert cursor.fetchone() == (True,)
+            cursor.execute(
+                """
+                SELECT reaction.uuid,
+                       reaction.canonical_message_uuid = native.message_uuid
+                FROM messenger_message_reaction_facts AS reaction
+                JOIN messenger_message_placements AS native
+                  ON native.project_id = reaction.project_id
+                 AND native.legacy_public_uuid = %s
+                WHERE reaction.project_id = %s
+                  AND reaction.uuid = ANY(%s::uuid[])
+                ORDER BY reaction.uuid
+                """,
+                (
+                    native_uuid,
+                    project_uuid,
+                    [native_reaction_uuid, echo_reaction_uuid],
+                ),
+            )
+            assert cursor.fetchall() == [(native_reaction_uuid, True)]
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM m_external_operations_v2
+                WHERE target_uuid = %s AND action = 'reaction.create'
+                """,
+                (native_reaction_uuid,),
+            )
+            assert cursor.fetchone() == (1,)
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM messenger_domain_outbox_events
+                WHERE project_id = %s
+                  AND event_kind = 'delivery_snapshot_event'
+                  AND payload->>'source_kind' = 'message.updated'
+                  AND payload->>'placement_uuid' = %s
+                """,
+                (project_uuid, str(retained_placement_uuid)),
+            )
+            assert cursor.fetchone() == (1,)
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM messenger_domain_outbox_events
+                WHERE project_id = %s AND event_kind = 'delivery_snapshot_event'
+                  AND payload->>'source_kind' = 'message.deleted'
+                  AND payload#>>'{placement,stream_uuid}' = %s
+                """,
+                (project_uuid, str(stream_uuid)),
+            )
+            assert cursor.fetchone() == (1,)
+    with ra_contexts.Context().session_manager() as session:
+        assert (
+            provider_v2._message_uuid(
+                session,
+                {
+                    "provider_realm_uuid": provider_realm_uuid,
+                    "account_uuid": sys_uuid.uuid4(),
+                },
+                "14019",
+            )
+            == native_uuid
+        )
+
+
 def test_provider_read_replay_freezes_identity_across_revision_transitions(api, db):
     conftest.seed_workspace_user(db, api.user_uuid, f"user-{api.user_uuid}")
     bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
@@ -19441,7 +20163,26 @@ def test_projection_move_rebinds_failed_provider_read_snapshot_retry(
     db.commit()
 
 
-def test_provider_read_page_precedes_a_later_snapshot_in_the_same_lane(api, db):
+@pytest.mark.parametrize(
+    (
+        "first_result_status",
+        "first_safe_error",
+        "expected_public_status",
+        "expected_page_status",
+    ),
+    [
+        ("succeeded", None, "succeeded", "succeeded"),
+        ("failed", "cancelled", "discarded", "discarded"),
+    ],
+)
+def test_provider_read_page_precedes_a_later_snapshot_in_the_same_lane(
+    api,
+    db,
+    first_result_status,
+    first_safe_error,
+    expected_public_status,
+    expected_page_status,
+):
     stream_uuid = conftest.seed_user_stream(
         db, api.project_id, api.user_uuid, "Interleaved provider reads"
     )
@@ -19553,7 +20294,7 @@ def test_provider_read_page_precedes_a_later_snapshot_in_the_same_lane(api, db):
             )
         )["operations"]
 
-    def report(operation):
+    def report(operation, status="succeeded", safe_error=None):
         return _run_database_operation(
             lambda session: provider_data.report_provider_result(
                 session,
@@ -19562,8 +20303,8 @@ def test_provider_read_page_precedes_a_later_snapshot_in_the_same_lane(api, db):
                     "result_uuid": str(sys_uuid.uuid4()),
                     "provider_operation_uuid": operation["provider_operation_uuid"],
                     "lease_uuid": operation["lease_uuid"],
-                    "status": "succeeded",
-                    "safe_error": None,
+                    "status": status,
+                    "safe_error": safe_error,
                 },
             )
         )
@@ -19571,7 +20312,30 @@ def test_provider_read_page_precedes_a_later_snapshot_in_the_same_lane(api, db):
     first_page = lease_one()
     assert len(first_page) == 1
     assert first_page[0]["payload"]["message_uuids"] == [str(message_uuids[0])]
-    assert report(first_page[0])["status"] == "applied"
+    assert report(first_page[0], first_result_status, first_safe_error)["status"] == (
+        "applied"
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT public.status, page.status,
+                   EXISTS (
+                       SELECT 1
+                       FROM m_external_provider_read_snapshots_v1 AS snapshot
+                       WHERE snapshot.external_operation_uuid = public.uuid
+                   )
+            FROM m_external_operations_v2 AS public
+            JOIN m_external_provider_operations_v1 AS page
+              ON page.external_operation_uuid = public.uuid
+            WHERE public.uuid = %s
+            """,
+            (snapshot_uuids[0],),
+        )
+        assert cursor.fetchone() == (
+            expected_public_status,
+            expected_page_status,
+            False,
+        )
 
     second_page = lease_one()
     assert len(second_page) == 1
@@ -19947,6 +20711,108 @@ def test_provider_read_snapshot_fifo_is_scoped_to_stream_lane(api, db, monkeypat
         == rolling_page["provider_operation_uuid"]
     )
     assert report(resumed_page[0])["status"] == "applied"
+
+
+def test_provider_read_page_excludes_messages_not_delivered_to_target_account(api, db):
+    stream_uuid = conftest.seed_user_stream(
+        db, api.project_id, api.user_uuid, "Provider delivery page"
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "general",
+        is_default=True,
+    )
+    message_uuids = []
+    for content in ("delivered", "not delivered"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+
+    bridge_uuid, _key_uuid, _private_key = _seed_zulip_bridge_target(db)
+    account_uuid = sys_uuid.uuid4()
+    provider_realm_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready,
+                provider_realm_uuid, provider_owner_user_id
+            ) VALUES (
+                %s, %s, 'zulip', '{}'::jsonb,
+                FALSE, 'live', TRUE, %s, '1'
+            )
+            """,
+            (account_uuid, api.user_uuid, provider_realm_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages AS legacy
+            SET source_name = 'zulip', external_account_uuid = %s,
+                provider_external_id = CASE placement.message_uuid
+                    WHEN %s THEN '9002' ELSE '1001' END
+            FROM messenger_message_placements AS placement
+            WHERE placement.project_id = %s
+              AND placement.message_uuid = ANY(%s::uuid[])
+              AND legacy.project_id = placement.project_id
+              AND legacy.uuid = COALESCE(
+                    placement.legacy_public_uuid, placement.uuid
+              )
+            RETURNING placement.message_uuid, placement.uuid, legacy.uuid
+            """,
+            (
+                account_uuid,
+                message_uuids[0],
+                api.project_id,
+                message_uuids,
+            ),
+        )
+        message_bindings = {
+            message_uuid: (placement_uuid, legacy_uuid)
+            for message_uuid, placement_uuid, legacy_uuid in cursor.fetchall()
+        }
+        placement_uuids = [
+            message_bindings[message_uuid][0] for message_uuid in message_uuids
+        ]
+        cursor.execute(
+            """
+            INSERT INTO m_external_provider_events_v1 (
+                bridge_instance_uuid, provider_event_uuid,
+                external_account_uuid, project_id, event_kind,
+                payload_sha256, status, target_uuid
+            ) VALUES (%s, %s, %s, %s, 'message.upsert', %s, 'applied', %s)
+            """,
+            (
+                bridge_uuid,
+                sys_uuid.uuid4(),
+                account_uuid,
+                api.project_id,
+                "0" * 64,
+                message_bindings[message_uuids[0]][1],
+            ),
+        )
+    db.commit()
+
+    bindings = _run_database_operation(
+        lambda session: provider_data._delivered_provider_read_page_bindings(
+            session,
+            external_account_uuid=account_uuid,
+            project_id=sys_uuid.UUID(str(api.project_id)),
+            message_uuids=placement_uuids,
+        )
+    )
+
+    assert bindings == [(placement_uuids[0], "9002")]
 
 
 def test_compact_bulk_and_single_read_race_keeps_exact_topic_counter(api, db):
@@ -20633,7 +21499,7 @@ def test_compact_account_message_purge_preserves_other_read_bits(api, db):
     "mode",
     [read_state.PROJECT_MODE_COMPACT, read_state.PROJECT_MODE_ROLLBACK],
 )
-def test_compact_provider_read_state_uses_bitmaps_and_keeps_own_message_read(
+def test_compact_provider_read_state_uses_bitmaps_and_preserves_own_unread(
     api, db, mode
 ):
     reader_uuid = sys_uuid.uuid4()
@@ -20663,6 +21529,58 @@ def test_compact_provider_read_state_uses_bitmaps_and_keeps_own_message_read(
         assert response.status_code == 201, response.text
         message_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
 
+    def canonical_states(user_uuid):
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT placement.legacy_public_uuid,
+                       state.read_at IS NOT NULL
+                FROM messenger_message_placements AS placement
+                JOIN messenger_stream_bindings AS stream_binding
+                  ON stream_binding.project_id = placement.project_id
+                 AND stream_binding.stream_uuid = placement.stream_uuid
+                 AND stream_binding.user_uuid = %s
+                 AND stream_binding.active
+                JOIN messenger_user_message_bindings AS binding
+                  ON binding.project_id = placement.project_id
+                 AND binding.placement_uuid = placement.uuid
+                 AND binding.user_uuid = stream_binding.user_uuid
+                 AND binding.membership_generation =
+                     stream_binding.membership_generation
+                JOIN messenger_user_message_states AS state
+                  ON state.project_id = placement.project_id
+                 AND state.placement_uuid = placement.uuid
+                 AND state.user_uuid = binding.user_uuid
+                 AND state.membership_generation =
+                     binding.membership_generation
+                WHERE placement.project_id = %s
+                  AND placement.legacy_public_uuid = ANY(%s::uuid[])
+                ORDER BY placement.legacy_public_uuid
+                """,
+                (user_uuid, api.project_id, message_uuids),
+            )
+            return {str(row[0]): row[1] for row in cursor.fetchall()}
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_user_message_bindings
+            SET membership_generation = 0
+            WHERE project_id = %s AND user_uuid = %s
+              AND placement_uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, reader_uuid, message_uuids),
+        )
+        cursor.execute(
+            """
+            UPDATE messenger_user_message_states
+            SET membership_generation = 0
+            WHERE project_id = %s AND user_uuid = %s
+              AND placement_uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, reader_uuid, message_uuids),
+        )
+
     _run_database_operation(
         lambda session: provider_event_apply._sync_provider_read_state(
             session,
@@ -20677,6 +21595,9 @@ def test_compact_provider_read_state_uses_bitmaps_and_keeps_own_message_read(
     assert _workspace_message_read_states(
         db, api.project_id, reader_uuid, message_uuids
     ) == {str(message_uuid): True for message_uuid in message_uuids}
+    assert canonical_states(reader_uuid) == {
+        str(message_uuid): True for message_uuid in message_uuids
+    }
     _run_database_operation(
         lambda session: provider_event_apply._sync_provider_read_state(
             session,
@@ -20691,6 +21612,9 @@ def test_compact_provider_read_state_uses_bitmaps_and_keeps_own_message_read(
     assert _workspace_message_read_states(
         db, api.project_id, reader_uuid, message_uuids
     ) == {str(message_uuid): False for message_uuid in message_uuids}
+    assert canonical_states(reader_uuid) == {
+        str(message_uuid): False for message_uuid in message_uuids
+    }
     _run_database_operation(
         lambda session: provider_event_apply._sync_provider_read_state(
             session,
@@ -20704,7 +21628,10 @@ def test_compact_provider_read_state_uses_bitmaps_and_keeps_own_message_read(
     )
     assert _workspace_message_read_states(
         db, api.project_id, api.user_uuid, message_uuids
-    ) == {str(message_uuid): True for message_uuid in message_uuids}
+    ) == {str(message_uuid): False for message_uuid in message_uuids}
+    assert canonical_states(api.user_uuid) == {
+        str(message_uuid): False for message_uuid in message_uuids
+    }
     with db.cursor() as cursor:
         cursor.execute(
             """

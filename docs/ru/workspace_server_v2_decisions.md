@@ -376,6 +376,36 @@ native stream, topic и folder snapshots.
 выполняются раньше массового импорта, а обычное объединение snapshots по-прежнему
 ограничивает нагрузку на базу.
 
+Те же read-actions в canonical transaction обновляют rolling compact
+compatibility state. Миграция `0166` для всех пользователей исправляет
+все существующие пары canonical-read/compact-unread, пересчитывает затронутую
+topic read-статистику и увеличивает пользовательскую read revision. Исправление
+монотонно: canonical unread rows, включая unread из provider snapshot, оно не
+меняет.
+
+Затем миграция `0167` для всех активных пользователей пересчитывает каждый
+compact или rollback topic read aggregate из сохранённого bitmap. Это также
+исправляет aggregate, который оставался устаревшим, хотя все побитовые значения
+сообщений уже совпадали с canonical `read_at`, поэтому счётчики stream, topic и
+folder используют одно и то же состояние чтения.
+
+Миграция `0168` пересчитывает общие compact-счётчики сообщений topic и последние
+ingest-координаты из сохранённых строк сообщений. Она закрывает оставшийся
+случай, когда пользовательские read counts уже точны, но устаревшее общее число
+сообщений topic всё ещё сдвигает compatibility-счётчики stream, topic и folder.
+
+Миграция `0169` повторно нормализует provider private chats и использует
+provider `display_name` каждого участника как источник названий personal и group
+чатов для конкретного пользователя. Workspace identity применяется только как
+fallback, если provider не передал имя. Старое название, совпадающее с прежней
+проекцией Workspace identities, распознаётся как provider-managed, а явное
+локальное переименование group чата сохраняется.
+
+Миграция `0170` также считает владельца выбранного provider-чата допустимым
+viewer, когда каталог personal chat содержит только собеседника. Поэтому
+provider-имя собеседника остаётся источником названия для каждого связанного
+аккаунта, даже если provider не повторяет владельца в списке участников.
+
 ## Порядок provider read pages
 
 Лениво материализованная provider read page использует позицию исходного
@@ -384,6 +414,36 @@ snapshot для упорядочивания внутри одной линии.
 блокирует старую page. Более ранние snapshots по-прежнему останавливают поздние
 записи в той же stream lane, а другие lanes остаются независимыми. Ограничения
 размера materialization и lease batch не меняются.
+
+## Восстановление provider ingress
+
+Команды приватного Provider API допускают безопасное повторение: их request,
+event, lease и result идентификаторы сохраняются между попытками. После
+PostgreSQL deadlock сервер целиком повторяет транзакцию запроса с короткой
+ограниченной экспоненциальной задержкой; прочие control и file запросы не
+повторяются. После исчерпания попыток возвращается повторяемый `503` без деталей
+базы. При provider deletion восстановление summary пропускает journal boundaries,
+сообщения которых уже отсутствуют, чтобы устаревший производный summary не
+отклонял весь входящий batch.
+Projection work, поставленная до provider deletion, считает удалённое canonical
+message отсутствующим. Поэтому устаревшие fanout и mention tasks завершаются как
+no-op, а не попадают в dead-letter queue.
+
+## Паритет read-state владельца provider-аккаунта
+
+У provider message, общего для нескольких аккаунтов одного realm, есть одна
+canonical placement, но отдельные binding и state для владельца каждого
+выбранного аккаунта. Compact import материализует эти строки одним ограниченным
+SQL batch и в одной транзакции обновляет compact bitmap и canonical `read_at`.
+Snapshot-only backfill по-прежнему не публикует отдельные message events, но
+авторитетные пересчёты stream и topic counters выполняются.
+
+Миграция `0162` использует журнал применённых provider events и восстанавливает
+только те пары message/account, которые действительно были доставлены. Значение
+прочитанности берётся из compact bitmap (или legacy flag вне compact mode),
+после чего пересчитываются затронутые stream, topic и folder counters и до
+commit проверяется паритет. Native messages и невыбранная provider history не
+расширяются.
 
 ## Совместимость и границы первой реализации
 

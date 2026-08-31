@@ -371,6 +371,35 @@ counter rebuild even when the canonical rows are already read. This makes an
 idempotent retry repair a stale snapshot. Their projection tasks run ahead of
 bulk import work, while normal snapshot coalescing still bounds database load.
 
+The same read actions update the rolling compact compatibility state
+in the canonical transaction. Migration `0166` repairs every existing
+canonical-read/compact-unread row for all users, refreshes affected topic read
+statistics, and advances the per-user read revision. The repair is monotonic:
+it never changes a canonical unread row, including an unread state received
+from a provider snapshot.
+
+Migration `0167` then reconciles every compact or rollback topic read aggregate
+from the persisted bitmap for all active users. This also repairs an aggregate
+that stayed stale while every per-message bitmap bit and canonical `read_at`
+already agreed, so stream, topic, and folder counters use the same read truth.
+
+Migration `0168` reconciles the shared compact topic message totals and latest
+ingest coordinates from the persisted message rows. It closes the remaining
+case where every user's read count was exact but a stale topic message total
+still shifted the compatibility stream, topic, and folder unread counters.
+
+Migration `0169` reapplies provider private-chat normalization and makes each
+provider participant `display_name` authoritative for per-viewer personal and
+group chat labels. Workspace identities are only a fallback when the provider
+omits a name. A legacy label that matches the former Workspace-identity
+projection is recognized as provider-managed, while an explicit local
+group-chat rename remains unchanged.
+
+Migration `0170` also treats the selected provider-chat owner as a valid
+viewer when a personal-chat catalog row lists only the peer participant. This
+keeps the provider peer label authoritative for every linked account, without
+requiring the provider to repeat the owner in the participant list.
+
 ## Provider read-page ordering
 
 A lazily materialized provider read page keeps the queue position of its source
@@ -378,6 +407,34 @@ snapshot for same-lane ordering. A newer snapshot may be persisted before that
 page receives a physical operation sequence, but it cannot block the older page.
 Earlier snapshots still fence later writes in the same stream lane, and other
 lanes remain independent. Materialization and lease batch limits are unchanged.
+
+## Provider ingress recovery
+
+Private Provider API commands are replay-safe: their request, event, lease, and
+result identifiers remain stable across attempts. The server retries a complete
+request transaction after a PostgreSQL deadlock with short bounded exponential
+backoff; it never retries unrelated control or file requests. Exhaustion returns
+a retryable `503` without database details. When a provider deletion restores a
+topic summary, journal boundaries whose messages no longer exist are skipped.
+This keeps a stale derived summary from rejecting the whole inbound batch.
+Projection work that was queued before a provider deletion treats the deleted
+canonical message as absent, so stale fanout or mention work completes as a
+no-op instead of entering the dead-letter queue.
+
+## Provider owner read-state parity
+
+A provider message shared by several accounts in the same realm has one
+canonical placement, but each selected account owner has an independent
+binding and state. Compact imports materialize those rows in one bounded SQL
+batch and update the compact bitmap and canonical `read_at` in the same
+transaction. Snapshot-only backfill still suppresses public per-message events;
+authoritative stream and topic counter projections remain enabled.
+
+Migration `0162` uses the durable applied provider-event ledger to restore only
+message/account pairs that were actually delivered. It copies the effective
+read value from the compact bitmap (or legacy flag outside compact mode),
+rebuilds affected stream, topic and folder counters, and verifies parity before
+commit. Native messages and unselected provider history are not expanded.
 
 ## Compatibility and boundaries of first implementation
 

@@ -34,6 +34,28 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
+        engine.rollback_migration("0173-accelerate-Messenger-v2-projections-8cda92.py")
+        engine.rollback_migration("0172-retry-expired-provider-read-pages-05d036.py")
+        engine.rollback_migration(
+            "0171-discard-cancelled-provider-read-snapshots-87ed2e.py"
+        )
+        engine.rollback_migration("0170-accept-provider-chat-owner-labels-90d43c.py")
+        engine.rollback_migration("0169-prefer-provider-chat-labels-485d62.py")
+        engine.rollback_migration(
+            "0168-reconcile-compact-topic-message-stats-7b45ba.py"
+        )
+        engine.rollback_migration("0167-reconcile-compact-topic-read-stats-303da9.py")
+        engine.rollback_migration("0166-repair-v2-compatibility-read-state-95c09d.py")
+        engine.rollback_migration(
+            "0165-repair-provider-participant-message-state-73514c.py"
+        )
+        engine.rollback_migration(
+            "0164-stabilize-provider-private-chat-labels-f8bd03.py"
+        )
+        engine.rollback_migration(
+            "0163-repair-duplicate-provider-projections-867945.py"
+        )
+        engine.rollback_migration("0162-repair-provider-owner-read-state-785e06.py")
         engine.rollback_migration(
             "0161-Unblock-interleaved-provider-read-pages-d06433.py"
         )
@@ -245,6 +267,60 @@ PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_UUID = "d0643389-d3dd-410a-a57c-5c1fab7691d
 PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_FILE = (
     "0161-Unblock-interleaved-provider-read-pages-d06433.py"
 )
+PROVIDER_OWNER_READ_REPAIR_MIGRATION_UUID = "785e0630-5d35-4324-bd53-4a03ce63c08c"
+PROVIDER_OWNER_READ_REPAIR_MIGRATION_FILE = (
+    "0162-repair-provider-owner-read-state-785e06.py"
+)
+DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION_UUID = (
+    "86794513-1402-47ed-b2a5-3f3e9aa05577"
+)
+DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION_FILE = (
+    "0163-repair-duplicate-provider-projections-867945.py"
+)
+PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION_UUID = "f8bd035a-0e32-46ee-aa57-7f9ff1599640"
+PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION_FILE = (
+    "0164-stabilize-provider-private-chat-labels-f8bd03.py"
+)
+PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION_UUID = (
+    "73514c7e-4cd6-496a-be60-1896107e7087"
+)
+PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION_FILE = (
+    "0165-repair-provider-participant-message-state-73514c.py"
+)
+V2_COMPATIBILITY_READ_REPAIR_MIGRATION_UUID = "95c09d2a-38f1-46ed-9115-cbe860d63fd6"
+V2_COMPATIBILITY_READ_REPAIR_MIGRATION_FILE = (
+    "0166-repair-v2-compatibility-read-state-95c09d.py"
+)
+COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION_UUID = "303da967-7711-4781-9d38-8aefef13c82d"
+COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION_FILE = (
+    "0167-reconcile-compact-topic-read-stats-303da9.py"
+)
+COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION_UUID = (
+    "7b45baf3-8dc5-4fb2-b8bf-d73985af14c6"
+)
+COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION_FILE = (
+    "0168-reconcile-compact-topic-message-stats-7b45ba.py"
+)
+PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION_UUID = "485d6246-c577-4564-83d7-da856015b8d2"
+PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION_FILE = (
+    "0169-prefer-provider-chat-labels-485d62.py"
+)
+PROVIDER_CHAT_OWNER_LABEL_MIGRATION_UUID = "90d43c8c-5d0f-4c84-99f3-9cda3f1f504a"
+PROVIDER_CHAT_OWNER_LABEL_MIGRATION_FILE = (
+    "0170-accept-provider-chat-owner-labels-90d43c.py"
+)
+CANCELLED_PROVIDER_READ_MIGRATION_UUID = "87ed2ec4-bcb3-4c5a-8ca4-904c3a998014"
+CANCELLED_PROVIDER_READ_MIGRATION_FILE = (
+    "0171-discard-cancelled-provider-read-snapshots-87ed2e.py"
+)
+EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID = "05d036bd-5dd8-49e1-8e37-f8b3b93939c6"
+EXPIRED_PROVIDER_READ_RETRY_MIGRATION_FILE = (
+    "0172-retry-expired-provider-read-pages-05d036.py"
+)
+PROJECTION_ACCELERATION_MIGRATION_UUID = "8cda92b7-3a84-47f5-939b-11222441b0ff"
+PROJECTION_ACCELERATION_MIGRATION_FILE = (
+    "0173-accelerate-Messenger-v2-projections-8cda92.py"
+)
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -339,12 +415,48 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_FILE]._depends == [
         INTERACTIVE_READ_INDEX_MIGRATION_FILE,
     ]
+    assert migrations[PROVIDER_OWNER_READ_REPAIR_MIGRATION_FILE]._depends == [
+        PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_FILE,
+    ]
+    assert migrations[DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION_FILE]._depends == [
+        PROVIDER_OWNER_READ_REPAIR_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION_FILE]._depends == [
+        DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION_FILE,
+    ]
+    assert migrations[PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION_FILE]._depends == [
+        PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION_FILE
+    ]
+    assert migrations[V2_COMPATIBILITY_READ_REPAIR_MIGRATION_FILE]._depends == [
+        PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION_FILE
+    ]
+    assert migrations[COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION_FILE]._depends == [
+        V2_COMPATIBILITY_READ_REPAIR_MIGRATION_FILE
+    ]
+    assert migrations[COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION_FILE]._depends == [
+        COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION_FILE]._depends == [
+        COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_CHAT_OWNER_LABEL_MIGRATION_FILE]._depends == [
+        PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION_FILE
+    ]
+    assert migrations[CANCELLED_PROVIDER_READ_MIGRATION_FILE]._depends == [
+        PROVIDER_CHAT_OWNER_LABEL_MIGRATION_FILE
+    ]
+    assert migrations[EXPIRED_PROVIDER_READ_RETRY_MIGRATION_FILE]._depends == [
+        CANCELLED_PROVIDER_READ_MIGRATION_FILE
+    ]
+    assert migrations[PROJECTION_ACCELERATION_MIGRATION_FILE]._depends == [
+        EXPIRED_PROVIDER_READ_RETRY_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_FILE
+    assert engine.get_latest_migration() == PROJECTION_ACCELERATION_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -399,6 +511,18 @@ def test_current_migrations_have_a_single_head(_database, db):
                     PROJECTION_CLAIM_INDEX_MIGRATION_UUID,
                     INTERACTIVE_READ_INDEX_MIGRATION_UUID,
                     PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_UUID,
+                    PROVIDER_OWNER_READ_REPAIR_MIGRATION_UUID,
+                    DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION_UUID,
+                    PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION_UUID,
+                    PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION_UUID,
+                    V2_COMPATIBILITY_READ_REPAIR_MIGRATION_UUID,
+                    COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION_UUID,
+                    COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION_UUID,
+                    PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION_UUID,
+                    PROVIDER_CHAT_OWNER_LABEL_MIGRATION_UUID,
+                    CANCELLED_PROVIDER_READ_MIGRATION_UUID,
+                    EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID,
+                    PROJECTION_ACCELERATION_MIGRATION_UUID,
                 ],
             ),
         )
@@ -452,6 +576,18 @@ def test_current_migrations_have_a_single_head(_database, db):
             (PROJECTION_CLAIM_INDEX_MIGRATION_UUID, True),
             (INTERACTIVE_READ_INDEX_MIGRATION_UUID, True),
             (PROVIDER_READ_PAGE_UNBLOCK_MIGRATION_UUID, True),
+            (PROVIDER_OWNER_READ_REPAIR_MIGRATION_UUID, True),
+            (DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION_UUID, True),
+            (PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION_UUID, True),
+            (PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION_UUID, True),
+            (V2_COMPATIBILITY_READ_REPAIR_MIGRATION_UUID, True),
+            (COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION_UUID, True),
+            (COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION_UUID, True),
+            (PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION_UUID, True),
+            (PROVIDER_CHAT_OWNER_LABEL_MIGRATION_UUID, True),
+            (CANCELLED_PROVIDER_READ_MIGRATION_UUID, True),
+            (EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID, True),
+            (PROJECTION_ACCELERATION_MIGRATION_UUID, True),
         }
         cur.execute(
             """
@@ -484,6 +620,86 @@ def test_current_migrations_have_a_single_head(_database, db):
         assert "(created_at, uuid)" in index_definition
         assert "read_counters" in index_definition
         assert "topic.read" in index_definition
+        cur.execute(
+            """
+            SELECT indexrelid::regclass::text, indisvalid, indisready,
+                   pg_get_indexdef(indexrelid)
+            FROM pg_index
+            WHERE indexrelid IN (
+                'messenger_domain_outbox_events_kind_created_idx'::regclass,
+                'messenger_projection_tasks_background_created_idx'::regclass,
+                'messenger_projection_tasks_fair_claim_idx'::regclass,
+                'messenger_message_reaction_facts_snapshot_idx'::regclass
+            )
+            ORDER BY indexrelid::regclass::text
+            """
+        )
+        acceleration_indexes = cur.fetchall()
+        assert len(acceleration_indexes) == 4
+        assert all(
+            valid and ready for _name, valid, ready, _definition in acceleration_indexes
+        )
+        definitions = {
+            name: definition
+            for name, _valid, _ready, definition in acceleration_indexes
+        }
+        assert (
+            "(event_kind, created_at, uuid)"
+            in definitions["messenger_domain_outbox_events_kind_created_idx"]
+        )
+        assert (
+            "(task_kind, created_at, ordering_created_at, outbox_event_uuid)"
+            in definitions["messenger_projection_tasks_fair_claim_idx"]
+        )
+        assert "status" in definitions["messenger_projection_tasks_fair_claim_idx"]
+        assert (
+            "(created_at, ordering_created_at, outbox_event_uuid)"
+            in definitions["messenger_projection_tasks_background_created_idx"]
+        )
+        assert (
+            "delivery_snapshot_event"
+            in definitions["messenger_projection_tasks_background_created_idx"]
+        )
+        assert (
+            "(project_id, canonical_message_uuid, emoji_name, created_at, uuid)"
+            in definitions["messenger_message_reaction_facts_snapshot_idx"]
+        )
+        assert (
+            "INCLUDE (user_uuid)"
+            in definitions["messenger_message_reaction_facts_snapshot_idx"]
+        )
+        cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_name = 'messenger_projection_tasks'
+              AND column_name = 'execution_stats'
+            """
+        )
+        data_type, is_nullable, column_default = cur.fetchone()
+        assert data_type == "jsonb"
+        assert is_nullable == "NO"
+        assert "'{}'::jsonb" in column_default
+        cur.execute(
+            """
+            SELECT pg_get_triggerdef(oid)
+            FROM pg_trigger
+            WHERE tgname = 'messenger_projection_task_stats_sync_v1'
+              AND NOT tgisinternal
+            """
+        )
+        trigger_definition = cur.fetchone()[0]
+        assert "BEFORE INSERT OR UPDATE OF payload" in trigger_definition
+        cur.execute(
+            """
+            SELECT pg_get_functiondef(
+                'messenger_v2_guard_rolling_broadcast_event()'::regprocedure
+            )
+            """
+        )
+        broadcast_guard = cur.fetchone()[0]
+        assert "FROM messenger_project_users AS project_user" in broadcast_guard
+        assert "ON CONFLICT (project_id, user_uuid) DO NOTHING" in broadcast_guard
         cur.execute(
             """
             SELECT pg_get_functiondef(
@@ -721,6 +937,347 @@ def test_current_migrations_have_a_single_head(_database, db):
             ("m_workspace_flags_project_message_user_idx", True),
             ("m_workspace_read_memberships_stream_user_idx", True),
         }
+
+
+def test_cancelled_provider_read_migration_unblocks_later_lane_state(_database, db):
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    cancelled_uuid = sys_uuid.uuid4()
+    retryable_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, f"user-{owner_uuid}")
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, FALSE, 'live', TRUE)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status, safe_error,
+                can_retry, can_discard, revision
+            ) VALUES (
+                %s, %s, %s, 'read_state.set', 'stream', 'failed',
+                %s, TRUE, TRUE, 4
+            )
+            """,
+            (
+                (cancelled_uuid, account_uuid, owner_uuid, "cancelled"),
+                (
+                    retryable_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "provider_unavailable",
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane,
+                payload, exhausted
+            ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb, TRUE)
+            """,
+            (
+                (
+                    cancelled_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                ),
+                (
+                    retryable_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                ),
+            ),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind,
+                causal_lane, payload, status, attempt, safe_error,
+                public_result_status, terminal_result, completed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set', %s,
+                '{"message_uuids":[]}'::jsonb, 'failed', 1, %s,
+                'failed', jsonb_build_object('status', 'failed'), NOW()
+            )
+            """,
+            (
+                (
+                    sys_uuid.uuid4(),
+                    cancelled_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    "cancelled",
+                ),
+                (
+                    sys_uuid.uuid4(),
+                    retryable_uuid,
+                    bridge_uuid,
+                    account_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    "provider_unavailable",
+                ),
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_candidate_packs_v1 (
+                external_operation_uuid, pack_number,
+                candidate_count, candidate_uuids
+            ) VALUES (%s, 0, 1, %s::uuid[])
+            """,
+            (cancelled_uuid, [sys_uuid.uuid4()]),
+        )
+    db.commit()
+
+    migration = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )._load_migrations()[CANCELLED_PROVIDER_READ_MIGRATION_FILE]
+    with ra_contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT uuid, status, safe_error, can_retry, can_discard, revision
+            FROM m_external_operations_v2
+            WHERE uuid = ANY(%s::uuid[])
+            ORDER BY uuid
+            """,
+            ([cancelled_uuid, retryable_uuid],),
+        )
+        rows = {row[0]: row[1:] for row in cur.fetchall()}
+        assert rows[cancelled_uuid] == (
+            "discarded",
+            "cancelled",
+            False,
+            False,
+            5,
+        )
+        assert rows[retryable_uuid] == (
+            "failed",
+            "provider_unavailable",
+            True,
+            True,
+            4,
+        )
+        cur.execute(
+            """
+            SELECT external_operation_uuid, status
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = ANY(%s::uuid[])
+            ORDER BY external_operation_uuid
+            """,
+            ([cancelled_uuid, retryable_uuid],),
+        )
+        page_rows = {row[0]: row[1] for row in cur.fetchall()}
+        assert page_rows == {
+            cancelled_uuid: "discarded",
+            retryable_uuid: "failed",
+        }
+        cur.execute(
+            """
+            SELECT external_operation_uuid
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = ANY(%s::uuid[])
+            """,
+            ([cancelled_uuid, retryable_uuid],),
+        )
+        assert cur.fetchall() == [(retryable_uuid,)]
+        cur.execute(
+            """
+            SELECT external_operation_uuid
+            FROM m_external_provider_read_candidate_packs_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (cancelled_uuid,),
+        )
+        assert cur.fetchall() == []
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_users WHERE uuid = %s",
+            (owner_uuid,),
+        )
+    db.commit()
+
+
+def test_expired_provider_read_migration_requeues_lane_head(_database, db):
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    bridge_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    operation_uuid = sys_uuid.uuid4()
+    failed_page_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, owner_uuid, f"user-{owner_uuid}")
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO m_external_bridge_instances_v2 (uuid, provider)
+            VALUES (%s, 'zulip')
+            """,
+            (bridge_uuid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, FALSE, 'live', TRUE)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, status, attempt, safe_error,
+                can_retry, can_discard, revision
+            ) VALUES (
+                %s, %s, %s, 'read_state.set', 'stream', 'failed', 2,
+                'expired', TRUE, TRUE, 7
+            )
+            """,
+            (operation_uuid, account_uuid, owner_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_read_snapshots_v1 (
+                external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, causal_lane,
+                payload, exhausted
+            ) VALUES (%s, %s, %s, %s, %s, '{}'::jsonb, TRUE)
+            """,
+            (
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_provider_operations_v1 (
+                uuid, external_operation_uuid, bridge_instance_uuid,
+                external_account_uuid, project_id, operation_kind,
+                causal_lane, payload, status, attempt, safe_error,
+                public_result_status, terminal_result, completed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, 'read_state.set', %s,
+                jsonb_build_object('message_uuids', jsonb_build_array(%s::text)),
+                'failed', 2, 'expired', 'failed',
+                jsonb_build_object('status', 'failed', 'safe_error', 'expired'),
+                NOW()
+            )
+            """,
+            (
+                failed_page_uuid,
+                operation_uuid,
+                bridge_uuid,
+                account_uuid,
+                project_uuid,
+                stream_uuid,
+                message_uuid,
+            ),
+        )
+    db.commit()
+
+    migration = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )._load_migrations()[EXPIRED_PROVIDER_READ_RETRY_MIGRATION_FILE]
+    with ra_contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT status, attempt, safe_error, can_retry, can_discard,
+                   duplicate_risk, retry_requires_confirmation, revision,
+                   details->>'record_uuid'
+            FROM m_external_operations_v2
+            WHERE uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        public_row = cur.fetchone()
+        assert public_row[:8] == (
+            "queued",
+            3,
+            None,
+            False,
+            True,
+            False,
+            False,
+            8,
+        )
+        queued_page_uuid = sys_uuid.UUID(public_row[8])
+        cur.execute(
+            """
+            SELECT uuid, status, attempt,
+                   payload->'message_uuids', public_result_status
+            FROM m_external_provider_operations_v1
+            WHERE external_operation_uuid = %s
+            ORDER BY created_at, uuid
+            """,
+            (operation_uuid,),
+        )
+        page_rows = {row[0]: row[1:] for row in cur.fetchall()}
+        assert page_rows[failed_page_uuid] == ("discarded", 2, [], None)
+        assert page_rows[queued_page_uuid] == (
+            "queued",
+            2,
+            [str(message_uuid)],
+            None,
+        )
+        cur.execute(
+            """
+            SELECT exhausted
+            FROM m_external_provider_read_snapshots_v1
+            WHERE external_operation_uuid = %s
+            """,
+            (operation_uuid,),
+        )
+        assert cur.fetchone() == (True,)
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_users WHERE uuid = %s",
+            (owner_uuid,),
+        )
+    db.commit()
 
 
 def test_shared_projection_recovery_advances_reset_and_desired_generations(

@@ -228,6 +228,13 @@ components:
         status:
           enum: [succeeded, failed, manual_reconciliation_required]
         safe_error: {type: [string, 'null'], maxLength: 1024}
+        provider_entity_id:
+          type: [string, 'null']
+          maxLength: 2048
+          description: >-
+            Provider-assigned identifier for a successfully created entity.
+            For a Zulip message.create result this binds the native Workspace
+            message before its provider echo is imported.
         original_url: {type: [string, 'null'], format: uri}
         reconciliation: {type: object}
     OperationResultResponse:

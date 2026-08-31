@@ -354,12 +354,58 @@ scope 中仍在等待的同类任务，并只提交一个权威快照和事件�
 一次权威计数重建。因此，幂等重试可以修复陈旧快照。这些投影任务优先于批量导入执行，
 而常规快照合并仍会限制数据库负载。
 
+这些已读操作还会在同一规范事务中更新滚动的 compact 兼容状态。迁移
+`0166` 会为所有用户修复现有的“规范状态已读但 compact bitmap 未读”记录，重新计算
+受影响的 topic 已读统计，并推进每个用户的已读修订号。该修复是单调的：它不会修改
+任何规范未读记录，包括来自 provider 快照的未读状态。
+
+随后，迁移 `0167` 会为所有活跃用户根据持久化 bitmap 重新计算每个 compact 或
+rollback topic 的已读聚合。即使每条消息的 bitmap 位已经与规范 `read_at` 一致，
+该迁移也会修复仍然陈旧的聚合，从而让 stream、topic 和 folder 计数使用同一份已读
+事实。
+
+迁移 `0168` 会根据持久化消息行重新计算共享的 compact topic 消息总数和最后的
+ingest 坐标。它修复最后一种情况：每个用户的已读计数都已准确，但过期的 topic
+消息总数仍会导致兼容 stream、topic 和 folder 未读计数发生偏移。
+
+迁移 `0169` 会重新应用 provider 私聊规范化，并以每个参与者的 provider
+`display_name` 作为面向当前用户的单聊和群聊名称来源。只有 provider 未提供名称时
+才回退到 Workspace identity。与旧 Workspace identity 投影结果相同的历史名称会被
+识别为 provider 管理名称；用户显式设置的本地群聊名称会保持不变。
+
+迁移 `0170` 还会在单聊目录记录只列出对方参与者时，将已选择 provider 聊天的所有者
+视为有效查看者。因此，对方的 provider 名称会继续作为每个已关联账户的权威聊天名称，
+无需 provider 在参与者列表中重复列出所有者。
+
 ## Provider 已读分页顺序
 
 延迟物化的 provider 已读分页使用其源快照的队列位置来确定同一 lane 内的顺序。较新的
 快照可能在该分页获得物理 operation sequence 之前就已持久化，但不能阻塞更早的分页。
 更早的快照仍会阻挡同一 stream lane 中的后续写入，其他 lane 保持独立。物化数量和
 lease batch 大小限制均保持不变。
+
+## Provider 入站恢复
+
+私有 Provider API 命令可安全重放：request、event、lease 和 result 标识符在各次尝试间
+保持不变。发生 PostgreSQL 死锁后，服务器会使用短时且有界的指数退避重试完整请求事务；
+其他 control 和 file 请求不会被重试。尝试耗尽时返回不包含数据库细节的可重试 `503`。
+Provider 删除触发 topic 摘要恢复时，会跳过对应消息已不存在的 journal boundary，避免
+陈旧的派生摘要导致整个入站 batch 被拒绝。
+在 Provider 删除之前排队的投影任务会把已删除的规范消息视为不存在，因此陈旧的
+fanout 或 mention 任务会以 no-op 完成，而不会进入 dead-letter 队列。
+
+## Provider 账户所有者的已读状态一致性
+
+同一 realm 中多个账户共享的 Provider 消息只有一个规范 placement，但每个已选
+账户的所有者都拥有独立的 binding 和 state。Compact 导入通过一个有界 SQL
+批次创建这些记录，并在同一事务中同步 compact bitmap 与规范 `read_at`。
+Snapshot-only 回填仍不发送逐消息公开事件，但会保留权威的 stream 和 topic
+计数重建。
+
+迁移 `0162` 使用持久化的已应用 Provider event 日志，只恢复实际投递过的
+message/account 组合。有效已读值来自 compact bitmap；非 compact 模式则来自
+legacy flag。迁移随后重建受影响的 stream、topic 和 folder 计数，并在提交前
+验证一致性，不会扩展 native 消息或未选择的 Provider 历史。
 
 ## 首次实现的兼容性和边界
 

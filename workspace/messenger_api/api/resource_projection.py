@@ -54,6 +54,10 @@ def simple(value: typing.Any) -> typing.Any:
     if isinstance(value, sys_uuid.UUID):
         return str(value)
     if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        else:
+            value = value.astimezone(datetime.timezone.utc)
         return value.isoformat().replace("+00:00", "Z")
     if isinstance(value, enum.Enum):
         return value.value

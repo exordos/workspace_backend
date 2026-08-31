@@ -19,6 +19,7 @@ import logging
 import sys
 
 from oslo_config import cfg
+from gcl_looper.services import hub
 from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
@@ -42,6 +43,61 @@ messenger_worker_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
 
 
+def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
+    worker_count = (
+        CONF[DOMAIN].v2_projection_workers if CONF[DOMAIN].v2_projection_enabled else 1
+    )
+    services = []
+    for worker_index in range(worker_count):
+        service = agents.MessengerWorkerAgent(
+            iter_min_period=0 if CONF[DOMAIN].v2_projection_enabled else 3,
+            iter_pause=0 if CONF[DOMAIN].v2_projection_enabled else 0.1,
+            event_retention=datetime.timedelta(
+                seconds=CONF[DOMAIN].event_retention_seconds,
+            ),
+            event_prune_interval_seconds=(CONF[DOMAIN].event_prune_interval_seconds),
+            event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
+            heartbeat_retention=datetime.timedelta(
+                seconds=CONF[DOMAIN].heartbeat_retention_seconds,
+            ),
+            read_state_compaction_enabled=(CONF[DOMAIN].read_state_compaction_enabled),
+            read_state_cleanup_enabled=CONF[DOMAIN].read_state_cleanup_enabled,
+            read_state_batch_size=CONF[DOMAIN].read_state_batch_size,
+            read_state_max_batches_per_iteration=(
+                CONF[DOMAIN].read_state_max_batches_per_iteration
+            ),
+            v2_projection_enabled=CONF[DOMAIN].v2_projection_enabled,
+            v2_projection_max_tasks_per_iteration=(
+                CONF[DOMAIN].v2_projection_max_tasks_per_iteration
+            ),
+            v2_idle_sleep_seconds=(CONF[DOMAIN].v2_projection_idle_sleep_seconds),
+            v2_fanout_batch_size=CONF[DOMAIN].v2_fanout_batch_size,
+            v2_metrics_log_interval_seconds=(
+                CONF[DOMAIN].v2_metrics_log_interval_seconds
+            ),
+            projection_only=worker_index > 0,
+            projection_deriver=(worker_index == (1 if worker_count > 1 else 0)),
+            summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
+            summary_connect_timeout_seconds=(
+                CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds
+            ),
+            summary_request_timeout_seconds=(
+                CONF[TOPIC_SUMMARY_DOMAIN].request_timeout_seconds
+            ),
+            summary_topic_claim_seconds=(
+                CONF[TOPIC_SUMMARY_DOMAIN].topic_claim_seconds
+            ),
+            summary_endpoint_claim_seconds=(
+                CONF[TOPIC_SUMMARY_DOMAIN].endpoint_claim_seconds
+            ),
+        )
+        service.add_setup(
+            lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
+        )
+        services.append(service)
+    return tuple(services)
+
+
 def main() -> None:
     config.parse(sys.argv[1:])
 
@@ -50,45 +106,10 @@ def main() -> None:
 
     factory = store_factory.build_store_factory()
     api_store.configure_store_factory(factory)
-    service = agents.MessengerWorkerAgent(
-        iter_min_period=3,
-        event_retention=datetime.timedelta(
-            seconds=CONF[DOMAIN].event_retention_seconds,
-        ),
-        event_prune_interval_seconds=(CONF[DOMAIN].event_prune_interval_seconds),
-        event_prune_batch_size=CONF[DOMAIN].event_prune_batch_size,
-        heartbeat_retention=datetime.timedelta(
-            seconds=CONF[DOMAIN].heartbeat_retention_seconds,
-        ),
-        read_state_compaction_enabled=(CONF[DOMAIN].read_state_compaction_enabled),
-        read_state_cleanup_enabled=CONF[DOMAIN].read_state_cleanup_enabled,
-        read_state_batch_size=CONF[DOMAIN].read_state_batch_size,
-        read_state_max_batches_per_iteration=(
-            CONF[DOMAIN].read_state_max_batches_per_iteration
-        ),
-        v2_projection_enabled=CONF[DOMAIN].v2_projection_enabled,
-        v2_projection_max_tasks_per_iteration=(
-            CONF[DOMAIN].v2_projection_max_tasks_per_iteration
-        ),
-        v2_fanout_batch_size=CONF[DOMAIN].v2_fanout_batch_size,
-        summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
-        summary_connect_timeout_seconds=(
-            CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds
-        ),
-        summary_request_timeout_seconds=(
-            CONF[TOPIC_SUMMARY_DOMAIN].request_timeout_seconds
-        ),
-        summary_topic_claim_seconds=CONF[TOPIC_SUMMARY_DOMAIN].topic_claim_seconds,
-        summary_endpoint_claim_seconds=(
-            CONF[TOPIC_SUMMARY_DOMAIN].endpoint_claim_seconds
-        ),
-    )
-
-    service.add_setup(
-        lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
-    )
-
-    service.start()
+    service_hub = hub.ProcessHubService()
+    for service in build_worker_services():
+        service_hub.add_service(service)
+    service_hub.start()
 
     log.info("Bye!!!")
 

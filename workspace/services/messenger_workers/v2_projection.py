@@ -12,8 +12,10 @@ snapshot commit in the same worker transaction.
 """
 
 import datetime
+import itertools
 import json
 import logging
+import time
 import types
 import typing
 import uuid as sys_uuid
@@ -34,6 +36,23 @@ DEFAULT_FANOUT_BATCH_SIZE = 1000
 MAX_FANOUT_BATCH_SIZE = 5000
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_LEASE_SECONDS = 30
+CLAIM_CANDIDATE_LIMIT = 128
+CLAIM_PROJECT_LIMIT = 16
+REACTION_COALESCE_LIMIT = 128
+FAIR_SCHEDULER_LANES = (
+    "fanout",
+    "fanout",
+    "fanout",
+    "fanout",
+    "interactive_read",
+    "interactive_read",
+    "reaction_snapshot",
+    "read_state",
+    "background",
+    "background",
+)
+_FAIR_SCHEDULER_CYCLE = itertools.cycle(FAIR_SCHEDULER_LANES)
+_FAIR_DERIVATION_CYCLE = itertools.cycle(FAIR_SCHEDULER_LANES)
 LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS = (
     "legacy_message_state.deleted",
     "legacy_message_state.updated",
@@ -234,12 +253,37 @@ def _guard_emitted_events(
     )
 
 
-def derive_projection_tasks(
-    session: typing.Any, limit: int = DEFAULT_DERIVE_LIMIT
+def _lane_predicate(alias: str, kind_column: str, lane: str) -> str:
+    interactive_read = f"""
+        {alias}.{kind_column} = 'read_counters'
+        AND {alias}.payload->>'source_kind' IN (
+            'message.read', 'messages.read', 'stream.read', 'topic.read'
+        )
+    """
+    predicates = {
+        "fanout": f"{alias}.{kind_column} = 'fanout'",
+        "interactive_read": interactive_read,
+        "reaction_snapshot": f"{alias}.{kind_column} = 'reaction_snapshot'",
+        "read_state": (
+            f"{alias}.{kind_column} = 'read_counters' AND NOT ({interactive_read})"
+        ),
+        "background": (
+            f"{alias}.{kind_column} IN ("
+            "'content_mentions', 'folder_projection', "
+            "'delivery_snapshot_event', 'topic_state_projection', "
+            "'topic_membership_policy_rebuild')"
+        ),
+    }
+    return predicates[lane]
+
+
+def _derive_projection_tasks_for_lane(
+    session: typing.Any,
+    limit: int,
+    lane_predicate: str,
 ) -> int:
-    """Create one idempotent task for each previously unseen outbox event."""
     rows = session.execute(
-        """
+        f"""
         WITH candidates AS (
             SELECT event.*
             FROM messenger_domain_outbox_events AS event
@@ -247,6 +291,7 @@ def derive_projection_tasks(
               ON task.project_id = event.project_id
              AND task.outbox_event_uuid = event.uuid
             WHERE task.uuid IS NULL
+              AND ({lane_predicate})
             ORDER BY event.created_at, event.uuid
             LIMIT %s
             FOR UPDATE OF event SKIP LOCKED
@@ -260,7 +305,7 @@ def derive_projection_tasks(
             project_id, uuid, event_kind, scope_kind, scope_key,
             COALESCE(
                 payload->>'placement_uuid',
-                payload#>>'{placement,uuid}',
+                payload#>>'{{placement,uuid}}',
                 payload->>'resource_uuid',
                 payload->>'canonical_message_uuid',
                 payload->>'topic_uuid',
@@ -285,14 +330,126 @@ def derive_projection_tasks(
     return len(rows)
 
 
+def derive_projection_tasks(
+    session: typing.Any, limit: int = DEFAULT_DERIVE_LIMIT
+) -> int:
+    """Derive a fair bounded outbox slice without starving fresh fanout."""
+    preferred_lane = next(_FAIR_DERIVATION_CYCLE)
+    derived = _derive_projection_tasks_for_lane(
+        session,
+        limit,
+        _lane_predicate("event", "event_kind", preferred_lane),
+    )
+    if derived < limit:
+        derived += _derive_projection_tasks_for_lane(
+            session,
+            limit - derived,
+            "TRUE",
+        )
+    return derived
+
+
 def _claim_task(
     session: typing.Any,
     worker_id: str,
     lease_seconds: int,
 ) -> typing.Any | None:
-    claim_sql = """
-        SELECT task.*
-        FROM messenger_projection_tasks AS task
+    preferred_lane = next(_FAIR_SCHEDULER_CYCLE)
+    lane_name = preferred_lane
+    candidate_lane_predicate = _lane_predicate("candidate", "task_kind", preferred_lane)
+    task_lane_predicate = _lane_predicate("task", "task_kind", preferred_lane)
+    project_id = _try_lock_claim_project(
+        session,
+        candidate_lane_predicate,
+        worker_id,
+    )
+    if project_id is None:
+        lane_name = "fallback"
+        candidate_lane_predicate = "TRUE"
+        task_lane_predicate = "TRUE"
+        project_id = _try_lock_claim_project(
+            session,
+            candidate_lane_predicate,
+            worker_id,
+        )
+    if project_id is None:
+        return None
+    claim_sql = f"""
+        /* workspace_projection_lane={{lane_name}} */
+        WITH candidates AS MATERIALIZED (
+            SELECT candidate.project_id, candidate.uuid
+            FROM messenger_projection_tasks AS candidate
+            LEFT JOIN messenger_projection_scope_leases AS candidate_scope_lease
+              ON candidate_scope_lease.project_id = candidate.project_id
+             AND candidate_scope_lease.scope_kind = candidate.scope_kind
+             AND candidate_scope_lease.scope_key = candidate.scope_key
+            WHERE candidate.project_id = %s
+              AND (
+                    candidate.status IN ('pending', 'failed')
+                    OR (
+                        candidate.status = 'running'
+                        AND candidate.lease_expires_at <= NOW()
+                    )
+                  )
+              AND (
+                    candidate.status = 'running'
+                    OR candidate.next_retry_at IS NULL
+                    OR candidate.next_retry_at <= NOW()
+                  )
+              AND (
+                    candidate.lease_expires_at IS NULL
+                    OR candidate.lease_expires_at <= NOW()
+                  )
+              AND candidate.status NOT IN ('completed', 'dead_letter')
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messenger_projection_tasks AS predecessor
+                    WHERE predecessor.project_id = candidate.project_id
+                      AND predecessor.scope_kind = candidate.scope_kind
+                      AND predecessor.scope_key = candidate.scope_key
+                      AND predecessor.ordering_key = candidate.ordering_key
+                      AND predecessor.task_kind = candidate.task_kind
+                      AND (
+                            predecessor.created_at,
+                            predecessor.ordering_created_at,
+                            predecessor.outbox_event_uuid
+                          ) < (
+                            candidate.created_at,
+                            candidate.ordering_created_at,
+                            candidate.outbox_event_uuid
+                          )
+                      AND predecessor.status NOT IN (
+                            'completed', 'dead_letter'
+                          )
+              )
+              AND ({{candidate_lane_predicate}})
+              AND (
+                    candidate_scope_lease.uuid IS NULL
+                    OR candidate_scope_lease.lease_expires_at IS NULL
+                    OR candidate_scope_lease.lease_expires_at <= NOW()
+                    OR candidate_scope_lease.owner = %s
+                  )
+            ORDER BY candidate.created_at, candidate.ordering_created_at,
+                     candidate.outbox_event_uuid
+            LIMIT {CLAIM_CANDIDATE_LIMIT}
+        )
+        SELECT task.uuid, task.project_id, task.outbox_event_uuid,
+               task.task_kind, task.scope_kind, task.scope_key,
+               task.ordering_key, task.ordering_created_at, task.payload,
+               task.status, task.lease_owner, task.fencing_token,
+               task.lease_expires_at, task.attempts, task.next_retry_at,
+               task.last_error, task.progress_created_at, task.progress_uuid,
+               task.processed_count, task.created_at, task.updated_at
+             , event.created_at AS outbox_created_at
+             , EXTRACT(EPOCH FROM (NOW() - task.created_at)) AS task_age_seconds
+             , EXTRACT(EPOCH FROM (NOW() - event.created_at)) AS outbox_age_seconds
+        FROM candidates AS candidate
+        JOIN messenger_projection_tasks AS task
+          ON task.project_id = candidate.project_id
+         AND task.uuid = candidate.uuid
+        JOIN messenger_domain_outbox_events AS event
+          ON event.project_id = task.project_id
+         AND event.uuid = task.outbox_event_uuid
         LEFT JOIN messenger_projection_scope_leases AS scope_lease
           ON scope_lease.project_id = task.project_id
          AND scope_lease.scope_kind = task.scope_kind
@@ -318,54 +475,38 @@ def _claim_task(
                   AND predecessor.scope_key = task.scope_key
                   AND predecessor.ordering_key = task.ordering_key
                   AND predecessor.task_kind = task.task_kind
-                  AND (predecessor.created_at, predecessor.uuid)
-                      < (task.created_at, task.uuid)
+                  AND (
+                        predecessor.created_at,
+                        predecessor.ordering_created_at,
+                        predecessor.outbox_event_uuid
+                      ) < (
+                        task.created_at,
+                        task.ordering_created_at,
+                        task.outbox_event_uuid
+                      )
                   AND predecessor.status NOT IN ('completed', 'dead_letter')
-              )
+          )
           AND task.status NOT IN ('completed', 'dead_letter')
-          AND {age_predicate}
+          AND ({{task_lane_predicate}})
           AND (
                 scope_lease.uuid IS NULL
                 OR scope_lease.lease_expires_at IS NULL
                 OR scope_lease.lease_expires_at <= NOW()
                 OR scope_lease.owner = %s
               )
-        ORDER BY {order_by}
+        ORDER BY task.created_at, task.ordering_created_at,
+                 task.outbox_event_uuid
         LIMIT 1
         FOR UPDATE OF task SKIP LOCKED
     """
-    interactive_read_predicate = """
-        task.task_kind = 'read_counters'
-        AND task.payload->>'source_kind' IN (
-            'message.read', 'messages.read', 'stream.read', 'topic.read'
-        )
-    """
     task = session.execute(
         claim_sql.format(
-            age_predicate=interactive_read_predicate,
-            order_by="task.created_at, task.uuid",
+            lane_name=lane_name,
+            candidate_lane_predicate=candidate_lane_predicate,
+            task_lane_predicate=task_lane_predicate,
         ),
-        (worker_id,),
+        (project_id, worker_id, worker_id),
     ).fetchone()
-    if task is None:
-        task = session.execute(
-            claim_sql.format(
-                age_predicate="task.created_at <= NOW() - interval '5 seconds'",
-                order_by="task.created_at, task.uuid",
-            ),
-            (worker_id,),
-        ).fetchone()
-    if task is None:
-        task = session.execute(
-            claim_sql.format(
-                age_predicate="task.created_at > NOW() - interval '5 seconds'",
-                order_by=(
-                    "CASE WHEN task.task_kind = 'fanout' THEN 0 ELSE 1 END, "
-                    "task.ordering_created_at DESC, task.created_at, task.uuid"
-                ),
-            ),
-            (worker_id,),
-        ).fetchone()
     if task is None:
         return None
     lease = session.execute(
@@ -419,6 +560,101 @@ def _claim_task(
     task["fencing_token"] = lease["fencing_token"]
     task["attempts"] += 1
     return task
+
+
+def _try_lock_claim_project(
+    session: typing.Any,
+    lane_predicate: str,
+    worker_id: str,
+) -> object | None:
+    """Take the event project lock before any projection task row lock."""
+    rows = session.execute(
+        f"""
+        WITH per_project AS MATERIALIZED (
+            SELECT DISTINCT ON (candidate.project_id)
+                   candidate.project_id, candidate.created_at,
+                   candidate.ordering_created_at,
+                   candidate.outbox_event_uuid
+            FROM messenger_projection_tasks AS candidate
+            LEFT JOIN messenger_projection_scope_leases AS scope_lease
+              ON scope_lease.project_id = candidate.project_id
+             AND scope_lease.scope_kind = candidate.scope_kind
+             AND scope_lease.scope_key = candidate.scope_key
+            WHERE (
+                    candidate.status IN ('pending', 'failed')
+                    OR (
+                        candidate.status = 'running'
+                        AND candidate.lease_expires_at <= NOW()
+                    )
+                  )
+              AND (
+                    candidate.status = 'running'
+                    OR candidate.next_retry_at IS NULL
+                    OR candidate.next_retry_at <= NOW()
+                  )
+              AND (
+                    candidate.lease_expires_at IS NULL
+                    OR candidate.lease_expires_at <= NOW()
+                  )
+              AND candidate.status NOT IN ('completed', 'dead_letter')
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messenger_projection_tasks AS predecessor
+                    WHERE predecessor.project_id = candidate.project_id
+                      AND predecessor.scope_kind = candidate.scope_kind
+                      AND predecessor.scope_key = candidate.scope_key
+                      AND predecessor.ordering_key = candidate.ordering_key
+                      AND predecessor.task_kind = candidate.task_kind
+                      AND (
+                            predecessor.created_at,
+                            predecessor.ordering_created_at,
+                            predecessor.outbox_event_uuid
+                          ) < (
+                            candidate.created_at,
+                            candidate.ordering_created_at,
+                            candidate.outbox_event_uuid
+                          )
+                      AND predecessor.status NOT IN (
+                            'completed', 'dead_letter'
+                          )
+              )
+              AND (
+                    scope_lease.uuid IS NULL
+                    OR scope_lease.lease_expires_at IS NULL
+                    OR scope_lease.lease_expires_at <= NOW()
+                    OR scope_lease.owner = %s
+                  )
+              AND ({lane_predicate})
+            ORDER BY candidate.project_id, candidate.created_at,
+                     candidate.ordering_created_at,
+                     candidate.outbox_event_uuid
+        ), candidates AS MATERIALIZED (
+            SELECT candidate.project_id, candidate.created_at,
+                   candidate.ordering_created_at,
+                   candidate.outbox_event_uuid
+            FROM per_project AS candidate
+            ORDER BY candidate.created_at, candidate.ordering_created_at,
+                     candidate.outbox_event_uuid
+            LIMIT {CLAIM_PROJECT_LIMIT}
+        )
+        SELECT project_id
+        FROM candidates
+        ORDER BY created_at, ordering_created_at, outbox_event_uuid
+        """,
+        (worker_id,),
+    ).fetchall()
+    for row in rows:
+        locked = session.execute(
+            """
+            SELECT pg_try_advisory_xact_lock(
+                hashtextextended(%s::text, 0)
+            ) AS locked
+            """,
+            (row["project_id"],),
+        ).fetchone()["locked"]
+        if locked:
+            return row["project_id"]
+    return None
 
 
 def _v2_rows(
@@ -476,6 +712,7 @@ def _message_namespace(
           ON message.project_id = placement.project_id
          AND message.uuid = placement.message_uuid
         WHERE placement.project_id = %s AND placement.uuid = %s
+          AND message.deleted_at IS NULL
         """,
         (project_id, placement_uuid),
     ).fetchone()
@@ -1117,6 +1354,97 @@ def _process_reaction_snapshot(
     message = _message_namespace(session, task["project_id"], placement_uuid)
     if message is None:
         return
+    siblings = session.execute(
+        """
+        SELECT sibling.uuid, sibling.project_id, sibling.outbox_event_uuid,
+               sibling.task_kind, sibling.scope_kind, sibling.scope_key,
+               sibling.ordering_key, sibling.ordering_created_at,
+               sibling.payload, sibling.status, sibling.lease_owner,
+               sibling.fencing_token, sibling.lease_expires_at,
+               sibling.attempts, sibling.next_retry_at, sibling.last_error,
+               sibling.progress_created_at, sibling.progress_uuid,
+               sibling.processed_count, sibling.created_at,
+               sibling.updated_at, event.created_at AS outbox_created_at
+        FROM messenger_projection_tasks AS sibling
+        JOIN messenger_domain_outbox_events AS event
+          ON event.project_id = sibling.project_id
+         AND event.uuid = sibling.outbox_event_uuid
+        WHERE sibling.project_id = %s
+          AND sibling.task_kind = 'reaction_snapshot'
+          AND sibling.scope_kind = %s AND sibling.scope_key = %s
+          AND sibling.uuid <> %s
+          AND sibling.status IN ('pending', 'failed')
+          AND (
+                sibling.next_retry_at IS NULL
+                OR sibling.next_retry_at <= NOW()
+              )
+          AND (
+                sibling.lease_expires_at IS NULL
+                OR sibling.lease_expires_at <= NOW()
+              )
+        ORDER BY event.created_at, event.uuid
+        LIMIT %s
+        FOR UPDATE SKIP LOCKED
+        """,
+        (
+            task["project_id"],
+            task["scope_kind"],
+            task["scope_key"],
+            task["uuid"],
+            REACTION_COALESCE_LIMIT - 1,
+        ),
+    ).fetchall()
+    snapshots = sorted(
+        [task, *(dict(sibling) for sibling in siblings)],
+        key=lambda sibling: (
+            sibling["outbox_created_at"],
+            str(sibling["outbox_event_uuid"]),
+        ),
+    )
+    reaction_fact_count = session.execute(
+        """
+        SELECT count(*) AS reaction_fact_count
+        FROM messenger_message_reaction_facts
+        WHERE project_id = %s AND canonical_message_uuid = %s
+        """,
+        (task["project_id"], message.canonical_message_uuid),
+    ).fetchone()["reaction_fact_count"]
+    if isinstance(task, dict):
+        task["_execution_stats"] = {
+            "coalesced_task_count": len(siblings),
+            "reaction_fact_count": int(reaction_fact_count),
+            "reaction_event_count": sum(
+                bool(snapshot["payload"].get("emit_reaction_event"))
+                for snapshot in snapshots
+            ),
+        }
+    event_placement_uuids = {
+        _uuid(snapshot["payload"].get("placement_uuid", placement_uuid))
+        for snapshot in snapshots
+        if snapshot["payload"].get("emit_reaction_event")
+    }
+    messages_by_placement = {placement_uuid: message}
+    for event_placement_uuid in sorted(event_placement_uuids, key=str):
+        if event_placement_uuid in messages_by_placement:
+            continue
+        event_message = _message_namespace(
+            session,
+            task["project_id"],
+            event_placement_uuid,
+        )
+        if event_message is None:
+            raise RuntimeError(
+                "Cannot emit a reaction event for a missing message placement"
+            )
+        if event_message.canonical_message_uuid != message.canonical_message_uuid:
+            raise RuntimeError(
+                "Coalesced reaction event crossed a canonical message boundary"
+            )
+        messages_by_placement[event_placement_uuid] = event_message
+    if isinstance(task, dict):
+        task["_execution_stats"]["reaction_placement_count"] = len(
+            event_placement_uuids
+        )
     session.execute(
         """
         UPDATE messenger_messages AS message
@@ -1134,7 +1462,7 @@ def _process_reaction_snapshot(
                        count(*) AS reaction_count,
                        jsonb_agg(user_uuid::text ORDER BY created_at, uuid) AS users
                 FROM messenger_message_reaction_facts
-                WHERE project_id = %s
+                WHERE project_id = %s AND canonical_message_uuid = %s
                 GROUP BY canonical_message_uuid, emoji_name
             ) AS grouped ON grouped.canonical_message_uuid = target.uuid
             WHERE target.project_id = %s AND target.uuid = (
@@ -1147,47 +1475,56 @@ def _process_reaction_snapshot(
         """,
         (
             task["project_id"],
+            message.canonical_message_uuid,
             task["project_id"],
             task["project_id"],
             placement_uuid,
             task["project_id"],
         ),
     )
-    if task["payload"].get("emit_reaction_event"):
-        reaction_values = dict(task["payload"]["reaction"])
+    for snapshot in snapshots:
+        payload = snapshot["payload"]
+        if not payload.get("emit_reaction_event"):
+            continue
+        event_message = messages_by_placement[
+            _uuid(payload.get("placement_uuid", placement_uuid))
+        ]
+        reaction_values = dict(payload["reaction"])
         for field in ("uuid", "project_id", "message_uuid", "user_uuid"):
             if reaction_values.get(field) is not None:
                 reaction_values[field] = _uuid(reaction_values[field])
         reaction = types.SimpleNamespace(**reaction_values)
-        source_kind = task["payload"]["source_kind"]
+        source_kind = payload["source_kind"]
         if source_kind == "message_reaction.created":
             emitted = messenger_events.create_message_reaction_created_event(
-                reaction, message, session=session
+                reaction, event_message, session=session
             )
         elif source_kind == "message_reaction.updated":
             old_message = types.SimpleNamespace(
-                uuid=_uuid(task["payload"]["old_message_uuid"]),
-                source_name=task["payload"]["old_source_name"],
-                source=task["payload"]["old_source"],
+                uuid=_uuid(payload["old_message_uuid"]),
+                source_name=payload["old_source_name"],
+                source=payload["old_source"],
             )
             emitted = messenger_events.create_message_reaction_updated_event(
                 reaction,
-                message,
+                event_message,
                 old_message,
-                task["payload"]["old_emoji_name"],
+                payload["old_emoji_name"],
                 session=session,
             )
         elif source_kind == "message_reaction.deleted":
             emitted = messenger_events.create_message_reaction_deleted_event(
-                reaction, message, session=session
+                reaction, event_message, session=session
             )
         _guard_emitted_events(
             session,
             emitted,
             project_id=task["project_id"],
-            stream_uuid=message.stream_uuid,
+            stream_uuid=event_message.stream_uuid,
         )
-    if task["payload"].get("emit_message_updated", True):
+    if any(
+        snapshot["payload"].get("emit_message_updated", True) for snapshot in snapshots
+    ):
         rows = _v2_rows(
             v2_models.WorkspaceUserMessage,
             task["project_id"],
@@ -1195,6 +1532,37 @@ def _process_reaction_snapshot(
             order_by={"uuid": "asc", "user_uuid": "asc"},
         )
         _emit_message_updated_rows(session, task["project_id"], rows)
+    if siblings:
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'completed', lease_owner = NULL,
+                lease_expires_at = NULL, next_retry_at = NULL,
+                last_error = NULL,
+                payload = jsonb_set(
+                    payload,
+                    '{_execution_stats}',
+                    COALESCE(payload->'_execution_stats', '{}'::jsonb)
+                    || jsonb_build_object(
+                        'schema_version', 1,
+                        'last_outcome', 'coalesced',
+                        'coalesced_by_task_uuid', %s::text,
+                        'last_finished_at', to_jsonb(NOW()),
+                        'queue_wait_ms', ROUND(
+                            EXTRACT(EPOCH FROM (NOW() - created_at)) * 1000
+                        )
+                    )
+                ),
+                updated_at = NOW()
+            WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+              AND status IN ('pending', 'failed')
+            """,
+            (
+                task["uuid"],
+                task["project_id"],
+                [sibling["uuid"] for sibling in siblings],
+            ),
+        )
 
 
 def _process_read_counters(
@@ -1208,24 +1576,32 @@ def _process_read_counters(
         # tasks that must emit a per-message read event remain independent.
         session.execute(
             """
-            UPDATE messenger_projection_tasks
+            WITH siblings AS MATERIALIZED (
+                SELECT uuid
+                FROM messenger_projection_tasks
+                WHERE project_id = %s AND task_kind = 'read_counters'
+                  AND scope_kind = %s AND scope_key = %s AND uuid <> %s
+                  AND status IN ('pending', 'failed')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                  AND COALESCE(
+                      (payload->>'emit_message_read')::boolean,
+                      FALSE
+                  ) = FALSE
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE messenger_projection_tasks AS task
             SET status = 'completed', lease_owner = NULL,
                 lease_expires_at = NULL, next_retry_at = NULL,
                 last_error = NULL, updated_at = NOW()
-            WHERE project_id = %s AND task_kind = 'read_counters'
-              AND scope_kind = %s AND scope_key = %s AND uuid <> %s
-              AND status IN ('pending', 'failed')
-              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
-              AND COALESCE(
-                  (payload->>'emit_message_read')::boolean,
-                  FALSE
-              ) = FALSE
+            FROM siblings
+            WHERE task.project_id = %s AND task.uuid = siblings.uuid
             """,
             (
                 task["project_id"],
                 task["scope_kind"],
                 task["scope_key"],
                 task["uuid"],
+                task["project_id"],
             ),
         )
     _refresh_recipient_counters(
@@ -1289,20 +1665,27 @@ def _process_folder_projection(
         # this scope because none of them carries a historical snapshot.
         session.execute(
             """
-            UPDATE messenger_projection_tasks
+            WITH siblings AS MATERIALIZED (
+                SELECT uuid
+                FROM messenger_projection_tasks
+                WHERE project_id = %s AND task_kind = 'folder_projection'
+                  AND scope_kind = 'user-folder' AND scope_key = %s
+                  AND uuid <> %s AND status IN ('pending', 'failed')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+                  AND payload->>'source_kind' IN (
+                      'legacy_message_state.deleted',
+                      'legacy_message_state.updated'
+                  )
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE messenger_projection_tasks AS task
             SET status = 'completed', lease_owner = NULL,
                 lease_expires_at = NULL, next_retry_at = NULL,
                 last_error = NULL, updated_at = NOW()
-            WHERE project_id = %s AND task_kind = 'folder_projection'
-              AND scope_kind = 'user-folder' AND scope_key = %s
-              AND uuid <> %s AND status IN ('pending', 'failed')
-              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
-              AND payload->>'source_kind' IN (
-                  'legacy_message_state.deleted',
-                  'legacy_message_state.updated'
-              )
+            FROM siblings
+            WHERE task.project_id = %s AND task.uuid = siblings.uuid
             """,
-            (project_id, task["scope_key"], task["uuid"]),
+            (project_id, task["scope_key"], task["uuid"], project_id),
         )
     if source_kind == "folder.deleted":
         if not payload.get("emit_public_event", True):
@@ -2285,30 +2668,73 @@ def process_one_projection_task(
     fanout_batch_size: int = DEFAULT_FANOUT_BATCH_SIZE,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    metrics: dict[str, float] | None = None,
 ) -> bool:
     """Process one claimed task; return ``False`` when the queue is empty."""
     if not 1 <= fanout_batch_size <= MAX_FANOUT_BATCH_SIZE:
         raise ValueError(
             f"fanout_batch_size must be between 1 and {MAX_FANOUT_BATCH_SIZE}"
         )
+    claim_started_at = time.monotonic()
+    claimed_at = datetime.datetime.now(datetime.timezone.utc)
     task = _claim_task(session, worker_id, lease_seconds)
+    claim_seconds = time.monotonic() - claim_started_at
+    if metrics is not None:
+        metrics["claim_seconds"] = metrics.get("claim_seconds", 0.0) + claim_seconds
+        metrics["claim_seconds_max"] = max(
+            metrics.get("claim_seconds_max", 0.0), claim_seconds
+        )
     if task is None:
+        if metrics is not None:
+            metrics["empty_claims"] = metrics.get("empty_claims", 0.0) + 1
+            metrics["empty_claim_seconds"] = (
+                metrics.get("empty_claim_seconds", 0.0) + claim_seconds
+            )
         return False
+    started_at = time.monotonic()
+    task_kind = str(task["task_kind"])
+    if metrics is not None:
+        metrics["claimed"] = metrics.get("claimed", 0.0) + 1
+        claimed_key = f"claimed_{task_kind}"
+        metrics[claimed_key] = metrics.get(claimed_key, 0.0) + 1
+        task_age = float(task["task_age_seconds"])
+        metrics["task_age_seconds_max"] = max(
+            metrics.get("task_age_seconds_max", 0.0), task_age
+        )
     session.execute("SAVEPOINT messenger_v2_projection_task", ())
+    outcome = "running"
     try:
         completed = _process_task(session, task, fanout_batch_size)
     except Exception as error:
         session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_task", ())
         attempts = int(task["attempts"])
         status = "dead_letter" if attempts >= max_attempts else "failed"
+        outcome = status
         delay = min(2 ** min(attempts, 10), 300)
+        duration = time.monotonic() - started_at
+        execution_stats = _finish_execution_stats(
+            task,
+            worker_id=worker_id,
+            claimed_at=claimed_at,
+            claim_seconds=claim_seconds,
+            processing_seconds=duration,
+            outcome=outcome,
+        )
         session.execute(
             """
             UPDATE messenger_projection_tasks
             SET status = %s, lease_owner = NULL, lease_expires_at = NULL,
                 next_retry_at = CASE WHEN %s = 'failed'
                     THEN NOW() + make_interval(secs => %s) ELSE NULL END,
-                last_error = %s, updated_at = NOW()
+                last_error = %s,
+                payload = jsonb_set(
+                    payload,
+                    '{_execution_stats}',
+                    %s::jsonb || jsonb_build_object(
+                        'processed_count', processed_count
+                    )
+                ),
+                updated_at = NOW()
             WHERE project_id = %s AND uuid = %s AND fencing_token = %s
             """,
             (
@@ -2316,6 +2742,7 @@ def process_one_projection_task(
                 status,
                 delay,
                 str(error)[:4096],
+                json.dumps(execution_stats),
                 task["project_id"],
                 task["uuid"],
                 task["fencing_token"],
@@ -2325,26 +2752,63 @@ def process_one_projection_task(
             "Failed to process Messenger v2 projection task",
             extra={"task_uuid": str(task["uuid"]), "task_kind": task["task_kind"]},
         )
+        if metrics is not None:
+            outcome = "dead_letter" if status == "dead_letter" else "retry"
+            metrics[outcome] = metrics.get(outcome, 0.0) + 1
+            outcome_key = f"{outcome}_{task_kind}"
+            metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
     else:
         session.execute("RELEASE SAVEPOINT messenger_v2_projection_task", ())
         if completed:
             _purge_completed_tombstone(session, task)
+        outcome = "completed" if completed else "requeued"
+        duration = time.monotonic() - started_at
+        execution_stats = _finish_execution_stats(
+            task,
+            worker_id=worker_id,
+            claimed_at=claimed_at,
+            claim_seconds=claim_seconds,
+            processing_seconds=duration,
+            outcome=outcome,
+        )
         session.execute(
             """
             UPDATE messenger_projection_tasks
             SET status = %s, lease_owner = NULL, lease_expires_at = NULL,
                 attempts = CASE WHEN %s THEN attempts ELSE 0 END,
-                next_retry_at = NULL, last_error = NULL, updated_at = NOW()
+                next_retry_at = NULL, last_error = NULL,
+                payload = jsonb_set(
+                    payload,
+                    '{_execution_stats}',
+                    %s::jsonb || jsonb_build_object(
+                        'processed_count', processed_count
+                    )
+                ),
+                updated_at = NOW()
             WHERE project_id = %s AND uuid = %s AND fencing_token = %s
             """,
             (
                 "completed" if completed else "pending",
                 completed,
+                json.dumps(execution_stats),
                 task["project_id"],
                 task["uuid"],
                 task["fencing_token"],
             ),
         )
+        if metrics is not None:
+            metrics[outcome] = metrics.get(outcome, 0.0) + 1
+            outcome_key = f"{outcome}_{task_kind}"
+            metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
+            if completed and task_kind == "fanout":
+                delay = (
+                    datetime.datetime.now(datetime.timezone.utc)
+                    - task["outbox_created_at"]
+                ).total_seconds()
+                metrics["fanout_outbox_to_websocket_seconds_max"] = max(
+                    metrics.get("fanout_outbox_to_websocket_seconds_max", 0.0),
+                    delay,
+                )
     finally:
         session.execute(
             """
@@ -2361,7 +2825,97 @@ def process_one_projection_task(
                 task["fencing_token"],
             ),
         )
+    if metrics is not None:
+        duration = time.monotonic() - started_at
+        metrics["processing_seconds"] = (
+            metrics.get("processing_seconds", 0.0) + duration
+        )
+        duration_key = f"processing_seconds_{task_kind}"
+        metrics[duration_key] = metrics.get(duration_key, 0.0) + duration
+        max_key = f"processing_seconds_max_{task_kind}"
+        metrics[max_key] = max(metrics.get(max_key, 0.0), duration)
     return True
+
+
+def _finish_execution_stats(
+    task: typing.Mapping[str, typing.Any],
+    *,
+    worker_id: str,
+    claimed_at: datetime.datetime,
+    claim_seconds: float,
+    processing_seconds: float,
+    outcome: str,
+) -> dict[str, object]:
+    """Build a compact per-task latency record without a history hot spot."""
+    existing = dict(
+        task.get("execution_stats")
+        or task.get("payload", {}).get("_execution_stats")
+        or {}
+    )
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
+    processing_ms = round(processing_seconds * 1000, 3)
+    raw_queue_wait_ms = float(task["task_age_seconds"]) * 1000
+    raw_outbox_wait_ms = float(task["outbox_age_seconds"]) * 1000
+    raw_derivation_delay_ms = (
+        task["created_at"] - task["outbox_created_at"]
+    ).total_seconds() * 1000
+    raw_outbox_to_finish_ms = (
+        finished_at - task["outbox_created_at"]
+    ).total_seconds() * 1000
+    observed_clock_skew_ms = max(
+        0.0,
+        -raw_queue_wait_ms,
+        -raw_outbox_wait_ms,
+        -raw_derivation_delay_ms,
+        -raw_outbox_to_finish_ms,
+    )
+    existing.update(
+        {
+            "schema_version": 1,
+            "claim_count": int(existing.get("claim_count", 0)) + 1,
+            "first_claimed_at": existing.get(
+                "first_claimed_at", claimed_at.isoformat()
+            ),
+            "last_claimed_at": claimed_at.isoformat(),
+            "last_finished_at": finished_at.isoformat(),
+            "last_worker_id": worker_id,
+            "last_outcome": outcome,
+            "queue_wait_ms": round(max(0.0, raw_queue_wait_ms), 3),
+            "outbox_wait_ms": round(max(0.0, raw_outbox_wait_ms), 3),
+            "derivation_delay_ms": round(max(0.0, raw_derivation_delay_ms), 3),
+            "observed_clock_skew_ms": round(observed_clock_skew_ms, 3),
+            "claim_duration_ms": round(claim_seconds * 1000, 3),
+            "processing_duration_ms": processing_ms,
+            "total_processing_duration_ms": round(
+                float(existing.get("total_processing_duration_ms", 0)) + processing_ms,
+                3,
+            ),
+            "outbox_to_finish_ms": round(max(0.0, raw_outbox_to_finish_ms), 3),
+        }
+    )
+    existing.update(task.get("_execution_stats") or {})
+    return existing
+
+
+def projection_queue_metrics(session: typing.Any) -> dict[str, float]:
+    """Return bounded queue gauges for structured worker metrics."""
+    row = session.execute(
+        """
+        SELECT count(*)::bigint AS unfinished,
+               count(*) FILTER (WHERE status = 'pending')::bigint AS pending,
+               count(*) FILTER (WHERE status = 'failed')::bigint AS failed,
+               count(*) FILTER (WHERE status = 'running')::bigint AS running,
+               EXTRACT(EPOCH FROM (NOW() - min(created_at)))
+                   AS oldest_pending_task_seconds,
+               EXTRACT(EPOCH FROM (
+                   NOW() - min(created_at) FILTER (WHERE task_kind = 'fanout')
+               )) AS oldest_pending_fanout_seconds
+        FROM messenger_projection_tasks
+        WHERE status NOT IN ('completed', 'dead_letter')
+        """,
+        (),
+    ).fetchone()
+    return {name: float(value or 0) for name, value in dict(row).items()}
 
 
 def drain_projection_queue(

@@ -48,6 +48,11 @@ def _legacy_read_state(monkeypatch):
         "_missing_provider_message_is_tombstoned",
         lambda *_args, **_kwargs: False,
     )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_provider_projection_recipients",
+        lambda session, _project_id, _stream_uuid: session.projection_recipients,
+    )
 
 
 def test_topic_merge_uses_notification_timestamp_not_generic_updated_at():
@@ -72,6 +77,13 @@ class Session:
     def __init__(self, rows):
         if not isinstance(rows, list):
             rows = [rows]
+        assignment = next(
+            (row for row in rows if isinstance(row, dict) and "owner_user_uuid" in row),
+            None,
+        )
+        self.projection_recipients = (
+            [] if assignment is None else [assignment["owner_user_uuid"]]
+        )
         self.rows = iter(rows)
         self.statements = []
 
@@ -1204,6 +1216,158 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
     ]
 
 
+def test_new_provider_group_dm_is_materialized_as_channel(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    member_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    created = []
+    bound = []
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStream",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None)
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceUser",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_all=lambda **_kwargs: [
+                    types.SimpleNamespace(uuid=owner_uuid),
+                    types.SimpleNamespace(uuid=member_uuid),
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStreamBinding",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_all=lambda **_kwargs: [])
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_or_create_workspace_user_stream",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_or_create_workspace_stream_bindings",
+        lambda *args, **kwargs: bound.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_revoked_workspace_external_chat_members",
+        lambda *args, **kwargs: set(),
+    )
+
+    external_projection.ensure_external_chat_stream(
+        object(),
+        project_id=project_uuid,
+        owner_user_uuid=owner_uuid,
+        projection_stream_uuid=stream_uuid,
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        external_account_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        provider_chat_id="group_direct:7,8,9",
+        display_name="Member One, Member Two",
+        source={
+            "chat_type": "group",
+            "description": "",
+            "topics": [],
+            "participants": [
+                {"identity_uuid": str(owner_uuid), "role": "owner"},
+                {"identity_uuid": str(member_uuid), "role": "member"},
+            ],
+        },
+        capabilities={},
+        account_settings={"server_url": "https://zulip.example.test"},
+    )
+
+    values = created[0][1]
+    assert values["private"] is False
+    assert values["invite_only"] is True
+    assert values["provider_metadata"]["default_display_name"] == (
+        "Member One, Member Two"
+    )
+    assert bound[0][1]["role_user_uuids"] == {
+        "owner": [owner_uuid],
+        "member": [member_uuid],
+    }
+
+
+def test_new_provider_self_dm_remains_private(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    created = []
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStream",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None)
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceUser",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_all=lambda **_kwargs: [types.SimpleNamespace(uuid=owner_uuid)]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.models,
+        "WorkspaceStreamBinding",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_all=lambda **_kwargs: [])
+        ),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_or_create_workspace_user_stream",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_or_create_workspace_stream_bindings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        external_projection.helpers,
+        "get_revoked_workspace_external_chat_members",
+        lambda *_args, **_kwargs: set(),
+    )
+
+    external_projection.ensure_external_chat_stream(
+        object(),
+        project_id=project_uuid,
+        owner_user_uuid=owner_uuid,
+        projection_stream_uuid=sys_uuid.uuid4(),
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        external_account_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        provider_chat_id="group_direct:7",
+        display_name="Saved messages",
+        source={
+            "chat_type": "group",
+            "description": "",
+            "topics": [],
+            "participants": [{"identity_uuid": str(owner_uuid), "role": "owner"}],
+        },
+        capabilities={},
+        account_settings={"server_url": "https://zulip.example.test"},
+    )
+
+    values = created[0][1]
+    assert values["private"] is True
+    assert values["direct_user_uuid"] == owner_uuid
+
+
 def test_message_upsert_is_scoped_to_selected_projection_and_adds_provider_metadata(
     monkeypatch,
 ):
@@ -1624,7 +1788,7 @@ def test_provider_message_snapshot_applies_owner_read_state(monkeypatch):
                 [message_uuid],
                 False,
             ),
-            {},
+            {"emit_events": True},
         )
     ]
 
@@ -1658,8 +1822,8 @@ def test_provider_backfill_message_suppresses_per_message_ui_events(monkeypatch)
         lambda *args, **kwargs: creates.append((args, kwargs)),
     )
     monkeypatch.setattr(
-        provider_event_apply.helpers,
-        "sync_workspace_user_message_flags",
+        provider_event_apply,
+        "_sync_provider_read_state",
         lambda *args, **kwargs: updates.append((args, kwargs)),
     )
 
@@ -1730,21 +1894,27 @@ def test_provider_reconciliation_loads_native_message_without_current_binding(
     assert message.source_name == models.SourceName.NATIVE.value
 
 
-def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
+def test_message_upsert_scopes_three_ui_events_to_projection_participants(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
     member_uuids = [sys_uuid.uuid4() for _index in range(300)]
+    confirmed_recipients = sorted(member_uuids[:2])
+    projection_recipients = sorted([owner_uuid, *confirmed_recipients])
     event = _message_event(stream_uuid)
     event_resource = event["payload"]["resource"]
     message_uuid = sys_uuid.UUID(event_resource["uuid"])
     user_topics = [
         types.SimpleNamespace(
             uuid=sys_uuid.UUID(event_resource["topic_uuid"]),
-            user_uuid=owner_uuid,
+            user_uuid=user_uuid,
         )
+        for user_uuid in projection_recipients
     ]
-    user_streams = [types.SimpleNamespace(uuid=stream_uuid, user_uuid=owner_uuid)]
+    user_streams = [
+        types.SimpleNamespace(uuid=stream_uuid, user_uuid=user_uuid)
+        for user_uuid in projection_recipients
+    ]
     session = Session(
         [
             {
@@ -1759,6 +1929,9 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
             user_streams,
         ]
     )
+    # The assignment owner remains the minimum safe recipient while the
+    # confirmed-access projection catches up with a newly selected chat.
+    session.projection_recipients = confirmed_recipients
     session._workspace_provider_event_batch_cache = {}
     created_flags = []
 
@@ -1779,7 +1952,7 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
             assert session is not None
 
         def get_recipients(self, session=None):
-            pytest.fail("provider projection must use its scoped account owner")
+            pytest.fail("provider projection must use its scoped recipients")
 
     FakeWorkspaceMessage.objects = types.SimpleNamespace(
         get_one_or_none=lambda **_kwargs: FakeWorkspaceMessage.created,
@@ -1892,7 +2065,7 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
         if 'INSERT INTO "m_workspace_user_message_flags"' in statement
     ]
     assert len(flag_inserts) == 1
-    assert flag_inserts[0][3] == [owner_uuid]
+    assert flag_inserts[0][3] == projection_recipients
     prepared = session._workspace_provider_event_batch_cache[
         ("prepared_broadcast_events",)
     ]
@@ -1901,7 +2074,7 @@ def test_message_upsert_scopes_three_ui_events_to_account_owner(monkeypatch):
         "topic.updated",
         "stream.updated",
     ]
-    assert [item["recipients"] for item in prepared] == [[owner_uuid]] * 3
+    assert [item["recipients"] for item in prepared] == [projection_recipients] * 3
     message_payload = prepared[0]["payload"]
     assert str(message_uuid) in str(message_payload)
     assert message_payload["source"]["kind"] == "zulip"
@@ -2066,7 +2239,7 @@ def test_provider_unread_state_emits_exact_owner_message_snapshots(monkeypatch):
     ]
 
 
-def test_provider_unread_state_keeps_owner_authored_message_read(monkeypatch):
+def test_provider_unread_state_preserves_owner_authored_message_unread(monkeypatch):
     project_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()
     topic_uuid = sys_uuid.uuid4()
@@ -2078,13 +2251,21 @@ def test_provider_unread_state_keeps_owner_authored_message_read(monkeypatch):
             "author_uuid": owner_uuid,
             "stream_uuid": stream_uuid,
             "topic_uuid": topic_uuid,
-            "read": False,
+            "read": True,
         }
     ]
     session = Session([None, stored_rows, [{"uuid": message_uuid}]])
+    snapshot = types.SimpleNamespace(uuid=message_uuid)
     read_events = []
     unread_events = []
     aggregate_events = []
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceUserMessage",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_all=lambda **_kwargs: [snapshot])
+        ),
+    )
     monkeypatch.setattr(
         provider_event_apply.helpers.messenger_events,
         "create_messages_read_event",
@@ -2111,13 +2292,10 @@ def test_provider_unread_state_keeps_owner_authored_message_read(monkeypatch):
         False,
     )
 
-    assert read_events == [
-        (
-            (project_uuid, owner_uuid, [message_uuid]),
-            {"session": session},
-        )
+    assert read_events == []
+    assert unread_events == [
+        ((), {"message": snapshot, "session": session})
     ]
-    assert unread_events == []
     assert aggregate_events == [
         (
             (project_uuid, [owner_uuid], stream_uuid, topic_uuid),
@@ -2943,6 +3121,47 @@ def test_message_delete_uses_compact_broadcast_path(monkeypatch):
             },
         )
     ]
+
+
+def test_provider_group_stream_update_preserves_local_name(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    updated = []
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_existing",
+        lambda *_args: types.SimpleNamespace(uuid=stream_uuid),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "is_native_direct_projection",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "update_workspace_user_stream",
+        lambda *args, **kwargs: updated.append((args, kwargs)),
+    )
+
+    provider_event_apply._stream_event(
+        object(),
+        {"kind": "stream.upsert"},
+        project_uuid,
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+            "source": {"chat_type": "group"},
+        },
+        {
+            "uuid": str(stream_uuid),
+            "name": "Provider participant list",
+            "description": "",
+        },
+    )
+
+    assert updated[0][0][:3] == (project_uuid, owner_uuid, stream_uuid)
+    assert "name" not in updated[0][0][3]
 
 
 def test_provider_stream_delete_preserves_shared_native_direct_chat(monkeypatch):

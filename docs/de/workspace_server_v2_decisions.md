@@ -387,6 +387,40 @@ bereits gelesen sind. So repariert ein idempotenter Wiederholungsversuch einen
 veralteten Snapshot. Diese Projektionsaufgaben laufen vor Massenimporten; die
 normale Snapshot-Zusammenfassung begrenzt weiterhin die Datenbanklast.
 
+Dieselben Leseaktionen aktualisieren im kanonischen Vorgang auch den rollenden
+Compact-Kompatibilitaetszustand. Migration `0166` repariert fuer
+alle Benutzer jede bestehende Kombination aus kanonisch gelesen und im
+Compact-Bitmap ungelesen, aktualisiert die betroffenen Topic-Lesestatistiken und
+erhoeht die benutzerspezifische Leserevision. Die Reparatur ist monoton und
+veraendert keine kanonisch ungelesene Zeile, auch nicht aus einem
+Provider-Snapshot.
+
+Migration `0167` gleicht danach fuer alle aktiven Benutzer jedes Compact- oder
+Rollback-Topic-Leseaggregat mit dem gespeicherten Bitmap ab. Dadurch wird auch
+ein Aggregat repariert, das veraltet blieb, obwohl alle Nachrichtenbits bereits
+mit dem kanonischen `read_at` uebereinstimmten, sodass Stream-, Topic- und
+Ordnerzaehler denselben Lesezustand verwenden.
+
+Migration `0168` gleicht die gemeinsamen Compact-Nachrichtenzahlen der Topics
+und die letzten Ingest-Koordinaten aus den gespeicherten Nachrichtenzeilen ab.
+Damit ist auch der Fall abgedeckt, in dem alle Benutzer-Lesezaehler korrekt
+sind, aber eine veraltete Topic-Nachrichtenzahl die Compatibility-Zaehler fuer
+Stream, Topic und Ordner weiterhin verschiebt.
+
+Migration `0169` wendet die Normalisierung privater Provider-Chats erneut an
+und verwendet den Provider-`display_name` jedes Teilnehmers als massgebliche
+Quelle fuer benutzerspezifische Namen von Einzel- und Gruppen-Chats. Eine
+Workspace-Identitaet dient nur als Fallback, wenn der Provider keinen Namen
+liefert. Ein alter Name, der der frueheren Workspace-Identity-Projektion
+entspricht, wird als Provider-verwaltet erkannt; eine explizite lokale
+Umbenennung eines Gruppen-Chats bleibt erhalten.
+
+Migration `0170` behandelt auch den Eigentümer des ausgewählten Provider-Chats
+als gültigen Betrachter, wenn ein Einzelchat-Katalogeintrag nur den
+Gesprächspartner enthält. Dadurch bleibt dessen Provider-Name für jedes
+verknüpfte Konto maßgeblich, ohne dass der Provider den Eigentümer in der
+Teilnehmerliste wiederholen muss.
+
 ## Reihenfolge der Provider-Leseseiten
 
 Eine verzögert materialisierte Provider-Leseseite verwendet für die Reihenfolge
@@ -396,6 +430,37 @@ Operationssequenz erhält, darf die ältere Seite aber nicht blockieren. Früher
 Snapshots sperren weiterhin spätere Schreibvorgänge derselben Stream-Lane;
 andere Lanes bleiben unabhängig. Die Grenzen für Materialisierung und
 Lease-Batches ändern sich nicht.
+
+## Wiederherstellung des Provider-Ingress
+
+Private Provider-API-Befehle können sicher wiederholt werden: Ihre Request-,
+Event-, Lease- und Result-IDs bleiben zwischen Versuchen stabil. Nach einem
+PostgreSQL-Deadlock wiederholt der Server die gesamte Request-Transaktion mit
+einem kurzen begrenzten exponentiellen Backoff; andere Control- und File-Requests
+werden nicht wiederholt. Sind alle Versuche erschöpft, wird ein wiederholbarer
+`503` ohne Datenbankdetails zurückgegeben. Beim Wiederherstellen einer
+Topic-Zusammenfassung nach einer Provider-Löschung werden Journal-Grenzen ohne
+vorhandene Nachricht übersprungen. So verwirft eine veraltete abgeleitete
+Zusammenfassung nicht den gesamten eingehenden Batch.
+Vor einer Provider-Löschung eingestellte Projektionsarbeit behandelt die
+gelöschte kanonische Nachricht als nicht vorhanden. Veraltete Fanout- oder
+Mention-Aufgaben enden dadurch als No-op statt in der Dead-Letter-Queue.
+
+## Read-State-Parität für Provider-Kontoinhaber
+
+Eine Provider-Nachricht, die von mehreren Konten desselben Realms gemeinsam
+verwendet wird, hat eine kanonische Platzierung, aber für jeden Inhaber eines
+ausgewählten Kontos einen eigenen Binding- und State-Datensatz. Der kompakte
+Import materialisiert diese Datensätze in einem begrenzten SQL-Batch und
+aktualisiert Compact-Bitmap und kanonisches `read_at` in derselben Transaktion.
+Snapshot-Backfills unterdrücken weiterhin öffentliche Einzelereignisse;
+autoritative Stream- und Topic-Zähler werden trotzdem neu berechnet.
+
+Migration `0162` stellt anhand des dauerhaften Journals angewendeter
+Provider-Ereignisse nur tatsächlich ausgelieferte Message/Account-Paare wieder
+her. Der effektive Lesestatus stammt aus dem Compact-Bitmap beziehungsweise
+außerhalb des Compact-Modus aus dem Legacy-Flag. Anschließend werden betroffene
+Stream-, Topic- und Folder-Zähler neu aufgebaut und vor dem Commit geprüft.
 
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 

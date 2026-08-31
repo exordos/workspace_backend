@@ -5,6 +5,7 @@
 
 import http.server
 import logging
+import random
 import re
 import socketserver
 import ssl
@@ -24,6 +25,26 @@ MAX_BODY = 52 * 1024 * 1024
 MAX_ENROLLMENT_BODY = 1024 * 1024
 _CANONICAL_CONTENT_LENGTH = re.compile(r"(?:0|[1-9][0-9]*)")
 LOG = logging.getLogger(__name__)
+PROVIDER_DEADLOCK_MAX_ATTEMPTS = 4
+PROVIDER_DEADLOCK_BASE_DELAY_SECONDS = 0.02
+
+
+class _ProviderDeadlockRetryExhausted(provider_data.ProviderDataError):
+    status = 503
+    error = "provider_database_contention"
+
+
+def _is_database_deadlock(error: BaseException) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "sqlstate", None) == "40P01":
+            return True
+        if getattr(current, "code", None) == "40P01":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class _RollbackResponse(RuntimeError):
@@ -168,34 +189,62 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
                 raise provider_service.ProviderIngressUnavailableError(
                     "Private API request transaction is not configured"
                 )
-            try:
-                commit_started_at = None
-                with server.request_session_factory() as request_session:
-                    response = server.private_service.handle(
-                        self.command,
-                        self.path,
-                        dict(self.headers.items()),
-                        body,
-                        certificate_der,
-                        request_session=request_session,
-                    )
-                    if response.status >= 400:
-                        raise _RollbackResponse(response)
-                    commit_started_at = time.monotonic()
-                if self.command == "POST" and urllib.parse.urlsplit(self.path).path in {
-                    "/api/workspace-provider/v1/events",
-                    "/api/workspace-provider/v2/commands",
-                }:
-                    commit_duration = time.monotonic() - commit_started_at
-                    LOG.info(
-                        "Committed provider event batch: duration_seconds=%.3f",
-                        commit_duration,
+            request_path = urllib.parse.urlsplit(self.path).path
+            provider_request = provider_service.ProviderDataService.matches(
+                request_path
+            )
+            for attempt in range(1, PROVIDER_DEADLOCK_MAX_ATTEMPTS + 1):
+                try:
+                    commit_started_at = None
+                    with server.request_session_factory() as request_session:
+                        response = server.private_service.handle(
+                            self.command,
+                            self.path,
+                            dict(self.headers.items()),
+                            body,
+                            certificate_der,
+                            request_session=request_session,
+                        )
+                        if response.status >= 400:
+                            raise _RollbackResponse(response)
+                        commit_started_at = time.monotonic()
+                    if self.command == "POST" and request_path in {
+                        "/api/workspace-provider/v1/events",
+                        "/api/workspace-provider/v2/commands",
+                    }:
+                        commit_duration = time.monotonic() - commit_started_at
+                        LOG.info(
+                            "Committed provider event batch: duration_seconds=%.3f",
+                            commit_duration,
+                            extra={
+                                "provider_batch_commit_duration_seconds": (
+                                    commit_duration
+                                ),
+                            },
+                        )
+                    break
+                except _RollbackResponse as rollback:
+                    response = rollback.response
+                    break
+                except Exception as error:
+                    if not provider_request or not _is_database_deadlock(error):
+                        raise
+                    if attempt == PROVIDER_DEADLOCK_MAX_ATTEMPTS:
+                        raise _ProviderDeadlockRetryExhausted(
+                            "The provider request could not complete due to "
+                            "concurrent database activity"
+                        ) from error
+                    delay = PROVIDER_DEADLOCK_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                    delay *= random.uniform(0.75, 1.25)
+                    LOG.warning(
+                        "Retrying provider request after PostgreSQL deadlock",
                         extra={
-                            "provider_batch_commit_duration_seconds": commit_duration,
+                            "provider_deadlock_retry_attempt": attempt,
+                            "provider_request_path": request_path,
+                            "provider_deadlock_retry_delay_seconds": delay,
                         },
                     )
-            except _RollbackResponse as rollback:
-                response = rollback.response
+                    time.sleep(delay)
         except provider_data.ProviderDataError as error:
             response = service.Response.json(
                 error.status,

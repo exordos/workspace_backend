@@ -72,6 +72,7 @@ def _healthy_bridge(capabilities=None):
 def _leased_row(identity, request_uuid):
     return {
         "uuid": sys_uuid.uuid4(),
+        "sequence": 1,
         "external_operation_uuid": sys_uuid.uuid4(),
         "bridge_instance_uuid": identity.bridge_instance_uuid,
         "external_account_uuid": sys_uuid.uuid4(),
@@ -251,6 +252,7 @@ def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
                 "operation_kind": "message.create",
             },
             None,
+            None,
             {"result_uuid": result_uuid},
             None,
             {"nonterminal_count": 0, "attempt": 2},
@@ -274,6 +276,7 @@ def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
             "lease_uuid": str(lease_uuid),
             "status": "succeeded",
             "safe_error": None,
+            "provider_entity_id": "14019",
         },
         now=NOW,
     )
@@ -282,9 +285,18 @@ def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
     assert session.statements[0][1] == (
         provider_data.read_state.READ_STATE_SCHEMA_LOCK_KEY,
     )
-    assert "m_external_provider_operation_results_v1" in session.statements[5][0]
-    assert "m_external_provider_operations_v1" in session.statements[6][0]
-    assert "m_external_operations_v2" in session.statements[9][0]
+    assert any(
+        'INSERT INTO "m_external_provider_operation_results_v1"' in statement
+        for statement, _params in session.statements
+    )
+    assert any(
+        'UPDATE "m_external_provider_operations_v1"' in statement
+        for statement, _params in session.statements
+    )
+    assert any(
+        'UPDATE "m_external_operations_v2"' in statement
+        for statement, _params in session.statements
+    )
     assert events == [
         (
             session,
@@ -293,6 +305,48 @@ def test_terminal_result_updates_queue_and_public_operation_once(monkeypatch):
             provider_data.messenger_events.EXTERNAL_OPERATION_UPDATED_EVENT,
         )
     ]
+
+
+def test_successful_zulip_message_result_requires_provider_identifier():
+    identity = _identity()
+    result_uuid = sys_uuid.uuid4()
+    lease_uuid = sys_uuid.uuid4()
+    session = Session(
+        [
+            None,
+            {
+                "external_operation_uuid": sys_uuid.uuid4(),
+                "project_id": sys_uuid.uuid4(),
+                "status": "leased",
+                "lease_uuid": lease_uuid,
+                "attempt": 1,
+                "operation_kind": "message.create",
+            },
+        ]
+    )
+
+    response = provider_data.report_provider_results(
+        session,
+        identity,
+        [
+            {
+                "result_uuid": str(result_uuid),
+                "provider_operation_uuid": str(sys_uuid.uuid4()),
+                "lease_uuid": str(lease_uuid),
+                "status": "succeeded",
+            }
+        ],
+        now=NOW,
+    )
+
+    assert response == {
+        "results": [{"result_uuid": str(result_uuid), "status": "rejected"}]
+    }
+    assert not any(
+        'INSERT INTO "m_external_provider_operation_results_v1"' in statement
+        or 'UPDATE "m_external_provider_operations_v1"' in statement
+        for statement, _params in session.statements
+    )
 
 
 def test_result_batch_partially_accepts_and_deduplicates_items():
@@ -1039,3 +1093,80 @@ def test_unknown_operation_kind_is_not_in_capability_allow_list():
     )
     assert "message.create" in allowed
     assert "unknown.operation" not in allowed
+
+
+def test_succeeded_native_message_result_binds_provider_message_identity():
+    identity = _identity()
+    external_operation_uuid = sys_uuid.uuid4()
+    external_account_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    realm_uuid = sys_uuid.uuid4()
+    session = Session(
+        [
+            {
+                "target_type": "message",
+                "target_uuid": message_uuid,
+                "external_account_uuid": external_account_uuid,
+            },
+            {"provider_realm_uuid": realm_uuid},
+            {
+                "source_name": "native",
+                "provider_uuid": None,
+                "external_account_uuid": None,
+                "provider_external_id": None,
+            },
+            None,
+            None,
+        ]
+    )
+
+    provider_data._bind_native_message_provider_identity(
+        session,
+        identity,
+        {
+            "external_operation_uuid": external_operation_uuid,
+            "project_id": project_uuid,
+            "operation_kind": "message.create",
+        },
+        "14019",
+    )
+
+    assert any(
+        params and "provider-message-identity-v1" in params[0]
+        for statement, params in session.statements
+        if "pg_advisory_xact_lock" in statement
+    )
+    update, params = next(
+        (statement, params)
+        for statement, params in session.statements
+        if 'UPDATE "m_workspace_messages"' in statement
+    )
+    assert "provider_metadata" in update
+    assert params == (
+        identity.bridge_instance_uuid,
+        external_account_uuid,
+        "14019",
+        external_account_uuid,
+        "14019",
+        realm_uuid,
+        project_uuid,
+        message_uuid,
+    )
+
+
+@pytest.mark.parametrize("provider_entity_id", ("", "014019", "not-a-number"))
+def test_native_message_result_rejects_invalid_zulip_message_identifier(
+    provider_entity_id,
+):
+    with pytest.raises(ValueError, match="Zulip provider message identifier"):
+        provider_data._bind_native_message_provider_identity(
+            Session([]),
+            _identity(),
+            {
+                "external_operation_uuid": sys_uuid.uuid4(),
+                "project_id": sys_uuid.uuid4(),
+                "operation_kind": "message.create",
+            },
+            provider_entity_id,
+        )

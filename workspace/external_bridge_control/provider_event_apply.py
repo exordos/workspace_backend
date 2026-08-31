@@ -434,6 +434,29 @@ def _message_recipients(
     )
 
 
+def _provider_projection_recipients(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    stream_uuid: sys_uuid.UUID,
+) -> list[sys_uuid.UUID]:
+    """Return every current member authorized for one provider projection."""
+    rows = session.execute(
+        """
+        SELECT DISTINCT binding.user_uuid
+        FROM m_workspace_stream_bindings AS binding
+        JOIN m_confirmed_external_stream_access AS access
+          ON access.project_id = binding.project_id
+         AND access.stream_uuid = binding.stream_uuid
+         AND access.user_uuid = binding.user_uuid
+        WHERE binding.project_id = %s
+          AND binding.stream_uuid = %s
+        ORDER BY binding.user_uuid
+        """,
+        (project_id, stream_uuid),
+    ).fetchall()
+    return [sys_uuid.UUID(str(row["user_uuid"])) for row in rows]
+
+
 def _file_projection_matches(
     candidate: typing.Any,
     source: typing.Any,
@@ -970,14 +993,20 @@ def _stream_event(
         raise ValueError("Provider stream projection must be materialized by control")
     if native_direct:
         return stream_uuid
+    values = _provider_values(
+        resource,
+        {"announce", "color", "description", "invite_only", "name"},
+    )
+    if assignment["source"].get("chat_type") == "group":
+        # Zulip group DMs have no mutable upstream title.  Their initial
+        # Workspace label comes from participants, but a local rename is a
+        # Workspace-owned value and must survive later provider snapshots.
+        values.pop("name", None)
     helpers.update_workspace_user_stream(
         project_id,
         assignment["owner_user_uuid"],
         stream_uuid,
-        _provider_values(
-            resource,
-            {"announce", "color", "description", "invite_only", "name"},
-        ),
+        values,
         session=session,
     )
     return stream_uuid
@@ -1431,6 +1460,17 @@ def _message_event(
             sys_uuid.UUID(str(event["external_account_uuid"])),
             emit_events=not quiet_backfill,
         )
+    projection_recipients = sorted(
+        {
+            assignment["owner_user_uuid"],
+            *_provider_projection_recipients(
+                session,
+                project_id,
+                stream_uuid,
+            ),
+        },
+        key=str,
+    )
     values = _scoped_provider_values(
         resource,
         {
@@ -1497,17 +1537,27 @@ def _message_event(
                     validation_cache
                 )
         try:
-            helpers.create_workspace_user_message(
+            created = helpers.create_workspace_user_message(
                 project_id,
                 values.pop("user_uuid"),
                 session=session,
                 enforce_visibility=False,
                 return_visible=False,
                 compact_events=True,
-                scoped_recipient_uuids=[assignment["owner_user_uuid"]],
+                scoped_recipient_uuids=projection_recipients,
                 **create_options,
                 **values,
             )
+            if read_state.project_mode(session, project_id) == (
+                read_state.PROJECT_MODE_COMPACT
+            ):
+                helpers.ensure_workspace_message_recipients(
+                    project_id,
+                    created,
+                    projection_recipients,
+                    session,
+                    emit_events=False,
+                )
         finally:
             if batch_validation_token is not None:
                 models._PROVIDER_MESSAGE_VALIDATION_CACHE.reset(batch_validation_token)
@@ -1516,7 +1566,7 @@ def _message_event(
             helpers.ensure_workspace_message_recipients(
                 project_id,
                 existing,
-                [assignment["owner_user_uuid"]],
+                projection_recipients,
                 session,
                 emit_events=not quiet_backfill,
             )
@@ -1652,7 +1702,7 @@ def _message_event(
                 helpers.ensure_workspace_message_recipients(
                     project_id,
                     existing,
-                    [assignment["owner_user_uuid"]],
+                    projection_recipients,
                     session,
                     emit_events=False,
                 )
@@ -1666,7 +1716,7 @@ def _message_event(
                     helpers.messenger_events.create_message_events(
                         project_id=project_id,
                         message=existing,
-                        recipients=[assignment["owner_user_uuid"]],
+                        recipients=projection_recipients,
                         session=session,
                         compact=True,
                     )
@@ -1708,25 +1758,16 @@ def _message_event(
             )
             existing.update(session=session)
     if read_value is not None:
-        if quiet_backfill:
-            helpers.sync_workspace_user_message_flags(
-                project_id,
-                assignment["owner_user_uuid"],
-                message_uuid,
-                {"read": read_value},
-                session=session,
-                emit_events=False,
-            )
-        else:
-            _sync_provider_read_state(
-                session,
-                project_id,
-                assignment["owner_user_uuid"],
-                stream_uuid,
-                sys_uuid.UUID(str(resource["topic_uuid"])),
-                [message_uuid],
-                read_value,
-            )
+        _sync_provider_read_state(
+            session,
+            project_id,
+            assignment["owner_user_uuid"],
+            stream_uuid,
+            sys_uuid.UUID(str(resource["topic_uuid"])),
+            [message_uuid],
+            read_value,
+            emit_events=not quiet_backfill,
+        )
     return message_uuid
 
 
@@ -1854,6 +1895,8 @@ def _sync_provider_read_state(
     topic_uuid: sys_uuid.UUID | None,
     message_uuids: list[sys_uuid.UUID],
     read: bool,
+    *,
+    emit_events: bool = True,
 ) -> None:
     # Workspace events acquire this project-scoped lock after mutating message
     # flags. Take it first for imported read-state batches so a concurrent
@@ -1865,6 +1908,17 @@ def _sync_provider_read_state(
         (project_id,),
     )
     mode = read_state.project_mode(session, project_id)
+    # A shared provider message can already exist because another account in
+    # the same realm projected it first.  Compact mode intentionally omits
+    # legacy unread flag rows, so ensure the selected account owns canonical
+    # binding/state rows before comparing either read representation.
+    if read_state.mode_uses_compact_state(mode):
+        helpers.ensure_compact_workspace_message_recipients(
+            project_id,
+            message_uuids,
+            [reader_uuid],
+            session,
+        )
     if read_state.mode_uses_compact_state(mode):
         messages = session.execute(
             f"""
@@ -1873,6 +1927,7 @@ def _sync_provider_read_state(
                 message.user_uuid AS author_uuid,
                 message.stream_uuid,
                 message.topic_uuid,
+                placement.uuid AS placement_uuid,
                 COALESCE(
                     get_bit(
                         chunk.read_bits,
@@ -1882,8 +1937,16 @@ def _sync_provider_read_state(
                         )::integer
                     ),
                     0
-                ) = 1 AS read
+                ) = 1 AS read,
+                state.read_at IS NOT NULL AS canonical_read
             FROM m_workspace_messages AS message
+            JOIN messenger_message_placements AS placement
+              ON placement.project_id = message.project_id
+             AND COALESCE(placement.legacy_public_uuid, placement.uuid) = message.uuid
+            JOIN messenger_user_message_states AS state
+              ON state.project_id = placement.project_id
+             AND state.placement_uuid = placement.uuid
+             AND state.user_uuid = %s
             LEFT JOIN m_workspace_user_read_chunks_v1 AS chunk
               ON chunk.user_uuid = %s
              AND chunk.chunk_number = (
@@ -1893,7 +1956,7 @@ def _sync_provider_read_state(
               AND message.uuid = ANY(%s::uuid[])
             ORDER BY message.uuid
             """,
-            (reader_uuid, project_id, message_uuids),
+            (reader_uuid, reader_uuid, project_id, message_uuids),
         ).fetchall()
     else:
         messages = session.execute(
@@ -1903,9 +1966,18 @@ def _sync_provider_read_state(
                 message.user_uuid AS author_uuid,
                 message.stream_uuid,
                 message.topic_uuid,
-                flags.read
+                placement.uuid AS placement_uuid,
+                COALESCE(flags.read, FALSE) AS read,
+                state.read_at IS NOT NULL AS canonical_read
             FROM m_workspace_messages AS message
-            JOIN m_workspace_user_message_flags AS flags
+            JOIN messenger_message_placements AS placement
+              ON placement.project_id = message.project_id
+             AND COALESCE(placement.legacy_public_uuid, placement.uuid) = message.uuid
+            JOIN messenger_user_message_states AS state
+              ON state.project_id = placement.project_id
+             AND state.placement_uuid = placement.uuid
+             AND state.user_uuid = %s
+            LEFT JOIN m_workspace_user_message_flags AS flags
               ON flags.uuid = message.uuid
              AND flags.project_id = message.project_id
              AND flags.user_uuid = %s
@@ -1913,7 +1985,7 @@ def _sync_provider_read_state(
               AND message.uuid = ANY(%s::uuid[])
             ORDER BY message.uuid
             """,
-            (reader_uuid, project_id, message_uuids),
+            (reader_uuid, reader_uuid, project_id, message_uuids),
         ).fetchall()
     if any(message["stream_uuid"] != stream_uuid for message in messages):
         raise ValueError("Provider read state message is outside the selected chat")
@@ -1921,12 +1993,26 @@ def _sync_provider_read_state(
         True: [],
         False: [],
     }
+    changed_canonical_placements_by_read: dict[bool, list[sys_uuid.UUID]] = {
+        True: [],
+        False: [],
+    }
     message_by_uuid = {message["uuid"]: message for message in messages}
     for message in messages:
-        effective_read = read or message["author_uuid"] == reader_uuid
+        # Provider snapshots are the authoritative per-account state. Zulip
+        # permits a user to mark their own message unread, so the native
+        # Workspace invariant that authored messages stay read must not be
+        # imposed on an externally projected message.
+        effective_read = read
         if message["read"] != effective_read:
             changed_message_uuids_by_read[effective_read].append(message["uuid"])
-    if not any(changed_message_uuids_by_read.values()):
+        if message.get("canonical_read", effective_read) != effective_read:
+            changed_canonical_placements_by_read[effective_read].append(
+                message.get("placement_uuid", message["uuid"])
+            )
+    if not any(changed_message_uuids_by_read.values()) and not any(
+        changed_canonical_placements_by_read.values()
+    ):
         return
     updated_message_uuids_by_read: dict[bool, list[sys_uuid.UUID]] = {
         True: [],
@@ -1974,11 +2060,89 @@ def _sync_provider_read_state(
                     updated_message_uuids_by_read[effective_read],
                     effective_read,
                 )
+    changed_canonical_placement_uuids: list[sys_uuid.UUID] = []
+    for effective_read, placement_uuids in changed_canonical_placements_by_read.items():
+        if not placement_uuids:
+            continue
+        session.execute(
+            """
+            UPDATE messenger_user_message_states
+            SET read_at = CASE WHEN %s THEN NOW() END,
+                updated_at = NOW()
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND placement_uuid = ANY(%s::uuid[])
+            """,
+            (effective_read, project_id, reader_uuid, placement_uuids),
+        )
+        changed_canonical_placement_uuids.extend(placement_uuids)
+    if changed_canonical_placement_uuids:
+        changed_canonical_messages = [
+            message
+            for message in messages
+            if message["placement_uuid"] in changed_canonical_placement_uuids
+        ]
+        counter_targets = {
+            (message["stream_uuid"], message["topic_uuid"])
+            for message in changed_canonical_messages
+        }
+        session.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key, payload
+            )
+            SELECT gen_random_uuid(), %s, 'read_counters', lane.scope_kind,
+                   %s::text || ':' || %s::text || ':' ||
+                       CASE WHEN lane.scope_kind = 'user-stream'
+                            THEN target.stream_uuid::text
+                            ELSE target.topic_uuid::text END,
+                   jsonb_build_object(
+                       'source_kind', 'provider_message_state.updated',
+                       'user_uuid', %s::uuid,
+                       'stream_uuid', target.stream_uuid,
+                       'topic_uuid', target.topic_uuid
+                   )
+            FROM unnest(%s::uuid[], %s::uuid[])
+                 AS target(stream_uuid, topic_uuid)
+            CROSS JOIN (
+                VALUES ('user-stream'::varchar), ('user-topic'::varchar)
+            ) AS lane(scope_kind)
+            """,
+            (
+                project_id,
+                project_id,
+                reader_uuid,
+                reader_uuid,
+                [
+                    target[0]
+                    for target in sorted(counter_targets, key=lambda x: str(x[1]))
+                ],
+                [
+                    target[1]
+                    for target in sorted(counter_targets, key=lambda x: str(x[1]))
+                ],
+            ),
+        )
+    for effective_read, placement_uuids in changed_canonical_placements_by_read.items():
+        if not placement_uuids:
+            continue
+        canonical_message_uuids = {
+            message["uuid"]
+            for message in messages
+            if message["placement_uuid"] in placement_uuids
+        }
+        updated_message_uuids_by_read[effective_read] = sorted(
+            set(updated_message_uuids_by_read[effective_read])
+            | canonical_message_uuids,
+            key=str,
+        )
     updated_message_uuids = [
         *updated_message_uuids_by_read[True],
         *updated_message_uuids_by_read[False],
     ]
     if not updated_message_uuids:
+        return
+    if not emit_events:
         return
     if updated_message_uuids_by_read[True]:
         helpers.messenger_events.create_messages_read_event(

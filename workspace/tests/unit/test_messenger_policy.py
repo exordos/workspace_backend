@@ -6,6 +6,7 @@
 """Authorization and route policy tests for the Messenger store boundary."""
 
 import contextlib
+import datetime
 import hashlib
 import io
 import types
@@ -27,6 +28,14 @@ from workspace.messenger_api.dm import helpers
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
 USER_UUID = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
 PEER_UUID = sys_uuid.UUID("30000000-0000-0000-0000-000000000003")
+
+
+def test_resource_projection_serializes_naive_datetimes_as_utc():
+    naive = datetime.datetime(2026, 8, 31, 10, 59, 17, 123456)
+    aware = naive.replace(tzinfo=datetime.timezone(datetime.timedelta(hours=3)))
+
+    assert resource_projection.simple(naive) == "2026-08-31T10:59:17.123456Z"
+    assert resource_projection.simple(aware) == "2026-08-31T07:59:17.123456Z"
 
 
 class RecordingStore:
