@@ -34,6 +34,10 @@ DEFAULT_FANOUT_BATCH_SIZE = 1000
 MAX_FANOUT_BATCH_SIZE = 5000
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_LEASE_SECONDS = 30
+LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS = (
+    "legacy_message_state.deleted",
+    "legacy_message_state.updated",
+)
 
 
 def process_one_provider_file_cleanup_task(
@@ -1239,6 +1243,27 @@ def _process_folder_projection(
     user_uuid = _uuid(payload["user_uuid"])
     source_kind = payload["source_kind"]
     stream_uuid = payload.get("stream_uuid")
+    if source_kind in LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS:
+        # Legacy flag repair can enqueue the same authoritative folder rebuild
+        # once per message.  The claimed rebuild absorbs every idle sibling for
+        # this scope because none of them carries a historical snapshot.
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'completed', lease_owner = NULL,
+                lease_expires_at = NULL, next_retry_at = NULL,
+                last_error = NULL, updated_at = NOW()
+            WHERE project_id = %s AND task_kind = 'folder_projection'
+              AND scope_kind = 'user-folder' AND scope_key = %s
+              AND uuid <> %s AND status IN ('pending', 'failed')
+              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+              AND payload->>'source_kind' IN (
+                  'legacy_message_state.deleted',
+                  'legacy_message_state.updated'
+              )
+            """,
+            (project_id, task["scope_key"], task["uuid"]),
+        )
     if source_kind == "folder.deleted":
         if not payload.get("emit_public_event", True):
             return

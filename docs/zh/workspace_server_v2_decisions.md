@@ -325,6 +325,15 @@ Workspace source，保留其稳定的账户 scope，并补充 topic 名称。Bri
 Provider key 保持幂等，因此已接受的行会被更新而不是重复创建。全新升级时，
 已停止的 Bridge 只会看到最终 generation，并且只执行一次导入。
 
+## 合并旧版已读状态修复产生的文件夹快照
+
+旧版已读状态修复可能为每个被修正的 message flag 各排入一次 folder
+projection。这些任务都会重建完整的当前文件夹快照，并不携带历史文件夹状态。
+因此，worker 获得 `user-folder` scope 后，已领取的旧版重建任务会吸收同一
+scope 中仍在等待的同类任务，并只提交一个权威快照和事件。该事务之后新到达
+的任务仍会保留在队列中并触发后续重建，所以 live 收敛保持不变，而迁移工作量
+由受影响的文件夹数量决定，不再随 message flag 数量增长。
+
 ## 首次实现的兼容性和边界
 
 - 公共路由,回复和WebSocket事件WorkspaceUI没有改变.

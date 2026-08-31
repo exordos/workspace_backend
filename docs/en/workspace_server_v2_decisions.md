@@ -336,6 +336,17 @@ complete retry. Provider keys remain idempotent, so already accepted rows are
 updated rather than duplicated. On a fresh upgrade the stopped Bridge observes
 only the final generation and performs one import.
 
+## Coalescing legacy read-state folder snapshots
+
+Legacy read-state repair may enqueue one folder projection for every repaired
+message flag. These projections always rebuild the complete current folder
+snapshot; they do not carry historical folder state. Once a worker owns a
+`user-folder` scope, its claimed legacy rebuild therefore absorbs idle sibling
+tasks for the same scope and commits one authoritative snapshot and event. A
+task that arrives after that transaction remains pending and triggers a later
+rebuild, so live convergence is preserved while migration work stays bounded by
+the number of affected folders instead of the number of message flags.
+
 ## Compatibility and boundaries of first implementation
 
 - Public routes, replies and WebSocket events Workspace UI are not changed.

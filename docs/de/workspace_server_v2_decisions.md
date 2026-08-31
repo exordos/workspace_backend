@@ -346,6 +346,19 @@ gestartet. Provider-Schlüssel bleiben idempotent; bereits angenommene Zeilen
 werden aktualisiert statt dupliziert. Bei einer frischen Aktualisierung sieht
 die gestoppte Bridge nur die finale Generation und führt einen Import aus.
 
+## Zusammenführen von Ordner-Snapshots bei der Legacy-Lesestatus-Reparatur
+
+Die Reparatur des Legacy-Lesestatus kann für jedes korrigierte Nachrichten-Flag
+eine eigene Ordnerprojektion einreihen. Jede dieser Aufgaben erstellt den
+vollständigen aktuellen Ordner-Snapshot neu und enthält keinen historischen
+Ordnerzustand. Sobald ein Worker den Scope `user-folder` besitzt, nimmt der
+beanspruchte Legacy-Neuaufbau deshalb wartende Schwesteraufgaben desselben Scopes
+auf und schreibt genau einen maßgeblichen Snapshot samt Event. Eine erst nach
+dieser Transaktion eintreffende Aufgabe bleibt ausstehend und löst einen späteren
+Neuaufbau aus. So bleibt die Live-Konvergenz erhalten, während der
+Migrationsaufwand mit der Zahl betroffener Ordner statt mit der Zahl der
+Nachrichten-Flags wächst.
+
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 
 - Öffentliche Routen, Antworten und WebSocket events Workspace UI nicht geändert.

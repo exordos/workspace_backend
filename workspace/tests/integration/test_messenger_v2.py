@@ -5487,6 +5487,100 @@ def test_native_v2_reclaims_an_expired_running_projection_task(api, db):
         assert cursor.fetchone() == ("completed", attempts + 1, None)
 
 
+def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
+    stream_response = api.post(
+        STREAMS,
+        json={
+            "name": "Legacy folder snapshot burst",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert stream_response.status_code == 201, stream_response.text
+    stream_uuid = stream_response.json()["uuid"]
+    folder_response = api.post(FOLDERS, json={"title": "Legacy snapshot target"})
+    assert folder_response.status_code == 201, folder_response.text
+    folder_uuid = folder_response.json()["uuid"]
+    _drain()
+    event_uuids = [sys_uuid.uuid4() for _ in range(3)]
+    scope_key = f"{api.project_id}:{api.user_uuid}:{folder_uuid}"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT snapshot_version
+            FROM messenger_user_folder_bindings
+            WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
+            """,
+            (api.project_id, api.user_uuid, folder_uuid),
+        )
+        snapshot_version = cursor.fetchone()[0]
+        cursor.executemany(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key, payload
+            ) VALUES (
+                %s, %s, 'folder_projection', 'user-folder', %s, %s::jsonb
+            )
+            """,
+            [
+                (
+                    event_uuid,
+                    api.project_id,
+                    scope_key,
+                    json.dumps(
+                        {
+                            "source_kind": source_kind,
+                            "user_uuid": api.user_uuid,
+                            "stream_uuid": stream_uuid,
+                            "folder_uuid": folder_uuid,
+                        }
+                    ),
+                )
+                for event_uuid, source_kind in zip(
+                    event_uuids,
+                    (
+                        "legacy_message_state.updated",
+                        "legacy_message_state.deleted",
+                        "legacy_message_state.updated",
+                    ),
+                    strict=True,
+                )
+            ],
+        )
+    with contexts.Context().session_manager() as session:
+        assert v2_projection.derive_projection_tasks(session) == 3
+        assert v2_projection.process_one_projection_task(
+            session,
+            "integration:legacy-folder-coalesce",
+        )
+        assert not v2_projection.process_one_projection_task(
+            session,
+            "integration:legacy-folder-coalesce",
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*) FILTER (WHERE status = 'completed'),
+                   count(*) FILTER (WHERE attempts = 1),
+                   count(*) FILTER (WHERE attempts = 0)
+            FROM messenger_projection_tasks
+            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
+            """,
+            (api.project_id, event_uuids),
+        )
+        assert cursor.fetchone() == (3, 1, 2)
+        cursor.execute(
+            """
+            SELECT snapshot_version
+            FROM messenger_user_folder_bindings
+            WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
+            """,
+            (api.project_id, api.user_uuid, folder_uuid),
+        )
+        assert cursor.fetchone()[0] == snapshot_version + 1
+
+
 def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
     stream_response = api.post(
         STREAMS,
