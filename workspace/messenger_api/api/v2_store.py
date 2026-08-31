@@ -2113,14 +2113,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                         target_uuid=resource_uuid,
                         provider_target=provider_target,
                     )
-                self._enqueue_counter_projections(
-                    source_kind="message.read",
-                    placement_uuid=message.uuid,
-                    user_uuid=self.user_uuid,
-                    stream_uuid=message.stream_uuid,
-                    topic_uuid=message.topic_uuid,
-                    emit_message_read=True,
-                )
+            self._enqueue_counter_projections(
+                source_kind="message.read",
+                placement_uuid=message.uuid,
+                user_uuid=self.user_uuid,
+                stream_uuid=message.stream_uuid,
+                topic_uuid=message.topic_uuid,
+                emit_message_read=changed is not None,
+            )
             return _public(self._message(message.uuid), "messages")
         if resource == "messages" and action == "read_up_to":
             message = self._message(resource_uuid)
@@ -2189,15 +2189,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     message.uuid,
                 ),
             )
-            if changed:
-                self._enqueue_counter_projections(
-                    source_kind="messages.read",
-                    placement_uuid=message.uuid,
-                    user_uuid=self.user_uuid,
-                    stream_uuid=message.stream_uuid,
-                    topic_uuid=message.topic_uuid,
-                    emit_message_read=True,
-                )
+            self._enqueue_counter_projections(
+                source_kind="messages.read",
+                placement_uuid=message.uuid,
+                user_uuid=self.user_uuid,
+                stream_uuid=message.stream_uuid,
+                topic_uuid=message.topic_uuid,
+                emit_message_read=changed,
+            )
             return _public(self._message(message.uuid), "messages")
         if resource == "messages" and action in {"star", "unstar"}:
             return self._mark_message_state(
@@ -2286,7 +2285,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, stream.uuid),
             ).fetchall()
-            if changed and topics:
+            if topics:
                 self._enqueue(
                     "read_counters",
                     "user-stream",
@@ -2298,7 +2297,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                         "topic_uuid": topics[0]["uuid"],
                     },
                 )
-            for topic in topics if changed else ():
+            for topic in topics:
                 self._enqueue(
                     "read_counters",
                     "user-topic",
@@ -2451,13 +2450,12 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, self.user_uuid, topic.uuid),
             )
-            if changed:
-                self._enqueue_counter_projections(
-                    source_kind="topic.read",
-                    user_uuid=self.user_uuid,
-                    stream_uuid=topic.stream_uuid,
-                    topic_uuid=topic.uuid,
-                )
+            self._enqueue_counter_projections(
+                source_kind="topic.read",
+                user_uuid=self.user_uuid,
+                stream_uuid=topic.stream_uuid,
+                topic_uuid=topic.uuid,
+            )
             return _public(self._topic(topic.uuid), "stream_topics")
         if resource == "stream_topics" and action == "set_default":
             topic = self._topic(resource_uuid)

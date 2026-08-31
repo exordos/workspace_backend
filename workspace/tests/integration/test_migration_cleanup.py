@@ -35,6 +35,9 @@ def _restore_latest_migration_after_module(_database):
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
         engine.rollback_migration(
+            "0160-repair-native-read-state-and-prioritize-reads-259cc2.py"
+        )
+        engine.rollback_migration(
             "0159-index-Messenger-v2-projection-claim-order-16837b.py"
         )
         engine.rollback_migration("0158-reset-Zulip-message-projections-c1e8bf.py")
@@ -231,6 +234,10 @@ PROJECTION_CLAIM_INDEX_MIGRATION_UUID = "16837bac-76d7-4e28-8b70-2f7739c9eb24"
 PROJECTION_CLAIM_INDEX_MIGRATION_FILE = (
     "0159-index-Messenger-v2-projection-claim-order-16837b.py"
 )
+INTERACTIVE_READ_INDEX_MIGRATION_UUID = "259cc21a-d775-4d90-98e5-6fde45181e3f"
+INTERACTIVE_READ_INDEX_MIGRATION_FILE = (
+    "0160-repair-native-read-state-and-prioritize-reads-259cc2.py"
+)
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -321,12 +328,15 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[PROJECTION_CLAIM_INDEX_MIGRATION_FILE]._depends == [
         ZULIP_MESSAGE_RESET_MIGRATION_FILE,
     ]
+    assert migrations[INTERACTIVE_READ_INDEX_MIGRATION_FILE]._depends == [
+        PROJECTION_CLAIM_INDEX_MIGRATION_FILE,
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == PROJECTION_CLAIM_INDEX_MIGRATION_FILE
+    assert engine.get_latest_migration() == INTERACTIVE_READ_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -379,6 +389,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     ZULIP_PROJECTION_RESET_MIGRATION_UUID,
                     ZULIP_MESSAGE_RESET_MIGRATION_UUID,
                     PROJECTION_CLAIM_INDEX_MIGRATION_UUID,
+                    INTERACTIVE_READ_INDEX_MIGRATION_UUID,
                 ],
             ),
         )
@@ -430,6 +441,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (ZULIP_PROJECTION_RESET_MIGRATION_UUID, True),
             (ZULIP_MESSAGE_RESET_MIGRATION_UUID, True),
             (PROJECTION_CLAIM_INDEX_MIGRATION_UUID, True),
+            (INTERACTIVE_READ_INDEX_MIGRATION_UUID, True),
         }
         cur.execute(
             """
@@ -447,6 +459,21 @@ def test_current_migrations_have_a_single_head(_database, db):
         assert "status" in index_definition
         assert "completed" in index_definition
         assert "dead_letter" in index_definition
+        cur.execute(
+            """
+            SELECT index.indisvalid, index.indisready,
+                   pg_get_indexdef(index.indexrelid)
+            FROM pg_index AS index
+            WHERE index.indexrelid =
+                'messenger_projection_tasks_interactive_read_idx'::regclass
+            """
+        )
+        index_valid, index_ready, index_definition = cur.fetchone()
+        assert index_valid is True
+        assert index_ready is True
+        assert "(created_at, uuid)" in index_definition
+        assert "read_counters" in index_definition
+        assert "topic.read" in index_definition
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
         )

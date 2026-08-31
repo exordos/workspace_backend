@@ -334,13 +334,27 @@ def _claim_task(
         LIMIT 1
         FOR UPDATE OF task SKIP LOCKED
     """
+    interactive_read_predicate = """
+        task.task_kind = 'read_counters'
+        AND task.payload->>'source_kind' IN (
+            'message.read', 'messages.read', 'stream.read', 'topic.read'
+        )
+    """
     task = session.execute(
         claim_sql.format(
-            age_predicate="task.created_at <= NOW() - interval '5 seconds'",
+            age_predicate=interactive_read_predicate,
             order_by="task.created_at, task.uuid",
         ),
         (worker_id,),
     ).fetchone()
+    if task is None:
+        task = session.execute(
+            claim_sql.format(
+                age_predicate="task.created_at <= NOW() - interval '5 seconds'",
+                order_by="task.created_at, task.uuid",
+            ),
+            (worker_id,),
+        ).fetchone()
     if task is None:
         task = session.execute(
             claim_sql.format(

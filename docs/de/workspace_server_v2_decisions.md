@@ -373,6 +373,20 @@ explizite Leseaktion ihr eigenes Event behält. Nach der Transaktion eintreffend
 Aufgaben bleiben ausstehend; damit bleibt die Live-Konvergenz erhalten und die
 Massenarbeit wird durch die betroffenen Benutzer-Scopes begrenzt.
 
+## Reparierbarer nativer Lesestatus und interaktive Priorität
+
+Migration `0160` stellt Lesezustände nativer Nachrichten wieder her, die beim
+Anlegen des kanonischen v2-Zustands im Legacy-Flag oder kompakten Bitmap
+vorhanden waren. Die Reparatur ist monoton: Sie füllt nur fehlende `read_at`-
+Werte, öffnet nach der Umstellung gelesene Nachrichten nie erneut und erstellt
+anschließend native Stream-, Topic- und Ordner-Snapshots neu.
+
+Explizite Leseaktionen für Nachricht, Bereich, Topic und Stream stellen auch
+dann eine maßgebliche Zählerneuberechnung ein, wenn die kanonischen Zeilen
+bereits gelesen sind. So repariert ein idempotenter Wiederholungsversuch einen
+veralteten Snapshot. Diese Projektionsaufgaben laufen vor Massenimporten; die
+normale Snapshot-Zusammenfassung begrenzt weiterhin die Datenbanklast.
+
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 
 - Öffentliche Routen, Antworten und WebSocket events Workspace UI nicht geändert.

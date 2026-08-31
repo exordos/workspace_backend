@@ -359,6 +359,18 @@ remain independent so every explicit per-message read action keeps its event.
 Tasks arriving after the transaction remain pending, preserving live
 convergence while bounding bulk work by affected user scopes.
 
+## Repairable native read state and interactive priority
+
+Migration `0160` restores native-message reads that were present in the legacy
+flag or compact bitmap when the v2 canonical state was created. The repair is
+monotonic: it fills only missing `read_at` values, never reopens messages read
+after cutover, and then rebuilds native stream, topic and folder snapshots.
+
+Explicit message, range, topic and stream read actions enqueue an authoritative
+counter rebuild even when the canonical rows are already read. This makes an
+idempotent retry repair a stale snapshot. Their projection tasks run ahead of
+bulk import work, while normal snapshot coalescing still bounds database load.
+
 ## Compatibility and boundaries of first implementation
 
 - Public routes, replies and WebSocket events Workspace UI are not changed.
