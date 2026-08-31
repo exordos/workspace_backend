@@ -359,6 +359,20 @@ Neuaufbau aus. So bleibt die Live-Konvergenz erhalten, während der
 Migrationsaufwand mit der Zahl betroffener Ordner statt mit der Zahl der
 Nachrichten-Flags wächst.
 
+## Zusammenfassen reiner Ungelesen-Snapshots
+
+Der Massenimport von Nachrichten, Nachrichtenkorrekturen und die
+Materialisierung von Mitgliedschaften können viele Read-Counter-Projektionen
+für denselben `user-stream`- oder `user-topic`-Scope erzeugen. Jede reine
+Snapshot-Aufgabe berechnet die vollständigen maßgeblichen aktuellen Zähler neu
+und enthält keinen historischen Zählerstand. Eine beanspruchte reine
+Snapshot-Aufgabe schließt deshalb in derselben Transaktion wartende reine
+Snapshot-Geschwister desselben Scopes ab und veröffentlicht einen aktuellen
+Snapshot. Aufgaben mit `emit_message_read=true` bleiben getrennt, damit jede
+explizite Leseaktion ihr eigenes Event behält. Nach der Transaktion eintreffende
+Aufgaben bleiben ausstehend; damit bleibt die Live-Konvergenz erhalten und die
+Massenarbeit wird durch die betroffenen Benutzer-Scopes begrenzt.
+
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 
 - Öffentliche Routen, Antworten und WebSocket events Workspace UI nicht geändert.

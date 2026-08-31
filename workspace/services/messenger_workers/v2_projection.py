@@ -1188,6 +1188,32 @@ def _process_read_counters(
 ) -> None:
     payload = task["payload"]
     user_uuid = _uuid(payload["user_uuid"])
+    if not payload.get("emit_message_read", False):
+        # Counter tasks are authoritative snapshots.  One claimed snapshot can
+        # absorb every idle snapshot-only sibling for the same user scope;
+        # tasks that must emit a per-message read event remain independent.
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'completed', lease_owner = NULL,
+                lease_expires_at = NULL, next_retry_at = NULL,
+                last_error = NULL, updated_at = NOW()
+            WHERE project_id = %s AND task_kind = 'read_counters'
+              AND scope_kind = %s AND scope_key = %s AND uuid <> %s
+              AND status IN ('pending', 'failed')
+              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
+              AND COALESCE(
+                  (payload->>'emit_message_read')::boolean,
+                  FALSE
+              ) = FALSE
+            """,
+            (
+                task["project_id"],
+                task["scope_kind"],
+                task["scope_key"],
+                task["uuid"],
+            ),
+        )
     _refresh_recipient_counters(
         session,
         task["project_id"],

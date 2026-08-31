@@ -5581,6 +5581,102 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
         assert cursor.fetchone()[0] == snapshot_version + 1
 
 
+def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
+    stream_response = api.post(
+        STREAMS,
+        json={
+            "name": "Read counter snapshot burst",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert stream_response.status_code == 201, stream_response.text
+    stream = stream_response.json()
+    _drain()
+    event_uuids = [sys_uuid.uuid4() for _ in range(4)]
+    scope_key = f"{api.project_id}:{api.user_uuid}:{stream['uuid']}"
+    common_payload = {
+        "user_uuid": api.user_uuid,
+        "stream_uuid": stream["uuid"],
+        "topic_uuid": stream["default_topic_uuid"],
+    }
+    payloads = [
+        {**common_payload, "source_kind": "message.created"},
+        {**common_payload, "source_kind": "message.updated"},
+        {**common_payload, "source_kind": "stream_binding.created"},
+        {
+            **common_payload,
+            "source_kind": "message.read",
+            "placement_uuid": str(sys_uuid.uuid4()),
+            "emit_message_read": True,
+        },
+    ]
+    with db.cursor() as cursor:
+        cursor.executemany(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key,
+                payload, created_at, updated_at
+            ) VALUES (
+                %s, %s, 'read_counters', 'user-stream', %s, %s::jsonb,
+                NOW() + %s * INTERVAL '1 second',
+                NOW() + %s * INTERVAL '1 second'
+            )
+            """,
+            [
+                (
+                    event_uuid,
+                    api.project_id,
+                    scope_key,
+                    json.dumps(payload),
+                    position,
+                    position,
+                )
+                for position, (event_uuid, payload) in enumerate(
+                    zip(event_uuids, payloads, strict=True)
+                )
+            ],
+        )
+    with contexts.Context().session_manager() as session:
+        assert v2_projection.derive_projection_tasks(session) == 4
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET created_at = CASE
+                WHEN (payload->>'emit_message_read')::boolean
+                    THEN NOW()
+                ELSE NOW() - INTERVAL '1 hour'
+            END
+            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
+            """,
+            (api.project_id, event_uuids),
+        )
+    with contexts.Context().session_manager() as session:
+        assert v2_projection.process_one_projection_task(
+            session,
+            "integration:read-counter-coalesce",
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*) FILTER (WHERE status = 'completed'),
+                   count(*) FILTER (WHERE status = 'pending'),
+                   count(*) FILTER (WHERE attempts = 1),
+                   count(*) FILTER (WHERE attempts = 0),
+                   count(*) FILTER (
+                       WHERE status = 'pending'
+                         AND (payload->>'emit_message_read')::boolean
+                   )
+            FROM messenger_projection_tasks
+            WHERE project_id = %s AND outbox_event_uuid = ANY(%s)
+            """,
+            (api.project_id, event_uuids),
+        )
+        assert cursor.fetchone() == (3, 1, 1, 3, 1)
+
+
 def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
     stream_response = api.post(
         STREAMS,

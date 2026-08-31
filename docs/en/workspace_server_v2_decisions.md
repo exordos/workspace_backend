@@ -347,6 +347,18 @@ task that arrives after that transaction remains pending and triggers a later
 rebuild, so live convergence is preserved while migration work stays bounded by
 the number of affected folders instead of the number of message flags.
 
+## Coalescing snapshot-only unread counters
+
+Bulk message ingestion, message repair and membership materialization may enqueue
+many read-counter projections for the same `user-stream` or `user-topic` scope.
+Each snapshot-only task recomputes the complete authoritative current counters;
+it does not carry a historical counter value. A claimed snapshot-only task
+therefore absorbs idle snapshot-only siblings for the same scope in its
+transaction and emits one current snapshot. Tasks with `emit_message_read=true`
+remain independent so every explicit per-message read action keeps its event.
+Tasks arriving after the transaction remain pending, preserving live
+convergence while bounding bulk work by affected user scopes.
+
 ## Compatibility and boundaries of first implementation
 
 - Public routes, replies and WebSocket events Workspace UI are not changed.
