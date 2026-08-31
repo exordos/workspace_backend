@@ -108,6 +108,14 @@ Task lifecycle: `pending -> leased/running -> completed`; retryable failure uses
 `max_attempts` moves to DLQ. Owner/fencing token, reaper/reconciliation and
 idempotent `outbox_event_uuid` effect guard are mandatory.
 
+The claim path preserves this scheduler policy with two bounded queries. It
+first drains tasks aged at least five seconds in `created_at, uuid` order; only
+when none are claimable does it select fresh work with fan-out first and newest
+`ordering_created_at` first. A partial active-task index on
+`(created_at, uuid)` prevents an old backlog from forcing a sort over the whole
+task history. Multiple workers remain safe through the same scope leases and
+fencing tokens.
+
 ## DOMAIN_EVENT_KINDS
 
 Internal `WorkspaceDomainOutboxEvent.event_kind` uses the same closed

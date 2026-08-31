@@ -108,6 +108,15 @@ Task lifecycle: `pending -> leased/running -> completed`; retryable failure uses
 `max_attempts` moves to DLQ. Owner/fencing token, reaper/reconciliation and
 idempotent `outbox_event_uuid` effect guard are mandatory.
 
+Der Claim-Pfad bewahrt diese Scheduler-Policy mit zwei begrenzten Abfragen. Er
+verarbeitet zuerst Aufgaben, die mindestens fünf Sekunden alt sind, in der
+Reihenfolge `created_at, uuid`; nur wenn keine davon beansprucht werden kann,
+wird frische Arbeit mit Fan-out-Priorität und absteigendem
+`ordering_created_at` gewählt. Ein partieller Index der aktiven Aufgaben auf
+`(created_at, uuid)` verhindert, dass ein alter Rückstau eine Sortierung der
+gesamten Aufgabenhistorie erzwingt. Mehrere Worker bleiben durch dieselben
+Scope-Leases und Fencing-Tokens sicher.
+
 ## DOMAIN_EVENT_KINDS
 
 Die innere `WorkspaceDomainOutboxEvent.event_kind` benutzt die gleiche geschlossene

@@ -34,6 +34,9 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
+        engine.rollback_migration(
+            "0159-index-Messenger-v2-projection-claim-order-16837b.py"
+        )
         engine.rollback_migration("0158-reset-Zulip-message-projections-c1e8bf.py")
         engine.rollback_migration("0157-reset-zulip-projections-9a596b.py")
         engine.rollback_migration("0156-repair-retained-provider-identities-2022d5.py")
@@ -224,6 +227,10 @@ ZULIP_PROJECTION_RESET_MIGRATION_UUID = "9a596b13-a187-45d6-8da6-d3b5d39a5c85"
 ZULIP_PROJECTION_RESET_MIGRATION_FILE = "0157-reset-zulip-projections-9a596b.py"
 ZULIP_MESSAGE_RESET_MIGRATION_UUID = "c1e8bf60-ff3c-4027-9b8c-410bec2c959d"
 ZULIP_MESSAGE_RESET_MIGRATION_FILE = "0158-reset-Zulip-message-projections-c1e8bf.py"
+PROJECTION_CLAIM_INDEX_MIGRATION_UUID = "16837bac-76d7-4e28-8b70-2f7739c9eb24"
+PROJECTION_CLAIM_INDEX_MIGRATION_FILE = (
+    "0159-index-Messenger-v2-projection-claim-order-16837b.py"
+)
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -311,12 +318,15 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[ZULIP_MESSAGE_RESET_MIGRATION_FILE]._depends == [
         ZULIP_PROJECTION_RESET_MIGRATION_FILE,
     ]
+    assert migrations[PROJECTION_CLAIM_INDEX_MIGRATION_FILE]._depends == [
+        ZULIP_MESSAGE_RESET_MIGRATION_FILE,
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == ZULIP_MESSAGE_RESET_MIGRATION_FILE
+    assert engine.get_latest_migration() == PROJECTION_CLAIM_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -368,6 +378,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     RETAINED_PROVIDER_IDENTITY_MIGRATION_UUID,
                     ZULIP_PROJECTION_RESET_MIGRATION_UUID,
                     ZULIP_MESSAGE_RESET_MIGRATION_UUID,
+                    PROJECTION_CLAIM_INDEX_MIGRATION_UUID,
                 ],
             ),
         )
@@ -418,7 +429,24 @@ def test_current_migrations_have_a_single_head(_database, db):
             (RETAINED_PROVIDER_IDENTITY_MIGRATION_UUID, True),
             (ZULIP_PROJECTION_RESET_MIGRATION_UUID, True),
             (ZULIP_MESSAGE_RESET_MIGRATION_UUID, True),
+            (PROJECTION_CLAIM_INDEX_MIGRATION_UUID, True),
         }
+        cur.execute(
+            """
+            SELECT index.indisvalid, index.indisready,
+                   pg_get_indexdef(index.indexrelid)
+            FROM pg_index AS index
+            WHERE index.indexrelid =
+                'messenger_projection_tasks_active_created_idx'::regclass
+            """
+        )
+        index_valid, index_ready, index_definition = cur.fetchone()
+        assert index_valid is True
+        assert index_ready is True
+        assert "(created_at, uuid)" in index_definition
+        assert "status" in index_definition
+        assert "completed" in index_definition
+        assert "dead_letter" in index_definition
         cur.execute(
             "SELECT to_regclass('m_workspace_files_external_content_hash_size_idx')"
         )

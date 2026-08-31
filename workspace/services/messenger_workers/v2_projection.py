@@ -286,8 +286,7 @@ def _claim_task(
     worker_id: str,
     lease_seconds: int,
 ) -> typing.Any | None:
-    task = session.execute(
-        """
+    claim_sql = """
         SELECT task.*
         FROM messenger_projection_tasks AS task
         LEFT JOIN messenger_projection_scope_leases AS scope_lease
@@ -319,29 +318,36 @@ def _claim_task(
                       < (task.created_at, task.uuid)
                   AND predecessor.status NOT IN ('completed', 'dead_letter')
               )
+          AND task.status NOT IN ('completed', 'dead_letter')
+          AND {age_predicate}
           AND (
                 scope_lease.uuid IS NULL
                 OR scope_lease.lease_expires_at IS NULL
                 OR scope_lease.lease_expires_at <= NOW()
                 OR scope_lease.owner = %s
               )
-        ORDER BY
-          CASE WHEN task.created_at <= NOW() - interval '5 seconds'
-               THEN 0 ELSE 1 END,
-          CASE WHEN task.created_at <= NOW() - interval '5 seconds'
-               THEN task.created_at END ASC,
-          CASE WHEN task.created_at > NOW() - interval '5 seconds'
-                    AND task.task_kind = 'fanout'
-               THEN 0 ELSE 1 END,
-          CASE WHEN task.created_at > NOW() - interval '5 seconds'
-               THEN task.ordering_created_at END DESC,
-          task.created_at,
-          task.uuid
+        ORDER BY {order_by}
         LIMIT 1
         FOR UPDATE OF task SKIP LOCKED
-        """,
+    """
+    task = session.execute(
+        claim_sql.format(
+            age_predicate="task.created_at <= NOW() - interval '5 seconds'",
+            order_by="task.created_at, task.uuid",
+        ),
         (worker_id,),
     ).fetchone()
+    if task is None:
+        task = session.execute(
+            claim_sql.format(
+                age_predicate="task.created_at > NOW() - interval '5 seconds'",
+                order_by=(
+                    "CASE WHEN task.task_kind = 'fanout' THEN 0 ELSE 1 END, "
+                    "task.ordering_created_at DESC, task.created_at, task.uuid"
+                ),
+            ),
+            (worker_id,),
+        ).fetchone()
     if task is None:
         return None
     lease = session.execute(

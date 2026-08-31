@@ -42,6 +42,9 @@ ZULIP_PROJECTION_RESET_MIGRATION = "0157-reset-zulip-projections-9a596b.py"
 ZULIP_PROJECTION_RESET_UUID = "9a596b13-a187-45d6-8da6-d3b5d39a5c85"
 ZULIP_MESSAGE_RESET_MIGRATION = "0158-reset-Zulip-message-projections-c1e8bf.py"
 ZULIP_MESSAGE_RESET_UUID = "c1e8bf60-ff3c-4027-9b8c-410bec2c959d"
+PROJECTION_CLAIM_INDEX_MIGRATION = (
+    "0159-index-Messenger-v2-projection-claim-order-16837b.py"
+)
 
 
 def _truncate_messenger_test_data():
@@ -101,7 +104,7 @@ def _isolate_v2_module(_database):
         engine = ra_migrations.MigrationEngine(
             migrations_path=str(conftest.MIGRATIONS_DIR)
         )
-        engine.apply_migration(ZULIP_MESSAGE_RESET_MIGRATION)
+        engine.apply_migration(PROJECTION_CLAIM_INDEX_MIGRATION)
 
 
 @pytest.fixture(autouse=True)
@@ -1588,6 +1591,62 @@ def test_native_v2_scheduler_prefers_newest_topic_message(api):
         assert claimed["task_kind"] == "fanout"
         assert str(claimed["payload"]["placement_uuid"]) == second["uuid"]
         assert str(claimed["payload"]["placement_uuid"]) != first["uuid"]
+
+
+def test_native_v2_scheduler_drains_aged_tasks_before_fresh_fanout(api):
+    stream = api.post(
+        STREAMS,
+        json={
+            "name": "Aged before fresh",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    ).json()
+    _drain()
+    aged = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "aged"},
+        },
+    ).json()
+    fresh = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "fresh"},
+        },
+    ).json()
+    with contexts.Context().session_manager() as session:
+        v2_projection.derive_projection_tasks(session)
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET created_at = CASE
+                    WHEN payload->>'placement_uuid' = %s
+                    THEN NOW() - interval '10 seconds'
+                    ELSE NOW()
+                END,
+                updated_at = NOW()
+            WHERE project_id = %s
+              AND payload->>'placement_uuid' IN (%s, %s)
+            """,
+            (aged["uuid"], api.project_id, aged["uuid"], fresh["uuid"]),
+        )
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'completed', updated_at = NOW()
+            WHERE project_id <> %s
+               OR COALESCE(payload->>'placement_uuid', '') NOT IN (%s, %s)
+            """,
+            (api.project_id, aged["uuid"], fresh["uuid"]),
+        )
+        claimed = v2_projection._claim_task(session, "integration:aged", 30)
+        assert str(claimed["payload"]["placement_uuid"]) == aged["uuid"]
 
 
 def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api, db):
@@ -3987,6 +4046,7 @@ def test_zulip_projection_reset_preserves_internal_messages_and_clears_counters(
 
 def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(PROJECTION_CLAIM_INDEX_MIGRATION)
     engine.rollback_migration(ZULIP_MESSAGE_RESET_MIGRATION)
     _truncate_messenger_test_data()
     try:
@@ -4621,7 +4681,7 @@ def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
         ) == (1, 0, 1, "mute")
     finally:
         _truncate_messenger_test_data()
-        engine.apply_migration(ZULIP_MESSAGE_RESET_MIGRATION)
+        engine.apply_migration(PROJECTION_CLAIM_INDEX_MIGRATION)
 
 
 def test_native_v2_migration_canonicalizes_legacy_provider_identity_links(api, db):

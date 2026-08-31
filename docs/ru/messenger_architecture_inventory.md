@@ -108,6 +108,14 @@ Task lifecycle: `pending -> leased/running -> completed`; retryable failure uses
 `max_attempts` moves to DLQ. Owner/fencing token, reaper/reconciliation and
 idempotent `outbox_event_uuid` effect guard are mandatory.
 
+Путь захвата сохраняет эту политику планировщика двумя ограниченными
+запросами. Сначала он обрабатывает задачи возрастом не менее пяти секунд в
+порядке `created_at, uuid`; только если таких задач нет, выбирается свежая
+работа с приоритетом fan-out и убывающим `ordering_created_at`. Частичный индекс
+активных задач по `(created_at, uuid)` не позволяет старой очереди заставлять
+PostgreSQL сортировать всю историю задач. Параллельные worker-процессы остаются
+безопасными благодаря тем же scope leases и fencing tokens.
+
 ## DOMAIN_EVENT_KINDS
 
 Внутренний `WorkspaceDomainOutboxEvent.event_kind` использует тот же закрытый
