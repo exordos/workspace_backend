@@ -894,10 +894,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> dict[str, typing.Any]:
         session = contexts.Context().get_session()
         stream = self._stream(values["stream_uuid"])
-        provider_targets = self._provider_targets_for_stream(
-            stream.uuid,
-            "message.create",
-        )
         topic_uuid = values.get("topic_uuid") or stream.default_topic_uuid
         if topic_uuid is None:
             raise ra_exceptions.ValidationErrorException()
@@ -910,11 +906,27 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         canonical_payload = resource_projection.simple(values["payload"])
         existing_placement = session.execute(
             """
-            SELECT uuid FROM messenger_message_placements
-            WHERE project_id = %s AND uuid = %s
+            SELECT message.author_uuid, message.payload,
+                   message.source_name, message.source
+            FROM messenger_message_placements AS placement
+            JOIN messenger_messages AS message
+              ON message.project_id = placement.project_id
+             AND message.uuid = placement.message_uuid
+            WHERE placement.project_id = %s AND placement.uuid = %s
             """,
             (self.project_uuid, placement_uuid),
         ).fetchone()
+        if existing_placement is not None and (
+            existing_placement["author_uuid"] != self.user_uuid
+            or existing_placement["payload"] != canonical_payload
+            or existing_placement["source_name"] != "native"
+            or existing_placement["source"] != source
+        ):
+            raise ra_exceptions.ValidationErrorException()
+        provider_targets = self._provider_targets_for_stream(
+            stream.uuid,
+            "message.create",
+        )
         if existing_placement is not None:
             row = _public(self._message(placement_uuid), "messages")
             self._queue_message_provider_operations(

@@ -1248,11 +1248,11 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         ).fetchall()
         return tuple(row["external_account_uuid"] for row in rows)
 
-    def _provider_read_account_uuids_for_stream(
+    def _provider_user_account_uuids_for_stream(
         self,
         stream: models.WorkspaceStream,
     ) -> tuple[object, ...]:
-        """Resolve provider read routes owned by the current Workspace user."""
+        """Resolve provider routes owned by the current Workspace user."""
         session = contexts.Context().get_session()
         rows = session.execute(
             """
@@ -1289,8 +1289,18 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         stream_uuid: object,
         operation_kind: str,
     ) -> tuple[typing.Any, ...]:
-        """Resolve every selected provider route before a canonical mutation."""
-        account_uuids = self._lock_provider_account_for_stream(stream_uuid)
+        """Resolve the author's selected provider routes before message creation."""
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+            session=contexts.Context().get_session(),
+        )
+        account_uuids = self._provider_user_account_uuids_for_stream(stream)
+        if not account_uuids:
+            return ()
+        self._lock_provider_accounts(account_uuids)
         return tuple(
             target
             for account_uuid in account_uuids
@@ -1322,7 +1332,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 },
                 session=session,
             )
-            account_uuids = self._provider_read_account_uuids_for_stream(stream)
+            account_uuids = self._provider_user_account_uuids_for_stream(stream)
             if not account_uuids:
                 return ()
             if not account_locked:
@@ -1458,7 +1468,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         if required_capability is None:
             raise ra_exceptions.ValidationErrorException()
         route_owner_uuid = (
-            self.user_uuid if operation_kind == "read_state.set" else stream.user_uuid
+            self.user_uuid
+            if operation_kind in {"message.create", "read_state.set"}
+            else stream.user_uuid
         )
         try:
             account, _chat, bridge = provider_data.resolve_provider_target(
@@ -1601,7 +1613,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             },
             session=session,
         )
-        external_account_uuids = self._provider_read_account_uuids_for_stream(stream)
+        external_account_uuids = self._provider_user_account_uuids_for_stream(stream)
         if not external_account_uuids:
             return ()
         self._lock_provider_accounts(external_account_uuids)
