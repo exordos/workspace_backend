@@ -223,6 +223,13 @@ def _message_uuid(
         provider_message_id,
         "provider message ID",
     )
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (
+            "provider-message-identity-v1:"
+            f"{route['provider_realm_uuid']}:{provider_message_id}",
+        ),
+    )
     row = session.execute(
         """
         SELECT COALESCE(placement.legacy_public_uuid, placement.uuid) AS public_uuid

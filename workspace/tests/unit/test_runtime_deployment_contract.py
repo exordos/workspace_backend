@@ -157,6 +157,18 @@ def test_compact_read_state_rollout_is_opt_in():
         assert "only after every Workspace API and worker" in config
 
 
+def test_messenger_v2_projection_worker_is_explicitly_enabled():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        assert "v2_projection_enabled = true" in config
+        assert "v2_projection_workers = 4" in config
+        assert "v2_projection_idle_sleep_seconds = 0.5" in config
+        assert "v2_metrics_log_interval_seconds = 30" in config
+
+
 def test_manifest_provisions_unassigned_external_integration_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     account_permissions = {

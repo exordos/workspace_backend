@@ -221,19 +221,10 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
               )
               OR EXISTS (
                   SELECT 1
-                  FROM "m_workspace_streams" AS external_stream
-                  JOIN "m_confirmed_external_account_access" AS stream_access
-                    ON stream_access."project_id" =
-                        external_stream."project_id"
-                   AND stream_access."user_uuid" = event."user_uuid"
-                   AND stream_access."account_type" =
-                        external_stream."source_name"
-                   AND stream_access."source_scope" = COALESCE(
-                        external_stream."source"->>'source_scope',
-                        external_stream."source"->>'server_url'
-                   )
-                  WHERE external_stream."project_id" = event."project_id"
-                    AND external_stream."uuid" =
+                  FROM "m_confirmed_external_stream_access" AS stream_access
+                  WHERE stream_access."project_id" = event."project_id"
+                    AND stream_access."user_uuid" = event."user_uuid"
+                    AND stream_access."stream_uuid" =
                         (event."payload"->>'stream_uuid')::uuid
               )
           )
@@ -328,19 +319,10 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
               )
               OR EXISTS (
                   SELECT 1
-                  FROM "m_workspace_streams" AS external_stream
-                  JOIN "m_confirmed_external_account_access" AS stream_access
-                    ON stream_access."project_id" =
-                        external_stream."project_id"
-                   AND stream_access."user_uuid" = event."user_uuid"
-                   AND stream_access."account_type" =
-                        external_stream."source_name"
-                   AND stream_access."source_scope" = COALESCE(
-                        external_stream."source"->>'source_scope',
-                        external_stream."source"->>'server_url'
-                   )
-                  WHERE external_stream."project_id" = event."project_id"
-                    AND external_stream."uuid" =
+                  FROM "m_confirmed_external_stream_access" AS stream_access
+                  WHERE stream_access."project_id" = event."project_id"
+                    AND stream_access."user_uuid" = event."user_uuid"
+                    AND stream_access."stream_uuid" =
                         (event."payload"->>'stream_uuid')::uuid
               )
           )
@@ -1266,6 +1248,34 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         ).fetchall()
         return tuple(row["external_account_uuid"] for row in rows)
 
+    def _provider_read_account_uuids_for_stream(
+        self,
+        stream: models.WorkspaceStream,
+    ) -> tuple[object, ...]:
+        """Resolve provider read routes owned by the current Workspace user."""
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            """
+            SELECT DISTINCT external_account_uuid
+            FROM m_external_chats_v2
+            WHERE owner_user_uuid = %s AND project_id = %s
+              AND projection_stream_uuid = %s AND selected
+              AND status IN ('syncing', 'live', 'degraded')
+              AND NOT transition_pending
+            ORDER BY external_account_uuid
+            """,
+            (self.user_uuid, self.project_uuid, stream.uuid),
+        ).fetchall()
+        account_uuids = tuple(row["external_account_uuid"] for row in rows)
+        if account_uuids:
+            return account_uuids
+        if (
+            stream.external_account_uuid is not None
+            and stream.user_uuid == self.user_uuid
+        ):
+            return (stream.external_account_uuid,)
+        return ()
+
     def _provider_account_uuid_for_stream(
         self,
         stream: models.WorkspaceStream,
@@ -1304,6 +1314,32 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> tuple[typing.Any, ...]:
         """Resolve every durable provider route that owns a message."""
         session = contexts.Context().get_session()
+        if operation_kind == "read_state.set":
+            stream = models.WorkspaceStream.objects.get_one(
+                filters={
+                    "project_id": dm_filters.EQ(self.project_uuid),
+                    "uuid": dm_filters.EQ(message.stream_uuid),
+                },
+                session=session,
+            )
+            account_uuids = self._provider_read_account_uuids_for_stream(stream)
+            if not account_uuids:
+                return ()
+            if not account_locked:
+                self._lock_provider_accounts(account_uuids)
+            return tuple(
+                target
+                for account_uuid in account_uuids
+                if (
+                    target := self._provider_target(
+                        message.stream_uuid,
+                        operation_kind,
+                        account_locked=True,
+                        external_account_uuid=account_uuid,
+                    )
+                )
+                is not None
+            )
         provenance = session.execute(
             """
             SELECT external_account_uuid
@@ -1382,6 +1418,29 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             return None
         if operation_kind is None:
             return _PROVIDER_TARGET_EXISTS
+        if (
+            operation_kind == "stream.update"
+            and session.execute(
+                """
+            SELECT 1
+            FROM m_external_chats_v2
+            WHERE external_account_uuid = %s
+              AND project_id = %s
+              AND projection_stream_uuid = %s
+              AND selected
+              AND source->>'chat_type' = 'group'
+              AND jsonb_array_length(
+                      COALESCE(source->'participants', '[]'::jsonb)
+                  ) > 1
+            LIMIT 1
+            """,
+                (external_account_uuid, self.project_uuid, stream_uuid),
+            ).fetchone()
+            is not None
+        ):
+            # Zulip group DMs have no rename endpoint.  Their Workspace title
+            # is therefore an intentionally local channel label.
+            return None
         if operation_kind in {
             "stream.notification.update",
             "topic.notification.update",
@@ -1398,11 +1457,14 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         required_capability = provider_data._required_capability(operation_kind)
         if required_capability is None:
             raise ra_exceptions.ValidationErrorException()
+        route_owner_uuid = (
+            self.user_uuid if operation_kind == "read_state.set" else stream.user_uuid
+        )
         try:
             account, _chat, bridge = provider_data.resolve_provider_target(
                 session,
                 project_id=self.project_uuid,
-                owner_user_uuid=stream.user_uuid,
+                owner_user_uuid=route_owner_uuid,
                 external_account_uuid=external_account_uuid,
                 stream_uuid=stream_uuid,
                 capability_name=required_capability,
@@ -1419,7 +1481,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                         provider_data.resolve_provider_queue_target(
                             session,
                             project_id=self.project_uuid,
-                            owner_user_uuid=stream.user_uuid,
+                            owner_user_uuid=route_owner_uuid,
                             external_account_uuid=external_account_uuid,
                             stream_uuid=stream_uuid,
                             allow_policy_blocked=operation_kind == "membership.remove",
@@ -1526,6 +1588,46 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
         return external_account_uuids
 
+    def _lock_provider_read_accounts_for_stream(
+        self,
+        stream_uuid: object,
+    ) -> tuple[object, ...]:
+        """Lock the current user's read routes and their causal lanes."""
+        session = contexts.Context().get_session()
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+            session=session,
+        )
+        external_account_uuids = self._provider_read_account_uuids_for_stream(stream)
+        if not external_account_uuids:
+            return ()
+        self._lock_provider_accounts(external_account_uuids)
+        for external_account_uuid in external_account_uuids:
+            try:
+                account, _chat, bridge = provider_data.resolve_provider_queue_target(
+                    session,
+                    project_id=self.project_uuid,
+                    owner_user_uuid=self.user_uuid,
+                    external_account_uuid=external_account_uuid,
+                    stream_uuid=stream_uuid,
+                    allow_policy_blocked=True,
+                )
+            except (
+                provider_data.ProviderUnavailableError,
+                storage_exceptions.RecordNotFound,
+            ):
+                continue
+            provider_data.lock_provider_causal_lane(
+                session,
+                bridge_instance_uuid=bridge.uuid,
+                external_account_uuid=account.uuid,
+                causal_lane=stream_uuid,
+            )
+        return external_account_uuids
+
     def _queue_provider_operation(
         self,
         *,
@@ -1572,9 +1674,25 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         """Queue exact, retry-safe provider read-state projection chunks."""
         if not message_uuids:
             return None
+        target = provider_target
+        session = (
+            contexts.Context().get_session()
+            if target is not _PROVIDER_TARGET_UNSET and target is not None
+            else None
+        )
         first_operation = None
         for offset in range(0, len(message_uuids), _PROVIDER_READ_STATE_MAX_MESSAGES):
             chunk = message_uuids[offset : offset + _PROVIDER_READ_STATE_MAX_MESSAGES]
+            provider_message_ids = (
+                provider_data._provider_message_ids_for_read_page(
+                    session,
+                    external_account_uuid=target[0].uuid,
+                    project_id=self.project_uuid,
+                    message_uuids=chunk,
+                )
+                if session is not None
+                else None
+            )
             queue_values: dict[str, typing.Any] = {
                 "operation_kind": "read_state.set",
                 "target_type": target_type,
@@ -1585,11 +1703,16 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                     "topic_uuid": None if topic_uuid is None else str(topic_uuid),
                     "reader_uuid": str(self.user_uuid),
                     "message_uuids": [str(message_uuid) for message_uuid in chunk],
+                    **(
+                        {}
+                        if provider_message_ids is None
+                        else {"provider_message_ids": provider_message_ids}
+                    ),
                     "read": True,
                 },
             }
-            if provider_target is not _PROVIDER_TARGET_UNSET:
-                queue_values["provider_target"] = provider_target
+            if target is not _PROVIDER_TARGET_UNSET:
+                queue_values["provider_target"] = target
             operation = self._queue_provider_operation(**queue_values)
             if first_operation is None:
                 first_operation = operation
@@ -1738,6 +1861,82 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                     raise ra_exceptions.ValidationErrorException() from exc
 
         return queue
+
+    def _provider_read_scope_callbacks(
+        self,
+        *,
+        provider_account_uuids: collections.abc.Sequence[object],
+        stream_uuid: object,
+        topic_uuid: object | None,
+        target_type: str,
+        target_uuid: object,
+        where_sql: str,
+        where_values: collections.abc.Sequence[object],
+    ) -> tuple[
+        read_state.BulkReadSnapshotCallback | None,
+        typing.Callable[[typing.Any], None],
+    ]:
+        """Project the complete provider scope, including idempotent reads."""
+        provider_callback = self._provider_read_snapshot_callback(
+            provider_account_uuids=provider_account_uuids,
+            stream_uuid=stream_uuid,
+            topic_uuid=topic_uuid,
+            target_type=target_type,
+            target_uuid=target_uuid,
+        )
+        if provider_callback is None:
+            return None, lambda _session: None
+        scope_sql = f"""
+            SELECT message.uuid, message.created_at, message.ingest_sequence
+            FROM m_workspace_messages AS message
+            WHERE message.project_id = %s AND {where_sql}
+            ORDER BY message.created_at, message.uuid
+        """
+        scope_values = (self.project_uuid, *where_values)
+        reconciled = False
+
+        def queue(
+            session: typing.Any,
+            candidate_sql: str,
+            candidate_values: collections.abc.Sequence[object],
+            candidate_chunks: collections.abc.Sequence[
+                collections.abc.Mapping[str, object]
+            ]
+            | None = None,
+        ) -> None:
+            del candidate_chunks
+            nonlocal reconciled
+            changed = (
+                session.execute(
+                    f"SELECT 1 FROM ({candidate_sql}) AS candidate LIMIT 1",
+                    candidate_values,
+                ).fetchone()
+                is not None
+            )
+            try:
+                provider_callback(session, scope_sql, scope_values)
+            except (
+                ra_exceptions.ValidationErrorException,
+                storage_exceptions.RecordNotFound,
+            ):
+                if changed:
+                    raise
+            reconciled = True
+
+        def reconcile_idempotent(session: typing.Any) -> None:
+            nonlocal reconciled
+            if reconciled:
+                return
+            try:
+                provider_callback(session, scope_sql, scope_values)
+            except (
+                ra_exceptions.ValidationErrorException,
+                storage_exceptions.RecordNotFound,
+            ):
+                pass
+            reconciled = True
+
+        return queue, reconcile_idempotent
 
     def create_resource(
         self,
@@ -2260,8 +2459,17 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 session=session,
             )
-            provider_account_uuids = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
                 resource_uuid
+            )
+            provider_callback, reconcile_provider = self._provider_read_scope_callbacks(
+                provider_account_uuids=provider_account_uuids,
+                stream_uuid=resource_uuid,
+                topic_uuid=None,
+                target_type="stream",
+                target_uuid=resource_uuid,
+                where_sql="message.stream_uuid = %s",
+                where_values=(resource_uuid,),
             )
             row = helpers.read_workspace_user_stream_messages(
                 self.project_uuid,
@@ -2270,14 +2478,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 session=session,
                 current_stream=stream,
                 collect_message_uuids=False,
-                message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
-                    provider_account_uuids=provider_account_uuids,
-                    stream_uuid=resource_uuid,
-                    topic_uuid=None,
-                    target_type="stream",
-                    target_uuid=resource_uuid,
-                ),
+                message_uuid_snapshot_callback=provider_callback,
             )
+            reconcile_provider(session)
         elif resource == "stream_bindings" and action == "add_users":
             role_user_uuids = {
                 role: [sys_uuid.UUID(str(value)) for value in user_uuids]
@@ -2398,8 +2601,17 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 session=session,
             )
-            provider_account_uuids = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
                 topic.stream_uuid
+            )
+            provider_callback, reconcile_provider = self._provider_read_scope_callbacks(
+                provider_account_uuids=provider_account_uuids,
+                stream_uuid=topic.stream_uuid,
+                topic_uuid=resource_uuid,
+                target_type="topic",
+                target_uuid=resource_uuid,
+                where_sql=("message.stream_uuid = %s AND message.topic_uuid = %s"),
+                where_values=(topic.stream_uuid, resource_uuid),
             )
             row = helpers.read_workspace_user_stream_topic_messages(
                 self.project_uuid,
@@ -2408,14 +2620,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 session=session,
                 current_topic=topic,
                 collect_message_uuids=False,
-                message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
-                    provider_account_uuids=provider_account_uuids,
-                    stream_uuid=topic.stream_uuid,
-                    topic_uuid=resource_uuid,
-                    target_type="topic",
-                    target_uuid=resource_uuid,
-                ),
+                message_uuid_snapshot_callback=provider_callback,
             )
+            reconcile_provider(session)
         elif resource == "messages" and action == "read":
             session = contexts.Context().get_session()
             message = helpers.get_workspace_user_message(
@@ -2424,8 +2631,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 session=session,
             )
-            provider_account_uuids = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
                 message.stream_uuid
+            )
+            provider_callback = self._provider_read_snapshot_callback(
+                provider_account_uuids=provider_account_uuids,
+                stream_uuid=message.stream_uuid,
+                topic_uuid=message.topic_uuid,
+                target_type="message",
+                target_uuid=resource_uuid,
             )
             row, message_uuids = helpers.read_workspace_user_message(
                 self.project_uuid,
@@ -2435,24 +2649,26 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 current_message=message,
                 return_message_uuids=True,
             )
-            provider_targets = (
-                self._message_provider_targets(
-                    message,
-                    "read_state.set",
-                    account_locked=bool(provider_account_uuids),
-                )
-                if message_uuids
-                else ()
-            )
-            for provider_target in provider_targets:
-                self._queue_provider_read(
-                    stream_uuid=message.stream_uuid,
-                    topic_uuid=message.topic_uuid,
-                    message_uuids=message_uuids,
-                    target_type="message",
-                    target_uuid=resource_uuid,
-                    provider_target=provider_target,
-                )
+            if provider_callback is not None:
+                try:
+                    provider_callback(
+                        session,
+                        """
+                            SELECT message.uuid, message.created_at,
+                                   message.ingest_sequence
+                            FROM m_workspace_messages AS message
+                            WHERE message.project_id = %s
+                              AND message.uuid = %s
+                            ORDER BY message.created_at, message.uuid
+                        """,
+                        (self.project_uuid, message.uuid),
+                    )
+                except (
+                    ra_exceptions.ValidationErrorException,
+                    storage_exceptions.RecordNotFound,
+                ):
+                    if message_uuids:
+                        raise
         elif resource == "messages" and action == "read_up_to":
             session = contexts.Context().get_session()
             message = helpers.get_workspace_user_message(
@@ -2465,8 +2681,27 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             # A concurrent provider event can make a boundary row unread after
             # any separate probe. Capability validation stays after RETURNING
             # so an idempotent no-op does not depend on provider availability.
-            provider_account_uuids = self._lock_provider_account_for_stream(
+            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
                 message.stream_uuid
+            )
+            boundary_created_at = _database_timestamp(message.created_at)
+            provider_callback, reconcile_provider = self._provider_read_scope_callbacks(
+                provider_account_uuids=provider_account_uuids,
+                stream_uuid=message.stream_uuid,
+                topic_uuid=message.topic_uuid,
+                target_type="message",
+                target_uuid=resource_uuid,
+                where_sql=(
+                    "message.stream_uuid = %s "
+                    "AND message.topic_uuid = %s "
+                    "AND (message.created_at, message.uuid) <= (%s, %s)"
+                ),
+                where_values=(
+                    message.stream_uuid,
+                    message.topic_uuid,
+                    boundary_created_at,
+                    resource_uuid,
+                ),
             )
             row = helpers.read_workspace_user_topic_messages_to_message(
                 self.project_uuid,
@@ -2475,14 +2710,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 session=session,
                 current_message=message,
                 collect_message_uuids=False,
-                message_uuid_snapshot_callback=self._provider_read_snapshot_callback(
-                    provider_account_uuids=provider_account_uuids,
-                    stream_uuid=message.stream_uuid,
-                    topic_uuid=message.topic_uuid,
-                    target_type="message",
-                    target_uuid=resource_uuid,
-                ),
+                message_uuid_snapshot_callback=provider_callback,
             )
+            reconcile_provider(session)
         elif resource == "messages" and action in {"star", "unstar"}:
             row = helpers.sync_workspace_user_message_flags(
                 project_id=self.project_uuid,

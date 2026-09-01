@@ -202,15 +202,25 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
   werden zu fiktiven Project-Benutzern: migration speichert sich selbst native
   Ereignis, aber erstellt keine canonical membership/guard für das bereits entfernte IAM
   Benutzer;
-- In derselben frozen migration werden bewiesene Zulip-imported messages,
-  verknüpfte reactions/read/event projections und Zulip files, auf die keine
-  surviving native message reference;
-- Zulip-origin reaction wird auch aus dem gespeicherten native/outbound message:
-  Ihre Provider provenance wird durch `external_account_uuid` bestimmt, und UUID
-  Reaktionen werden in die Reinigung der alten Ereignisse eingeschaltet canonical copy. Native reaction
-  Sie wird in derselben gespeicherten Nachricht gespeichert;
-- Workspace→Zulip messages native und werden aus dem Reset ausgeschlossen, wenn ihre
-  `message.create` user operation bestätigt die lokale Herkunft;
+- `0157` verwendet eine Container-Grenze: Die Migration löscht jede Nachricht,
+  die in einem kanonischen Stream mit dem exakten Paar `source_name=zulip` und
+  `source.kind=zulip` liegt, unabhängig vom Ursprung der Nachricht. Auch
+  Workspace→Zulip-Nachrichten in einem solchen Stream werden entfernt und durch
+  den normalen Zulip-Backfill wiederhergestellt. `0158` vervollständigt den
+  Reset und löscht Nachrichten mit derselben exakten Zulip-Herkunft auch dann,
+  wenn sie in einen nativen Direct-Container projiziert wurden. Nachrichten
+  nativen Ursprungs im selben Container bleiben erhalten;
+- dieselbe Transaktion entfernt zugehörige Reaction-/Read-/Event-Projektionen
+  und nicht mehr referenzierte Zulip-Dateien. Legacy-Compact-Statistiken sowie
+  kanonische v2-Stream-/Topic-/Folder-Zähler werden vor dem Commit aus den
+  erhaltenen Nachrichten neu berechnet. Gemischte native Container behalten
+  Rollen, Membership-Generationen, Benachrichtigungsmodi, Topic-Zustand und
+  Folder-Platzierung; Unread-, Aktiv/Passiv- und Last-Message-Werte werden exakt
+  rekonstruiert. Zuerst werden die Compact-Message-/Read-Statistiken jedes
+  Topics im betroffenen Stream aktualisiert. Danach folgt das kanonische
+  `read_at` je Benutzer der maßgeblichen Compact-Bitmap (außerhalb der Modi
+  compact/rollback dem Legacy-Read-Flag), bevor die Zähler veröffentlicht
+  werden;
 - alte `link_kind=provider_identity`, die von der Account-scoped-Implementierung erstellt wurden,
   Sie werden auf genau `UUIDv5(verified_realm_uuid, "user:<id>")` übertragen.
   surviving native relational references, event payloads, chat catalog und
@@ -250,13 +260,14 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
   oder nach dem Anchor. Snapshot wird nur beim Bootstrap erstellt/reset, und
   nicht in der Realtime-Schleife; die globale Pause ist einfacher und
   billiger als die ständige Zusatz-Commit-Order-Infrastruktur;
-- Der destruktive Reset ist fehlersicher: konsistente Werte für `source_name`,
-  `source.kind`, `source.message_id`, Account-/Provider-Evidenz und dauerhafte
-  Evidenz mit `action=message.create` unterscheiden eingehende Projektionen von
-  nativen ausgehenden Daten. Unvollständige oder widersprüchliche Herkunft
-  bricht die Migration vor dem Löschen ab;
+- der destruktive Reset arbeitet bei Container- und Message-Metadaten
+  fail-closed: Ein unvollständiges oder widersprüchliches Paar aus
+  `source_name` und `source.kind` bricht vor dem Löschen ab. Die vollständige
+  Grenze ist die Vereinigung bestätigter Zulip-Container und Nachrichten mit
+  bestätigter Zulip-Herkunft, einschließlich Legacy-only-Kompatibilitätszeilen
+  und kanonischer Zeilen, die über Message oder Placement verknüpft sind;
 - ein unbeaufsichtigter eingefrorener Cutover ist auf eine Million
-  Legacy-Nachrichten, 30 Sekunden Lock-Wartezeit und 30 Minuten Statement-Limit
+  Legacy-Nachrichten, 30 Sekunden Lock-Wartezeit und 45 Minuten Statement-Limit
   begrenzt. Ein größerer Cutover erfordert nach Backup und produktionsgroßem
   Probelauf eine ausdrückliche Operatorfreigabe; 50 Millionen Nachrichten sind
   das Ziel im stabilen Betrieb nach dem Neuimport, keine Erlaubnis zur
@@ -271,6 +282,185 @@ Nach den Entscheidungen erlassene Klarstellung `1B`–`5A`:
 Rollback schema nicht wiederherstellt , Zulip projection:
 Die Daten werden von den Native-Daten gespeichert.
 Sie sind sowohl bei Upgrade als auch bei schema downgrade.
+
+## Unveränderlicher Cutover und Forward-Reparatur der Identität
+
+Die in Workspace Server `1.0.0` veröffentlichte Migration `0152` ist
+unveränderlich. Ein neuer Vorbereitungszweig (`0155`) beginnt bei `0151`; der
+Join-Head (`0156`) führt ihn vor der normalen Kette `0152` → `0154` auf. Bei
+einem frischen Upgrade wird die Herkunft daher vor dem veröffentlichten
+Cutover vorbereitet. Installationen, die `0152` bereits verbucht haben,
+überspringen diese Vorbereitung und werden durch `0156` vorwärts repariert. Da
+`pg_dump` keine Planner-Statistiken erhält, führt der frische Pfad außerdem
+`ANALYZE` für alle eingefrorenen Cutover-Eingaben aus, bevor die unveränderlichen
+mengenbasierten Anweisungen laufen.
+
+Die Vorbereitung akzeptiert ein historisches ausgehendes Echo nur mit einer
+exakt passenden, erfolgreichen `message.create`-Operation. Die Source-Message-
+ID darf fehlen, aber nicht der Provider-ID widersprechen. Konsistente native
+Zeilen aus der Zeit vor der Operationswarteschlange erhalten kurzlebige
+`discarded`-Herkunftsmarker. Sie können nie in eine Provider-Warteschlange
+gelangen und werden vom Join-Head entfernt.
+
+Die erste veröffentlichte Bridge-Nutzlast nach `0152` ließ
+`source.message_id` aus, enthielt aber weiterhin die vollständige konsistente
+Legacy-Form: `source.kind=zulip`, eine numerische `provider_external_id`,
+dieselbe ID in den Provider-Metadaten, die ursprüngliche Provider-URL und ein
+widerspruchsfreies Realm. `0156` akzeptiert beim Forward-Repair ausschließlich
+diese vollständige Form. Eine eindeutige Zeile erhält die realm-globale
+Identität; eine nachgewiesene Account-Alias-Kopie wird gelöst, wenn bereits ein
+global identifizierter Import existiert. Unvollständige oder widersprüchliche
+Varianten brechen weiterhin atomar ab. Die Rolling-Legacy-Trigger verwenden
+dieselbe Kompatibilitätsregel, bis diese veröffentlichte Bridge außer Betrieb
+ist.
+
+`0156` weist erhaltenen Nachrichten eine realm-globale Provider-Identität zu
+und lässt für eine physische Zulip-Nachricht genau einen Provider-verknüpften
+Gewinner. Nachgewiesene Account-Aliase müssen bei Realm/Message-ID, Projekt,
+Autor, getrennten Accounts, Provider-URL und Metadatenidentität übereinstimmen.
+Alle internen Nachrichten, Placements und öffentlichen UUIDs bleiben erhalten;
+nur die Provider-Verknüpfung der übrigen Aliase wird gelöst. Eine bereits
+global identifizierte Importzeile gewinnt gegen einen passenden erhaltenen
+Alias. Jeder nicht belegte Konflikt bricht atomar ab. Rolling Trigger für
+Legacy-Insert/Update erzwingen dieselbe Regel, bis alte Server entfernt sind.
+
+## Eigentum gemeinsamer Zulip-Projektionen und erneuter Import
+
+Ein realm-globaler Zulip-Kanal besitzt genau einen kanonischen Stream pro
+Workspace-Projekt. Mehrere ausgewählte Accounts dürfen deshalb auf dieselbe
+`projection_stream_uuid` zeigen, während der physische Stream den Eigentümer
+behält, der ihn zuerst materialisiert hat. Der Provider-Import akzeptiert einen
+anderen Account-Eigentümer nur, wenn im selben Projekt eine weitere ausgewählte
+Zuweisung auf diesen Stream zeigt. Ohne diese gespeicherte Peer-Zuweisung bleibt
+die abweichende Eigentümerschaft ein harter Fehler.
+
+Bei `topic.upsert` leitet der Server die typisierte Workspace-Quelle aus dem
+persistierten kanonischen Stream ab. Dessen stabiler Account-Scope bleibt
+erhalten und der Topic-Name wird ergänzt. Die Bridge muss serververwaltete
+Source-Felder nicht in jedem Event wiederholen.
+
+Migration `0154` erhöht die Reset-Generation jedes Zulip-Accounts einmal und
+veröffentlicht die ausgewählten Zuweisungen erneut. Damit werden unter
+Quarantäne gestellte Teillieferungen verworfen und ein vollständiger Neuversuch
+gestartet. Provider-Schlüssel bleiben idempotent; bereits angenommene Zeilen
+werden aktualisiert statt dupliziert. Bei einer frischen Aktualisierung sieht
+die gestoppte Bridge nur die finale Generation und führt einen Import aus.
+
+## Zusammenführen von Ordner-Snapshots bei der Legacy-Lesestatus-Reparatur
+
+Die Reparatur des Legacy-Lesestatus kann für jedes korrigierte Nachrichten-Flag
+eine eigene Ordnerprojektion einreihen. Jede dieser Aufgaben erstellt den
+vollständigen aktuellen Ordner-Snapshot neu und enthält keinen historischen
+Ordnerzustand. Sobald ein Worker den Scope `user-folder` besitzt, nimmt der
+beanspruchte Legacy-Neuaufbau deshalb wartende Schwesteraufgaben desselben Scopes
+auf und schreibt genau einen maßgeblichen Snapshot samt Event. Eine erst nach
+dieser Transaktion eintreffende Aufgabe bleibt ausstehend und löst einen späteren
+Neuaufbau aus. So bleibt die Live-Konvergenz erhalten, während der
+Migrationsaufwand mit der Zahl betroffener Ordner statt mit der Zahl der
+Nachrichten-Flags wächst.
+
+## Zusammenfassen reiner Ungelesen-Snapshots
+
+Der Massenimport von Nachrichten, Nachrichtenkorrekturen und die
+Materialisierung von Mitgliedschaften können viele Read-Counter-Projektionen
+für denselben `user-stream`- oder `user-topic`-Scope erzeugen. Jede reine
+Snapshot-Aufgabe berechnet die vollständigen maßgeblichen aktuellen Zähler neu
+und enthält keinen historischen Zählerstand. Eine beanspruchte reine
+Snapshot-Aufgabe schließt deshalb in derselben Transaktion wartende reine
+Snapshot-Geschwister desselben Scopes ab und veröffentlicht einen aktuellen
+Snapshot. Aufgaben mit `emit_message_read=true` bleiben getrennt, damit jede
+explizite Leseaktion ihr eigenes Event behält. Nach der Transaktion eintreffende
+Aufgaben bleiben ausstehend; damit bleibt die Live-Konvergenz erhalten und die
+Massenarbeit wird durch die betroffenen Benutzer-Scopes begrenzt.
+
+## Reparierbarer nativer Lesestatus und interaktive Priorität
+
+Migration `0160` stellt Lesezustände nativer Nachrichten wieder her, die beim
+Anlegen des kanonischen v2-Zustands im Legacy-Flag oder kompakten Bitmap
+vorhanden waren. Die Reparatur ist monoton: Sie füllt nur fehlende `read_at`-
+Werte, öffnet nach der Umstellung gelesene Nachrichten nie erneut und erstellt
+anschließend native Stream-, Topic- und Ordner-Snapshots neu.
+
+Explizite Leseaktionen für Nachricht, Bereich, Topic und Stream stellen auch
+dann eine maßgebliche Zählerneuberechnung ein, wenn die kanonischen Zeilen
+bereits gelesen sind. So repariert ein idempotenter Wiederholungsversuch einen
+veralteten Snapshot. Diese Projektionsaufgaben laufen vor Massenimporten; die
+normale Snapshot-Zusammenfassung begrenzt weiterhin die Datenbanklast.
+
+Dieselben Leseaktionen aktualisieren im kanonischen Vorgang auch den rollenden
+Compact-Kompatibilitaetszustand. Migration `0166` repariert fuer
+alle Benutzer jede bestehende Kombination aus kanonisch gelesen und im
+Compact-Bitmap ungelesen, aktualisiert die betroffenen Topic-Lesestatistiken und
+erhoeht die benutzerspezifische Leserevision. Die Reparatur ist monoton und
+veraendert keine kanonisch ungelesene Zeile, auch nicht aus einem
+Provider-Snapshot.
+
+Migration `0167` gleicht danach fuer alle aktiven Benutzer jedes Compact- oder
+Rollback-Topic-Leseaggregat mit dem gespeicherten Bitmap ab. Dadurch wird auch
+ein Aggregat repariert, das veraltet blieb, obwohl alle Nachrichtenbits bereits
+mit dem kanonischen `read_at` uebereinstimmten, sodass Stream-, Topic- und
+Ordnerzaehler denselben Lesezustand verwenden.
+
+Migration `0168` gleicht die gemeinsamen Compact-Nachrichtenzahlen der Topics
+und die letzten Ingest-Koordinaten aus den gespeicherten Nachrichtenzeilen ab.
+Damit ist auch der Fall abgedeckt, in dem alle Benutzer-Lesezaehler korrekt
+sind, aber eine veraltete Topic-Nachrichtenzahl die Compatibility-Zaehler fuer
+Stream, Topic und Ordner weiterhin verschiebt.
+
+Migration `0169` wendet die Normalisierung privater Provider-Chats erneut an
+und verwendet den Provider-`display_name` jedes Teilnehmers als massgebliche
+Quelle fuer benutzerspezifische Namen von Einzel- und Gruppen-Chats. Eine
+Workspace-Identitaet dient nur als Fallback, wenn der Provider keinen Namen
+liefert. Ein alter Name, der der frueheren Workspace-Identity-Projektion
+entspricht, wird als Provider-verwaltet erkannt; eine explizite lokale
+Umbenennung eines Gruppen-Chats bleibt erhalten.
+
+Migration `0170` behandelt auch den Eigentümer des ausgewählten Provider-Chats
+als gültigen Betrachter, wenn ein Einzelchat-Katalogeintrag nur den
+Gesprächspartner enthält. Dadurch bleibt dessen Provider-Name für jedes
+verknüpfte Konto maßgeblich, ohne dass der Provider den Eigentümer in der
+Teilnehmerliste wiederholen muss.
+
+## Reihenfolge der Provider-Leseseiten
+
+Eine verzögert materialisierte Provider-Leseseite verwendet für die Reihenfolge
+innerhalb derselben Lane die Queue-Position ihres Quell-Snapshots. Ein neuerer
+Snapshot kann gespeichert werden, bevor die Seite eine physische
+Operationssequenz erhält, darf die ältere Seite aber nicht blockieren. Frühere
+Snapshots sperren weiterhin spätere Schreibvorgänge derselben Stream-Lane;
+andere Lanes bleiben unabhängig. Die Grenzen für Materialisierung und
+Lease-Batches ändern sich nicht.
+
+## Wiederherstellung des Provider-Ingress
+
+Private Provider-API-Befehle können sicher wiederholt werden: Ihre Request-,
+Event-, Lease- und Result-IDs bleiben zwischen Versuchen stabil. Nach einem
+PostgreSQL-Deadlock wiederholt der Server die gesamte Request-Transaktion mit
+einem kurzen begrenzten exponentiellen Backoff; andere Control- und File-Requests
+werden nicht wiederholt. Sind alle Versuche erschöpft, wird ein wiederholbarer
+`503` ohne Datenbankdetails zurückgegeben. Beim Wiederherstellen einer
+Topic-Zusammenfassung nach einer Provider-Löschung werden Journal-Grenzen ohne
+vorhandene Nachricht übersprungen. So verwirft eine veraltete abgeleitete
+Zusammenfassung nicht den gesamten eingehenden Batch.
+Vor einer Provider-Löschung eingestellte Projektionsarbeit behandelt die
+gelöschte kanonische Nachricht als nicht vorhanden. Veraltete Fanout- oder
+Mention-Aufgaben enden dadurch als No-op statt in der Dead-Letter-Queue.
+
+## Read-State-Parität für Provider-Kontoinhaber
+
+Eine Provider-Nachricht, die von mehreren Konten desselben Realms gemeinsam
+verwendet wird, hat eine kanonische Platzierung, aber für jeden Inhaber eines
+ausgewählten Kontos einen eigenen Binding- und State-Datensatz. Der kompakte
+Import materialisiert diese Datensätze in einem begrenzten SQL-Batch und
+aktualisiert Compact-Bitmap und kanonisches `read_at` in derselben Transaktion.
+Snapshot-Backfills unterdrücken weiterhin öffentliche Einzelereignisse;
+autoritative Stream- und Topic-Zähler werden trotzdem neu berechnet.
+
+Migration `0162` stellt anhand des dauerhaften Journals angewendeter
+Provider-Ereignisse nur tatsächlich ausgelieferte Message/Account-Paare wieder
+her. Der effektive Lesestatus stammt aus dem Compact-Bitmap beziehungsweise
+außerhalb des Compact-Modus aus dem Legacy-Flag. Anschließend werden betroffene
+Stream-, Topic- und Folder-Zähler neu aufgebaut und vor dem Commit geprüft.
 
 ## Vereinbarkeit und Grenzen der ersten Umsetzung
 

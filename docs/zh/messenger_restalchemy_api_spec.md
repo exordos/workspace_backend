@@ -739,6 +739,7 @@ class WorkspaceProjectionTask(
     scope_kind = properties.property(types.String(max_length=64), required=True)
     scope_key = properties.property(types.String(max_length=512), required=True)
     payload = properties.property(types.Dict(), required=True)
+    execution_stats = properties.property(types.Dict(), default=dict, read_only=True)
     status = properties.property(types.Enum([
         "pending", "leased", "running", "completed", "failed", "dead_letter",
     ]), default="pending")

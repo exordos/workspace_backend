@@ -115,6 +115,10 @@ continue to use `urn:user:<identity-uuid>`.
   temporarily unavailable actions are disabled with a safe explanation.
 - The last confirmed operation wins. Delete wins over a concurrent edit.
 - Every operation has a stable UUID and provider idempotency metadata.
+- A successful native `message.create` result carries the provider-assigned
+  message identifier. Workspace binds that identifier before importing the
+  provider echo, so every connected account in the same Zulip realm resolves
+  one canonical message and preserves its original author.
 - Backfill runs newest-to-oldest. Live synchronization starts first and has
   strict scheduling priority over outbox retries and backfill.
 - Initial catch-up does not create desktop notifications. Notifications are

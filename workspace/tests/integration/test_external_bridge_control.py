@@ -5209,6 +5209,76 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
         )
         assert cursor.fetchone() == (account_uuids[0], owner_uuids[0])
 
+        # The persisted physical owner remains sufficient proof of a shared
+        # realm/chat even while that owner's account is disconnected. The live
+        # alias must still be able to recover the shared projection.
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'disconnected', live_ready = FALSE
+            WHERE uuid = %s
+            """,
+            (account_uuids[0],),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET status = 'deselected'
+            WHERE uuid = %s
+            """,
+            (chat_uuids[0],),
+        )
+
+    provider_topic_event = {
+        "provider_event_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(account_uuids[1]),
+        "external_chat_uuid": str(chat_uuids[1]),
+        "project_id": str(project_uuid),
+        "provider_sequence": "2",
+        "kind": "topic.upsert",
+        "payload": {
+            "resource": {
+                "uuid": topic_uuid,
+                "stream_uuid": str(projection_stream_uuid),
+                "name": "deploys",
+                "provider_external_id": "42:deploys",
+                "provider_metadata": {"delivery_class": "backfill"},
+            }
+        },
+    }
+    with session_factory() as session:
+        assert provider_event_apply.apply_event(
+            provider_topic_event,
+            session,
+            identity,
+        ) == sys_uuid.UUID(topic_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT source->>'source_scope'
+            FROM m_workspace_stream_topics
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, topic_uuid),
+        )
+        assert cursor.fetchone()[0] == str(account_uuids[0])
+        cursor.execute(
+            """
+            UPDATE m_external_accounts_v2
+            SET status = 'live', live_ready = TRUE
+            WHERE uuid = %s
+            """,
+            (account_uuids[0],),
+        )
+        cursor.execute(
+            """
+            UPDATE m_external_chats_v2
+            SET status = 'live'
+            WHERE uuid = %s
+            """,
+            (chat_uuids[0],),
+        )
+
     deselected = api.post(
         f"/v1/external_chats/{chat_uuids[0]}/actions/deselect/invoke",
         json={},

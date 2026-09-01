@@ -202,15 +202,23 @@ UUIDv5(verified_realm_uuid,
   превращаются в фиктивных project users: migration сохраняет само native
   событие, но не создаёт canonical membership/guard для уже удалённого IAM
   пользователя;
-- в том же frozen migration удаляются доказанные Zulip-imported messages,
-  связанные reactions/read/event projections и Zulip files, на которые нет
-  surviving native message reference;
-- Zulip-origin reaction удаляется также с сохраняемого native/outbound message:
-  её provider provenance определяется по `external_account_uuid`, а UUID
-  реакции включается в очистку старых events до canonical copy. Native reaction
-  на том же сохраняемом сообщении остаётся;
-- Workspace→Zulip messages считаются native и исключаются из reset, если их
-  `message.create` user operation подтверждает локальное происхождение;
+- `0157` использует container boundary: удаляются все messages, размещённые в
+  canonical stream с точной парой `source_name=zulip` и `source.kind=zulip`,
+  независимо от происхождения самого message. Поэтому Workspace→Zulip
+  outbound messages в таком stream также удаляются и затем возвращаются
+  обычным backfill из Zulip. `0158` завершает reset: удаляет messages с такой же
+  точной Zulip provenance, даже если они были спроецированы в native Direct
+  container. Native-origin messages в том же container сохраняются;
+- в той же транзакции удаляются связанные reactions/read/event projections и
+  неиспользуемые Zulip files. Legacy compact stats и canonical v2
+  stream/topic/folder counters пересчитываются по сохранённым messages до
+  commit. Поэтому смешанные native containers сохраняют roles, membership
+  generations, notification modes, topic state и положение в folders, а их
+  unread, active/passive и last-message значения восстанавливаются точно.
+  Сначала обновляются compact message/read stats каждого topic в затронутом
+  stream; затем canonical `read_at` каждого пользователя приводится к
+  authoritative compact bitmap (либо к legacy read flag вне режимов
+  compact/rollback), и только после этого публикуются counters;
 - старые `link_kind=provider_identity`, созданные account-scoped реализацией,
   переводятся на exact `UUIDv5(verified_realm_uuid, "user:<id>")`. Все
   surviving native relational references, event payloads, chat catalog и
@@ -250,13 +258,13 @@ UUIDv5(verified_realm_uuid,
   либо строго после anchor. Snapshot создаётся только при bootstrap/reset, а
   не в realtime loop; глобальная краткая пауза control-plane writers проще и
   дешевле постоянной дополнительной commit-order инфраструктуры;
-- destructive reset работает fail-closed: согласованные `source_name`,
-  `source.kind`, `source.message_id`, account/provider evidence и durable
-  `action=message.create` evidence отличают inbound projection от native
-  outbound data. Частичное или противоречивое происхождение останавливает
-  migration до delete;
+- destructive reset работает fail-closed по container и message metadata:
+  частичная или противоречивая пара `source_name`/`source.kind` останавливает
+  migration до удаления. Полная граница — объединение подтверждённых Zulip
+  containers и messages с подтверждённым Zulip origin, включая legacy-only
+  compatibility rows и canonical rows, связанные через message или placement;
 - unattended frozen cutover ограничен одним миллионом legacy messages,
-  ожиданием lock не более 30 секунд и statement deadline 30 минут. Больший
+  ожиданием lock не более 30 секунд и statement deadline 45 минут. Больший
   cutover требует явного разрешения оператора после backup и production-sized
   rehearsal; целевые 50 миллионов сообщений — steady state после reimport, а
   не разрешение на automatic legacy conversion;
@@ -270,6 +278,172 @@ UUIDv5(verified_realm_uuid,
 Rollback schema не восстанавливает намеренно уничтоженную Zulip projection:
 для этого используется проверенный pre-migration backup. Native data остаются
 доступны и при upgrade, и при schema downgrade.
+
+## Неизменяемый cutover и forward-repair идентичности
+
+Миграция `0152`, опубликованная в Workspace Server `1.0.0`, неизменяема. Новая
+подготовительная ветка (`0155`) начинается от `0151`, а join-head (`0156`)
+перечисляет её перед обычной цепочкой `0152` → `0154`. Поэтому при чистом
+upgrade происхождение данных подготавливается до запуска опубликованного
+cutover. Инсталляция, где `0152` уже записана, пропускает подготовку и получает
+forward-repair в `0156`. Поскольку `pg_dump` не сохраняет planner statistics,
+fresh-путь также выполняет `ANALYZE` для всех замороженных inputs до запуска
+неизменяемых set-based statements.
+
+Подготовка признаёт historical outbound echo только при точной успешной
+операции `message.create`. `source.message_id` может отсутствовать, но не может
+противоречить provider ID. Согласованные native rows, созданные до появления
+operation queue, временно получают `discarded` provenance markers. Они не могут
+попасть в provider queue и удаляются join-head миграцией.
+
+Первая опубликованная после `0152` версия Bridge не записывала
+`source.message_id`, но сохраняла полный согласованный legacy-набор:
+`source.kind=zulip`, числовой `provider_external_id`, тот же ID в provider
+metadata, исходный provider URL и непротиворечивый realm. Во время forward
+repair `0156` принимает только такую полную форму. Уникальная строка получает
+realm-global identity, а доказанная account-alias копия отсоединяется, если уже
+есть импорт с global key. Частичные или противоречивые варианты по-прежнему
+атомарно останавливают миграцию. Rolling legacy triggers применяют то же правило
+совместимости до вывода этой версии Bridge из эксплуатации.
+
+`0156` назначает сохранённым сообщениям realm-global provider identity и
+оставляет provider linkage только у одного победителя для физического Zulip
+message. Доказанные account aliases должны совпадать по realm/message ID,
+project, author, разным account owners, provider URL и metadata identity. Все
+внутренние messages, placements и public UUID сохраняются; у проигравших
+aliases отсоединяется только provider linkage. Уже импортированная строка с
+global identity имеет приоритет над совпадающим retained alias. Любой
+недоказанный конфликт атомарно останавливает миграцию. Rolling triggers на
+legacy insert/update затем поддерживают то же правило до отключения старых
+серверов.
+
+## Владение общей Zulip projection и повторный импорт
+
+Для realm-global Zulip channel используется один canonical stream на проект
+Workspace. Поэтому несколько выбранных аккаунтов могут ссылаться на один
+`projection_stream_uuid`, а физический stream сохраняет владельца, который
+материализовал его первым. Provider ingestion принимает другого владельца
+аккаунта только тогда, когда в том же проекте есть выбранный peer assignment на
+этот stream. Без такой сохранённой связи несовпадение владельца остаётся
+жёсткой ошибкой.
+
+Для `topic.upsert` сервер формирует типизированный Workspace source из
+сохранённого canonical stream: его стабильный account scope не меняется, а к
+нему добавляется имя topic. Bridge не обязан повторять server-owned source
+fields в каждом событии.
+
+Миграция `0154` один раз увеличивает reset generation каждого Zulip-аккаунта и
+повторно публикует выбранные assignments. Это удаляет карантин частично
+доставленного импорта и запускает полный повтор. Provider keys идемпотентны,
+поэтому уже принятые строки обновляются, а не дублируются. При новой установке
+остановленный Bridge видит только итоговое generation и выполняет один импорт.
+
+## Объединение folder snapshots при восстановлении legacy read-state
+
+Восстановление legacy read-state может поставить отдельную folder projection
+для каждого исправленного message flag. Каждая такая задача заново строит
+полный актуальный snapshot папки и не содержит исторического состояния. Поэтому
+worker, получивший `user-folder` scope, поглощает ожидающие legacy-задачи того же
+scope и фиксирует один авторитетный snapshot и event. Задача, появившаяся после
+этой транзакции, остаётся в очереди и запускает следующую сборку: live-сходимость
+сохраняется, а объём миграционной работы зависит от числа затронутых папок, а не
+от числа message flags.
+
+## Объединение snapshot-only счётчиков непрочитанных
+
+Массовый импорт messages, исправление сообщений и материализация membership
+могут поставить много read-counter projections для одного `user-stream` или
+`user-topic` scope. Каждая snapshot-only задача заново вычисляет полные
+авторитетные текущие счётчики и не содержит исторического значения. Поэтому
+получившая scope snapshot-only задача в своей транзакции поглощает ожидающие
+snapshot-only задачи того же scope и публикует один актуальный snapshot. Задачи
+с `emit_message_read=true` остаются отдельными, чтобы каждое явное чтение
+сообщения сохранило свой event. Новые задачи, появившиеся после транзакции,
+остаются в очереди: live-сходимость сохраняется, а массовая работа ограничена
+числом затронутых пользовательских scopes.
+
+## Восстанавливаемый native read-state и приоритет интерактивного чтения
+
+Миграция `0160` восстанавливает прочтение native messages, которое было
+зафиксировано в legacy flag или compact bitmap при создании canonical v2
+state. Исправление монотонно: оно заполняет только отсутствующие `read_at`, не
+открывает заново сообщения, прочитанные после переключения, а затем перестраивает
+native stream, topic и folder snapshots.
+
+Явные действия чтения message, диапазона, topic и stream ставят авторитетный
+пересчёт counters даже тогда, когда canonical rows уже прочитаны. Поэтому
+идемпотентный повтор исправляет устаревший snapshot. Такие projection tasks
+выполняются раньше массового импорта, а обычное объединение snapshots по-прежнему
+ограничивает нагрузку на базу.
+
+Те же read-actions в canonical transaction обновляют rolling compact
+compatibility state. Миграция `0166` для всех пользователей исправляет
+все существующие пары canonical-read/compact-unread, пересчитывает затронутую
+topic read-статистику и увеличивает пользовательскую read revision. Исправление
+монотонно: canonical unread rows, включая unread из provider snapshot, оно не
+меняет.
+
+Затем миграция `0167` для всех активных пользователей пересчитывает каждый
+compact или rollback topic read aggregate из сохранённого bitmap. Это также
+исправляет aggregate, который оставался устаревшим, хотя все побитовые значения
+сообщений уже совпадали с canonical `read_at`, поэтому счётчики stream, topic и
+folder используют одно и то же состояние чтения.
+
+Миграция `0168` пересчитывает общие compact-счётчики сообщений topic и последние
+ingest-координаты из сохранённых строк сообщений. Она закрывает оставшийся
+случай, когда пользовательские read counts уже точны, но устаревшее общее число
+сообщений topic всё ещё сдвигает compatibility-счётчики stream, topic и folder.
+
+Миграция `0169` повторно нормализует provider private chats и использует
+provider `display_name` каждого участника как источник названий personal и group
+чатов для конкретного пользователя. Workspace identity применяется только как
+fallback, если provider не передал имя. Старое название, совпадающее с прежней
+проекцией Workspace identities, распознаётся как provider-managed, а явное
+локальное переименование group чата сохраняется.
+
+Миграция `0170` также считает владельца выбранного provider-чата допустимым
+viewer, когда каталог personal chat содержит только собеседника. Поэтому
+provider-имя собеседника остаётся источником названия для каждого связанного
+аккаунта, даже если provider не повторяет владельца в списке участников.
+
+## Порядок provider read pages
+
+Лениво материализованная provider read page использует позицию исходного
+snapshot для упорядочивания внутри одной линии. Более новый snapshot может быть
+сохранён до того, как page получит физический operation sequence, но он не
+блокирует старую page. Более ранние snapshots по-прежнему останавливают поздние
+записи в той же stream lane, а другие lanes остаются независимыми. Ограничения
+размера materialization и lease batch не меняются.
+
+## Восстановление provider ingress
+
+Команды приватного Provider API допускают безопасное повторение: их request,
+event, lease и result идентификаторы сохраняются между попытками. После
+PostgreSQL deadlock сервер целиком повторяет транзакцию запроса с короткой
+ограниченной экспоненциальной задержкой; прочие control и file запросы не
+повторяются. После исчерпания попыток возвращается повторяемый `503` без деталей
+базы. При provider deletion восстановление summary пропускает journal boundaries,
+сообщения которых уже отсутствуют, чтобы устаревший производный summary не
+отклонял весь входящий batch.
+Projection work, поставленная до provider deletion, считает удалённое canonical
+message отсутствующим. Поэтому устаревшие fanout и mention tasks завершаются как
+no-op, а не попадают в dead-letter queue.
+
+## Паритет read-state владельца provider-аккаунта
+
+У provider message, общего для нескольких аккаунтов одного realm, есть одна
+canonical placement, но отдельные binding и state для владельца каждого
+выбранного аккаунта. Compact import материализует эти строки одним ограниченным
+SQL batch и в одной транзакции обновляет compact bitmap и canonical `read_at`.
+Snapshot-only backfill по-прежнему не публикует отдельные message events, но
+авторитетные пересчёты stream и topic counters выполняются.
+
+Миграция `0162` использует журнал применённых provider events и восстанавливает
+только те пары message/account, которые действительно были доставлены. Значение
+прочитанности берётся из compact bitmap (или legacy flag вне compact mode),
+после чего пересчитываются затронутые stream, topic и folder counters и до
+commit проверяется паритет. Native messages и невыбранная provider history не
+расширяются.
 
 ## Совместимость и границы первой реализации
 

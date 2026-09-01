@@ -23,6 +23,7 @@ from workspace.messenger_api.dm import helpers as messenger_helpers
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import read_state
+from workspace.messenger_api.dm import v2_models
 
 
 LEASE_MIN_SECONDS = 10
@@ -680,6 +681,205 @@ def rebind_provider_read_lane_project(
     )
 
 
+def _provider_message_ids_for_read_page(
+    session: typing.Any,
+    *,
+    external_account_uuid: object,
+    project_id: object,
+    message_uuids: typing.Sequence[object],
+) -> list[str] | None:
+    """Resolve an exact read page to immutable Zulip message identifiers."""
+    if not message_uuids:
+        return None
+    rows = session.execute(
+        """
+        WITH candidate AS (
+            SELECT message_uuid, ordinal_position
+            FROM unnest(%s::uuid[]) WITH ORDINALITY
+                 AS value(message_uuid, ordinal_position)
+        ), target_account AS (
+            SELECT provider_realm_uuid
+            FROM m_external_accounts_v2
+            WHERE uuid = %s AND provider = 'zulip'
+        )
+        SELECT candidate.message_uuid,
+               COALESCE(direct.provider_external_id,
+                        legacy.provider_external_id) AS provider_message_id
+        FROM candidate
+        CROSS JOIN target_account
+        LEFT JOIN m_workspace_messages AS direct
+          ON direct.project_id = %s
+         AND direct.uuid = candidate.message_uuid
+         AND direct.provider_external_id IS NOT NULL
+         AND EXISTS (
+                SELECT 1
+                FROM m_external_accounts_v2 AS source_account
+                WHERE source_account.uuid = direct.external_account_uuid
+                  AND source_account.provider = 'zulip'
+                  AND source_account.provider_realm_uuid =
+                      target_account.provider_realm_uuid
+         )
+        LEFT JOIN messenger_message_placements AS placement
+          ON placement.project_id = %s
+         AND placement.uuid = candidate.message_uuid
+        LEFT JOIN m_workspace_messages AS legacy
+          ON legacy.project_id = placement.project_id
+         AND legacy.uuid = placement.legacy_public_uuid
+         AND legacy.provider_external_id IS NOT NULL
+         AND EXISTS (
+                SELECT 1
+                FROM m_external_accounts_v2 AS source_account
+                WHERE source_account.uuid = legacy.external_account_uuid
+                  AND source_account.provider = 'zulip'
+                  AND source_account.provider_realm_uuid =
+                      target_account.provider_realm_uuid
+         )
+        ORDER BY candidate.ordinal_position
+        """,
+        (list(message_uuids), external_account_uuid, project_id, project_id),
+    ).fetchall()
+    if len(rows) != len(message_uuids):
+        return None
+    provider_ids = [row["provider_message_id"] for row in rows]
+    if any(
+        value is None
+        or not str(value).isdecimal()
+        or (len(str(value)) > 1 and str(value).startswith("0"))
+        for value in provider_ids
+    ):
+        return None
+    return [str(value) for value in provider_ids]
+
+
+def _delivered_provider_read_page_bindings(
+    session: typing.Any,
+    *,
+    external_account_uuid: object,
+    project_id: object,
+    message_uuids: typing.Sequence[object],
+) -> list[tuple[object, str]] | None:
+    """Bind only messages that were delivered to the target Zulip account."""
+    if not message_uuids:
+        return []
+    rows = session.execute(
+        """
+        WITH candidate AS (
+            SELECT message_uuid, ordinal_position
+            FROM unnest(%s::uuid[]) WITH ORDINALITY
+                 AS value(message_uuid, ordinal_position)
+        ), target_account AS (
+            SELECT provider_realm_uuid, owner_user_uuid
+            FROM m_external_accounts_v2
+            WHERE uuid = %s AND provider = 'zulip'
+        ), target_delivery AS (
+            SELECT EXISTS (
+                SELECT 1
+                FROM m_external_provider_events_v1 AS event
+                WHERE event.project_id = %s
+                  AND event.external_account_uuid = %s
+                  AND event.status = 'applied'
+                  AND event.event_kind = 'message.upsert'
+                  AND event.target_uuid IS NOT NULL
+            ) AS available
+        ), resolved AS (
+            SELECT candidate.message_uuid, candidate.ordinal_position,
+                   COALESCE(direct.uuid, legacy.uuid) AS legacy_message_uuid,
+                   COALESCE(direct.stream_uuid,
+                            legacy.stream_uuid) AS stream_uuid,
+                   COALESCE(direct.provider_external_id,
+                            legacy.provider_external_id) AS provider_message_id,
+                   COALESCE(direct.source_name,
+                            legacy.source_name) AS source_name,
+                   COALESCE(direct.external_account_uuid,
+                            legacy.external_account_uuid)
+                       AS source_external_account_uuid,
+                   target_account.owner_user_uuid
+            FROM candidate
+            CROSS JOIN target_account
+            LEFT JOIN m_workspace_messages AS direct
+              ON direct.project_id = %s
+             AND direct.uuid = candidate.message_uuid
+             AND direct.provider_external_id IS NOT NULL
+             AND EXISTS (
+                    SELECT 1
+                    FROM m_external_accounts_v2 AS source_account
+                    WHERE source_account.uuid = direct.external_account_uuid
+                      AND source_account.provider = 'zulip'
+                      AND source_account.provider_realm_uuid =
+                          target_account.provider_realm_uuid
+             )
+            LEFT JOIN messenger_message_placements AS placement
+              ON placement.project_id = %s
+             AND placement.uuid = candidate.message_uuid
+            LEFT JOIN m_workspace_messages AS legacy
+              ON legacy.project_id = placement.project_id
+             AND legacy.uuid = placement.legacy_public_uuid
+             AND legacy.provider_external_id IS NOT NULL
+             AND EXISTS (
+                    SELECT 1
+                    FROM m_external_accounts_v2 AS source_account
+                    WHERE source_account.uuid = legacy.external_account_uuid
+                      AND source_account.provider = 'zulip'
+                      AND source_account.provider_realm_uuid =
+                          target_account.provider_realm_uuid
+             )
+        )
+        SELECT resolved.message_uuid, resolved.provider_message_id,
+               target_delivery.available,
+               EXISTS (
+                SELECT 1
+                FROM m_external_provider_events_v1 AS event
+                WHERE event.project_id = %s
+                  AND event.external_account_uuid = %s
+                  AND event.status = 'applied'
+                  AND event.event_kind = 'message.upsert'
+                  AND event.target_uuid = resolved.legacy_message_uuid
+               ) OR (
+                resolved.source_name = 'native'
+                AND resolved.source_external_account_uuid = %s
+               ) OR EXISTS (
+                SELECT 1
+                FROM m_workspace_stream_bindings AS binding
+                JOIN m_confirmed_external_stream_access AS access
+                  ON access.project_id = binding.project_id
+                 AND access.stream_uuid = binding.stream_uuid
+                 AND access.user_uuid = binding.user_uuid
+                WHERE binding.project_id = %s
+                  AND binding.stream_uuid = resolved.stream_uuid
+                  AND binding.user_uuid = resolved.owner_user_uuid
+               ) AS delivered
+        FROM resolved
+        CROSS JOIN target_delivery
+        ORDER BY resolved.ordinal_position
+        """,
+        (
+            list(message_uuids),
+            external_account_uuid,
+            project_id,
+            external_account_uuid,
+            project_id,
+            project_id,
+            project_id,
+            external_account_uuid,
+            external_account_uuid,
+            project_id,
+        ),
+    ).fetchall()
+    if rows and not rows[0]["available"]:
+        return None
+    return [
+        (row["message_uuid"], str(row["provider_message_id"]))
+        for row in rows
+        if row["delivered"]
+        and row["provider_message_id"] is not None
+        and str(row["provider_message_id"]).isdecimal()
+        and not (
+            len(str(row["provider_message_id"])) > 1
+            and str(row["provider_message_id"]).startswith("0")
+        )
+    ]
+
+
 def _materialize_provider_read_pages(
     session: typing.Any,
     *,
@@ -930,6 +1130,30 @@ def _materialize_provider_read_pages(
                 (exhausted, now, operation_uuid),
             )
             if candidates:
+                candidate_message_uuids = [
+                    candidate["message_uuid"] for candidate in candidates
+                ]
+                delivered_bindings = _delivered_provider_read_page_bindings(
+                    session,
+                    external_account_uuid=snapshot["external_account_uuid"],
+                    project_id=snapshot["project_id"],
+                    message_uuids=candidate_message_uuids,
+                )
+            else:
+                candidate_message_uuids = []
+                delivered_bindings = []
+            if delivered_bindings is None:
+                message_uuids = candidate_message_uuids
+                provider_message_ids = _provider_message_ids_for_read_page(
+                    session,
+                    external_account_uuid=snapshot["external_account_uuid"],
+                    project_id=snapshot["project_id"],
+                    message_uuids=message_uuids,
+                )
+            else:
+                message_uuids = [binding[0] for binding in delivered_bindings]
+                provider_message_ids = [binding[1] for binding in delivered_bindings]
+            if message_uuids:
                 _insert_provider_operation(
                     session,
                     external_operation_uuid=operation_uuid,
@@ -941,9 +1165,12 @@ def _materialize_provider_read_pages(
                     payload={
                         **snapshot["payload"],
                         "_workspace_response_revision": 2,
-                        "message_uuids": [
-                            str(candidate["message_uuid"]) for candidate in candidates
-                        ],
+                        "message_uuids": [str(value) for value in message_uuids],
+                        **(
+                            {}
+                            if provider_message_ids is None
+                            else {"provider_message_ids": provider_message_ids}
+                        ),
                     },
                     now=now,
                 )
@@ -1147,6 +1374,66 @@ def sync_operation_target_delivery(
     if target is None or operation.target_uuid is None:
         return
     delivery = _operation_delivery(operation)
+    if operation.target_type == "message":
+        canonical = session.execute(
+            """
+            SELECT placement.message_uuid,
+                   (
+                       SELECT count(*)
+                       FROM messenger_message_placements AS sibling
+                       WHERE sibling.project_id = placement.project_id
+                         AND sibling.message_uuid = placement.message_uuid
+                   ) AS placement_count
+            FROM messenger_message_placements AS placement
+            WHERE placement.project_id = %s
+              AND (
+                  placement.legacy_public_uuid = %s
+                  OR placement.uuid = %s
+              )
+            ORDER BY (placement.legacy_public_uuid = %s) DESC, placement.uuid
+            LIMIT 1
+            """,
+            (
+                project_id,
+                operation.target_uuid,
+                operation.target_uuid,
+                operation.target_uuid,
+            ),
+        ).fetchone()
+        if canonical is not None and canonical["placement_count"] > 1:
+            changed = session.execute(
+                """
+                UPDATE messenger_messages
+                SET delivery = %s::jsonb
+                WHERE project_id = %s AND uuid = %s
+                  AND delivery IS DISTINCT FROM %s::jsonb
+                RETURNING uuid
+                """,
+                (
+                    _canonical_json(delivery),
+                    project_id,
+                    canonical["message_uuid"],
+                    _canonical_json(delivery),
+                ),
+            ).fetchone()
+            if changed is not None:
+                resources = v2_models.WorkspaceUserMessage.objects.get_all(
+                    filters={
+                        "project_id": dm_filters.EQ(project_id),
+                        "canonical_message_uuid": dm_filters.EQ(
+                            canonical["message_uuid"]
+                        ),
+                    },
+                    order_by={"uuid": "asc", "user_uuid": "asc"},
+                    session=session,
+                )
+                messenger_events.create_message_updated_events(
+                    project_id,
+                    resources,
+                    session=session,
+                    compact=True,
+                )
+            return
     legacy_status = {
         "pending": "pending",
         "delivered": "delivered",
@@ -1354,7 +1641,16 @@ def lease_provider_operations(
                             operation.bridge_instance_uuid
                       AND barrier.external_account_uuid =
                             operation.external_account_uuid
-                      AND barrier.queue_sequence < operation.sequence
+                      AND barrier.queue_sequence < COALESCE(
+                            (
+                                SELECT page_snapshot.queue_sequence
+                                FROM m_external_provider_read_snapshots_v1
+                                    AS page_snapshot
+                                WHERE page_snapshot.external_operation_uuid =
+                                        operation.external_operation_uuid
+                            ),
+                            operation.sequence
+                      )
                       AND (
                             -- Fail closed for rows written by an old process
                             -- during a rolling migration.
@@ -1389,6 +1685,11 @@ def lease_provider_operations(
             now,
         ),
     ).fetchall()
+    # UPDATE ... RETURNING does not preserve the ORDER BY of the candidate
+    # CTE. Keep the lease response in causal queue order just like replaying an
+    # existing request above; otherwise concurrently materialized read pages
+    # can be delivered out of order after PostgreSQL changes its update plan.
+    rows = sorted(rows, key=lambda row: row["sequence"])
     if rows:
         newly_running = session.execute(
             """
@@ -1452,6 +1753,13 @@ def _validated_result(result: object) -> dict[str, typing.Any]:
     original_url = result.get("original_url")
     if original_url is not None and not isinstance(original_url, str):
         raise ValueError("Provider original URL is invalid")
+    provider_entity_id = result.get("provider_entity_id")
+    if provider_entity_id is not None and (
+        not isinstance(provider_entity_id, str)
+        or not provider_entity_id
+        or len(provider_entity_id) > 2048
+    ):
+        raise ValueError("Provider entity identifier is invalid")
     reconciliation = result.get("reconciliation") or {}
     if not isinstance(reconciliation, dict):
         raise ValueError("Provider reconciliation data is invalid")
@@ -1469,9 +1777,590 @@ def _validated_result(result: object) -> dict[str, typing.Any]:
         "public_status": public_status,
         "safe_error": safe_error,
         "original_url": original_url,
+        "provider_entity_id": provider_entity_id,
         "reconciliation": reconciliation,
         "manual": manual,
     }
+
+
+def _bind_native_message_provider_identity(
+    session: typing.Any,
+    identity: typing.Any,
+    operation: typing.Mapping[str, typing.Any],
+    provider_entity_id: str | None,
+) -> None:
+    """Bind a committed native send before its provider echo can be imported.
+
+    Provider Data v1 uses the operation result as the only place where a
+    provider-assigned message ID becomes available.  Persist it on the native
+    target in the same transaction as the terminal result so every account in
+    the same provider realm resolves a later echo to that one message.
+    """
+    if (
+        operation["operation_kind"] != "message.create"
+        or identity.provider_kind != "zulip"
+    ):
+        return
+    if provider_entity_id is None:
+        raise ValueError(
+            "Successful Zulip message result requires a provider identifier"
+        )
+    if (
+        not provider_entity_id.isdecimal()
+        or len(provider_entity_id) > 32
+        or (len(provider_entity_id) > 1 and provider_entity_id.startswith("0"))
+    ):
+        raise ValueError("Zulip provider message identifier is invalid")
+    public_operation = session.execute(
+        """
+        SELECT "target_type", "target_uuid", "external_account_uuid"
+        FROM "m_external_operations_v2"
+        WHERE "uuid" = %s
+        FOR UPDATE
+        """,
+        (operation["external_operation_uuid"],),
+    ).fetchone()
+    if (
+        public_operation is None
+        or public_operation["target_type"] != "message"
+        or public_operation["target_uuid"] is None
+        or public_operation["external_account_uuid"] is None
+    ):
+        return
+    account = session.execute(
+        """
+        SELECT "provider_realm_uuid"
+        FROM "m_external_accounts_v2"
+        WHERE "uuid" = %s AND "provider" = 'zulip'
+        FOR SHARE
+        """,
+        (public_operation["external_account_uuid"],),
+    ).fetchone()
+    if account is None or account["provider_realm_uuid"] is None:
+        return
+    realm_uuid = account["provider_realm_uuid"]
+    session.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"provider-message-identity-v1:{realm_uuid}:{provider_entity_id}",),
+    )
+    message = session.execute(
+        """
+        SELECT "source_name", "provider_uuid", "external_account_uuid",
+               "provider_external_id"
+        FROM "m_workspace_messages"
+        WHERE "project_id" = %s AND "uuid" = %s
+        FOR UPDATE
+        """,
+        (operation["project_id"], public_operation["target_uuid"]),
+    ).fetchone()
+    if message is None:
+        # The native message may have been deleted while its provider request
+        # was in flight.  The result remains terminal, but must not create a
+        # new local projection for the now-deleted target.
+        return
+    if message["source_name"] != "native":
+        raise ValueError("Provider message result target is not native")
+    if _reconcile_native_message_provider_echo(
+        session,
+        operation["project_id"],
+        public_operation["target_uuid"],
+        realm_uuid,
+        provider_entity_id,
+        identity.bridge_instance_uuid,
+        public_operation["external_account_uuid"],
+    ):
+        return
+    existing_identity = (
+        message["provider_uuid"],
+        message["external_account_uuid"],
+        message["provider_external_id"],
+    )
+    expected_identity = (
+        identity.bridge_instance_uuid,
+        public_operation["external_account_uuid"],
+        provider_entity_id,
+    )
+    if any(value is not None for value in existing_identity):
+        if existing_identity != expected_identity:
+            raise ValueError("Native message provider identity conflicts")
+        return
+    session.execute(
+        """
+        UPDATE "m_workspace_messages"
+        SET "provider_uuid" = %s,
+            "external_account_uuid" = %s,
+            "provider_external_id" = %s,
+            "provider_metadata" = jsonb_build_object(
+                'kind', 'zulip',
+                'account_uuid', %s::text,
+                'external_id', %s::text,
+                'provider_realm_uuid', %s::text,
+                'capabilities', '{}'::jsonb
+            )
+        WHERE "project_id" = %s AND "uuid" = %s
+        """,
+        (
+            identity.bridge_instance_uuid,
+            public_operation["external_account_uuid"],
+            provider_entity_id,
+            public_operation["external_account_uuid"],
+            provider_entity_id,
+            realm_uuid,
+            operation["project_id"],
+            public_operation["target_uuid"],
+        ),
+    )
+
+
+def _reconcile_native_message_provider_echo(
+    session: typing.Any,
+    project_id: object,
+    native_public_uuid: object,
+    provider_realm_uuid: object,
+    provider_message_id: str,
+    provider_uuid: object,
+    external_account_uuid: object,
+) -> bool:
+    """Merge a provider echo that committed before its outbound result.
+
+    Provider command canonicalization and the result path share the same
+    realm/message advisory lock. If the echo won the race, move its distinct
+    placements onto the native canonical row, merge semantic state for the
+    duplicate placement, then delete the echo canonical root. Existing foreign
+    keys own the cascade for every remaining placement dependency.
+    """
+    native = session.execute(
+        """
+        SELECT placement.uuid AS placement_uuid,
+               placement.legacy_public_uuid,
+               placement.stream_uuid, placement.topic_uuid,
+               message.uuid AS canonical_uuid
+        FROM messenger_message_placements AS placement
+        JOIN messenger_messages AS message
+          ON message.project_id = placement.project_id
+         AND message.uuid = placement.message_uuid
+        WHERE placement.project_id = %s
+          AND COALESCE(placement.legacy_public_uuid, placement.uuid) = %s
+        FOR UPDATE OF placement, message
+        """,
+        (project_id, native_public_uuid),
+    ).fetchone()
+    if native is None:
+        return False
+    echo = session.execute(
+        """
+        SELECT uuid, project_id, author_uuid, source_name, source
+        FROM messenger_messages
+        WHERE provider_realm_uuid = %s AND provider_message_id = %s
+        FOR UPDATE
+        """,
+        (provider_realm_uuid, provider_message_id),
+    ).fetchone()
+    if echo is None or echo["uuid"] == native["canonical_uuid"]:
+        return False
+    if echo["project_id"] != project_id:
+        raise ValueError("Provider echo belongs to another Workspace project")
+
+    # The successful native send owns authorship, content, and creation time.
+    # The echo owns the realm-global provider identity and may already own
+    # projections for other selected accounts.
+    session.execute(
+        """
+        UPDATE messenger_messages AS echo
+        SET author_uuid = native.author_uuid,
+            payload = native.payload,
+            source_name = native.source_name,
+            source = native.source,
+            delivery = COALESCE(native.delivery, echo.delivery),
+            created_at = LEAST(native.created_at, echo.created_at),
+            updated_at = GREATEST(native.updated_at, echo.updated_at)
+        FROM messenger_messages AS native
+        WHERE native.project_id = %s AND native.uuid = %s
+          AND echo.project_id = %s AND echo.uuid = %s
+        """,
+        (
+            project_id,
+            native["canonical_uuid"],
+            project_id,
+            echo["uuid"],
+        ),
+    )
+
+    duplicate_placement = session.execute(
+        """
+        SELECT uuid, legacy_public_uuid, stream_uuid, topic_uuid
+        FROM messenger_message_placements
+        WHERE project_id = %s AND message_uuid = %s
+          AND stream_uuid = %s AND topic_uuid = %s
+          AND uuid <> %s
+        ORDER BY created_at, uuid
+        LIMIT 1
+        FOR UPDATE
+        """,
+        (
+            project_id,
+            echo["uuid"],
+            native["stream_uuid"],
+            native["topic_uuid"],
+            native["placement_uuid"],
+        ),
+    ).fetchone()
+
+    if duplicate_placement is not None:
+        source_placement_uuid = duplicate_placement["uuid"]
+        target_placement_uuid = native["placement_uuid"]
+
+        session.execute(
+            """
+            INSERT INTO messenger_user_message_bindings (
+                uuid, project_id, placement_uuid, user_uuid,
+                membership_generation, relation_role, visibility,
+                permissions, created_at, updated_at
+            )
+            SELECT messenger_uuid_v5(%s, source.user_uuid::text),
+                   source.project_id, %s, source.user_uuid,
+                   membership.membership_generation,
+                   CASE WHEN source.user_uuid = message.author_uuid
+                        THEN 'author' ELSE source.relation_role END,
+                   source.visibility, source.permissions,
+                   source.created_at, source.updated_at
+            FROM messenger_user_message_bindings AS source
+            JOIN messenger_stream_bindings AS membership
+              ON membership.project_id = source.project_id
+             AND membership.stream_uuid = %s
+             AND membership.user_uuid = source.user_uuid
+             AND membership.active
+            JOIN messenger_messages AS message
+              ON message.project_id = source.project_id AND message.uuid = %s
+            WHERE source.project_id = %s AND source.placement_uuid = %s
+            ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE SET
+                membership_generation = EXCLUDED.membership_generation,
+                relation_role = EXCLUDED.relation_role,
+                visibility = EXCLUDED.visibility,
+                permissions = EXCLUDED.permissions,
+                created_at = LEAST(
+                    messenger_user_message_bindings.created_at,
+                    EXCLUDED.created_at
+                ),
+                updated_at = GREATEST(
+                    messenger_user_message_bindings.updated_at,
+                    EXCLUDED.updated_at
+                )
+            """,
+            (
+                target_placement_uuid,
+                target_placement_uuid,
+                native["stream_uuid"],
+                echo["uuid"],
+                project_id,
+                source_placement_uuid,
+            ),
+        )
+        session.execute(
+            """
+            INSERT INTO messenger_user_message_states (
+                uuid, project_id, placement_uuid, user_uuid,
+                membership_generation, read_at, mentioned, starred, pinned,
+                created_at, updated_at
+            )
+            SELECT messenger_uuid_v5(%s, source.user_uuid::text),
+                   source.project_id, %s, source.user_uuid,
+                   membership.membership_generation,
+                   source.read_at, source.mentioned, source.starred,
+                   source.pinned, source.created_at, source.updated_at
+            FROM messenger_user_message_states AS source
+            JOIN messenger_stream_bindings AS membership
+              ON membership.project_id = source.project_id
+             AND membership.stream_uuid = %s
+             AND membership.user_uuid = source.user_uuid
+             AND membership.active
+            WHERE source.project_id = %s AND source.placement_uuid = %s
+            ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE SET
+                membership_generation = EXCLUDED.membership_generation,
+                read_at = CASE
+                    WHEN messenger_user_message_states.read_at IS NULL
+                    THEN EXCLUDED.read_at
+                    WHEN EXCLUDED.read_at IS NULL
+                    THEN messenger_user_message_states.read_at
+                    ELSE GREATEST(
+                        messenger_user_message_states.read_at,
+                        EXCLUDED.read_at
+                    )
+                END,
+                mentioned = messenger_user_message_states.mentioned
+                            OR EXCLUDED.mentioned,
+                starred = messenger_user_message_states.starred
+                          OR EXCLUDED.starred,
+                pinned = messenger_user_message_states.pinned
+                         OR EXCLUDED.pinned,
+                created_at = LEAST(
+                    messenger_user_message_states.created_at,
+                    EXCLUDED.created_at
+                ),
+                updated_at = GREATEST(
+                    messenger_user_message_states.updated_at,
+                    EXCLUDED.updated_at
+                )
+            """,
+            (
+                target_placement_uuid,
+                target_placement_uuid,
+                native["stream_uuid"],
+                project_id,
+                source_placement_uuid,
+            ),
+        )
+
+        # Save a bounded audience snapshot before removing the duplicate
+        # placement, then schedule exact counter snapshots for both scopes.
+        session.execute(
+            """
+            WITH recipients AS (
+                SELECT COALESCE(jsonb_agg(binding.user_uuid), '[]'::jsonb)
+                           AS user_uuids,
+                       COALESCE(
+                           jsonb_object_agg(
+                               binding.user_uuid::text,
+                               binding.membership_generation
+                           ),
+                           '{}'::jsonb
+                       ) AS generations
+                FROM messenger_user_message_bindings AS binding
+                WHERE binding.project_id = %s
+                  AND binding.placement_uuid = %s
+            )
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key, payload
+            )
+            SELECT gen_random_uuid(), %s, 'delivery_snapshot_event',
+                   'message', %s::text || ':' || %s::text,
+                   jsonb_build_object(
+                       'source_kind', 'message.deleted',
+                       'placement', jsonb_build_object(
+                           'uuid', %s::text,
+                           'stream_uuid', %s::text,
+                           'topic_uuid', %s::text
+                       ),
+                       'recipients', recipients.user_uuids,
+                       'membership_generations', recipients.generations,
+                       'author_uuid', %s::text,
+                       'source_name', %s::text,
+                       'source', %s::jsonb,
+                       'emit_public_event', true
+                   )
+            FROM recipients
+            WHERE jsonb_array_length(recipients.user_uuids) > 0
+            """,
+            (
+                project_id,
+                source_placement_uuid,
+                project_id,
+                project_id,
+                echo["uuid"],
+                source_placement_uuid,
+                native["stream_uuid"],
+                native["topic_uuid"],
+                echo["author_uuid"],
+                echo["source_name"],
+                json.dumps(echo["source"]),
+            ),
+        )
+        session.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key, payload
+            )
+            SELECT gen_random_uuid(), binding.project_id, 'read_counters',
+                   scope.kind,
+                   binding.project_id::text || ':' || binding.user_uuid::text
+                       || ':' || scope.uuid::text,
+                   jsonb_build_object(
+                       'source_kind', 'message.deleted',
+                       'user_uuid', binding.user_uuid,
+                       'stream_uuid', %s::uuid,
+                       'topic_uuid', %s::uuid
+                   )
+            FROM messenger_stream_bindings AS binding
+            CROSS JOIN LATERAL (
+                VALUES ('user-stream'::varchar, %s::uuid),
+                       ('user-topic'::varchar, %s::uuid)
+            ) AS scope(kind, uuid)
+            WHERE binding.project_id = %s AND binding.stream_uuid = %s
+              AND binding.active
+            """,
+            (
+                native["stream_uuid"],
+                native["topic_uuid"],
+                native["stream_uuid"],
+                native["topic_uuid"],
+                project_id,
+                native["stream_uuid"],
+            ),
+        )
+
+        session.execute(
+            """
+            UPDATE messenger_message_reaction_facts AS provider
+            SET placement_uuid = %s, updated_at = NOW()
+            WHERE provider.project_id = %s
+              AND provider.canonical_message_uuid = %s
+              AND provider.placement_uuid = %s
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messenger_message_reaction_facts AS native
+                    WHERE native.project_id = provider.project_id
+                      AND native.canonical_message_uuid = %s
+                      AND native.user_uuid = provider.user_uuid
+                      AND native.emoji_name = provider.emoji_name
+              )
+            """,
+            (
+                target_placement_uuid,
+                project_id,
+                echo["uuid"],
+                source_placement_uuid,
+                native["canonical_uuid"],
+            ),
+        )
+    # Preserve native reaction identities that clients and queued provider
+    # operations already reference. Duplicate echo facts remain owned by the
+    # echo root and are removed by its cascade below.
+    session.execute(
+        """
+        UPDATE messenger_message_reaction_facts AS native
+        SET created_at = LEAST(native.created_at, provider.created_at),
+            updated_at = GREATEST(native.updated_at, provider.updated_at)
+        FROM messenger_message_reaction_facts AS provider
+        WHERE native.project_id = %s
+          AND native.canonical_message_uuid = %s
+          AND provider.project_id = native.project_id
+          AND provider.canonical_message_uuid = %s
+          AND provider.user_uuid = native.user_uuid
+          AND provider.emoji_name = native.emoji_name
+        """,
+        (project_id, native["canonical_uuid"], echo["uuid"]),
+    )
+    session.execute(
+        """
+        UPDATE messenger_message_reaction_facts AS provider
+        SET canonical_message_uuid = %s,
+            updated_at = NOW()
+        WHERE provider.project_id = %s
+          AND provider.canonical_message_uuid = %s
+          AND NOT EXISTS (
+                SELECT 1
+                FROM messenger_message_reaction_facts AS native
+                WHERE native.project_id = provider.project_id
+                  AND native.canonical_message_uuid = %s
+                  AND native.user_uuid = provider.user_uuid
+                  AND native.emoji_name = provider.emoji_name
+          )
+        """,
+        (
+            native["canonical_uuid"],
+            project_id,
+            echo["uuid"],
+            native["canonical_uuid"],
+        ),
+    )
+    session.execute(
+        """
+        WITH moved AS (
+            UPDATE messenger_message_placements AS source
+            SET message_uuid = %s, updated_at = NOW()
+            WHERE source.project_id = %s AND source.message_uuid = %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM messenger_message_placements AS native
+                  WHERE native.project_id = source.project_id
+                    AND native.message_uuid = %s
+                    AND native.stream_uuid = source.stream_uuid
+                    AND native.topic_uuid = source.topic_uuid
+              )
+            RETURNING source.uuid
+        )
+        INSERT INTO messenger_domain_outbox_events (
+            uuid, project_id, event_kind, scope_kind, scope_key, payload
+        )
+        SELECT gen_random_uuid(), %s, 'delivery_snapshot_event',
+               'message', %s::text || ':' || moved.uuid::text,
+               jsonb_build_object(
+                   'source_kind', 'message.updated',
+                   'placement_uuid', moved.uuid::text
+               )
+        FROM moved
+        """,
+        (
+            native["canonical_uuid"],
+            project_id,
+            echo["uuid"],
+            native["canonical_uuid"],
+            project_id,
+            project_id,
+        ),
+    )
+    # Any placement left under the echo root duplicates a native placement.
+    # Deleting the canonical root delegates cleanup to the schema ownership
+    # chain: placements, bindings, states, reactions, and fanout roots all use
+    # ON DELETE CASCADE. Immutable outbox evidence remains and safely no-ops
+    # because its deleted placement can no longer be resolved.
+    session.execute(
+        """
+        DELETE FROM messenger_messages
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (project_id, echo["uuid"]),
+    )
+    session.execute(
+        """
+        UPDATE messenger_messages AS message
+        SET provider_uuid = %s,
+            external_account_uuid = %s,
+            provider_external_id = %s,
+            provider_realm_uuid = %s,
+            provider_message_id = %s,
+            provider = jsonb_build_object(
+                'kind', 'zulip',
+                'account_uuid', %s::text,
+                'external_id', %s::text,
+                'provider_realm_uuid', %s::text,
+                'capabilities', '{}'::jsonb
+            ),
+            reactions = COALESCE(snapshot.reactions, '{}'::jsonb),
+            reaction_users = COALESCE(snapshot.reaction_users, '{}'::jsonb),
+            updated_at = NOW()
+        FROM (
+            SELECT jsonb_object_agg(grouped.emoji_name, grouped.total)
+                       AS reactions,
+                   jsonb_object_agg(grouped.emoji_name, grouped.users)
+                       AS reaction_users
+            FROM (
+                SELECT emoji_name, count(*) AS total,
+                       jsonb_agg(user_uuid::text ORDER BY created_at, uuid)
+                           AS users
+                FROM messenger_message_reaction_facts
+                WHERE project_id = %s AND canonical_message_uuid = %s
+                GROUP BY emoji_name
+            ) AS grouped
+        ) AS snapshot
+        WHERE message.project_id = %s AND message.uuid = %s
+        """,
+        (
+            provider_uuid,
+            external_account_uuid,
+            provider_message_id,
+            provider_realm_uuid,
+            provider_message_id,
+            external_account_uuid,
+            provider_message_id,
+            provider_realm_uuid,
+            project_id,
+            native["canonical_uuid"],
+            project_id,
+            native["canonical_uuid"],
+        ),
+    )
+    return True
 
 
 def report_provider_result(
@@ -1489,6 +2378,7 @@ def report_provider_result(
     queue_status = validated["queue_status"]
     public_status = validated["public_status"]
     safe_error = validated["safe_error"]
+    provider_entity_id = validated["provider_entity_id"]
     canonical_hash = _sha256(result)
     read_state.lock_read_state_schema_shared(session)
     session.execute(
@@ -1524,6 +2414,13 @@ def report_provider_result(
         return {"result_uuid": str(result_uuid), "status": "not_found"}
     if operation["status"] != "leased" or operation["lease_uuid"] != lease_uuid:
         return {"result_uuid": str(result_uuid), "status": "stale_lease"}
+    if queue_status == "succeeded":
+        _bind_native_message_provider_identity(
+            session,
+            identity,
+            operation,
+            provider_entity_id,
+        )
     snapshot = None
     if operation["operation_kind"] == "read_state.set":
         snapshot = session.execute(
@@ -1637,6 +2534,15 @@ def report_provider_result(
     safe_error = validated["safe_error"]
     manual = validated["manual"]
     reconciliation = validated["reconciliation"]
+    cancelled_read_snapshot = (
+        snapshot is not None and public_status == "failed" and safe_error == "cancelled"
+    )
+    if cancelled_read_snapshot:
+        # The bridge uses ``cancelled`` only when the leased page belongs to a
+        # desired-state assignment that is no longer current. Retrying that
+        # page against a replacement assignment is unsafe, and retaining its
+        # snapshot would permanently block every later read in the same lane.
+        public_status = "discarded"
     session.execute(
         """
         UPDATE "m_external_operations_v2"
@@ -1683,7 +2589,16 @@ def report_provider_result(
             operation["external_operation_uuid"],
         ),
     )
-    if snapshot is not None and public_status == "succeeded":
+    if cancelled_read_snapshot:
+        session.execute(
+            """
+            UPDATE m_external_provider_operations_v1
+            SET status = 'discarded', updated_at = %s
+            WHERE external_operation_uuid = %s AND status = 'failed'
+            """,
+            (now, operation["external_operation_uuid"]),
+        )
+    if snapshot is not None and public_status in {"succeeded", "discarded"}:
         session.execute(
             """
             DELETE FROM m_external_provider_read_snapshots_v1
@@ -2390,6 +3305,12 @@ def enqueue_provider_read_operation(
             )
         first_operation = None
         for index, page in enumerate(pages):
+            provider_message_ids = _provider_message_ids_for_read_page(
+                session,
+                external_account_uuid=external_account_uuid,
+                project_id=project_id,
+                message_uuids=page["candidate_uuids"],
+            )
             operation, _record_uuid = _enqueue_provider_operation(
                 session,
                 operation_uuid=(operation_uuid if index == 0 else sys_uuid.uuid4()),
@@ -2405,6 +3326,11 @@ def enqueue_provider_read_operation(
                     "message_uuids": [
                         str(message_uuid) for message_uuid in page["candidate_uuids"]
                     ],
+                    **(
+                        {}
+                        if provider_message_ids is None
+                        else {"provider_message_ids": provider_message_ids}
+                    ),
                 },
                 causal_lane=causal_lane,
             )

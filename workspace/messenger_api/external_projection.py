@@ -172,10 +172,9 @@ def reconcile_personal_chat_projection(
     participant_uuids = _native_direct_participant_uuids(normalized_source)
     if participant_uuids is None or len(normalized_source["topics"]) != 1:
         return projection_stream_uuid, normalized_source, False
-    if (
-        normalized_source["chat_type"] == "group"
-        and participant_uuids[0] != sys_uuid.UUID(str(owner_user_uuid))
-    ):
+    if normalized_source["chat_type"] == "group" and participant_uuids[
+        0
+    ] != sys_uuid.UUID(str(owner_user_uuid)):
         return projection_stream_uuid, normalized_source, False
 
     unique_participant_uuids = set(participant_uuids)
@@ -540,15 +539,19 @@ def ensure_external_chat_stream(
         self_direct_participants = _native_direct_participant_uuids(source)
         self_direct_user_uuid = (
             self_direct_participants[0]
-            if source["chat_type"] == "group"
-            and self_direct_participants is not None
+            if source["chat_type"] == "group" and self_direct_participants is not None
             else None
         )
+        is_provider_self_direct = self_direct_user_uuid is not None
         stream_fields = {
             "uuid": projection_stream_uuid,
             "name": display_name,
             "description": source["description"],
-            "private": chat_type != "channel",
+            # A multi-user provider DM behaves like a membership-scoped
+            # channel in Workspace.  Keeping it non-private puts it in the
+            # Channels system folder while the external access gate still
+            # limits visibility to the confirmed provider participants.
+            "private": chat_type == "personal" or is_provider_self_direct,
             "invite_only": chat_type != "channel",
             "source_name": source_name,
             "source": workspace_source,
@@ -568,6 +571,7 @@ def ensure_external_chat_stream(
                 "kind": provider_kind,
                 "account_uuid": str(external_account_uuid),
                 "external_id": provider_chat_id,
+                "default_display_name": display_name,
                 "capabilities": dict(capabilities),
             },
             "emit_events": emit_events,

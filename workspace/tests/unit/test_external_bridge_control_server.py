@@ -167,6 +167,83 @@ def test_provider_event_commit_duration_is_logged_separately(monkeypatch):
     ]
 
 
+def test_provider_request_retries_wrapped_deadlock_transaction(monkeypatch):
+    class WrappedDeadlock(Exception):
+        code = "40P01"
+
+    handler = _handler(
+        [("Content-Length", "0")],
+        path="/api/workspace-provider/v2/commands",
+    )
+    response = types.SimpleNamespace(
+        status=200,
+        content_type="application/json",
+        body=b"{}",
+        headers={},
+    )
+    handler.server.private_service.handle.side_effect = [
+        WrappedDeadlock("deadlock"),
+        response,
+    ]
+    delays = []
+    monkeypatch.setattr(server.random, "uniform", lambda _start, _end: 1.0)
+    monkeypatch.setattr(server.time, "sleep", delays.append)
+
+    handler._dispatch()
+
+    first_session = handler.server.private_service.handle.call_args_list[0].kwargs[
+        "request_session"
+    ]
+    second_session = handler.server.private_service.handle.call_args_list[1].kwargs[
+        "request_session"
+    ]
+    assert first_session is not second_session
+    assert handler.transaction_events == [
+        ("begin", first_session),
+        ("rollback", first_session),
+        ("begin", second_session),
+        ("commit", second_session),
+    ]
+    assert delays == [server.PROVIDER_DEADLOCK_BASE_DELAY_SECONDS]
+    handler.send_response.assert_called_once_with(200)
+
+
+def test_non_provider_request_does_not_retry_database_deadlock():
+    class DeadlockDetected(Exception):
+        sqlstate = "40P01"
+
+    handler = _handler([("Content-Length", "0")], path="/v1/desired-state/changes")
+    handler.server.private_service.handle.side_effect = DeadlockDetected("deadlock")
+
+    with pytest.raises(DeadlockDetected):
+        handler._dispatch()
+
+    assert handler.server.private_service.handle.call_count == 1
+
+
+def test_provider_deadlock_retry_exhaustion_returns_safe_retryable_response(
+    monkeypatch,
+):
+    class DeadlockDetected(Exception):
+        sqlstate = "40P01"
+
+    handler = _handler(
+        [("Content-Length", "0")],
+        path="/api/workspace-provider/v1/events",
+    )
+    handler.server.private_service.handle.side_effect = DeadlockDetected("deadlock")
+    monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
+
+    handler._dispatch()
+
+    assert handler.server.private_service.handle.call_count == (
+        server.PROVIDER_DEADLOCK_MAX_ATTEMPTS
+    )
+    handler.send_response.assert_called_once_with(503)
+    assert b"provider_database_contention" in handler.wfile.getvalue()
+    assert b"deadlock" not in handler.wfile.getvalue()
+
+
 def test_private_handler_rejects_incomplete_body_and_closes_connection():
     handler = _handler([("Content-Length", "2")], body=b"x")
 

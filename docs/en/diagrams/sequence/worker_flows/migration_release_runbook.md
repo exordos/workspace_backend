@@ -84,22 +84,32 @@ outbound message may acquire provider/account identifiers after echo
 reconciliation. The migration therefore runs a deterministic preflight under
 the same writer freeze and accepts only these combinations:
 
-- inbound message: consistent `source_name` and `source.kind`, a
-  `source.message_id`, plus either a matching Zulip account and
-  `provider_external_id`, a Zulip-owned stream, or corroborating legacy entity
-  evidence;
+- inbound message: consistent `source_name` and `source.kind`, provider message
+  identity from `source.message_id` or the legacy `provider_external_id` (the
+  values must match when both exist), the complete historical Bridge identity
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  plus either a matching Zulip account, a Zulip-owned stream, or corroborating
+  legacy entity evidence;
 - native outbound message: a durable `m_external_operations_v2` row with
   `action=message.create`, matching `target_uuid`, local `owner_user_uuid`, and
   the same account when the message already carries one;
+- legacy native/outbound message created before that operation queue existed:
+  the consistent pair `source_name=native` and `source.kind=native`; provider
+  identifiers attached by later echo reconciliation do not override this pair;
 - external file: a Zulip account, the dedicated external-content storage
   namespace, and no reference from any retained message. A surviving
   `urn:file|image|video:<uuid>` reference always wins and preserves the row and
   physical object.
 
-Any row with partial or contradictory Zulip signals aborts the migration before
-destructive work. A row that simultaneously proves inbound and local-outbound
-origin also aborts. `m_zulip_processed_entities` is never sufficient by itself;
-it is only corroborating evidence alongside consistent source fields.
+Any row with partial or contradictory source or Zulip signals aborts the
+migration before destructive work. When a fully reconciled historical echo has
+both inbound fields and an exact durable `message.create` operation, the
+operation takes precedence and the native/outbound row is retained.
+Likewise, any Zulip-source UUID—including an arbitrary UUIDv5—that does not
+equal the complete legacy identity and lacks that operation is treated as an
+ambiguous pre-operation-queue Workspace send and aborts instead of being reset.
+`m_zulip_processed_entities` is never sufficient by itself; it is only
+corroborating evidence alongside consistent source fields.
 
 Provider-origin reactions are removed through their Zulip account provenance,
 including reactions attached to retained native/outbound messages. Native
@@ -128,6 +138,33 @@ inside Markdown as `urn:file|image|video:<uuid>`. The migration scans all
 surviving payloads before choosing a file candidate, so it cannot create a
 dangling link or rely on an invented FK.
 
+## Migration topology and rolling identity repair
+
+Do not edit the released `0152` file. Verify its published checksum before the
+release. Apply only the current head, `0156`; its dependency order provides two
+safe paths:
+
+- fresh v1 database: `0155` prepares provenance, then the immutable
+  `0152` → `0153` → `0154` chain runs, and `0156` completes cleanup;
+- database that already applied `0152`–`0154`: `0155` records a no-op and
+  `0156` repairs retained provider identities forward.
+
+For proven aliases of one physical provider message, `0156` preserves every
+internal message, placement, content revision, and public UUID. It keeps
+provider linkage on one deterministic winner and clears only
+`external_account_uuid`/`provider_external_id` on the other aliases. A terminal
+local operation wins, then a non-lossy copy, then the newest copy. An already
+realm-keyed imported row always wins over an otherwise matching retained
+alias. Proof requires the same realm/message ID, project, author, provider URL,
+metadata identity, and distinct alias accounts. Any weaker collision is a hard
+rollback condition.
+
+After the migration, require one migration head, no duplicate
+`(provider_realm_uuid, provider_message_id)`, no eligible provider-linked row
+without a realm key, no transient provenance marker or preparation index, and
+both rolling legacy repair triggers enabled. Message/placement/public UUID
+counts for the retained set must be unchanged.
+
 ## Complete fresh Zulip reimport
 
 Fresh import assigns a new canonical `MESSAGE.uuid`; the public placement UUID
@@ -152,6 +189,19 @@ Import runs automatically in bounded keyset batches with durable checkpoints,
 retry/backoff, progress logging, and reconciliation. Provider integration stays
 frozen until the final source cursor/high-water mark is recorded, preventing
 loss or duplication at the freeze boundary.
+
+## Recovery after a partial v2 import
+
+If a deployed v2 server accepted only part of the Zulip history, deploy the
+server build containing migration `0154` while the Bridge is stopped. The
+migration advances every Zulip account reset generation once and republishes
+all selected assignments. Start the Bridge only after the backend is healthy.
+
+Confirm that every account observes the new generation, old quarantined
+deliveries are gone, backfill jobs restart, and no new Provider API rejection
+appears. Shared realm-global streams are valid only when every additional owner
+has a selected peer assignment for the same project and stream. Keep the
+pre-migration backup until the repeated import and all acceptance gates pass.
 
 ## Rebuild and acceptance gates
 

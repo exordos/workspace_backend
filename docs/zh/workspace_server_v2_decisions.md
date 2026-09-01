@@ -202,15 +202,21 @@ UUIDv5(verified_realm_uuid,
   转换为虚拟的 project users: migration 保存自动 native
   事件,但不会为已删除的事件创建 canonical membership/guard IAM
   用户;
-- 在同一 frozen migration 中,删除已被证明的 Zulip-imported messages,
-  相关的反应/read/event 投影和Zulip文件,没有
-  surviving native message reference;
-- Zulip-origin reaction 也可以从存储的 native/outbound message:
-  它的提供者来源值是 `external_account_uuid`, UUID
-  反应在清理旧事件之前 canonical copy. Native reaction
-  在同一存储的消息中保持;
-- Workspace→Zulip messages 它们被认为是原生,如果它们
-  `message.create` user operation 确认本地产地;
+- `0157` 使用容器边界：只要消息位于同时满足 `source_name=zulip` 与
+  `source.kind=zulip` 的 canonical stream 中，就会被删除，而不再按消息本身的
+  来源分类。因此，该 stream 中的 Workspace→Zulip outbound messages 也会被
+  删除，随后由常规 Zulip backfill 重新导入。`0158` 会完成重置：即使消息被
+  投影到 native Direct container，只要具有同样明确的 Zulip provenance，也会
+  被删除；同一 container 中 native-origin 的消息仍会保留；
+- 同一事务还会删除相关 reaction/read/event projections 与无剩余引用的 Zulip
+  files，并在提交前刷新 legacy compact statistics 以及 canonical v2 的
+  stream/topic/folder counters，数据来源是保留下来的 messages。因此，混合的
+  native container 会保留 roles、membership generations、notification modes、
+  topic state 和 folder placement，同时精确重建 unread、active/passive 与
+  last-message 值。迁移会先刷新受影响 stream 中每个 topic 的 compact
+  message/read statistics；随后，每个用户的 canonical `read_at` 会与权威的
+  compact bitmap 对齐（非 compact/rollback 模式则使用 legacy read flag），
+  最后才发布 counters；
 - 旧的 `link_kind=provider_identity`,由 account-scoped 实现创建,
   它们的重写是`UUIDv5(verified_realm_uuid, "user:<id>")`.
   surviving native relational references, event payloads, chat catalog 其他
@@ -250,12 +256,13 @@ UUIDv5(verified_realm_uuid,
   快照只在bootstrap/reset时创建,而
   不是实时循环;全球暂停 control-plane writers 更简单,
   总的附加 commit-order 基础设施比较便宜;
-- 破坏性重置采用失败即关闭策略：一致的 `source_name`、`source.kind`、
-  `source.message_id`、account/provider evidence 和持久化的
-  `action=message.create` evidence 用于区分入站投影与原生出站数据。任何
-  不完整或相互矛盾的来源都会在删除前中止迁移；
+- 破坏性重置对 container 与 message metadata 都采用 fail-closed 策略：
+  `source_name` 与 `source.kind` 只要部分缺失或相互矛盾，就会在删除前中止。
+  完整边界是已确认的 Zulip containers 与已确认 Zulip-origin messages 的并集，
+  其中包括 legacy-only compatibility rows，以及通过 message 或 placement 关联的
+  canonical rows；
 - 无人值守的冻结切换最多处理一百万条 legacy messages，等待锁最多 30 秒，
-  statement deadline 为 30 分钟。更大的切换必须在完成备份和生产规模演练
+  statement deadline 为 45 分钟。更大的切换必须在完成备份和生产规模演练
   后由操作员明确授权；五千万消息是重新导入后的稳态目标，并不允许自动转换
   legacy 数据；
 - control-plane snapshot 规模门禁至少使用 15,000 个包含大型
@@ -268,6 +275,137 @@ UUIDv5(verified_realm_uuid,
 Rollback schema 没有恢复故意摧毁的 Zulip projection:
 通过验证的前迁移备份.
 升级和升级都可用 schema downgrade.
+
+## 不可变切换与身份前向修复
+
+Workspace Server `1.0.0` 已发布的迁移 `0152` 保持不可变。新的准备分支
+`0155` 从 `0151` 开始，join head `0156` 会先列出该分支，再列出正常的
+`0152` → `0154` 链。因此，全新升级会先准备来源证据，再执行已发布的
+cutover；已经记录 `0152` 的安装会跳过准备工作，并由 `0156` 前向修复。
+由于 `pg_dump` 不保留 planner statistics，全新路径还会在执行不可变的
+set-based statements 之前，对所有冻结的 cutover inputs 运行 `ANALYZE`。
+
+只有存在精确匹配且成功的 `message.create` operation 时，准备阶段才把历史
+outbound echo 视为原生数据。`source.message_id` 可以缺失，但不能与 provider
+ID 冲突。在 durable operation queue 出现之前创建的一致 native rows 会获得
+短期 `discarded` 来源标记；这些标记不会进入 provider queue，并由 join head
+删除。
+
+`0152` 之后首个已发布的 Bridge payload 未写入 `source.message_id`，但仍携带
+完整且一致的旧版证据：`source.kind=zulip`、数字
+`provider_external_id`、provider metadata 中相同的 ID、原始 provider URL，
+以及不冲突的 realm。`0156` 在前向修复时只接受这一完整旧版形态。唯一行会
+获得 realm-global identity；如果已经存在带 global key 的导入行，则仅解除
+已证明 account-alias 副本的 provider linkage。任何不完整或矛盾的变体仍会
+原子中止。Rolling legacy triggers 在该已发布 Bridge 退役前使用相同的兼容
+规则。
+
+`0156` 为保留消息补充 realm-global provider identity，并确保同一条物理
+Zulip message 只有一个保留 provider linkage 的赢家。已证明的 account aliases
+必须在 realm/message ID、project、author、不同账户、provider URL 和 metadata
+identity 上一致。所有内部 messages、placements 和 public UUID 都会保留；
+仅从失败 alias 上解除 provider linkage。已有 global identity 的导入行优先于
+匹配的 retained alias。任何未经证明的冲突都会原子中止。随后，legacy
+insert/update rolling triggers 会继续执行相同规则，直到旧服务器退役。
+
+## 共享 Zulip 投影的所有权与重新导入
+
+每个 Workspace 项目中的 realm-global Zulip 频道只对应一个规范 stream。
+因此，多个已选择的账户可以指向同一个 `projection_stream_uuid`，而物理
+stream 仍保留首次创建它的所有者。只有当同一项目中存在另一个指向该 stream
+的已选择 assignment 时，provider 导入才允许由不同账户所有者写入。若没有
+这条持久化的 peer assignment，所有者不匹配仍然是硬错误。
+
+处理 `topic.upsert` 时，服务器根据持久化的 canonical stream 生成类型化
+Workspace source，保留其稳定的账户 scope，并补充 topic 名称。Bridge 无需
+在每个事件中重复由服务器管理的 source 字段。
+
+迁移 `0154` 会将每个 Zulip 账户的 reset generation 增加一次，并重新发布
+已选择的 assignments。这样会丢弃被隔离的部分投递并启动一次完整重试。
+Provider key 保持幂等，因此已接受的行会被更新而不是重复创建。全新升级时，
+已停止的 Bridge 只会看到最终 generation，并且只执行一次导入。
+
+## 合并旧版已读状态修复产生的文件夹快照
+
+旧版已读状态修复可能为每个被修正的 message flag 各排入一次 folder
+projection。这些任务都会重建完整的当前文件夹快照，并不携带历史文件夹状态。
+因此，worker 获得 `user-folder` scope 后，已领取的旧版重建任务会吸收同一
+scope 中仍在等待的同类任务，并只提交一个权威快照和事件。该事务之后新到达
+的任务仍会保留在队列中并触发后续重建，所以 live 收敛保持不变，而迁移工作量
+由受影响的文件夹数量决定，不再随 message flag 数量增长。
+
+## 合并仅快照的未读计数任务
+
+批量导入消息、修复消息以及生成成员关系时，可能会为同一个 `user-stream` 或
+`user-topic` 作用域创建大量未读计数投影。每个仅快照任务都会重新计算完整且权威的
+当前计数，并不携带历史计数值。因此，一个已领取的仅快照任务会在同一事务中吸收该
+作用域内空闲的同类任务，并只发布一个当前快照。带有
+`emit_message_read=true` 的任务仍保持独立，以确保每次明确的逐消息已读操作都保留自己
+的事件。事务结束后到达的新任务仍会排队，从而既保持实时收敛，又把批量工作量限制在
+受影响的用户作用域数量内。
+
+## 可修复的原生已读状态与交互优先级
+
+迁移 `0160` 会恢复创建 v2 规范状态时已存在于旧版 flag 或紧凑 bitmap 中的原生消息
+已读状态。修复是单调的：它只填充缺失的 `read_at`，不会把切换后已读的消息重新标为
+未读，随后会重建原生 stream、topic 和 folder 快照。
+
+即使规范行已经是已读状态，显式的单条消息、范围、topic 和 stream 已读操作仍会排入
+一次权威计数重建。因此，幂等重试可以修复陈旧快照。这些投影任务优先于批量导入执行，
+而常规快照合并仍会限制数据库负载。
+
+这些已读操作还会在同一规范事务中更新滚动的 compact 兼容状态。迁移
+`0166` 会为所有用户修复现有的“规范状态已读但 compact bitmap 未读”记录，重新计算
+受影响的 topic 已读统计，并推进每个用户的已读修订号。该修复是单调的：它不会修改
+任何规范未读记录，包括来自 provider 快照的未读状态。
+
+随后，迁移 `0167` 会为所有活跃用户根据持久化 bitmap 重新计算每个 compact 或
+rollback topic 的已读聚合。即使每条消息的 bitmap 位已经与规范 `read_at` 一致，
+该迁移也会修复仍然陈旧的聚合，从而让 stream、topic 和 folder 计数使用同一份已读
+事实。
+
+迁移 `0168` 会根据持久化消息行重新计算共享的 compact topic 消息总数和最后的
+ingest 坐标。它修复最后一种情况：每个用户的已读计数都已准确，但过期的 topic
+消息总数仍会导致兼容 stream、topic 和 folder 未读计数发生偏移。
+
+迁移 `0169` 会重新应用 provider 私聊规范化，并以每个参与者的 provider
+`display_name` 作为面向当前用户的单聊和群聊名称来源。只有 provider 未提供名称时
+才回退到 Workspace identity。与旧 Workspace identity 投影结果相同的历史名称会被
+识别为 provider 管理名称；用户显式设置的本地群聊名称会保持不变。
+
+迁移 `0170` 还会在单聊目录记录只列出对方参与者时，将已选择 provider 聊天的所有者
+视为有效查看者。因此，对方的 provider 名称会继续作为每个已关联账户的权威聊天名称，
+无需 provider 在参与者列表中重复列出所有者。
+
+## Provider 已读分页顺序
+
+延迟物化的 provider 已读分页使用其源快照的队列位置来确定同一 lane 内的顺序。较新的
+快照可能在该分页获得物理 operation sequence 之前就已持久化，但不能阻塞更早的分页。
+更早的快照仍会阻挡同一 stream lane 中的后续写入，其他 lane 保持独立。物化数量和
+lease batch 大小限制均保持不变。
+
+## Provider 入站恢复
+
+私有 Provider API 命令可安全重放：request、event、lease 和 result 标识符在各次尝试间
+保持不变。发生 PostgreSQL 死锁后，服务器会使用短时且有界的指数退避重试完整请求事务；
+其他 control 和 file 请求不会被重试。尝试耗尽时返回不包含数据库细节的可重试 `503`。
+Provider 删除触发 topic 摘要恢复时，会跳过对应消息已不存在的 journal boundary，避免
+陈旧的派生摘要导致整个入站 batch 被拒绝。
+在 Provider 删除之前排队的投影任务会把已删除的规范消息视为不存在，因此陈旧的
+fanout 或 mention 任务会以 no-op 完成，而不会进入 dead-letter 队列。
+
+## Provider 账户所有者的已读状态一致性
+
+同一 realm 中多个账户共享的 Provider 消息只有一个规范 placement，但每个已选
+账户的所有者都拥有独立的 binding 和 state。Compact 导入通过一个有界 SQL
+批次创建这些记录，并在同一事务中同步 compact bitmap 与规范 `read_at`。
+Snapshot-only 回填仍不发送逐消息公开事件，但会保留权威的 stream 和 topic
+计数重建。
+
+迁移 `0162` 使用持久化的已应用 Provider event 日志，只恢复实际投递过的
+message/account 组合。有效已读值来自 compact bitmap；非 compact 模式则来自
+legacy flag。迁移随后重建受影响的 stream、topic 和 folder 计数，并在提交前
+验证一致性，不会扩展 native 消息或未选择的 Provider 历史。
 
 ## 首次实现的兼容性和边界
 

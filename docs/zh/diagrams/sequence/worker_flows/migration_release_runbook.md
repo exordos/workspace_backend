@@ -78,20 +78,29 @@ Bridge 随后丢弃旧的可重建去重状态，并从权威 Zulip 数据源执
 后也可能带上 provider/account 标识。因此，迁移会在同一个 writer freeze
 下执行确定性的预检查，并且只接受以下组合：
 
-- 入站消息：`source_name` 与 `source.kind` 一致，存在
-  `source.message_id`，并且还具有匹配的 Zulip account 与
-  `provider_external_id`、Zulip 所有的 stream，或可相互印证的历史
-  entity evidence 之一；
+- 入站消息：`source_name` 与 `source.kind` 一致，provider 消息标识来自
+  `source.message_id` 或旧版 `provider_external_id`（两者同时存在时必须
+  一致），具有完整的旧版 Bridge 身份
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`，
+  并且还具有匹配的 Zulip
+  account、Zulip 所有的 stream，或可相互印证的历史 entity evidence 之一；
 - 原生出站消息：`m_external_operations_v2` 中存在持久化记录，包含
   `action=message.create`、匹配的 `target_uuid`、本地
   `owner_user_uuid`，并且在消息已有 account 时二者一致；
+- 在该 operation queue 出现之前创建的旧版原生/出站消息：
+  `source_name=native` 与 `source.kind=native` 必须成对一致；之后通过 echo
+  对账附加的 provider 标识不会覆盖这一判断；
 - 外部文件：属于 Zulip account，位于专用 external-content 存储命名空间，
   且没有任何保留消息引用它。任何仍然存在的
   `urn:file|image|video:<uuid>` 引用都具有最高优先级，会保留数据库行和
   物理对象。
 
-任何带有不完整或相互矛盾 Zulip 信号的行，都会在破坏性操作开始前中止
-迁移。同时被证明为入站和本地出站的行也会中止迁移。
+任何带有不完整或相互矛盾 source 或 Zulip 信号的行，都会在破坏性操作
+开始前中止迁移。如果已完全对账的历史 echo 同时具有入站字段和精确匹配的
+持久化 `message.create` operation，则该 operation 优先，并保留原生/出站行。
+任何 Zulip 来源 UUID（包括任意 UUIDv5），如果不等于完整的旧版身份且没有
+该 operation，都会被视为 operation queue 出现之前 Workspace 发送的歧义
+记录，并中止迁移而不是重置。
 `m_zulip_processed_entities` 绝不能单独作为证据，只能在 source 字段一致
 时提供补充证明。
 
@@ -116,6 +125,31 @@ read/topic state 和依赖 events 只对已证实的 reset candidates 清理。
 `urn:file|image|video:<uuid>` 形式位于 Markdown 内。迁移会在选择文件候选
 项前扫描所有保留 payload，因此既不会产生悬空链接，也不会依赖不存在的 FK。
 
+## 迁移拓扑与滚动身份修复
+
+不得修改已发布的 `0152` 文件；发布前必须验证其 checksum。只应用当前 head
+`0156`，其依赖顺序提供两条安全路径：
+
+- 全新 v1 database：`0155` 先准备来源证据，然后执行不可变的
+  `0152` → `0153` → `0154` 链，最后由 `0156` 完成清理；
+- 已应用 `0152`–`0154` 的 database：`0155` 记录为 no-op，`0156` 对保留的
+  provider identities 执行前向修复。
+
+对于已证明属于同一物理 provider message 的 aliases，`0156` 会保留每一条
+内部 message、placement、内容 revision 和 public UUID。Provider linkage
+只保留在一个确定性赢家上；其他 aliases 仅清除
+`external_account_uuid`/`provider_external_id`。选择顺序依次为：terminal
+local operation、non-lossy copy、最新 copy。已有 realm-global key 的导入行
+始终优先于其他匹配的 retained alias。证据必须包括相同的 realm/message ID、
+project、author、provider URL、metadata identity，以及不同的 alias accounts。
+证据更弱的冲突必须回滚。
+
+迁移后必须确认：只有一个 migration head；不存在重复的
+`(provider_realm_uuid, provider_message_id)`；不存在符合条件但缺少 realm key
+的 provider-linked row；不存在临时 provenance marker 或准备 index；两个
+rolling legacy repair triggers 均已启用。Retained set 的
+message/placement/public UUID 数量必须保持不变。
+
 ## 完整的全新 Zulip 导入
 
 全新导入会分配新的规范 `MESSAGE.uuid`；公共 placement UUID 仍按
@@ -135,6 +169,18 @@ identity。重复批次会收敛到同一组新 file/attachment 行，不会重�
 导入使用有界 keyset batches 自动运行，并带有持久化 checkpoints、
 retry/backoff、进度日志和对账。在记录最终 source cursor/high-water mark
 之前，provider integration 保持冻结，从而避免 freeze 边界上的丢失或重复。
+
+## 部分 v2 导入后的恢复
+
+如果已部署的 v2 server 只接受了部分 Zulip 历史记录，应先停止 Bridge，再
+部署包含迁移 `0154` 的 server build。该迁移会将每个 Zulip 账户的 reset
+generation 增加一次，并重新发布所有已选择的 assignments。只有在确认 backend
+健康后才能启动 Bridge。
+
+需要确认每个账户都观察到新的 generation、旧的隔离投递已被删除、backfill
+jobs 已重新启动，并且没有新的 Provider API 拒绝。共享 realm-global stream
+仅在每个额外所有者都具有指向同一 project 和 stream 的已选择 peer assignment
+时才有效。在重新导入和所有验收门禁通过之前，必须保留迁移前备份。
 
 ## 重建与验收门禁
 

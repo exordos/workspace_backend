@@ -70,11 +70,31 @@ messenger_worker_opts = [
         help="Process native Messenger v2 outbox tasks",
     ),
     cfg.IntOpt(
+        "v2-projection-workers",
+        default=4,
+        min=1,
+        max=8,
+        help=(
+            "Messenger v2 projection process count; one process also runs "
+            "the bounded maintenance agents"
+        ),
+    ),
+    cfg.IntOpt(
         "v2-projection-max-tasks-per-iteration",
         default=100,
         min=1,
         max=1000,
         help="Maximum separately committed Messenger v2 tasks per worker pass",
+    ),
+    cfg.FloatOpt(
+        "v2-projection-idle-sleep-seconds",
+        default=0.5,
+        min=0.1,
+        max=3.0,
+        help=(
+            "Delay before polling Messenger v2 again only when the previous "
+            "database cycle found no task"
+        ),
     ),
     cfg.IntOpt(
         "v2-fanout-batch-size",
@@ -82,6 +102,13 @@ messenger_worker_opts = [
         min=1,
         max=5000,
         help="Maximum stream recipients projected by one fanout task attempt",
+    ),
+    cfg.IntOpt(
+        "v2-metrics-log-interval-seconds",
+        default=30,
+        min=5,
+        max=300,
+        help="Structured Messenger v2 projection metrics interval",
     ),
 ]
 

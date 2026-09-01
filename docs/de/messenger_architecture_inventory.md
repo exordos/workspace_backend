@@ -108,6 +108,17 @@ Task lifecycle: `pending -> leased/running -> completed`; retryable failure uses
 `max_attempts` moves to DLQ. Owner/fencing token, reaper/reconciliation and
 idempotent `outbox_event_uuid` effect guard are mandatory.
 
+Der Claim-Pfad durchläuft einen gewichteten Lane-Zyklus: vier Fan-out-Slots,
+zwei Slots für interaktive Leseaktionen, einen Reaktions-Slot, einen Slot für
+nicht interaktiven Lesestatus und zwei Hintergrund-Slots. In jedem Durchlauf
+wird projektübergreifend die älteste berechtigte Aufgabe der bevorzugten Lane
+gewählt; ist diese leer, folgt die älteste berechtigte Aufgabe einer beliebigen
+Lane. Projektsuche und endgültiger Claim verwenden dieselben Vorgänger-, Retry-
+und Scope-Lease-Bedingungen. Begrenzte Kandidatenabfragen und partielle Indizes
+für aktive Aufgaben vermeiden eine Sortierung der gesamten Aufgabenhistorie;
+Scope-Leases, projektbezogene Advisory Locks und Fencing-Tokens schützen
+mehrere Worker.
+
 ## DOMAIN_EVENT_KINDS
 
 Die innere `WorkspaceDomainOutboxEvent.event_kind` benutzt die gleiche geschlossene

@@ -108,6 +108,14 @@ Task lifecycle: `pending -> leased/running -> completed`; retryable failure uses
 `max_attempts` moves to DLQ. Owner/fencing token, reaper/reconciliation and
 idempotent `outbox_event_uuid` effect guard are mandatory.
 
+任务领取路径按加权队列周期运行：四个 fan-out 槽、两个交互式已读槽、
+一个 reaction 槽、一个非交互式 read-state 槽和两个后台槽。每一轮先在
+所有项目中选择首选队列里最早的可领取任务；若该队列为空，则回退到任意
+队列中最早的可领取任务。项目扫描和最终领取使用相同的前置任务、重试和
+scope lease 条件。有界候选查询和活动任务的部分索引避免对全部任务历史
+排序；scope lease、项目 advisory lock 和 fencing token 保证多个 worker
+安全并行。
+
 ## DOMAIN_EVENT_KINDS
 
 内部 `WorkspaceDomainOutboxEvent.event_kind` 使用相同的封闭

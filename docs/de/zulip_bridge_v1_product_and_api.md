@@ -115,6 +115,10 @@ weiterhin `urn:user:<identity-uuid>` verwenden.
   vorübergehend nicht verfügbare Aktionen mit einer sicheren Erklärung deaktiviert werden.
 - Die letzte bestätigte Operation gewinnt.
 - Jede Operation hat eine stabile UUID und Anbieter-Idempotency-Metadaten.
+- Ein erfolgreiches natives `message.create`-Ergebnis enthält die vom Provider
+  vergebene Nachrichten-ID. Workspace speichert diese Bindung vor dem Import
+  des Provider-Echos, damit alle verbundenen Konten derselben Zulip-Instanz
+  eine kanonische Nachricht mit dem ursprünglichen Autor auflösen.
 - Die Live-Synchronisation startet zuerst und hat
   Strenge Planungsprioritäten gegenüber Auslaufversuchen und Rückfüllung.
 - Die erste Aufholphase erzeugt keine Desktop-Benachrichtigungen.

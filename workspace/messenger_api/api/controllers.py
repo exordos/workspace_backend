@@ -477,7 +477,7 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         marker = getattr(self, "_pagination_marker", None)
         if marker is not None:
             filters[self.model.get_id_property_name()] = dm_filters.GT(marker)
-        if order_by is None:
+        if not order_by:
             order_by = {self.model.get_id_property_name(): "asc"}
         return filters, order_by
 

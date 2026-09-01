@@ -871,12 +871,17 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
         reconciliation_reason=None,
     )
     statements = []
-    session = types.SimpleNamespace(
-        execute=lambda statement, params: (
-            statements.append((statement, params))
-            or types.SimpleNamespace(fetchone=lambda: {"uuid": target_uuid})
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        row = (
+            {"message_uuid": target_uuid, "placement_count": 1}
+            if "SELECT placement.message_uuid" in statement
+            else {"uuid": target_uuid}
         )
-    )
+        return types.SimpleNamespace(fetchone=lambda: row)
+
+    session = types.SimpleNamespace(execute=execute)
     target_resource = object()
     target_queries = []
     monkeypatch.setattr(
@@ -908,10 +913,80 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
 
     assert external_events[0][1]["session"] is session
     assert "pg_advisory_xact_lock_shared" in statements[0][0]
-    assert "UPDATE m_workspace_messages" in statements[1][0]
-    assert statements[1][1][1:4] == ("delivered", None, updated_at)
+    assert "SELECT placement.message_uuid" in statements[1][0]
+    assert "UPDATE m_workspace_messages" in statements[2][0]
+    assert statements[2][1][1:4] == ("delivered", None, updated_at)
     assert target_queries[0]["session"] is session
     assert target_events == [((project_uuid, target_resource), {"session": session})]
+
+
+def test_multi_placement_delivery_updates_canonical_snapshot(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    canonical_uuid = sys_uuid.uuid4()
+    updated_at = datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc)
+    operation = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        target_type="message",
+        target_uuid=target_uuid,
+        status="succeeded",
+        safe_error=None,
+        can_retry=False,
+        can_discard=False,
+        updated_at=updated_at,
+        duplicate_risk=False,
+        retry_requires_confirmation=False,
+        original_url=None,
+        reconciliation_reason=None,
+    )
+    statements = []
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        row = (
+            {"message_uuid": canonical_uuid, "placement_count": 2}
+            if "SELECT placement.message_uuid" in statement
+            else {"uuid": canonical_uuid}
+        )
+        return types.SimpleNamespace(fetchone=lambda: row)
+
+    session = types.SimpleNamespace(execute=execute)
+    resources = [object(), object()]
+    queries = []
+    monkeypatch.setattr(
+        provider_data.v2_models.WorkspaceUserMessage,
+        "objects",
+        types.SimpleNamespace(
+            get_all=lambda **kwargs: queries.append(kwargs) or resources
+        ),
+    )
+    events = []
+    monkeypatch.setattr(
+        provider_data.messenger_events,
+        "create_message_updated_events",
+        lambda *args, **kwargs: events.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        provider_data.models.WorkspaceMessage,
+        "objects",
+        types.SimpleNamespace(
+            get_one=lambda **_kwargs: pytest.fail("legacy snapshot was queried")
+        ),
+    )
+
+    provider_data.sync_operation_target_delivery(
+        session,
+        operation,
+        project_uuid,
+        _event_order_locked=True,
+    )
+
+    assert "UPDATE messenger_messages" in statements[1][0]
+    assert "UPDATE m_workspace_messages" not in statements[1][0]
+    assert queries[0]["session"] is session
+    assert events == [
+        ((project_uuid, resources), {"session": session, "compact": True})
+    ]
 
 
 def test_publish_operation_locks_schema_before_project_event(monkeypatch):
@@ -1336,3 +1411,133 @@ def test_provider_event_uuid_reuse_with_different_payload_is_rejected():
             },
             apply=lambda event, current_session: None,
         )
+
+
+def test_provider_read_page_binds_workspace_uuids_to_provider_message_ids():
+    message_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
+    rows = [
+        {"message_uuid": message_uuids[0], "provider_message_id": "9002"},
+        {"message_uuid": message_uuids[1], "provider_message_id": "1001"},
+    ]
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(fetchall=lambda: rows)
+    )
+
+    result = provider_data._provider_message_ids_for_read_page(
+        session,
+        external_account_uuid=sys_uuid.uuid4(),
+        project_id=sys_uuid.uuid4(),
+        message_uuids=message_uuids,
+    )
+
+    assert result == ["9002", "1001"]
+
+
+def test_provider_read_page_binds_only_messages_delivered_to_target_account():
+    delivered_uuid = sys_uuid.uuid4()
+    undelivered_uuid = sys_uuid.uuid4()
+    rows = [
+        {
+            "message_uuid": delivered_uuid,
+            "provider_message_id": "9002",
+            "available": True,
+            "delivered": True,
+        },
+        {
+            "message_uuid": undelivered_uuid,
+            "provider_message_id": "1001",
+            "available": True,
+            "delivered": False,
+        },
+    ]
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(fetchall=lambda: rows)
+    )
+
+    result = provider_data._delivered_provider_read_page_bindings(
+        session,
+        external_account_uuid=sys_uuid.uuid4(),
+        project_id=sys_uuid.uuid4(),
+        message_uuids=[delivered_uuid, undelivered_uuid],
+    )
+
+    assert result == [(delivered_uuid, "9002")]
+
+
+@pytest.mark.parametrize("provider_message_id", (None, "invalid", "014019"))
+def test_provider_read_page_omits_untrusted_delivered_message_ids(
+    provider_message_id,
+):
+    message_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(
+            fetchall=lambda: [
+                {
+                    "message_uuid": message_uuid,
+                    "provider_message_id": provider_message_id,
+                    "available": True,
+                    "delivered": True,
+                }
+            ]
+        )
+    )
+
+    assert provider_data._delivered_provider_read_page_bindings(
+        session,
+        external_account_uuid=sys_uuid.uuid4(),
+        project_id=sys_uuid.uuid4(),
+        message_uuids=[message_uuid],
+    ) == []
+
+
+def test_provider_read_page_preserves_legacy_projects_without_delivery_ledger():
+    message_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(
+            fetchall=lambda: [
+                {
+                    "message_uuid": message_uuid,
+                    "provider_message_id": None,
+                    "available": False,
+                    "delivered": False,
+                }
+            ]
+        )
+    )
+
+    assert (
+        provider_data._delivered_provider_read_page_bindings(
+            session,
+            external_account_uuid=sys_uuid.uuid4(),
+            project_id=sys_uuid.uuid4(),
+            message_uuids=[message_uuid],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("provider_message_id", (None, "invalid", "014019"))
+def test_provider_read_page_omits_untrusted_provider_message_ids(
+    provider_message_id,
+):
+    message_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(
+            fetchall=lambda: [
+                {
+                    "message_uuid": message_uuid,
+                    "provider_message_id": provider_message_id,
+                }
+            ]
+        )
+    )
+
+    assert (
+        provider_data._provider_message_ids_for_read_page(
+            session,
+            external_account_uuid=sys_uuid.uuid4(),
+            project_id=sys_uuid.uuid4(),
+            message_uuids=[message_uuid],
+        )
+        is None
+    )

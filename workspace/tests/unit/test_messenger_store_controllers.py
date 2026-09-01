@@ -267,7 +267,9 @@ def test_generic_pagination_pushes_limit_plus_one_into_store(fake_store):
     controller._pagination_limit = 2
 
     assert controller.filter({}) == []
+    assert controller.filter({}, {}) == []
     assert fake_store.calls == [
+        ("filter", "folders", {}, {"uuid": "asc"}, 3),
         ("filter", "folders", {}, {"uuid": "asc"}, 3),
     ]
 

@@ -517,6 +517,7 @@ class WorkspaceProjectionTask(
     scope_kind = properties.property(types.String(max_length=64), required=True)
     scope_key = properties.property(types.String(max_length=512), required=True)
     payload = properties.property(types.Dict(), required=True)
+    execution_stats = properties.property(types.Dict(), default=dict, read_only=True)
     status = properties.property(types.String(max_length=32), default="pending")
     lease_owner = properties.property(
         types.AllowNone(types.String(max_length=255)), default=None

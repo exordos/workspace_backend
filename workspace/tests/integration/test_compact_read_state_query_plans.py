@@ -19,44 +19,43 @@ def _walk_plan(node):
 
 def test_reverse_chunk_update_uses_chunk_user_index(db):
     index_name = "m_workspace_user_read_chunks_chunk_user_idx"
-    with db.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT indexdef
-            FROM pg_indexes
-            WHERE indexname = %s
-              AND schemaname = current_schema()
-            """,
-            (index_name,),
-        )
-        index_definition = cursor.fetchone()[0].replace('"', "")
-        assert "(chunk_number, user_uuid)" in index_definition
+    with db.transaction():
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT indexdef
+                FROM pg_indexes
+                WHERE indexname = %s
+                  AND schemaname = current_schema()
+                """,
+                (index_name,),
+            )
+            index_definition = cursor.fetchone()[0].replace('"', "")
+            assert "(chunk_number, user_uuid)" in index_definition
 
-        cursor.execute("SET LOCAL enable_seqscan = off")
-        cursor.execute(
-            """
-            EXPLAIN (FORMAT JSON)
-            UPDATE m_workspace_user_read_chunks_v1
-            SET read_bits = set_bit(read_bits, %s, 0)
-            WHERE chunk_number = %s
-              AND get_bit(read_bits, %s) = 1
-            """,
-            (0, 0, 0),
-        )
-        plan = cursor.fetchone()[0][0]["Plan"]
-        cursor.execute("SET LOCAL enable_seqscan = on")
+            cursor.execute("SET LOCAL enable_seqscan = off")
+            cursor.execute(
+                """
+                EXPLAIN (FORMAT JSON)
+                UPDATE m_workspace_user_read_chunks_v1
+                SET read_bits = set_bit(read_bits, %s, 0)
+                WHERE chunk_number = %s
+                  AND get_bit(read_bits, %s) = 1
+                """,
+                (0, 0, 0),
+            )
+            plan = cursor.fetchone()[0][0]["Plan"]
 
     assert any(node.get("Index Name") == index_name for node in _walk_plan(plan))
 
 
 def _explain(db, statement, values):
-    with db.cursor() as cursor:
-        cursor.execute("SET LOCAL enable_seqscan = off")
-        cursor.execute("SET LOCAL enable_sort = off")
-        cursor.execute(f"EXPLAIN (FORMAT JSON) {statement}", values)
-        plan = cursor.fetchone()[0][0]["Plan"]
-        cursor.execute("SET LOCAL enable_seqscan = on")
-        cursor.execute("SET LOCAL enable_sort = on")
+    with db.transaction():
+        with db.cursor() as cursor:
+            cursor.execute("SET LOCAL enable_seqscan = off")
+            cursor.execute("SET LOCAL enable_sort = off")
+            cursor.execute(f"EXPLAIN (FORMAT JSON) {statement}", values)
+            plan = cursor.fetchone()[0][0]["Plan"]
     return plan
 
 
@@ -318,10 +317,14 @@ def test_legacy_gap_flag_lookup_probes_only_paired_coordinates(db):
         SELECT flags.uuid, flags.user_uuid
         FROM unnest(%s::uuid[], %s::uuid[])
             AS coordinate(uuid, user_uuid)
-        JOIN m_workspace_user_message_flags AS flags
-          ON flags.project_id = %s
-         AND flags.uuid = coordinate.uuid
-         AND flags.user_uuid = coordinate.user_uuid
+        CROSS JOIN LATERAL (
+            SELECT flags.uuid, flags.user_uuid
+            FROM m_workspace_user_message_flags AS flags
+            WHERE flags.project_id = %s
+              AND flags.uuid = coordinate.uuid
+              AND flags.user_uuid = coordinate.user_uuid
+            LIMIT 1
+        ) AS flags
         """,
         (
             [

@@ -21,20 +21,17 @@ import json
 import typing
 import uuid as sys_uuid
 
-from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
+from restalchemy.common import exceptions as ra_exc
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exc
 from restalchemy.storage.sql import sessions as sql_sessions
-from workspace.messenger_api import exceptions as messenger_exc
-from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api import file_storage
-from workspace.messenger_api import reaction_users
-from workspace.messenger_api.dm import base as messenger_dm_base
-from workspace.messenger_api.dm import message_payloads
-from workspace.messenger_api.dm import models
-from workspace.messenger_api.dm import read_state
 
+from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import exceptions as messenger_exc
+from workspace.messenger_api import file_storage, reaction_users
+from workspace.messenger_api.dm import base as messenger_dm_base
+from workspace.messenger_api.dm import message_payloads, models, read_state
 
 _SUMMARY_REASONING_UNSET = object()
 ALL_CHATS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -1628,8 +1625,14 @@ WITH requested_users AS MATERIALIZED (
 )
 SELECT
     scoped.uuid,
-    CASE WHEN scoped.private THEN
-        COALESCE(
+    CASE
+        WHEN external_label.chat_type = 'group'
+             AND scoped.provider_metadata ? 'default_display_name'
+             AND scoped.provider_metadata->>'default_display_name' = scoped.name
+            THEN COALESCE(external_label.display_name, scoped.name)
+        WHEN scoped.private AND external_label.chat_type = 'personal' THEN
+            COALESCE(external_label.display_name, scoped.name)
+        WHEN scoped.private THEN COALESCE(
             NULLIF(
                 TRIM(
                     COALESCE(peer.first_name, '') || ' ' ||
@@ -1640,7 +1643,8 @@ SELECT
             peer.username,
             scoped.name
         )
-    ELSE scoped.name END AS name,
+        ELSE scoped.name
+    END::varchar AS name,
     scoped.description,
     scoped.project_id,
     scoped.source_name,
@@ -1661,6 +1665,8 @@ SELECT
     scoped.created_at,
     scoped.updated_at,
     CASE
+        WHEN scoped.private AND external_label.chat_type = 'personal'
+            THEN external_label.peer_uuid
         WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
              AND scoped.user_uuid = scoped.scoped_user_uuid
             THEN scoped.direct_user_uuid
@@ -1697,14 +1703,74 @@ LEFT JOIN LATERAL (
     ORDER BY message.created_at DESC, message.uuid DESC
     LIMIT 1
 ) AS last_message ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        chat.source->>'chat_type' AS chat_type,
+        CASE
+            WHEN chat.source->>'chat_type' IN ('personal', 'direct')
+                 AND names.peer_count = 1
+                THEN names.peer_uuid
+            ELSE NULL
+        END AS peer_uuid,
+        NULLIF(names.display_name, '') AS display_name
+    FROM m_external_chats_v2 AS chat
+    CROSS JOIN LATERAL (
+        SELECT
+            COUNT(*) AS peer_count,
+            (ARRAY_AGG(
+                (participant.value->>'identity_uuid')::uuid
+                ORDER BY participant.position
+            ))[1] AS peer_uuid,
+            STRING_AGG(
+                COALESCE(
+                    NULLIF(participant.value->>'display_name', ''),
+                    NULLIF(
+                        TRIM(
+                            COALESCE(participant_user.first_name, '') || ' ' ||
+                            COALESCE(participant_user.last_name, '')
+                        ),
+                        ''
+                    ),
+                    NULLIF(participant_user.username, '')
+                ),
+                ', ' ORDER BY participant.position
+            ) AS display_name
+        FROM jsonb_array_elements(
+            COALESCE(chat.source->'participants', '[]'::jsonb)
+        ) WITH ORDINALITY AS participant(value, position)
+        LEFT JOIN m_workspace_users AS participant_user
+          ON participant_user.uuid =
+                (participant.value->>'identity_uuid')::uuid
+        WHERE participant.value->>'identity_uuid' <>
+              scoped.scoped_user_uuid::text
+    ) AS names
+    WHERE chat.project_id = scoped.project_id
+      AND chat.projection_stream_uuid = scoped.uuid
+      AND chat.selected
+      AND (
+          chat.owner_user_uuid = scoped.scoped_user_uuid
+          OR EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(
+                  COALESCE(chat.source->'participants', '[]'::jsonb)
+              ) AS viewer(value)
+              WHERE viewer.value->>'identity_uuid' =
+                    scoped.scoped_user_uuid::text
+          )
+      )
+    ORDER BY
+        (chat.owner_user_uuid = scoped.scoped_user_uuid) DESC,
+        chat.updated_at DESC,
+        chat.uuid
+    LIMIT 1
+) AS external_label
+  ON scoped.source_name <> 'native'
 LEFT JOIN m_workspace_users AS peer
   ON peer.uuid = CASE
         WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
              AND scoped.user_uuid = scoped.scoped_user_uuid
             THEN scoped.direct_user_uuid
         WHEN scoped.private AND scoped.direct_user_uuid IS NOT NULL
-            THEN scoped.user_uuid
-        WHEN scoped.private AND scoped.user_uuid <> scoped.scoped_user_uuid
             THEN scoped.user_uuid
         ELSE NULL
     END
@@ -5011,6 +5077,158 @@ def create_message_flags_bulk(
         )
 
 
+def ensure_compact_workspace_message_recipients(
+    project_id: object,
+    message_uuids: typing.Any,
+    recipient_uuids: typing.Any,
+    session: typing.Any,
+) -> list[sys_uuid.UUID]:
+    """Materialize canonical recipient state for compact provider projections."""
+    requested_messages = sorted(
+        {sys_uuid.UUID(str(message_uuid)) for message_uuid in message_uuids},
+        key=str,
+    )
+    requested_recipients = sorted(
+        {sys_uuid.UUID(str(recipient_uuid)) for recipient_uuid in recipient_uuids},
+        key=str,
+    )
+    if not requested_messages or not requested_recipients:
+        return []
+    inserted_rows = session.execute(
+        """
+            WITH targets AS MATERIALIZED (
+                SELECT placement.uuid AS placement_uuid,
+                       placement.stream_uuid,
+                       placement.topic_uuid,
+                       binding.user_uuid,
+                       binding.membership_generation,
+                       canonical.author_uuid,
+                       canonical.payload,
+                       canonical.created_at,
+                       canonical.updated_at
+                FROM m_workspace_messages AS legacy
+                JOIN messenger_message_placements AS placement
+                  ON placement.project_id = legacy.project_id
+                 AND COALESCE(placement.legacy_public_uuid, placement.uuid) =
+                     legacy.uuid
+                JOIN messenger_messages AS canonical
+                  ON canonical.project_id = placement.project_id
+                 AND canonical.uuid = placement.message_uuid
+                 AND canonical.deleted_at IS NULL
+                JOIN messenger_stream_bindings AS binding
+                  ON binding.project_id = placement.project_id
+                 AND binding.stream_uuid = placement.stream_uuid
+                 AND binding.user_uuid = ANY(%s::uuid[])
+                 AND binding.active
+                WHERE legacy.project_id = %s
+                  AND legacy.uuid = ANY(%s::uuid[])
+            ), inserted_bindings AS (
+                INSERT INTO messenger_user_message_bindings (
+                    uuid, project_id, placement_uuid, user_uuid,
+                    membership_generation, relation_role, visibility,
+                    permissions, created_at, updated_at
+                )
+                SELECT messenger_uuid_v5(
+                           target.placement_uuid,
+                           target.user_uuid::text
+                       ),
+                       %s, target.placement_uuid, target.user_uuid,
+                       target.membership_generation,
+                       CASE WHEN target.author_uuid = target.user_uuid
+                            THEN 'author' ELSE 'member' END,
+                       'visible',
+                       '{"read":true,"react":true,"star":true,"pin":true}'::jsonb,
+                       target.created_at, target.updated_at
+                FROM targets AS target
+                ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE
+                SET membership_generation = EXCLUDED.membership_generation,
+                    relation_role = EXCLUDED.relation_role,
+                    visibility = EXCLUDED.visibility,
+                    permissions = EXCLUDED.permissions,
+                    updated_at = NOW()
+                WHERE messenger_user_message_bindings.membership_generation
+                      <> EXCLUDED.membership_generation
+                RETURNING user_uuid
+            ), inserted_states AS (
+                INSERT INTO messenger_user_message_states (
+                    uuid, project_id, placement_uuid, user_uuid,
+                    membership_generation, read_at, mentioned,
+                    created_at, updated_at
+                )
+                SELECT messenger_uuid_v5(
+                           target.placement_uuid,
+                           target.user_uuid::text
+                       ),
+                       %s, target.placement_uuid, target.user_uuid,
+                       target.membership_generation,
+                       CASE WHEN target.author_uuid = target.user_uuid
+                            THEN target.updated_at END,
+                       POSITION(
+                           '](urn:user:' || lower(target.user_uuid::text) || ')'
+                           IN lower(COALESCE(target.payload->>'content', ''))
+                       ) > 0,
+                       target.created_at, target.updated_at
+                FROM targets AS target
+                ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
+                SET membership_generation = EXCLUDED.membership_generation,
+                    read_at = EXCLUDED.read_at,
+                    mentioned = EXCLUDED.mentioned,
+                    starred = FALSE,
+                    pinned = FALSE,
+                    updated_at = NOW()
+                WHERE messenger_user_message_states.membership_generation
+                      <> EXCLUDED.membership_generation
+                RETURNING user_uuid, placement_uuid
+            ), queued AS (
+                INSERT INTO messenger_domain_outbox_events (
+                    uuid, project_id, event_kind, scope_kind,
+                    scope_key, payload
+                )
+                SELECT gen_random_uuid(), %s, 'read_counters', lane.scope_kind,
+                       %s::text || ':' || state.user_uuid::text || ':' ||
+                           CASE WHEN lane.scope_kind = 'user-stream'
+                                THEN target.stream_uuid::text
+                                ELSE target.topic_uuid::text END,
+                       jsonb_build_object(
+                           'source_kind', 'provider_message_state.created',
+                           'user_uuid', state.user_uuid,
+                           'stream_uuid', target.stream_uuid,
+                           'topic_uuid', target.topic_uuid,
+                           'placement_uuid', state.placement_uuid
+                       )
+                FROM inserted_states AS state
+                JOIN targets AS target
+                  ON target.placement_uuid = state.placement_uuid
+                 AND target.user_uuid = state.user_uuid
+                CROSS JOIN (
+                    VALUES ('user-stream'::varchar), ('user-topic'::varchar)
+                ) AS lane(scope_kind)
+                RETURNING uuid
+            )
+            SELECT DISTINCT changed.user_uuid,
+                            (SELECT count(*) FROM queued) AS queued_count
+            FROM (
+                SELECT user_uuid FROM inserted_bindings
+                UNION ALL
+                SELECT user_uuid FROM inserted_states
+            ) AS changed
+            """,
+        (
+            requested_recipients,
+            project_id,
+            requested_messages,
+            project_id,
+            project_id,
+            project_id,
+            project_id,
+        ),
+    ).fetchall()
+    return sorted(
+        {sys_uuid.UUID(str(row["user_uuid"])) for row in inserted_rows},
+        key=str,
+    )
+
+
 def ensure_workspace_message_recipients(
     project_id: object,
     message: typing.Any,
@@ -5027,6 +5245,12 @@ def ensure_workspace_message_recipients(
         return []
     _lock_workspace_project_event_writes(project_id, session)
     if read_state.project_mode(session, project_id) == read_state.PROJECT_MODE_COMPACT:
+        inserted_recipients = ensure_compact_workspace_message_recipients(
+            project_id,
+            [message.uuid],
+            recipient_uuids,
+            session,
+        )
         if message.user_uuid in recipient_uuids:
             read_state.set_message_read(
                 session,
@@ -5035,7 +5259,29 @@ def ensure_workspace_message_recipients(
                 message.uuid,
                 True,
             )
-        return []
+        if not emit_events or not inserted_recipients:
+            return inserted_recipients
+        messenger_events.create_message_events(
+            project_id=project_id,
+            message=message,
+            recipients=inserted_recipients,
+            session=session,
+            compact=True,
+        )
+        unread_recipients = [
+            recipient
+            for recipient in inserted_recipients
+            if recipient != message.user_uuid
+        ]
+        _create_compact_messages_unread_updated_events(
+            project_id=project_id,
+            user_uuids=unread_recipients,
+            stream_uuid=message.stream_uuid,
+            topic_uuid=message.topic_uuid,
+            session=session,
+            recipients_are_scoped=True,
+        )
+        return inserted_recipients
     inserted_rows = session.execute(
         """
         INSERT INTO "m_workspace_user_message_flags" (
@@ -6223,19 +6469,28 @@ def _restore_topic_summary_after_message_deletion(
 
     restored = session.execute(
         """
-        SELECT summary, boundary_message_uuid
-        FROM m_workspace_topic_summary_journal
-        WHERE topic_uuid = %s
-          AND invalidated_at IS NULL
-          AND (boundary_message_created_at, boundary_message_uuid) < (%s, %s)
+        SELECT journal.summary, journal.boundary_message_uuid
+        FROM m_workspace_topic_summary_journal AS journal
+        JOIN m_workspace_messages AS boundary
+          ON boundary.project_id = %s
+         AND boundary.topic_uuid = %s
+         AND boundary.uuid = journal.boundary_message_uuid
+        WHERE journal.topic_uuid = %s
+          AND journal.invalidated_at IS NULL
+          AND (
+                journal.boundary_message_created_at,
+                journal.boundary_message_uuid
+              ) < (%s, %s)
         ORDER BY
-            boundary_message_created_at DESC,
-            boundary_message_uuid DESC,
-            generated_at DESC,
-            uuid DESC
+            journal.boundary_message_created_at DESC,
+            journal.boundary_message_uuid DESC,
+            journal.generated_at DESC,
+            journal.uuid DESC
         LIMIT 1
         """,
         (
+            project_id,
+            topic_uuid,
             topic_uuid,
             deleted_message_created_at,
             deleted_message_uuid,

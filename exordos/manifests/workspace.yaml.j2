@@ -492,6 +492,15 @@ resources:
           read_state_cleanup_enabled = false
           read_state_batch_size = 50000
           read_state_max_batches_per_iteration = 8
+          # Keep the canonical Messenger v2 projection queue active explicitly;
+          # do not rely on the Python option default in deployed installations.
+          v2_projection_enabled = true
+          # One primary maintenance process plus three projection-only workers.
+          # The hard runtime bound is eight to protect the PostgreSQL pool.
+          v2_projection_workers = 4
+          # Poll quickly after an empty cycle; completed work never sleeps.
+          v2_projection_idle_sleep_seconds = 0.5
+          v2_metrics_log_interval_seconds = 30
 
 
           [topic_summary]

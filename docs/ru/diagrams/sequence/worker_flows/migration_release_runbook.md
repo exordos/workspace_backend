@@ -85,22 +85,32 @@ Cleanup не принимает решение по одному nullable пол
 echo reconciliation. Поэтому migration выполняет детерминированный preflight
 под тем же writer freeze и принимает только такие комбинации:
 
-- inbound message: согласованные `source_name` и `source.kind`, наличие
-  `source.message_id` и либо совпадающие Zulip account и
-  `provider_external_id`, либо Zulip-owned stream, либо дополнительное legacy
+- inbound message: согласованные `source_name` и `source.kind`, provider message
+  identity из `source.message_id` или legacy `provider_external_id` (если есть
+  оба значения, они должны совпадать), полная historical identity Bridge
+  `UUIDv5(legacy_namespace, "zulip:<account_uuid>:message:<provider_id>")`,
+  а также matching Zulip account, Zulip-owned stream или дополнительное legacy
   entity evidence;
 - native outbound message: durable строка `m_external_operations_v2` с
   `action=message.create`, совпадающим `target_uuid`, локальным
   `owner_user_uuid` и тем же account, если он уже записан в message;
+- legacy native/outbound message, созданный до появления этой operation queue:
+  согласованная пара `source_name=native` и `source.kind=native`; provider
+  identifiers, добавленные поздней echo reconciliation, не отменяют эту пару;
 - external file: Zulip account, специальный external-content storage namespace
   и отсутствие ссылки из любого retained message. Любая surviving ссылка
   `urn:file|image|video:<uuid>` имеет приоритет и сохраняет row и physical object.
 
-Любая строка с частичными или противоречивыми Zulip signals останавливает
-migration до destructive work. Одновременное доказательство inbound и local
-outbound происхождения также блокирует migration. `m_zulip_processed_entities`
-никогда не является достаточным доказательством само по себе и используется
-только как дополнительный сигнал при согласованных source fields.
+Любая строка с частичными или противоречивыми source или Zulip signals
+останавливает migration до destructive work. Если полностью reconciled
+historical echo одновременно содержит inbound fields и точную durable
+`message.create` operation, operation имеет приоритет, а native/outbound row
+сохраняется. Любой UUID Zulip-source row, включая произвольный UUIDv5, который
+не совпадает с полной legacy identity и не имеет такой operation, считается
+неоднозначным Workspace send до появления operation queue и останавливает
+migration вместо reset. `m_zulip_processed_entities` никогда не является достаточным
+доказательством само по себе и используется только как дополнительный сигнал
+при согласованных source fields.
 
 Provider-origin reactions удаляются по Zulip account provenance, включая
 reactions на сохраняемых native/outbound messages. Native reactions остаются.
@@ -126,6 +136,35 @@ reference. Metadata sidecar удаляется отдельно, retry идем�
 `urn:file|image|video:<uuid>` находятся внутри Markdown. Migration сканирует все
 surviving payloads до выбора file candidate, поэтому не создаёт dangling link и
 не полагается на выдуманный FK.
+
+## Топология миграций и rolling repair идентичности
+
+Опубликованный файл `0152` изменять нельзя; перед релизом проверяется его
+checksum. Применяется только текущий head `0156`, а порядок зависимостей даёт
+два безопасных пути:
+
+- чистая v1 database: `0155` подготавливает provenance, затем выполняется
+  неизменяемая цепочка `0152` → `0153` → `0154`, после чего `0156` завершает
+  cleanup;
+- database, где `0152`–`0154` уже применены: `0155` фиксируется как no-op, а
+  `0156` выполняет forward-repair сохранённых provider identities.
+
+Для доказанных aliases одного физического provider message миграция `0156`
+сохраняет каждый internal message, placement, content revision и public UUID.
+Provider linkage остаётся у одного детерминированного победителя; у остальных
+очищаются только `external_account_uuid`/`provider_external_id`. Сначала
+выбирается строка с terminal local operation, затем non-lossy copy, затем самая
+новая copy. Уже realm-keyed imported row всегда имеет приоритет над совпадающим
+retained alias. Доказательство требует совпадения realm/message ID, project,
+author, provider URL и metadata identity, а также разных alias accounts. Любой
+более слабый конфликт требует rollback.
+
+После миграции обязательны один migration head, отсутствие дубликатов
+`(provider_realm_uuid, provider_message_id)`, отсутствие подходящих
+provider-linked rows без realm key, отсутствие transient provenance marker и
+подготовительных indexes, а также включённые оба rolling legacy repair
+triggers. Количество messages/placements/public UUID для retained set не должно
+меняться.
 
 ## Fresh complete Zulip reimport
 
@@ -153,6 +192,21 @@ Import автоматически работает bounded batches с keyset/che
 retry/backoff, progress logs и reconciliation. Provider integration остаётся frozen до фиксации
 финального source cursor/high-watermark, чтобы сообщения и файлы на границе
 freeze не потерялись и не задублировались.
+
+## Восстановление после частичного v2 import
+
+Если развёрнутый v2 server принял только часть Zulip history, Bridge следует
+остановить и развернуть server build с миграцией `0154`. Миграция один раз
+увеличивает reset generation всех Zulip-аккаунтов и повторно публикует все
+выбранные assignments. Bridge запускается только после подтверждения здоровья
+backend.
+
+Нужно проверить, что каждый аккаунт увидел новое generation, старые
+quarantined deliveries удалены, backfill jobs запустились заново, а новых
+Provider API rejections нет. Общий realm-global stream допустим только если у
+каждого дополнительного владельца есть выбранный peer assignment на тот же
+project и stream. Pre-migration backup сохраняется до завершения повторного
+импорта и прохождения всех acceptance gates.
 
 ## Rebuild и acceptance gates
 
