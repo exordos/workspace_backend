@@ -555,6 +555,71 @@ def test_v2_store_preserves_existing_provider_outbound_actions(api, db):
     )
 
 
+def test_v2_message_replay_rejects_foreign_author_before_provider_routing(api, db):
+    stream_response = api.post(
+        STREAMS,
+        json={
+            "name": "Provider v2 replay ownership",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert stream_response.status_code == 201, stream_response.text
+    stream = stream_response.json()
+    author_account_uuid = _seed_v2_provider_route(
+        db,
+        api.project_id,
+        api.user_uuid,
+        stream["uuid"],
+    )
+
+    other_user_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, other_user_uuid, f"user-{other_user_uuid}")
+    _register_project_user(db, api.project_id, other_user_uuid)
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(other_user_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    other_account_uuid = _seed_v2_provider_route(
+        db,
+        api.project_id,
+        other_user_uuid,
+        stream["uuid"],
+    )
+
+    canonical_message_uuid = sys_uuid.uuid4()
+    payload = {"kind": "markdown", "content": "owned by the first author"}
+    message_request = {
+        "uuid": str(canonical_message_uuid),
+        "stream_uuid": stream["uuid"],
+        "topic_uuid": stream["default_topic_uuid"],
+        "payload": payload,
+    }
+    created = api.post(MESSAGES, json=message_request)
+    assert created.status_code == 201, created.text
+
+    foreign_replay = api.post(
+        MESSAGES,
+        user=other_user_uuid,
+        json=message_request,
+    )
+    assert foreign_replay.status_code == 400, foreign_replay.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT external_account_uuid, COUNT(*)
+            FROM m_external_operations_v2
+            WHERE action = 'message.create' AND target_uuid = %s
+            GROUP BY external_account_uuid
+            """,
+            (created.json()["uuid"],),
+        )
+        operations = dict(cursor.fetchall())
+    assert operations == {author_account_uuid: 1}
+    assert other_account_uuid not in operations
+
+
 def test_v2_provider_result_reconciles_echo_by_placement_uuid(api, db):
     stream_response = api.post(
         STREAMS,

@@ -829,7 +829,7 @@ def test_canonical_store_has_no_mail_replay_or_nested_session_boundary():
     assert "session_manager" not in source
 
 
-def test_provider_operation_uses_projection_owner_target_in_request_transaction(
+def test_provider_message_create_uses_author_target_in_request_transaction(
     monkeypatch,
 ):
     stream_uuid = sys_uuid.uuid4()
@@ -910,7 +910,7 @@ def test_provider_operation_uses_projection_owner_target_in_request_transaction(
             session,
             {
                 "project_id": PROJECT_UUID,
-                "owner_user_uuid": PROJECTION_OWNER_UUID,
+                "owner_user_uuid": USER_UUID,
                 "external_account_uuid": account_uuid,
                 "stream_uuid": stream_uuid,
                 "capability_name": "messenger.message.send",
@@ -2891,7 +2891,7 @@ def test_event_retention_has_created_at_leading_index():
     assert "m_workspace_events_retention_cutoff_idx" in migration
 
 
-def test_provider_read_route_prefers_current_users_selected_projection(monkeypatch):
+def test_provider_user_route_prefers_current_users_selected_projection(monkeypatch):
     stream_uuid = sys_uuid.uuid4()
     canonical_account_uuid = sys_uuid.uuid4()
     reader_account_uuid = sys_uuid.uuid4()
@@ -2912,6 +2912,56 @@ def test_provider_read_route_prefers_current_users_selected_projection(monkeypat
         external_account_uuid=canonical_account_uuid,
     )
 
-    assert store._provider_read_account_uuids_for_stream(stream) == (
+    assert store._provider_user_account_uuids_for_stream(stream) == (
         reader_account_uuid,
     )
+
+
+def test_provider_user_route_does_not_fallback_to_another_users_account(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    canonical_account_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(fetchall=lambda: [])
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    stream = types.SimpleNamespace(
+        uuid=stream_uuid,
+        user_uuid=PROJECTION_OWNER_UUID,
+        external_account_uuid=canonical_account_uuid,
+    )
+
+    assert store._provider_user_account_uuids_for_stream(stream) == ()
+
+
+def test_message_create_has_no_provider_target_without_author_owned_route(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    canonical_account_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(
+        execute=lambda *_args: types.SimpleNamespace(fetchall=lambda: [])
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        FakeObjects(
+            [
+                types.SimpleNamespace(
+                    uuid=stream_uuid,
+                    user_uuid=PROJECTION_OWNER_UUID,
+                    external_account_uuid=canonical_account_uuid,
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    assert store._provider_targets_for_stream(stream_uuid, "message.create") == ()

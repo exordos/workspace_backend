@@ -2924,6 +2924,38 @@ def test_provider_operation_resolution_allows_backfill_and_uses_current_policy(
             sys_uuid.UUID(message.json()["uuid"]),
         )
 
+    other_user_uuid = sys_uuid.uuid4()
+    conftest.seed_user_stream_binding(
+        db,
+        api.project_id,
+        stream_uuid,
+        other_user_uuid,
+    )
+    db.commit()
+    other_message = api.post(
+        MESSAGES,
+        user=other_user_uuid,
+        json={
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "payload": {
+                "kind": "markdown",
+                "content": "author without a provider route",
+            },
+        },
+    )
+    assert other_message.status_code == 201, other_message.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_external_operations_v2
+            WHERE target_uuid = %s
+            """,
+            (other_message.json()["uuid"],),
+        )
+        assert cursor.fetchone()[0] == 0
+
     with db.cursor() as cursor:
         cursor.execute(
             """
