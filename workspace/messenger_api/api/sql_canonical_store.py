@@ -1322,9 +1322,14 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         *,
         account_locked: bool = False,
     ) -> tuple[typing.Any, ...]:
-        """Resolve every durable provider route that owns a message."""
+        """Resolve every durable provider route for a message operation."""
         session = contexts.Context().get_session()
-        if operation_kind == "read_state.set":
+        if operation_kind in {
+            "reaction.create",
+            "reaction.update",
+            "reaction.delete",
+            "read_state.set",
+        }:
             stream = models.WorkspaceStream.objects.get_one(
                 filters={
                     "project_id": dm_filters.EQ(self.project_uuid),
@@ -1469,7 +1474,14 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             raise ra_exceptions.ValidationErrorException()
         route_owner_uuid = (
             self.user_uuid
-            if operation_kind in {"message.create", "read_state.set"}
+            if operation_kind
+            in {
+                "message.create",
+                "reaction.create",
+                "reaction.update",
+                "reaction.delete",
+                "read_state.set",
+            }
             else stream.user_uuid
         )
         try:
