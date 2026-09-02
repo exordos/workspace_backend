@@ -5,9 +5,11 @@
 
 """Native Messenger v2 cutover tests through the unchanged HTTP contract."""
 
+import concurrent.futures
 import datetime
 import itertools
 import json
+import threading
 import types
 import uuid as sys_uuid
 
@@ -19,6 +21,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.messenger_api.dm import models as messenger_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.external_bridge_control import provider_event_apply
 from workspace.external_bridge_control import provider_v2
@@ -213,6 +216,75 @@ def _register_project_user(db, project_uuid, user_uuid):
             "SELECT messenger_v2_register_project_user(%s, %s)",
             (project_uuid, user_uuid),
         )
+
+
+def test_first_request_materializes_iam_user_before_native_write(http_server, db):
+    user_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    client = conftest.ApiClient(http_server, user_uuid, project_uuid)
+
+    response = client.post(
+        STREAMS,
+        json={
+            "name": "First request",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT workspace_user.username, project_user.user_uuid
+            FROM m_workspace_users AS workspace_user
+            JOIN messenger_project_users AS project_user
+              ON project_user.user_uuid = workspace_user.uuid
+            WHERE workspace_user.uuid = %s AND project_user.project_id = %s
+            """,
+            (user_uuid, project_uuid),
+        )
+        assert cursor.fetchone() == (f"user-{user_uuid}", user_uuid)
+
+
+def test_concurrent_first_requests_share_one_iam_user_import(db, monkeypatch):
+    user_uuid = sys_uuid.uuid4()
+    username = f"user-{user_uuid}"
+    first_lookup = threading.Barrier(2)
+    thread_state = threading.local()
+    objects = messenger_models.WorkspaceUser.objects
+    original_get_one_or_none = objects.get_one_or_none
+
+    def synchronized_get_one_or_none(*args, **kwargs):
+        result = original_get_one_or_none(*args, **kwargs)
+        if not getattr(thread_state, "initial_lookup_complete", False):
+            thread_state.initial_lookup_complete = True
+            first_lookup.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(objects, "get_one_or_none", synchronized_get_one_or_none)
+
+    def import_user():
+        with contexts.Context().session_manager():
+            return messenger_models.WorkspaceUser.sync_iam_identity(
+                user_uuid=user_uuid,
+                username=username,
+                first_name=None,
+                last_name=None,
+                email=None,
+            ).uuid
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _: import_user(), range(2)))
+
+    assert results == (user_uuid, user_uuid)
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT count(*) FROM m_workspace_users WHERE uuid = %s",
+            (user_uuid,),
+        )
+        assert cursor.fetchone()[0] == 1
 
 
 def _seed_v2_provider_route(db, project_uuid, owner_uuid, stream_uuid):

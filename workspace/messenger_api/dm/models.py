@@ -381,6 +381,15 @@ class WorkspaceUser(
             filters={"uuid": dm_filters.EQ(user_uuid)},
         )
         if workspace_user is None:
+            session = contexts.Context().get_session()
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))",
+                (user_uuid,),
+            )
+            workspace_user = cls.objects.get_one_or_none(
+                filters={"uuid": dm_filters.EQ(user_uuid)},
+            )
+        if workspace_user is None:
             workspace_user = cls.objects.get_one_or_none(
                 filters={"username": dm_filters.EQ(username)},
             )
