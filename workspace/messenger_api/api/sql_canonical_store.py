@@ -38,6 +38,30 @@ RESOURCE_MODELS: dict[str, typing.Any] = {
 _PROVIDER_TARGET_UNSET = object()
 _PROVIDER_READ_STATE_MAX_MESSAGES = 500
 _PROVIDER_TARGET_EXISTS = object()
+_CURRENT_USER_PROVIDER_OPERATIONS = frozenset(
+    {
+        "message.create",
+        "message.update",
+        "message.delete",
+        "reaction.create",
+        "reaction.update",
+        "reaction.delete",
+        "read_state.set",
+    }
+)
+_STREAM_OWNER_PROVIDER_OPERATIONS = frozenset(
+    {
+        "membership.add",
+        "membership.remove",
+        "stream.notification.update",
+        "topic.notification.update",
+        "stream.delete",
+        "topic.create",
+        "stream.update",
+        "topic.update",
+        "topic.delete",
+    }
+)
 EVENT_RETENTION = datetime.timedelta(hours=72)
 EVENT_PRUNE_BATCH_SIZE = 25000
 SLOW_LIST_PROJECTION_SECONDS = 1.0
@@ -1481,18 +1505,12 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         required_capability = provider_data._required_capability(operation_kind)
         if required_capability is None:
             raise ra_exceptions.ValidationErrorException()
-        route_owner_uuid = (
-            self.user_uuid
-            if operation_kind
-            in {
-                "message.create",
-                "reaction.create",
-                "reaction.update",
-                "reaction.delete",
-                "read_state.set",
-            }
-            else stream.user_uuid
-        )
+        if operation_kind in _CURRENT_USER_PROVIDER_OPERATIONS:
+            route_owner_uuid = self.user_uuid
+        elif operation_kind in _STREAM_OWNER_PROVIDER_OPERATIONS:
+            route_owner_uuid = stream.user_uuid
+        else:
+            raise ra_exceptions.ValidationErrorException()
         try:
             account, _chat, bridge = provider_data.resolve_provider_target(
                 session,
