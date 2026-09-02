@@ -2709,7 +2709,7 @@ class MessengerV2StoreFactory(sql_canonical_store.SQLCanonicalMessengerStoreFact
         user_uuid: str | sys_uuid.UUID,
     ) -> typing.Iterator[api_store.MessengerStore]:
         messenger_store = MessengerV2Store(project_uuid, user_uuid)
-        messenger_store._ensure_project_user(user_uuid)
+        self._sync_request_iam_identity(messenger_store, user_uuid)
         yield typing.cast(
             api_store.MessengerStore,
             messenger_store,

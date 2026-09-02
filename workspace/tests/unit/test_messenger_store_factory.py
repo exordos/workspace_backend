@@ -6,6 +6,9 @@
 import pathlib
 import subprocess
 import sys
+import types
+import uuid as sys_uuid
+from unittest import mock
 
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
@@ -117,3 +120,42 @@ def test_postgresql_projection_move_is_a_noop():
     factory = sql_canonical_store.SQLCanonicalMessengerStoreFactory()
 
     assert factory.move_stream_projection(stream_uuid="stream") is None
+
+
+def test_postgresql_factory_syncs_active_request_iam_identity(monkeypatch):
+    user_uuid = sys_uuid.uuid4()
+    iam_user = types.SimpleNamespace(
+        name="cassi",
+        first_name="Cassandra",
+        last_name="Volkova",
+        email="cassi@exordos.com",
+    )
+    iam_context = mock.Mock()
+    iam_context.get_introspection_info.return_value.user_info = iam_user
+
+    class RequestContext:
+        @property
+        def iam_context(self):
+            return iam_context
+
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "get_context",
+        lambda: RequestContext(),
+    )
+    store = mock.Mock()
+
+    sql_canonical_store.SQLCanonicalMessengerStoreFactory._sync_request_iam_identity(
+        store,
+        user_uuid,
+    )
+
+    store.sync_iam_identity.assert_called_once_with(
+        {
+            "user_uuid": user_uuid,
+            "username": "cassi",
+            "first_name": "Cassandra",
+            "last_name": "Volkova",
+            "email": "cassi@exordos.com",
+        }
+    )

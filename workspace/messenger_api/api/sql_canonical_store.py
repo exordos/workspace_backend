@@ -80,6 +80,15 @@ MENTIONED_MESSAGE_UUIDS_SQL = """
     ORDER BY candidate.created_at {direction}, candidate.uuid {direction}
     LIMIT %s
 """
+
+
+class _IAMIdentityStore(typing.Protocol):
+    def sync_iam_identity(
+        self,
+        values: dict[str, typing.Any],
+    ) -> dict[str, typing.Any]: ...
+
+
 COMPACT_MENTIONED_MESSAGE_UUIDS_SQL = """
     WITH authorized_streams AS MATERIALIZED (
         SELECT binding.stream_uuid
@@ -2966,16 +2975,40 @@ class PostgresEventStore:
 class SQLCanonicalMessengerStoreFactory:
     """Open PostgreSQL stores without owning or nesting a DB transaction."""
 
+    @staticmethod
+    def _sync_request_iam_identity(
+        store: _IAMIdentityStore,
+        user_uuid: str | sys_uuid.UUID,
+    ) -> None:
+        try:
+            request_context = typing.cast(typing.Any, contexts.get_context())
+        except contexts.ContextIsNotExistsInStorage:
+            return
+        if getattr(type(request_context), "iam_context", None) is None:
+            return
+        iam_user = request_context.iam_context.get_introspection_info().user_info
+        store.sync_iam_identity(
+            {
+                "user_uuid": sys_uuid.UUID(str(user_uuid)),
+                "username": iam_user.name,
+                "first_name": iam_user.first_name,
+                "last_name": iam_user.last_name,
+                "email": iam_user.email,
+            }
+        )
+
     @contextlib.contextmanager
     def draft_store(
         self,
         project_uuid: str | sys_uuid.UUID,
         user_uuid: str | sys_uuid.UUID,
     ) -> collections.abc.Iterator[api_store.MessengerStore]:
-        yield typing.cast(
+        store = typing.cast(
             api_store.MessengerStore,
             SQLCanonicalMessengerStore(project_uuid, user_uuid),
         )
+        self._sync_request_iam_identity(store, user_uuid)
+        yield store
 
     @contextlib.contextmanager
     def event_store(
@@ -2983,6 +3016,13 @@ class SQLCanonicalMessengerStoreFactory:
         project_uuid: str | sys_uuid.UUID,
         user_uuid: str | sys_uuid.UUID,
     ) -> collections.abc.Iterator[PostgresEventStore]:
+        self._sync_request_iam_identity(
+            typing.cast(
+                api_store.MessengerStore,
+                SQLCanonicalMessengerStore(project_uuid, user_uuid),
+            ),
+            user_uuid,
+        )
         yield PostgresEventStore(project_uuid, user_uuid)
 
     @staticmethod
@@ -2996,7 +3036,9 @@ class SQLCanonicalMessengerStoreFactory:
         project_uuid: str | sys_uuid.UUID,
         user_uuid: str | sys_uuid.UUID,
     ) -> collections.abc.Iterator[api_store.MessengerStore]:
-        yield typing.cast(
+        store = typing.cast(
             api_store.MessengerStore,
             SQLCanonicalMessengerStore(project_uuid, user_uuid),
         )
+        self._sync_request_iam_identity(store, user_uuid)
+        yield store
