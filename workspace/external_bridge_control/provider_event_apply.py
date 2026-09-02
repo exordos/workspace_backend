@@ -19,6 +19,7 @@ from workspace.messenger_api import external_projection, file_storage
 from workspace.messenger_api.dm import helpers, message_payloads, models, read_state
 
 SUPPORTED_EVENT_KINDS = {
+    "history.finalize",
     "identity.upsert",
     "message.delete",
     "message.upsert",
@@ -91,6 +92,7 @@ def prime_assignment_cache(
                 "capabilities",
                 "account_settings",
                 "provider_realm_uuid",
+                "assignment_generation",
             )
         }
         for name in (
@@ -132,37 +134,35 @@ def _assignment(
         SELECT chat."owner_user_uuid", chat."projection_stream_uuid",
                chat."provider_chat_id", chat."display_name", chat."source",
                chat."capabilities", account."settings" AS account_settings,
-               account."provider_realm_uuid"
+               account."provider_realm_uuid",
+               desired."generation" AS assignment_generation
         FROM "m_external_chats_v2" AS chat
         JOIN "m_external_accounts_v2" AS account
           ON account."uuid" = chat."external_account_uuid"
+        JOIN "m_external_bridge_desired_resources_v1" AS desired
+          ON desired."bridge_instance_uuid" = %s
+         AND desired."provider_kind" = %s
+         AND desired."resource_type" = 'external_chat_assignment'
+         AND desired."resource_uuid" = chat."uuid"
+         AND desired."operation" = 'upsert'
+         AND desired."resource"->>'external_account_uuid' = %s
+         AND desired."resource"->>'project_id' = %s
+         AND desired."resource"#>>'{workspace_projection,stream,uuid}' =
+             chat."projection_stream_uuid"::text
         WHERE chat."uuid" = %s AND chat."external_account_uuid" = %s
           AND chat."provider" = %s AND chat."project_id" = %s
           AND chat."selected" AND chat."status" IN ('syncing', 'live', 'degraded')
           AND chat."projection_stream_uuid" IS NOT NULL
-          AND EXISTS (
-            SELECT 1
-            FROM "m_external_bridge_desired_resources_v1" AS desired
-            WHERE desired."bridge_instance_uuid" = %s
-              AND desired."provider_kind" = %s
-              AND desired."resource_type" = 'external_chat_assignment'
-              AND desired."resource_uuid" = chat."uuid"
-              AND desired."operation" = 'upsert'
-              AND desired."resource"->>'external_account_uuid' = %s
-              AND desired."resource"->>'project_id' = %s
-              AND desired."resource"#>>'{workspace_projection,stream,uuid}' =
-                  chat."projection_stream_uuid"::text
-          )
         """,
         (
-            chat_uuid,
-            account_uuid,
-            identity.provider_kind,
-            project_id,
             identity.bridge_instance_uuid,
             identity.provider_kind,
             str(account_uuid),
             str(project_id),
+            chat_uuid,
+            account_uuid,
+            identity.provider_kind,
+            project_id,
         ),
     ).fetchone()
     if row is None:
@@ -200,6 +200,8 @@ def _resource(
     provider_metadata.setdefault("capabilities", {})
     if event.get("provider_sequence") is not None:
         provider_metadata["provider_sequence"] = event["provider_sequence"]
+    if event.get("delivery_class") is not None:
+        provider_metadata["delivery_class"] = event["delivery_class"]
     resource.update(
         {
             "provider_uuid": identity.bridge_instance_uuid,
@@ -431,6 +433,101 @@ def _message_recipients(
     return sorted(
         {sys_uuid.UUID(str(user_message.user_uuid)) for user_message in user_messages},
         key=str,
+    )
+
+
+def _canonical_message_recipients(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    message_uuid: sys_uuid.UUID,
+) -> list[sys_uuid.UUID]:
+    """Return the persisted audience in every read-state migration mode."""
+    rows = session.execute(
+        """
+        SELECT DISTINCT recipient.user_uuid
+        FROM (
+            SELECT state.user_uuid
+            FROM m_workspace_messages AS legacy
+            JOIN messenger_message_placements AS placement
+              ON placement.project_id = legacy.project_id
+             AND COALESCE(placement.legacy_public_uuid, placement.uuid) =
+                 legacy.uuid
+            JOIN messenger_user_message_states AS state
+              ON state.project_id = placement.project_id
+             AND state.placement_uuid = placement.uuid
+            WHERE legacy.project_id = %s AND legacy.uuid = %s
+            UNION
+            SELECT flags.user_uuid
+            FROM m_workspace_user_message_flags AS flags
+            WHERE flags.project_id = %s AND flags.uuid = %s
+        ) AS recipient
+        ORDER BY recipient.user_uuid
+        """,
+        (project_id, message_uuid, project_id, message_uuid),
+    ).fetchall()
+    return [sys_uuid.UUID(str(row["user_uuid"])) for row in rows]
+
+
+def _schedule_backfill_move_source_counters(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    recipient_uuids: list[sys_uuid.UUID],
+    stream_uuid: sys_uuid.UUID,
+    topic_uuid: sys_uuid.UUID | None,
+    provider_event_uuid: sys_uuid.UUID,
+    include_stream: bool = True,
+) -> None:
+    """Refresh scopes that a quiet backfill move removed a message from."""
+    normalized_recipients = sorted(
+        {sys_uuid.UUID(str(value)) for value in recipient_uuids},
+        key=str,
+    )
+    if not normalized_recipients:
+        return
+    session.execute(
+        """
+        INSERT INTO messenger_domain_outbox_events (
+            uuid, project_id, event_kind, scope_kind, scope_key, payload
+        )
+        SELECT messenger_uuid_v5(
+                   %s,
+                   'history-move-source:' || target.user_uuid::text || ':' ||
+                       lane.scope_kind || ':' ||
+                       CASE WHEN lane.scope_kind = 'user-stream'
+                            THEN %s::uuid::text ELSE %s::uuid::text END
+               ),
+               %s, 'read_counters', lane.scope_kind,
+               %s::text || ':' || target.user_uuid::text || ':' ||
+                   CASE WHEN lane.scope_kind = 'user-stream'
+                        THEN %s::uuid::text ELSE %s::uuid::text END,
+               jsonb_build_object(
+                   'source_kind', 'provider_backfill_message.moved',
+                   'user_uuid', target.user_uuid,
+                   'stream_uuid', %s::uuid,
+                   'topic_uuid', %s::uuid
+               )
+        FROM unnest(%s::uuid[]) AS target(user_uuid)
+        CROSS JOIN (
+            VALUES ('user-stream'::varchar), ('user-topic'::varchar)
+        ) AS lane(scope_kind)
+        WHERE (lane.scope_kind <> 'user-stream' OR %s::boolean)
+          AND (lane.scope_kind = 'user-stream' OR %s::uuid IS NOT NULL)
+        ON CONFLICT (project_id, uuid) DO NOTHING
+        """,
+        (
+            provider_event_uuid,
+            stream_uuid,
+            topic_uuid,
+            project_id,
+            project_id,
+            stream_uuid,
+            topic_uuid,
+            stream_uuid,
+            topic_uuid,
+            normalized_recipients,
+            include_stream,
+            topic_uuid,
+        ),
     )
 
 
@@ -1081,7 +1178,7 @@ def _topic_event(
         assignment,
         identity,
         sys_uuid.UUID(str(event["external_account_uuid"])),
-        emit_events=not quiet_backfill,
+        emit_events=True,
     )
     existing = _existing(models.WorkspaceStreamTopic, project_id, topic_uuid, session)
     if event["kind"] == "topic.delete":
@@ -1130,7 +1227,7 @@ def _topic_event(
         values.pop("stream_uuid", None)
         existing.update_dm(values=values)
         existing.update(session=session)
-    if not quiet_backfill:
+    if existing is None or not quiet_backfill:
         helpers.create_compact_workspace_stream_topic_events(
             project_id,
             stream_uuid,
@@ -1458,7 +1555,7 @@ def _message_event(
             assignment,
             identity,
             sys_uuid.UUID(str(event["external_account_uuid"])),
-            emit_events=not quiet_backfill,
+            emit_events=True,
         )
     projection_recipients = sorted(
         {
@@ -1545,6 +1642,7 @@ def _message_event(
                 return_visible=False,
                 compact_events=True,
                 scoped_recipient_uuids=projection_recipients,
+                schedule_counters=not quiet_backfill,
                 **create_options,
                 **values,
             )
@@ -1557,6 +1655,7 @@ def _message_event(
                     projection_recipients,
                     session,
                     emit_events=False,
+                    schedule_counters=not quiet_backfill,
                 )
         finally:
             if batch_validation_token is not None:
@@ -1569,6 +1668,7 @@ def _message_event(
                 projection_recipients,
                 session,
                 emit_events=not quiet_backfill,
+                schedule_counters=not quiet_backfill,
             )
         # A provider replay may report the edit time as created_at. Once the
         # message exists, its creation timestamp is immutable.
@@ -1615,9 +1715,17 @@ def _message_event(
             else []
         )
         source_recipients = (
-            _message_recipients(session, source_project_id, message_uuid)
-            if cross_project_move and not quiet_backfill
-            else []
+            _canonical_message_recipients(
+                session,
+                source_project_id,
+                message_uuid,
+            )
+            if moved and quiet_backfill
+            else (
+                _message_recipients(session, source_project_id, message_uuid)
+                if cross_project_move
+                else []
+            )
         )
         source_changed = (
             update_values.get("source_name") is not None
@@ -1705,12 +1813,26 @@ def _message_event(
                     projection_recipients,
                     session,
                     emit_events=False,
+                    schedule_counters=not quiet_backfill,
                 )
             if moved:
                 external_projection._invalidate_moved_topic_summaries(
                     session,
                     list(dict.fromkeys([previous_topic_uuid, reported_topic_uuid])),
                 )
+                if quiet_backfill:
+                    _schedule_backfill_move_source_counters(
+                        session,
+                        source_project_id,
+                        source_recipients,
+                        previous_stream_uuid,
+                        previous_topic_uuid,
+                        sys_uuid.UUID(str(event["provider_event_uuid"])),
+                        include_stream=(
+                            cross_project_move
+                            or previous_stream_uuid != stream_uuid
+                        ),
+                    )
             if not quiet_backfill:
                 if cross_project_move:
                     helpers.messenger_events.create_message_events(
@@ -1758,6 +1880,9 @@ def _message_event(
             )
             existing.update(session=session)
     if read_value is not None:
+        read_options = {"emit_events": not quiet_backfill}
+        if quiet_backfill:
+            read_options["schedule_counters"] = False
         _sync_provider_read_state(
             session,
             project_id,
@@ -1766,7 +1891,7 @@ def _message_event(
             sys_uuid.UUID(str(resource["topic_uuid"])),
             [message_uuid],
             read_value,
-            emit_events=not quiet_backfill,
+            **read_options,
         )
     return message_uuid
 
@@ -1933,6 +2058,7 @@ def _sync_provider_read_state(
     read: bool,
     *,
     emit_events: bool = True,
+    schedule_counters: bool = True,
 ) -> None:
     # Workspace events acquire this project-scoped lock after mutating message
     # flags. Take it first for imported read-state batches so a concurrent
@@ -1954,6 +2080,7 @@ def _sync_provider_read_state(
             message_uuids,
             [reader_uuid],
             session,
+            schedule_counters=schedule_counters,
         )
     if read_state.mode_uses_compact_state(mode):
         messages = session.execute(
@@ -2067,24 +2194,29 @@ def _sync_provider_read_state(
             )
             updated_message_uuids_by_read[effective_read] = changed_message_uuids
         else:
-            updated_rows = session.execute(
-                """
-                UPDATE m_workspace_user_message_flags
-                SET read = %s, updated_at = NOW()
-                WHERE project_id = %s
-                  AND user_uuid = %s
-                  AND uuid = ANY(%s::uuid[])
-                  AND read IS DISTINCT FROM %s
-                RETURNING uuid
-                """,
-                (
-                    effective_read,
-                    project_id,
-                    reader_uuid,
-                    changed_message_uuids,
-                    effective_read,
-                ),
-            ).fetchall()
+            with helpers.suppress_legacy_message_flag_counters(
+                session,
+                project_id,
+                not schedule_counters,
+            ):
+                updated_rows = session.execute(
+                    """
+                    UPDATE m_workspace_user_message_flags
+                    SET read = %s, updated_at = NOW()
+                    WHERE project_id = %s
+                      AND user_uuid = %s
+                      AND uuid = ANY(%s::uuid[])
+                      AND read IS DISTINCT FROM %s
+                    RETURNING uuid
+                    """,
+                    (
+                        effective_read,
+                        project_id,
+                        reader_uuid,
+                        changed_message_uuids,
+                        effective_read,
+                    ),
+                ).fetchall()
             updated_message_uuids_by_read[effective_read] = [
                 row["uuid"] for row in updated_rows
             ]
@@ -2112,7 +2244,7 @@ def _sync_provider_read_state(
             (effective_read, project_id, reader_uuid, placement_uuids),
         )
         changed_canonical_placement_uuids.extend(placement_uuids)
-    if changed_canonical_placement_uuids:
+    if schedule_counters and changed_canonical_placement_uuids:
         changed_canonical_messages = [
             message
             for message in messages
@@ -2278,6 +2410,111 @@ def _read_state_event(
     return stream_uuid
 
 
+def _history_finalize_event(
+    session: typing.Any,
+    event: dict[str, typing.Any],
+    project_id: sys_uuid.UUID,
+    assignment: typing.Mapping[str, typing.Any],
+    resource: dict[str, typing.Any],
+) -> sys_uuid.UUID:
+    stream_uuid = sys_uuid.UUID(str(resource["stream_uuid"]))
+    if (
+        stream_uuid != assignment["projection_stream_uuid"]
+        or sys_uuid.UUID(str(resource["uuid"])) != stream_uuid
+    ):
+        raise ValueError("Provider history does not match the selected stream")
+    provider_metadata = resource["provider_metadata"]
+    if provider_metadata.get("delivery_class") != "backfill":
+        raise ValueError("Provider history finalization must be a backfill event")
+    generation = resource["generation"]
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
+        raise ValueError("Provider history generation is invalid")
+    if generation != int(assignment["assignment_generation"]):
+        raise ValueError("Provider history generation is stale")
+    owner_uuid = assignment["owner_user_uuid"]
+    recipient_uuids = sorted(
+        {
+            owner_uuid,
+            *_provider_projection_recipients(
+                session,
+                project_id,
+                stream_uuid,
+            ),
+        },
+        key=str,
+    )
+    provider_event_uuid = sys_uuid.UUID(str(event["provider_event_uuid"]))
+    session.execute(
+        """
+        WITH targets AS (
+            SELECT 'user-stream'::varchar AS scope_kind,
+                   binding.user_uuid,
+                   stream.uuid AS scope_uuid,
+                   stream.default_topic_uuid AS topic_uuid
+            FROM messenger_streams AS stream
+            JOIN messenger_stream_bindings AS binding
+              ON binding.project_id = stream.project_id
+             AND binding.stream_uuid = stream.uuid
+             AND binding.user_uuid = ANY(%s::uuid[])
+             AND binding.active
+            WHERE stream.project_id = %s AND stream.uuid = %s
+            UNION ALL
+            SELECT 'user-topic'::varchar, binding.user_uuid,
+                   topic.uuid, topic.uuid
+            FROM messenger_user_topic_bindings AS binding
+            JOIN messenger_topics AS topic
+              ON topic.project_id = binding.project_id
+             AND topic.uuid = binding.topic_uuid
+             AND topic.deleted_at IS NULL
+            JOIN messenger_stream_bindings AS stream_binding
+              ON stream_binding.project_id = topic.project_id
+             AND stream_binding.stream_uuid = topic.stream_uuid
+             AND stream_binding.user_uuid = binding.user_uuid
+             AND stream_binding.active
+            WHERE binding.project_id = %s
+              AND binding.user_uuid = ANY(%s::uuid[])
+              AND topic.stream_uuid = %s
+        )
+        INSERT INTO messenger_domain_outbox_events (
+            uuid, project_id, event_kind, scope_kind, scope_key, payload
+        )
+        SELECT messenger_uuid_v5(
+                   %s,
+                   'history-finalize:' || target.user_uuid::text || ':' ||
+                       target.scope_kind || ':' || target.scope_uuid::text
+               ),
+               %s, 'read_counters', target.scope_kind,
+               %s::text || ':' || target.user_uuid::text || ':' ||
+                   target.scope_uuid::text,
+               jsonb_build_object(
+                   'source_kind', 'provider_history.finalized',
+                   'user_uuid', target.user_uuid,
+                   'stream_uuid', %s::uuid,
+                   'topic_uuid', target.topic_uuid
+               )
+        FROM targets AS target
+        ON CONFLICT (project_id, uuid) DO NOTHING
+        """,
+        (
+            recipient_uuids,
+            project_id,
+            stream_uuid,
+            project_id,
+            recipient_uuids,
+            stream_uuid,
+            provider_event_uuid,
+            project_id,
+            project_id,
+            stream_uuid,
+        ),
+    )
+    return stream_uuid
+
+
 def apply_event(
     event: dict[str, typing.Any],
     session: typing.Any,
@@ -2304,6 +2541,14 @@ def apply_event(
             assignment,
             resource,
             account_uuid,
+        )
+    if event["kind"] == "history.finalize":
+        return _history_finalize_event(
+            session,
+            event,
+            project_id,
+            assignment,
+            resource,
         )
     if event["kind"] == "stream.notification.update":
         return _stream_notification_event(

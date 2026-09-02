@@ -82,7 +82,6 @@ def _is_quiet_backfill_event(event: object) -> bool:
         "message.upsert",
         "reaction.upsert",
         "reaction.delete",
-        "topic.upsert",
     }:
         return False
     payload = event.get("payload")
@@ -2803,7 +2802,8 @@ def apply_provider_event_batch(
                     NULL::jsonb AS source,
                     NULL::jsonb AS capabilities,
                     account.settings AS account_settings,
-                    account.provider_realm_uuid
+                    account.provider_realm_uuid,
+                    NULL::integer AS assignment_generation
                 FROM requested
                 JOIN "m_external_accounts_v2" AS account
                   ON account."uuid" = requested.account_uuid
@@ -2834,7 +2834,8 @@ def apply_provider_event_batch(
                     chat.source,
                     chat.capabilities,
                     account.settings AS account_settings,
-                    account.provider_realm_uuid
+                    account.provider_realm_uuid,
+                    assignment.generation AS assignment_generation
                 FROM requested
                 JOIN "m_external_accounts_v2" AS account
                   ON account."uuid" = requested.account_uuid
@@ -2847,6 +2848,20 @@ def apply_provider_event_batch(
                  AND chat."selected"
                  AND chat."status" IN ('syncing', 'live', 'degraded')
                  AND chat."projection_stream_uuid" IS NOT NULL
+                JOIN "m_external_bridge_desired_resources_v1" AS assignment
+                  ON assignment."bridge_instance_uuid" = %s
+                 AND assignment."provider_kind" = %s
+                 AND assignment."resource_type" =
+                     'external_chat_assignment'
+                 AND assignment."resource_uuid" = chat."uuid"
+                 AND assignment."operation" = 'upsert'
+                 AND assignment."resource"->>'external_account_uuid' =
+                     requested.account_uuid::text
+                 AND assignment."resource"->>'project_id' =
+                     requested.project_id::text
+                 AND assignment."resource"->>'selected' = 'true'
+                 AND assignment."resource"#>>'{workspace_projection,stream,uuid}' =
+                     chat."projection_stream_uuid"::text
                 WHERE NOT requested.account_global
                   AND EXISTS (
                     SELECT 1
@@ -2856,22 +2871,6 @@ def apply_provider_event_batch(
                       AND desired."resource_type" = 'external_account'
                       AND desired."resource_uuid" = account."uuid"
                       AND desired."operation" = 'upsert'
-                  )
-                  AND EXISTS (
-                    SELECT 1
-                    FROM "m_external_bridge_desired_resources_v1" AS desired
-                    WHERE desired."bridge_instance_uuid" = %s
-                      AND desired."provider_kind" = %s
-                      AND desired."resource_type" = 'external_chat_assignment'
-                      AND desired."resource_uuid" = chat."uuid"
-                      AND desired."operation" = 'upsert'
-                      AND desired."resource"->>'external_account_uuid' =
-                          requested.account_uuid::text
-                      AND desired."resource"->>'project_id' =
-                          requested.project_id::text
-                      AND desired."resource"->>'selected' = 'true'
-                      AND desired."resource"#>>'{workspace_projection,stream,uuid}' =
-                          chat."projection_stream_uuid"::text
                   )
             )
             SELECT count(*) AS matched,
@@ -2889,7 +2888,9 @@ def apply_provider_event_batch(
                            'capabilities', authorized.capabilities,
                            'account_settings', authorized.account_settings,
                            'provider_realm_uuid',
-                               authorized.provider_realm_uuid
+                               authorized.provider_realm_uuid,
+                           'assignment_generation',
+                               authorized.assignment_generation
                        )) FILTER (WHERE authorized.chat_uuid IS NOT NULL),
                        '[]'::jsonb
                    ) AS assignments

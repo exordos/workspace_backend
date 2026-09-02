@@ -123,6 +123,7 @@ tasks 其他 reconciliation:
 Backfill actual transition 通过原子创建一个准备好公开事件
 常规的 Workspace 投影路径 `delivery_class="backfill"`; duplicate/no-op
 没有创建事件. notification policy.
+The message snapshot carries `read`; the final fence is `history.finalize`.
 
 ## Graceful restart 其他 observability
 

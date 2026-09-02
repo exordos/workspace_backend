@@ -6,11 +6,57 @@
 import contextlib
 import datetime
 import types
+import uuid as sys_uuid
 
 from workspace.cmd import messenger_worker
 from workspace.common import messenger_worker_opts
 from workspace.services.messenger_workers import agents
 from workspace.services.messenger_workers import v2_projection
+
+
+def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    calls = []
+    monkeypatch.setattr(
+        v2_projection,
+        "_refresh_recipient_counters",
+        lambda *args: calls.append(("refresh", args)),
+    )
+    monkeypatch.setattr(
+        v2_projection,
+        "_emit_unread_snapshots",
+        lambda *args: calls.append(("emit", args)),
+    )
+    monkeypatch.setattr(
+        v2_projection,
+        "_enqueue_folder_outbox_events",
+        lambda *args, **kwargs: calls.append(("folder", args, kwargs)),
+    )
+    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: None)
+
+    v2_projection._process_read_counters(
+        session,
+        {
+            "uuid": sys_uuid.uuid4(),
+            "project_id": project_uuid,
+            "scope_kind": "user-stream",
+            "scope_key": f"{project_uuid}:{user_uuid}:{stream_uuid}",
+            "outbox_event_uuid": sys_uuid.uuid4(),
+            "payload": {
+                "source_kind": "provider_history.finalized",
+                "user_uuid": str(user_uuid),
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": None,
+            },
+        },
+    )
+
+    assert calls[0][0] == "refresh"
+    assert calls[0][1][3] is None
+    assert calls[-1][0] == "emit"
+    assert calls[-1][1][3] is None
 
 
 def test_projection_worker_count_is_bounded_and_defaults_to_four():

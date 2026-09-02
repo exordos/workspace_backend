@@ -85,6 +85,9 @@ EXPIRED_PROVIDER_READ_RETRY_MIGRATION = (
     "0172-retry-expired-provider-read-pages-05d036.py"
 )
 PROJECTION_ACCELERATION_MIGRATION = "0173-accelerate-Messenger-v2-projections-8cda92.py"
+LEGACY_BACKFILL_COUNTER_MIGRATION = (
+    "0174-suppress-legacy-backfill-counters-a2cd99.py"
+)
 
 
 def _truncate_messenger_test_data():
@@ -137,6 +140,7 @@ def _truncate_messenger_test_data():
 def _isolate_v2_module(_database):
     """Keep migration rollback/reapply tests independent and bounded."""
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine.rollback_migration(LEGACY_BACKFILL_COUNTER_MIGRATION)
     engine.rollback_migration(PROJECTION_ACCELERATION_MIGRATION)
     engine.rollback_migration(EXPIRED_PROVIDER_READ_RETRY_MIGRATION)
     engine.rollback_migration(CANCELLED_PROVIDER_READ_MIGRATION)
@@ -158,6 +162,7 @@ def _isolate_v2_module(_database):
         engine.apply_migration(CANCELLED_PROVIDER_READ_MIGRATION)
         engine.apply_migration(EXPIRED_PROVIDER_READ_RETRY_MIGRATION)
         engine.apply_migration(PROJECTION_ACCELERATION_MIGRATION)
+        engine.apply_migration(LEGACY_BACKFILL_COUNTER_MIGRATION)
 
 
 @pytest.fixture(autouse=True)
@@ -8989,6 +8994,84 @@ def test_rolling_provider_message_uses_realm_global_canonical_identity(api, db):
     assert legacy_state == (legacy_uuid, True, True, True, legacy_uuid)
 
 
+def test_provider_backfill_move_source_counters_are_exact_and_idempotent(api, db):
+    provider_event_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    recipients = [api.user_uuid, sys_uuid.uuid4()]
+
+    for _attempt in range(2):
+        with contexts.Context().session_manager() as session:
+            provider_event_apply._schedule_backfill_move_source_counters(
+                session,
+                api.project_id,
+                recipients,
+                stream_uuid,
+                topic_uuid,
+                provider_event_uuid,
+            )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT scope_kind, payload->>'user_uuid',
+                   payload->>'stream_uuid', payload->>'topic_uuid'
+            FROM messenger_domain_outbox_events
+            WHERE project_id = %s
+              AND payload->>'source_kind' = 'provider_backfill_message.moved'
+            ORDER BY scope_kind, payload->>'user_uuid'
+            """,
+            (api.project_id,),
+        )
+        rows = cursor.fetchall()
+
+    assert len(rows) == 4
+    assert {row[0] for row in rows} == {"user-stream", "user-topic"}
+    assert {row[1] for row in rows} == {str(value) for value in recipients}
+    assert {row[2] for row in rows} == {str(stream_uuid)}
+    assert {row[3] for row in rows} == {str(topic_uuid)}
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM messenger_domain_outbox_events
+            WHERE project_id = %s
+              AND payload->>'source_kind' = 'provider_backfill_message.moved'
+            """,
+            (api.project_id,),
+        )
+    db.commit()
+
+    for _attempt in range(2):
+        with contexts.Context().session_manager() as session:
+            provider_event_apply._schedule_backfill_move_source_counters(
+                session,
+                api.project_id,
+                recipients,
+                stream_uuid,
+                topic_uuid,
+                provider_event_uuid,
+                include_stream=False,
+            )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT scope_kind, payload->>'user_uuid'
+            FROM messenger_domain_outbox_events
+            WHERE project_id = %s
+              AND payload->>'source_kind' = 'provider_backfill_message.moved'
+            ORDER BY scope_kind, payload->>'user_uuid'
+            """,
+            (api.project_id,),
+        )
+        topic_only_rows = cursor.fetchall()
+
+    assert len(topic_only_rows) == 2
+    assert {row[0] for row in topic_only_rows} == {"user-topic"}
+    assert {row[1] for row in topic_only_rows} == {str(value) for value in recipients}
+
+
 def test_provider_v2_resolves_scope_and_identity_without_workspace_ids(api, db):
     stream = api.post(
         STREAMS,
@@ -9131,11 +9214,13 @@ def test_provider_v2_resolves_scope_and_identity_without_workspace_ids(api, db):
         "external_account_uuid": str(account_uuid),
         "provider_chat_key": "channel:42",
         "provider_sequence": "1",
+        "delivery_class": "backfill",
         "kind": "message.upsert",
         "provider_object": {"kind": "message", "id": provider_message_id},
         "provider_references": {"topic": "42:general", "user": "1"},
         "payload": {
             "payload": {"kind": "markdown", "content": "Provider-native"},
+            "read": False,
             "created_at": "2026-08-29T12:00:00Z",
             "provider_metadata": {
                 "provider_original_url": "https://provider.invalid/#narrow/near/101",
@@ -9186,6 +9271,59 @@ def test_provider_v2_resolves_scope_and_identity_without_workspace_ids(api, db):
             provider_message_id,
             expected_placement_uuid,
         )
+        cursor.execute(
+            """
+            SELECT state.read_at,
+                   COUNT(outbox.uuid) FILTER (
+                       WHERE outbox.event_kind = 'read_counters'
+                         AND outbox.payload->>'source_kind' =
+                             'provider_message_state.updated'
+                         AND outbox.payload->>'placement_uuid' =
+                             state.placement_uuid::text
+                   )
+            FROM messenger_user_message_states AS state
+            LEFT JOIN messenger_domain_outbox_events AS outbox
+              ON outbox.project_id = state.project_id
+            WHERE state.project_id = %s AND state.user_uuid = %s
+              AND state.placement_uuid = %s
+            GROUP BY state.read_at
+            """,
+            (api.project_id, api.user_uuid, expected_placement_uuid),
+        )
+        assert cursor.fetchone() == (None, 0)
+
+    finalizer = {
+        "provider_event_key": "history:channel:42:finalize:1",
+        "delivery_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(account_uuid),
+        "provider_chat_key": "channel:42",
+        "provider_sequence": None,
+        "delivery_class": "backfill",
+        "kind": "history.finalize",
+        "provider_object": {"kind": "history", "id": "channel:42"},
+        "provider_references": {},
+        "payload": {"generation": 1},
+    }
+    with contexts.Context().session_manager() as session:
+        finalized = provider_v2.apply_provider_command_batch(
+            session,
+            identity,
+            [finalizer],
+        )
+    assert finalized["results"][0]["target_uuid"] == stream["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT scope_kind, COUNT(*)
+            FROM messenger_domain_outbox_events
+            WHERE project_id = %s
+              AND payload->>'source_kind' = 'provider_history.finalized'
+            GROUP BY scope_kind
+            ORDER BY scope_kind
+            """,
+            (api.project_id,),
+        )
+        assert cursor.fetchall() == [("user-stream", 1), ("user-topic", 2)]
     public_message = api.get(f"{MESSAGES}{expected_placement_uuid}")
     assert public_message.status_code == 200, public_message.text
     assert public_message.json()["payload"]["content"] == "Provider-native"
@@ -9215,10 +9353,10 @@ def test_provider_v2_resolves_scope_and_identity_without_workspace_ids(api, db):
                 uuid, owner_user_uuid, provider, settings,
                 credential_present, status, live_ready,
                 provider_realm_uuid, provider_owner_user_id
-            ) VALUES (
-                %s, %s, 'zulip', %s::jsonb,
-                FALSE, 'live', TRUE, %s, '2'
-            )
+                ) VALUES (
+                    %s, %s, 'zulip', %s::jsonb,
+                    TRUE, 'live', TRUE, %s, '2'
+                )
             """,
             (
                 alias_account_uuid,
@@ -9269,6 +9407,12 @@ def test_provider_v2_resolves_scope_and_identity_without_workspace_ids(api, db):
                 """,
                 (bridge_uuid, resource_type, resource_uuid, json.dumps(resource)),
             )
+        conftest.seed_user_stream_binding(
+            db,
+            api.project_id,
+            stream["uuid"],
+            alias_owner_uuid,
+        )
 
     alias_command = {
         **command,
@@ -9288,6 +9432,60 @@ def test_provider_v2_resolves_scope_and_identity_without_workspace_ids(api, db):
         "safe_error": None,
         "duplicate": False,
     }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM messenger_domain_outbox_events
+            WHERE project_id = %s
+              AND payload->>'source_kind' = 'provider_history.finalized'
+            """,
+            (api.project_id,),
+        )
+        cursor.execute(
+            """
+            UPDATE messenger_streams
+            SET default_topic_uuid = NULL
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, stream["uuid"]),
+        )
+    db.commit()
+    shared_finalizer = {
+        **finalizer,
+        "provider_event_key": "history:channel:42:finalize:shared-members",
+        "delivery_uuid": str(sys_uuid.uuid4()),
+    }
+    with contexts.Context().session_manager() as session:
+        shared_finalized = provider_v2.apply_provider_command_batch(
+            session,
+            identity,
+            [shared_finalizer],
+        )
+    assert shared_finalized["results"][0]["target_uuid"] == stream["uuid"]
+    expected_finalized_users = {str(api.user_uuid), str(alias_owner_uuid)}
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload->>'user_uuid', payload->>'topic_uuid'
+            FROM messenger_domain_outbox_events
+            WHERE project_id = %s AND scope_kind = 'user-stream'
+              AND payload->>'source_kind' = 'provider_history.finalized'
+            """,
+            (api.project_id,),
+        )
+        stream_targets = cursor.fetchall()
+        assert {row[0] for row in stream_targets} == expected_finalized_users
+        assert all(row[1] is None for row in stream_targets)
+        cursor.execute(
+            """
+            SELECT DISTINCT payload->>'user_uuid'
+            FROM messenger_domain_outbox_events
+            WHERE project_id = %s AND scope_kind = 'user-topic'
+              AND payload->>'source_kind' = 'provider_history.finalized'
+            """,
+            (api.project_id,),
+        )
+        assert {row[0] for row in cursor.fetchall()} == expected_finalized_users
     with db.cursor() as cursor:
         cursor.execute(
             """
