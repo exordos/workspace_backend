@@ -63,6 +63,36 @@ def test_create_message_flags_bulk_uses_one_insert_for_all_recipients():
     )
 
 
+def test_create_message_flags_bulk_scopes_counter_suppression():
+    project_id = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    author_uuid = sys_uuid.uuid4()
+    session = mock.Mock()
+    previous_setting = mock.Mock()
+    previous_setting.fetchone.return_value = {"setting": ""}
+    session.execute.side_effect = [
+        previous_setting,
+        mock.Mock(),
+        mock.Mock(),
+        mock.Mock(),
+    ]
+
+    dm_helpers.create_message_flags_bulk(
+        project_id,
+        message_uuid,
+        author_uuid,
+        [author_uuid],
+        session,
+        schedule_counters=False,
+    )
+
+    calls = session.execute.call_args_list
+    assert "current_setting" in calls[0].args[0]
+    assert calls[1].args[1][1] == str(project_id)
+    assert "m_workspace_user_message_flags" in calls[2].args[0]
+    assert calls[3].args[1][1] == ""
+
+
 def test_stream_access_lookup_uses_only_bounded_visibility_projections():
     project_id = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
@@ -2280,6 +2310,25 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             recipients_are_scoped=True,
         )
 
+    def test_compact_message_recipient_backfill_skips_counter_queue(self):
+        project_id = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        result = types.SimpleNamespace(fetchall=lambda: [{"user_uuid": recipient_uuid}])
+        session = types.SimpleNamespace(execute=mock.Mock(return_value=result))
+
+        inserted = dm_helpers.ensure_compact_workspace_message_recipients(
+            project_id,
+            [sys_uuid.uuid4()],
+            [recipient_uuid],
+            session,
+            schedule_counters=False,
+        )
+
+        self.assertEqual(inserted, [recipient_uuid])
+        statement, params = session.execute.call_args.args
+        self.assertIn("WHERE %s::boolean", statement)
+        self.assertIs(params[-1], False)
+
     def test_ensure_workspace_message_recipients_marks_inserted_author_compact_read(
         self,
     ):
@@ -3641,6 +3690,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             author_uuid=user_uuid,
             recipients=[user_uuid, other_user_uuid],
             session=session,
+            schedule_counters=True,
         )
         create_message_events.assert_called_once()
         get_topic_source_fields.assert_called_once_with(
@@ -3725,6 +3775,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             author_uuid=author_uuid,
             recipients=[owner_uuid],
             session=session,
+            schedule_counters=True,
         )
 
     def test_compact_external_message_uses_prevalidated_scoped_recipient(self):
@@ -3792,6 +3843,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             author_uuid=author_uuid,
             recipients=[owner_uuid],
             session=session,
+            schedule_counters=True,
         )
         create_unread_events.assert_called_once_with(
             project_id=project_id,
@@ -3927,6 +3979,7 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             author_uuid=user_uuid,
             recipients=[user_uuid],
             session=session,
+            schedule_counters=True,
         )
         create_message_events.assert_called_once()
         create_unread_events.assert_called_once_with(

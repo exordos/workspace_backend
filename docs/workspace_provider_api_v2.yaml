@@ -168,9 +168,16 @@ components:
         provider_sequence:
           type: [string, 'null']
           description: Real provider revision only; null when none exists.
+        delivery_class:
+          enum: [live, backfill]
+          default: live
+          description: |
+            Transport classification used to suppress per-message backfill
+            fan-out. Omission is accepted as `live` during rolling upgrades.
         kind:
           enum:
             - identity.upsert
+            - history.finalize
             - stream.upsert
             - stream.delete
             - stream.notification.update
@@ -190,7 +197,11 @@ components:
           type: object
           description: |
             Desired provider state after removing server-owned Workspace UUIDs
-            and transport-only metadata. Unsupported kinds fail before mutation.
+            and transport-only metadata. A backfill `message.upsert` may carry
+            the account owner's exact `read` boolean. `history.finalize` carries
+            the selected assignment generation and schedules one exact unread
+            recomputation after the chat's causal history lane is complete.
+            Unsupported kinds fail before mutation.
     ProviderObject:
       type: object
       additionalProperties: false

@@ -21,7 +21,7 @@ from workspace.messenger_api.dm import read_state
         ("message.upsert", True),
         ("reaction.upsert", True),
         ("reaction.delete", True),
-        ("topic.upsert", True),
+        ("topic.upsert", False),
         ("identity.upsert", False),
         ("stream.upsert", False),
         ("read_state.set", False),
@@ -1482,12 +1482,15 @@ def test_provider_read_page_omits_untrusted_delivered_message_ids(
         )
     )
 
-    assert provider_data._delivered_provider_read_page_bindings(
-        session,
-        external_account_uuid=sys_uuid.uuid4(),
-        project_id=sys_uuid.uuid4(),
-        message_uuids=[message_uuid],
-    ) == []
+    assert (
+        provider_data._delivered_provider_read_page_bindings(
+            session,
+            external_account_uuid=sys_uuid.uuid4(),
+            project_id=sys_uuid.uuid4(),
+            message_uuids=[message_uuid],
+        )
+        == []
+    )
 
 
 def test_provider_read_page_preserves_legacy_projects_without_delivery_ledger():

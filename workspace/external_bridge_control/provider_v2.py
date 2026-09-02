@@ -16,7 +16,7 @@ from workspace.external_bridge_control import provider_event_apply
 
 
 COMMAND_MAX_ITEMS = 500
-_COMMAND_FIELDS = {
+_COMMAND_REQUIRED_FIELDS = {
     "provider_event_key",
     "delivery_uuid",
     "external_account_uuid",
@@ -27,6 +27,7 @@ _COMMAND_FIELDS = {
     "provider_references",
     "payload",
 }
+_COMMAND_FIELDS = _COMMAND_REQUIRED_FIELDS | {"delivery_class"}
 _REFERENCE_FIELDS = {"message", "messages", "reader", "topic", "user"}
 _DIRECT_PREFIX = "direct-conversation:v1:"
 
@@ -131,11 +132,18 @@ def _resolve_route(
                account.settings AS account_settings,
                chat.uuid AS chat_uuid, chat.project_id,
                chat.projection_stream_uuid, chat.provider_chat_id,
-               chat.source
+               chat.source, desired.generation AS assignment_generation
         FROM m_external_accounts_v2 AS account
         JOIN m_external_chats_v2 AS chat
           ON chat.external_account_uuid = account.uuid
          AND chat.provider = account.provider
+        JOIN m_external_bridge_desired_resources_v1 AS desired
+          ON desired.bridge_instance_uuid = %s
+         AND desired.provider_kind = %s
+         AND desired.resource_type = 'external_chat_assignment'
+         AND desired.resource_uuid = chat.uuid
+         AND desired.operation = 'upsert'
+         AND desired.resource->>'selected' = 'true'
         WHERE account.uuid = %s AND account.provider = %s
           AND account.provider_realm_uuid IS NOT NULL
           AND chat.provider_chat_id IN (%s, %s)
@@ -144,26 +152,16 @@ def _resolve_route(
           AND NOT chat.transition_pending
           AND chat.project_id IS NOT NULL
           AND chat.projection_stream_uuid IS NOT NULL
-          AND EXISTS (
-              SELECT 1
-              FROM m_external_bridge_desired_resources_v1 AS desired
-              WHERE desired.bridge_instance_uuid = %s
-                AND desired.provider_kind = %s
-                AND desired.resource_type = 'external_chat_assignment'
-                AND desired.resource_uuid = chat.uuid
-                AND desired.operation = 'upsert'
-                AND desired.resource->>'selected' = 'true'
-          )
         ORDER BY (chat.provider_chat_id = %s) DESC
         LIMIT 1
         """,
         (
+            identity.bridge_instance_uuid,
+            identity.provider_kind,
             account_uuid,
             identity.provider_kind,
             provider_chat_key,
             legacy_chat_key,
-            identity.bridge_instance_uuid,
-            identity.provider_kind,
             provider_chat_key,
         ),
     ).fetchone()
@@ -405,6 +403,25 @@ def _canonical_resource(
         )
         if topic_uuid is not None:
             resource["topic_uuid"] = topic_uuid
+    elif kind == "history.finalize":
+        if object_kind != "history" or object_id != str(command["provider_chat_key"]):
+            raise ValueError("History command requires the selected provider chat")
+        generation = resource["generation"]
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise ValueError("History command generation is invalid")
+        if generation != int(route["assignment_generation"]):
+            raise ValueError("History command generation is stale")
+        resource.update(
+            {
+                "uuid": stream_uuid,
+                "stream_uuid": stream_uuid,
+                "provider_external_id": object_id,
+            }
+        )
     else:
         raise ValueError("Provider command kind is not supported")
     if kind in {"stream.notification.update", "topic.notification.update"}:
@@ -417,7 +434,11 @@ def _canonical_event(
     identity: typing.Any,
     command: object,
 ) -> tuple[str, dict[str, typing.Any]]:
-    if not isinstance(command, dict) or set(command) != _COMMAND_FIELDS:
+    if (
+        not isinstance(command, dict)
+        or not _COMMAND_REQUIRED_FIELDS.issubset(command)
+        or set(command) - _COMMAND_FIELDS
+    ):
         raise ValueError("Provider command envelope is invalid")
     event_key = command["provider_event_key"]
     if not isinstance(event_key, str) or not 1 <= len(event_key) <= 2048:
@@ -428,6 +449,9 @@ def _canonical_event(
     kind = command["kind"]
     if kind not in provider_event_apply.SUPPORTED_EVENT_KINDS:
         raise ValueError("Provider command kind is not supported")
+    delivery_class = command.get("delivery_class", "live")
+    if delivery_class not in {"live", "backfill"}:
+        raise ValueError("Provider command delivery class is invalid")
     account_uuid = sys_uuid.UUID(str(command["external_account_uuid"]))
     provider_chat_key = command["provider_chat_key"]
     if not isinstance(provider_chat_key, str) or not provider_chat_key:
@@ -458,6 +482,7 @@ def _canonical_event(
         ),
         "project_id": str(route["project_id"]),
         "provider_sequence": command["provider_sequence"],
+        "delivery_class": delivery_class,
         "kind": kind,
         "payload": {"resource": resource},
     }

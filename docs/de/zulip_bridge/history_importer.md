@@ -123,6 +123,7 @@ tasks und reconciliation:
 Backfill actual transition Atomisch erstellt man ein bereites öffentliches Ereignis über
 gewöhnlicher Workspace Projektionsweg mit `delivery_class="backfill"`; duplicate/no-op
 Es wird kein Event erstellt. notification policy.
+The message snapshot carries `read`; the final fence is `history.finalize`.
 
 ## Graceful restart und observability
 

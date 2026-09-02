@@ -12,6 +12,7 @@ import pytest
 from restalchemy.common import exceptions as ra_exc
 
 from workspace.external_bridge_control import provider_event_apply
+from workspace.external_bridge_control import provider_v2
 from workspace.messenger_api import external_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
@@ -284,6 +285,7 @@ def test_assignment_gate_primes_provider_batch_cache_without_second_query():
         "capabilities": {},
         "account_settings": {"server_url": "https://zulip.example.test"},
         "provider_realm_uuid": str(sys_uuid.uuid4()),
+        "assignment_generation": 3,
     }
     event = {
         "external_account_uuid": str(account_uuid),
@@ -876,7 +878,7 @@ def test_topic_upsert_repairs_missing_projection_owner_binding(monkeypatch):
     ]
 
 
-def test_backfill_topic_upsert_suppresses_stream_and_topic_events(monkeypatch):
+def test_backfill_topic_create_keeps_stream_and_topic_events(monkeypatch):
     identity = _identity()
     stream_uuid = sys_uuid.uuid4()
     owner_uuid = sys_uuid.uuid4()
@@ -922,12 +924,14 @@ def test_backfill_topic_upsert_suppresses_stream_and_topic_events(monkeypatch):
     monkeypatch.setattr(
         provider_event_apply.helpers,
         "create_compact_workspace_stream_topic_events",
-        lambda *_args, **_kwargs: pytest.fail("backfill topic must stay quiet"),
+        lambda *args, **kwargs: compact_calls.append((args, kwargs)),
     )
+    compact_calls = []
 
     provider_event_apply.apply_event(event, session, identity)
 
-    assert ensured[0][1]["emit_events"] is False
+    assert ensured[0][1]["emit_events"] is True
+    assert len(compact_calls) == 1
 
 
 def test_missing_external_chat_stream_is_materialized(monkeypatch):
@@ -1800,6 +1804,11 @@ def test_provider_backfill_message_suppresses_per_message_ui_events(monkeypatch)
     event = _message_event(stream_uuid)
     event["payload"]["resource"]["read"] = True
     event["payload"]["resource"]["provider_metadata"]["delivery_class"] = "backfill"
+    monkeypatch.setattr(
+        provider_event_apply.read_state,
+        "project_mode",
+        lambda *_args: provider_event_apply.read_state.PROJECT_MODE_COMPACT,
+    )
     session = Session(
         {
             "owner_user_uuid": owner_uuid,
@@ -1815,11 +1824,22 @@ def test_provider_backfill_message_suppresses_per_message_ui_events(monkeypatch)
         lambda *_args, **kwargs: ensured.append(kwargs),
     )
     creates = []
+    recipient_updates = []
     updates = []
     monkeypatch.setattr(
         provider_event_apply.helpers,
         "create_workspace_user_message",
-        lambda *args, **kwargs: creates.append((args, kwargs)),
+        lambda *args, **kwargs: (
+            creates.append((args, kwargs))
+            or types.SimpleNamespace(
+                uuid=sys_uuid.UUID(event["payload"]["resource"]["uuid"])
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *args, **kwargs: recipient_updates.append((args, kwargs)),
     )
     monkeypatch.setattr(
         provider_event_apply,
@@ -1830,9 +1850,135 @@ def test_provider_backfill_message_suppresses_per_message_ui_events(monkeypatch)
     provider_event_apply.apply_event(event, session, identity)
 
     assert creates[0][1]["emit_events"] is False
+    assert creates[0][1]["schedule_counters"] is False
+    assert recipient_updates[0][1]["schedule_counters"] is False
     assert updates[0][1]["emit_events"] is False
-    assert updates[0][1].get("allow_author_unread", False) is False
-    assert ensured[0]["emit_events"] is False
+    assert updates[0][1]["schedule_counters"] is False
+    assert ensured[0]["emit_events"] is True
+
+
+def test_provider_backfill_read_state_suppresses_rollback_recipient_counters(
+    monkeypatch,
+):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    ensured = []
+    monkeypatch.setattr(
+        provider_event_apply.read_state,
+        "project_mode",
+        lambda *_args: provider_event_apply.read_state.PROJECT_MODE_ROLLBACK,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_compact_workspace_message_recipients",
+        lambda *args, **kwargs: ensured.append((args, kwargs)),
+    )
+
+    session = Session([None, []])
+    provider_event_apply._sync_provider_read_state(
+        session,
+        project_uuid,
+        owner_uuid,
+        stream_uuid,
+        topic_uuid,
+        [message_uuid],
+        False,
+        emit_events=False,
+        schedule_counters=False,
+    )
+
+    assert ensured == [
+        (
+            (project_uuid, [message_uuid], [owner_uuid], session),
+            {"schedule_counters": False},
+        )
+    ]
+
+
+def test_provider_history_finalizer_schedules_one_exact_counter_pass():
+    identity = _identity()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    event = {
+        "provider_event_uuid": str(sys_uuid.uuid4()),
+        "external_account_uuid": str(sys_uuid.uuid4()),
+        "external_chat_uuid": str(sys_uuid.uuid4()),
+        "project_id": str(sys_uuid.uuid4()),
+        "provider_sequence": None,
+        "delivery_class": "backfill",
+        "kind": "history.finalize",
+        "payload": {
+            "resource": {
+                "uuid": str(stream_uuid),
+                "stream_uuid": str(stream_uuid),
+                "generation": 3,
+                "provider_external_id": "channel:42",
+            }
+        },
+    }
+    assignment = {
+        "owner_user_uuid": owner_uuid,
+        "projection_stream_uuid": stream_uuid,
+        "provider_chat_id": "channel:42",
+        "assignment_generation": 3,
+    }
+    session = Session([assignment, None])
+    projection_recipient_uuid = sys_uuid.uuid4()
+    session.projection_recipients.append(projection_recipient_uuid)
+
+    assert provider_event_apply.apply_event(event, session, identity) == stream_uuid
+
+    statement, parameters = session.statements[-1]
+    assert "'provider_history.finalized'" in statement
+    assert "messenger_stream_bindings" in statement
+    assert "messenger_user_topic_bindings" in statement
+    assert "stream_binding.active" in statement
+    assert "binding.user_uuid = ANY(%s::uuid[])" in statement
+    assert "target.user_uuid::text" in statement
+    assert "WHERE target.topic_uuid IS NOT NULL" not in statement
+    assert "ON CONFLICT (project_id, uuid) DO NOTHING" in statement
+    assert parameters[0] == sorted(
+        [owner_uuid, projection_recipient_uuid],
+        key=str,
+    )
+    assert parameters[0] == parameters[4]
+    assert parameters[2] == stream_uuid
+
+    event["payload"]["resource"]["generation"] = 2
+    with pytest.raises(ValueError, match="generation is stale"):
+        provider_event_apply.apply_event(event, Session([assignment]), identity)
+
+
+def test_provider_v2_history_finalizer_is_server_scoped():
+    stream_uuid = sys_uuid.uuid4()
+    route = {
+        "projection_stream_uuid": stream_uuid,
+        "provider_chat_id": "channel:42",
+        "assignment_generation": 3,
+    }
+    command = {
+        "kind": "history.finalize",
+        "provider_chat_key": "channel:42",
+        "provider_object": {"kind": "history", "id": "channel:42"},
+        "provider_references": {},
+        "payload": {"generation": 3},
+    }
+
+    resource = provider_v2._canonical_resource(None, route, command)
+
+    assert resource == {
+        "generation": 3,
+        "uuid": stream_uuid,
+        "stream_uuid": stream_uuid,
+        "provider_external_id": "channel:42",
+    }
+
+    command["payload"]["generation"] = 2
+    with pytest.raises(ValueError, match="generation is stale"):
+        provider_v2._canonical_resource(None, route, command)
 
 
 def test_native_message_still_requires_author_stream_binding(monkeypatch):
@@ -2293,9 +2439,7 @@ def test_provider_unread_state_preserves_owner_authored_message_unread(monkeypat
     )
 
     assert read_events == []
-    assert unread_events == [
-        ((), {"message": snapshot, "session": session})
-    ]
+    assert unread_events == [((), {"message": snapshot, "session": session})]
     assert aggregate_events == [
         (
             (project_uuid, [owner_uuid], stream_uuid, topic_uuid),
@@ -2550,7 +2694,7 @@ def test_message_update_preserves_created_at_and_uses_compact_broadcast(monkeypa
     assert ensured_recipients == [
         (
             (sys_uuid.UUID(event["project_id"]), existing, [owner_uuid], session),
-            {"emit_events": True},
+            {"emit_events": True, "schedule_counters": True},
         )
     ]
 
@@ -2729,6 +2873,88 @@ def test_message_update_moves_existing_provider_message_to_reported_stream(
             (new_stream_uuid, new_topic_uuid),
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("cross_stream", "expected_stream_counter"),
+    [(True, True), (False, False)],
+)
+def test_backfill_message_move_refreshes_exact_source_counters(
+    monkeypatch,
+    cross_stream,
+    expected_stream_counter,
+):
+    identity = _identity()
+    project_uuid = sys_uuid.uuid4()
+    old_stream_uuid = sys_uuid.uuid4()
+    new_stream_uuid = sys_uuid.uuid4() if cross_stream else old_stream_uuid
+    old_topic_uuid = sys_uuid.uuid4()
+    new_topic_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    member_uuid = sys_uuid.uuid4()
+    event = _message_event(new_stream_uuid)
+    event["project_id"] = str(project_uuid)
+    resource = event["payload"]["resource"]
+    resource["topic_uuid"] = str(new_topic_uuid)
+    resource["provider_metadata"]["delivery_class"] = "backfill"
+    resource.pop("payload")
+    message_uuid = sys_uuid.UUID(resource["uuid"])
+    existing = types.SimpleNamespace(
+        uuid=message_uuid,
+        project_id=project_uuid,
+        user_uuid=sys_uuid.UUID(resource["user_uuid"]),
+        stream_uuid=old_stream_uuid,
+        topic_uuid=old_topic_uuid,
+        update_dm=lambda values: None,
+        update=lambda session=None: None,
+    )
+    session = Session(
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": new_stream_uuid,
+            "provider_chat_id": "zulip-channel-8",
+        }
+    )
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: existing)
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "_lock_workspace_project_event_writes",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_canonical_message_recipients",
+        lambda *_args: [owner_uuid, member_uuid],
+    )
+    monkeypatch.setattr(
+        provider_event_apply.read_state,
+        "relocate_message",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "_invalidate_moved_topic_summaries",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert provider_event_apply.apply_event(event, session, identity) == message_uuid
+
+    counter_statement, counter_parameters = next(
+        (statement, parameters)
+        for statement, parameters in session.statements
+        if "'provider_backfill_message.moved'" in statement
+    )
+    assert "ON CONFLICT (project_id, uuid) DO NOTHING" in counter_statement
+    assert counter_parameters[3] == project_uuid
+    assert counter_parameters[5] == old_stream_uuid
+    assert counter_parameters[6] == old_topic_uuid
+    assert counter_parameters[9] == sorted([owner_uuid, member_uuid], key=str)
+    assert counter_parameters[10] is expected_stream_counter
 
 
 def test_message_update_atomically_moves_provider_projection_between_projects(

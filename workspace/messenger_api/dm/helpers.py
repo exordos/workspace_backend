@@ -34,6 +34,9 @@ from workspace.messenger_api.dm import base as messenger_dm_base
 from workspace.messenger_api.dm import message_payloads, models, read_state
 
 _SUMMARY_REASONING_UNSET = object()
+_LEGACY_MESSAGE_FLAG_COUNTER_SUPPRESSION = (
+    "workspace.messenger_v2_suppress_legacy_flag_counters"
+)
 ALL_CHATS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000000")
 PERSONAL_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000001")
 CHANNELS_FOLDER_UUID = sys_uuid.UUID("00000000-0000-0000-0000-000000000002")
@@ -104,6 +107,32 @@ def _workspace_session(
     session: typing.Any = None,
 ) -> typing.Iterator[typing.Any]:
     yield session if session is not None else contexts.Context().get_session()
+
+
+@contextlib.contextmanager
+def suppress_legacy_message_flag_counters(
+    session: typing.Any,
+    project_id: object,
+    suppress: bool,
+) -> typing.Iterator[None]:
+    """Scope legacy-trigger counter suppression to one project and statement."""
+    if not suppress:
+        yield
+        return
+    previous_row = session.execute(
+        "SELECT current_setting(%s, TRUE) AS setting",
+        (_LEGACY_MESSAGE_FLAG_COUNTER_SUPPRESSION,),
+    ).fetchone()
+    previous_setting = previous_row["setting"] if previous_row is not None else ""
+    session.execute(
+        "SELECT set_config(%s, %s, TRUE)",
+        (_LEGACY_MESSAGE_FLAG_COUNTER_SUPPRESSION, str(project_id)),
+    )
+    yield
+    session.execute(
+        "SELECT set_config(%s, %s, TRUE)",
+        (_LEGACY_MESSAGE_FLAG_COUNTER_SUPPRESSION, previous_setting or ""),
+    )
 
 
 def _lock_workspace_project_event_writes(
@@ -5047,34 +5076,40 @@ def create_message_flags_bulk(
     author_uuid: object,
     recipients: typing.Any,
     session: typing.Any,
+    schedule_counters: bool = True,
 ) -> None:
     """Insert a historical message audience without one ORM round trip per user."""
     recipient_uuids = sorted(set(recipients), key=str)
     mode = read_state.project_mode(session, project_id)
-    if recipient_uuids and mode != read_state.PROJECT_MODE_COMPACT:
-        session.execute(
-            """
-            INSERT INTO "m_workspace_user_message_flags" (
-                "uuid", "user_uuid", "project_id", "read"
+    with suppress_legacy_message_flag_counters(
+        session,
+        project_id,
+        not schedule_counters,
+    ):
+        if recipient_uuids and mode != read_state.PROJECT_MODE_COMPACT:
+            session.execute(
+                """
+                INSERT INTO "m_workspace_user_message_flags" (
+                    "uuid", "user_uuid", "project_id", "read"
+                )
+                SELECT %s, recipient_uuid, %s, recipient_uuid = %s
+                FROM unnest(%s::uuid[]) AS recipient_uuid
+                """,
+                (message_uuid, project_id, author_uuid, recipient_uuids),
             )
-            SELECT %s, recipient_uuid, %s, recipient_uuid = %s
-            FROM unnest(%s::uuid[]) AS recipient_uuid
-            """,
-            (message_uuid, project_id, author_uuid, recipient_uuids),
-        )
-    if author_uuid in recipient_uuids and mode in {
-        read_state.PROJECT_MODE_PREPARING,
-        read_state.PROJECT_MODE_DUAL,
-        read_state.PROJECT_MODE_COMPACT,
-        read_state.PROJECT_MODE_ROLLBACK,
-    }:
-        read_state.set_message_read(
-            session,
-            project_id,
-            author_uuid,
-            message_uuid,
-            True,
-        )
+        if author_uuid in recipient_uuids and mode in {
+            read_state.PROJECT_MODE_PREPARING,
+            read_state.PROJECT_MODE_DUAL,
+            read_state.PROJECT_MODE_COMPACT,
+            read_state.PROJECT_MODE_ROLLBACK,
+        }:
+            read_state.set_message_read(
+                session,
+                project_id,
+                author_uuid,
+                message_uuid,
+                True,
+            )
 
 
 def ensure_compact_workspace_message_recipients(
@@ -5082,6 +5117,7 @@ def ensure_compact_workspace_message_recipients(
     message_uuids: typing.Any,
     recipient_uuids: typing.Any,
     session: typing.Any,
+    schedule_counters: bool = True,
 ) -> list[sys_uuid.UUID]:
     """Materialize canonical recipient state for compact provider projections."""
     requested_messages = sorted(
@@ -5203,6 +5239,7 @@ def ensure_compact_workspace_message_recipients(
                 CROSS JOIN (
                     VALUES ('user-stream'::varchar), ('user-topic'::varchar)
                 ) AS lane(scope_kind)
+                WHERE %s::boolean
                 RETURNING uuid
             )
             SELECT DISTINCT changed.user_uuid,
@@ -5221,6 +5258,7 @@ def ensure_compact_workspace_message_recipients(
             project_id,
             project_id,
             project_id,
+            schedule_counters,
         ),
     ).fetchall()
     return sorted(
@@ -5235,6 +5273,7 @@ def ensure_workspace_message_recipients(
     recipients: typing.Any,
     session: typing.Any,
     emit_events: bool = True,
+    schedule_counters: bool = True,
 ) -> list[sys_uuid.UUID]:
     """Add only missing per-user message projections for scoped recipients."""
     recipient_uuids = sorted(
@@ -5250,6 +5289,7 @@ def ensure_workspace_message_recipients(
             [message.uuid],
             recipient_uuids,
             session,
+            schedule_counters=schedule_counters,
         )
         if message.user_uuid in recipient_uuids:
             read_state.set_message_read(
@@ -5282,37 +5322,43 @@ def ensure_workspace_message_recipients(
             recipients_are_scoped=True,
         )
         return inserted_recipients
-    inserted_rows = session.execute(
-        """
-        INSERT INTO "m_workspace_user_message_flags" (
-            "uuid", "user_uuid", "project_id", "read"
-        )
-        SELECT %s, recipient_uuid, %s, recipient_uuid = %s
-        FROM unnest(%s::uuid[]) AS recipient_uuid
-        ON CONFLICT ("uuid", "user_uuid") DO NOTHING
-        RETURNING "user_uuid"
-        """,
-        (
-            message.uuid,
-            project_id,
-            message.user_uuid,
-            recipient_uuids,
-        ),
-    ).fetchall()
-    inserted_recipients = sorted(
-        (sys_uuid.UUID(str(row["user_uuid"])) for row in inserted_rows),
-        key=str,
-    )
-    if message.user_uuid in inserted_recipients and read_state.writes_compact_state(
-        session, project_id
+    with suppress_legacy_message_flag_counters(
+        session,
+        project_id,
+        not schedule_counters,
     ):
-        read_state.set_message_read(
-            session,
-            project_id,
-            message.user_uuid,
-            message.uuid,
-            True,
+        inserted_rows = session.execute(
+            """
+            INSERT INTO "m_workspace_user_message_flags" (
+                "uuid", "user_uuid", "project_id", "read"
+            )
+            SELECT %s, recipient_uuid, %s, recipient_uuid = %s
+            FROM unnest(%s::uuid[]) AS recipient_uuid
+            ON CONFLICT ("uuid", "user_uuid") DO NOTHING
+            RETURNING "user_uuid"
+            """,
+            (
+                message.uuid,
+                project_id,
+                message.user_uuid,
+                recipient_uuids,
+            ),
+        ).fetchall()
+        inserted_recipients = sorted(
+            (sys_uuid.UUID(str(row["user_uuid"])) for row in inserted_rows),
+            key=str,
         )
+        if (
+            message.user_uuid in inserted_recipients
+            and read_state.writes_compact_state(session, project_id)
+        ):
+            read_state.set_message_read(
+                session,
+                project_id,
+                message.user_uuid,
+                message.uuid,
+                True,
+            )
     if not emit_events or not inserted_recipients:
         return inserted_recipients
     messenger_events.create_message_events(
@@ -5344,6 +5390,7 @@ def create_workspace_user_message(
     return_visible: typing.Any = True,
     compact_events: typing.Any = False,
     emit_events: bool = True,
+    schedule_counters: bool = True,
     scoped_recipient_uuids: typing.Any = None,
     **kwargs: typing.Any,
 ) -> typing.Any:
@@ -5443,6 +5490,7 @@ def create_workspace_user_message(
             author_uuid=message.user_uuid,
             recipients=event_recipients,
             session=current_session,
+            schedule_counters=schedule_counters,
         )
         if isinstance(ingest_sequence, int) and read_state.writes_compact_state(
             current_session,

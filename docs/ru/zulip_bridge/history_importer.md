@@ -123,6 +123,7 @@ tasks и reconciliation:
 Backfill actual transition атомарно создаёт one ready public event через
 обычный Workspace projection path с `delivery_class="backfill"`; duplicate/no-op
 не создаёт event. Bridge не выбирает notification policy.
+The message snapshot carries `read`; the final fence is `history.finalize`.
 
 ## Graceful restart и observability
 

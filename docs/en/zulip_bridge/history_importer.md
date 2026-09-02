@@ -87,9 +87,11 @@ budgets They stay in canonical OPEN-list.
 Inside the stream importer first provides users, stream, mandatory topics and
 memberships/bindings. Then for each message newest-first:
 
-1. It 's a common call . idempotent `message.create`/`update`/`delete`/`move` command;
-2. Workspace transaction Creates or updates canonical `MESSAGE`, placement,
-   author binding/state and outbox;
+1. the bridge sends one idempotent `message.create`/`update` command containing
+   both the message snapshot and the account owner's exact `read` flag;
+2. the Workspace transaction creates or updates the canonical `MESSAGE`,
+   placement, author binding, and read state without publishing a message event
+   or scheduling unread counters for every imported row;
 3. After base message, import files/attachment links and reactions;
 4. unresolved older quote/message/file reference keeps as deferred, not
    synthetic public object;
@@ -120,9 +122,13 @@ tasks and reconciliation:
 - no duplicate canonical rows/outbox/events when overlapping with realtime;
 - Workspace task/DLQ/outbound failures and projection lag reported separately.
 
-Backfill actual transition Atomically creates one ready public event through
-ordinary Workspace projection path with `delivery_class="backfill"`; duplicate/no-op
-does not create an event. Bridge does not select notification policy.
+Stream and topic creation events remain visible so clients can discover the
+projection while it is loading. After the last message in a selected chat has
+been acknowledged, the bridge sends a causal `history.finalize` fence. Workspace
+then schedules one exact stream counter snapshot plus one snapshot per projected
+topic; those tasks publish the final unread state and refresh affected folders.
+Duplicate finalizers are idempotent. Live message and read events retain their
+normal realtime behavior throughout the import.
 
 ## Graceful restart and observability
 

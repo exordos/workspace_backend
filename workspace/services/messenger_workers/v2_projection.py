@@ -1570,6 +1570,10 @@ def _process_read_counters(
 ) -> None:
     payload = task["payload"]
     user_uuid = _uuid(payload["user_uuid"])
+    topic_value = payload.get("topic_uuid")
+    topic_uuid = None if topic_value is None else _uuid(topic_value)
+    if task["scope_kind"] == "user-topic" and topic_uuid is None:
+        raise ValueError("Topic counter task is missing its topic UUID")
     if not payload.get("emit_message_read", False):
         # Counter tasks are authoritative snapshots.  One claimed snapshot can
         # absorb every idle snapshot-only sibling for the same user scope;
@@ -1608,7 +1612,7 @@ def _process_read_counters(
         session,
         task["project_id"],
         _uuid(payload["stream_uuid"]),
-        _uuid(payload["topic_uuid"]),
+        topic_uuid,
         [user_uuid],
         task["scope_kind"],
     )
@@ -1644,7 +1648,7 @@ def _process_read_counters(
         session,
         task["project_id"],
         _uuid(payload["stream_uuid"]),
-        _uuid(payload["topic_uuid"]),
+        topic_uuid,
         [user_uuid],
         task["scope_kind"],
     )

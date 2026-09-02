@@ -34,6 +34,9 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
+        engine.rollback_migration(
+            "0174-suppress-legacy-backfill-counters-a2cd99.py"
+        )
         engine.rollback_migration("0173-accelerate-Messenger-v2-projections-8cda92.py")
         engine.rollback_migration("0172-retry-expired-provider-read-pages-05d036.py")
         engine.rollback_migration(
@@ -321,6 +324,10 @@ PROJECTION_ACCELERATION_MIGRATION_UUID = "8cda92b7-3a84-47f5-939b-11222441b0ff"
 PROJECTION_ACCELERATION_MIGRATION_FILE = (
     "0173-accelerate-Messenger-v2-projections-8cda92.py"
 )
+LEGACY_BACKFILL_COUNTER_MIGRATION_UUID = "a2cd99ae-7165-4885-9889-f7729d74e45c"
+LEGACY_BACKFILL_COUNTER_MIGRATION_FILE = (
+    "0174-suppress-legacy-backfill-counters-a2cd99.py"
+)
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -451,12 +458,15 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[PROJECTION_ACCELERATION_MIGRATION_FILE]._depends == [
         EXPIRED_PROVIDER_READ_RETRY_MIGRATION_FILE
     ]
+    assert migrations[LEGACY_BACKFILL_COUNTER_MIGRATION_FILE]._depends == [
+        PROJECTION_ACCELERATION_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == PROJECTION_ACCELERATION_MIGRATION_FILE
+    assert engine.get_latest_migration() == LEGACY_BACKFILL_COUNTER_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -523,6 +533,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     CANCELLED_PROVIDER_READ_MIGRATION_UUID,
                     EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID,
                     PROJECTION_ACCELERATION_MIGRATION_UUID,
+                    LEGACY_BACKFILL_COUNTER_MIGRATION_UUID,
                 ],
             ),
         )
@@ -588,6 +599,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (CANCELLED_PROVIDER_READ_MIGRATION_UUID, True),
             (EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID, True),
             (PROJECTION_ACCELERATION_MIGRATION_UUID, True),
+            (LEGACY_BACKFILL_COUNTER_MIGRATION_UUID, True),
         }
         cur.execute(
             """
