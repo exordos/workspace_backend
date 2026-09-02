@@ -188,6 +188,109 @@ def test_shared_self_dm_provider_events_are_account_scoped(_database, db):
         assert cursor.fetchone() == (0,)
 
 
+def test_provider_reaction_echo_reuses_unicode_presentation_variant(
+    _database,
+    db,
+    monkeypatch,
+):
+    identity = _identity(sys_uuid.uuid4(), sys_uuid.uuid4())
+    account_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(db, project_uuid, owner_uuid, "Provider stream")
+    )
+    topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(
+            db,
+            project_uuid,
+            stream_uuid,
+            owner_uuid,
+            "Provider topic",
+            is_default=True,
+        )
+    )
+    message_uuid = sys_uuid.uuid4()
+    native_reaction_uuid = sys_uuid.uuid4()
+    provider_reaction_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid, payload,
+                external_account_uuid, provider_external_id
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"heart"}'::jsonb,
+                %s, '101'
+            )
+            """,
+            (
+                message_uuid,
+                project_uuid,
+                stream_uuid,
+                topic_uuid,
+                owner_uuid,
+                account_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_message_reactions (
+                uuid, project_id, message_uuid, user_uuid, emoji_name,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            """,
+            (
+                native_reaction_uuid,
+                project_uuid,
+                message_uuid,
+                owner_uuid,
+                "❤️",
+            ),
+        )
+    db.commit()
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_validate_provider_message_scope",
+        lambda *_args, **_kwargs: None,
+    )
+
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        resolved_uuid = provider_event_apply._reaction_event(
+            session,
+            {
+                "external_account_uuid": str(account_uuid),
+                "kind": "reaction.upsert",
+            },
+            project_uuid,
+            {"projection_stream_uuid": stream_uuid},
+            {
+                "uuid": str(provider_reaction_uuid),
+                "message_uuid": str(message_uuid),
+                "user_uuid": str(owner_uuid),
+                "emoji_name": "❤",
+                "provider_external_id": "zulip-reaction-heart",
+            },
+            identity,
+        )
+
+    assert resolved_uuid == native_reaction_uuid
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid, emoji_name, provider_external_id
+            FROM m_workspace_message_reactions
+            WHERE project_id = %s AND message_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, message_uuid, owner_uuid),
+        )
+        assert cursor.fetchall() == [
+            (native_reaction_uuid, "❤️", "zulip-reaction-heart")
+        ]
+
+
 @pytest.mark.parametrize(
     "attachment_kind",
     ["provider", "native-stream", "native-public"],
