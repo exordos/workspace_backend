@@ -28,7 +28,11 @@ class WorkspaceMessengerAuthContext(iam_contexts.GenesisCoreAuthContext):
     def start_new_session(self) -> typing.Any:
         """Fence every API transaction before its first relation access."""
         session = super().start_new_session()
-        read_state.lock_read_state_schema_shared(session)
+        try:
+            read_state.lock_read_state_schema_shared(session)
+        except Exception:
+            self.session_close()
+            raise
         return session
 
     @property
