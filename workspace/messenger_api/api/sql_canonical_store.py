@@ -18,6 +18,7 @@ from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage import exceptions as storage_exceptions
 
+from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import provider_data
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exceptions
@@ -1357,37 +1358,6 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> tuple[typing.Any, ...]:
         """Resolve every durable provider route for a message operation."""
         session = contexts.Context().get_session()
-        if operation_kind in {
-            "reaction.create",
-            "reaction.update",
-            "reaction.delete",
-            "read_state.set",
-        }:
-            stream = models.WorkspaceStream.objects.get_one(
-                filters={
-                    "project_id": dm_filters.EQ(self.project_uuid),
-                    "uuid": dm_filters.EQ(message.stream_uuid),
-                },
-                session=session,
-            )
-            account_uuids = self._provider_user_account_uuids_for_stream(stream)
-            if not account_uuids:
-                return ()
-            if not account_locked:
-                self._lock_provider_accounts(account_uuids)
-            return tuple(
-                target
-                for account_uuid in account_uuids
-                if (
-                    target := self._provider_target(
-                        message.stream_uuid,
-                        operation_kind,
-                        account_locked=True,
-                        external_account_uuid=account_uuid,
-                    )
-                )
-                is not None
-            )
         provenance = session.execute(
             """
             SELECT external_account_uuid
@@ -1399,22 +1369,63 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         if provenance is None:
             return ()
         message_account_uuid = provenance["external_account_uuid"]
-        if message_account_uuid is not None:
-            account_uuids = (message_account_uuid,)
-        else:
+        if message_account_uuid is None:
             create_routes = session.execute(
                 """
                 SELECT DISTINCT external_account_uuid
                 FROM m_external_operations_v2
                 WHERE owner_user_uuid = %s AND action = 'message.create'
-                  AND target_type = 'message'
-                  AND target_uuid = %s
+                  AND target_type = 'message' AND target_uuid = %s
                 ORDER BY external_account_uuid
                 """,
                 (self.user_uuid, message.uuid),
             ).fetchall()
             account_uuids = tuple(
                 route["external_account_uuid"] for route in create_routes
+            )
+        else:
+            actor_routes = session.execute(
+                """
+                SELECT DISTINCT actor_chat.external_account_uuid,
+                       actor_account.provider_realm_uuid AS actor_realm_uuid,
+                       provenance_account.provider_realm_uuid
+                           AS provenance_realm_uuid,
+                       actor_account.settings->>'server_url' AS actor_server_url,
+                       provenance_account.settings->>'server_url'
+                           AS provenance_server_url
+                FROM m_external_chats_v2 AS provenance_chat
+                JOIN m_external_accounts_v2 AS provenance_account
+                  ON provenance_account.uuid = provenance_chat.external_account_uuid
+                JOIN m_external_chats_v2 AS actor_chat
+                  ON actor_chat.project_id = provenance_chat.project_id
+                 AND actor_chat.projection_stream_uuid =
+                     provenance_chat.projection_stream_uuid
+                 AND actor_chat.provider = provenance_chat.provider
+                 AND actor_chat.provider_chat_id =
+                     provenance_chat.provider_chat_id
+                JOIN m_external_accounts_v2 AS actor_account
+                  ON actor_account.uuid = actor_chat.external_account_uuid
+                 AND actor_account.provider = provenance_account.provider
+                WHERE provenance_chat.external_account_uuid = %s
+                  AND provenance_chat.project_id = %s
+                  AND provenance_chat.projection_stream_uuid = %s
+                  AND actor_chat.owner_user_uuid = %s
+                  AND actor_chat.selected
+                  AND actor_chat.status IN ('syncing', 'live', 'degraded')
+                  AND NOT actor_chat.transition_pending
+                ORDER BY actor_chat.external_account_uuid
+                """,
+                (
+                    message_account_uuid,
+                    self.project_uuid,
+                    message.stream_uuid,
+                    self.user_uuid,
+                ),
+            ).fetchall()
+            account_uuids = tuple(
+                route["external_account_uuid"]
+                for route in actor_routes
+                if self._provider_route_identity_matches(route)
             )
         if not account_uuids:
             return ()
@@ -1433,6 +1444,24 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
             is not None
         )
+
+    @staticmethod
+    def _provider_route_identity_matches(
+        route: typing.Mapping[str, typing.Any],
+    ) -> bool:
+        """Match a provider realm, normalizing pre-discovery origins."""
+        actor_realm_uuid = route["actor_realm_uuid"]
+        provenance_realm_uuid = route["provenance_realm_uuid"]
+        if actor_realm_uuid is not None and provenance_realm_uuid is not None:
+            return actor_realm_uuid == provenance_realm_uuid
+        try:
+            return identity_linking.normalize_provider_origin(
+                route["actor_server_url"]
+            ) == identity_linking.normalize_provider_origin(
+                route["provenance_server_url"]
+            )
+        except ValueError:
+            return False
 
     def _provider_target(
         self,

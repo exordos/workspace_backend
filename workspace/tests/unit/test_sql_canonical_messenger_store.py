@@ -18,6 +18,7 @@ from workspace.messenger_api.api import sql_canonical_store
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
 USER_UUID = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
 PROJECTION_OWNER_UUID = sys_uuid.UUID("30000000-0000-0000-0000-000000000003")
+PROVIDER_REALM_UUID = sys_uuid.UUID("40000000-0000-0000-0000-000000000004")
 
 
 class FakeObjects:
@@ -2133,115 +2134,91 @@ def test_provider_read_snapshot_maps_legacy_capacity_to_validation_error(monkeyp
         callback(session, "SELECT uuid FROM candidate", (), None)
 
 
-def test_message_target_uses_persisted_account_with_shared_self_dm(monkeypatch):
-    stream_uuid = sys_uuid.uuid4()
-    message_uuid = sys_uuid.uuid4()
-    account_uuid = sys_uuid.uuid4()
-    expected_target = (object(), object())
-
-    class Result:
-        def fetchone(self):
-            return {"external_account_uuid": account_uuid}
-
-    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: Result())
+@pytest.mark.parametrize(
+    "operation_kind",
+    [
+        "message.update",
+        "message.delete",
+        "reaction.create",
+        "reaction.update",
+        "reaction.delete",
+        "read_state.set",
+    ],
+)
+def test_local_message_mutation_does_not_select_a_provider_route(
+    monkeypatch,
+    operation_kind,
+):
+    message = types.SimpleNamespace(uuid=sys_uuid.uuid4(), stream_uuid=sys_uuid.uuid4())
+    results = iter(
+        (
+            types.SimpleNamespace(fetchone=lambda: {"external_account_uuid": None}),
+            types.SimpleNamespace(fetchall=lambda: []),
+        )
+    )
+    session = types.SimpleNamespace(execute=lambda *_args: next(results))
     monkeypatch.setattr(
         sql_canonical_store.contexts,
         "Context",
         lambda: types.SimpleNamespace(get_session=lambda: session),
     )
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
-    targets = []
-    monkeypatch.setattr(
-        store,
-        "_provider_target",
-        lambda *args, **kwargs: targets.append((args, kwargs)) or expected_target,
-    )
 
-    result = store._message_provider_targets(
-        types.SimpleNamespace(uuid=message_uuid, stream_uuid=stream_uuid),
+    assert store._message_provider_targets(message, operation_kind) == ()
+
+
+@pytest.mark.parametrize(
+    "operation_kind",
+    [
         "message.update",
-        account_locked=True,
-    )
-
-    assert result == (expected_target,)
-    assert targets == [
-        (
-            (stream_uuid, "message.update"),
-            {
-                "account_locked": True,
-                "external_account_uuid": account_uuid,
-            },
-        )
-    ]
-
-
-def test_message_targets_keep_failed_create_routes_and_lock_them_together(monkeypatch):
+        "message.delete",
+        "reaction.create",
+        "reaction.update",
+        "reaction.delete",
+        "read_state.set",
+    ],
+)
+def test_failed_provider_create_uses_current_actor_route_for_later_mutation(
+    monkeypatch,
+    operation_kind,
+):
     stream_uuid = sys_uuid.uuid4()
-    message_uuid = sys_uuid.uuid4()
-    account_uuids = tuple(sorted((sys_uuid.uuid4(), sys_uuid.uuid4()), key=str))
-    expected_targets = {
-        account_uuid: (object(), object()) for account_uuid in account_uuids
-    }
-    statements = []
-
-    class Result:
-        def __init__(self, *, row=None, rows=None):
-            self.row = row
-            self.rows = rows
-
-        def fetchone(self):
-            return self.row
-
-        def fetchall(self):
-            return self.rows
-
+    message = types.SimpleNamespace(uuid=sys_uuid.uuid4(), stream_uuid=stream_uuid)
+    actor_account_uuid = sys_uuid.uuid4()
     results = iter(
         (
-            Result(row={"external_account_uuid": None}),
-            Result(
-                rows=[
-                    {"external_account_uuid": account_uuid}
-                    for account_uuid in account_uuids
-                ]
+            types.SimpleNamespace(fetchone=lambda: {"external_account_uuid": None}),
+            types.SimpleNamespace(
+                fetchall=lambda: [{"external_account_uuid": actor_account_uuid}]
             ),
         )
     )
-
-    def execute(statement, _params):
-        statements.append(statement)
-        return next(results)
-
-    session = types.SimpleNamespace(execute=execute)
+    session = types.SimpleNamespace(execute=lambda *_args: next(results))
     monkeypatch.setattr(
         sql_canonical_store.contexts,
         "Context",
         lambda: types.SimpleNamespace(get_session=lambda: session),
     )
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
-    locked = []
-    monkeypatch.setattr(
-        store,
-        "_lock_provider_accounts",
-        lambda values: locked.append(tuple(values)),
-    )
+    monkeypatch.setattr(store, "_lock_provider_accounts", lambda _values: None)
+    target = (object(), object())
+    resolved = []
     monkeypatch.setattr(
         store,
         "_provider_target",
-        lambda _stream_uuid, _operation_kind, **kwargs: expected_targets[
-            kwargs["external_account_uuid"]
-        ],
+        lambda *args, **kwargs: resolved.append((args, kwargs)) or target,
     )
 
-    targets = store._message_provider_targets(
-        types.SimpleNamespace(uuid=message_uuid, stream_uuid=stream_uuid),
-        "message.delete",
-    )
-
-    assert targets == tuple(
-        expected_targets[account_uuid] for account_uuid in account_uuids
-    )
-    assert locked == [account_uuids]
-    assert "status IN" not in statements[1]
+    assert store._message_provider_targets(message, operation_kind) == (target,)
+    assert resolved == [
+        (
+            (stream_uuid, operation_kind),
+            {
+                "account_locked": True,
+                "external_account_uuid": actor_account_uuid,
+            },
+        )
+    ]
 
 
 def test_message_create_fans_out_to_every_selected_self_dm_account(monkeypatch):
@@ -2950,9 +2927,16 @@ def test_provider_user_route_does_not_fallback_to_another_users_account(monkeypa
 
 @pytest.mark.parametrize(
     "operation_kind",
-    ["reaction.create", "reaction.update", "reaction.delete"],
+    [
+        "message.update",
+        "message.delete",
+        "reaction.create",
+        "reaction.update",
+        "reaction.delete",
+        "read_state.set",
+    ],
 )
-def test_reaction_target_uses_current_users_route_not_message_provenance(
+def test_actor_operation_uses_current_users_route_not_message_provenance(
     monkeypatch,
     operation_kind,
 ):
@@ -2960,35 +2944,38 @@ def test_reaction_target_uses_current_users_route_not_message_provenance(
     message_uuid = sys_uuid.uuid4()
     message_account_uuid = sys_uuid.uuid4()
     actor_account_uuid = sys_uuid.uuid4()
-    stream = types.SimpleNamespace(
-        uuid=stream_uuid,
-        user_uuid=PROJECTION_OWNER_UUID,
-        external_account_uuid=message_account_uuid,
-    )
     message = types.SimpleNamespace(uuid=message_uuid, stream_uuid=stream_uuid)
-    session = types.SimpleNamespace(
-        execute=lambda *_args: types.SimpleNamespace(
-            fetchone=lambda: {"external_account_uuid": message_account_uuid}
+    statements = []
+    results = iter(
+        (
+            types.SimpleNamespace(
+                fetchone=lambda: {"external_account_uuid": message_account_uuid}
+            ),
+            types.SimpleNamespace(
+                fetchall=lambda: [
+                    {
+                        "external_account_uuid": actor_account_uuid,
+                        "actor_realm_uuid": PROVIDER_REALM_UUID,
+                        "provenance_realm_uuid": PROVIDER_REALM_UUID,
+                        "actor_server_url": "https://zulip.example.com",
+                        "provenance_server_url": "https://zulip.example.com",
+                    }
+                ]
+            ),
         )
     )
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        return next(results)
+
+    session = types.SimpleNamespace(execute=execute)
     monkeypatch.setattr(
         sql_canonical_store.contexts,
         "Context",
         lambda: types.SimpleNamespace(get_session=lambda: session),
     )
-    monkeypatch.setattr(
-        sql_canonical_store.models.WorkspaceStream,
-        "objects",
-        FakeObjects([stream]),
-    )
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
-    monkeypatch.setattr(
-        store,
-        "_provider_user_account_uuids_for_stream",
-        lambda requested_stream: (
-            (actor_account_uuid,) if requested_stream is stream else ()
-        ),
-    )
     locked_accounts = []
     monkeypatch.setattr(
         store,
@@ -3008,6 +2995,18 @@ def test_reaction_target_uses_current_users_route_not_message_provenance(
         provider_target,
     )
     assert locked_accounts == [(actor_account_uuid,)]
+    assert "actor_account.provider_realm_uuid" in statements[1][0]
+    assert "actor_chat.projection_stream_uuid" in statements[1][0]
+    assert (
+        "actor_chat.provider_chat_id =\n                     "
+        "provenance_chat.provider_chat_id" in statements[1][0]
+    )
+    assert statements[1][1] == (
+        message_account_uuid,
+        PROJECT_UUID,
+        stream_uuid,
+        USER_UUID,
+    )
     assert targets == [
         (
             stream_uuid,
@@ -3018,6 +3017,36 @@ def test_reaction_target_uses_current_users_route_not_message_provenance(
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("actor_realm_uuid", "provenance_realm_uuid", "actor_server_url", "result"),
+    [
+        (PROVIDER_REALM_UUID, PROVIDER_REALM_UUID, "https://other.invalid", True),
+        (sys_uuid.uuid4(), PROVIDER_REALM_UUID, "https://zulip.example.com", False),
+        (None, PROVIDER_REALM_UUID, "https://ZULIP.EXAMPLE.COM/", True),
+        (PROVIDER_REALM_UUID, None, "https://zulip.example.com:443/path", True),
+        (None, None, "https://other.example.com", False),
+        (None, None, "not-a-url", False),
+    ],
+)
+def test_provider_route_identity_matches_normalized_legacy_origin(
+    actor_realm_uuid,
+    provenance_realm_uuid,
+    actor_server_url,
+    result,
+):
+    assert (
+        sql_canonical_store.SQLCanonicalMessengerStore._provider_route_identity_matches(
+            {
+                "actor_realm_uuid": actor_realm_uuid,
+                "provenance_realm_uuid": provenance_realm_uuid,
+                "actor_server_url": actor_server_url,
+                "provenance_server_url": "https://zulip.example.com",
+            }
+        )
+        is result
+    )
 
 
 @pytest.mark.parametrize(
