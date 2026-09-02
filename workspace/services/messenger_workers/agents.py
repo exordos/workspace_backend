@@ -357,6 +357,29 @@ class MessengerWorkerAgent(basic.BasicService):
                 self._v2_metrics.get("claimed", 0.0) > 0
             ),
         }
+        claim_samples = self._v2_metrics.get(
+            "claimed", 0.0
+        ) + self._v2_metrics.get("empty_claims", 0.0)
+        fields.update(
+            {
+                "projection_claim_duration_ms_avg": (
+                    self._v2_metrics.get("claim_seconds", 0.0)
+                    / max(claim_samples, 1.0)
+                    * 1000
+                ),
+                "projection_claim_duration_ms_max": (
+                    self._v2_metrics.get("claim_seconds_max", 0.0) * 1000
+                ),
+                "projection_processing_duration_ms_avg": (
+                    self._v2_metrics.get("processing_seconds", 0.0)
+                    / max(self._v2_metrics.get("claimed", 0.0), 1.0)
+                    * 1000
+                ),
+                "projection_task_age_seconds_max": self._v2_metrics.get(
+                    "task_age_seconds_max", 0.0
+                ),
+            }
+        )
         fields.update(
             {
                 f"projection_{name}": value
@@ -376,7 +399,26 @@ class MessengerWorkerAgent(basic.BasicService):
                         for name, value in queue_metrics.items()
                     }
                 )
-        LOG.info("Messenger v2 projection worker metrics", extra=fields)
+        LOG.info(
+            "Messenger v2 projection worker metrics worker=%s role=%s "
+            "claimed=%.0f completed=%.0f user_partitions=%.0f "
+            "project_partitions=%.0f partition_contention=%.0f "
+            "event_lock_contention=%.0f claim_ms_avg=%.3f "
+            "claim_ms_max=%.3f processing_ms_avg=%.3f task_age_max_s=%.3f",
+            self._v2_worker_id,
+            fields["projection_worker_role"],
+            self._v2_metrics.get("claimed", 0.0),
+            self._v2_metrics.get("completed", 0.0),
+            self._v2_metrics.get("claimed_partition_user", 0.0),
+            self._v2_metrics.get("claimed_partition_project", 0.0),
+            self._v2_metrics.get("partition_contention", 0.0),
+            self._v2_metrics.get("event_lock_contention", 0.0),
+            fields["projection_claim_duration_ms_avg"],
+            fields["projection_claim_duration_ms_max"],
+            fields["projection_processing_duration_ms_avg"],
+            fields["projection_task_age_seconds_max"],
+            extra=fields,
+        )
         self._v2_metrics = {}
         self._v2_metrics_started_at = now
 

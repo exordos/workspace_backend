@@ -5,6 +5,7 @@
 
 import contextlib
 import datetime
+import logging
 import types
 
 from workspace.cmd import messenger_worker
@@ -139,6 +140,7 @@ def test_execution_stats_report_clock_skew_without_negative_latencies():
         "outbox_created_at": now + datetime.timedelta(milliseconds=200),
         "task_age_seconds": 0.1,
         "outbox_age_seconds": -0.2,
+        "partition_kind": "user",
         "payload": {},
     }
 
@@ -156,3 +158,39 @@ def test_execution_stats_report_clock_skew_without_negative_latencies():
     assert stats["derivation_delay_ms"] == 0
     assert stats["outbox_to_finish_ms"] == 0
     assert stats["observed_clock_skew_ms"] >= 299
+    assert stats["partition_kind"] == "user"
+
+
+def test_projection_metrics_log_surfaces_partition_activity(
+    caplog,
+    monkeypatch,
+):
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_metrics_log_interval_seconds=1,
+        projection_only=True,
+    )
+    worker._v2_metrics = {
+        "claimed": 4,
+        "completed": 3,
+        "claimed_partition_user": 3,
+        "claimed_partition_project": 1,
+        "partition_contention": 5,
+        "event_lock_contention": 2,
+        "claim_seconds": 0.01,
+        "claim_seconds_max": 0.004,
+        "processing_seconds": 0.02,
+        "task_age_seconds_max": 3,
+    }
+    worker._v2_metrics_started_at = 0
+    monkeypatch.setattr(agents.time, "monotonic", lambda: 2)
+
+    with caplog.at_level(logging.INFO):
+        worker._record_v2_projection_metrics({})
+
+    assert "claimed=4 completed=3" in caplog.text
+    assert "user_partitions=3 project_partitions=1" in caplog.text
+    assert "partition_contention=5" in caplog.text
+    assert "event_lock_contention=2" in caplog.text
+    assert "claim_ms_avg=2.500 claim_ms_max=4.000" in caplog.text
+    assert "processing_ms_avg=5.000 task_age_max_s=3.000" in caplog.text
