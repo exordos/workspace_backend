@@ -5,6 +5,7 @@
 
 import contextlib
 import datetime
+import logging
 import types
 import uuid as sys_uuid
 
@@ -33,6 +34,11 @@ def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
         v2_projection,
         "_enqueue_folder_outbox_events",
         lambda *args, **kwargs: calls.append(("folder", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        v2_projection,
+        "_try_lock_project_event_tail",
+        lambda *args: calls.append(("lock", args)),
     )
     session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: None)
 
@@ -178,6 +184,246 @@ def test_projection_pass_derives_and_checks_cleanup_once(monkeypatch):
     assert calls.count("process") == 4
 
 
+def test_projection_pass_keeps_earlier_progress_after_event_lock_contention(
+    monkeypatch,
+):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace()
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_provider_file_cleanup_task",
+        lambda _session, _worker_id: False,
+    )
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "derive_projection_tasks",
+        lambda _session: 0,
+    )
+
+    def process(_session, _worker_id, *, metrics, **_kwargs):
+        calls.append("process")
+        if len(calls) == 1:
+            return True
+        metrics["event_lock_contention"] = metrics.get("event_lock_contention", 0.0) + 1
+        return False
+
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_projection_task",
+        process,
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_projection_max_tasks_per_iteration=10,
+        v2_metrics_log_interval_seconds=300,
+    )
+
+    assert worker._run_v2_projection_tasks() is True
+    assert calls == ["process", "process"]
+
+
+def test_projection_pass_reports_no_progress_for_only_event_lock_contention(
+    monkeypatch,
+):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace()
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_provider_file_cleanup_task",
+        lambda _session, _worker_id: False,
+    )
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "derive_projection_tasks",
+        lambda _session: 0,
+    )
+
+    def process(_session, _worker_id, *, metrics, **_kwargs):
+        calls.append("process")
+        metrics["event_lock_contention"] = metrics.get("event_lock_contention", 0.0) + 1
+        return False
+
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_projection_task",
+        process,
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_projection_max_tasks_per_iteration=10,
+        v2_metrics_log_interval_seconds=300,
+    )
+
+    assert worker._run_v2_projection_tasks() is False
+    assert calls == ["process"]
+
+
+def test_projection_pass_continues_a_truncated_partition_scan(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace()
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_provider_file_cleanup_task",
+        lambda _session, _worker_id: False,
+    )
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "derive_projection_tasks",
+        lambda _session: 0,
+    )
+
+    def process(_session, _worker_id, *, metrics, **_kwargs):
+        calls.append("process")
+        if len(calls) <= 2:
+            metrics["partition_scan_continuation"] = (
+                metrics.get("partition_scan_continuation", 0.0) + 1
+            )
+            return False
+        return len(calls) == 3
+
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_projection_task",
+        process,
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_projection_max_tasks_per_iteration=10,
+        v2_metrics_log_interval_seconds=300,
+    )
+
+    assert worker._run_v2_projection_tasks() is True
+    assert calls == ["process", "process", "process", "process"]
+
+
+def test_projection_pass_paces_after_maximum_truncated_scans(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace()
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_provider_file_cleanup_task",
+        lambda _session, _worker_id: False,
+    )
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "derive_projection_tasks",
+        lambda _session: 0,
+    )
+
+    def process(_session, _worker_id, *, metrics, **_kwargs):
+        calls.append("process")
+        metrics["partition_scan_continuation"] = (
+            metrics.get("partition_scan_continuation", 0.0) + 1
+        )
+        return False
+
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_projection_task",
+        process,
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_projection_max_tasks_per_iteration=3,
+        v2_metrics_log_interval_seconds=300,
+    )
+
+    assert worker._run_v2_projection_tasks() is False
+    assert calls == ["process", "process", "process"]
+
+
+def test_operator_drain_continues_a_truncated_partition_scan(monkeypatch):
+    calls = []
+    monkeypatch.setattr(v2_projection, "derive_projection_tasks", lambda *_args: 0)
+
+    def process(*_args, metrics, **_kwargs):
+        calls.append("process")
+        if len(calls) == 1:
+            metrics["partition_scan_continuation"] = 1
+            return False
+        return True
+
+    monkeypatch.setattr(v2_projection, "process_one_projection_task", process)
+
+    assert v2_projection.drain_projection_queue(None, "operator:drain", limit=1) == 1
+    assert calls == ["process", "process"]
+
+
+def test_operator_drain_stops_to_commit_an_admission_marker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(v2_projection, "derive_projection_tasks", lambda *_args: 0)
+
+    def process(*_args, metrics, **_kwargs):
+        calls.append("process")
+        metrics["admission_commit_required"] = 1
+        return False
+
+    monkeypatch.setattr(v2_projection, "process_one_projection_task", process)
+
+    assert v2_projection.drain_projection_queue(None, "operator:drain", limit=1) == 0
+    assert calls == ["process"]
+
+
+def test_projection_pass_sleeps_after_a_complete_empty_partition_scan(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace()
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_provider_file_cleanup_task",
+        lambda _session, _worker_id: False,
+    )
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "derive_projection_tasks",
+        lambda _session: 0,
+    )
+
+    def process(_session, _worker_id, *, metrics, **_kwargs):
+        calls.append("process")
+        if len(calls) == 1:
+            metrics["partition_scan_continuation"] = 1
+        return False
+
+    monkeypatch.setattr(
+        agents.v2_projection,
+        "process_one_projection_task",
+        process,
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_projection_max_tasks_per_iteration=10,
+        v2_metrics_log_interval_seconds=300,
+    )
+
+    assert worker._run_v2_projection_tasks() is False
+    assert calls == ["process", "process"]
+
+
 def test_execution_stats_report_clock_skew_without_negative_latencies():
     now = datetime.datetime.now(datetime.timezone.utc)
     task = {
@@ -185,6 +431,7 @@ def test_execution_stats_report_clock_skew_without_negative_latencies():
         "outbox_created_at": now + datetime.timedelta(milliseconds=200),
         "task_age_seconds": 0.1,
         "outbox_age_seconds": -0.2,
+        "partition_kind": "user",
         "payload": {},
     }
 
@@ -202,3 +449,39 @@ def test_execution_stats_report_clock_skew_without_negative_latencies():
     assert stats["derivation_delay_ms"] == 0
     assert stats["outbox_to_finish_ms"] == 0
     assert stats["observed_clock_skew_ms"] >= 299
+    assert stats["partition_kind"] == "user"
+
+
+def test_projection_metrics_log_surfaces_partition_activity(
+    caplog,
+    monkeypatch,
+):
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        v2_metrics_log_interval_seconds=1,
+        projection_only=True,
+    )
+    worker._v2_metrics = {
+        "claimed": 4,
+        "completed": 3,
+        "claimed_partition_user": 3,
+        "claimed_partition_project": 1,
+        "partition_contention": 5,
+        "event_lock_contention": 2,
+        "claim_seconds": 0.01,
+        "claim_seconds_max": 0.004,
+        "processing_seconds": 0.02,
+        "task_age_seconds_max": 3,
+    }
+    worker._v2_metrics_started_at = 0
+    monkeypatch.setattr(agents.time, "monotonic", lambda: 2)
+
+    with caplog.at_level(logging.INFO):
+        worker._record_v2_projection_metrics({})
+
+    assert "claimed=4 completed=3" in caplog.text
+    assert "user_partitions=3 project_partitions=1" in caplog.text
+    assert "partition_contention=5" in caplog.text
+    assert "event_lock_contention=2" in caplog.text
+    assert "claim_ms_avg=2.500 claim_ms_max=4.000" in caplog.text
+    assert "processing_ms_avg=5.000 task_age_max_s=3.000" in caplog.text

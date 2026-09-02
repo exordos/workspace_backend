@@ -10,6 +10,7 @@ import threading
 import time
 import uuid as sys_uuid
 
+import psycopg
 import pytest
 from restalchemy.common import contexts
 
@@ -17,6 +18,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import v2_projection
+from workspace.tests.integration import conftest
 
 
 V1 = "/v1"
@@ -80,6 +82,45 @@ def _create_message(api, name):
     ).json()
     _drain()
     return stream, message
+
+
+def _seed_partition_claim_tasks(api, specifications):
+    event_uuids = [sys_uuid.uuid4() for _ in specifications]
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key,
+                payload, created_at, updated_at
+            )
+            SELECT input.uuid, %s, input.event_kind, input.scope_kind,
+                   input.scope_key, input.payload::jsonb,
+                   NOW() + input.position * INTERVAL '1 millisecond',
+                   NOW() + input.position * INTERVAL '1 millisecond'
+            FROM unnest(
+                %s::uuid[], %s::text[], %s::text[], %s::text[],
+                %s::text[], %s::integer[]
+            ) AS input(
+                uuid, event_kind, scope_kind, scope_key, payload, position
+            )
+            """,
+            (
+                api.project_id,
+                event_uuids,
+                [specification["task_kind"] for specification in specifications],
+                [specification["scope_kind"] for specification in specifications],
+                [specification["scope_key"] for specification in specifications],
+                [
+                    json.dumps(specification["payload"])
+                    for specification in specifications
+                ],
+                list(range(len(specifications))),
+            ),
+        )
+        assert v2_projection.derive_projection_tasks(
+            session, len(specifications)
+        ) == len(specifications)
+    return event_uuids
 
 
 def _plan_nodes(plan):
@@ -605,9 +646,9 @@ def test_coalesced_reaction_events_resolve_each_placement(api, db, monkeypatch):
             "integration:reaction-multi-placement",
         )
 
-    assert {(placement_uuid, stream_uuid) for _, placement_uuid, stream_uuid in emitted} == {
-        (placement_uuid, stream_uuid) for placement_uuid, stream_uuid in placements
-    }
+    assert {
+        (placement_uuid, stream_uuid) for _, placement_uuid, stream_uuid in emitted
+    } == {(placement_uuid, stream_uuid) for placement_uuid, stream_uuid in placements}
     assert set(guarded_streams) == {stream_uuid for _, stream_uuid in placements}
 
 
@@ -711,6 +752,855 @@ def test_rolled_back_claim_is_immediately_reusable(api, monkeypatch):
         assert reclaimed is not None
         assert reclaimed["uuid"] == first_task_uuid
         assert reclaimed["attempts"] == 1
+
+
+def test_projection_claims_different_users_in_one_project_concurrently(
+    api,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("interactive_read"),
+    )
+    user_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "topic.read",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+            for user_uuid in user_uuids
+        ],
+    )
+    claimed = threading.Barrier(3)
+    release = threading.Event()
+
+    def hold_claim(worker_id):
+        with contexts.Context().session_manager() as session:
+            task = v2_projection._claim_task(session, worker_id, 30)
+            claimed.wait(timeout=5)
+            assert release.wait(timeout=5)
+            session.rollback()
+            return task
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(hold_claim, f"integration:user-partition:{index}")
+            for index in range(2)
+        ]
+        claimed.wait(timeout=5)
+        release.set()
+        tasks = [future.result(timeout=5) for future in futures]
+
+    assert all(task is not None for task in tasks)
+    assert {task["partition_kind"] for task in tasks} == {"user"}
+    assert {task["partition_key"] for task in tasks} == {
+        str(user_uuid) for user_uuid in user_uuids
+    }
+
+
+def test_projection_claim_serializes_different_scopes_for_one_user(
+    api,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("interactive_read"),
+    )
+    user_uuid = sys_uuid.uuid4()
+    _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": scope_kind,
+                "scope_key": f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": source_kind,
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+            for scope_kind, source_kind in (
+                ("user-stream", "stream.read"),
+                ("user-topic", "topic.read"),
+            )
+        ],
+    )
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_first_claim():
+        with contexts.Context().session_manager() as session:
+            task = v2_projection._claim_task(session, "integration:same-user:1", 30)
+            ready.set()
+            assert release.wait(timeout=5)
+            session.rollback()
+            return task
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(hold_first_claim)
+        assert ready.wait(timeout=5)
+        with contexts.Context().session_manager() as session:
+            competing = v2_projection._claim_task(
+                session,
+                "integration:same-user:2",
+                30,
+            )
+        release.set()
+        first = future.result(timeout=5)
+
+    assert first is not None
+    assert first["partition_kind"] == "user"
+    assert competing is None
+
+
+def test_user_partition_and_scope_fifo_use_the_same_ordering_key(
+    api,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("interactive_read"),
+    )
+    user_uuid = sys_uuid.uuid4()
+    scope_key = f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}"
+    event_uuids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": scope_key,
+                "payload": {
+                    "source_kind": "topic.read",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+            for _ in range(2)
+        ],
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET created_at = CASE outbox_event_uuid
+                    WHEN %s THEN NOW() + INTERVAL '2 seconds'
+                    ELSE NOW() + INTERVAL '1 second'
+                END,
+                ordering_created_at = CASE outbox_event_uuid
+                    WHEN %s THEN NOW() - INTERVAL '2 seconds'
+                    ELSE NOW() - INTERVAL '1 second'
+                END
+            WHERE project_id = %s AND outbox_event_uuid IN (%s, %s)
+            """,
+            (
+                event_uuids[0],
+                event_uuids[0],
+                api.project_id,
+                event_uuids[0],
+                event_uuids[1],
+            ),
+        )
+    db.commit()
+
+    with contexts.Context().session_manager() as session:
+        task = v2_projection._claim_task(session, "integration:fifo-key", 30)
+        assert task is not None
+        assert task["outbox_event_uuid"] == event_uuids[1]
+        session.rollback()
+
+
+def test_user_projection_partition_blocks_project_global_task(api, monkeypatch):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    user_uuid = sys_uuid.uuid4()
+    event_uuids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "user-folder",
+                "scope_key": f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "folder.updated",
+                    "user_uuid": str(user_uuid),
+                    "folder_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "stream-folders",
+                "scope_key": f"{api.project_id}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "stream.updated",
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+        ],
+    )
+    ready = threading.Event()
+    release = threading.Event()
+    global_started = threading.Event()
+
+    def hold_user_claim():
+        with contexts.Context().session_manager() as session:
+            task = v2_projection._claim_task(session, "integration:user-gate", 30)
+            ready.set()
+            assert release.wait(timeout=5)
+            session.execute(
+                """
+                UPDATE messenger_projection_tasks
+                SET status = 'completed', lease_owner = NULL,
+                    lease_expires_at = NULL, updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (task["project_id"], task["uuid"]),
+            )
+            session.execute(
+                """
+                UPDATE messenger_projection_scope_leases
+                SET owner = NULL, lease_expires_at = NOW(), updated_at = NOW()
+                WHERE project_id = %s AND scope_kind = %s AND scope_key = %s
+                """,
+                (task["project_id"], task["scope_kind"], task["scope_key"]),
+            )
+            return task
+
+    def wait_for_global_claim():
+        with contexts.Context().session_manager() as session:
+            global_started.set()
+            task = v2_projection._claim_task(
+                session,
+                "integration:global-gate",
+                30,
+            )
+            session.rollback()
+            return task
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        user_future = executor.submit(hold_user_claim)
+        assert ready.wait(timeout=5)
+        global_future = executor.submit(wait_for_global_claim)
+        assert global_started.wait(timeout=5)
+        assert not global_future.done()
+        release.set()
+        user_task = user_future.result(timeout=5)
+        global_task = global_future.result(timeout=5)
+
+    assert user_task is not None
+    assert user_task["outbox_event_uuid"] == event_uuids[0]
+    assert user_task["partition_kind"] == "user"
+    assert global_task is not None
+    assert global_task["outbox_event_uuid"] == event_uuids[1]
+    assert global_task["partition_kind"] == "project"
+
+
+def test_waiting_global_task_stops_younger_user_admission(api, db, monkeypatch):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    user_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    event_uuids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "user-folder",
+                "scope_key": f"{api.project_id}:{user_uuids[0]}:older-user",
+                "payload": {
+                    "source_kind": "folder.updated",
+                    "user_uuid": str(user_uuids[0]),
+                    "folder_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "stream-folders",
+                "scope_key": f"{api.project_id}:waiting-global",
+                "payload": {
+                    "source_kind": "stream.updated",
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "user-folder",
+                "scope_key": f"{api.project_id}:{user_uuids[1]}:younger-user",
+                "payload": {
+                    "source_kind": "folder.updated",
+                    "user_uuid": str(user_uuids[1]),
+                    "folder_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+        ],
+    )
+    other_project_id = sys_uuid.uuid4()
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key,
+                payload, created_at, updated_at
+            ) VALUES (
+                gen_random_uuid(), %s, 'folder_projection', 'stream-folders', %s,
+                jsonb_build_object(
+                    'source_kind', 'stream.updated',
+                    'stream_uuid', gen_random_uuid()::text
+                ),
+                NOW() + interval '1 minute', NOW() + interval '1 minute'
+            )
+            """,
+            (other_project_id, f"{other_project_id}:available-later"),
+        )
+        assert v2_projection.derive_projection_tasks(session, 1) == 1
+    user_ready = threading.Event()
+    release_user = threading.Event()
+    global_started = threading.Event()
+    global_pid = []
+
+    def hold_older_user_claim():
+        with contexts.Context().session_manager() as session:
+            task = v2_projection._claim_task(
+                session,
+                "integration:global-admission:user",
+                30,
+            )
+            assert task is not None
+            user_ready.set()
+            assert release_user.wait(timeout=10)
+            session.execute(
+                """
+                UPDATE messenger_projection_tasks
+                SET status = 'completed', lease_owner = NULL,
+                    lease_expires_at = NULL, updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (task["project_id"], task["uuid"]),
+            )
+            session.execute(
+                """
+                UPDATE messenger_projection_scope_leases
+                SET owner = NULL, lease_expires_at = NOW(), updated_at = NOW()
+                WHERE project_id = %s AND scope_kind = %s AND scope_key = %s
+                """,
+                (task["project_id"], task["scope_kind"], task["scope_key"]),
+            )
+            return task
+
+    def wait_for_global_claim():
+        with contexts.Context().session_manager() as session:
+            global_pid.append(
+                session.execute("SELECT pg_backend_pid() AS pid", ()).fetchone()["pid"]
+            )
+            global_started.set()
+            task = v2_projection._claim_task(
+                session,
+                "integration:global-admission:global",
+                30,
+            )
+            return task
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        user_future = executor.submit(hold_older_user_claim)
+        assert user_ready.wait(timeout=5)
+        global_future = executor.submit(wait_for_global_claim)
+        assert global_started.wait(timeout=5)
+        deadline = time.monotonic() + 5
+        while True:
+            with db.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_locks
+                        WHERE pid = %s AND locktype = 'advisory'
+                          AND NOT granted
+                    )
+                    """,
+                    (global_pid[0],),
+                )
+                if cursor.fetchone()[0]:
+                    break
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        timed_out_global = global_future.result(timeout=3)
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT owner, lease_expires_at > NOW()
+                FROM messenger_projection_scope_leases
+                WHERE project_id = %s
+                  AND scope_kind = %s
+                  AND scope_key = %s
+                """,
+                (
+                    api.project_id,
+                    v2_projection.PROJECTION_PROJECT_ADMISSION_SCOPE_KIND,
+                    str(api.project_id),
+                ),
+            )
+            admission_marker = cursor.fetchone()
+        with contexts.Context().session_manager() as session:
+            started_at = time.monotonic()
+            competing = v2_projection._claim_task(
+                session,
+                "integration:global-admission:competing",
+                30,
+            )
+            competing_elapsed = time.monotonic() - started_at
+        release_user.set()
+        user_task = user_future.result(timeout=5)
+
+    assert user_task["outbox_event_uuid"] == event_uuids[0]
+    assert timed_out_global is None
+    assert admission_marker is not None
+    assert admission_marker[1] is True
+    assert competing is None
+    assert competing_elapsed < 2
+    with contexts.Context().session_manager() as session:
+        global_task = v2_projection._claim_task(
+            session,
+            "integration:global-admission:after-drain",
+            30,
+        )
+        assert global_task is not None
+        assert global_task["outbox_event_uuid"] == event_uuids[1]
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'completed', lease_owner = NULL,
+                lease_expires_at = NULL, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (global_task["project_id"], global_task["uuid"]),
+        )
+        session.execute(
+            """
+            UPDATE messenger_projection_scope_leases
+            SET owner = NULL, lease_expires_at = NOW(), updated_at = NOW()
+            WHERE project_id = %s AND scope_kind = %s AND scope_key = %s
+            """,
+            (
+                global_task["project_id"],
+                global_task["scope_kind"],
+                global_task["scope_key"],
+            ),
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM messenger_projection_scope_leases
+            WHERE project_id = %s
+              AND scope_kind = %s
+              AND scope_key = %s
+            """,
+            (
+                api.project_id,
+                v2_projection.PROJECTION_PROJECT_ADMISSION_SCOPE_KIND,
+                str(api.project_id),
+            ),
+        )
+        assert cursor.fetchone()[0] == 0
+    with contexts.Context().session_manager() as session:
+        younger_user = v2_projection._claim_task(
+            session,
+            "integration:global-admission:younger-user",
+            30,
+        )
+        assert younger_user is not None
+        assert younger_user["outbox_event_uuid"] == event_uuids[2]
+        session.rollback()
+
+
+def test_project_admission_marker_preserves_oldest_global_task(api):
+    _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "fanout",
+                "scope_kind": "message",
+                "scope_key": f"{api.project_id}:older-global",
+                "payload": {"placement_uuid": str(sys_uuid.uuid4())},
+            },
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "stream-folders",
+                "scope_key": f"{api.project_id}:newer-global",
+                "payload": {
+                    "source_kind": "stream.updated",
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+        ],
+    )
+    with contexts.Context().session_manager() as session:
+        tasks = session.execute(
+            """
+            SELECT *
+            FROM messenger_projection_tasks
+            WHERE project_id = %s
+            ORDER BY created_at, ordering_created_at, outbox_event_uuid
+            """,
+            (api.project_id,),
+        ).fetchall()
+        v2_projection._mark_projection_project_admission(session, tasks[0], 30)
+        v2_projection._mark_projection_project_admission(session, tasks[1], 30)
+        marker = session.execute(
+            """
+            SELECT owner
+            FROM messenger_projection_scope_leases
+            WHERE project_id = %s AND scope_kind = %s
+            """,
+            (
+                api.project_id,
+                v2_projection.PROJECTION_PROJECT_ADMISSION_SCOPE_KIND,
+            ),
+        ).fetchone()
+        assert marker["owner"] == str(tasks[0]["uuid"])
+        v2_projection._clear_projection_project_admission(session, tasks[1])
+        marker = session.execute(
+            """
+            SELECT owner
+            FROM messenger_projection_scope_leases
+            WHERE project_id = %s AND scope_kind = %s
+            """,
+            (
+                api.project_id,
+                v2_projection.PROJECTION_PROJECT_ADMISSION_SCOPE_KIND,
+            ),
+        ).fetchone()
+        assert marker["owner"] == str(tasks[0]["uuid"])
+
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'completed'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (api.project_id, tasks[0]["uuid"]),
+        )
+        v2_projection._mark_projection_project_admission(session, tasks[1], 30)
+        marker = session.execute(
+            """
+            SELECT owner
+            FROM messenger_projection_scope_leases
+            WHERE project_id = %s AND scope_kind = %s
+            """,
+            (
+                api.project_id,
+                v2_projection.PROJECTION_PROJECT_ADMISSION_SCOPE_KIND,
+            ),
+        ).fetchone()
+        assert marker["owner"] == str(tasks[1]["uuid"])
+        v2_projection._clear_projection_project_admission(session, tasks[0])
+        v2_projection._clear_projection_project_admission(session, tasks[1])
+        marker = session.execute(
+            """
+            SELECT owner
+            FROM messenger_projection_scope_leases
+            WHERE project_id = %s AND scope_kind = %s
+            """,
+            (
+                api.project_id,
+                v2_projection.PROJECTION_PROJECT_ADMISSION_SCOPE_KIND,
+            ),
+        ).fetchone()
+        assert marker is None
+
+
+def test_global_projection_claim_keeps_project_event_ordering_lock(
+    api,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "stream-folders",
+                "scope_key": f"{api.project_id}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "stream.updated",
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+        ],
+    )
+
+    with contexts.Context().session_manager() as session:
+        task = v2_projection._claim_task(session, "integration:global-event", 30)
+        assert task is not None
+        assert task["partition_kind"] == "project"
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as observer:
+            with observer.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_try_advisory_lock(hashtextextended(%s::text, 0))",
+                    (api.project_id,),
+                )
+                assert cursor.fetchone() == (False,)
+        session.rollback()
+
+
+def test_user_projection_requeues_without_attempt_on_event_lock_contention(
+    api,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("interactive_read"),
+    )
+    user_uuid = sys_uuid.uuid4()
+    event_uuids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "topic.read",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-stream",
+                "scope_key": f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "stream.read",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(sys_uuid.uuid4()),
+                },
+            },
+        ],
+    )
+    event_uuid = event_uuids[0]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'failed', attempts = 1, next_retry_at = NOW(),
+                last_error = 'transient projection failure'
+            WHERE project_id = %s AND outbox_event_uuid = %s
+            """,
+            (api.project_id, event_uuid),
+        )
+    db.commit()
+
+    def publish_at_tail(session, task, _batch_size):
+        session.execute("SELECT pg_sleep(0.2)", ())
+        v2_projection._try_lock_project_event_tail(session, task["project_id"])
+        return True
+
+    monkeypatch.setattr(v2_projection, "_process_task", publish_at_tail)
+    metrics = {}
+    blocker = psycopg.connect(conftest.TEST_DB_URL)
+    with blocker.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s::text, 0))",
+            (api.project_id,),
+        )
+    try:
+        with contexts.Context().session_manager() as session:
+            assert not v2_projection.process_one_projection_task(
+                session,
+                "integration:event-contention",
+                metrics=metrics,
+            )
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT EXTRACT(EPOCH FROM (next_retry_at - NOW()))
+                FROM messenger_projection_tasks
+                WHERE project_id = %s AND outbox_event_uuid = %s
+                """,
+                (api.project_id, event_uuid),
+            )
+            first_retry_delay = float(cursor.fetchone()[0])
+            assert first_retry_delay > 0.05
+            cursor.execute(
+                """
+                UPDATE messenger_projection_tasks
+                SET next_retry_at = NOW()
+                WHERE project_id = %s AND outbox_event_uuid = %s
+                """,
+                (api.project_id, event_uuid),
+            )
+        db.commit()
+        with contexts.Context().session_manager() as session:
+            assert not v2_projection.process_one_projection_task(
+                session,
+                "integration:event-contention-repeat",
+                metrics=metrics,
+            )
+    finally:
+        with blocker.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                (api.project_id,),
+            )
+        blocker.close()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET next_retry_at = NOW() + INTERVAL '1 hour'
+            WHERE project_id = %s AND outbox_event_uuid = %s
+            """,
+            (api.project_id, event_uuid),
+        )
+    db.commit()
+    with contexts.Context().session_manager() as session:
+        assert (
+            v2_projection._claim_task(
+                session,
+                "integration:ordered-event-contention",
+                30,
+            )
+            is None
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT status, attempts, last_error,
+                   execution_stats->>'last_outcome',
+                   execution_stats->>'partition_kind',
+                   (execution_stats->>'event_lock_contention_streak')::integer,
+                   EXTRACT(EPOCH FROM (next_retry_at - NOW()))
+            FROM messenger_projection_tasks
+            WHERE project_id = %s AND outbox_event_uuid = %s
+            """,
+            (api.project_id, event_uuid),
+        )
+        row = cursor.fetchone()
+        assert row[:6] == (
+            "pending",
+            1,
+            "transient projection failure",
+            "event_lock_contention",
+            "user",
+            2,
+        )
+        assert float(row[6]) > first_retry_delay + 0.05
+    assert metrics["event_lock_contention"] == 2
+    assert metrics["claimed_partition_user"] == 2
+    assert metrics["claim_seconds_read_counters"] >= 0
+    assert metrics["processing_seconds_read_counters"] >= 0
+    assert "outbox_to_finish_seconds_read_counters" not in metrics
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET next_retry_at = NOW()
+            WHERE project_id = %s AND outbox_event_uuid = %s
+            """,
+            (api.project_id, event_uuid),
+        )
+    db.commit()
+    with contexts.Context().session_manager() as session:
+        assert v2_projection.process_one_projection_task(
+            session,
+            "integration:event-contention-retry",
+            metrics=metrics,
+        )
+    assert metrics["claimed_partition_user"] == 3
+    assert metrics["outbox_to_finish_seconds_read_counters"] >= 0
+
+
+def test_history_import_snapshot_requeues_on_event_lock_contention(
+    api,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("read_state"),
+    )
+    user_uuid = sys_uuid.uuid4()
+    event_uuid = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": f"{api.project_id}:{user_uuid}:{sys_uuid.uuid4()}",
+                "payload": {
+                    "source_kind": "history.imported",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+        ],
+    )[0]
+    blocker = psycopg.connect(conftest.TEST_DB_URL)
+    with blocker.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s::text, 0))",
+            (api.project_id,),
+        )
+    started_at = time.monotonic()
+    try:
+        with contexts.Context().session_manager() as session:
+            assert not v2_projection.process_one_projection_task(
+                session,
+                "integration:history-event-contention",
+            )
+    finally:
+        with blocker.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                (api.project_id,),
+            )
+        blocker.close()
+    elapsed = time.monotonic() - started_at
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT status, attempts, execution_stats->>'last_outcome'
+            FROM messenger_projection_tasks
+            WHERE project_id = %s AND outbox_event_uuid = %s
+            """,
+            (api.project_id, event_uuid),
+        )
+        assert cursor.fetchone() == ("pending", 0, "event_lock_contention")
+    assert elapsed < 1
 
 
 def test_broadcast_guard_does_not_deadlock_with_existing_project_user_update(api):
@@ -887,11 +1777,16 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
             )
             SELECT gen_random_uuid(), %s, 'read_counters', 'user-topic',
                    %s || ':read:' || input.number::text,
-                   jsonb_build_object('source_kind', 'legacy_message_state.updated'),
+                   jsonb_build_object(
+                       'source_kind', 'legacy_message_state.updated',
+                       'user_uuid', md5(
+                           %s || ':user:' || input.number::text
+                       )::uuid::text
+                   ),
                    NOW() - interval '1 day', NOW() - interval '1 day'
             FROM generate_series(1, 30000) AS input(number)
             """,
-            (project_id, str(project_id)),
+            (project_id, str(project_id), str(project_id)),
         )
         for event_kind, scope_kind, suffix, payload in special_events:
             session.execute(
@@ -932,6 +1827,21 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
             LIMIT 128
             """,
             (),
+        ).fetchone()["QUERY PLAN"][0]
+        user_partition_plan = session.execute(
+            """
+            EXPLAIN (FORMAT JSON)
+            SELECT project_id, uuid
+            FROM messenger_projection_tasks
+            WHERE project_id = %s
+              AND payload->>'user_uuid' IS NOT NULL
+              AND payload->>'user_uuid' = %s
+              AND task_kind IN ('read_counters', 'folder_projection')
+              AND status NOT IN ('completed', 'dead_letter')
+            ORDER BY created_at, ordering_created_at, outbox_event_uuid
+            LIMIT 1
+            """,
+            (project_id, api.user_uuid),
         ).fetchone()["QUERY PLAN"][0]
         started_at = time.monotonic()
         claimed = []
@@ -975,17 +1885,22 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
         node.get("Index Name") == "messenger_projection_tasks_fair_claim_idx"
         for node in _plan_nodes(plan["Plan"])
     ), json.dumps(plan)
+    assert any(
+        node.get("Index Name") == "messenger_projection_tasks_user_partition_idx"
+        for node in _plan_nodes(user_partition_plan["Plan"])
+    ), json.dumps(user_partition_plan)
     # The indexed, bounded plan is the stable regression check. Keep only a
     # coarse end-to-end guard here so shared-runner I/O and autovacuum timing
     # cannot turn an otherwise bounded query into a flaky test.
-    assert elapsed < 30
+    assert v2_projection.CLAIM_CANDIDATE_LIMIT < 30000
+    assert elapsed < 10
     assert metrics["unfinished"] >= 29994
     assert metrics["oldest_pending_task_seconds"] >= 23 * 60 * 60
 
 
 def test_fair_scheduler_scans_past_dense_locked_project(api, monkeypatch):
     locked_project_id = sys_uuid.UUID(api.project_id)
-    available_project_id = sys_uuid.uuid4()
+    available_project_id = sys_uuid.UUID(int=locked_project_id.int + 1)
     monkeypatch.setattr(
         v2_projection,
         "_FAIR_SCHEDULER_CYCLE",
@@ -1009,7 +1924,7 @@ def test_fair_scheduler_scans_past_dense_locked_project(api, monkeypatch):
             (
                 locked_project_id,
                 str(locked_project_id),
-                v2_projection.CLAIM_CANDIDATE_LIMIT + 1,
+                2000,
             ),
         )
         session.execute(
@@ -1025,9 +1940,7 @@ def test_fair_scheduler_scans_past_dense_locked_project(api, monkeypatch):
             """,
             (available_project_id, f"{available_project_id}:available"),
         )
-        assert v2_projection.derive_projection_tasks(session, 1000) == (
-            v2_projection.CLAIM_CANDIDATE_LIMIT + 2
-        )
+        assert v2_projection.derive_projection_tasks(session, 3000) == 2001
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task
@@ -1045,8 +1958,15 @@ def test_fair_scheduler_scans_past_dense_locked_project(api, monkeypatch):
     def hold_project_lock():
         with contexts.Context().session_manager() as session:
             session.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))",
-                (locked_project_id,),
+                """
+                SELECT pg_advisory_xact_lock_shared(
+                    hashtextextended(%s, 0)
+                )
+                """,
+                (
+                    f"{v2_projection.PROJECTION_PROJECT_ADMISSION_PREFIX}:"
+                    f"{locked_project_id}",
+                ),
             )
             locked.set()
             assert release.wait(timeout=10)
@@ -1056,16 +1976,265 @@ def test_fair_scheduler_scans_past_dense_locked_project(api, monkeypatch):
         assert locked.wait(timeout=5)
         try:
             with contexts.Context().session_manager() as session:
+                started_at = time.monotonic()
+                deferred = v2_projection._claim_task(
+                    session,
+                    "integration:dense-project-fairness",
+                    30,
+                )
+                assert deferred is None
+            with contexts.Context().session_manager() as session:
                 claimed = v2_projection._claim_task(
                     session,
                     "integration:dense-project-fairness",
                     30,
                 )
+                elapsed = time.monotonic() - started_at
                 assert claimed is not None
                 assert claimed["project_id"] == available_project_id
+                assert elapsed < 2
         finally:
             release.set()
         holder.result(timeout=10)
+
+
+def test_fair_scheduler_scans_past_dense_busy_user_partition(api, monkeypatch):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    busy_user_uuid = sys_uuid.uuid4()
+    available_user_uuid = sys_uuid.uuid4()
+    specifications = [
+        {
+            "task_kind": "folder_projection",
+            "scope_kind": "user-folder",
+            "scope_key": f"{api.project_id}:{busy_user_uuid}:{index}",
+            "payload": {
+                "source_kind": "folder.updated",
+                "user_uuid": str(busy_user_uuid),
+                "folder_uuid": str(sys_uuid.uuid4()),
+            },
+        }
+        for index in range(2000)
+    ]
+    specifications.append(
+        {
+            "task_kind": "folder_projection",
+            "scope_kind": "user-folder",
+            "scope_key": f"{api.project_id}:{available_user_uuid}:available",
+            "payload": {
+                "source_kind": "folder.updated",
+                "user_uuid": str(available_user_uuid),
+                "folder_uuid": str(sys_uuid.uuid4()),
+            },
+        }
+    )
+    event_uuids = _seed_partition_claim_tasks(api, specifications)
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'running', lease_owner = 'busy-user-worker',
+                lease_expires_at = NOW() + INTERVAL '1 hour'
+            WHERE project_id = %s AND outbox_event_uuid = %s
+            """,
+            (api.project_id, event_uuids[0]),
+        )
+
+    with contexts.Context().session_manager() as session:
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:dense-user-fairness",
+            30,
+        )
+        assert claimed is not None
+        assert claimed["outbox_event_uuid"] == event_uuids[-1]
+        assert claimed["partition_key"] == str(available_user_uuid)
+        session.rollback()
+
+
+def test_fair_scheduler_rotates_bounded_user_partition_scan(api, monkeypatch):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    user_uuids = sorted(
+        (
+            sys_uuid.uuid4()
+            for _index in range(v2_projection.CLAIM_PARTITION_SCAN_LIMIT + 1)
+        ),
+        key=str,
+    )
+    specifications = [
+        {
+            "task_kind": "folder_projection",
+            "scope_kind": "user-folder",
+            "scope_key": f"{api.project_id}:{user_uuid}",
+            "payload": {
+                "source_kind": "folder.updated",
+                "user_uuid": str(user_uuid),
+                "folder_uuid": str(sys_uuid.uuid4()),
+            },
+        }
+        for user_uuid in user_uuids
+    ]
+    event_uuids = _seed_partition_claim_tasks(api, specifications)
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'running', lease_owner = 'busy-window-worker',
+                lease_expires_at = NOW() + INTERVAL '1 hour'
+            WHERE project_id = %s
+              AND payload->>'user_uuid' = ANY(%s::text[])
+            """,
+            (api.project_id, [str(value) for value in user_uuids[:-1]]),
+        )
+
+    with contexts.Context().session_manager() as session:
+        metrics = {}
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:bounded-user-rotation",
+            30,
+            metrics,
+        )
+        assert claimed is None
+        assert metrics["partition_scan_continuation"] == 1
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:bounded-user-rotation",
+            30,
+            metrics,
+        )
+        assert claimed is not None
+        assert claimed["outbox_event_uuid"] == event_uuids[-1]
+        assert claimed["partition_key"] == str(user_uuids[-1])
+        session.rollback()
+
+
+def test_deferred_global_claim_keeps_truncated_window_cursor(monkeypatch):
+    worker_id = "integration:deferred-truncated-cursor"
+    deferred_project_id = sys_uuid.uuid4()
+    window_end_project_id = sys_uuid.uuid4()
+    scan_state = {
+        "user_partition_scan_count": 0,
+        "user_cursor_project_id": None,
+        "user_cursor_partition_key": None,
+        "global_project_scan_count": v2_projection.CLAIM_PARTITION_SCAN_LIMIT,
+        "global_cursor_project_id": window_end_project_id,
+    }
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    monkeypatch.setattr(
+        v2_projection,
+        "_claim_task_for_lane",
+        lambda *_args, **_kwargs: (None, scan_state, deferred_project_id),
+    )
+    metrics = {}
+    try:
+        assert v2_projection._claim_task(None, worker_id, 30, metrics) is None
+        assert v2_projection._claim_partition_cursors(worker_id)[2] == (
+            window_end_project_id
+        )
+        assert metrics["admission_commit_required"] == 1
+        assert "partition_scan_continuation" not in metrics
+    finally:
+        with v2_projection._CLAIM_PARTITION_CURSOR_LOCK:
+            v2_projection._CLAIM_PARTITION_CURSORS.pop(worker_id, None)
+
+
+def test_fallback_lane_reuses_preferred_partition_window(api, monkeypatch):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("fanout"),
+    )
+    user_uuids = sorted(
+        (
+            sys_uuid.uuid4()
+            for _index in range(v2_projection.CLAIM_PARTITION_SCAN_LIMIT + 1)
+        ),
+        key=str,
+    )
+    event_uuids = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "user-folder",
+                "scope_key": f"{api.project_id}:{user_uuid}",
+                "payload": {
+                    "source_kind": "folder.updated",
+                    "user_uuid": str(user_uuid),
+                    "folder_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+            for user_uuid in user_uuids
+        ],
+    )
+    with contexts.Context().session_manager() as session:
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'running', lease_owner = 'busy-fallback-worker',
+                lease_expires_at = NOW() + INTERVAL '1 hour'
+            WHERE project_id = %s
+              AND payload->>'user_uuid' <> %s
+            """,
+            (api.project_id, str(user_uuids[0])),
+        )
+
+    with contexts.Context().session_manager() as session:
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:fallback-window",
+            30,
+        )
+        assert claimed is not None
+        assert claimed["outbox_event_uuid"] == event_uuids[0]
+        assert claimed["partition_key"] == str(user_uuids[0])
+        session.rollback()
+
+
+def test_null_user_partition_payload_reaches_failure_path(api, monkeypatch):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("background"),
+    )
+    event_uuid = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "folder_projection",
+                "scope_kind": "user-folder",
+                "scope_key": f"{api.project_id}:null-user",
+                "payload": {
+                    "source_kind": "folder.updated",
+                    "user_uuid": None,
+                    "folder_uuid": str(sys_uuid.uuid4()),
+                },
+            }
+        ],
+    )[0]
+
+    with contexts.Context().session_manager() as session:
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:null-user-payload",
+            30,
+        )
+        assert claimed is not None
+        assert claimed["outbox_event_uuid"] == event_uuid
+        assert claimed["partition_kind"] == "project"
+        session.rollback()
 
 
 def test_fair_scheduler_skips_project_with_retry_blocked_predecessor(
