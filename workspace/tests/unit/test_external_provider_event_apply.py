@@ -1686,6 +1686,87 @@ def test_provider_backfill_reaction_echo_is_quiet(monkeypatch):
     assert updates[0][1]["enforce_visibility"] is False
 
 
+def test_provider_reaction_echo_reuses_unicode_presentation_variant(monkeypatch):
+    identity = _identity()
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    provider_reaction_uuid = sys_uuid.uuid4()
+    actor_uuid = sys_uuid.uuid4()
+    native_reaction_uuid = sys_uuid.uuid4()
+    external_account_uuid = sys_uuid.uuid4()
+    message = types.SimpleNamespace(stream_uuid=stream_uuid)
+    native_reaction = types.SimpleNamespace(
+        uuid=native_reaction_uuid,
+        message_uuid=message_uuid,
+        user_uuid=actor_uuid,
+        emoji_name="❤️",
+    )
+    original_message_model = models.WorkspaceMessage
+    monkeypatch.setattr(
+        models,
+        "WorkspaceMessageReactions",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: None),
+        ),
+    )
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_existing",
+        lambda model, _project_id, entity_uuid, _session: (
+            message
+            if model is original_message_model
+            else native_reaction
+            if entity_uuid == native_reaction_uuid
+            else None
+        ),
+    )
+    updates = []
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "update_workspace_message_reaction",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+    event = {
+        "external_account_uuid": str(external_account_uuid),
+        "kind": "reaction.upsert",
+    }
+    resource = {
+        "uuid": str(provider_reaction_uuid),
+        "message_uuid": str(message_uuid),
+        "user_uuid": str(actor_uuid),
+        "emoji_name": "❤",
+        "provider_external_id": "zulip-reaction-heart",
+    }
+    session = Session({"uuid": native_reaction_uuid})
+
+    resolved_uuid = provider_event_apply._reaction_event(
+        session,
+        event,
+        project_uuid,
+        {"projection_stream_uuid": stream_uuid},
+        resource,
+        identity,
+    )
+
+    assert resolved_uuid == native_reaction_uuid
+    assert "chr(65038)" in session.statements[0][0]
+    assert "chr(65039)" in session.statements[0][0]
+    assert session.statements[0][1] == (
+        project_uuid,
+        message_uuid,
+        actor_uuid,
+        "❤",
+        "❤",
+    )
+    assert updates[0][0][:3] == (
+        project_uuid,
+        actor_uuid,
+        native_reaction_uuid,
+    )
+    assert updates[0][0][3]["emoji_name"] == "❤️"
+
+
 def test_provider_backfill_reaction_create_is_quiet(monkeypatch):
     identity = _identity()
     project_uuid = sys_uuid.uuid4()

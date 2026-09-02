@@ -1842,6 +1842,40 @@ def _reaction_event(
         },
         session=session,
     )
+    presentation_matching = None
+    if matching is None:
+        # Zulip strips Unicode text/emoji presentation selectors while the UI
+        # keeps them, so compare reaction identity without U+FE0E and U+FE0F.
+        row = session.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_message_reactions
+            WHERE project_id = %s AND message_uuid = %s AND user_uuid = %s
+              AND emoji_name <> %s
+              AND replace(
+                    replace(emoji_name, chr(65038), ''), chr(65039), ''
+                  ) = replace(
+                    replace(%s, chr(65038), ''), chr(65039), ''
+                  )
+            ORDER BY created_at, uuid
+            LIMIT 1
+            """,
+            (
+                project_id,
+                message_uuid,
+                actor_uuid,
+                resource["emoji_name"],
+                resource["emoji_name"],
+            ),
+        ).fetchone()
+        if row is not None:
+            presentation_matching = _existing(
+                models.WorkspaceMessageReactions,
+                project_id,
+                row["uuid"],
+                session,
+            )
+            matching = presentation_matching
     if existing is None and matching is not None:
         existing = matching
         reaction_uuid = existing.uuid
@@ -1865,6 +1899,8 @@ def _reaction_event(
         {"emoji_name", "message_uuid", "uuid"},
     )
     values["message_uuid"] = message_uuid
+    if presentation_matching is not None:
+        values["emoji_name"] = presentation_matching.emoji_name
     if existing is None:
         values.update({"uuid": reaction_uuid, "message_uuid": message_uuid})
         helpers.create_workspace_message_reaction(
