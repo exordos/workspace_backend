@@ -829,6 +829,16 @@ def test_canonical_store_has_no_mail_replay_or_nested_session_boundary():
     assert "session_manager" not in source
 
 
+def test_provider_operation_owner_policy_is_complete():
+    current_user_operations = sql_canonical_store._CURRENT_USER_PROVIDER_OPERATIONS
+    stream_owner_operations = sql_canonical_store._STREAM_OWNER_PROVIDER_OPERATIONS
+
+    assert current_user_operations.isdisjoint(stream_owner_operations)
+    assert current_user_operations | stream_owner_operations == frozenset(
+        sql_canonical_store.provider_data._OPERATION_CAPABILITIES
+    )
+
+
 def test_provider_message_create_uses_author_target_in_request_transaction(
     monkeypatch,
 ):
@@ -3012,9 +3022,17 @@ def test_reaction_target_uses_current_users_route_not_message_provenance(
 
 @pytest.mark.parametrize(
     "operation_kind",
-    ["reaction.create", "reaction.update", "reaction.delete"],
+    [
+        "message.create",
+        "message.update",
+        "message.delete",
+        "reaction.create",
+        "reaction.update",
+        "reaction.delete",
+        "read_state.set",
+    ],
 )
-def test_reaction_provider_target_is_owned_by_current_user(monkeypatch, operation_kind):
+def test_actor_provider_target_is_owned_by_current_user(monkeypatch, operation_kind):
     stream_uuid = sys_uuid.uuid4()
     actor_account_uuid = sys_uuid.uuid4()
     stream = types.SimpleNamespace(
@@ -3063,6 +3081,74 @@ def test_reaction_provider_target_is_owned_by_current_user(monkeypatch, operatio
     assert resolved[0][0] is session
     assert resolved[0][1]["owner_user_uuid"] == USER_UUID
     assert resolved[0][1]["external_account_uuid"] == actor_account_uuid
+
+
+@pytest.mark.parametrize(
+    "operation_kind",
+    [
+        "membership.add",
+        "membership.remove",
+        "stream.delete",
+        "topic.create",
+        "stream.update",
+        "topic.update",
+        "topic.delete",
+    ],
+)
+def test_projection_provider_target_is_owned_by_stream_owner(
+    monkeypatch,
+    operation_kind,
+):
+    stream_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    stream = types.SimpleNamespace(
+        uuid=stream_uuid,
+        user_uuid=PROJECTION_OWNER_UUID,
+        external_account_uuid=account_uuid,
+        private_index=None,
+    )
+    session = types.SimpleNamespace(
+        execute=lambda *_args, **_kwargs: types.SimpleNamespace(fetchone=lambda: None)
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        FakeObjects([stream]),
+    )
+    resolved = []
+    account = types.SimpleNamespace(uuid=account_uuid)
+    bridge = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+
+    def resolve_provider_target(requested_session, **kwargs):
+        resolved.append((requested_session, kwargs))
+        return account, object(), bridge
+
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "resolve_provider_target",
+        resolve_provider_target,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.provider_data,
+        "lock_provider_causal_lane",
+        lambda *_args, **_kwargs: None,
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+
+    assert store._provider_target(
+        stream_uuid,
+        operation_kind,
+        account_locked=True,
+        external_account_uuid=account_uuid,
+    ) == (account, bridge)
+    assert resolved[0][0] is session
+    assert resolved[0][1]["owner_user_uuid"] == PROJECTION_OWNER_UUID
+    assert resolved[0][1]["external_account_uuid"] == account_uuid
 
 
 def test_message_create_has_no_provider_target_without_author_owned_route(monkeypatch):
