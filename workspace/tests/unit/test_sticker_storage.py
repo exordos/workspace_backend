@@ -69,17 +69,17 @@ def test_local_storage_saves_reads_deletes_and_has_no_sidecar(tmp_path):
     )
     path = tmp_path / info.storage_object_id
     assert path.read_bytes() == b"sticker bytes"
-    assert storage.read(STICKER_UUID, "png") == b"sticker bytes"
+    assert storage.read(info.storage_object_id) == b"sticker bytes"
     assert sorted(pathlib.Path(tmp_path).rglob("*")) == [
         tmp_path / "stickers",
         tmp_path / "stickers/00000000-0000-0000-0000-000000000001",
         path,
     ]
 
-    storage.delete(STICKER_UUID, "png")
-    storage.delete(STICKER_UUID, "png")
+    storage.delete(info.storage_object_id)
+    storage.delete(info.storage_object_id)
     with pytest.raises(sticker_storage.StickerStorageNotFoundError):
-        storage.read(STICKER_UUID, "png")
+        storage.read(info.storage_object_id)
 
 
 def test_local_storage_is_idempotent_for_same_content_and_rejects_overwrite(
@@ -93,7 +93,7 @@ def test_local_storage_is_idempotent_for_same_content_and_rejects_overwrite(
 
     with pytest.raises(sticker_storage.StickerStorageConflictError):
         storage.save(STICKER_UUID, "gif", b"different")
-    assert storage.read(STICKER_UUID, "gif") == b"same"
+    assert storage.read(first.storage_object_id) == b"same"
 
 
 def test_local_storage_rejects_parent_symlink_without_touching_outside(tmp_path):
@@ -137,9 +137,61 @@ def test_local_storage_does_not_read_or_accept_existing_target_symlink(tmp_path)
 
     with pytest.raises(sticker_storage.StickerStorageConflictError):
         storage.save(STICKER_UUID, "gif", b"stored")
-    with pytest.raises(sticker_storage.StickerStorageBackendError):
-        storage.read(STICKER_UUID, "gif")
+    with pytest.raises(ValueError):
+        storage.read(info.storage_object_id)
+    with pytest.raises(ValueError):
+        storage.delete(info.storage_object_id)
     assert outside.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize(
+    "object_id",
+    (
+        "/stickers/media.gif",
+        "stickers/../outside.gif",
+        "stickers/./media.gif",
+        "stickers//media.gif",
+        "outside/media.gif",
+        "stickers\\outside.gif",
+    ),
+)
+def test_local_storage_rejects_unsafe_object_ids(tmp_path, object_id):
+    storage = sticker_storage.LocalStickerStorage(str(tmp_path))
+
+    with pytest.raises(ValueError):
+        storage.read(object_id)
+    with pytest.raises(ValueError):
+        storage.delete(object_id)
+
+
+def test_local_storage_rejects_object_id_parent_symlink_escape(tmp_path):
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (storage_root / "stickers").symlink_to(outside, target_is_directory=True)
+    storage = sticker_storage.LocalStickerStorage(str(storage_root))
+    object_id = "stickers/item/media.png"
+
+    with pytest.raises(ValueError):
+        storage.read(object_id)
+    with pytest.raises(ValueError):
+        storage.delete(object_id)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_local_storage_reads_and_deletes_the_supplied_object_id(tmp_path):
+    storage = sticker_storage.LocalStickerStorage(str(tmp_path))
+    moved_object_id = "stickers/archive/moved-media.webp"
+    moved_path = tmp_path / moved_object_id
+    moved_path.parent.mkdir(parents=True)
+    moved_path.write_bytes(b"moved")
+
+    assert storage.read(moved_object_id) == b"moved"
+    storage.delete(moved_object_id)
+
+    assert not moved_path.exists()
 
 
 def test_s3_storage_uses_guarded_put_and_translates_operations():
@@ -150,8 +202,8 @@ def test_s3_storage_uses_guarded_put_and_translates_operations():
 
     info = storage.save(STICKER_UUID, "webp", b"s3 bytes")
     assert info.storage_object_id.endswith("/media.webp")
-    assert storage.read(STICKER_UUID, "webp") == b"s3 bytes"
-    storage.delete(STICKER_UUID, "webp")
+    assert storage.read(info.storage_object_id) == b"s3 bytes"
+    storage.delete(info.storage_object_id)
 
     put_call = client.put_object.call_args.kwargs
     assert put_call["Bucket"] == "sticker-catalog"
@@ -186,9 +238,42 @@ def test_s3_storage_translates_not_found_and_backend_errors():
         _client_error("AccessDenied"),
     ]
     storage = _s3_storage(client)
+    object_id = sticker_storage.get_sticker_object_id(STICKER_UUID, "gif")
 
     with pytest.raises(sticker_storage.StickerStorageNotFoundError):
-        storage.read(STICKER_UUID, "gif")
-    storage.delete(STICKER_UUID, "gif")
+        storage.read(object_id)
+    storage.delete(object_id)
     with pytest.raises(sticker_storage.StickerStorageBackendError):
-        storage.delete(STICKER_UUID, "gif")
+        storage.delete(object_id)
+
+
+def test_s3_storage_reads_and_deletes_the_supplied_object_id():
+    client = mock.Mock()
+    client.get_object.return_value = {"Body": io.BytesIO(b"moved")}
+    storage = _s3_storage(client)
+    moved_object_id = "stickers/archive/moved-media.webp"
+
+    assert storage.read(moved_object_id) == b"moved"
+    storage.delete(moved_object_id)
+
+    assert client.get_object.call_args.kwargs == {
+        "Bucket": "sticker-catalog",
+        "Key": moved_object_id,
+    }
+    assert client.delete_object.call_args.kwargs == {
+        "Bucket": "sticker-catalog",
+        "Key": moved_object_id,
+    }
+
+
+def test_s3_storage_rejects_unsafe_object_id_before_client_access():
+    client = mock.Mock()
+    storage = _s3_storage(client)
+
+    with pytest.raises(ValueError):
+        storage.read("../other-bucket/object")
+    with pytest.raises(ValueError):
+        storage.delete("/stickers/media.gif")
+
+    client.get_object.assert_not_called()
+    client.delete_object.assert_not_called()

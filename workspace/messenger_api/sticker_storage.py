@@ -67,9 +67,9 @@ class StickerStorage(typing.Protocol):
         source: bytes | typing.BinaryIO,
     ) -> StickerStorageInfo: ...
 
-    def read(self, sticker_uuid: sys_uuid.UUID, format: str) -> bytes: ...
+    def read(self, storage_object_id: str) -> bytes: ...
 
-    def delete(self, sticker_uuid: sys_uuid.UUID, format: str) -> None: ...
+    def delete(self, storage_object_id: str) -> None: ...
 
 
 def get_sticker_object_id(sticker_uuid: sys_uuid.UUID, format: str) -> str:
@@ -80,6 +80,21 @@ def get_sticker_object_id(sticker_uuid: sys_uuid.UUID, format: str) -> str:
     if format not in SUPPORTED_FORMATS:
         raise ValueError("Sticker format is unsupported")
     return f"stickers/{normalized_uuid}/media.{format}"
+
+
+def _validate_storage_object_id(storage_object_id: str) -> pathlib.PurePosixPath:
+    if not isinstance(storage_object_id, str) or not storage_object_id:
+        raise ValueError("Sticker object id is invalid")
+    if "\\" in storage_object_id or "\x00" in storage_object_id:
+        raise ValueError("Sticker object id is invalid")
+    parts = storage_object_id.split("/")
+    if (
+        parts[0] != "stickers"
+        or any(part in {"", ".", ".."} for part in parts)
+        or pathlib.PurePosixPath(storage_object_id).is_absolute()
+    ):
+        raise ValueError("Sticker object id is invalid")
+    return pathlib.PurePosixPath(*parts)
 
 
 def _read_source_to_temp(
@@ -146,11 +161,9 @@ class LocalStickerStorage:
             storage_path or file_storage.get_storage_path(),
         ).resolve()
 
-    def _path(self, sticker_uuid: sys_uuid.UUID, format: str) -> pathlib.Path:
-        object_id = get_sticker_object_id(sticker_uuid, format)
-        path = self._root / object_id
-        if self._root not in path.parents:
-            raise ValueError("Sticker object id is invalid")
+    def _path(self, storage_object_id: str) -> pathlib.Path:
+        relative_path = _validate_storage_object_id(storage_object_id)
+        path = self._root.joinpath(*relative_path.parts)
         try:
             resolved_parent = path.parent.resolve()
             resolved_parent.relative_to(self._root)
@@ -165,9 +178,9 @@ class LocalStickerStorage:
         source: bytes | typing.BinaryIO,
     ) -> StickerStorageInfo:
         object_id = get_sticker_object_id(sticker_uuid, format)
-        path = self._path(sticker_uuid, format)
+        path = self._path(object_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path = self._path(sticker_uuid, format)
+        path = self._path(object_id)
         temporary_path, size, digest = _read_source_to_temp(source, path.parent)
         try:
             if path.exists() or path.is_symlink():
@@ -188,8 +201,10 @@ class LocalStickerStorage:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    def read(self, sticker_uuid: sys_uuid.UUID, format: str) -> bytes:
-        path = self._path(sticker_uuid, format)
+    def read(self, storage_object_id: str) -> bytes:
+        path = self._path(storage_object_id)
+        if path.is_symlink():
+            raise ValueError("Sticker storage path is invalid")
         fd: int | None = None
         try:
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -204,8 +219,10 @@ class LocalStickerStorage:
             if fd is not None:
                 os.close(fd)
 
-    def delete(self, sticker_uuid: sys_uuid.UUID, format: str) -> None:
-        path = self._path(sticker_uuid, format)
+    def delete(self, storage_object_id: str) -> None:
+        path = self._path(storage_object_id)
+        if path.is_symlink():
+            raise ValueError("Sticker storage path is invalid")
         try:
             path.unlink(missing_ok=True)
         except OSError as error:
@@ -283,8 +300,8 @@ class S3StickerStorage:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    def read(self, sticker_uuid: sys_uuid.UUID, format: str) -> bytes:
-        object_id = get_sticker_object_id(sticker_uuid, format)
+    def read(self, storage_object_id: str) -> bytes:
+        object_id = str(_validate_storage_object_id(storage_object_id))
         try:
             response = self.client.get_object(Bucket=self.bucket_name, Key=object_id)
             return response["Body"].read()
@@ -296,8 +313,8 @@ class S3StickerStorage:
             raise StickerStorageBackendError("S3 sticker storage failed") from error
         raise AssertionError("unreachable")
 
-    def delete(self, sticker_uuid: sys_uuid.UUID, format: str) -> None:
-        object_id = get_sticker_object_id(sticker_uuid, format)
+    def delete(self, storage_object_id: str) -> None:
+        object_id = str(_validate_storage_object_id(storage_object_id))
         try:
             self.client.delete_object(Bucket=self.bucket_name, Key=object_id)
         except botocore_exceptions.ClientError as error:
