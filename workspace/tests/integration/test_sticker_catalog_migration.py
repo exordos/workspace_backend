@@ -11,35 +11,17 @@ from workspace.tests.integration import conftest
 
 MIGRATION_FILE = "0175-add-workspace-sticker-catalog-tables-ba2289.py"
 MIGRATION_ID = "ba2289b6-0a23-470e-a143-a5b986287601"
-API_ROLE = "workspace_messenger_api"
-WORKER_ROLE = "workspace_messenger_worker"
 
 
 @pytest.fixture(scope="module")
-def _sticker_catalog_migration(_database, db):
-    engine = ra_migrations.MigrationEngine(
-        migrations_path=str(conftest.MIGRATIONS_DIR)
-    )
-    with db.cursor() as cursor:
-        cursor.execute(
-            "SELECT rolname FROM pg_roles WHERE rolname = ANY(%s)",
-            ([API_ROLE, WORKER_ROLE],),
-        )
-        existing_roles = {row[0] for row in cursor.fetchall()}
-        for role in (API_ROLE, WORKER_ROLE):
-            if role not in existing_roles:
-                cursor.execute(f'CREATE ROLE "{role}" NOLOGIN')
-
+def _sticker_catalog_migration(_database):
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine.rollback_migration(MIGRATION_FILE)
     try:
         yield engine
     finally:
         engine.rollback_migration(MIGRATION_FILE)
         engine.apply_migration(MIGRATION_FILE)
-        for role in (API_ROLE, WORKER_ROLE):
-            if role not in existing_roles:
-                with db.cursor() as cursor:
-                    cursor.execute(f'DROP ROLE "{role}"')
 
 
 def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_grants(
@@ -237,20 +219,16 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
             WHERE table_name IN (
                 'm_workspace_stickers', 'm_workspace_sticker_favorites'
             )
-              AND grantee IN (%s, %s)
+              AND grantee = %s
             ORDER BY grantee, table_name, privilege_type
             """,
-            (API_ROLE, WORKER_ROLE),
+            ("workspace",),
         )
         grants = cursor.fetchall()
-        assert grants.count((API_ROLE, "DELETE")) == 2
-        assert grants.count((API_ROLE, "INSERT")) == 2
-        assert grants.count((API_ROLE, "SELECT")) == 2
-        assert grants.count((API_ROLE, "UPDATE")) == 2
-        assert grants.count((WORKER_ROLE, "DELETE")) == 2
-        assert grants.count((WORKER_ROLE, "INSERT")) == 2
-        assert grants.count((WORKER_ROLE, "SELECT")) == 2
-        assert grants.count((WORKER_ROLE, "UPDATE")) == 2
+        assert grants.count(("workspace", "DELETE")) == 2
+        assert grants.count(("workspace", "INSERT")) == 2
+        assert grants.count(("workspace", "SELECT")) == 2
+        assert grants.count(("workspace", "UPDATE")) == 2
 
         sticker_uuid = sys_uuid.uuid4()
         cursor.execute(
@@ -309,8 +287,7 @@ def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_gra
         for column in ("width", "height", "size_bytes"):
             with pytest.raises(psycopg.errors.CheckViolation):
                 cursor.execute(
-                    f"UPDATE m_workspace_stickers SET {column} = 0 "
-                    "WHERE uuid = %s",
+                    f"UPDATE m_workspace_stickers SET {column} = 0 WHERE uuid = %s",
                     (str(sticker_uuid),),
                 )
         with pytest.raises(psycopg.errors.CheckViolation):

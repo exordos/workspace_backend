@@ -79,15 +79,10 @@ FROM PUBLIC;
 
 DO $migration$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace_messenger_api') THEN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace') THEN
         EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE '
             'm_workspace_stickers, m_workspace_sticker_favorites '
-            'TO workspace_messenger_api';
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace_messenger_worker') THEN
-        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE '
-            'm_workspace_stickers, m_workspace_sticker_favorites '
-            'TO workspace_messenger_worker';
+            'TO workspace';
     END IF;
 END
 $migration$;
@@ -97,15 +92,10 @@ $migration$;
 DOWNGRADE_SQL = """
 DO $migration$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace_messenger_api') THEN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace') THEN
         EXECUTE 'REVOKE ALL ON TABLE '
             'm_workspace_stickers, m_workspace_sticker_favorites '
-            'FROM workspace_messenger_api';
-    END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace_messenger_worker') THEN
-        EXECUTE 'REVOKE ALL ON TABLE '
-            'm_workspace_stickers, m_workspace_sticker_favorites '
-            'FROM workspace_messenger_worker';
+            'FROM workspace';
     END IF;
 END
 $migration$;
@@ -116,7 +106,6 @@ DROP TABLE m_workspace_stickers;
 
 
 class MigrationStep(migrations.AbstractMigrationStep):
-
     def __init__(self):
         self._depends = ["0174-suppress-legacy-backfill-counters-a2cd99.py"]
 

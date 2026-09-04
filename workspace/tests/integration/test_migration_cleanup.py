@@ -328,6 +328,7 @@ LEGACY_BACKFILL_COUNTER_MIGRATION_UUID = "a2cd99ae-7165-4885-9889-f7729d74e45c"
 LEGACY_BACKFILL_COUNTER_MIGRATION_FILE = (
     "0174-suppress-legacy-backfill-counters-a2cd99.py"
 )
+STICKER_CATALOG_MIGRATION_UUID = "ba2289b6-0a23-470e-a143-a5b986287601"
 CURRENT_HEAD_MIGRATION_FILE = "0175-add-workspace-sticker-catalog-tables-ba2289.py"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
@@ -535,6 +536,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID,
                     PROJECTION_ACCELERATION_MIGRATION_UUID,
                     LEGACY_BACKFILL_COUNTER_MIGRATION_UUID,
+                    STICKER_CATALOG_MIGRATION_UUID,
                 ],
             ),
         )
@@ -601,6 +603,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID, True),
             (PROJECTION_ACCELERATION_MIGRATION_UUID, True),
             (LEGACY_BACKFILL_COUNTER_MIGRATION_UUID, True),
+            (STICKER_CATALOG_MIGRATION_UUID, True),
         }
         cur.execute(
             """
