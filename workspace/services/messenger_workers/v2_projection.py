@@ -37,8 +37,10 @@ MAX_FANOUT_BATCH_SIZE = 5000
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_LEASE_SECONDS = 30
 CLAIM_CANDIDATE_LIMIT = 128
-CLAIM_PROJECT_LIMIT = 16
 REACTION_COALESCE_LIMIT = 128
+PROJECTION_PROJECT_GATE_PREFIX = "messenger-v2-projection-project-v1"
+PROJECTION_USER_PARTITION_PREFIX = "messenger-v2-projection-user-v1"
+USER_PARTITION_TASK_KINDS = ("read_counters", "folder_projection")
 FAIR_SCHEDULER_LANES = (
     "fanout",
     "fanout",
@@ -353,234 +355,91 @@ def _claim_task(
     session: typing.Any,
     worker_id: str,
     lease_seconds: int,
+    metrics: dict[str, float] | None = None,
 ) -> typing.Any | None:
     preferred_lane = next(_FAIR_SCHEDULER_CYCLE)
-    lane_name = preferred_lane
-    candidate_lane_predicate = _lane_predicate("candidate", "task_kind", preferred_lane)
-    task_lane_predicate = _lane_predicate("task", "task_kind", preferred_lane)
-    project_id = _try_lock_claim_project(
+    task = _claim_task_for_lane(
         session,
-        candidate_lane_predicate,
         worker_id,
+        lease_seconds,
+        preferred_lane,
+        _lane_predicate("candidate", "task_kind", preferred_lane),
+        _lane_predicate("task", "task_kind", preferred_lane),
+        metrics,
     )
-    if project_id is None:
-        lane_name = "fallback"
-        candidate_lane_predicate = "TRUE"
-        task_lane_predicate = "TRUE"
-        project_id = _try_lock_claim_project(
-            session,
-            candidate_lane_predicate,
-            worker_id,
-        )
-    if project_id is None:
-        return None
-    claim_sql = f"""
-        /* workspace_projection_lane={{lane_name}} */
-        WITH candidates AS MATERIALIZED (
-            SELECT candidate.project_id, candidate.uuid
-            FROM messenger_projection_tasks AS candidate
-            LEFT JOIN messenger_projection_scope_leases AS candidate_scope_lease
-              ON candidate_scope_lease.project_id = candidate.project_id
-             AND candidate_scope_lease.scope_kind = candidate.scope_kind
-             AND candidate_scope_lease.scope_key = candidate.scope_key
-            WHERE candidate.project_id = %s
-              AND (
-                    candidate.status IN ('pending', 'failed')
-                    OR (
-                        candidate.status = 'running'
-                        AND candidate.lease_expires_at <= NOW()
-                    )
-                  )
-              AND (
-                    candidate.status = 'running'
-                    OR candidate.next_retry_at IS NULL
-                    OR candidate.next_retry_at <= NOW()
-                  )
-              AND (
-                    candidate.lease_expires_at IS NULL
-                    OR candidate.lease_expires_at <= NOW()
-                  )
-              AND candidate.status NOT IN ('completed', 'dead_letter')
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM messenger_projection_tasks AS predecessor
-                    WHERE predecessor.project_id = candidate.project_id
-                      AND predecessor.scope_kind = candidate.scope_kind
-                      AND predecessor.scope_key = candidate.scope_key
-                      AND predecessor.ordering_key = candidate.ordering_key
-                      AND predecessor.task_kind = candidate.task_kind
-                      AND (
-                            predecessor.created_at,
-                            predecessor.ordering_created_at,
-                            predecessor.outbox_event_uuid
-                          ) < (
-                            candidate.created_at,
-                            candidate.ordering_created_at,
-                            candidate.outbox_event_uuid
-                          )
-                      AND predecessor.status NOT IN (
-                            'completed', 'dead_letter'
-                          )
-              )
-              AND ({{candidate_lane_predicate}})
-              AND (
-                    candidate_scope_lease.uuid IS NULL
-                    OR candidate_scope_lease.lease_expires_at IS NULL
-                    OR candidate_scope_lease.lease_expires_at <= NOW()
-                    OR candidate_scope_lease.owner = %s
-                  )
-            ORDER BY candidate.created_at, candidate.ordering_created_at,
-                     candidate.outbox_event_uuid
-            LIMIT {CLAIM_CANDIDATE_LIMIT}
-        )
-        SELECT task.uuid, task.project_id, task.outbox_event_uuid,
-               task.task_kind, task.scope_kind, task.scope_key,
-               task.ordering_key, task.ordering_created_at, task.payload,
-               task.status, task.lease_owner, task.fencing_token,
-               task.lease_expires_at, task.attempts, task.next_retry_at,
-               task.last_error, task.progress_created_at, task.progress_uuid,
-               task.processed_count, task.created_at, task.updated_at
-             , event.created_at AS outbox_created_at
-             , EXTRACT(EPOCH FROM (NOW() - task.created_at)) AS task_age_seconds
-             , EXTRACT(EPOCH FROM (NOW() - event.created_at)) AS outbox_age_seconds
-        FROM candidates AS candidate
-        JOIN messenger_projection_tasks AS task
-          ON task.project_id = candidate.project_id
-         AND task.uuid = candidate.uuid
-        JOIN messenger_domain_outbox_events AS event
-          ON event.project_id = task.project_id
-         AND event.uuid = task.outbox_event_uuid
-        LEFT JOIN messenger_projection_scope_leases AS scope_lease
-          ON scope_lease.project_id = task.project_id
-         AND scope_lease.scope_kind = task.scope_kind
-         AND scope_lease.scope_key = task.scope_key
-        WHERE (
-                task.status IN ('pending', 'failed')
-                OR (
-                    task.status = 'running'
-                    AND task.lease_expires_at <= NOW()
-                )
-              )
-          AND (
-                task.status = 'running'
-                OR task.next_retry_at IS NULL
-                OR task.next_retry_at <= NOW()
-              )
-          AND (task.lease_expires_at IS NULL OR task.lease_expires_at <= NOW())
-          AND NOT EXISTS (
-                SELECT 1
-                FROM messenger_projection_tasks AS predecessor
-                WHERE predecessor.project_id = task.project_id
-                  AND predecessor.scope_kind = task.scope_kind
-                  AND predecessor.scope_key = task.scope_key
-                  AND predecessor.ordering_key = task.ordering_key
-                  AND predecessor.task_kind = task.task_kind
-                  AND (
-                        predecessor.created_at,
-                        predecessor.ordering_created_at,
-                        predecessor.outbox_event_uuid
-                      ) < (
-                        task.created_at,
-                        task.ordering_created_at,
-                        task.outbox_event_uuid
-                      )
-                  AND predecessor.status NOT IN ('completed', 'dead_letter')
-          )
-          AND task.status NOT IN ('completed', 'dead_letter')
-          AND ({{task_lane_predicate}})
-          AND (
-                scope_lease.uuid IS NULL
-                OR scope_lease.lease_expires_at IS NULL
-                OR scope_lease.lease_expires_at <= NOW()
-                OR scope_lease.owner = %s
-              )
-        ORDER BY task.created_at, task.ordering_created_at,
-                 task.outbox_event_uuid
-        LIMIT 1
-        FOR UPDATE OF task SKIP LOCKED
-    """
-    task = session.execute(
-        claim_sql.format(
-            lane_name=lane_name,
-            candidate_lane_predicate=candidate_lane_predicate,
-            task_lane_predicate=task_lane_predicate,
-        ),
-        (project_id, worker_id, worker_id),
-    ).fetchone()
     if task is None:
-        return None
-    lease = session.execute(
-        """
-        INSERT INTO messenger_projection_scope_leases (
-            uuid, project_id, scope_kind, scope_key, owner,
-            fencing_token, lease_expires_at
-        ) VALUES (
-            messenger_uuid_v5(%s, %s), %s, %s, %s, %s, 1,
-            NOW() + make_interval(secs => %s)
+        task = _claim_task_for_lane(
+            session,
+            worker_id,
+            lease_seconds,
+            "fallback",
+            "TRUE",
+            "TRUE",
+            metrics,
         )
-        ON CONFLICT (project_id, scope_kind, scope_key) DO UPDATE
-        SET owner = EXCLUDED.owner,
-            fencing_token = messenger_projection_scope_leases.fencing_token + 1,
-            lease_expires_at = EXCLUDED.lease_expires_at,
-            updated_at = NOW()
-        WHERE messenger_projection_scope_leases.lease_expires_at IS NULL
-           OR messenger_projection_scope_leases.lease_expires_at <= NOW()
-           OR messenger_projection_scope_leases.owner = EXCLUDED.owner
-        RETURNING fencing_token
-        """,
-        (
-            task["project_id"],
-            f"{task['scope_kind']}:{task['scope_key']}",
-            task["project_id"],
-            task["scope_kind"],
-            task["scope_key"],
-            worker_id,
-            lease_seconds,
-        ),
-    ).fetchone()
-    if lease is None:
-        return None
-    session.execute(
-        """
-        UPDATE messenger_projection_tasks
-        SET status = 'running', lease_owner = %s, fencing_token = %s,
-            lease_expires_at = NOW() + make_interval(secs => %s),
-            attempts = attempts + 1, updated_at = NOW()
-        WHERE project_id = %s AND uuid = %s
-        """,
-        (
-            worker_id,
-            lease["fencing_token"],
-            lease_seconds,
-            task["project_id"],
-            task["uuid"],
-        ),
-    )
-    task = dict(task)
-    task["fencing_token"] = lease["fencing_token"]
-    task["attempts"] += 1
     return task
 
 
-def _try_lock_claim_project(
+def _claim_task_for_lane(
     session: typing.Any,
-    lane_predicate: str,
     worker_id: str,
-) -> object | None:
-    """Take the event project lock before any projection task row lock."""
-    rows = session.execute(
+    lease_seconds: int,
+    lane_name: str,
+    candidate_lane_predicate: str,
+    task_lane_predicate: str,
+    metrics: dict[str, float] | None,
+) -> typing.Any | None:
+    candidates = session.execute(
         f"""
-        WITH per_project AS MATERIALIZED (
-            SELECT DISTINCT ON (candidate.project_id)
-                   candidate.project_id, candidate.created_at,
-                   candidate.ordering_created_at,
-                   candidate.outbox_event_uuid
+        /* workspace_projection_lane={lane_name} */
+        WITH partitioned AS MATERIALIZED (
+            SELECT candidate.*,
+                   CASE
+                       WHEN candidate.task_kind IN (
+                                'read_counters', 'folder_projection'
+                            )
+                            AND candidate.payload ? 'user_uuid'
+                       THEN 'user'
+                       ELSE 'project'
+                   END AS partition_kind,
+                   CASE
+                       WHEN candidate.task_kind IN (
+                                'read_counters', 'folder_projection'
+                            )
+                            AND candidate.payload ? 'user_uuid'
+                       THEN candidate.payload->>'user_uuid'
+                       ELSE candidate.project_id::text
+                   END AS partition_key,
+                   row_number() OVER (
+                       PARTITION BY candidate.project_id,
+                           CASE
+                               WHEN candidate.task_kind IN (
+                                        'read_counters', 'folder_projection'
+                                    )
+                                    AND candidate.payload ? 'user_uuid'
+                               THEN 'user:' || (
+                                   candidate.payload->>'user_uuid'
+                               )
+                               ELSE 'task:' || candidate.uuid::text
+                           END
+                       ORDER BY candidate.created_at,
+                                candidate.ordering_created_at,
+                                candidate.outbox_event_uuid
+                   ) AS partition_position
             FROM messenger_projection_tasks AS candidate
+            WHERE candidate.status NOT IN ('completed', 'dead_letter')
+        ), eligible AS MATERIALIZED (
+            SELECT candidate.project_id, candidate.uuid,
+                   candidate.ordering_created_at,
+                   candidate.outbox_event_uuid, candidate.created_at,
+                   candidate.partition_kind, candidate.partition_key
+            FROM partitioned AS candidate
             LEFT JOIN messenger_projection_scope_leases AS scope_lease
               ON scope_lease.project_id = candidate.project_id
              AND scope_lease.scope_kind = candidate.scope_kind
              AND scope_lease.scope_key = candidate.scope_key
-            WHERE (
+            WHERE candidate.partition_position = 1
+              AND (
                     candidate.status IN ('pending', 'failed')
                     OR (
                         candidate.status = 'running'
@@ -624,37 +483,266 @@ def _try_lock_claim_project(
                     OR scope_lease.lease_expires_at <= NOW()
                     OR scope_lease.owner = %s
                   )
-              AND ({lane_predicate})
-            ORDER BY candidate.project_id, candidate.created_at,
-                     candidate.ordering_created_at,
-                     candidate.outbox_event_uuid
-        ), candidates AS MATERIALIZED (
-            SELECT candidate.project_id, candidate.created_at,
-                   candidate.ordering_created_at,
-                   candidate.outbox_event_uuid
-            FROM per_project AS candidate
-            ORDER BY candidate.created_at, candidate.ordering_created_at,
-                     candidate.outbox_event_uuid
-            LIMIT {CLAIM_PROJECT_LIMIT}
+              AND ({candidate_lane_predicate})
+        ), per_partition AS MATERIALIZED (
+            SELECT DISTINCT ON (
+                       eligible.project_id, eligible.partition_kind,
+                       eligible.partition_key
+                   )
+                   eligible.*
+            FROM eligible
+            ORDER BY eligible.project_id, eligible.partition_kind,
+                     eligible.partition_key, eligible.created_at,
+                     eligible.ordering_created_at, eligible.outbox_event_uuid
         )
-        SELECT project_id
-        FROM candidates
+        SELECT project_id, uuid, partition_kind, partition_key
+        FROM per_partition
         ORDER BY created_at, ordering_created_at, outbox_event_uuid
+        LIMIT {CLAIM_CANDIDATE_LIMIT}
         """,
         (worker_id,),
     ).fetchall()
-    for row in rows:
-        locked = session.execute(
+    for candidate in candidates:
+        session.execute("SAVEPOINT messenger_v2_projection_claim", ())
+        task = session.execute(
+            f"""
+            SELECT task.uuid, task.project_id, task.outbox_event_uuid,
+                   task.task_kind, task.scope_kind, task.scope_key,
+                   task.ordering_key, task.ordering_created_at, task.payload,
+                   task.status, task.lease_owner, task.fencing_token,
+                   task.lease_expires_at, task.attempts, task.next_retry_at,
+                   task.last_error, task.progress_created_at,
+                   task.progress_uuid, task.processed_count, task.created_at,
+                   task.updated_at,
+                   event.created_at AS outbox_created_at,
+                   EXTRACT(EPOCH FROM (NOW() - task.created_at))
+                       AS task_age_seconds,
+                   EXTRACT(EPOCH FROM (NOW() - event.created_at))
+                       AS outbox_age_seconds
+            FROM messenger_projection_tasks AS task
+            JOIN messenger_domain_outbox_events AS event
+              ON event.project_id = task.project_id
+             AND event.uuid = task.outbox_event_uuid
+            LEFT JOIN messenger_projection_scope_leases AS scope_lease
+              ON scope_lease.project_id = task.project_id
+             AND scope_lease.scope_kind = task.scope_kind
+             AND scope_lease.scope_key = task.scope_key
+            WHERE task.project_id = %s AND task.uuid = %s
+              AND (
+                    task.status IN ('pending', 'failed')
+                    OR (
+                        task.status = 'running'
+                        AND task.lease_expires_at <= NOW()
+                    )
+                  )
+              AND (
+                    task.status = 'running'
+                    OR task.next_retry_at IS NULL
+                    OR task.next_retry_at <= NOW()
+                  )
+              AND (task.lease_expires_at IS NULL OR task.lease_expires_at <= NOW())
+              AND task.status NOT IN ('completed', 'dead_letter')
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messenger_projection_tasks AS predecessor
+                    WHERE predecessor.project_id = task.project_id
+                      AND predecessor.scope_kind = task.scope_kind
+                      AND predecessor.scope_key = task.scope_key
+                      AND predecessor.ordering_key = task.ordering_key
+                      AND predecessor.task_kind = task.task_kind
+                      AND (
+                            predecessor.created_at,
+                            predecessor.ordering_created_at,
+                            predecessor.outbox_event_uuid
+                          ) < (
+                            task.created_at,
+                            task.ordering_created_at,
+                            task.outbox_event_uuid
+                          )
+                      AND predecessor.status NOT IN (
+                            'completed', 'dead_letter'
+                          )
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM messenger_projection_tasks AS partition_predecessor
+                    WHERE task.task_kind IN (
+                            'read_counters', 'folder_projection'
+                          )
+                      AND task.payload ? 'user_uuid'
+                      AND partition_predecessor.project_id = task.project_id
+                      AND partition_predecessor.task_kind IN (
+                            'read_counters', 'folder_projection'
+                          )
+                      AND partition_predecessor.payload ? 'user_uuid'
+                      AND partition_predecessor.payload->>'user_uuid'
+                          = task.payload->>'user_uuid'
+                      AND (
+                            partition_predecessor.created_at,
+                            partition_predecessor.ordering_created_at,
+                            partition_predecessor.outbox_event_uuid
+                          ) < (
+                            task.created_at,
+                            task.ordering_created_at,
+                            task.outbox_event_uuid
+                          )
+                      AND partition_predecessor.status NOT IN (
+                            'completed', 'dead_letter'
+                          )
+              )
+              AND ({task_lane_predicate})
+              AND (
+                    scope_lease.uuid IS NULL
+                    OR scope_lease.lease_expires_at IS NULL
+                    OR scope_lease.lease_expires_at <= NOW()
+                    OR scope_lease.owner = %s
+                  )
+            FOR UPDATE OF task SKIP LOCKED
+            """,
+            (candidate["project_id"], candidate["uuid"], worker_id),
+        ).fetchone()
+        if task is None:
+            _record_partition_contention(metrics, candidate["partition_kind"])
+            session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_claim", ())
+            session.execute("RELEASE SAVEPOINT messenger_v2_projection_claim", ())
+            continue
+        if not _try_lock_projection_partition(session, task):
+            _record_partition_contention(metrics, candidate["partition_kind"])
+            session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_claim", ())
+            session.execute("RELEASE SAVEPOINT messenger_v2_projection_claim", ())
+            continue
+        lease = session.execute(
+            """
+            INSERT INTO messenger_projection_scope_leases (
+                uuid, project_id, scope_kind, scope_key, owner,
+                fencing_token, lease_expires_at
+            ) VALUES (
+                messenger_uuid_v5(%s, %s), %s, %s, %s, %s, 1,
+                NOW() + make_interval(secs => %s)
+            )
+            ON CONFLICT (project_id, scope_kind, scope_key) DO UPDATE
+            SET owner = EXCLUDED.owner,
+                fencing_token = messenger_projection_scope_leases.fencing_token + 1,
+                lease_expires_at = EXCLUDED.lease_expires_at,
+                updated_at = NOW()
+            WHERE messenger_projection_scope_leases.lease_expires_at IS NULL
+               OR messenger_projection_scope_leases.lease_expires_at <= NOW()
+               OR messenger_projection_scope_leases.owner = EXCLUDED.owner
+            RETURNING fencing_token
+            """,
+            (
+                task["project_id"],
+                f"{task['scope_kind']}:{task['scope_key']}",
+                task["project_id"],
+                task["scope_kind"],
+                task["scope_key"],
+                worker_id,
+                lease_seconds,
+            ),
+        ).fetchone()
+        if lease is None:
+            _record_partition_contention(metrics, candidate["partition_kind"])
+            session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_claim", ())
+            session.execute("RELEASE SAVEPOINT messenger_v2_projection_claim", ())
+            continue
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'running', lease_owner = %s, fencing_token = %s,
+                lease_expires_at = NOW() + make_interval(secs => %s),
+                attempts = attempts + 1, updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                worker_id,
+                lease["fencing_token"],
+                lease_seconds,
+                task["project_id"],
+                task["uuid"],
+            ),
+        )
+        session.execute("RELEASE SAVEPOINT messenger_v2_projection_claim", ())
+        claimed = dict(task)
+        claimed["fencing_token"] = lease["fencing_token"]
+        claimed["attempts"] += 1
+        claimed["partition_kind"] = candidate["partition_kind"]
+        claimed["partition_key"] = candidate["partition_key"]
+        return claimed
+    return None
+
+
+def _record_partition_contention(
+    metrics: dict[str, float] | None,
+    partition_kind: str,
+) -> None:
+    if metrics is None:
+        return
+    metrics["partition_contention"] = metrics.get("partition_contention", 0.0) + 1
+    key = f"partition_contention_{partition_kind}"
+    metrics[key] = metrics.get(key, 0.0) + 1
+
+
+def _try_lock_projection_partition(
+    session: typing.Any,
+    task: typing.Mapping[str, typing.Any],
+) -> bool:
+    """Fence global work while allowing different project users in parallel."""
+    project_gate_key = f"{PROJECTION_PROJECT_GATE_PREFIX}:{task['project_id']}"
+    user_uuid = task["payload"].get("user_uuid")
+    user_partition = (
+        task["task_kind"] in USER_PARTITION_TASK_KINDS and user_uuid is not None
+    )
+    lock_function = (
+        "pg_try_advisory_xact_lock_shared"
+        if user_partition
+        else "pg_try_advisory_xact_lock"
+    )
+    project_gate = session.execute(
+        f"""
+        SELECT {lock_function}(hashtextextended(%s, 0)) AS locked
+        """,
+        (project_gate_key,),
+    ).fetchone()["locked"]
+    if not project_gate:
+        return False
+    if user_partition:
+        user_gate_key = (
+            f"{PROJECTION_USER_PARTITION_PREFIX}:{task['project_id']}:{user_uuid}"
+        )
+        return bool(
+            session.execute(
+                """
+                SELECT pg_try_advisory_xact_lock(
+                    hashtextextended(%s, 0)
+                ) AS locked
+                """,
+                (user_gate_key,),
+            ).fetchone()["locked"]
+        )
+    return bool(
+        session.execute(
             """
             SELECT pg_try_advisory_xact_lock(
                 hashtextextended(%s::text, 0)
             ) AS locked
             """,
-            (row["project_id"],),
+            (task["project_id"],),
         ).fetchone()["locked"]
-        if locked:
-            return row["project_id"]
-    return None
+    )
+
+
+def _try_lock_project_event_tail(session: typing.Any, project_id: object) -> None:
+    """Acquire cursor ordering only after user projection writes are ready."""
+    locked = session.execute(
+        """
+        SELECT pg_try_advisory_xact_lock(
+            hashtextextended(%s::text, 0)
+        ) AS locked
+        """,
+        (project_id,),
+    ).fetchone()["locked"]
+    if not locked:
+        raise messenger_events.ProjectEventLockUnavailableError(str(project_id))
 
 
 def _v2_rows(
@@ -1625,6 +1713,7 @@ def _process_read_counters(
             user_uuid=user_uuid,
             stream_uuid=_uuid(payload["stream_uuid"]),
         )
+    _try_lock_project_event_tail(session, task["project_id"])
     if payload.get("placement_uuid") and payload.get("emit_message_read"):
         messages = _v2_rows(
             v2_models.WorkspaceUserMessage,
@@ -1694,6 +1783,7 @@ def _process_folder_projection(
     if source_kind == "folder.deleted":
         if not payload.get("emit_public_event", True):
             return
+        _try_lock_project_event_tail(session, project_id)
         emitted = messenger_events.create_folder_deleted_event(
             project_id=project_id,
             user_uuid=user_uuid,
@@ -1861,6 +1951,7 @@ def _process_folder_projection(
     )
     if not payload.get("emit_public_event", True):
         return
+    _try_lock_project_event_tail(session, project_id)
     folders = v2_models.WorkspaceUserFolder.objects.get_all(
         filters={
             "project_id": dm_filters.EQ(project_id),
@@ -2681,7 +2772,7 @@ def process_one_projection_task(
         )
     claim_started_at = time.monotonic()
     claimed_at = datetime.datetime.now(datetime.timezone.utc)
-    task = _claim_task(session, worker_id, lease_seconds)
+    task = _claim_task(session, worker_id, lease_seconds, metrics)
     claim_seconds = time.monotonic() - claim_started_at
     if metrics is not None:
         metrics["claim_seconds"] = metrics.get("claim_seconds", 0.0) + claim_seconds
@@ -2701,6 +2792,16 @@ def process_one_projection_task(
         metrics["claimed"] = metrics.get("claimed", 0.0) + 1
         claimed_key = f"claimed_{task_kind}"
         metrics[claimed_key] = metrics.get(claimed_key, 0.0) + 1
+        claim_duration_key = f"claim_seconds_{task_kind}"
+        metrics[claim_duration_key] = (
+            metrics.get(claim_duration_key, 0.0) + claim_seconds
+        )
+        claim_max_key = f"claim_seconds_max_{task_kind}"
+        metrics[claim_max_key] = max(
+            metrics.get(claim_max_key, 0.0), claim_seconds
+        )
+        partition_key = f"claimed_partition_{task['partition_kind']}"
+        metrics[partition_key] = metrics.get(partition_key, 0.0) + 1
         task_age = float(task["task_age_seconds"])
         metrics["task_age_seconds_max"] = max(
             metrics.get("task_age_seconds_max", 0.0), task_age
@@ -2709,6 +2810,55 @@ def process_one_projection_task(
     outcome = "running"
     try:
         completed = _process_task(session, task, fanout_batch_size)
+    except messenger_events.ProjectEventLockUnavailableError:
+        session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_task", ())
+        outcome = "event_lock_contention"
+        duration = time.monotonic() - started_at
+        execution_stats = _finish_execution_stats(
+            task,
+            worker_id=worker_id,
+            claimed_at=claimed_at,
+            claim_seconds=claim_seconds,
+            processing_seconds=duration,
+            outcome=outcome,
+        )
+        session.execute(
+            """
+            UPDATE messenger_projection_tasks
+            SET status = 'pending', lease_owner = NULL,
+                lease_expires_at = NULL,
+                attempts = GREATEST(attempts - 1, 0),
+                next_retry_at = NOW() + INTERVAL '100 milliseconds',
+                last_error = NULL,
+                payload = jsonb_set(
+                    payload,
+                    '{_execution_stats}',
+                    %s::jsonb || jsonb_build_object(
+                        'processed_count', processed_count
+                    )
+                ),
+                updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s AND fencing_token = %s
+            """,
+            (
+                json.dumps(execution_stats),
+                task["project_id"],
+                task["uuid"],
+                task["fencing_token"],
+            ),
+        )
+        LOG.info(
+            "Deferred Messenger v2 user projection because the event lock is busy",
+            extra={
+                "task_uuid": str(task["uuid"]),
+                "task_kind": task_kind,
+                "projection_partition_kind": task["partition_kind"],
+            },
+        )
+        if metrics is not None:
+            metrics[outcome] = metrics.get(outcome, 0.0) + 1
+            outcome_key = f"{outcome}_{task_kind}"
+            metrics[outcome_key] = metrics.get(outcome_key, 0.0) + 1
     except Exception as error:
         session.execute("ROLLBACK TO SAVEPOINT messenger_v2_projection_task", ())
         attempts = int(task["attempts"])
@@ -2838,6 +2988,17 @@ def process_one_projection_task(
         metrics[duration_key] = metrics.get(duration_key, 0.0) + duration
         max_key = f"processing_seconds_max_{task_kind}"
         metrics[max_key] = max(metrics.get(max_key, 0.0), duration)
+        if outcome == "completed":
+            outbox_to_finish = max(
+                0.0,
+                float(task["outbox_age_seconds"]) + duration,
+            )
+            outbox_key = f"outbox_to_finish_seconds_{task_kind}"
+            metrics[outbox_key] = metrics.get(outbox_key, 0.0) + outbox_to_finish
+            outbox_max_key = f"outbox_to_finish_seconds_max_{task_kind}"
+            metrics[outbox_max_key] = max(
+                metrics.get(outbox_max_key, 0.0), outbox_to_finish
+            )
     return True
 
 
@@ -2884,6 +3045,7 @@ def _finish_execution_stats(
             "last_finished_at": finished_at.isoformat(),
             "last_worker_id": worker_id,
             "last_outcome": outcome,
+            "partition_kind": task["partition_kind"],
             "queue_wait_ms": round(max(0.0, raw_queue_wait_ms), 3),
             "outbox_wait_ms": round(max(0.0, raw_outbox_wait_ms), 3),
             "derivation_delay_ms": round(max(0.0, raw_derivation_delay_ms), 3),
