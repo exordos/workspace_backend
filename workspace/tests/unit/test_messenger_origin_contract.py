@@ -25,11 +25,18 @@ from workspace.messenger_api.api import app
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import middlewares
 from workspace.messenger_api.api import routes
+from workspace.messenger_api.api import sticker_controllers
+from workspace.messenger_api.api import sticker_routes
 from workspace.messenger_api.dm import models
 from workspace.messenger_api import events
 
 
 ROUTE_MANIFEST = {
+    "stickers": (
+        sticker_routes.StickerRoute,
+        sticker_controllers.StickerController,
+        {ra_routes.FILTER, ra_routes.GET, ra_routes.UPDATE},
+    ),
     "folders": (
         routes.FolderRoute,
         controllers.FolderController,
@@ -183,6 +190,18 @@ ROUTE_MANIFEST = {
 
 
 ACTION_MANIFEST = {
+    (sticker_routes.StickerRoute, "download"): (
+        sticker_controllers.StickerController,
+        False,
+    ),
+    (sticker_routes.StickerRoute, "star"): (
+        sticker_controllers.StickerController,
+        True,
+    ),
+    (sticker_routes.StickerRoute, "unstar"): (
+        sticker_controllers.StickerController,
+        True,
+    ),
     (routes.ExternalAccountRoute, "reconnect"): (
         controllers.ExternalAccountController,
         True,

@@ -1433,3 +1433,293 @@ def add_events_cursor_contract(
         "application/json": {"schema": copy.deepcopy(EVENT_CURSOR_SCHEMA)}
     }
     return specification
+
+
+def add_sticker_catalog_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+    components: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    """Replace technical Sticker model paths with the public catalog contract."""
+
+    component_values = components["components"]
+    component_values.setdefault("securitySchemes", {})["bearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+    }
+    schemas = component_values["schemas"]
+    schemas["StickerMedia"] = _object_schema(
+        {
+            "format": {"type": "string", "enum": ["gif", "webp", "png"]},
+            "width": {"type": "integer", "minimum": 1},
+            "height": {"type": "integer", "minimum": 1},
+            "url": {"type": "string", "minLength": 1},
+        },
+        ["format", "url"],
+    )
+    schemas["StickerCard"] = _object_schema(
+        {
+            "id": {"type": "string", "format": "uuid"},
+            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+            "alt_text": {"type": "string", "maxLength": 500},
+            "emoji": {
+                "type": "array",
+                "maxItems": 5,
+                "items": {"type": "string", "minLength": 1, "maxLength": 128},
+            },
+            "tags": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {"type": "string", "minLength": 1, "maxLength": 64},
+            },
+            "category": {"type": "string", "enum": ["gif", "sticker"]},
+            "media": {"$ref": "#/components/schemas/StickerMedia"},
+            "is_favorite": {"type": "boolean"},
+        },
+        [
+            "id",
+            "title",
+            "alt_text",
+            "emoji",
+            "tags",
+            "category",
+            "media",
+            "is_favorite",
+        ],
+    )
+    schemas["StickerImportResult"] = _object_schema(
+        {
+            "created": {"type": "integer", "minimum": 0},
+            "duplicates": {"type": "integer", "minimum": 0},
+            "items": {
+                "type": "array",
+                "items": _object_schema(
+                    {
+                        "client_id": {"type": "string", "format": "uuid"},
+                        "file": {"type": "string", "minLength": 1},
+                        "status": {
+                            "type": "string",
+                            "enum": ["created", "duplicate"],
+                        },
+                        "sticker_uuid": {"type": "string", "format": "uuid"},
+                    },
+                    ["client_id", "file", "status", "sticker_uuid"],
+                ),
+            },
+        },
+        ["created", "duplicates", "items"],
+    )
+    for name in ("Sticker_Filter", "Sticker_Get", "Sticker_Update"):
+        schemas.pop(name, None)
+    generated_item_path = f"{root}stickers/{{StickerUuid}}"
+    for path in tuple(specification["paths"]):
+        if path == generated_item_path or path.startswith(f"{generated_item_path}/"):
+            specification["paths"].pop(path)
+
+    security: list[dict[str, list[str]]] = [{"bearerAuth": []}]
+    json_card = {
+        "description": "Public sticker card.",
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/StickerCard"}}
+        },
+    }
+    json_list = {
+        "description": "Sticker catalog page.",
+        "headers": {
+            "ETag": {"schema": {"type": "string"}},
+            "Cache-Control": {"schema": {"type": "string"}},
+            "X-Pagination-Limit": {"schema": {"type": "integer"}},
+            "X-Pagination-Marker": {
+                "schema": {"type": "string"},
+                "description": "Opaque continuation marker, when another page exists.",
+            },
+        },
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/StickerCard"},
+                }
+            }
+        },
+    }
+    collection_path = f"{root}stickers/"
+    item_path = f"{root}stickers/{{sticker_uuid}}"
+    sticker_uuid_parameter = {
+        "name": "sticker_uuid",
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string", "format": "uuid"},
+    }
+    specification["paths"][collection_path] = {
+        "get": {
+            "operationId": "ListStickers",
+            "security": security,
+            "parameters": [
+                {
+                    "name": "q",
+                    "in": "query",
+                    "schema": {"type": "string", "maxLength": 200},
+                },
+                {
+                    "name": "favorite",
+                    "in": "query",
+                    "schema": {"type": "boolean", "default": False},
+                },
+                {
+                    "name": "uuid",
+                    "in": "query",
+                    "style": "form",
+                    "explode": True,
+                    "schema": {
+                        "type": "array",
+                        "maxItems": 100,
+                        "items": {"type": "string", "format": "uuid"},
+                    },
+                },
+                {
+                    "name": "category",
+                    "in": "query",
+                    "schema": {"type": "string", "enum": ["gif", "sticker"]},
+                },
+                {
+                    "name": "format",
+                    "in": "query",
+                    "schema": {"type": "string", "enum": ["gif", "webp", "png"]},
+                },
+                {
+                    "name": "page_limit",
+                    "in": "query",
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 50,
+                    },
+                },
+                {
+                    "name": "page_marker",
+                    "in": "query",
+                    "description": "Opaque base64url continuation marker.",
+                    "schema": {"type": "string"},
+                },
+                {
+                    "name": "If-None-Match",
+                    "in": "header",
+                    "schema": {"type": "string"},
+                },
+            ],
+            "responses": {
+                200: json_list,
+                304: {
+                    "description": "The private catalog representation is unchanged.",
+                    "headers": copy.deepcopy(json_list["headers"]),
+                },
+            },
+        }
+    }
+    specification["paths"][item_path] = {
+        "get": {
+            "operationId": "GetSticker",
+            "security": security,
+            "parameters": [copy.deepcopy(sticker_uuid_parameter)],
+            "responses": {200: copy.deepcopy(json_card)},
+        },
+        "put": {
+            "operationId": "UpdateSticker",
+            "security": security,
+            "x-required-permission": "workspace.sticker_catalog.manage",
+            "parameters": [copy.deepcopy(sticker_uuid_parameter)],
+            "requestBody": _request_body(
+                {
+                    "type": "object",
+                    "minProperties": 1,
+                    "additionalProperties": False,
+                    "properties": {
+                        key: copy.deepcopy(value)
+                        for key, value in schemas["StickerCard"]["properties"].items()
+                        if key
+                        in {
+                            "title",
+                            "alt_text",
+                            "emoji",
+                            "tags",
+                            "category",
+                        }
+                    }
+                    | {
+                        "active": {"type": "boolean"},
+                        "blocked": {"type": "boolean"},
+                    },
+                }
+            ),
+            "responses": {200: copy.deepcopy(json_card)},
+        },
+    }
+    download_path = f"{item_path}/actions/download"
+    specification["paths"][download_path] = {
+        "get": {
+            "operationId": "DownloadSticker",
+            "security": security,
+            "parameters": [copy.deepcopy(sticker_uuid_parameter)],
+            "responses": {
+                200: {
+                    "description": "Raw sticker media bytes.",
+                    "headers": {
+                        "ETag": {"schema": {"type": "string"}},
+                        "Cache-Control": {"schema": {"type": "string"}},
+                    },
+                    "content": {
+                        content_type: {"schema": {"type": "string", "format": "binary"}}
+                        for content_type in ("image/gif", "image/webp", "image/png")
+                    },
+                }
+            },
+        }
+    }
+    for action in ("star", "unstar"):
+        specification["paths"][f"{item_path}/actions/{action}/invoke"] = {
+            "post": {
+                "operationId": f"{action.title()}Sticker",
+                "security": security,
+                "parameters": [copy.deepcopy(sticker_uuid_parameter)],
+                "responses": {200: {"description": "Success."}},
+            }
+        }
+    specification["paths"][f"{root}stickers/actions/import_archive/invoke"] = {
+        "post": {
+            "operationId": "ImportStickerArchive",
+            "security": security,
+            "x-required-permission": "workspace.sticker_catalog.manage",
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {
+                        "schema": _object_schema(
+                            {
+                                "archive": {
+                                    "type": "string",
+                                    "format": "binary",
+                                }
+                            },
+                            ["archive"],
+                        )
+                    }
+                },
+            },
+            "responses": {
+                200: {
+                    "description": "Archive import result.",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/StickerImportResult"
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+    return specification
