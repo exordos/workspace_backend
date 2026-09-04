@@ -162,6 +162,9 @@ resources:
     workspace_topic_summary_settings_manage:
       name: "workspace.topic_summary_settings.manage"
       description: "Manage global and project Workspace topic summary settings"
+    workspace_sticker_catalog_manage:
+      name: "workspace.sticker_catalog.manage"
+      description: "Manage the global Workspace sticker catalog"
 
   # Roles are provisioned with their permission sets but are intentionally not
   # assigned to users. Operators create project-scoped role bindings explicitly.
@@ -177,6 +180,10 @@ resources:
     workspace_topic_summary_admin:
       name: "workspace-topic-summary-admin"
       description: "Administer Workspace topic summarization"
+      project_id: null
+    workspace_sticker_catalog_admin:
+      name: "workspace-sticker-catalog-admin"
+      description: "Administer the global Workspace sticker catalog"
       project_id: null
 
   $core.iam.permissionbinding:
@@ -247,6 +254,10 @@ resources:
     workspace_topic_summary_admin_settings_manage:
       role: $core.iam.roles.$workspace_topic_summary_admin:uuid
       permission: $core.iam.permissions.$workspace_topic_summary_settings_manage:uuid
+      project_id: null
+    workspace_sticker_catalog_admin_manage:
+      role: $core.iam.roles.$workspace_sticker_catalog_admin:uuid
+      permission: $core.iam.permissions.$workspace_sticker_catalog_manage:uuid
       project_id: null
 
   $core.compute.nodes:

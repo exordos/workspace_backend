@@ -10,6 +10,7 @@ import json
 import uuid as sys_uuid
 
 import pytest
+from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
@@ -78,6 +79,10 @@ class _Repository:
 
     def unstar(self, session, user_uuid, sticker_uuid):
         self.calls.append(("unstar", session, user_uuid, sticker_uuid))
+
+    def update_admin_fields(self, session, sticker_uuid, values):
+        self.calls.append(("update", session, sticker_uuid, values))
+        return self.active
 
 
 class _Storage:
@@ -192,7 +197,7 @@ def test_get_uses_active_lookup_and_returns_safe_not_found():
     assert card["id"] == str(STICKER_UUID)
     assert card["is_favorite"] is True
 
-    with pytest.raises(sticker_repository.StickerNotFoundError):
+    with pytest.raises(ra_exc.ResourceNotFoundError):
         sticker_catalog.get_public_sticker(
             object(), USER_UUID, _Repository(), STICKER_UUID
         )
@@ -217,7 +222,7 @@ def test_download_checks_database_before_storage_and_uses_stored_object_id(avail
     storage = _Storage()
 
     if not available:
-        with pytest.raises(sticker_repository.StickerNotFoundError):
+        with pytest.raises(ra_exc.ResourceNotFoundError):
             sticker_catalog.download_sticker(
                 object(), USER_UUID, repository, storage, STICKER_UUID
             )
@@ -237,10 +242,25 @@ def test_download_checks_database_before_storage_and_uses_stored_object_id(avail
     }
 
 
+def test_download_never_reads_storage_for_blocked_record():
+    storage = _Storage()
+
+    with pytest.raises(ra_exc.ResourceNotFoundError):
+        sticker_catalog.download_sticker(
+            object(),
+            USER_UUID,
+            _Repository(resolved=[_record(active=False, blocked=True)]),
+            storage,
+            STICKER_UUID,
+        )
+
+    assert storage.calls == []
+
+
 def test_download_maps_missing_storage_object_to_safe_not_found():
     storage = _Storage(error=sticker_storage.StickerStorageNotFoundError())
 
-    with pytest.raises(sticker_repository.StickerNotFoundError) as error:
+    with pytest.raises(ra_exc.ResourceNotFoundError) as error:
         sticker_catalog.download_sticker(
             object(),
             USER_UUID,
@@ -290,4 +310,64 @@ def test_star_propagates_safe_hidden_blocked_or_missing_rejection():
     with pytest.raises(sticker_repository.StickerNotVisibleError):
         sticker_catalog.star_sticker(
             object(), USER_UUID, RejectingRepository(), STICKER_UUID
+        )
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {},
+        {"uuid": sys_uuid.uuid4()},
+        {"format": "png"},
+        {"width": 1},
+        {"height": 1},
+        {"size_bytes": 1},
+        {"sha256": "a" * 64},
+        {"media_object_id": "stickers/other/media.png"},
+        {"unknown": True},
+    ),
+)
+def test_admin_update_rejects_empty_unknown_and_read_only_fields(values):
+    repository = _Repository(active=_record())
+
+    with pytest.raises(ra_exc.ValidationErrorException):
+        sticker_catalog.update_sticker(object(), repository, STICKER_UUID, values)
+
+    assert repository.calls == []
+
+
+def test_admin_update_returns_persisted_hidden_or_blocked_sticker():
+    session = object()
+    blocked = _record(active=False, blocked=True)
+    repository = _Repository(active=blocked)
+    values = {
+        "title": " Новое название ",
+        "alt_text": "Описание",
+        "emoji": ["✅"],
+        "tags": ["Да"],
+        "category": "sticker",
+        "active": False,
+        "blocked": True,
+    }
+
+    result = sticker_catalog.update_sticker(session, repository, STICKER_UUID, values)
+
+    assert result is blocked.sticker
+    assert result.active is False
+    assert result.blocked is True
+    assert repository.calls == [("update", session, STICKER_UUID, values)]
+
+
+def test_admin_update_uses_no_storage_or_user_project_boundary():
+    parameters = inspect.signature(sticker_catalog.update_sticker).parameters
+    assert tuple(parameters) == ("session", "repository", "sticker_uuid", "values")
+    assert "storage" not in parameters
+    assert "user_uuid" not in parameters
+    assert "project_id" not in parameters
+
+
+def test_admin_update_returns_safe_not_found():
+    with pytest.raises(ra_exc.ResourceNotFoundError):
+        sticker_catalog.update_sticker(
+            object(), _Repository(), STICKER_UUID, {"active": False}
         )

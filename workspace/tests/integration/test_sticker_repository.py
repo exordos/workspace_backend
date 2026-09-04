@@ -316,6 +316,8 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         blocked = repository.update(db, second, {"active": False, "blocked": True})
         assert blocked is not None
         assert blocked.sticker.blocked is True
+        with pytest.raises(sticker_repository.StickerRepositoryValidationError):
+            repository.update(db, third, {"active": True, "blocked": True})
         assert repository.get_active(db, user_uuid, second) is None
         normal_after_hide = repository.list_stickers(db, user_uuid)
         assert first not in {item.uuid for item in normal_after_hide.items}

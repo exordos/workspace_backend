@@ -20,7 +20,8 @@ import json
 import typing
 import uuid as sys_uuid
 
-from workspace.messenger_api import sticker_repository
+from restalchemy.common import exceptions as ra_exc
+
 from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import stickers as sticker_models
 
@@ -30,6 +31,7 @@ MEDIA_CONTENT_TYPES = {
     "webp": "image/webp",
     "png": "image/png",
 }
+STICKER_CATALOG_MANAGE_PERMISSION = "workspace.sticker_catalog.manage"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -222,7 +224,7 @@ def list_public_stickers(
     try:
         actual_page_limit = validate_page_limit(page_limit)
     except (TypeError, ValueError):
-        raise sticker_repository.StickerRepositoryValidationError() from None
+        raise ra_exc.ValidationErrorException() from None
     page = repository.list_stickers(
         session,
         user_uuid,
@@ -257,7 +259,10 @@ def get_public_sticker(
 ) -> dict[str, object]:
     record = repository.get_active(session, user_uuid, sticker_uuid)
     if record is None:
-        raise sticker_repository.StickerNotFoundError()
+        raise ra_exc.ResourceNotFoundError(
+            resource="Sticker",
+            path=str(sticker_uuid),
+        )
     return _public_record(record)
 
 
@@ -281,13 +286,19 @@ def download_sticker(
     """Read media only after the catalog row is known to be downloadable."""
 
     records = repository.resolve_batch(session, user_uuid, [sticker_uuid])
-    if not records:
-        raise sticker_repository.StickerNotFoundError()
+    if not records or records[0].sticker.blocked:
+        raise ra_exc.ResourceNotFoundError(
+            resource="Sticker",
+            path=str(sticker_uuid),
+        )
     sticker = records[0].sticker
     try:
         body = storage.read(sticker.media_object_id)
     except sticker_storage.StickerStorageNotFoundError:
-        raise sticker_repository.StickerNotFoundError() from None
+        raise ra_exc.ResourceNotFoundError(
+            resource="Sticker",
+            path=str(sticker_uuid),
+        ) from None
     return StickerHttpResponse(
         body=body,
         status=200,
@@ -319,6 +330,27 @@ def unstar_sticker(
     """Idempotently remove one sticker from the current user's favorites."""
 
     repository.unstar(session, user_uuid, sticker_uuid)
+
+
+def update_sticker(
+    session: typing.Any,
+    repository: typing.Any,
+    sticker_uuid: sys_uuid.UUID,
+    values: dict[str, typing.Any],
+) -> sticker_models.Sticker:
+    """Update only catalog metadata; media identity remains immutable."""
+
+    if not isinstance(values, dict) or not values:
+        raise ra_exc.ValidationErrorException()
+    if set(values).difference(sticker_models.STICKER_ADMIN_MUTABLE_FIELDS):
+        raise ra_exc.ValidationErrorException()
+    record = repository.update_admin_fields(session, sticker_uuid, values)
+    if record is None:
+        raise ra_exc.ResourceNotFoundError(
+            resource="Sticker",
+            path=str(sticker_uuid),
+        )
+    return typing.cast(sticker_models.Sticker, record.sticker)
 
 
 def validate_query(value: str) -> str:
