@@ -58,6 +58,7 @@ class StickerController(ra_controllers.BaseResourceController):
         convert_underscore=False,
         process_filters=False,
     )
+    __filter_param__ = None
     __generate_location_for__ = ()
 
     def _repository(self) -> sticker_repository.StickerRepository:

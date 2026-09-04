@@ -364,6 +364,7 @@ def test_runtime_routes_mount_same_catalog_under_both_api_roots():
     assert sticker_routes.StickerRoute.download.is_invoke() is False
     assert sticker_routes.StickerRoute.star.is_invoke() is True
     assert sticker_routes.StickerRoute.unstar.is_invoke() is True
+    assert sticker_controllers.StickerController.__filter_param__ is None
 
 
 @pytest.mark.parametrize(
