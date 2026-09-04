@@ -8,6 +8,7 @@ from unittest import mock
 
 import webob
 from restalchemy.api import applications
+from restalchemy.api import constants
 from restalchemy.api import contexts
 
 from workspace.messenger_api.api import app as messenger_app
@@ -241,6 +242,7 @@ def _build_openapi(app_module):
     request = webob.Request.blank(f"/specifications/{OPENAPI_VERSION}")
     request.application = application
     request.api_context = contexts.RequestContext(request)
+    request.api_context.set_active_method(constants.GET)
 
     specification = application.openapi_engine.build_openapi_specification(
         OPENAPI_VERSION,
