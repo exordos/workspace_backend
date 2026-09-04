@@ -14,10 +14,31 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import dataclasses
+import hashlib
+import json
 import typing
 import uuid as sys_uuid
 
+from workspace.messenger_api import sticker_repository
+from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import stickers as sticker_models
+
+
+MEDIA_CONTENT_TYPES = {
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "png": "image/png",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class StickerHttpResponse:
+    """An application result that the RestAlchemy controller can return verbatim."""
+
+    body: bytes | None
+    status: int
+    headers: dict[str, str]
 
 
 class NormalizedStickerFields(typing.TypedDict):
@@ -161,6 +182,121 @@ def public_card_dict(card: sticker_models.StickerCard) -> dict[str, object]:
         "media": media_dict,
         "is_favorite": card.is_favorite,
     }
+
+
+def _public_record(record: typing.Any) -> dict[str, object]:
+    return public_card_dict(
+        build_public_card(record.sticker, is_favorite=record.is_favorite)
+    )
+
+
+def _stable_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _etag(value: bytes) -> str:
+    return '"%s"' % hashlib.sha256(value).hexdigest()
+
+
+def list_public_stickers(
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any,
+    *,
+    q: str | None = None,
+    favorite: bool = False,
+    uuids: typing.Iterable[sys_uuid.UUID] | None = None,
+    category: str | None = None,
+    format: str | None = None,
+    page_limit: int | None = None,
+    page_marker: str | None = None,
+    if_none_match: str | None = None,
+) -> StickerHttpResponse:
+    """Build one private, stable JSON catalog page for the current user."""
+
+    try:
+        actual_page_limit = validate_page_limit(page_limit)
+    except (TypeError, ValueError):
+        raise sticker_repository.StickerRepositoryValidationError() from None
+    page = repository.list_stickers(
+        session,
+        user_uuid,
+        q=q,
+        favorite=favorite,
+        uuids=uuids,
+        category=category,
+        format=format,
+        page_limit=actual_page_limit,
+        page_marker=page_marker,
+    )
+    body = _stable_json_bytes([_public_record(record) for record in page.items])
+    etag = _etag(body)
+    headers = {
+        "Cache-Control": "private, no-cache",
+        "Content-Type": "application/json; charset=UTF-8",
+        "ETag": etag,
+        "X-Pagination-Limit": str(actual_page_limit),
+    }
+    if page.next_marker is not None:
+        headers["X-Pagination-Marker"] = page.next_marker
+    if if_none_match == etag:
+        return StickerHttpResponse(body=None, status=304, headers=headers)
+    return StickerHttpResponse(body=body, status=200, headers=headers)
+
+
+def get_public_sticker(
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any,
+    sticker_uuid: sys_uuid.UUID,
+) -> dict[str, object]:
+    record = repository.get_active(session, user_uuid, sticker_uuid)
+    if record is None:
+        raise sticker_repository.StickerNotFoundError()
+    return _public_record(record)
+
+
+def resolve_public_stickers(
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any,
+    sticker_uuids: typing.Iterable[sys_uuid.UUID],
+) -> list[dict[str, object]]:
+    records = repository.resolve_batch(session, user_uuid, sticker_uuids)
+    return [_public_record(record) for record in records]
+
+
+def download_sticker(
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any,
+    storage: typing.Any,
+    sticker_uuid: sys_uuid.UUID,
+) -> StickerHttpResponse:
+    """Read media only after the catalog row is known to be downloadable."""
+
+    records = repository.resolve_batch(session, user_uuid, [sticker_uuid])
+    if not records:
+        raise sticker_repository.StickerNotFoundError()
+    sticker = records[0].sticker
+    try:
+        body = storage.read(sticker.media_object_id)
+    except sticker_storage.StickerStorageNotFoundError:
+        raise sticker_repository.StickerNotFoundError() from None
+    return StickerHttpResponse(
+        body=body,
+        status=200,
+        headers={
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Content-Type": MEDIA_CONTENT_TYPES[sticker.format],
+            "ETag": '"%s"' % sticker.sha256,
+        },
+    )
 
 
 def validate_query(value: str) -> str:
