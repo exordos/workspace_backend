@@ -59,10 +59,16 @@ class _Session:
 
 
 class _Storage:
-    def __init__(self, *, fail_on_save: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_on_save: int | None = None,
+        fail_on_delete: bool = False,
+    ) -> None:
         self.saved: list[str] = []
         self.deleted: list[str] = []
         self.fail_on_save = fail_on_save
+        self.fail_on_delete = fail_on_delete
 
     def save(
         self,
@@ -80,6 +86,8 @@ class _Storage:
         return sticker_storage.StickerStorageInfo("test", "test", object_id)
 
     def delete(self, storage_object_id: str) -> None:
+        if self.fail_on_delete:
+            raise RuntimeError("cleanup backend details must not escape")
         self.deleted.append(storage_object_id)
 
 
@@ -121,12 +129,22 @@ class _FailingRepository(_Repository):
         raise RuntimeError("SQL details must not escape")
 
 
+class _FailingInsertRepository(_Repository):
+    def insert_batch(
+        self,
+        session: object,
+        values: list[stickers.Sticker],
+    ) -> dict[str, sys_uuid.UUID]:
+        del session, values
+        raise RuntimeError("SQL details must not escape")
+
+
 @contextlib.contextmanager
 def _validated(archive: sticker_import.StickerImportArchive):
     yield archive
 
 
-def test_import_groups_sha_deterministically_and_returns_manifest_order(
+def test_import_uses_first_manifest_sha_item_and_returns_manifest_order(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -154,7 +172,7 @@ def test_import_groups_sha_deterministically_and_returns_manifest_order(
 
     assert result.created == 1
     assert result.duplicates == 1
-    assert [item.status for item in result["items"]] == ["duplicate", "created"]
+    assert [item.status for item in result["items"]] == ["created", "duplicate"]
     assert result["items"][0].sticker_uuid == result["items"][1].sticker_uuid
     assert result["items"][0].file == first.manifest.file
     assert len(storage.saved) == 1
@@ -284,3 +302,154 @@ def test_known_sql_failure_rolls_back_without_storage_writes(
         )
     assert session.rollback_count == 1
     assert storage.saved == []
+
+
+def test_insert_failure_after_multiple_saves_cleans_exact_owned_objects(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _archive_item(
+        tmp_path,
+        "10000000-0000-0000-0000-000000000005",
+        SHA_ONE,
+        b"one",
+    )
+    second = _archive_item(
+        tmp_path,
+        "10000000-0000-0000-0000-000000000006",
+        SHA_TWO,
+        b"two",
+    )
+    archive = sticker_import.StickerImportArchive(
+        manifest=stickers.StickerManifest(schema_version=1, items=[]),
+        items=(first, second),
+        temporary_directory=tmp_path,
+    )
+    monkeypatch.setattr(
+        sticker_import, "validate_archive", lambda source: _validated(archive)
+    )
+    session = _Session()
+    storage = _Storage()
+    with pytest.raises(sticker_import.StickerImportError):
+        sticker_import.import_archive(
+            b"ignored",
+            session,
+            USER_UUID,
+            _FailingInsertRepository(),
+            storage,
+        )
+    assert session.rollback_count == 2
+    assert storage.deleted == storage.saved
+    assert len(storage.deleted) == 2
+
+
+def test_cleanup_failure_is_logged_without_masking_original_error(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    item = _archive_item(
+        tmp_path,
+        "10000000-0000-0000-0000-000000000007",
+        SHA_ONE,
+        b"one",
+    )
+    archive = sticker_import.StickerImportArchive(
+        manifest=stickers.StickerManifest(schema_version=1, items=[]),
+        items=(item,),
+        temporary_directory=tmp_path,
+    )
+    monkeypatch.setattr(
+        sticker_import, "validate_archive", lambda source: _validated(archive)
+    )
+    storage = _Storage(fail_on_delete=True)
+    caplog.set_level("WARNING")
+    with pytest.raises(sticker_import.StickerImportError):
+        sticker_import.import_archive(
+            b"ignored",
+            _Session(),
+            USER_UUID,
+            _FailingInsertRepository(),
+            storage,
+        )
+    assert "cleanup backend details" not in caplog.text
+    assert "Sticker import object cleanup failed" in caplog.text
+
+
+def test_uncertain_caller_commit_does_not_delete_and_retry_is_duplicate(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = _archive_item(
+        tmp_path,
+        "10000000-0000-0000-0000-000000000008",
+        SHA_ONE,
+        b"one",
+    )
+    archive = sticker_import.StickerImportArchive(
+        manifest=stickers.StickerManifest(schema_version=1, items=[]),
+        items=(item,),
+        temporary_directory=tmp_path,
+    )
+    monkeypatch.setattr(
+        sticker_import, "validate_archive", lambda source: _validated(archive)
+    )
+    storage = _Storage()
+    repository = _Repository()
+    result = sticker_import.import_archive(
+        b"ignored", _Session(), USER_UUID, repository, storage
+    )
+    assert result.created == 1
+    assert storage.deleted == []
+
+    class _UncertainCommit:
+        def commit(self) -> None:
+            raise OSError("commit outcome is unknown")
+
+    with pytest.raises(OSError):
+        _UncertainCommit().commit()
+    retry = sticker_import.import_archive(
+        b"ignored", _Session(), USER_UUID, repository, storage
+    )
+    assert retry.created == 0
+    assert retry.duplicates == 1
+    assert retry["items"][0].status == "duplicate"
+    assert len(storage.saved) == 1
+
+
+def test_mixed_existing_and_new_sha_has_per_item_status(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing_uuid = sys_uuid.UUID("40000000-0000-0000-0000-000000000000")
+    first = _archive_item(
+        tmp_path,
+        "10000000-0000-0000-0000-000000000009",
+        SHA_ONE,
+        b"one",
+    )
+    second = _archive_item(
+        tmp_path,
+        "10000000-0000-0000-0000-000000000010",
+        SHA_TWO,
+        b"two",
+    )
+    archive = sticker_import.StickerImportArchive(
+        manifest=stickers.StickerManifest(schema_version=1, items=[]),
+        items=(first, second),
+        temporary_directory=tmp_path,
+    )
+    monkeypatch.setattr(
+        sticker_import, "validate_archive", lambda source: _validated(archive)
+    )
+    storage = _Storage()
+    result = sticker_import.import_archive(
+        b"ignored",
+        _Session(),
+        USER_UUID,
+        _Repository({SHA_ONE: existing_uuid}),
+        storage,
+    )
+    assert [item.status for item in result["items"]] == ["duplicate", "created"]
+    assert result["items"][0].sticker_uuid == existing_uuid
+    assert len(storage.saved) == 1

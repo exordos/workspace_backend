@@ -420,10 +420,8 @@ def _import_validated_archive(
     for item in archive.items:
         by_sha.setdefault(item.sha256, []).append(item)
 
-    representatives = {
-        sha: min(group, key=lambda value: str(value.manifest.client_id))
-        for sha, group in by_sha.items()
-    }
+    # D-13 makes the first manifest item the deterministic winner for a SHA.
+    representatives = {sha: group[0] for sha, group in by_sha.items()}
     sha_values = sorted(by_sha)
     existing = repository.find_duplicates(session, sha_values)
     missing = [value for value in sha_values if value not in existing]
