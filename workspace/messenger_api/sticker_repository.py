@@ -10,6 +10,7 @@ parsing, permission checks, and media storage stay outside this module.
 
 import base64
 import binascii
+import collections.abc as collections_abc
 import dataclasses
 import datetime
 import hashlib
@@ -94,6 +95,7 @@ class StickerPage:
 @dataclasses.dataclass(frozen=True)
 class _Query:
     q: str
+    tag_query: str
     favorite: bool
     category: str | None
     format: str | None
@@ -257,6 +259,7 @@ class StickerRepository:
                 raise ValueError("q must be a string")
             if type(favorite) is not bool:
                 raise ValueError("favorite must be a boolean")
+            raw_q = sticker_catalog.normalize_whitespace(q or "").lower()
             normalized_q = sticker_catalog.validate_query(q or "")
             normalized_limit = sticker_catalog.validate_page_limit(page_limit)
             if (
@@ -288,6 +291,7 @@ class StickerRepository:
         )
         return _Query(
             q=normalized_q,
+            tag_query=raw_q,
             favorite=bool(favorite),
             category=category,
             format=format,
@@ -330,7 +334,44 @@ class StickerRepository:
                 raise StickerRepositoryValidationError()
             marker_values = _parse_marker_values(payload, query.sort)
         rows, params = self._list_statement(query, user_uuid, marker_values)
-        result_rows = session.execute(rows, params).fetchall()
+        if query.q:
+            connection = getattr(session, "_conn", session)
+            is_autocommit = bool(getattr(connection, "autocommit", False))
+            previous_row = session.execute(
+                "SELECT show_limit() AS threshold"
+            ).fetchone()
+            previous_limit = (
+                previous_row["threshold"]
+                if isinstance(previous_row, collections_abc.Mapping)
+                else previous_row[0]
+            )
+            if is_autocommit:
+                session.execute("SELECT set_limit(%s::real)", (0.1,))
+            else:
+                session.execute(
+                    "SELECT set_config('pg_trgm.similarity_threshold', %s, true)",
+                    ("0.1",),
+                )
+            try:
+                result_rows = session.execute(rows, params).fetchall()
+            finally:
+                try:
+                    if is_autocommit:
+                        session.execute(
+                            "SELECT set_limit(%s::real)",
+                            (previous_limit,),
+                        )
+                    else:
+                        session.execute(
+                            "SELECT set_config('pg_trgm.similarity_threshold', %s, true)",
+                            (str(previous_limit),),
+                        )
+                except Exception:
+                    # The caller owns rollback/connection lifecycle; never
+                    # replace a query error with threshold restoration noise.
+                    pass
+        else:
+            result_rows = session.execute(rows, params).fetchall()
         has_next = len(result_rows) > query.page_limit
         if has_next:
             result_rows = result_rows[: query.page_limit]
@@ -364,16 +405,19 @@ class StickerRepository:
     ) -> tuple[str, tuple[typing.Any, ...]]:
         query_rank = "0.0"
         rank_params: list[typing.Any] = []
-        match_clause = ""
-        match_params: list[typing.Any] = []
+        candidate_from = "m_workspace_stickers AS s"
+        candidate_params: list[typing.Any] = []
         if query.q:
             # Tags retain their original ё spelling, while search_text stores
-            # the canonical е spelling.  Both tag operands remain GIN-indexed.
-            alternate_tag = query.q.replace("е", "ё")
-            tag_match = "s.tags @> ARRAY[%s]::text[] OR s.tags @> ARRAY[%s]::text[]"
+            # the canonical е spelling.  Ranking keeps tag normalization; the
+            # candidate branches use only raw indexed search predicates.
+            tag_match = "replace(lower(tag.value), 'ё', 'е') = %s"
             query_rank = """
                 CASE
-                  WHEN {tag_match} THEN 4.0
+                  WHEN EXISTS (
+                    SELECT 1 FROM unnest(s.tags) AS tag(value)
+                    WHERE {tag_match}
+                  ) THEN 4.0
                   WHEN replace(lower(s.title), 'ё', 'е') = %s THEN 3.0
                   WHEN replace(lower(s.title), 'ё', 'е') LIKE %s || '%%' THEN 2.0
                   WHEN s.search_text LIKE '%%' || %s || '%%'
@@ -381,31 +425,7 @@ class StickerRepository:
                   ELSE similarity(s.search_text, %s)
                 END
             """.format(tag_match=tag_match)
-            rank_params = [
-                query.q,
-                alternate_tag,
-                query.q,
-                query.q,
-                query.q,
-                query.q,
-            ]
-            match_clause = """
-                (
-                  ({tag_match})
-                  OR replace(lower(s.title), 'ё', 'е') = %s
-                  OR replace(lower(s.title), 'ё', 'е') LIKE %s || '%%'
-                  OR s.search_text LIKE '%%' || %s || '%%'
-                  OR similarity(s.search_text, %s) >= 0.1
-                )
-            """.format(tag_match=tag_match)
-            match_params = [
-                query.q,
-                alternate_tag,
-                query.q,
-                query.q,
-                query.q,
-                query.q,
-            ]
+            rank_params = [query.q] * 5
 
         where = ["s.blocked = FALSE"]
         uuid_batch = bool(query.uuids and not query.q and not query.favorite)
@@ -415,9 +435,54 @@ class StickerRepository:
         where.extend((query.format and "s.format = %s",) if query.format else ())
         if query.uuids:
             where.append("s.uuid = ANY(%s::uuid[])")
-        where.append(match_clause)
         if query.favorite:
             where.append("favorite.sticker_uuid IS NOT NULL")
+        if query.q:
+            candidate_where = [
+                part.replace("s.", "candidate.")
+                for part in where
+                if "favorite." not in part
+            ]
+            candidate_where_sql = " AND ".join(candidate_where)
+            candidate_from = """(
+                SELECT candidate.*
+                  FROM m_workspace_stickers AS candidate
+                 WHERE {where} AND candidate.tags @> ARRAY[%s]::text[]
+                UNION
+                SELECT candidate.*
+                  FROM m_workspace_stickers AS candidate
+                 WHERE {where} AND candidate.tags @> ARRAY[%s]::text[]
+                UNION
+                SELECT candidate.*
+                  FROM m_workspace_stickers AS candidate
+                 WHERE {where} AND candidate.search_text LIKE '%%' || %s || '%%'
+                UNION
+                SELECT candidate.*
+                  FROM m_workspace_stickers AS candidate
+                 WHERE {where} AND candidate.search_text %% %s
+            ) AS s""".format(where=candidate_where_sql)
+            for value in (
+                query.q,
+                query.tag_query,
+                query.q,
+                query.q,
+            ):
+                if query.category:
+                    candidate_params.append(query.category)
+                if query.format:
+                    candidate_params.append(query.format)
+                if query.uuids:
+                    candidate_params.append(list(query.uuids))
+                candidate_params.append(value)
+            where = [
+                part
+                for part in where
+                if not (
+                    part.startswith("s.category")
+                    or part.startswith("s.format")
+                    or part.startswith("s.uuid")
+                )
+            ]
         outer_where = ""
         marker_params: list[typing.Any] = []
         if marker_values is not None:
@@ -477,7 +542,7 @@ class StickerRepository:
                      favorite.created_at AS favorite_created_at,
                      favorite.sticker_uuid IS NOT NULL AS is_favorite,
                      {rank} AS rank
-                FROM m_workspace_stickers AS s
+                FROM {candidate_from}
                 LEFT JOIN m_workspace_sticker_favorites AS favorite
                   ON favorite.sticker_uuid = s.uuid
                  AND favorite.user_uuid = %s
@@ -490,20 +555,22 @@ class StickerRepository:
         """.format(
             columns=columns,
             rank=query_rank,
+            candidate_from=candidate_from,
             where=" AND ".join(part for part in where if part),
             outer_where=outer_where,
             order=order,
         )
         params: list[typing.Any] = []
         params.extend(rank_params)
+        params.extend(candidate_params)
         params.append(user_uuid)
-        if query.category:
-            params.append(query.category)
-        if query.format:
-            params.append(query.format)
-        if query.uuids:
-            params.append(list(query.uuids))
-        params.extend(match_params)
+        if not query.q:
+            if query.category:
+                params.append(query.category)
+            if query.format:
+                params.append(query.format)
+            if query.uuids:
+                params.append(list(query.uuids))
         params.extend(marker_params)
         params.append(query.page_limit + 1)
         return statement, tuple(params)
@@ -530,6 +597,27 @@ class StickerRepository:
         return self._record_from_row(rows[0]) if rows else None
 
     get = get_active
+
+    def get_any(
+        self,
+        session: typing.Any,
+        user_uuid: sys_uuid.UUID,
+        sticker_uuid: sys_uuid.UUID,
+    ) -> StickerRecord | None:
+        """Get any row, including hidden/blocked admin records and favorite state."""
+
+        rows = session.execute(
+            """
+            SELECT s.*, favorite.created_at AS favorite_created_at,
+                   favorite.sticker_uuid IS NOT NULL AS is_favorite
+              FROM m_workspace_stickers AS s
+              LEFT JOIN m_workspace_sticker_favorites AS favorite
+                ON favorite.sticker_uuid = s.uuid AND favorite.user_uuid = %s
+             WHERE s.uuid = %s
+            """,
+            (user_uuid, sticker_uuid),
+        ).fetchall()
+        return self._record_from_row(rows[0]) if rows else None
 
     def resolve_batch(
         self,

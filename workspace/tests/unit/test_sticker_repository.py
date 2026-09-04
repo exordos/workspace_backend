@@ -111,14 +111,29 @@ def test_search_parameter_order_matches_cte_placeholder_order() -> None:
     )
     statement, params = repository._list_statement(query, user_uuid, None)
     assert statement.count("%s") == len(params)
-    assert "unnest(s.tags)" not in statement
+    assert "unnest(s.tags)" in statement
     assert "replace(lower(s.search_text)" not in statement
     assert "s.search_text LIKE" in statement
-    assert params[:6] == ("кот",) * 6
-    assert params[6] == user_uuid
-    assert params[7:9] == ("sticker", "png")
-    assert params[9] == [first]
-    assert params[10:] == ("кот",) * 6 + (11,)
+    assert params[:5] == ("кот",) * 5
+    assert params[5:9] == ("sticker", "png", [first], "кот")
+    assert params[9:13] == ("sticker", "png", [first], "кот")
+    assert params[13:17] == ("sticker", "png", [first], "кот")
+    assert params[17:21] == ("sticker", "png", [first], "кот")
+    assert params[21] == user_uuid
+    assert params[22:] == (11,)
+
+
+def test_search_keeps_raw_yo_spelling_for_exact_tag_candidates() -> None:
+    query = sticker_repository.StickerRepository()._query(
+        q="берёза",
+        favorite=False,
+        category=None,
+        format=None,
+        uuids=None,
+        page_limit=10,
+    )
+    assert query.q == "береза"
+    assert query.tag_query == "берёза"
 
 
 def test_uuid_only_batch_allows_hidden_but_search_and_favorite_do_not() -> None:
