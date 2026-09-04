@@ -71,6 +71,17 @@ class StickerImportArchive:
     temporary_directory: pathlib.Path
 
 
+@dataclasses.dataclass
+class _ByteBudget:
+    limit: int
+    used: int = 0
+
+    def consume(self, amount: int) -> None:
+        if self.used + amount > self.limit:
+            _invalid("Archive exceeds the unpacked size limit")
+        self.used += amount
+
+
 def _invalid(message: str, error: BaseException | None = None) -> typing.NoReturn:
     if error is None:
         raise StickerImportValidationError(message)
@@ -163,6 +174,8 @@ def _preflight_entries(
         elif name.startswith("media/"):
             if pathlib.PurePosixPath(name).suffix.lower() in _ARCHIVE_SUFFIXES:
                 _invalid("Archive contains a nested archive")
+            if info.file_size <= 0:
+                _invalid("Media file must not be empty")
             if info.file_size > MAX_MEDIA_BYTES:
                 _invalid("Media file exceeds the size limit")
             media_entries[name] = info
@@ -180,18 +193,29 @@ def _preflight_entries(
 def _read_manifest(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
-) -> stickers.StickerManifest:
+    budget: _ByteBudget,
+) -> tuple[stickers.StickerManifest, int]:
     try:
+        content = io.BytesIO()
+        actual_size = 0
         with archive.open(info, "r") as source:
-            content = source.read(MAX_UNPACKED_BYTES + 1)
-            if len(content) > MAX_UNPACKED_BYTES:
-                _invalid("Manifest exceeds the archive size limit")
-        value = json.loads(content.decode("utf-8"))
+            while True:
+                chunk = source.read(_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                if not isinstance(chunk, bytes):
+                    _invalid("Manifest must contain binary data")
+                budget.consume(len(chunk))
+                actual_size += len(chunk)
+                content.write(chunk)
+        if actual_size != info.file_size:
+            _invalid("Manifest size does not match the archive entry")
+        value = json.loads(content.getvalue().decode("utf-8"))
         manifest = stickers.StickerManifest.from_simple_type(value)
         manifest.validate()
         for item in manifest["items"]:
             item.validate()
-        return manifest
+        return manifest, actual_size
     except StickerImportValidationError:
         raise
     except (
@@ -211,6 +235,7 @@ def _extract_media(
     info: zipfile.ZipInfo,
     destination: pathlib.Path,
     expected_size: int,
+    budget: _ByteBudget,
 ) -> tuple[int, str]:
     digest = hashlib.sha256()
     total = 0
@@ -221,6 +246,7 @@ def _extract_media(
                 if not chunk:
                     break
                 total += len(chunk)
+                budget.consume(len(chunk))
                 if total > MAX_MEDIA_BYTES or total > expected_size:
                     _invalid("Media file exceeds the declared size")
                 digest.update(chunk)
@@ -241,7 +267,8 @@ def _validate_zip(
     try:
         with zipfile.ZipFile(archive_path, "r") as archive:
             manifest_info, media_entries, unpacked_size = _preflight_entries(archive)
-            manifest = _read_manifest(archive, manifest_info)
+            budget = _ByteBudget(MAX_UNPACKED_BYTES)
+            manifest, _manifest_size = _read_manifest(archive, manifest_info, budget)
             items = manifest["items"]
             if len(items) > MAX_ITEMS:
                 _invalid("Archive contains too many items")
@@ -267,7 +294,10 @@ def _validate_zip(
                     info,
                     destination,
                     info.file_size,
+                    budget,
                 )
+                if size_bytes <= 0:
+                    _invalid("Media file must not be empty")
                 if digest != item.sha256:
                     _invalid("Media checksum does not match the manifest")
                 extracted.append(

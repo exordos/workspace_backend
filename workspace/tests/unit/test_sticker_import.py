@@ -80,6 +80,14 @@ def test_valid_archive_extracts_arbitrary_declared_image_bytes_and_cleans_up():
     assert not temporary_directory.exists()
 
 
+def test_empty_media_is_rejected_even_with_valid_manifest_metadata():
+    item = _item(data=b"")
+
+    with pytest.raises(sticker_import.StickerImportValidationError):
+        with sticker_import.validate_archive(_archive([item], {item["file"]: b""})):
+            pass
+
+
 @pytest.mark.parametrize(
     "manifest",
     [
@@ -254,6 +262,27 @@ def test_item_count_and_crc_errors_are_rejected():
         with pytest.raises(sticker_import.StickerImportValidationError):
             with sticker_import.validate_archive(payload):
                 pass
+
+
+def test_actual_streamed_bytes_cannot_exceed_cumulative_unpacked_limit(monkeypatch):
+    item = _item(data=b"small")
+    payload = _archive([item], {item["file"]: b"small"})
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        declared_total = sum(info.file_size for info in archive.infolist())
+    monkeypatch.setattr(sticker_import, "MAX_UNPACKED_BYTES", declared_total)
+    original_open = sticker_import.zipfile.ZipFile.open
+
+    def overread_media(archive, info, *args, **kwargs):
+        if info.filename.startswith("media/"):
+            with original_open(archive, info, *args, **kwargs) as source:
+                return io.BytesIO(source.read() + b"extra")
+        return original_open(archive, info, *args, **kwargs)
+
+    with mock.patch.object(sticker_import.zipfile.ZipFile, "open", overread_media):
+        with pytest.raises(sticker_import.StickerImportValidationError) as error:
+            with sticker_import.validate_archive(payload):
+                pass
+    assert str(error.value) == "Archive exceeds the unpacked size limit"
 
 
 def test_temporary_directory_is_cleaned_after_validation_error(tmp_path, monkeypatch):
