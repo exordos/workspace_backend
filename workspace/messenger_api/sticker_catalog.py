@@ -143,12 +143,13 @@ def sticker_download_url(sticker_uuid: sys_uuid.UUID) -> str:
 def build_public_card(
     sticker: sticker_models.Sticker,
     is_favorite: bool = False,
+    media_url_root: str = "/api/workspace/v1/messenger/stickers",
 ) -> sticker_models.StickerCard:
     media = sticker_models.StickerMedia(
         format=sticker.format,
         width=sticker.width,
         height=sticker.height,
-        url=sticker_download_url(sticker.uuid),
+        url=f"{media_url_root.rstrip('/')}/{sticker.uuid}/actions/download",
     )
     return sticker_models.StickerCard(
         id=sticker.uuid,
@@ -186,9 +187,16 @@ def public_card_dict(card: sticker_models.StickerCard) -> dict[str, object]:
     }
 
 
-def _public_record(record: typing.Any) -> dict[str, object]:
+def _public_record(
+    record: typing.Any,
+    media_url_root: str = "/api/workspace/v1/messenger/stickers",
+) -> dict[str, object]:
     return public_card_dict(
-        build_public_card(record.sticker, is_favorite=record.is_favorite)
+        build_public_card(
+            record.sticker,
+            is_favorite=record.is_favorite,
+            media_url_root=media_url_root,
+        )
     )
 
 
@@ -218,6 +226,7 @@ def list_public_stickers(
     page_limit: int | None = None,
     page_marker: str | None = None,
     if_none_match: str | None = None,
+    media_url_root: str = "/api/workspace/v1/messenger/stickers",
 ) -> StickerHttpResponse:
     """Build one private, stable JSON catalog page for the current user."""
 
@@ -236,7 +245,9 @@ def list_public_stickers(
         page_limit=actual_page_limit,
         page_marker=page_marker,
     )
-    body = _stable_json_bytes([_public_record(record) for record in page.items])
+    body = _stable_json_bytes(
+        [_public_record(record, media_url_root) for record in page.items]
+    )
     etag = _etag(body)
     headers = {
         "Cache-Control": "private, no-cache",
@@ -256,6 +267,7 @@ def get_public_sticker(
     user_uuid: sys_uuid.UUID,
     repository: typing.Any,
     sticker_uuid: sys_uuid.UUID,
+    media_url_root: str = "/api/workspace/v1/messenger/stickers",
 ) -> dict[str, object]:
     record = repository.get_active(session, user_uuid, sticker_uuid)
     if record is None:
@@ -263,7 +275,7 @@ def get_public_sticker(
             resource="Sticker",
             path=str(sticker_uuid),
         )
-    return _public_record(record)
+    return _public_record(record, media_url_root)
 
 
 def resolve_public_stickers(

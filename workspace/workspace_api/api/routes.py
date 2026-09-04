@@ -6,6 +6,7 @@
 from restalchemy.api import routes
 
 from workspace.messenger_api.api import routes as messenger_routes
+from workspace.messenger_api.api import sticker_routes
 from workspace.user_api.api import routes as user_routes
 from workspace.workspace_api.api import controllers
 
@@ -43,6 +44,7 @@ class MessengerRoute(routes.Route):
         messenger_routes.WorkspaceMessageReactionRoute,
     )
     files = routes.route(messenger_routes.WorkspaceFileRoute)
+    stickers = routes.route(sticker_routes.StickerRoute)
 
 
 class ServiceRoute(user_routes.ServiceRoute):

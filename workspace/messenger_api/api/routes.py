@@ -20,6 +20,7 @@ from restalchemy.api import constants
 from restalchemy.api import routes
 
 from workspace.messenger_api.api import controllers
+from workspace.messenger_api.api import sticker_routes
 
 
 class FolderItemPinAction(routes.Action):
@@ -463,5 +464,6 @@ class ApiEndpointRoute(routes.Route):
     topic_summary_settings = routes.route(TopicSummarySettingsRoute)
     message_reactions = routes.route(WorkspaceMessageReactionRoute)
     files = routes.route(WorkspaceFileRoute)
+    stickers = routes.route(sticker_routes.StickerRoute)
     users = routes.route(WorkspaceUserRoute)
     me = routes.route(MeRoute)
