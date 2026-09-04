@@ -29,6 +29,7 @@ import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exc
 
+from workspace.common import database
 from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
 from workspace.messenger_api import sticker_storage
@@ -394,7 +395,7 @@ def _cleanup_failed_import(
     owned_objects: collections_abc.Iterable[str],
 ) -> None:
     try:
-        session.rollback()
+        database.rollback_current_session(session)
     except Exception as error:  # pragma: no cover - defensive backend boundary
         LOG.warning(
             "Sticker import rollback failed (%s)",
@@ -416,25 +417,25 @@ def _import_validated_archive(
     repository: typing.Any,
     storage: sticker_storage.StickerStorage,
 ) -> stickers.StickerImportResult:
-    by_sha: dict[str, list[StickerImportItem]] = {}
-    for item in archive.items:
-        by_sha.setdefault(item.sha256, []).append(item)
-
-    # D-13 makes the first manifest item the deterministic winner for a SHA.
-    representatives = {sha: group[0] for sha, group in by_sha.items()}
-    sha_values = sorted(by_sha)
-    existing = repository.find_duplicates(session, sha_values)
-    missing = [value for value in sha_values if value not in existing]
-
-    if missing:
-        _lock_sha256_values(session, missing)
-        existing.update(repository.find_duplicates(session, missing))
-    missing = [value for value in sha_values if value not in existing]
-
     owned_objects: list[str] = []
-    candidates: list[stickers.Sticker] = []
-    candidate_by_sha: dict[str, stickers.Sticker] = {}
     try:
+        by_sha: dict[str, list[StickerImportItem]] = {}
+        for item in archive.items:
+            by_sha.setdefault(item.sha256, []).append(item)
+
+        # D-13 makes the first manifest item the deterministic winner for a SHA.
+        representatives = {sha: group[0] for sha, group in by_sha.items()}
+        sha_values = sorted(by_sha)
+        existing = repository.find_duplicates(session, sha_values)
+        missing = [value for value in sha_values if value not in existing]
+
+        if missing:
+            _lock_sha256_values(session, missing)
+            existing.update(repository.find_duplicates(session, missing))
+        missing = [value for value in sha_values if value not in existing]
+
+        candidates: list[stickers.Sticker] = []
+        candidate_by_sha: dict[str, stickers.Sticker] = {}
         for sha in missing:
             item = representatives[sha]
             sticker_uuid = sys_uuid.uuid4()
@@ -519,32 +520,9 @@ def import_archive(
         storage if storage is not None else sticker_storage.get_sticker_storage()
     )
     with validate_archive(source) as archive:
-        try:
-            return _import_validated_archive(
-                archive,
-                session,
-                active_repository,
-                active_storage,
-            )
-        except StickerImportValidationError:
-            raise
-        except ra_exc.RestAlchemyException:
-            # The inner operation already compensates uploaded objects.  The
-            # extra rollback also covers errors before the first upload.
-            try:
-                session.rollback()
-            except Exception as error:  # pragma: no cover - defensive boundary
-                LOG.warning(
-                    "Sticker import rollback failed (%s)",
-                    type(error).__name__,
-                )
-            raise
-        except Exception as error:
-            try:
-                session.rollback()
-            except Exception as rollback_error:  # pragma: no cover
-                LOG.warning(
-                    "Sticker import rollback failed (%s)",
-                    type(rollback_error).__name__,
-                )
-            raise StickerImportError() from error
+        return _import_validated_archive(
+            archive,
+            session,
+            active_repository,
+            active_storage,
+        )

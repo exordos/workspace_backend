@@ -221,7 +221,7 @@ def test_import_storage_failure_rolls_back_and_cleans_owned_objects(
             storage,
         )
 
-    assert session.rollback_count == 2
+    assert session.rollback_count == 1
     assert storage.deleted == storage.saved
 
 
@@ -343,7 +343,7 @@ def test_insert_failure_after_multiple_saves_cleans_exact_owned_objects(
             _FailingInsertRepository(),
             storage,
         )
-    assert session.rollback_count == 2
+    assert session.rollback_count == 1
     assert storage.deleted == storage.saved
     assert len(storage.deleted) == 2
 
