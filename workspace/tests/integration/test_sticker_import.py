@@ -54,7 +54,11 @@ def _item(
 
 
 def _connection() -> psycopg.Connection:
-    return psycopg.connect(TEST_DB_URL, autocommit=False)
+    return psycopg.connect(
+        TEST_DB_URL,
+        autocommit=False,
+        row_factory=psycopg.rows.dict_row,
+    )
 
 
 def _delete_stickers(connection: psycopg.Connection) -> None:
@@ -172,7 +176,8 @@ def test_real_postgres_concurrent_same_sha_has_one_winner(
                     "SELECT count(*) FROM m_workspace_stickers WHERE sha256 = %s",
                     (hashlib.sha256(data).hexdigest(),),
                 )
-                assert cursor.fetchone()[0] == 1
+                row = cursor.fetchone()
+                assert row["count"] == 1
         finally:
             connection.close()
     finally:
