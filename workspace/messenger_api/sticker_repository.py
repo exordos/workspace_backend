@@ -14,6 +14,7 @@ import dataclasses
 import datetime
 import hashlib
 import json
+import math
 import re
 import typing
 import uuid as sys_uuid
@@ -229,7 +230,11 @@ def _parse_marker_values(
     if expected_count == 2:
         return marker_time, marker_uuid
     rank = values[0]
-    if isinstance(rank, bool) or not isinstance(rank, (int, float)):
+    if (
+        isinstance(rank, bool)
+        or not isinstance(rank, (int, float))
+        or not math.isfinite(float(rank))
+    ):
         raise StickerRepositoryValidationError()
     return float(rank), marker_time, marker_uuid
 
@@ -474,15 +479,16 @@ class StickerRepository:
             outer_where=outer_where,
             order=order,
         )
-        params: list[typing.Any] = [user_uuid]
+        params: list[typing.Any] = []
         params.extend(rank_params)
-        params.extend(match_params)
+        params.append(user_uuid)
         if query.category:
             params.append(query.category)
         if query.format:
             params.append(query.format)
         if query.uuids:
             params.append(list(query.uuids))
+        params.extend(match_params)
         params.extend(marker_params)
         params.append(query.page_limit + 1)
         return statement, tuple(params)

@@ -95,3 +95,39 @@ def test_query_selects_each_d01_sort_and_parameterizes_search() -> None:
         assert "кот" not in statement
         assert "AND AND" not in statement
         assert statement.count("%s") == len(params)
+
+
+def test_search_parameter_order_matches_cte_placeholder_order() -> None:
+    repository = sticker_repository.StickerRepository()
+    user_uuid = sys_uuid.uuid4()
+    first = sys_uuid.uuid4()
+    query = repository._query(
+        q="кот",
+        favorite=False,
+        category="sticker",
+        format="png",
+        uuids=[first],
+        page_limit=10,
+    )
+    statement, params = repository._list_statement(query, user_uuid, None)
+    assert statement.count("%s") == len(params)
+    assert params[:5] == ("кот",) * 5
+    assert params[5] == user_uuid
+    assert params[6:8] == ("sticker", "png")
+    assert params[8] == [first]
+    assert params[9:] == ("кот",) * 5 + (11,)
+
+
+def test_rank_marker_rejects_non_finite_values() -> None:
+    payload = (
+        '{"filters_sha256":"%s","sort":"%s","v":1,'
+        '"values":[NaN,"2026-01-01T00:00:00+00:00",'
+        '"00000000-0000-0000-0000-000000000001"]}'
+        % ("a" * 64, sticker_repository.SORT_RANK_UPDATED)
+    )
+    marker = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    decoded = sticker_repository.decode_page_marker(marker)
+    with pytest.raises(sticker_repository.StickerRepositoryValidationError):
+        sticker_repository._parse_marker_values(
+            decoded, sticker_repository.SORT_RANK_UPDATED
+        )
