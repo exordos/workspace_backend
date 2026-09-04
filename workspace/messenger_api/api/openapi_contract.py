@@ -1475,7 +1475,10 @@ def add_sticker_catalog_contract(
             },
             "category": {"type": "string", "enum": ["gif", "sticker"]},
             "media": {"$ref": "#/components/schemas/StickerMedia"},
-            "is_favorite": {"type": "boolean"},
+            "is_favorite": {
+                "type": "boolean",
+                "description": "Whether the current user has starred this sticker.",
+            },
         },
         [
             "id",

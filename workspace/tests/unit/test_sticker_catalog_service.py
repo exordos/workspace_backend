@@ -70,6 +70,10 @@ class _Repository:
         self.calls.append(("get", session, user_uuid, sticker_uuid))
         return self.active
 
+    def get_any(self, session, user_uuid, sticker_uuid):
+        self.calls.append(("get_any", session, user_uuid, sticker_uuid))
+        return self.active
+
     def resolve_batch(self, session, user_uuid, sticker_uuids):
         self.calls.append(("resolve", session, user_uuid, list(sticker_uuids)))
         return self.resolved
@@ -331,7 +335,9 @@ def test_admin_update_rejects_empty_unknown_and_read_only_fields(values):
     repository = _Repository(active=_record())
 
     with pytest.raises(ra_exc.ValidationErrorException):
-        sticker_catalog.update_sticker(object(), repository, STICKER_UUID, values)
+        sticker_catalog.update_sticker(
+            object(), USER_UUID, repository, STICKER_UUID, values
+        )
 
     assert repository.calls == []
 
@@ -350,24 +356,43 @@ def test_admin_update_returns_persisted_hidden_or_blocked_sticker():
         "blocked": True,
     }
 
-    result = sticker_catalog.update_sticker(session, repository, STICKER_UUID, values)
+    result = sticker_catalog.update_sticker(
+        session,
+        USER_UUID,
+        repository,
+        STICKER_UUID,
+        values,
+    )
 
-    assert result is blocked.sticker
-    assert result.active is False
-    assert result.blocked is True
-    assert repository.calls == [("update", session, STICKER_UUID, values)]
+    assert result is blocked
+    assert result.sticker.active is False
+    assert result.sticker.blocked is True
+    assert result.is_favorite is True
+    assert repository.calls == [
+        ("update", session, STICKER_UUID, values),
+        ("get_any", session, USER_UUID, STICKER_UUID),
+    ]
 
 
-def test_admin_update_uses_no_storage_or_user_project_boundary():
+def test_admin_update_uses_user_favorite_but_no_storage_or_project_boundary():
     parameters = inspect.signature(sticker_catalog.update_sticker).parameters
-    assert tuple(parameters) == ("session", "repository", "sticker_uuid", "values")
+    assert tuple(parameters) == (
+        "session",
+        "user_uuid",
+        "repository",
+        "sticker_uuid",
+        "values",
+    )
     assert "storage" not in parameters
-    assert "user_uuid" not in parameters
     assert "project_id" not in parameters
 
 
 def test_admin_update_returns_safe_not_found():
     with pytest.raises(ra_exc.ResourceNotFoundError):
         sticker_catalog.update_sticker(
-            object(), _Repository(), STICKER_UUID, {"active": False}
+            object(),
+            USER_UUID,
+            _Repository(),
+            STICKER_UUID,
+            {"active": False},
         )

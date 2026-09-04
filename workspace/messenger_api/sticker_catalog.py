@@ -25,6 +25,9 @@ from restalchemy.common import exceptions as ra_exc
 from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import stickers as sticker_models
 
+if typing.TYPE_CHECKING:
+    from workspace.messenger_api import sticker_repository
+
 
 MEDIA_CONTENT_TYPES = {
     "gif": "image/gif",
@@ -334,23 +337,30 @@ def unstar_sticker(
 
 def update_sticker(
     session: typing.Any,
+    user_uuid: sys_uuid.UUID,
     repository: typing.Any,
     sticker_uuid: sys_uuid.UUID,
     values: dict[str, typing.Any],
-) -> sticker_models.Sticker:
+) -> "sticker_repository.StickerRecord":
     """Update only catalog metadata; media identity remains immutable."""
 
     if not isinstance(values, dict) or not values:
         raise ra_exc.ValidationErrorException()
     if set(values).difference(sticker_models.STICKER_ADMIN_MUTABLE_FIELDS):
         raise ra_exc.ValidationErrorException()
-    record = repository.update_admin_fields(session, sticker_uuid, values)
+    updated = repository.update_admin_fields(session, sticker_uuid, values)
+    if updated is None:
+        raise ra_exc.ResourceNotFoundError(
+            resource="Sticker",
+            path=str(sticker_uuid),
+        )
+    record = repository.get_any(session, user_uuid, sticker_uuid)
     if record is None:
         raise ra_exc.ResourceNotFoundError(
             resource="Sticker",
             path=str(sticker_uuid),
         )
-    return typing.cast(sticker_models.Sticker, record.sticker)
+    return record
 
 
 def validate_query(value: str) -> str:

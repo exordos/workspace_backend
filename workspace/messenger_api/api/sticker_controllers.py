@@ -158,13 +158,17 @@ class StickerController(ra_controllers.BaseResourceController):
                 raise ra_exceptions.ValidationErrorException() from None
             updated = sticker_catalog.update_sticker(
                 self._session(),
+                self._user_uuid(),
                 self._repository(),
                 sticker_uuid,
                 values,
             )
             return _json_response(
                 sticker_catalog.public_card_dict(
-                    sticker_catalog.build_public_card(updated, is_favorite=False)
+                    sticker_catalog.build_public_card(
+                        updated.sticker,
+                        is_favorite=updated.is_favorite,
+                    )
                 )
             )
         raise ra_exceptions.UnsupportedHttpMethod(method=self.request.method)

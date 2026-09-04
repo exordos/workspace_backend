@@ -185,7 +185,14 @@ def test_admin_update_checks_permission_before_body_and_returns_public_allowlist
     controller = sticker_controllers.StickerController(authorized)
     monkeypatch.setattr(controller, "_session", lambda: object())
     monkeypatch.setattr(controller, "_repository", lambda: object())
-    monkeypatch.setattr(sticker_catalog, "update_sticker", lambda *args: _sticker())
+    monkeypatch.setattr(
+        sticker_catalog,
+        "update_sticker",
+        lambda *args: sticker_repository.StickerRecord(
+            _sticker(active=False, blocked=True),
+            is_favorite=True,
+        ),
+    )
 
     response = controller.do_resource(str(STICKER_UUID))
     payload = response.json
@@ -201,6 +208,7 @@ def test_admin_update_checks_permission_before_body_and_returns_public_allowlist
         "is_favorite",
     }
     assert set(payload["media"]) == {"format", "height", "url"}
+    assert payload["is_favorite"] is True
     assert "media_object_id" not in response.text
     assert "private" not in response.text
 
@@ -485,6 +493,10 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
 
     public_schema = specification["components"]["schemas"]["StickerCard"]
     properties = public_schema["properties"]
+    assert properties["is_favorite"] == {
+        "type": "boolean",
+        "description": "Whether the current user has starred this sticker.",
+    }
     for internal in (
         "uuid",
         "search_text",

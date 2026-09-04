@@ -274,11 +274,20 @@ def test_real_http_catalog_full_flow_through_unified_mount(
         assert updated.status_code == 200, updated.text
         _assert_public_card(updated.json())
         assert updated.json()["title"] == f"Updated {token}"
+        assert updated.json()["is_favorite"] is False
 
         other_user = sys_uuid.uuid4()
         other_project = sys_uuid.uuid4()
         starred = workspace_api.post(f"{UNIFIED_ROOT}/{first_uuid}/actions/star/invoke")
         assert starred.status_code == 200, starred.text
+        personalized_update = workspace_api.put(
+            f"{UNIFIED_ROOT}/{first_uuid}",
+            permissions=(MANAGE_PERMISSION,),
+            json={"alt_text": f"Personalized {token}"},
+        )
+        assert personalized_update.status_code == 200, personalized_update.text
+        _assert_public_card(personalized_update.json())
+        assert personalized_update.json()["is_favorite"] is True
         same_user_other_project = workspace_api.get(
             f"{UNIFIED_ROOT}/",
             project=other_project,
@@ -319,6 +328,7 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             json={"active": False},
         )
         assert hidden.status_code == 200, hidden.text
+        assert hidden.json()["is_favorite"] is True
         assert workspace_api.get(f"{UNIFIED_ROOT}/{first_uuid}").status_code == 404
         hidden_search = workspace_api.get(
             f"{UNIFIED_ROOT}/",
@@ -358,6 +368,7 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             json={"active": True},
         )
         assert unhidden.status_code == 200, unhidden.text
+        assert unhidden.json()["is_favorite"] is True
         restored_favorite = workspace_api.get(
             f"{UNIFIED_ROOT}/",
             params={"favorite": "true"},
@@ -370,6 +381,7 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             json={"active": False, "blocked": True},
         )
         assert blocked.status_code == 200, blocked.text
+        assert blocked.json()["is_favorite"] is True
         blocked_batch = workspace_api.get(
             f"{UNIFIED_ROOT}/",
             params=uuid_params,
