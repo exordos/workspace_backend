@@ -121,6 +121,37 @@ def test_search_parameter_order_matches_cte_placeholder_order() -> None:
     assert params[10:] == ("кот",) * 6 + (11,)
 
 
+def test_uuid_only_batch_allows_hidden_but_search_and_favorite_do_not() -> None:
+    repository = sticker_repository.StickerRepository()
+    user_uuid = sys_uuid.uuid4()
+    sticker_uuid = sys_uuid.uuid4()
+
+    uuid_query = repository._query(
+        q=None,
+        favorite=False,
+        category=None,
+        format=None,
+        uuids=[sticker_uuid],
+        page_limit=10,
+    )
+    uuid_statement, _ = repository._list_statement(uuid_query, user_uuid, None)
+    assert "s.blocked = FALSE" in uuid_statement
+    assert "s.active = TRUE" not in uuid_statement
+
+    for favorite, q in ((False, "кот"), (True, None)):
+        query = repository._query(
+            q=q,
+            favorite=favorite,
+            category=None,
+            format=None,
+            uuids=[sticker_uuid],
+            page_limit=10,
+        )
+        statement, _ = repository._list_statement(query, user_uuid, None)
+        assert "s.active = TRUE" in statement
+        assert "s.blocked = FALSE" in statement
+
+
 def test_rank_marker_rejects_non_finite_values() -> None:
     payload = (
         '{"filters_sha256":"%s","sort":"%s","v":1,'

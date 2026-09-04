@@ -407,7 +407,10 @@ class StickerRepository:
                 query.q,
             ]
 
-        where = ["s.active = TRUE", "s.blocked = FALSE"]
+        where = ["s.blocked = FALSE"]
+        uuid_batch = bool(query.uuids and not query.q and not query.favorite)
+        if not uuid_batch:
+            where.insert(0, "s.active = TRUE")
         where.extend((query.category and "s.category = %s",) if query.category else ())
         where.extend((query.format and "s.format = %s",) if query.format else ())
         if query.uuids:
