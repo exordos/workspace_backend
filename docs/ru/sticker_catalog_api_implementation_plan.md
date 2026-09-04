@@ -1,0 +1,647 @@
+# План реализации серверного каталога стикеров
+
+## Статус документа
+
+- Версия плана: `1.0`.
+- Состояние: решения `D-01`–`D-14` закрыты на Gate G0 и обязательны для зависимых пакетов.
+- Основание: `docs/ru/sticker_catalog_api_tz.md`, версия `0.17`.
+- Этот документ описывает порядок разработки. Источником истины для продуктового и API-контракта остаётся ТЗ.
+- Прикладная реализация начинается после Gate G0; этот документ фиксирует её неизменяемые границы.
+
+## 1. Итог первой реализации
+
+После завершения плана Workspace backend должен предоставлять общий серверный каталог GIF и стикеров, в котором:
+
+- медиафайлы хранятся по одному объекту на стикер в S3-совместимом хранилище;
+- карточки каталога, поисковые поля и избранное хранятся в PostgreSQL;
+- аутентифицированный пользователь может получать каталог, искать, разрешать список UUID и работать со своим глобальным избранным;
+- уполномоченный администратор может импортировать ZIP-архив и редактировать карточки;
+- скрытые стикеры продолжают разрешаться для истории, а заблокированные не отдают медиа;
+- публичный контракт не раскрывает bucket, S3 key и параметры доступа;
+- сообщения продолжают использовать Markdown и `urn:sticker:<sticker_uuid>` без отдельного `payload.kind`.
+
+## 2. Границы плана
+
+### 2.1. Входит
+
+- миграция PostgreSQL;
+- доменные модели и проверка полей;
+- отдельная граница хранения и поиска глобального каталога;
+- адаптер хранения медиа поверх существующей local/S3 инфраструктуры;
+- REST API каталога, поиска, пакетного разрешения и скачивания;
+- глобальное избранное пользователя;
+- административное редактирование;
+- синхронный импорт ZIP версии 1;
+- защита от опасных архивов и проверка фактического формата медиа;
+- OpenAPI и контрактные тесты;
+- unit-, integration- и storage-тесты;
+- проверка миграции, индексов, плана поиска и регрессии существующего Messenger API.
+
+### 2.2. Не входит
+
+- клиентский интерфейс каталога в `workspace_ui`;
+- изменение браузерного расширения;
+- административная панель;
+- пользовательская загрузка стикеров;
+- группы и фильтрация по `emoji`;
+- WebM, Lottie, JPEG и MP4;
+- серверное сжатие, перекодирование, постеры и миниатюры;
+- отдельный тип сообщения для стикера;
+- журнал импортов, фоновые импорты и откат нескольких ZIP как единого пакета;
+- события WebSocket для обновления каталога;
+- физическое удаление исторически использованных медиа.
+
+Обновление расширения и интеграция фронтенда перечислены в конце как отдельные последующие потоки. Они не должны блокировать backend, кроме согласования импортного и клиентского контрактов.
+
+## 3. Обязательные архитектурные ограничения
+
+1. Каталог общий и не имеет `project_id`.
+2. Избранное имеет ключ `(user_uuid, sticker_uuid)` и также не имеет `project_id`.
+3. Текущий `StoreResourceController` и Messenger store ориентированы на проект. Каталог нельзя молча встроить в них с фиктивным проектом.
+4. Репозиторий каталога получает текущую RestAlchemy `session` от контроллера. Он не открывает собственный `session_manager()`.
+5. Валидация значений доменной модели не дублируется в контроллере.
+6. Сложная SQL-выборка, ранжирование и избранное находятся за отдельным интерфейсом репозитория каталога.
+7. Стикер не создаётся как `WorkspaceFile`: у каталога нет stream/project ACL и файлового sidecar-контракта.
+8. Допускается переиспользовать существующие local/S3 адаптеры байтов с явным `storage_object_id`.
+9. В S3 сохраняется только медиафайл. ZIP и `manifest.json` целиком не сохраняются.
+10. `search_text`, размеры, фактический формат, MIME и SHA-256 вычисляет backend.
+11. Весь архив валидируется до первой постоянной записи. Дубликат SHA-256 не является ошибкой.
+12. Один рабочий пакет не расширяет scope ТЗ и не меняет контракт без решения оркестратора.
+
+## 4. Решения, которые фиксируются до основной разработки
+
+Эти пункты входят в `WP-00`. Пока они не закрыты, зависимые пакеты не начинают реализацию.
+
+| Код | Решение | Закрытый контракт Gate G0 |
+|---|---|---|
+| `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Без `q`: `created_at DESC, uuid DESC`; с `q`: `rank DESC, updated_at DESC, uuid DESC`; `favorite=true`: `favorite_created_at DESC, uuid DESC`. Маркер другой сортировки/фильтров даёт 400. |
+| `D-02` | Технические лимиты текстовых полей | `title` 200 Unicode code points, `alt_text` 500, один tag 64, не более 64 tags, суммарно tags 4096 UTF-8 bytes, `q` 200, `page_limit` 1–100 (default 50), повторяемый `uuid` не более 100 значений. Это технические лимиты, не словарь. |
+| `D-03` | Ответ при невалидном атомарном импорте | Весь запрос отвечает стандартной ошибкой RestAlchemy `400` (`ValidationErrorException`); постоянные записи и объекты не создаются. Успех — `200` JSON с `created`, `duplicates`, `items`; поля `rejected` нет. |
+| `D-04` | Повторный импорт SHA заблокированного или скрытого стикера | Уникальный SHA возвращает существующий `sticker_uuid` как `duplicate`; копия не создаётся и состояние автоматически не меняется. |
+| `D-05` | Условное обновление каталога | ETag — quoted SHA-256 стабильного UTF-8 JSON тела страницы (с учётом текущего пользователя и всех фильтров); `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` с ETag и без тела. |
+| `D-06` | Кэш медиа | GET download возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, max-age=31536000, immutable`, `Content-Type` фактического формата; редирект не используется в MVP и внутренний object id не раскрывается. |
+| `D-07` | Проверка размеров и формата изображений | Pillow — единственная библиотека декодирования. Проверяются сигнатура, Pillow `verify()`/размеры и фактический формат GIF/WebP/PNG; MIME и расширение только дополняют проверку. Dependency review показал, что Pillow отсутствует в runtime и должен быть добавлен отдельным dependency-пакетом до WP-08. |
+| `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. В текущем manifest permission и binding отсутствуют; WP-07 добавляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding`, без implicit user assignment. |
+| `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при выходе из `Context.session_manager()` после успешного response; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows, а при любом исключении до ответа компенсирует только объекты этой попытки. Неопределённый исход commit не удаляет объекты: retry по SHA безопасен и завершает orphan-repair отдельной проверкой. |
+| `D-10` | Чтение скрытого стикера | Обычный GET и list/search возвращают только `active=true, blocked=false`; batch resolve возвращает hidden (`active=false, blocked=false`) для истории; download разрешён для active и hidden, но blocked отвечает безопасным `404` без чтения storage. |
+| `D-11` | `id` против `uuid` в публичном JSON | Публичная карточка сохраняет поле `id` со значением sticker UUID. В БД и маршрутах используется `uuid`; import result использует `sticker_uuid`. Числовые IDs и `media_object_id` наружу не выдаются. |
+| `D-12` | Идентичность storage | В строке хранится только `media_object_id`; доступ идёт через единый `sticker_storage` adapter. Production — настроенный S3, local backend только для development/tests; bucket и object key не входят в DTO, error и logs. |
+| `D-13` | Одинаковый SHA внутри одного ZIP | Первый элемент с SHA создаёт одну запись; каждый последующий такой SHA получает тот же `sticker_uuid` и `status: duplicate`, независимо от порядка ZIP. |
+| `D-14` | Favorite после hide/block | Favorite row сохраняется при hide/block. `favorite=true` возвращает только видимые элементы; после unhide/unblock ранее сохранённое favorite снова появляется. Star запрещён для hidden/blocked, unstar идемпотентен. |
+
+Результат `WP-00` — не обсуждение в чате, а короткая зафиксированная таблица решений и контрактные примеры, на которые могут ссылаться все агенты.
+
+### 4.1. Доказанные RestAlchemy и runtime conventions
+
+В существующем Messenger коде `WorkspaceFileRoute.download` объявлен как `routes.action(... )` без `invoke=True`, а `WorkspaceMessageRoute.star` и `unstar` — с `invoke=True` (`workspace/messenger_api/api/routes.py:140-150,211-224`). Их контроллеры используют `@ra_actions.get` для download и `@ra_actions.post` для команд (`workspace/messenger_api/api/controllers.py:918-937,1143-1172`). `StoreResourceController.get_packer()` выбирает JSON или multipart packer (`workspace/messenger_api/api/controllers.py:426-434`), но каталог получает собственный packer без storage-полей.
+
+В установленном RestAlchemy `Route.do()` распознаёт action только в ветви, где уже извлечён `{resource_uuid}` (`.tox/develop/lib/python3.10/site-packages/restalchemy/api/routes.py:576-584`); `Action.do()` проверяет `invoke` и разрешённый HTTP method (`:625-657`). Поэтому collection action `/stickers/actions/import_archive/invoke` реализуется отдельным route subclass с явным dispatch collection action. Нельзя объявлять его обычным item action и нельзя менять стандартный route dispatcher.
+
+Поскольку стандартная генерация OpenAPI также перечисляет actions только для resource route, WP-10 добавляет collection-action path и multipart schema явной функцией в `workspace/messenger_api/api/openapi_contract.py`; это не меняет поведение RestAlchemy dispatcher и не создаёт отдельную сущность импорта.
+
+`WP-00` добавляет только unit spike `workspace/tests/unit/test_sticker_catalog_restalchemy_contract.py`; он проверяет эти flags и фиксирует, что stock dispatcher не принимает collection action. Реальный sticker API, route wiring и production IAM в spike не подключаются.
+
+### 4.2. Transaction failure matrix
+
+| Сбой | Ожидаемое состояние PostgreSQL | Ожидаемое состояние S3 | Действие импорта |
+|---|---|---|---|
+| preflight/manifest/Pillow validation | нет записей | нет объектов | вернуть RestAlchemy `400` |
+| N-й upload до DB writes | нет записей | удалить только объекты текущей попытки; cleanup error логировать безопасно | вернуть `500` |
+| DB insert/constraint до commit | rollback | удалить объекты текущей попытки | вернуть `400/409/500` по типу ошибки |
+| request exception до context exit | rollback | удалить объекты текущей попытки | вернуть ошибку |
+| final `session.commit()` failure | состояние commit неопределённо | не удалять автоматически | вернуть `500`; повтор разрешён по SHA и отдельная orphan-repair проверка |
+| response уже отправлен, процесс остановлен около commit | состояние commit неопределённо | объекты остаются | повторный импорт идемпотентен по UNIQUE SHA; orphan inventory — операционная проверка |
+
+RestAlchemy context middleware оборачивает WSGI вызов в одну session (`restalchemy/api/middlewares/contexts.py:119-134`), а `Context.session_manager()` коммитит только после нормального выхода и закрывает session в `finally` (`restalchemy/common/contexts.py:124-155`). Поэтому S3 нельзя считать частью DB transaction, а компенсация не должна удалять объект после неопределённого commit.
+
+## 5. Целевая структура реализации
+
+Зафиксированное разделение модулей:
+
+```text
+workspace/messenger_api/
+  dm/stickers.py                 # доменные и публичные модели
+  sticker_catalog.py             # нормализация и прикладные операции каталога
+  sticker_repository.py          # SQL, поиск, пагинация, избранное
+  sticker_storage.py             # object id, save/read/delete
+  sticker_import.py              # разбор и полная валидация ZIP
+  api/sticker_controllers.py     # тонкие RestAlchemy-контроллеры
+  api/sticker_routes.py          # ресурс, действия и collection action
+```
+
+Эти границы обязательны для следующих пакетов. Субагенты работают в новых файлах, а интегратор один раз изменяет общие точки подключения.
+
+Общие файлы, которыми владеет только интегратор:
+
+- `workspace/messenger_api/api/routes.py`;
+- `workspace/workspace_api/api/routes.py`;
+- `workspace/messenger_api/api/openapi_contract.py`;
+- `workspace/messenger_api/api/store.py`, если интерфейс общего store действительно потребуется;
+- `pyproject.toml` и lock-файл;
+- номер и dependency graph миграций при интеграции;
+- ТЗ и этот план.
+
+### 5.1. Основной поток чтения
+
+```text
+HTTP list/get
+  -> RestAlchemy controller
+  -> sticker catalog service
+  -> sticker repository + текущий user_uuid
+  -> PostgreSQL
+  -> public DTO с media.url и is_favorite
+```
+
+### 5.2. Поток скачивания
+
+```text
+GET action download
+  -> проверка active/blocked с учётом режима разрешения
+  -> чтение media_object_id из PostgreSQL
+  -> sticker storage
+  -> local/S3 bytes
+```
+
+### 5.3. Поток импорта
+
+```text
+multipart archive
+  -> проверка разрешения и общего размера
+  -> безопасное чтение ZIP directory
+  -> manifest schema
+  -> проверка путей, лимитов и соответствия 1:1
+  -> потоковый SHA-256 и проверка изображения
+  -> поиск дубликатов
+  -> загрузка только новых объектов
+  -> одна PostgreSQL-транзакция для новых строк
+  -> результат created/duplicate
+  -> компенсационная очистка новых S3 objects при ошибке
+```
+
+## 6. Граф зависимостей
+
+```text
+WP-00 Контракты и spikes
+  ├── WP-01 Миграция PostgreSQL
+  ├── WP-02 Доменные модели и нормализация
+  ├── WP-03 Хранилище медиа
+  └── WP-08 Валидатор ZIP
+
+WP-01 + WP-02
+  -> WP-04 Репозиторий, поиск и пагинация
+
+WP-03 + WP-04
+  -> WP-05 Чтение каталога и download
+
+WP-04
+  ├── WP-06 Избранное
+  └── WP-07 Административное редактирование
+
+WP-01 + WP-02 + WP-03 + WP-04 + WP-07 + WP-08
+  -> WP-09 Оркестрация импорта
+
+WP-05 + WP-06 + WP-07 + WP-09
+  -> WP-10 Маршруты, OpenAPI и общая интеграция
+  -> WP-11 Полная приёмка и hardening
+```
+
+После `WP-00` пакеты `WP-01`, `WP-02`, `WP-03` и `WP-08` допускается запускать параллельно. `WP-05`, `WP-06` и `WP-07` можно параллелить после готовности репозитория, если они не изменяют общие route-файлы.
+
+## 7. Рабочие пакеты
+
+### WP-00 — Фиксация контрактов и технические spikes
+
+**Цель:** устранить решения, способные заставить следующие пакеты переделывать схему или публичный API.
+
+**Работы (выполнены):**
+
+- сверить каждый маршрут с фактическими RestAlchemy action conventions;
+- доказать форму collection action `/stickers/actions/import_archive/invoke` на минимальном тестовом маршруте;
+- зафиксировать публичные JSON-схемы, коды ответа и стандартные ошибки;
+- определить точную схему непрозрачного курсора и устойчивую сортировку;
+- установить технические лимиты строк, тегов, UUID-фильтра и размера страницы;
+- проверить доступность IAM permission;
+- выбрать библиотеку определения размеров/формата и проверить GIF/WebP/PNG;
+- исследовать фактический момент commit RestAlchemy и выбрать проверяемую S3 compensation strategy;
+- зафиксировать cache headers и `ETag` behavior;
+- закрыть различия `id`/`uuid`, storage identity, duplicate SHA внутри архива и favorite после hide/block.
+
+**Результат:** закрытая таблица решений `D-01`–`D-14`, API fixtures, evidence по IAM/Pillow/transaction lifecycle и unit spike RestAlchemy.
+
+**Критерии готовности:** выполнены; ни один блокирующий пункт не остаётся в состоянии «разберёмся в реализации», а ТЗ и план совпадают по решениям.
+
+### WP-01 — Миграция PostgreSQL
+
+**Зависимость:** `WP-00`.
+
+**Владелец:** один агент; миграция создаётся только через `.tox/develop/bin/ra-new-migration --path migrations --depend HEAD`.
+
+**Результат:**
+
+- `m_workspace_stickers` со всеми полями из ТЗ;
+- `m_workspace_sticker_favorites` с первичным ключом `(user_uuid, sticker_uuid)`;
+- внешний ключ favorite → sticker с `ON DELETE CASCADE`;
+- без внешнего ключа `user_uuid` на проектно-зависимую строку пользователя;
+- CHECK constraints для category, format, положительных размеров и состояния `active/blocked`;
+- UNIQUE для `sha256`;
+- GIN по `tags`;
+- `pg_trgm` GIN по `search_text`;
+- индекс избранного для `(user_uuid, created_at DESC, sticker_uuid)`;
+- необходимые grants для runtime-роли;
+- обратимый rollback в рамках принятых правил миграций проекта.
+
+**Критерии готовности:** миграция применяется на чистой базе, ограничения реально отклоняют плохие строки, индексы существуют с ожидаемыми operator classes, rollback и повторное применение проверены.
+
+### WP-02 — Доменные модели, публичные DTO и нормализация
+
+**Зависимость:** `WP-00`.
+
+**Результат:**
+
+- модель хранимого стикера;
+- модель favorite при необходимости RestAlchemy mapping;
+- отдельная публичная модель без `media_object_id`, bucket и storage credentials;
+- manifest v1 input models;
+- import result models со статусами `created` и `duplicate`;
+- нормализация title, alt text, tags и `ё/е` для `search_text`;
+- дедупликация tags и emoji с сохранением стабильного порядка;
+- построение `media.url` только из `sticker_uuid`;
+- строгие field permissions для административно изменяемых и read-only полей.
+
+**Не делать:** SQL-поиск, ZIP I/O, S3 I/O и маршруты.
+
+**Критерии готовности:** pure unit tests покрывают границы полей, Unicode, пустые значения, дубликаты, неизвестные поля, category по умолчанию и отсутствие внутренних storage-полей в публичном JSON.
+
+### WP-03 — Хранилище медиа стикеров
+
+**Зависимость:** `WP-00`.
+
+**Результат:**
+
+- детерминированный object id `stickers/{sticker_uuid}/media.{format}`;
+- интерфейс `save/read/delete` для одного объекта;
+- адаптация существующих local и S3 storage implementations;
+- неизменяемость: существующий object id нельзя молча перезаписать другим содержимым;
+- отсутствие `WorkspaceFile`, project/stream ACL и metadata sidecar;
+- типизированные ошибки хранения без утечки bucket/key в публичный ответ.
+
+**Критерии готовности:** unit tests local adapter, mocked S3 put/get/delete, точного object id, cleanup и отсутствия лишнего sidecar; тесты не требуют production credentials.
+
+### WP-04 — Репозиторий каталога, поиск и пагинация
+
+**Зависимости:** `WP-01`, `WP-02`.
+
+**Результат:**
+
+- интерфейс репозитория, принимающий текущую `session` и `user_uuid`;
+- list/search с `q`, `favorite`, повторяемым `uuid`, `category`, `format`;
+- get active item;
+- batch resolve, допускающий hidden и исключающий blocked media;
+- вычисление `is_favorite` одним запросом, без N+1;
+- устойчивое ранжирование: exact tag, title exact/prefix, partial text, trigram;
+- непрозрачный курсор, связанный с запросом, фильтрами и сортировкой;
+- операции duplicate lookup, batch insert, update, star и unstar;
+- идемпотентность и защита уникальными ограничениями при гонках.
+
+**Не делать:** HTTP parsing, S3 и ZIP.
+
+**Критерии готовности:** integration tests PostgreSQL проверяют порядок, границы страниц без пропусков/дубликатов, русский и английский поиск, `ё/е`, опечатку, комбинацию фильтров, favorite order, hidden/blocked и два конкурентных действия star/import.
+
+### WP-05 — Публичное чтение каталога и скачивание
+
+**Зависимости:** `WP-03`, `WP-04`.
+
+**Результат:**
+
+- прикладные handlers list/get/batch resolve;
+- download handler с проверкой состояния до обращения к storage;
+- JSON точно по разделу 7 ТЗ;
+- `is_favorite` для текущего IAM user;
+- `ETag`, `If-None-Match`, cache headers и заголовки media response;
+- одинаковое безопасное внешнее поведение для отсутствующего и недоступного blocked объекта;
+- скрытая карточка доступна только batch resolve для истории, а её download разрешён при `blocked=false`.
+
+**Критерии готовности:** controller/service tests покрывают 200, 304, pagination headers, 404/безопасный отказ, hidden, blocked, отсутствие S3 key и отсутствие чтения storage для заблокированного элемента.
+
+### WP-06 — Глобальное избранное
+
+**Зависимость:** `WP-04`.
+
+**Результат:**
+
+- идемпотентные операции star/unstar;
+- user_uuid берётся только из IAM context;
+- запрет добавления hidden/blocked/несуществующего стикера;
+- `favorite=true` с сортировкой от новых к старым;
+- одинаковое избранное для одного пользователя в разных проектах;
+- отсутствие возможности передать user_uuid другого пользователя.
+
+**Критерии готовности:** unit/integration tests повторного star/unstar, двух пользователей, двух проектов одного пользователя, скрытия после добавления и конкурентного star.
+
+### WP-07 — Административное редактирование
+
+**Зависимость:** `WP-04`.
+
+**Результат:**
+
+- permission gate `workspace.sticker_catalog.manage`;
+- объявление permission в `exordos/manifests/workspace.yaml.j2` и явная привязка только к согласованной административной роли;
+- изменение только `title`, `alt_text`, `emoji`, `tags`, `category`, `active`, `blocked`;
+- пересборка `search_text` при каждом релевантном изменении;
+- DB constraint и domain validation для несовместимого `active=true, blocked=true`;
+- запрет изменения UUID, media, format, размеров, SHA и object id;
+- отсутствие автоматической замены/удаления медиа.
+
+**Критерии готовности:** проверки без permission, с permission, unknown/read-only fields, повторного обновления, hide/unhide, block/unblock и немедленного влияния на поиск/скачивание.
+
+### WP-08 — Безопасный разбор и валидация ZIP
+
+**Зависимость:** `WP-00`.
+
+**Результат:**
+
+- чтение ровно одного UTF-8 `manifest.json` schema version 1;
+- проверка 1:1 между manifest items и `media/`;
+- запрет absolute paths, `..`, symlink, duplicate paths, extra media, nested archives и encrypted entries;
+- лимиты 40 МиБ compressed, 100 МиБ unpacked, 50 items, 10 МиБ на media и 20:1 ratio;
+- потоковый hash и безопасное извлечение только ожидаемых файлов во временную директорию;
+- проверка фактической сигнатуры и декодирования GIF/WebP/PNG;
+- размеры не более 2048×2048;
+- сверка расширения, manifest format, MIME и SHA-256;
+- результат в памяти/temporary files, не создающий DB/S3 side effects.
+
+**Критерии готовности:** table-driven tests валидного архива и каждого класса атаки/ошибки; временные файлы удаляются и при успехе, и при исключении; проверки не читают более установленных лимитов.
+
+### WP-09 — Оркестрация административного импорта
+
+**Зависимости:** `WP-01`, `WP-02`, `WP-03`, `WP-04`, `WP-07`, `WP-08`, решение `D-09`.
+
+**Результат:**
+
+- multipart handler поля `archive`;
+- permission проверяется до тяжёлого чтения архива;
+- полная preflight validation до постоянных writes;
+- batch lookup дубликатов по SHA-256;
+- генерация серверных `sticker_uuid` только для новых объектов;
+- загрузка новых медиа и создание каталожных строк в согласованной транзакционной последовательности;
+- компенсационная очистка только объектов текущей неуспешной попытки;
+- защита от гонки двух импортов одинакового SHA;
+- ответ с сопоставлением `client_id`, `file`, status и `sticker_uuid`;
+- архив и manifest не сохраняются как отдельные сущности.
+
+**Критерии готовности:** integration tests all-created, mixed-created/duplicate, all-duplicate, invalid atomic reject, ошибка N-го S3 upload, SQL failure, duplicate race, cleanup failure и повтор после неопределённого клиентского результата.
+
+### WP-10 — RestAlchemy routes, OpenAPI и интеграция модулей
+
+**Зависимости:** `WP-05`, `WP-06`, `WP-07`, `WP-09`.
+
+**Владелец:** интегратор; этот пакет не делегируется нескольким агентам одновременно.
+
+**Результат:**
+
+- ресурс `/api/workspace/v1/messenger/stickers/`;
+- GET одного ресурса;
+- GET action `actions/download` без `/invoke`;
+- POST actions `star` и `unstar` с `/invoke`;
+- collection action `actions/import_archive/invoke`;
+- PUT административного редактирования;
+- подключение в `MessengerRoute`;
+- multipart packer и OpenAPI request/response schemas;
+- контрактные snapshot/assertion tests путей, методов, параметров, headers и скрытых полей;
+- отсутствие изменений существующих Messenger routes.
+
+**Критерии готовности:** сгенерированный OpenAPI содержит только согласованные пути; старые route tests зелёные; неизвестные методы получают штатный отказ RestAlchemy.
+
+### WP-11 — Общая приёмка, безопасность и производительность
+
+**Зависимость:** `WP-10`.
+
+**Результат:**
+
+- полный E2E через реальный HTTP слой и PostgreSQL;
+- проверка local storage и отдельный S3-compatible smoke, если доступен тестовый endpoint;
+- `EXPLAIN (ANALYZE, BUFFERS)` для типового поиска и списка избранного на репрезентативном объёме;
+- подтверждение использования GIN/pg_trgm индексов там, где это ожидается;
+- тест лимита Nginx `50m` против прикладного лимита `40 MiB`;
+- проверка отсутствия object ids, bucket names и credentials в JSON, errors и logs;
+- проверка авторизации двух пользователей и двух проектов;
+- регрессия сообщений с `urn:sticker:<uuid>` на уровне существующего Markdown parsing/render contract, без нового message kind;
+- обновление API-документации и списка известных ограничений.
+
+**Критерии готовности:** focused tests, полный backend test suite, `ruff check`, `ruff format --check`, `mypy`, проверка миграции и `git diff --check` проходят; ручные S3/runtime проверки либо выполнены, либо честно отмечены как отдельная граница.
+
+## 8. Волны оркестрации
+
+### Волна 0 — Подготовка
+
+- `WP-00` выполняется одним исследовательским агентом под контролем оркестратора.
+- Оркестратор утверждает решения, создаёт baseline и только после этого разрешает кодовые пакеты.
+
+### Волна 1 — Независимый фундамент
+
+Параллельно:
+
+- агент A: `WP-01`;
+- агент B: `WP-02`;
+- агент C: `WP-03`;
+- после освобождения слота агент D: `WP-08`.
+
+Оркестратор проверяет каждый commit отдельно и интегрирует только после focused tests.
+
+### Волна 2 — Прикладные операции
+
+- сначала `WP-04`;
+- затем параллельно `WP-05`, `WP-06`, `WP-07`;
+- после их интеграции — `WP-09`.
+
+### Волна 3 — Публичный API
+
+- интегратор выполняет `WP-10`;
+- никакой другой агент в этот момент не меняет shared route/OpenAPI files.
+
+### Волна 4 — Приёмка
+
+- отдельный агент проводит независимый review по ТЗ;
+- отдельный агент проверяет migration/search/storage failure paths;
+- оркестратор запускает `WP-11`, устраняет замечания и формирует итоговый отчёт.
+
+## 9. Правила для субагентов
+
+1. Один work package — один отдельный commit из согласованного baseline.
+2. Перед изменениями агент читает `AGENTS.md`, ТЗ, этот пакет и указанные reference files.
+3. Агент не редактирует чужие и shared files без явного назначения.
+4. Агент не меняет публичный контракт, схему migration и ограничения импорта по собственной инициативе.
+5. Если обнаружено противоречие, агент останавливает только зависимую часть и возвращает evidence с вариантами решения.
+6. Нельзя добавлять fallback на legacy Zulip или проектную область для глобального каталога.
+7. Нельзя открывать новую DB session внутри request flow.
+8. Нельзя логировать содержимое manifest, пользовательские данные, токены, credentials или S3 secrets целиком.
+9. Сначала запускаются focused tests пакета; полный suite запускает интегратор после объединения.
+10. Агент возвращает строго структурированный отчёт:
+
+```text
+Статус: done | partial | blocked
+Commit: <sha или none>
+Изменённые файлы:
+- ...
+Проверки:
+- команда -> результат
+Изменения контракта: none | описание
+Риски и незакрытые вопросы:
+- ...
+```
+
+## 10. Интеграционные ворота
+
+### Gate G0 — Контракт готов
+
+- закрыты `D-01`–`D-14`;
+- импортный manifest и response fixtures зафиксированы;
+- permission и transaction strategy проверены.
+
+### Gate G1 — Фундамент готов
+
+- миграция, модели, storage и ZIP validator интегрированы;
+- unit tests зелёные;
+- shared interfaces больше не меняются без версии.
+
+### Gate G2 — Домен готов
+
+- repository/search/favorites/admin operations работают против PostgreSQL;
+- hidden/blocked и pagination semantics доказаны тестами.
+
+### Gate G3 — API готов
+
+- все пути RestAlchemy и OpenAPI соответствуют ТЗ;
+- valid import проходит end to end;
+- failure paths не оставляют видимых строк или незапланированных объектов.
+
+### Gate G4 — MVP принят
+
+- все проверки `WP-11` завершены;
+- известные ограничения задокументированы;
+- нет незакрытых security/authorization замечаний высокой критичности.
+
+## 11. Матрица обязательных проверок
+
+### Unit
+
+- нормализация tags, emoji и `search_text`;
+- field limits и defaults;
+- cursor encode/decode и fingerprint фильтров;
+- object id;
+- ZIP paths, counts, sizes, ratio, signatures, hash и dimensions;
+- public DTO не раскрывает internal fields;
+- permission gate вызывается до импорта.
+
+### PostgreSQL integration
+
+- apply/rollback migration;
+- CHECK, UNIQUE, FK и CASCADE;
+- search ranking и pagination;
+- favorite owner isolation и global cross-project behavior;
+- concurrent star и duplicate import;
+- update пересобирает `search_text`.
+
+### HTTP integration
+
+- list/search/filter/batch/get/download;
+- `ETag`/304 и pagination headers;
+- star/unstar;
+- PUT с permission и без него;
+- multipart import;
+- ошибки не раскрывают internal storage data;
+- route/OpenAPI contract.
+
+### Storage
+
+- local save/read/delete;
+- mocked S3 save/read/delete;
+- partial upload cleanup;
+- blocked download не обращается к S3;
+- immutable object behavior.
+
+### Регрессия
+
+- существующий Messenger API;
+- existing file upload/download;
+- message star/unstar;
+- OpenAPI generation;
+- runtime deployment contract.
+
+## 12. Основные риски и способы контроля
+
+### PostgreSQL и S3 не образуют общую транзакцию
+
+Контроль: `D-09` закрыт по исходнику RestAlchemy и failure matrix. Upload/SQL failures компенсируются объектами текущей попытки; неопределённый final commit не запускает автоматическое удаление и проверяется orphan inventory/retry по SHA на WP-09/WP-11.
+
+### Ранжирование может ломать маркерную пагинацию
+
+Контроль: курсор содержит полную sort tuple и fingerprint запроса; UUID завершает сортировку; тест проходит несколько страниц при одинаковом score.
+
+### Глобальный user_uuid не имеет естественного FK на проектную таблицу пользователей
+
+Контроль: не добавлять ложный project FK; доверять IAM identity и проверять изоляцию прикладными тестами.
+
+### ZIP может исчерпать память или диск
+
+Контроль: читать multipart и entries потоково, считать compressed/uncompressed limits до extraction, использовать временную директорию и очищать её в `finally`.
+
+### Формат по расширению может быть подделан
+
+Контроль: сверять manifest, расширение, сигнатуру и успешное декодирование; размеры брать только из фактического файла.
+
+### Дубликат заблокированного файла может обойти модерацию
+
+Контроль: UNIQUE SHA и правило `D-04`; импорт не меняет состояние существующего стикера.
+
+### Персональный `is_favorite` может попасть в общий кэш
+
+Контроль: каталог имеет private caching и пользовательский ETag; CDN/shared cache не используется для персонализированного JSON.
+
+### Permission может существовать только в проекте документации
+
+Контроль: проверить реальный IAM contract до кодового импорта; production rollout блокируется без выдачи разрешения администратору.
+
+## 13. Последующие отдельные потоки
+
+### EXT-01 — Профиль Workspace в браузерном расширении
+
+После `Gate G0` расширение получает отдельный exporter, который:
+
+- создаёт manifest schema version 1 из ТЗ;
+- экспортирует только GIF/WebP/PNG;
+- формирует `media/<client_id>.<format>`;
+- автоматически делит выборку на независимые ZIP не более 40 МиБ и 50 элементов;
+- показывает пропущенные записи и причины;
+- не добавляет `pack`, `name`, `generator`, source и внутренние поля расширения;
+- имеет contract fixtures, общие по смыслу с backend importer tests.
+
+### FE-01 — Каталог в Workspace UI
+
+После `Gate G3` фронтенд:
+
+- реализует repository interface только для согласованного backend API;
+- заменяет прямую GIPHY-зависимость в выбранном продуктовом режиме, не смешивая два источника;
+- использует lazy media loading и не сохраняет временные redirect URLs;
+- отправляет уже поддерживаемый Markdown `![sticker](urn:sticker:<uuid>)`;
+- хранит cache с owner/org scope и защитой от stale async writes;
+- не реализует emoji groups до отдельного требования.
+
+### ADMIN-01 — Панель управления
+
+После MVP можно добавить UI поверх уже существующих import/update операций. Этот поток не меняет таблицы и API без нового требования.
+
+## 14. Definition of Done первой реализации
+
+Первая реализация считается готовой, когда:
+
+1. Администратор с реальным permission загружает валидный ZIP через один RestAlchemy collection action.
+2. Каждый новый файл хранится отдельным неизменяемым объектом, а каталог содержит вычисленные backend данные.
+3. Повторный импорт возвращает duplicate и не создаёт вторую запись.
+4. Обычный пользователь получает страницы каталога, ищет по title/alt/tags и не видит внутренних storage-полей.
+5. Один и тот же пользователь видит одно избранное во всех проектах, другой пользователь — только своё.
+6. Hidden не появляется в каталоге, но разрешается для истории; blocked не отдаёт медиа.
+7. Администратор меняет разрешённые поля, а поиск и доступность обновляются согласованно.
+8. Ошибочный архив не создаёт строк; проверенные storage/SQL failure paths не оставляют незапланированные объекты.
+9. OpenAPI, миграции, focused tests, полный suite, Ruff, mypy и `git diff --check` проходят.
+10. Проверка с реальным S3-compatible endpoint выполнена либо вынесена в явно названный production gate без заявления о её прохождении.
