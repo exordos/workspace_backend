@@ -64,6 +64,36 @@ def _archive(items=None, files=None, manifest=None, compression=zipfile.ZIP_DEFL
     return output.getvalue()
 
 
+def test_gateway_archive_limit_covers_application_compressed_limit():
+    repository_root = pathlib.Path(__file__).resolve().parents[3]
+    manifest_path = repository_root / "exordos" / "manifests" / "workspace.yaml.j2"
+    assert manifest_path.relative_to(repository_root).as_posix() == (
+        "exordos/manifests/workspace.yaml.j2"
+    )
+
+    content = manifest_path.read_text(encoding="utf-8")
+    nginx_path = "      path: /etc/nginx/sites-available/workspace.conf\n"
+    _, path_marker, nginx_block = content.partition(nginx_path)
+    assert path_marker
+    body_marker = "        content: |\n"
+    _, body_separator, nginx_body = nginx_block.partition(body_marker)
+    assert body_separator
+    nginx_body, block_separator, _ = nginx_body.partition(
+        "\n    workspace_backend_nginx_core_upstream:"
+    )
+    assert block_separator
+    limit_lines = [
+        line.strip()
+        for line in nginx_body.splitlines()
+        if line.strip().startswith("client_max_body_size ")
+    ]
+    assert limit_lines == ["client_max_body_size 50m;"]
+
+    gateway_limit_bytes = 50 * 1024 * 1024
+    assert sticker_import.MAX_COMPRESSED_BYTES == 40 * 1024 * 1024
+    assert gateway_limit_bytes >= sticker_import.MAX_COMPRESSED_BYTES
+
+
 def test_valid_archive_extracts_arbitrary_declared_image_bytes_and_cleans_up():
     data = b"this is not a decoded PNG"
     item = _item(data=data)
