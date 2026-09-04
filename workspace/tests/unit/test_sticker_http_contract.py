@@ -15,6 +15,7 @@ from restalchemy.api import applications
 from restalchemy.api import contexts as ra_contexts
 from restalchemy.api import routes as ra_routes
 from restalchemy.common import exceptions as ra_exceptions
+from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import sticker_catalog
@@ -232,6 +233,34 @@ def test_item_action_preload_uses_persisted_sticker_not_public_visibility(
     )
 
     assert actual is expected
+    get_one.assert_called_once_with(filters={"uuid": STICKER_UUID})
+
+
+def test_item_action_preload_normalizes_absent_record_but_preserves_uuid_validation(
+    monkeypatch,
+):
+    get_one = mock.Mock(
+        side_effect=storage_exceptions.RecordNotFound(
+            model="Sticker",
+            filters={"uuid": STICKER_UUID},
+        )
+    )
+    monkeypatch.setattr(
+        stickers.Sticker,
+        "objects",
+        types.SimpleNamespace(get_one=get_one),
+    )
+    controller = sticker_controllers.StickerController(_request())
+
+    with pytest.raises(ra_exceptions.ResourceNotFoundError) as missing:
+        controller.get_resource_by_uuid(str(STICKER_UUID))
+
+    assert str(STICKER_UUID) in str(missing.value)
+    assert "filters" not in str(missing.value)
+    assert "model" not in str(missing.value)
+    with pytest.raises(ra_exceptions.ParseError) as invalid:
+        controller.get_resource_by_uuid("not-a-uuid")
+    assert invalid.value.code == 400
     get_one.assert_called_once_with(filters={"uuid": STICKER_UUID})
 
 

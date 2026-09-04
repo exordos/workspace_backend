@@ -14,6 +14,7 @@ from restalchemy.api import controllers as ra_controllers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
+from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_import
@@ -180,7 +181,13 @@ class StickerController(ra_controllers.BaseResourceController):
     ) -> stickers.Sticker:
         del parent_resource
         sticker_uuid = self._parse_uuid(uuid)
-        return stickers.Sticker.objects.get_one(filters={"uuid": sticker_uuid})
+        try:
+            return stickers.Sticker.objects.get_one(filters={"uuid": sticker_uuid})
+        except storage_exceptions.RecordNotFound:
+            raise ra_exceptions.ResourceNotFoundError(
+                resource="Sticker",
+                path=str(sticker_uuid),
+            ) from None
 
     def process_result(
         self,

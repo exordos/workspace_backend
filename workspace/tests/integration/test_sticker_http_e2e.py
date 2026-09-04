@@ -13,6 +13,7 @@ import uuid as sys_uuid
 import zipfile
 
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import sticker_storage
 from workspace.tests.integration import conftest
 
 
@@ -387,10 +388,26 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             params=uuid_params,
         )
         assert [card["id"] for card in blocked_batch.json()] == [second_uuid]
+
+        class StorageReadSentinel:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def read(self, media_object_id: str) -> bytes:
+                self.calls.append(media_object_id)
+                raise AssertionError("blocked media must not be read")
+
+        storage_sentinel = StorageReadSentinel()
+        monkeypatch.setattr(
+            sticker_storage,
+            "get_sticker_storage",
+            lambda: storage_sentinel,
+        )
         blocked_download = workspace_api.get(
             f"{UNIFIED_ROOT}/{first_uuid}/actions/download"
         )
         assert blocked_download.status_code == 404, blocked_download.text
+        assert storage_sentinel.calls == []
         for secret in ("media_object_id", "sha256", "size_bytes", str(tmp_path)):
             assert secret not in blocked_download.text
         assert (
@@ -399,6 +416,18 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             ).status_code
             == 200
         )
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM m_workspace_stickers WHERE uuid = %s",
+                (first_uuid,),
+            )
+        absent_download = workspace_api.get(
+            f"{UNIFIED_ROOT}/{first_uuid}/actions/download"
+        )
+        assert absent_download.status_code == blocked_download.status_code == 404
+        assert absent_download.json() == blocked_download.json()
+        assert storage_sentinel.calls == []
 
         standalone = api.get(
             f"{STANDALONE_ROOT}/",
