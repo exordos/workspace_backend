@@ -25,8 +25,10 @@ def _row(
     active: bool = True,
     blocked: bool = False,
     timestamp: datetime.datetime | None = None,
+    updated_timestamp: datetime.datetime | None = None,
 ) -> tuple[object, ...]:
     timestamp = timestamp or datetime.datetime.now(datetime.timezone.utc)
+    updated_timestamp = updated_timestamp or timestamp
     tags = tags if tags is not None else ["кот"]
     return (
         sticker_uuid,
@@ -43,7 +45,7 @@ def _row(
         active,
         blocked,
         timestamp,
-        timestamp,
+        updated_timestamp,
     )
 
 
@@ -86,12 +88,24 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
     third = sys_uuid.uuid4()
     partial = sys_uuid.uuid4()
     typo = sys_uuid.uuid4()
+    equal_old = sys_uuid.uuid4()
+    equal_new = sys_uuid.uuid4()
     inserted = sys_uuid.uuid4()
     english = sys_uuid.uuid4()
     race_one = sys_uuid.uuid4()
     race_two = sys_uuid.uuid4()
-    initial_uuids = (first, second, third, partial, typo)
-    sticker_uuids = (first, second, third, partial, typo, inserted, english)
+    initial_uuids = (first, second, third, partial, typo, equal_old, equal_new)
+    sticker_uuids = (
+        first,
+        second,
+        third,
+        partial,
+        typo,
+        equal_old,
+        equal_new,
+        inserted,
+        english,
+    )
     cleanup_uuids = sticker_uuids + (race_one, race_two)
     timestamp = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
     seed_rows = (
@@ -128,6 +142,24 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
             search_text="кит",
             timestamp=timestamp,
         ),
+        _row(
+            equal_old,
+            "9" * 64,
+            title="животное",
+            tags=[],
+            search_text="животное кот",
+            timestamp=timestamp,
+            updated_timestamp=timestamp + datetime.timedelta(seconds=1),
+        ),
+        _row(
+            equal_new,
+            "a" * 64,
+            title="животное",
+            tags=[],
+            search_text="животное кот",
+            timestamp=timestamp,
+            updated_timestamp=timestamp + datetime.timedelta(seconds=2),
+        ),
     )
     with db.cursor() as cursor:
         for values in seed_rows:
@@ -146,6 +178,8 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         repository.star(db, user_uuid, second)
         repository.star(db, user_uuid, third)
         repository.star(db, user_uuid, partial)
+        repository.star(db, user_uuid, equal_old)
+        repository.star(db, user_uuid, equal_new)
         user_two = sys_uuid.uuid4()
         repository.star(db, user_two, typo)
         with db.cursor() as cursor:
@@ -154,6 +188,8 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 second: timestamp + datetime.timedelta(seconds=2),
                 third: timestamp + datetime.timedelta(seconds=3),
                 partial: timestamp + datetime.timedelta(seconds=4),
+                equal_old: timestamp + datetime.timedelta(seconds=5),
+                equal_new: timestamp + datetime.timedelta(seconds=6),
             }
             for sticker_uuid, favorite_time in favorite_times.items():
                 cursor.execute(
@@ -184,9 +220,9 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
 
         expected_orders = {
             (None, False): sorted(initial_uuids, key=str, reverse=True),
-            (None, True): [partial, third, second, first],
-            ("кот", False): [first, second, third, partial, typo],
-            ("кот", True): [first, second, third, partial],
+            (None, True): [equal_new, equal_old, partial, third, second, first],
+            ("кот", False): [first, second, third, equal_new, equal_old, partial, typo],
+            ("кот", True): [first, second, third, equal_new, equal_old, partial],
         }
         for q, favorite in (
             (None, False),
@@ -247,6 +283,12 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         )
         assert updated_text is not None
         assert updated_text.sticker.search_text == "еж кот лиса"
+        assert [
+            item.uuid for item in repository.list_stickers(db, user_uuid, q="ёж").items
+        ] == [third]
+        assert [
+            item.uuid for item in repository.list_stickers(db, user_uuid, q="еж").items
+        ] == [third]
 
         hidden = repository.update(db, first, {"active": False})
         assert hidden is not None
@@ -305,7 +347,7 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
             )
             connection.row_factory = psycopg.rows.dict_row
             try:
-                return repository.star(connection, user_uuid, third)
+                return repository.star(connection, user_uuid, typo)
             finally:
                 connection.close()
 
@@ -317,7 +359,7 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 SELECT COUNT(*) FROM m_workspace_sticker_favorites
                  WHERE user_uuid = %s AND sticker_uuid = %s
                 """,
-                (user_uuid, third),
+                (user_uuid, typo),
             )
             assert cursor.fetchone()["count"] == 1
 
