@@ -19,6 +19,7 @@ from restalchemy.common import exceptions as ra_exceptions
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_import
+from workspace.messenger_api import sticker_repository
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import sticker_controllers
 from workspace.messenger_api.api import sticker_routes
@@ -125,6 +126,39 @@ def test_list_uses_only_explicit_query_contract_and_passthrough_response(monkeyp
     invalid = _request("/v1/stickers/?sort_key=uuid")
     with pytest.raises(ra_exceptions.ValidationErrorException):
         sticker_controllers.StickerController(invalid).do_collection()
+
+
+def test_uuid_batch_route_serializes_hidden_record_and_requests_blocked_filtering(
+    monkeypatch,
+):
+    hidden_uuid = STICKER_UUID
+    blocked_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000002")
+    hidden = _sticker(active=False, blocked=False)
+
+    class Repository:
+        def list_stickers(self, session, user_uuid, **kwargs):
+            assert session is expected_session
+            assert user_uuid == USER_UUID
+            assert kwargs["uuids"] == [hidden_uuid, blocked_uuid]
+            return sticker_repository.StickerPage(
+                [sticker_repository.StickerRecord(hidden, is_favorite=False)]
+            )
+
+    expected_session = object()
+    request = _request(
+        f"/v1/stickers/?uuid={hidden_uuid}&uuid={blocked_uuid}",
+    )
+    controller = sticker_controllers.StickerController(request)
+    monkeypatch.setattr(controller, "_session", lambda: expected_session)
+    monkeypatch.setattr(controller, "_repository", Repository)
+
+    response = controller.do_collection()
+
+    assert [item["id"] for item in response.json] == [str(hidden_uuid)]
+    assert response.json[0]["media"]["url"] == (
+        f"/api/workspace/v1/messenger/stickers/{hidden_uuid}/actions/download"
+    )
+    assert str(blocked_uuid) not in response.text
 
 
 def test_admin_update_checks_permission_before_body_and_returns_public_allowlist(
