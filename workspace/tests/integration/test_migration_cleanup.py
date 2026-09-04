@@ -34,9 +34,7 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
-        engine.rollback_migration(
-            "0174-suppress-legacy-backfill-counters-a2cd99.py"
-        )
+        engine.rollback_migration("0174-suppress-legacy-backfill-counters-a2cd99.py")
         engine.rollback_migration("0173-accelerate-Messenger-v2-projections-8cda92.py")
         engine.rollback_migration("0172-retry-expired-provider-read-pages-05d036.py")
         engine.rollback_migration(
