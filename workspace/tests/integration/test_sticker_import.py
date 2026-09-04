@@ -186,3 +186,67 @@ def test_real_postgres_concurrent_same_sha_has_one_winner(
             _delete_stickers(connection)
         finally:
             connection.close()
+
+
+def test_real_postgres_mixed_existing_and_new_sha_writes_only_new_storage_object(
+    _database: None,
+    tmp_path: pathlib.Path,
+) -> None:
+    existing_data = b"pre-existing arbitrary bytes"
+    new_data = b"new arbitrary bytes"
+    existing_id = sys_uuid.uuid4()
+    new_id = sys_uuid.uuid4()
+    existing_archive = _archive(
+        [_item(existing_id, existing_data)],
+        {"media/%s.gif" % existing_id: existing_data},
+    )
+    mixed_archive = _archive(
+        [_item(existing_id, existing_data), _item(new_id, new_data)],
+        {
+            "media/%s.gif" % existing_id: existing_data,
+            "media/%s.gif" % new_id: new_data,
+        },
+    )
+    connection = _connection()
+    try:
+        repository = sticker_repository.StickerRepository()
+        existing_storage = sticker_storage.LocalStickerStorage(
+            str(tmp_path / "existing")
+        )
+        first = sticker_import.import_archive(
+            existing_archive,
+            connection,
+            USER_UUID,
+            repository,
+            existing_storage,
+        )
+        connection.commit()
+        existing_uuid = first["items"][0].sticker_uuid
+
+        new_storage = sticker_storage.LocalStickerStorage(str(tmp_path / "new"))
+        result = sticker_import.import_archive(
+            mixed_archive,
+            connection,
+            USER_UUID,
+            repository,
+            new_storage,
+        )
+        connection.commit()
+        assert result.created == 1
+        assert result.duplicates == 1
+        assert [item.status for item in result["items"]] == [
+            "duplicate",
+            "created",
+        ]
+        assert result["items"][0].sticker_uuid == existing_uuid
+        assert result["items"][1].sticker_uuid != existing_uuid
+        stored_files = [
+            path for path in (tmp_path / "new").rglob("*") if path.is_file()
+        ]
+        assert len(stored_files) == 1
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT count(*) AS count FROM m_workspace_stickers")
+            assert cursor.fetchone()["count"] == 2
+    finally:
+        _delete_stickers(connection)
+        connection.close()

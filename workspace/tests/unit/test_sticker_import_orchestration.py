@@ -58,6 +58,11 @@ class _Session:
         self.rollback_count += 1
 
 
+class _UncertainSession(_Session):
+    def commit(self) -> None:
+        raise OSError("commit outcome is unknown")
+
+
 class _Storage:
     def __init__(
         self,
@@ -395,26 +400,36 @@ def test_uncertain_caller_commit_does_not_delete_and_retry_is_duplicate(
         sticker_import, "validate_archive", lambda source: _validated(archive)
     )
     storage = _Storage()
+    session = _UncertainSession()
     repository = _Repository()
     result = sticker_import.import_archive(
-        b"ignored", _Session(), USER_UUID, repository, storage
+        b"ignored", session, USER_UUID, repository, storage
     )
     assert result.created == 1
     assert storage.deleted == []
 
-    class _UncertainCommit:
-        def commit(self) -> None:
-            raise OSError("commit outcome is unknown")
-
     with pytest.raises(OSError):
-        _UncertainCommit().commit()
+        session.commit()
     retry = sticker_import.import_archive(
-        b"ignored", _Session(), USER_UUID, repository, storage
+        b"ignored", session, USER_UUID, repository, storage
     )
     assert retry.created == 0
     assert retry.duplicates == 1
     assert retry["items"][0].status == "duplicate"
     assert len(storage.saved) == 1
+
+    # The other possible commit outcome is a rollback.  The caller removes
+    # the uncommitted repository row, while the service still does not delete
+    # the object whose commit outcome was uncertain.
+    repository.existing.pop(SHA_ONE)
+    rolled_back_retry = sticker_import.import_archive(
+        b"ignored", _Session(), USER_UUID, repository, storage
+    )
+    assert rolled_back_retry.created == 1
+    assert rolled_back_retry["items"][0].status == "created"
+    assert len(storage.saved) == 2
+    assert storage.saved[0] != storage.saved[1]
+    assert storage.deleted == []
 
 
 def test_mixed_existing_and_new_sha_has_per_item_status(
