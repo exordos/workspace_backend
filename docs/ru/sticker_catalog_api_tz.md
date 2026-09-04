@@ -2,7 +2,7 @@
 
 ## Статус документа
 
-- Версия: `1.0`.
+- Версия: `1.1`.
 - Состояние: контракт Gate G0 закрыт; решения `D-01`–`D-14` обязательны для реализации.
 - Документ описывает согласованный контракт и не является утверждением, что API уже реализован.
 
@@ -78,7 +78,7 @@ S3-совместимое хранилище содержит бинарные �
 
 - `category = gif` — гифка, мемная или реакционная картинка, обычно анимированная;
 - `category = sticker` — самостоятельный стикер, статический или анимированный, с прозрачным фоном или без него;
-- `format = gif | webp | png` — фактический формат медиафайла.
+- `format = gif | webp | png` — фактический формат медиафайла, подтверждённый серверной проверкой.
 
 Категория не определяется автоматически только по формату или наличию прозрачности. Один и тот же формат может использоваться в обеих категориях.
 
@@ -156,7 +156,7 @@ stickers/{sticker_uuid}/media.{расширение}
 
 Сервер не сжимает, не перекодирует и не создаёт производные версии файла. Если файл превышает установленные ограничения, импорт отклоняет его с понятной ошибкой.
 
-Объект должен быть неизменяемым. Новая версия файла получает новый ключ или новый идентификатор стикера.
+Объект должен быть неизменяемым. Существующие local/S3 `save` paths backend допускают overwrite, поэтому будущий sticker storage adapter обязан перед записью отказать при занятом object id либо сделать idempotent no-op только при том же SHA-256. Другой content никогда не перезаписывается. Новая версия файла получает новый ключ или новый идентификатор стикера.
 
 ### 4.2. Таблица каталога
 
@@ -289,7 +289,7 @@ GET /api/workspace/v1/messenger/stickers/
 
 `page_limit` принимает целое от 1 до 100, значение по умолчанию — 50. `q` ограничен 200 Unicode code points. Повторяемый `uuid` допускает не более 100 значений. Неизвестные параметры и нарушение лимитов получают стандартную ошибку RestAlchemy `400`.
 
-Для списка без `q` сортировка: `created_at DESC, uuid DESC`; для поиска: `rank DESC, updated_at DESC, uuid DESC`; для `favorite=true`: `favorite_created_at DESC, uuid DESC`. `page_marker` — opaque base64url без padding с canonical JSON-полями `v`, `sort`, `filters_sha256`, `values`. `values` содержит полную sort tuple. `filters_sha256` — SHA-256 canonical JSON параметров `q`, `favorite`, `category`, `format` и сортировки. Несовпадение fingerprint или версии маркера даёт `400`.
+Для списка без `q` сортировка: `created_at DESC, uuid DESC`; для поиска и `favorite=true` сортировка: `rank DESC, favorite_created_at DESC, uuid DESC` (`favorite_created_at` для не-избранных равен минимальному значению). `page_marker` — opaque base64url без padding с canonical JSON-полями `v`, `sort`, `filters_sha256`, `values`. `values` содержит полную sort tuple. `filters_sha256` — SHA-256 canonical JSON параметров `q`, `favorite`, `category`, `format`, canonicalized `uuid` и сортировки. UUID dedupe-ится и сортируется лексикографически перед fingerprint; допускается pagination с максимумом 100 UUID. Несовпадение fingerprint или версии маркера даёт `400`.
 
 Пакетное разрешение по `uuid` может возвращать скрытые стикеры с `active = false`, чтобы старые сообщения продолжали отображаться. Заблокированные стикеры не возвращаются как доступные медиа.
 
@@ -466,11 +466,11 @@ PUT /api/workspace/v1/messenger/stickers/{sticker_uuid}
 
 Идентификаторы решений: `D-01` — cursor и sort tuple из следующего абзаца; `D-02` — перечисленные лимиты; `D-03` — атомарный `400` без `rejected` в успехе; `D-04` — duplicate по SHA без смены состояния; `D-05` — персональный ETag JSON; `D-06` — immutable media cache; `D-07` — Pillow и фактическая проверка формата; `D-08` — permission `workspace.sticker_catalog.manage` из IAM; `D-09` — request transaction и S3 compensation; `D-10` — hidden только для batch/history; `D-11` — публичный `id`, внутренний `uuid`; `D-12` — storage через `media_object_id`; `D-13` — один UUID на одинаковый SHA внутри ZIP; `D-14` — favorite row сохраняется при hide/block.
 
-Маркер страницы кодируется как base64url без padding от canonical JSON `{ "v": 1, "sort": "...", "filters_sha256": "...", "values": [...] }`. `values` содержит полную sort tuple, последний элемент — UUID. Fingerprint считается от canonical JSON параметров `q`, `favorite`, `category`, `format` и сортировки. Маркер с другим fingerprint или версией отвечает `400`.
+Маркер страницы кодируется как base64url без padding от canonical JSON `{ "v": 1, "sort": "...", "filters_sha256": "...", "values": [...] }`. `values` содержит полную sort tuple, последний элемент — UUID. Fingerprint считается от canonical JSON параметров `q`, `favorite`, `category`, `format`, dedupe+lexicographically sorted `uuid` и сортировки. Маркер с другим fingerprint или версией отвечает `400`.
 
 Состояния имеют точную семантику: list/search и item GET показывают только `active=true, blocked=false`; batch resolve также возвращает hidden (`active=false, blocked=false`); download разрешён active и hidden, но blocked отвечает безопасным `404` без обращения к storage. Favorite row не удаляется при hide/block, но фильтр `favorite=true` возвращает только видимое; после unhide/unblock связь снова видна. Star для hidden/blocked запрещён, unstar идемпотентен.
 
-Для проверки GIF/WebP/PNG используется Pillow как единственная библиотека декодирования. В текущем runtime Pillow отсутствует; WP-08 добавляет её отдельным dependency-пакетом до прикладной реализации. Проверяются сигнатура, фактический формат, `verify()` и размеры до 2048×2048.
+Для проверки GIF/WebP/PNG используется Pillow как единственная библиотека декодирования. Общий dependency-шаг WP-00.1 добавляет её в runtime и lock до начала WP-08. Проверяются сигнатура, фактический формат, `verify()` и размеры до 2048×2048.
 
 Проверка выполняется по байтам: GIF начинается с `GIF87a` или `GIF89a`, PNG — с сигнатуры `89 50 4e 47 0d 0a 1a 0a`, WebP — с `RIFF` в первых 4 байтах и `WEBP` в байтах 8–11. После проверки сигнатуры Pillow открывает файл, его `format` должен совпасть с manifest/расширением, размеры проверяются до `load()`, затем вызываются `verify()` и повторное открытие с `load()` для проверки декодирования. `DecompressionBombError` и `UnidentifiedImageError` превращаются в стандартную ошибку валидации; сервер не доверяет MIME, расширению или размерам из manifest.
 
@@ -666,16 +666,6 @@ URN содержит устойчивый `sticker_uuid`. Клиент расп�
 - Существующую S3-конфигурацию можно переиспользовать, но каталог не следует представлять как набор пользовательских `WorkspaceFile` с проектными ACL.
 - Миграции создаются штатными средствами RestAlchemy и содержат необходимые ограничения, внешние ключи и индексы PostgreSQL.
 
-### 13.1. Evidence Gate G0
-
-- `workspace/messenger_api/api/routes.py:140-150,211-224` — item CRUD allow-list, GET `download` action without invoke, POST `star`/`unstar` actions with invoke.
-- `workspace/messenger_api/api/controllers.py:426-434,918-937` — resource packer selection and existing download response pattern; sticker DTO must use a dedicated packer and must not expose storage fields.
-- `.tox/develop/lib/python3.10/site-packages/restalchemy/api/routes.py:576-584,617-666` — stock action dispatcher resolves a resource UUID before `actions`; collection import therefore needs a dedicated thin route override, while action method/invoke validation is standard.
-- `.tox/develop/lib/python3.10/site-packages/restalchemy/api/middlewares/contexts.py:119-134` and `.tox/develop/lib/python3.10/site-packages/restalchemy/common/contexts.py:124-155` — one request session surrounds the WSGI call and commits on normal exit, rolls back on exception, then closes.
-- `workspace/messenger_api/api/context.py:25-47` — request context obtains `user_uuid` from IAM token and project id from IAM introspection; favorite operations never accept a client user UUID.
-- `exordos/manifests/workspace.yaml.j2:109-250` — current permission catalog/role/binding convention; `workspace.sticker_catalog.manage` is absent and belongs to WP-07.
-- `pyproject.toml:21-31` — Pillow is not a current runtime dependency; WP-08 must add it before image validation.
-
 ### 13.1. Доказательства Gate G0
 
 - `workspace/messenger_api/api/routes.py:140-150,211-224` — item CRUD allow-list, GET `download` без `/invoke`, POST `star`/`unstar` с `/invoke`.
@@ -683,8 +673,8 @@ URN содержит устойчивый `sticker_uuid`. Клиент расп�
 - `.tox/develop/lib/python3.10/site-packages/restalchemy/api/routes.py:576-584,625-657` — штатный dispatcher разрешает actions только после resource UUID; collection import требует отдельного route override.
 - `.tox/develop/lib/python3.10/site-packages/restalchemy/api/middlewares/contexts.py:119-134` и `.tox/develop/lib/python3.10/site-packages/restalchemy/common/contexts.py:124-155` — одна request session, commit после успешного выхода, rollback при исключении и close в `finally`.
 - `workspace/messenger_api/api/context.py:25-47` — `user_uuid` берётся из IAM token, project id — из IAM introspection.
-- `exordos/manifests/workspace.yaml.j2:109-250` — текущая схема permission catalog/role/binding; `workspace.sticker_catalog.manage` отсутствует и добавляется в WP-07.
-- `pyproject.toml:21-31` — Pillow отсутствует среди runtime dependencies; его добавление выполняется отдельным dependency-изменением до WP-08.
+- `exordos/manifests/workspace.yaml.j2:109-250` — текущая схема permission catalog/role/binding; permission catalog не назначает пользователей неявно, а role и binding используют `project_id: null`; `workspace.sticker_catalog.manage` добавляется в WP-07.
+- `pyproject.toml:21-31` и `uv.lock:1326-1342` — зависимость RestAlchemy зафиксирована в lock на 15.3.0; Pillow добавляется отдельным dependency-шагом WP-00.1 до WP-08.
 
 ## 14. Отложенные вопросы
 

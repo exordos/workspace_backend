@@ -2,9 +2,10 @@
 
 ## Статус документа
 
-- Версия плана: `1.0`.
+- Версия плана: `1.1`.
+- Для `D-07` зафиксирован prerequisite общего dependency-шага до WP-08; его выполнение обязательно до Gate G1.
 - Состояние: решения `D-01`–`D-14` закрыты на Gate G0 и обязательны для зависимых пакетов.
-- Основание: `docs/ru/sticker_catalog_api_tz.md`, версия `0.17`.
+- Основание: `docs/ru/sticker_catalog_api_tz.md`, версия `1.1`.
 - Этот документ описывает порядок разработки. Источником истины для продуктового и API-контракта остаётся ТЗ.
 - Прикладная реализация начинается после Gate G0; этот документ фиксирует её неизменяемые границы.
 
@@ -74,15 +75,15 @@
 
 | Код | Решение | Закрытый контракт Gate G0 |
 |---|---|---|
-| `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Без `q`: `created_at DESC, uuid DESC`; с `q`: `rank DESC, updated_at DESC, uuid DESC`; `favorite=true`: `favorite_created_at DESC, uuid DESC`. Маркер другой сортировки/фильтров даёт 400. |
+| `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Без `q`: `created_at DESC, uuid DESC`; с `q` и `favorite=true`: `rank DESC, favorite_created_at DESC, uuid DESC` (`favorite_created_at` для не-избранных — минимальное значение). Fingerprint включает canonical `uuid`: dedupe и lexicographic sort, максимум 100 UUID; pagination с uuid разрешена. Маркер другой сортировки/фильтров даёт 400. |
 | `D-02` | Технические лимиты текстовых полей | `title` 200 Unicode code points, `alt_text` 500, один tag 64, не более 64 tags, суммарно tags 4096 UTF-8 bytes, `q` 200, `page_limit` 1–100 (default 50), повторяемый `uuid` не более 100 значений. Это технические лимиты, не словарь. |
 | `D-03` | Ответ при невалидном атомарном импорте | Весь запрос отвечает стандартной ошибкой RestAlchemy `400` (`ValidationErrorException`); постоянные записи и объекты не создаются. Успех — `200` JSON с `created`, `duplicates`, `items`; поля `rejected` нет. |
 | `D-04` | Повторный импорт SHA заблокированного или скрытого стикера | Уникальный SHA возвращает существующий `sticker_uuid` как `duplicate`; копия не создаётся и состояние автоматически не меняется. |
 | `D-05` | Условное обновление каталога | ETag — quoted SHA-256 стабильного UTF-8 JSON тела страницы (с учётом текущего пользователя и всех фильтров); `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` с ETag и без тела. |
-| `D-06` | Кэш медиа | GET download возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, max-age=31536000, immutable`, `Content-Type` фактического формата; редирект не используется в MVP и внутренний object id не раскрывается. |
-| `D-07` | Проверка размеров и формата изображений | Pillow — единственная библиотека декодирования. Проверяются сигнатура, Pillow `verify()`/размеры и фактический формат GIF/WebP/PNG; MIME и расширение только дополняют проверку. Dependency review показал, что Pillow отсутствует в runtime и должен быть добавлен отдельным dependency-пакетом до WP-08. |
-| `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. В текущем manifest permission и binding отсутствуют; WP-07 добавляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding`, без implicit user assignment. |
-| `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при выходе из `Context.session_manager()` после успешного response; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows, а при любом исключении до ответа компенсирует только объекты этой попытки. Неопределённый исход commit не удаляет объекты: retry по SHA безопасен и завершает orphan-repair отдельной проверкой. |
+| `D-06` | Кэш медиа | GET download возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, max-age=31536000, immutable`, `Content-Type`, выведенным из сохранённого `format`; редирект не используется в MVP и внутренний object id не раскрывается. |
+| `D-07` | Проверка размеров и формата изображений | До WP-08 отдельный общий dependency-шаг добавляет Pillow в runtime dependencies и lock штатным `uv`-процессом; сам WP-00 shared-файлы зависимостей не меняет. WP-08 использует Pillow в безопасном режиме для определения и проверки GIF/WebP/PNG (без сохранения/перекодирования), а также проверяет заявленные `format`, размеры и SHA-256. При недоступной или повреждённой подписи изображения импорт отвечает стандартной ошибкой RestAlchemy `400`. |
+| `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. В текущем manifest permission и binding отсутствуют; WP-07 добавляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding` по существующей схеме `project_id: null`, без implicit user assignment. |
+| `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при любом нормальном возврате WSGI response, включая response со статусом 500; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows, а ошибки после DB writes должны поднимать exception до выхода из context для rollback. Неопределённый исход commit не удаляет объекты: retry по SHA безопасен и завершает orphan-repair отдельной проверкой. |
 | `D-10` | Чтение скрытого стикера | Обычный GET и list/search возвращают только `active=true, blocked=false`; batch resolve возвращает hidden (`active=false, blocked=false`) для истории; download разрешён для active и hidden, но blocked отвечает безопасным `404` без чтения storage. |
 | `D-11` | `id` против `uuid` в публичном JSON | Публичная карточка сохраняет поле `id` со значением sticker UUID. В БД и маршрутах используется `uuid`; import result использует `sticker_uuid`. Числовые IDs и `media_object_id` наружу не выдаются. |
 | `D-12` | Идентичность storage | В строке хранится только `media_object_id`; доступ идёт через единый `sticker_storage` adapter. Production — настроенный S3, local backend только для development/tests; bucket и object key не входят в DTO, error и logs. |
@@ -96,6 +97,8 @@
 В существующем Messenger коде `WorkspaceFileRoute.download` объявлен как `routes.action(... )` без `invoke=True`, а `WorkspaceMessageRoute.star` и `unstar` — с `invoke=True` (`workspace/messenger_api/api/routes.py:140-150,211-224`). Их контроллеры используют `@ra_actions.get` для download и `@ra_actions.post` для команд (`workspace/messenger_api/api/controllers.py:918-937,1143-1172`). `StoreResourceController.get_packer()` выбирает JSON или multipart packer (`workspace/messenger_api/api/controllers.py:426-434`), но каталог получает собственный packer без storage-полей.
 
 В установленном RestAlchemy `Route.do()` распознаёт action только в ветви, где уже извлечён `{resource_uuid}` (`.tox/develop/lib/python3.10/site-packages/restalchemy/api/routes.py:576-584`); `Action.do()` проверяет `invoke` и разрешённый HTTP method (`:625-657`). Поэтому collection action `/stickers/actions/import_archive/invoke` реализуется отдельным route subclass с явным dispatch collection action. Нельзя объявлять его обычным item action и нельзя менять стандартный route dispatcher.
+
+Collection route сначала проверяет ровно `POST /actions/import_archive/invoke`, затем через единый boundary `workspace/messenger_api/api/permission_guards.py:require_iam_permission` получает IAM permissions из request context. Только после успешной проверки вызывается стандартный `Action.do`; таким образом, до отказа `403` не читаются `request.api_context.params`, multipart body или packer. Остальные методы получают `UnsupportedHttpMethod` (405), а отсутствие `/invoke` — `UnsupportedMethod` (404), что зафиксировано spike-тестом. WP-10 переиспользует этот route/helper pattern.
 
 Поскольку стандартная генерация OpenAPI также перечисляет actions только для resource route, WP-10 добавляет collection-action path и multipart schema явной функцией в `workspace/messenger_api/api/openapi_contract.py`; это не меняет поведение RestAlchemy dispatcher и не создаёт отдельную сущность импорта.
 
@@ -205,7 +208,7 @@ WP-05 + WP-06 + WP-07 + WP-09
   -> WP-11 Полная приёмка и hardening
 ```
 
-После `WP-00` пакеты `WP-01`, `WP-02`, `WP-03` и `WP-08` допускается запускать параллельно. `WP-05`, `WP-06` и `WP-07` можно параллелить после готовности репозитория, если они не изменяют общие route-файлы.
+После `WP-00` `WP-01`, `WP-02`, `WP-03` и `WP-08` допускается запускать параллельно. `WP-05`, `WP-06` и `WP-07` можно параллелить после готовности репозитория, если они не изменяют общие route-файлы.
 
 ## 7. Рабочие пакеты
 
@@ -281,7 +284,7 @@ WP-05 + WP-06 + WP-07 + WP-09
 - детерминированный object id `stickers/{sticker_uuid}/media.{format}`;
 - интерфейс `save/read/delete` для одного объекта;
 - адаптация существующих local и S3 storage implementations;
-- неизменяемость: существующий object id нельзя молча перезаписать другим содержимым;
+- неизменяемость на уровне adapter: существующие local/S3 `save` paths сейчас допускают overwrite, поэтому adapter обязан перед записью отказать при занятом object id (или сравнить тот же SHA и сделать idempotent no-op); другой content никогда не перезаписывается;
 - отсутствие `WorkspaceFile`, project/stream ACL и metadata sidecar;
 - типизированные ошибки хранения без утечки bucket/key в публичный ответ.
 
@@ -354,9 +357,17 @@ WP-05 + WP-06 + WP-07 + WP-09
 
 **Критерии готовности:** проверки без permission, с permission, unknown/read-only fields, повторного обновления, hide/unhide, block/unblock и немедленного влияния на поиск/скачивание.
 
+### WP-00.1 — Общая runtime-зависимость Pillow
+
+**Зависимость:** `WP-00`; prerequisite для `WP-08`.
+
+**Результат:** Pillow добавлен в runtime dependencies и lock штатным `uv`-процессом; develop environment синхронизирован с lock и RestAlchemy `15.3.0`. Этот шаг выполняется отдельным владельцем shared dependency files до начала WP-08. WP-00 не меняет `pyproject.toml` или `uv.lock`.
+
+**Критерии готовности:** dependency diff минимален, lock воспроизводим, `import PIL` и decoder smoke проходят, а `restalchemy` в develop соответствует `uv.lock` (`15.3.0`).
+
 ### WP-08 — Безопасный разбор и валидация ZIP
 
-**Зависимость:** `WP-00`.
+**Зависимость:** `WP-00`, `WP-00.1`.
 
 **Результат:**
 
@@ -365,7 +376,7 @@ WP-05 + WP-06 + WP-07 + WP-09
 - запрет absolute paths, `..`, symlink, duplicate paths, extra media, nested archives и encrypted entries;
 - лимиты 40 МиБ compressed, 100 МиБ unpacked, 50 items, 10 МиБ на media и 20:1 ratio;
 - потоковый hash и безопасное извлечение только ожидаемых файлов во временную директорию;
-- проверка фактической сигнатуры и декодирования GIF/WebP/PNG;
+- проверка фактической сигнатуры и декодирования GIF/WebP/PNG через Pillow;
 - размеры не более 2048×2048;
 - сверка расширения, manifest format, MIME и SHA-256;
 - результат в памяти/temporary files, не создающий DB/S3 side effects.
@@ -436,15 +447,16 @@ WP-05 + WP-06 + WP-07 + WP-09
 
 - `WP-00` выполняется одним исследовательским агентом под контролем оркестратора.
 - Оркестратор утверждает решения, создаёт baseline и только после этого разрешает кодовые пакеты.
+- `WP-00.1` добавляет Pillow и синхронизирует develop с lock; только после его PASS начинается `WP-08`.
 
 ### Волна 1 — Независимый фундамент
 
-Параллельно:
+Параллельно после `WP-00.1`:
 
 - агент A: `WP-01`;
 - агент B: `WP-02`;
 - агент C: `WP-03`;
-- после освобождения слота агент D: `WP-08`.
+- агент D: `WP-08` после `WP-00.1`, параллельно с остальными фундаментальными пакетами.
 
 Оркестратор проверяет каждый commit отдельно и интегрирует только после focused tests.
 
@@ -489,6 +501,19 @@ Commit: <sha или none>
 Риски и незакрытые вопросы:
 - ...
 ```
+
+### 9.1. Обязательная граница D-07 для текущей оркестрации
+
+До запуска зависимых пакетов оркестратор должен передать всем агентам следующую границу MVP:
+
+- До WP-08 shared dependency step обязан добавить Pillow в `pyproject.toml` и lock и синхронизировать develop с RestAlchemy `15.3.0`;
+- WP-08 декодирует только заголовок/структуру GIF/WebP/PNG через Pillow в безопасном режиме, не сохраняет и не перекодирует изображение;
+- сервер по-прежнему обязан защищать ZIP: пути, symlink, nested/encrypted entries, количество, сжатый и распакованный объём, ratio, временные файлы и очистка;
+- `format` и расширение проверяются как заявленные значения импортного контракта, `sha256` считается потоково сервером, а `width` и `height` сверяются с безопасно прочитанными размерами;
+- архив не сохраняется целиком, а Pillow не используется для преобразования, рендеринга или генерации производных файлов;
+- отказ decoder или несовпадение фактического формата с manifest — стандартная ошибка RestAlchemy `400`.
+
+Если dependency step не завершён или develop остаётся на RestAlchemy `15.2.8` вместо lock-версии `15.3.0`, WP-08 и Gate G1 блокируются до штатной синхронизации; сетевой retry в WP-00 не выполняется.
 
 ## 10. Интеграционные ворота
 
@@ -588,7 +613,7 @@ Commit: <sha или none>
 
 ### Формат по расширению может быть подделан
 
-Контроль: сверять manifest, расширение, сигнатуру и успешное декодирование; размеры брать только из фактического файла.
+Контроль MVP: сверять manifest, расширение, сигнатуру и успешное декодирование; размеры брать только из фактического файла.
 
 ### Дубликат заблокированного файла может обойти модерацию
 
