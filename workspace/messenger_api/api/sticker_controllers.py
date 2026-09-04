@@ -72,12 +72,6 @@ class StickerController(ra_controllers.BaseResourceController):
     def _user_uuid(self) -> sys_uuid.UUID:
         return typing.cast(sys_uuid.UUID, self.get_context().user_uuid)
 
-    def _media_url_root(self) -> str:
-        prefix, separator, _ = self.request.path.partition("/stickers")
-        if not separator:
-            raise ra_exceptions.NotFoundError(path=self.request.path)
-        return f"{prefix}/stickers"
-
     def _parse_uuid(self, value: object) -> sys_uuid.UUID:
         return typing.cast(
             sys_uuid.UUID,
@@ -124,7 +118,6 @@ class StickerController(ra_controllers.BaseResourceController):
             page_limit=page_limit,
             page_marker=self._query_value("page_marker"),
             if_none_match=self.request.headers.get("If-None-Match"),
-            media_url_root=self._media_url_root(),
         )
         return _http_response(result)
 
@@ -150,7 +143,6 @@ class StickerController(ra_controllers.BaseResourceController):
                     self._user_uuid(),
                     self._repository(),
                     sticker_uuid,
-                    media_url_root=self._media_url_root(),
                 )
             )
         if self.request.method == "PUT":
@@ -171,11 +163,7 @@ class StickerController(ra_controllers.BaseResourceController):
             )
             return _json_response(
                 sticker_catalog.public_card_dict(
-                    sticker_catalog.build_public_card(
-                        updated,
-                        is_favorite=False,
-                        media_url_root=self._media_url_root(),
-                    )
+                    sticker_catalog.build_public_card(updated, is_favorite=False)
                 )
             )
         raise ra_exceptions.UnsupportedHttpMethod(method=self.request.method)

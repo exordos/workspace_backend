@@ -118,7 +118,6 @@ def test_list_uses_only_explicit_query_contract_and_passthrough_response(monkeyp
                 "page_limit": 25,
                 "page_marker": None,
                 "if_none_match": None,
-                "media_url_root": "/v1/stickers",
             },
         )
     ]
@@ -334,21 +333,16 @@ def test_runtime_routes_mount_same_catalog_under_both_api_roots():
 
 
 @pytest.mark.parametrize(
-    ("application_route", "path", "media_url_root"),
+    ("application_route", "path"),
     [
-        (messenger_app.MessengerApiApp, "/v1/stickers/", "/v1/stickers"),
-        (
-            workspace_app.WorkspaceApiApp,
-            "/v1/messenger/stickers/",
-            "/v1/messenger/stickers",
-        ),
+        (messenger_app.MessengerApiApp, "/v1/stickers/"),
+        (workspace_app.WorkspaceApiApp, "/v1/messenger/stickers/"),
     ],
 )
-def test_both_runtime_entrypoints_dispatch_without_deployment_prefix(
+def test_both_runtime_entrypoints_dispatch_catalog(
     monkeypatch,
     application_route,
     path,
-    media_url_root,
 ):
     request = _request(path)
     monkeypatch.setattr(
@@ -361,11 +355,11 @@ def test_both_runtime_entrypoints_dispatch_without_deployment_prefix(
         "_repository",
         lambda self: object(),
     )
-    roots = []
+    calls = []
 
     def list_stickers(*args, **kwargs):
         del args
-        roots.append(kwargs["media_url_root"])
+        calls.append(kwargs)
         return sticker_catalog.StickerHttpResponse(
             body=b"[]",
             status=200,
@@ -377,7 +371,7 @@ def test_both_runtime_entrypoints_dispatch_without_deployment_prefix(
     response = application_route(request).do()
 
     assert response.status_int == 200
-    assert roots == [media_url_root]
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize(
