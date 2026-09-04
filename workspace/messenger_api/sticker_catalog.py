@@ -299,6 +299,28 @@ def download_sticker(
     )
 
 
+def star_sticker(
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any,
+    sticker_uuid: sys_uuid.UUID,
+) -> None:
+    """Idempotently add one visible sticker to the current user's favorites."""
+
+    repository.star(session, user_uuid, sticker_uuid)
+
+
+def unstar_sticker(
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any,
+    sticker_uuid: sys_uuid.UUID,
+) -> None:
+    """Idempotently remove one sticker from the current user's favorites."""
+
+    repository.unstar(session, user_uuid, sticker_uuid)
+
+
 def validate_query(value: str) -> str:
     normalized = normalize_whitespace(value)
     if len(normalized) > sticker_models.MAX_QUERY_LENGTH:

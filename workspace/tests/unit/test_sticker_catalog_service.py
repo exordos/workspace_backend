@@ -5,6 +5,7 @@
 
 import datetime
 import hashlib
+import inspect
 import json
 import uuid as sys_uuid
 
@@ -71,6 +72,12 @@ class _Repository:
     def resolve_batch(self, session, user_uuid, sticker_uuids):
         self.calls.append(("resolve", session, user_uuid, list(sticker_uuids)))
         return self.resolved
+
+    def star(self, session, user_uuid, sticker_uuid):
+        self.calls.append(("star", session, user_uuid, sticker_uuid))
+
+    def unstar(self, session, user_uuid, sticker_uuid):
+        self.calls.append(("unstar", session, user_uuid, sticker_uuid))
 
 
 class _Storage:
@@ -243,3 +250,44 @@ def test_download_maps_missing_storage_object_to_safe_not_found():
         )
 
     assert "stickers/moved" not in str(error.value)
+
+
+def test_favorite_services_are_idempotent_repository_commands_for_current_user():
+    repository = _Repository()
+    session = object()
+
+    sticker_catalog.star_sticker(session, USER_UUID, repository, STICKER_UUID)
+    sticker_catalog.star_sticker(session, USER_UUID, repository, STICKER_UUID)
+    sticker_catalog.unstar_sticker(session, USER_UUID, repository, STICKER_UUID)
+    sticker_catalog.unstar_sticker(session, USER_UUID, repository, STICKER_UUID)
+
+    assert repository.calls == [
+        ("star", session, USER_UUID, STICKER_UUID),
+        ("star", session, USER_UUID, STICKER_UUID),
+        ("unstar", session, USER_UUID, STICKER_UUID),
+        ("unstar", session, USER_UUID, STICKER_UUID),
+    ]
+
+
+def test_favorite_services_have_no_project_or_client_values_boundary():
+    for operation in (sticker_catalog.star_sticker, sticker_catalog.unstar_sticker):
+        parameters = inspect.signature(operation).parameters
+        assert tuple(parameters) == (
+            "session",
+            "user_uuid",
+            "repository",
+            "sticker_uuid",
+        )
+        assert "project_id" not in parameters
+
+
+def test_star_propagates_safe_hidden_blocked_or_missing_rejection():
+    class RejectingRepository(_Repository):
+        def star(self, session, user_uuid, sticker_uuid):
+            del session, user_uuid, sticker_uuid
+            raise sticker_repository.StickerNotVisibleError()
+
+    with pytest.raises(sticker_repository.StickerNotVisibleError):
+        sticker_catalog.star_sticker(
+            object(), USER_UUID, RejectingRepository(), STICKER_UUID
+        )
