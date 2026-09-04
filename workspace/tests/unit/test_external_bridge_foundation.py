@@ -13,6 +13,7 @@ import uuid as sys_uuid
 import pytest
 import webob
 from restalchemy.api import applications
+from restalchemy.api import constants
 from restalchemy.api import contexts
 
 from workspace.messenger_api.api import controllers
@@ -191,6 +192,7 @@ def test_zb_contract_001_public_openapi_exposes_exact_ui_boundary():
     request = webob.Request.blank("/specifications/3.0.3")
     request.application = application
     request.api_context = contexts.RequestContext(request)
+    request.api_context.set_active_method(constants.GET)
     specification = application.openapi_engine.build_openapi_specification(
         "3.0.3",
         request,
