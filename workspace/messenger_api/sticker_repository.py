@@ -367,33 +367,45 @@ class StickerRepository:
         match_clause = ""
         match_params: list[typing.Any] = []
         if query.q:
+            # Tags retain their original ё spelling, while search_text stores
+            # the canonical е spelling.  Both tag operands remain GIN-indexed.
+            alternate_tag = query.q.replace("е", "ё")
+            tag_match = "s.tags @> ARRAY[%s]::text[] OR s.tags @> ARRAY[%s]::text[]"
             query_rank = """
                 CASE
-                  WHEN EXISTS (
-                    SELECT 1 FROM unnest(s.tags) AS tag(value)
-                    WHERE replace(lower(tag.value), 'ё', 'е') = %s
-                  ) THEN 4.0
+                  WHEN {tag_match} THEN 4.0
                   WHEN replace(lower(s.title), 'ё', 'е') = %s THEN 3.0
                   WHEN replace(lower(s.title), 'ё', 'е') LIKE %s || '%%' THEN 2.0
-                  WHEN replace(lower(s.search_text), 'ё', 'е') LIKE '%%' || %s || '%%'
+                  WHEN s.search_text LIKE '%%' || %s || '%%'
                     THEN 1.0
-                  ELSE similarity(replace(lower(s.search_text), 'ё', 'е'), %s)
+                  ELSE similarity(s.search_text, %s)
                 END
-            """
-            rank_params = [query.q, query.q, query.q, query.q, query.q]
+            """.format(tag_match=tag_match)
+            rank_params = [
+                query.q,
+                alternate_tag,
+                query.q,
+                query.q,
+                query.q,
+                query.q,
+            ]
             match_clause = """
                 (
-                  EXISTS (
-                    SELECT 1 FROM unnest(s.tags) AS match_tag(value)
-                    WHERE replace(lower(match_tag.value), 'ё', 'е') = %s
-                  )
+                  ({tag_match})
                   OR replace(lower(s.title), 'ё', 'е') = %s
                   OR replace(lower(s.title), 'ё', 'е') LIKE %s || '%%'
-                  OR replace(lower(s.search_text), 'ё', 'е') LIKE '%%' || %s || '%%'
-                  OR similarity(replace(lower(s.search_text), 'ё', 'е'), %s) >= 0.1
+                  OR s.search_text LIKE '%%' || %s || '%%'
+                  OR similarity(s.search_text, %s) >= 0.1
                 )
-            """
-            match_params = [query.q, query.q, query.q, query.q, query.q]
+            """.format(tag_match=tag_match)
+            match_params = [
+                query.q,
+                alternate_tag,
+                query.q,
+                query.q,
+                query.q,
+                query.q,
+            ]
 
         where = ["s.active = TRUE", "s.blocked = FALSE"]
         where.extend((query.category and "s.category = %s",) if query.category else ())

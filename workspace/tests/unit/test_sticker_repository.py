@@ -111,11 +111,14 @@ def test_search_parameter_order_matches_cte_placeholder_order() -> None:
     )
     statement, params = repository._list_statement(query, user_uuid, None)
     assert statement.count("%s") == len(params)
-    assert params[:5] == ("кот",) * 5
-    assert params[5] == user_uuid
-    assert params[6:8] == ("sticker", "png")
-    assert params[8] == [first]
-    assert params[9:] == ("кот",) * 5 + (11,)
+    assert "unnest(s.tags)" not in statement
+    assert "replace(lower(s.search_text)" not in statement
+    assert "s.search_text LIKE" in statement
+    assert params[:6] == ("кот",) * 6
+    assert params[6] == user_uuid
+    assert params[7:9] == ("sticker", "png")
+    assert params[9] == [first]
+    assert params[10:] == ("кот",) * 6 + (11,)
 
 
 def test_rank_marker_rejects_non_finite_values() -> None:
