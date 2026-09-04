@@ -105,6 +105,14 @@ def test_gate_g0_query_page_and_uuid_limits() -> None:
     with pytest.raises(ValueError):
         sticker_catalog.validate_uuid_filter([sys_uuid.uuid4()] * 101)
 
+    first = sys_uuid.UUID("10000000-0000-0000-0000-000000000002")
+    second = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
+    assert sticker_catalog.validate_uuid_filter([first, second, first]) == [
+        second,
+        first,
+    ]
+    assert sticker_catalog.validate_uuid_filter([second, first]) == [second, first]
+
 
 def test_public_card_has_no_storage_fields_and_uses_exact_download_action() -> None:
     sticker = stickers.Sticker(
@@ -134,6 +142,17 @@ def test_public_card_has_no_storage_fields_and_uses_exact_download_action() -> N
     assert card.media.height == 180
     assert card.is_favorite is True
 
+    with pytest.raises(Exception):
+        stickers.Sticker(
+            title="x",
+            alt_text="",
+            search_text="x",
+            format="gif",
+            size_bytes=0,
+            sha256=SHA256,
+            media_object_id="object",
+        )
+
 
 def test_sticker_field_permissions_match_admin_contract() -> None:
     props = stickers.Sticker.properties.properties
@@ -154,11 +173,13 @@ def test_import_result_has_only_created_and_duplicate_statuses() -> None:
         items=[
             stickers.StickerImportItemResult(
                 client_id=CLIENT_UUID,
+                file="media/20000000-0000-0000-0000-000000000000.gif",
                 sticker_uuid=STICKER_UUID,
                 status="created",
             ),
             stickers.StickerImportItemResult(
                 client_id=sys_uuid.uuid4(),
+                file="media/20000000-0000-0000-0000-000000000000.gif",
                 sticker_uuid=STICKER_UUID,
                 status="duplicate",
             ),
@@ -168,6 +189,7 @@ def test_import_result_has_only_created_and_duplicate_statuses() -> None:
     with pytest.raises(Exception):
         stickers.StickerImportItemResult(
             client_id=CLIENT_UUID,
+            file="media/20000000-0000-0000-0000-000000000000.gif",
             sticker_uuid=STICKER_UUID,
             status="rejected",
         )

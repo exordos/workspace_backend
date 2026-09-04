@@ -41,6 +41,10 @@ DEFAULT_PAGE_LIMIT = 50
 MAX_UUID_FILTER_COUNT = 100
 MAX_FILE_PATH_LENGTH = 260
 SHA256_LENGTH = 64
+STICKER_FILE_PATH_TYPE = types.String(
+    min_length=1,
+    max_length=MAX_FILE_PATH_LENGTH,
+)
 STICKER_ADMIN_MUTABLE_FIELDS = frozenset(
     {"title", "alt_text", "emoji", "tags", "category", "active", "blocked"}
 )
@@ -129,7 +133,7 @@ class Sticker(
         read_only=True,
     )
     size_bytes = properties.property(
-        types.Integer(min_value=0),
+        types.Integer(min_value=1),
         required=True,
         read_only=True,
     )
@@ -255,7 +259,7 @@ class StickerManifestItem(_StrictModel):
 
     client_id = properties.property(types.UUID(), required=True)
     file = properties.property(
-        types.String(min_length=1, max_length=MAX_FILE_PATH_LENGTH),
+        STICKER_FILE_PATH_TYPE,
         required=True,
     )
     sha256 = properties.property(
@@ -376,12 +380,17 @@ class StickerManifest(_StrictModel):
 
 class StickerImportItemResult(_StrictModel):
     client_id = properties.property(types.UUID(), required=True, read_only=True)
-    sticker_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    file = properties.property(
+        STICKER_FILE_PATH_TYPE,
+        required=True,
+        read_only=True,
+    )
     status = properties.property(
         types.Enum(STICKER_IMPORT_STATUSES),
         required=True,
         read_only=True,
     )
+    sticker_uuid = properties.property(types.UUID(), required=True, read_only=True)
 
 
 class StickerImportResult(_StrictModel):

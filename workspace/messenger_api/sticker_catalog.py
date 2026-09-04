@@ -182,7 +182,7 @@ def validate_uuid_filter(values: typing.Iterable[sys_uuid.UUID]) -> list[sys_uui
     raw_values = list(values)
     if len(raw_values) > sticker_models.MAX_UUID_FILTER_COUNT:
         raise ValueError("uuid cannot contain more than 100 values")
-    result = _stable_dedupe(str(value) for value in raw_values)
+    result = sorted({str(value) for value in raw_values})
     return [sys_uuid.UUID(value) for value in result]
 
 
