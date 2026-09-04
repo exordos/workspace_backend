@@ -15,6 +15,7 @@
 import io
 import hashlib
 import pathlib
+import tempfile
 import types
 import uuid as sys_uuid
 from unittest import mock
@@ -93,6 +94,52 @@ def test_local_storage_is_idempotent_for_same_content_and_rejects_overwrite(
     with pytest.raises(sticker_storage.StickerStorageConflictError):
         storage.save(STICKER_UUID, "gif", b"different")
     assert storage.read(STICKER_UUID, "gif") == b"same"
+
+
+def test_local_storage_rejects_parent_symlink_without_touching_outside(tmp_path):
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (storage_root / "stickers").symlink_to(outside, target_is_directory=True)
+    storage = sticker_storage.LocalStickerStorage(str(storage_root))
+
+    with pytest.raises(ValueError):
+        storage.save(STICKER_UUID, "png", b"not outside")
+
+    assert list(outside.iterdir()) == []
+
+
+def test_local_storage_creates_temporary_file_in_target_parent(tmp_path, monkeypatch):
+    storage = sticker_storage.LocalStickerStorage(str(tmp_path))
+    target_parent = tmp_path / "stickers" / str(STICKER_UUID)
+    original = tempfile.NamedTemporaryFile
+    calls = []
+
+    def record_tempfile(*args, **kwargs):
+        calls.append(kwargs["dir"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sticker_storage.tempfile, "NamedTemporaryFile", record_tempfile)
+    storage.save(STICKER_UUID, "png", b"same")
+
+    assert calls == [target_parent]
+
+
+def test_local_storage_does_not_read_or_accept_existing_target_symlink(tmp_path):
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    storage = sticker_storage.LocalStickerStorage(str(tmp_path))
+    info = storage.save(STICKER_UUID, "gif", b"stored")
+    target = tmp_path / info.storage_object_id
+    target.unlink()
+    target.symlink_to(outside)
+
+    with pytest.raises(sticker_storage.StickerStorageConflictError):
+        storage.save(STICKER_UUID, "gif", b"stored")
+    with pytest.raises(sticker_storage.StickerStorageBackendError):
+        storage.read(STICKER_UUID, "gif")
+    assert outside.read_bytes() == b"outside"
 
 
 def test_s3_storage_uses_guarded_put_and_translates_operations():

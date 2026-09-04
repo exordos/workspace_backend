@@ -84,6 +84,7 @@ def get_sticker_object_id(sticker_uuid: sys_uuid.UUID, format: str) -> str:
 
 def _read_source_to_temp(
     source: bytes | typing.BinaryIO,
+    directory: pathlib.Path | None = None,
 ) -> tuple[pathlib.Path, int, str]:
     if isinstance(source, bytes):
         source = io.BytesIO(source)
@@ -95,7 +96,11 @@ def _read_source_to_temp(
     size = 0
     temporary_path: pathlib.Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w+b", delete=False) as temporary:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            dir=directory,
+            delete=False,
+        ) as temporary:
             temporary_path = pathlib.Path(temporary.name)
             while True:
                 chunk = file_source.read(_COPY_CHUNK_SIZE)
@@ -114,17 +119,21 @@ def _read_source_to_temp(
 
 
 def _file_matches(path: pathlib.Path, size: int, digest: str) -> bool:
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return False
     hasher = hashlib.sha256()
     actual_size = 0
-    with path.open("rb") as file:
-        while True:
-            chunk = file.read(_COPY_CHUNK_SIZE)
-            if not chunk:
-                break
-            hasher.update(chunk)
-            actual_size += len(chunk)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as file:
+            while True:
+                chunk = file.read(_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                actual_size += len(chunk)
+    except OSError:
+        return False
     return actual_size == size and hasher.hexdigest() == digest
 
 
@@ -142,6 +151,11 @@ class LocalStickerStorage:
         path = self._root / object_id
         if self._root not in path.parents:
             raise ValueError("Sticker object id is invalid")
+        try:
+            resolved_parent = path.parent.resolve()
+            resolved_parent.relative_to(self._root)
+        except (OSError, ValueError) as error:
+            raise ValueError("Sticker storage path is invalid") from error
         return path
 
     def save(
@@ -153,7 +167,8 @@ class LocalStickerStorage:
         object_id = get_sticker_object_id(sticker_uuid, format)
         path = self._path(sticker_uuid, format)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path, size, digest = _read_source_to_temp(source)
+        path = self._path(sticker_uuid, format)
+        temporary_path, size, digest = _read_source_to_temp(source, path.parent)
         try:
             if path.exists() or path.is_symlink():
                 if _file_matches(path, size, digest):
@@ -175,12 +190,19 @@ class LocalStickerStorage:
 
     def read(self, sticker_uuid: sys_uuid.UUID, format: str) -> bytes:
         path = self._path(sticker_uuid, format)
+        fd: int | None = None
         try:
-            return path.read_bytes()
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as file:
+                fd = None
+                return file.read()
         except FileNotFoundError as error:
             raise StickerStorageNotFoundError("Sticker object was not found") from error
         except OSError as error:
             raise StickerStorageBackendError("Local sticker storage failed") from error
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def delete(self, sticker_uuid: sys_uuid.UUID, format: str) -> None:
         path = self._path(sticker_uuid, format)
