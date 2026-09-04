@@ -377,7 +377,7 @@ class StickerRepository:
             """
             rank_params = [query.q, query.q, query.q, query.q, query.q]
             match_clause = """
-                AND (
+                (
                   EXISTS (
                     SELECT 1 FROM unnest(s.tags) AS match_tag(value)
                     WHERE replace(lower(match_tag.value), 'ё', 'е') = %s

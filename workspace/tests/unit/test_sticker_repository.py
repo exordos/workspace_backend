@@ -93,4 +93,5 @@ def test_query_selects_each_d01_sort_and_parameterizes_search() -> None:
         statement, params = repository._list_statement(query, user_uuid, None)
         assert query.sort == expected[(has_q, favorite)]
         assert "кот" not in statement
+        assert "AND AND" not in statement
         assert statement.count("%s") == len(params)
