@@ -149,7 +149,7 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
             tags=[],
             search_text="животное кот",
             timestamp=timestamp,
-            updated_timestamp=timestamp + datetime.timedelta(seconds=1),
+            updated_timestamp=timestamp + datetime.timedelta(seconds=2),
         ),
         _row(
             equal_new,
@@ -189,7 +189,7 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 third: timestamp + datetime.timedelta(seconds=3),
                 partial: timestamp + datetime.timedelta(seconds=4),
                 equal_old: timestamp + datetime.timedelta(seconds=5),
-                equal_new: timestamp + datetime.timedelta(seconds=6),
+                equal_new: timestamp + datetime.timedelta(seconds=5),
             }
             for sticker_uuid, favorite_time in favorite_times.items():
                 cursor.execute(
@@ -218,11 +218,19 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
             for item in repository.list_stickers(db, user_uuid, favorite=True).items
         }
 
+        equal_rank_uuid_order = sorted((equal_old, equal_new), key=str, reverse=True)
         expected_orders = {
             (None, False): sorted(initial_uuids, key=str, reverse=True),
-            (None, True): [equal_new, equal_old, partial, third, second, first],
-            ("кот", False): [first, second, third, equal_new, equal_old, partial, typo],
-            ("кот", True): [first, second, third, equal_new, equal_old, partial],
+            (None, True): [*equal_rank_uuid_order, partial, third, second, first],
+            ("кот", False): [
+                first,
+                second,
+                third,
+                *equal_rank_uuid_order,
+                partial,
+                typo,
+            ],
+            ("кот", True): [first, second, third, *equal_rank_uuid_order, partial],
         }
         for q, favorite in (
             (None, False),
