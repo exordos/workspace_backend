@@ -75,7 +75,7 @@
 
 | Код | Решение | Закрытый контракт Gate G0 |
 |---|---|---|
-| `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Без `q`: `created_at DESC, uuid DESC`; с `q` и `favorite=true`: `rank DESC, favorite_created_at DESC, uuid DESC` (`favorite_created_at` для не-избранных — минимальное значение). Fingerprint включает canonical `uuid`: dedupe и lexicographic sort, максимум 100 UUID; pagination с uuid разрешена. Маркер другой сортировки/фильтров даёт 400. |
+| `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Сортировка однозначно выбирается по `q` и `favorite`: без `q`, `favorite=false` — `created_at DESC, uuid DESC`; без `q`, `favorite=true` — `favorite_created_at DESC, uuid DESC`; с `q`, `favorite=false` — `rank DESC, updated_at DESC, uuid DESC`; с `q`, `favorite=true` — `rank DESC, favorite_created_at DESC, uuid DESC`. Fingerprint включает canonical `uuid`: dedupe и lexicographic sort, максимум 100 UUID; pagination с uuid разрешена. Маркер другой сортировки/фильтров даёт 400. |
 | `D-02` | Технические лимиты текстовых полей и метаданных | `title` — 200 символов Unicode, `alt_text` — 500, один tag — 64, не более 64 tags, общий размер tags — 4096 байт UTF-8, `q` — 200, `page_limit` — от 1 до 100 (по умолчанию 50), повторяемый `uuid` — не более 100 значений. `width` и `height` — необязательные поля; при наличии положительное целое, при отсутствии `NULL`. Это техническая проверка формы, а не проверка содержимого. |
 | `D-03` | Ответ при невалидном атомарном импорте | Весь запрос отвечает стандартной ошибкой RestAlchemy `400` (`ValidationErrorException`); постоянные записи и объекты не создаются. Успех — `200` JSON с `created`, `duplicates`, `items`; поля `rejected` нет. |
 | `D-04` | Повторный импорт SHA заблокированного или скрытого стикера | Уникальный SHA возвращает существующий `sticker_uuid` как `duplicate`; копия не создаётся и состояние автоматически не меняется. |
@@ -83,7 +83,7 @@
 | `D-06` | Кэш медиа | GET download возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, max-age=31536000, immutable`, `Content-Type`, выведенным из сохранённого `format`; редирект не используется в MVP и внутренний object id не раскрывается. |
 | `D-07` | Заявленные метаданные медиафайла в MVP | `format` допускается только как `gif`, `webp` или `png`, а расширение должно ему соответствовать; сервер не декодирует байты медиафайла и не проверяет его содержимое. `width` и `height` — необязательные метаданные из manifest; при наличии положительное целое, при отсутствии `NULL`, без сравнения с байтами. SHA-256 считает сервер потоково. Реальный формат и визуальная пригодность проверяются администратором до импорта; проверка содержимого изображения — отдельное будущее усиление. |
 | `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. В текущем manifest permission и binding отсутствуют; WP-07 добавляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding` по существующей схеме `project_id: null`, без implicit user assignment. |
-| `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при любом нормальном возврате WSGI response, включая response со статусом 500; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows, а ошибки после DB writes должны поднимать exception до выхода из context для rollback. Неопределённый исход commit не удаляет объекты: retry по SHA безопасен и завершает orphan-repair отдельной проверкой. |
+| `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при любом нормальном возврате WSGI response, включая response со статусом 500; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows. Известная ошибка SQL до подтверждённой финальной фиксации требует `session.rollback()` и удаления только объектов текущей попытки. Только при неопределённом исходе финальной фиксации автоматическое удаление запрещено: retry по SHA безопасен и завершается отдельной orphan-repair проверкой. |
 | `D-10` | Чтение скрытого стикера | Обычный GET и list/search возвращают только `active=true, blocked=false`; batch resolve возвращает hidden (`active=false, blocked=false`) для истории; download разрешён для active и hidden, но blocked отвечает безопасным `404` без чтения storage. |
 | `D-11` | `id` против `uuid` в публичном JSON | Публичная карточка сохраняет поле `id` со значением sticker UUID. В БД и маршрутах используется `uuid`; import result использует `sticker_uuid`. Числовые IDs и `media_object_id` наружу не выдаются. |
 | `D-12` | Идентичность storage | В строке хранится только `media_object_id`; доступ идёт через единый `sticker_storage` adapter. Production — настроенный S3, local backend только для development/tests; bucket и object key не входят в DTO, error и logs. |
@@ -110,7 +110,7 @@
 |---|---|---|---|
 | предварительная проверка/manifest/метаданных | нет записей | нет объектов | вернуть RestAlchemy `400` |
 | N-й upload до DB writes | нет записей | удалить только объекты текущей попытки; cleanup error логировать безопасно | вернуть `500` |
-| DB insert/constraint до commit | rollback | удалить объекты текущей попытки | вернуть `400/409/500` по типу ошибки |
+| известная ошибка SQL до подтверждённой финальной фиксации | rollback | удалить только объекты текущей попытки | вернуть `400/409/500` по типу ошибки |
 | request exception до context exit | rollback | удалить объекты текущей попытки | вернуть ошибку |
 | final `session.commit()` failure | состояние commit неопределённо | не удалять автоматически | вернуть `500`; повтор разрешён по SHA и отдельная orphan-repair проверка |
 | response уже отправлен, процесс остановлен около commit | состояние commit неопределённо | объекты остаются | повторный импорт идемпотентен по UNIQUE SHA; orphan inventory — операционная проверка |
@@ -224,7 +224,7 @@ WP-05 + WP-06 + WP-07 + WP-09
 - определить точную схему непрозрачного курсора и устойчивую сортировку;
 - установить технические лимиты строк, тегов, UUID-фильтра и размера страницы;
 - проверить доступность IAM permission;
-- выбрать библиотеку определения размеров/формата и проверить GIF/WebP/PNG;
+- зафиксировать границу `D-07`: MVP не использует Pillow или иной декодер изображений, не проверяет сигнатуру файла/фактический формат и не меняет файлы зависимостей;
 - исследовать фактический момент commit RestAlchemy и выбрать проверяемую S3 compensation strategy;
 - зафиксировать cache headers и `ETag` behavior;
 - закрыть различия `id`/`uuid`, storage identity, duplicate SHA внутри архива и favorite после hide/block.
@@ -335,7 +335,7 @@ WP-05 + WP-06 + WP-07 + WP-09
 - идемпотентные операции star/unstar;
 - user_uuid берётся только из IAM context;
 - запрет добавления hidden/blocked/несуществующего стикера;
-- `favorite=true` с сортировкой от новых к старым;
+- точная сортировка `favorite=true`: без `q` — `favorite_created_at DESC, uuid DESC`, с `q` — `rank DESC, favorite_created_at DESC, uuid DESC`;
 - одинаковое избранное для одного пользователя в разных проектах;
 - отсутствие возможности передать user_uuid другого пользователя.
 
@@ -373,7 +373,7 @@ WP-05 + WP-06 + WP-07 + WP-09
 - потоковый SHA-256 и сверка manifest checksum;
 - результат в памяти/temporary files, не создающий DB/S3 side effects.
 
-**Критерии готовности:** table-driven tests валидного архива и каждого класса атаки/ошибки; временные файлы удаляются и при успехе, и при исключении; проверки не читают более установленных лимитов.
+**Критерии готовности:** table-driven tests валидного архива и каждого класса атаки/ошибки, включая зашифрованные элементы архива; временные файлы удаляются и при успехе, и при исключении; проверки не читают более установленных лимитов; тесты подтверждают отсутствие Pillow/декодера изображений, проверки сигнатуры файла и сравнения размеров с байтами изображения.
 
 ### WP-09 — Оркестрация административного импорта
 
@@ -392,7 +392,7 @@ WP-05 + WP-06 + WP-07 + WP-09
 - ответ с сопоставлением `client_id`, `file`, status и `sticker_uuid`;
 - архив и manifest не сохраняются как отдельные сущности.
 
-**Критерии готовности:** integration tests all-created, mixed-created/duplicate, all-duplicate, invalid atomic reject, ошибка N-го S3 upload, SQL failure, duplicate race, cleanup failure и повтор после неопределённого клиентского результата.
+**Критерии готовности:** integration tests all-created, mixed-created/duplicate, all-duplicate, invalid atomic reject, ошибка N-го S3 upload, известная ошибка SQL с rollback и очисткой объектов текущей попытки, duplicate race, ошибка очистки и повтор после неопределённой финальной фиксации без автоматической очистки.
 
 ### WP-10 — RestAlchemy routes, OpenAPI и интеграция модулей
 
