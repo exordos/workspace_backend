@@ -18,13 +18,20 @@ import dataclasses
 import hashlib
 import io
 import json
+import logging
 import pathlib
 import re
 import stat
 import tempfile
 import typing
 import zipfile
+import uuid as sys_uuid
 
+from restalchemy.common import exceptions as ra_exc
+
+from workspace.messenger_api import sticker_catalog
+from workspace.messenger_api import sticker_repository
+from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import stickers
 
 
@@ -50,10 +57,18 @@ _ARCHIVE_SUFFIXES = frozenset(
         ".zip",
     )
 )
+LOG = logging.getLogger(__name__)
 
 
 class StickerImportValidationError(ValueError):
     """A client-correctable sticker archive validation error."""
+
+
+class StickerImportError(ra_exc.RestAlchemyException):
+    """A non-client failure while importing a validated archive."""
+
+    message = "Sticker archive import failed"
+    code = 500
 
 
 @dataclasses.dataclass(frozen=True)
@@ -330,3 +345,208 @@ def validate_archive(
         _copy_archive(source, archive_path)
         result = _validate_zip(archive_path, temporary_directory)
         yield result
+
+
+def _lock_sha256_values(session: typing.Any, values: typing.Iterable[str]) -> None:
+    """Serialize imports for each SHA without taking a process-local lock."""
+
+    for value in values:
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (value,),
+        )
+
+
+def _build_sticker(
+    item: StickerImportItem,
+    sticker_uuid: sys_uuid.UUID,
+    media_object_id: str,
+) -> stickers.Sticker:
+    try:
+        normalized = sticker_catalog.normalize_sticker_fields(
+            item.manifest.title,
+            item.manifest.alt_text,
+            item.manifest.emoji,
+            item.manifest.tags,
+        )
+        return stickers.Sticker(
+            uuid=sticker_uuid,
+            title=normalized["title"],
+            alt_text=normalized["alt_text"],
+            emoji=normalized["emoji"],
+            tags=normalized["tags"],
+            search_text=normalized["search_text"],
+            category=item.manifest.category,
+            format=item.manifest.format,
+            width=item.manifest.width,
+            height=item.manifest.height,
+            size_bytes=item.size_bytes,
+            sha256=item.sha256,
+            media_object_id=media_object_id,
+        )
+    except (TypeError, ValueError) as error:
+        raise StickerImportValidationError("Sticker metadata is invalid") from error
+
+
+def _cleanup_failed_import(
+    session: typing.Any,
+    storage: sticker_storage.StickerStorage,
+    owned_objects: collections_abc.Iterable[str],
+) -> None:
+    try:
+        session.rollback()
+    except Exception as error:  # pragma: no cover - defensive backend boundary
+        LOG.warning(
+            "Sticker import rollback failed (%s)",
+            type(error).__name__,
+        )
+    for object_id in owned_objects:
+        try:
+            storage.delete(object_id)
+        except Exception as error:  # pragma: no cover - exercised by integration
+            LOG.warning(
+                "Sticker import object cleanup failed (%s)",
+                type(error).__name__,
+            )
+
+
+def _import_validated_archive(
+    archive: StickerImportArchive,
+    session: typing.Any,
+    repository: typing.Any,
+    storage: sticker_storage.StickerStorage,
+) -> stickers.StickerImportResult:
+    by_sha: dict[str, list[StickerImportItem]] = {}
+    for item in archive.items:
+        by_sha.setdefault(item.sha256, []).append(item)
+
+    representatives = {
+        sha: min(group, key=lambda value: str(value.manifest.client_id))
+        for sha, group in by_sha.items()
+    }
+    sha_values = sorted(by_sha)
+    existing = repository.find_duplicates(session, sha_values)
+    missing = [value for value in sha_values if value not in existing]
+
+    if missing:
+        _lock_sha256_values(session, missing)
+        existing.update(repository.find_duplicates(session, missing))
+    missing = [value for value in sha_values if value not in existing]
+
+    owned_objects: list[str] = []
+    candidates: list[stickers.Sticker] = []
+    candidate_by_sha: dict[str, stickers.Sticker] = {}
+    try:
+        for sha in missing:
+            item = representatives[sha]
+            sticker_uuid = sys_uuid.uuid4()
+            object_id = sticker_storage.get_sticker_object_id(
+                sticker_uuid,
+                item.manifest.format,
+            )
+            with item.path.open("rb") as source:
+                saved = storage.save(sticker_uuid, item.manifest.format, source)
+            if saved.storage_object_id != object_id:
+                raise StickerImportError()
+            owned_objects.append(saved.storage_object_id)
+            candidate = _build_sticker(item, sticker_uuid, saved.storage_object_id)
+            candidates.append(candidate)
+            candidate_by_sha[sha] = candidate
+
+        if candidates:
+            inserted = repository.insert_batch(session, candidates)
+            existing.update(inserted)
+        else:
+            inserted = {}
+
+        result_items: list[stickers.StickerImportItemResult] = []
+        created_count = 0
+        duplicate_count = 0
+        for item in archive.items:
+            sha = item.sha256
+            sticker_uuid = existing.get(sha)
+            if sticker_uuid is None:
+                raise StickerImportError()
+            created = (
+                sha in candidate_by_sha
+                and inserted.get(sha) == candidate_by_sha[sha].uuid
+                and item is representatives[sha]
+            )
+            status = "created" if created else "duplicate"
+            if created:
+                created_count += 1
+            else:
+                duplicate_count += 1
+            result_items.append(
+                stickers.StickerImportItemResult(
+                    client_id=item.manifest.client_id,
+                    file=item.manifest.file,
+                    status=status,
+                    sticker_uuid=sticker_uuid,
+                )
+            )
+        return stickers.StickerImportResult(
+            created=created_count,
+            duplicates=duplicate_count,
+            items=result_items,
+        )
+    except Exception as error:
+        _cleanup_failed_import(session, storage, owned_objects)
+        if isinstance(
+            error, (StickerImportValidationError, ra_exc.RestAlchemyException)
+        ):
+            raise
+        raise StickerImportError() from error
+
+
+def import_archive(
+    source: bytes | typing.BinaryIO,
+    session: typing.Any,
+    user_uuid: sys_uuid.UUID,
+    repository: typing.Any | None = None,
+    storage: sticker_storage.StickerStorage | None = None,
+) -> stickers.StickerImportResult:
+    """Import a fully validated archive in the caller's transaction.
+
+    The service intentionally does not commit or open a session.  A successful
+    return leaves the storage objects in place for the caller's final commit;
+    only known failures trigger rollback and compensation.
+    """
+
+    del user_uuid
+    active_repository = (
+        repository if repository is not None else sticker_repository.StickerRepository()
+    )
+    active_storage = (
+        storage if storage is not None else sticker_storage.get_sticker_storage()
+    )
+    with validate_archive(source) as archive:
+        try:
+            return _import_validated_archive(
+                archive,
+                session,
+                active_repository,
+                active_storage,
+            )
+        except StickerImportValidationError:
+            raise
+        except ra_exc.RestAlchemyException:
+            # The inner operation already compensates uploaded objects.  The
+            # extra rollback also covers errors before the first upload.
+            try:
+                session.rollback()
+            except Exception as error:  # pragma: no cover - defensive boundary
+                LOG.warning(
+                    "Sticker import rollback failed (%s)",
+                    type(error).__name__,
+                )
+            raise
+        except Exception as error:
+            try:
+                session.rollback()
+            except Exception as rollback_error:  # pragma: no cover
+                LOG.warning(
+                    "Sticker import rollback failed (%s)",
+                    type(rollback_error).__name__,
+                )
+            raise StickerImportError() from error
