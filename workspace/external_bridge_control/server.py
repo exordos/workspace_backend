@@ -9,6 +9,7 @@ import random
 import re
 import socketserver
 import ssl
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -18,6 +19,7 @@ from workspace.external_bridge_control import pki
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_service
 from workspace.external_bridge_control import service
+from workspace.history_import import contract as history_contract
 
 
 MAX_REQUEST_TARGET = 512
@@ -168,6 +170,9 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             return
         length = int(content_lengths[0])
+        if urllib.parse.urlsplit(self.path).path.startswith(history_contract.PATH):
+            self._dispatch_history(length, certificate_der)
+            return
         limit = MAX_ENROLLMENT_BODY if enrollment else MAX_BODY
         if length > limit:
             self.send_error(413)
@@ -255,6 +260,50 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
                     "message": str(error),
                 },
             )
+        self._send_response(response)
+
+    def _dispatch_history(self, length: int, certificate_der: bytes) -> None:
+        server = cast(PrivateServer, self.server)
+        if server.history_service is None:
+            self.send_error(404)
+            self.close_connection = True
+            return
+        if length > history_contract.MAX_BODY_BYTES:
+            self.send_error(413)
+            self.close_connection = True
+            return
+        # Acquire admission before allocating the body. Realtime requests never
+        # wait on this semaphore and keep their existing request transaction.
+        if not server.history_admission.acquire(blocking=False):
+            self._send_response(
+                service.Response.json(503, {"error": "history_import_busy"})
+            )
+            self.close_connection = True
+            return
+        try:
+            try:
+                body = self.rfile.read(length)
+            except (OSError, TimeoutError):
+                self.send_error(408)
+                self.close_connection = True
+                return
+            if len(body) != length:
+                self.send_error(400)
+                self.close_connection = True
+                return
+            self._send_response(
+                server.history_service.handle(
+                    self.command,
+                    self.path,
+                    dict(self.headers.items()),
+                    body,
+                    certificate_der,
+                )
+            )
+        finally:
+            server.history_admission.release()
+
+    def _send_response(self, response: service.Response) -> None:
         self.send_response(response.status)
         if response.content_type:
             self.send_header("Content-Type", response.content_type)
@@ -276,8 +325,11 @@ class PrivateServer(_ThreadingServer):
         private_service: service.PrivateBridgeService,
         ssl_context: ssl.SSLContext,
         request_session_factory: Callable[[], Any] | None = None,
+        history_service: Any = None,
     ) -> None:
         super().__init__(address, PrivateHandler)
         self.private_service = private_service
         self.request_session_factory = request_session_factory
+        self.history_service = history_service
+        self.history_admission = threading.BoundedSemaphore(2)
         self.socket = ssl_context.wrap_socket(self.socket, server_side=True)

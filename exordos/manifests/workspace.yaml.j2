@@ -691,6 +691,21 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
+    workspace_history_import_worker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-history-import-worker
+      path: /usr/bin/workspace-history-import-worker --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
     workspace_external_bridge_control:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-external-bridge-control

@@ -28,6 +28,7 @@ WORKSPACE_BINARIES=(
     workspace-api
     workspace-messenger-api
     workspace-messenger-worker
+    workspace-history-import-worker
     workspace-messenger-events
     workspace-external-bridge-api
 )
