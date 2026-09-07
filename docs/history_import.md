@@ -224,3 +224,10 @@ visible UI under the primary account, read/starred isolation, repeated batches,
 restart checkpoints, source removal/depth changes and concurrent realtime
 messages. Record p95/p99 client latency, errors, transaction maximum, throughput,
 RSS and retries; do not infer zero UI lag from import throughput alone.
+
+## Partial updates arriving before publication
+
+See [partial move recovery](provider_partial_move_recovery.md) for the classified
+missing-base outcome, post-import reference gate, durable recovery intents and
+backend-first release/rollback procedure. Local mappings do not prove a base
+message exists, and completed capture does not imply completed publication.
