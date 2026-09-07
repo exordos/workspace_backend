@@ -27,6 +27,7 @@ from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import pki
 from workspace.external_bridge_control import provider_event_apply
 from workspace.external_bridge_control import provider_service
+from workspace.external_bridge_control import provider_wakeup
 from workspace.external_bridge_control import server
 from workspace.external_bridge_control import service
 from workspace.external_bridge_control import sql_state
@@ -153,6 +154,9 @@ def build_runtime(
             control_pki,
             control_state,
             request_context.session_manager,
+        ),
+        provider_operation_wakeup_factory=provider_wakeup.ProviderOperationWakeupPool(
+            CONF.db.connection_url
         ),
     )
     return bootstrap_server, private_server

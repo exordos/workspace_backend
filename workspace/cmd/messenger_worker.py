@@ -60,6 +60,12 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
             heartbeat_retention=datetime.timedelta(
                 seconds=CONF[DOMAIN].heartbeat_retention_seconds,
             ),
+            capability_refresh_interval_seconds=(
+                CONF[DOMAIN].capability_refresh_interval_seconds
+            ),
+            capability_projection_refresh_interval_seconds=(
+                CONF[DOMAIN].capability_projection_refresh_interval_seconds
+            ),
             read_state_compaction_enabled=(CONF[DOMAIN].read_state_compaction_enabled),
             read_state_cleanup_enabled=CONF[DOMAIN].read_state_cleanup_enabled,
             read_state_batch_size=CONF[DOMAIN].read_state_batch_size,

@@ -89,6 +89,102 @@ class CapabilityLeaseSession:
         return LeaseResponse()
 
 
+def test_provider_operation_wait_is_bounded_by_next_durable_deadline():
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    statements = []
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        if "statement_timestamp() AS current_time" in statement:
+            return LeaseResponse(one={"current_time": now})
+        if 'FROM "m_external_bridge_instances_v2"' in statement:
+            return LeaseResponse(
+                one={
+                    "status": "active",
+                    "capabilities": {"messenger.message.send": {"revision": 1}},
+                    "last_heartbeat_at": now,
+                }
+            )
+        return LeaseResponse(one={"next_due_seconds": 0.375})
+
+    session = types.SimpleNamespace(execute=execute)
+
+    assert provider_data.provider_operation_wait_seconds(session, identity, 20.0) == (
+        0.375
+    )
+    deadline_statement, deadline_params = statements[-1]
+    assert "operation.operation_kind = ANY(%s::text[])" in deadline_statement
+    assert "policy.enabled = TRUE" in deadline_statement
+    assert "barrier.queue_sequence" in deadline_statement
+    assert deadline_params[1] == ["message.create"]
+
+
+def test_provider_operation_wait_includes_already_due_work():
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    statements = []
+
+    def execute(statement, params):
+        statements.append(statement)
+        if "statement_timestamp() AS current_time" in statement:
+            return LeaseResponse(one={"current_time": now})
+        if 'FROM "m_external_bridge_instances_v2"' in statement:
+            return LeaseResponse(
+                one={
+                    "status": "active",
+                    "capabilities": {"messenger.message.send": {"revision": 1}},
+                    "last_heartbeat_at": now,
+                }
+            )
+        return LeaseResponse(one={"next_due_seconds": -0.001})
+
+    session = types.SimpleNamespace(execute=execute)
+
+    assert provider_data.provider_operation_wait_seconds(session, identity, 20.0) == 0.0
+    assert "available_at > statement_timestamp()" not in statements[-1]
+    assert "lease_expires_at > statement_timestamp()" not in statements[-1]
+
+
+def test_provider_operation_wait_ignores_unadvertised_operation_kinds():
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=sys_uuid.uuid4(),
+        provider_kind="zulip",
+        identity_generation=1,
+    )
+    now = datetime.datetime.now(datetime.timezone.utc)
+    statements = []
+
+    def execute(statement, params):
+        statements.append(statement)
+        if "statement_timestamp() AS current_time" in statement:
+            return LeaseResponse(one={"current_time": now})
+        if 'FROM "m_external_bridge_instances_v2"' in statement:
+            return LeaseResponse(
+                one={
+                    "status": "active",
+                    "capabilities": {},
+                    "last_heartbeat_at": now,
+                }
+            )
+        raise AssertionError("Deadline query must not run without leasable kinds")
+
+    session = types.SimpleNamespace(execute=execute)
+
+    assert provider_data.provider_operation_wait_seconds(session, identity, 20.0) == (
+        20.0
+    )
+    assert len(statements) == 2
+
+
 @pytest.mark.parametrize(
     ("capabilities", "expected", "materializes"),
     [

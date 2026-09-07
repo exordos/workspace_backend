@@ -26,6 +26,7 @@ class Response:
     body: bytes
     content_type: str
     headers: dict[str, str]
+    provider_wait_key: str | None = None
 
     @classmethod
     def json(
@@ -33,6 +34,7 @@ class Response:
         status: int,
         payload: object,
         headers: dict[str, str] | None = None,
+        provider_wait_key: str | None = None,
     ) -> "Response":
         return cls(
             status=status,
@@ -46,6 +48,7 @@ class Response:
                 "application/problem+json" if status >= 400 else "application/json"
             ),
             headers={"Cache-Control": "no-store", **(headers or {})},
+            provider_wait_key=provider_wait_key,
         )
 
 
@@ -191,7 +194,32 @@ class PrivateBridgeService:
             )
             if response is None:
                 return self._problem(404, "resource_not_found", request_uuid)
-            return Response.json(200, response)
+            response_headers = {}
+            wait_seconds = provider_service.lease_wait_seconds(
+                method,
+                path,
+                payload,
+            )
+            if wait_seconds:
+                response_headers[provider_service.LEASE_WAIT_SUPPORTED_HEADER] = "1"
+                provider_response = cast(dict[str, object], response)
+                if not provider_response["operations"]:
+                    wait_seconds = self.provider_data_service.empty_lease_wait_seconds(
+                        request_session,
+                        identity,
+                        wait_seconds,
+                    )
+                    response_headers[provider_service.LEASE_WAIT_HEADER] = str(
+                        wait_seconds
+                    )
+            return Response.json(
+                200,
+                response,
+                headers=response_headers,
+                provider_wait_key=(
+                    str(identity.bridge_instance_uuid) if wait_seconds else None
+                ),
+            )
         if method == "POST" and path == "/v1/certificate-renewals":
             return Response.json(200, self.control_pki.renew(identity, payload))
         if method == "GET" and path == "/v1/desired-state/changes":

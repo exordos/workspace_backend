@@ -90,6 +90,8 @@ class MessengerWorkerAgent(basic.BasicService):
         event_prune_interval_seconds: int = EVENT_PRUNE_INTERVAL_SECONDS,
         event_prune_batch_size: int = (sql_canonical_store.EVENT_PRUNE_BATCH_SIZE),
         heartbeat_retention: datetime.timedelta = HEARTBEAT_RETENTION,
+        capability_refresh_interval_seconds: float = 5.0,
+        capability_projection_refresh_interval_seconds: float = 5.0,
         read_state_compaction_enabled: bool = False,
         read_state_cleanup_enabled: bool = False,
         read_state_batch_size: int = read_state.COMPACTION_BATCH_SIZE,
@@ -121,6 +123,10 @@ class MessengerWorkerAgent(basic.BasicService):
         self._event_prune_interval_seconds = event_prune_interval_seconds
         self._event_prune_batch_size = event_prune_batch_size
         self._heartbeat_retention = heartbeat_retention
+        self._capability_refresh_interval_seconds = capability_refresh_interval_seconds
+        self._capability_projection_refresh_interval_seconds = (
+            capability_projection_refresh_interval_seconds
+        )
         self._read_state_compaction_enabled = read_state_compaction_enabled
         self._read_state_cleanup_enabled = read_state_cleanup_enabled
         self._read_state_batch_size = read_state_batch_size
@@ -159,6 +165,8 @@ class MessengerWorkerAgent(basic.BasicService):
             summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS,
         )
         self._last_event_prune: float | None = None
+        self._last_capability_refresh: float | None = None
+        self._last_capability_projection_refresh: float | None = None
         self._capability_refresh_cursor: object | None = None
         self._capability_projection_refresh_cursor: object | None = None
 
@@ -275,8 +283,25 @@ class MessengerWorkerAgent(basic.BasicService):
                     },
                 )
 
-        self._refresh_capabilities(now)
-        self._refresh_capability_projections()
+        capability_refresh_due = (
+            self._capability_refresh_cursor is not None
+            or self._last_capability_refresh is None
+            or monotonic_now - self._last_capability_refresh
+            >= self._capability_refresh_interval_seconds
+        )
+        if capability_refresh_due:
+            self._refresh_capabilities(now)
+            self._last_capability_refresh = monotonic_now
+
+        capability_projection_refresh_due = (
+            self._capability_projection_refresh_cursor is not None
+            or self._last_capability_projection_refresh is None
+            or monotonic_now - self._last_capability_projection_refresh
+            >= self._capability_projection_refresh_interval_seconds
+        )
+        if capability_projection_refresh_due:
+            self._refresh_capability_projections()
+            self._last_capability_projection_refresh = monotonic_now
 
         if prune_due:
             try:

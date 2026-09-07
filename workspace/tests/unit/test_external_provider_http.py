@@ -997,6 +997,24 @@ def test_provider_http_service_dispatches_only_private_provider_routes():
         )
 
 
+@pytest.mark.parametrize("wait_seconds", [-1, 25.1, 10**400, True, "5"])
+def test_provider_lease_rejects_invalid_long_poll_wait(wait_seconds):
+    api = provider_service.ProviderDataService()
+
+    with pytest.raises((TypeError, ValueError)):
+        api.handle(
+            object(),
+            _identity(),
+            "POST",
+            f"{provider_service.API_ROOT_V2}/operations/actions/lease",
+            {},
+            {
+                "request_uuid": str(sys_uuid.uuid4()),
+                "wait_seconds": wait_seconds,
+            },
+        )
+
+
 def test_provider_http_service_dispatches_v2_provider_commands(monkeypatch):
     identity = _identity()
     session = object()

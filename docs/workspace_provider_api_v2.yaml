@@ -75,6 +75,13 @@ paths:
       responses:
         '200':
           description: A possibly empty leased operation batch.
+          headers:
+            X-Workspace-Provider-Lease-Wait-Supported:
+              schema: {type: string, const: '1'}
+              description: Present when notification-backed lease waiting is supported.
+            X-Workspace-Provider-Lease-Wait-Seconds:
+              schema: {type: string}
+              description: Present on an empty response selected for server-side waiting.
           content:
             application/json:
               schema:

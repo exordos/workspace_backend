@@ -201,6 +201,70 @@ class _SessionContext:
         )
 
 
+def test_capability_maintenance_uses_independent_deadlines(monkeypatch):
+    clock = [100.0]
+    calls = []
+    session_number = 0
+
+    def session_context():
+        nonlocal session_number
+        session_number += 1
+        return _SessionContext(
+            types.SimpleNamespace(name=f"session-{session_number}"),
+            [],
+        )
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(agents.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        agents.messenger_dm_helpers,
+        "mark_stale_workspace_users_offline",
+        lambda *, session: None,
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
+        "degrade_stale_bridge_instances",
+        lambda session, *, now: 0,
+    )
+    worker = agents.MessengerWorkerAgent(
+        capability_refresh_interval_seconds=10.0,
+        capability_projection_refresh_interval_seconds=30.0,
+    )
+    worker._last_event_prune = clock[0]
+    monkeypatch.setattr(
+        worker,
+        "_refresh_capabilities",
+        lambda _now: calls.append("capabilities"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_refresh_capability_projections",
+        lambda: calls.append("capability-projections"),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_repair_external_projection_transitions",
+        lambda _session: None,
+    )
+    monkeypatch.setattr(worker, "_summarize_one_topic", lambda: False)
+
+    worker._iteration()
+    clock[0] = 109.0
+    worker._iteration()
+    clock[0] = 110.0
+    worker._iteration()
+    clock[0] = 130.0
+    worker._iteration()
+
+    assert calls == [
+        "capabilities",
+        "capability-projections",
+        "capabilities",
+        "capabilities",
+        "capability-projections",
+    ]
+
+
 def test_worker_prunes_postgresql_events_in_owned_session(monkeypatch):
     now = datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc)
     session = types.SimpleNamespace()
