@@ -466,7 +466,10 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == LEGACY_BACKFILL_COUNTER_MIGRATION_FILE
+    assert (
+        engine.get_latest_migration()
+        == "0180-Cascade-bridge-history-scopes-with-online-cleanup-indexes-f3bf9f.py"
+    )
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',

@@ -1574,6 +1574,27 @@ def _process_read_counters(
     topic_uuid = None if topic_value is None else _uuid(topic_value)
     if task["scope_kind"] == "user-topic" and topic_uuid is None:
         raise ValueError("Topic counter task is missing its topic UUID")
+    if payload.get("source_kind") == "history.imported":
+        # The import transaction already applied bounded counter deltas. Never
+        # scan message history again to publish its completion snapshot.
+        if task["scope_kind"] == "user-stream":
+            _enqueue_folder_outbox_events(
+                session,
+                source_event_uuid=task["outbox_event_uuid"],
+                project_id=task["project_id"],
+                source_kind="history.imported",
+                user_uuid=user_uuid,
+                stream_uuid=_uuid(payload["stream_uuid"]),
+            )
+        _emit_unread_snapshots(
+            session,
+            task["project_id"],
+            _uuid(payload["stream_uuid"]),
+            topic_uuid,
+            [user_uuid],
+            task["scope_kind"],
+        )
+        return
     if not payload.get("emit_message_read", False):
         # Counter tasks are authoritative snapshots.  One claimed snapshot can
         # absorb every idle snapshot-only sibling for the same user scope;
