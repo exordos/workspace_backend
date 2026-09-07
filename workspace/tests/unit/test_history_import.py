@@ -180,6 +180,16 @@ def test_source_count_is_bounded_before_sql_authority_fences():
         contract.Batch.parse(body)
 
 
+def test_source_count_above_previous_limit_is_accepted():
+    body = batch()
+    source = body["sources"][0]
+    body["sources"] = [
+        {**source, "chat_uuid": str(sys_uuid.UUID(int=index + 1))}
+        for index in range(147)
+    ]
+    assert len(contract.Batch.parse(body).sources) == 147
+
+
 def test_bridge_golden_batch_and_markdown_are_compatible():
     import json
     import pathlib
