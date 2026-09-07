@@ -71,12 +71,14 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
                 CONF[DOMAIN].v2_projection_max_tasks_per_iteration
             ),
             v2_idle_sleep_seconds=(CONF[DOMAIN].v2_projection_idle_sleep_seconds),
+            v2_projection_db_url=(
+                CONF.db.connection_url if CONF[DOMAIN].v2_projection_enabled else None
+            ),
             v2_fanout_batch_size=CONF[DOMAIN].v2_fanout_batch_size,
             v2_metrics_log_interval_seconds=(
                 CONF[DOMAIN].v2_metrics_log_interval_seconds
             ),
             projection_only=worker_index > 0,
-            projection_deriver=(worker_index == (1 if worker_count > 1 else 0)),
             summary_secret_key=CONF[TOPIC_SUMMARY_DOMAIN].secret_encryption_key,
             summary_connect_timeout_seconds=(
                 CONF[TOPIC_SUMMARY_DOMAIN].connect_timeout_seconds

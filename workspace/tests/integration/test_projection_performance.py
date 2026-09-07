@@ -117,9 +117,6 @@ def _seed_partition_claim_tasks(api, specifications):
                 list(range(len(specifications))),
             ),
         )
-        assert v2_projection.derive_projection_tasks(
-            session, len(specifications)
-        ) == len(specifications)
     return event_uuids
 
 
@@ -246,7 +243,6 @@ def test_reaction_burst_coalesces_and_preserves_realtime_events(api, db, monkeyp
     assert deleted.status_code in (200, 204), deleted.text
 
     with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session, 100) >= 3
         processed = v2_projection.process_one_projection_task(
             session,
             "integration:reaction-coalescing",
@@ -344,7 +340,6 @@ def test_reaction_coalescing_locks_a_bounded_sibling_batch(api, db, monkeypatch)
                 task_count,
             ),
         )
-        assert v2_projection.derive_projection_tasks(session, task_count) == task_count
         assert v2_projection.process_one_projection_task(
             session,
             "integration:bounded-reaction:first",
@@ -438,7 +433,6 @@ def test_reaction_coalescing_honors_sibling_retry_deadlines(api, db, monkeypatch
                 """,
                 (api.project_id, scope_key, placement_uuid),
             )
-        assert v2_projection.derive_projection_tasks(session, 2) == 2
         session.execute(
             """
             UPDATE messenger_projection_tasks
@@ -497,9 +491,6 @@ def test_concurrent_reaction_workers_keep_one_exact_snapshot(api, db, monkeypatc
         )
         assert response.status_code == 201, response.text
         reactions.append(response.json())
-    with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session, 100) >= len(reactions)
-
     ready = threading.Barrier(2)
 
     def process(worker_id):
@@ -640,7 +631,6 @@ def test_coalesced_reaction_events_resolve_each_placement(api, db, monkeypatch):
                     ),
                 ),
             )
-        assert v2_projection.derive_projection_tasks(session, 10) == 2
         assert v2_projection.process_one_projection_task(
             session,
             "integration:reaction-multi-placement",
@@ -684,7 +674,6 @@ def test_reaction_move_rebuilds_both_message_snapshots(api, db, monkeypatch):
     )
     assert moved.status_code == 200, moved.text
     with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session, 100) == 2
         assert v2_projection.process_one_projection_task(
             session, "integration:reaction-move:new"
         )
@@ -731,8 +720,6 @@ def test_rolled_back_claim_is_immediately_reusable(api, monkeypatch):
             """,
             (event_uuid, api.project_id, f"{api.project_id}:shutdown-reclaim"),
         )
-        assert v2_projection.derive_projection_tasks(session, 10) == 1
-
     first_task_uuid = None
     try:
         with contexts.Context().session_manager() as session:
@@ -1073,7 +1060,6 @@ def test_waiting_global_task_stops_younger_user_admission(api, db, monkeypatch):
             """,
             (other_project_id, f"{other_project_id}:available-later"),
         )
-        assert v2_projection.derive_projection_tasks(session, 1) == 1
     user_ready = threading.Event()
     release_user = threading.Event()
     global_started = threading.Event()
@@ -1689,13 +1675,9 @@ def test_broadcast_guard_does_not_deadlock_with_existing_project_user_update(api
         }
 
 
-def test_fanout_is_derived_before_old_read_outbox(api, monkeypatch):
-    monkeypatch.setattr(
-        v2_projection,
-        "_FAIR_DERIVATION_CYCLE",
-        itertools.repeat("fanout"),
-    )
+def test_bulk_outbox_insert_enqueues_projection_tasks_inline(api):
     fanout_uuid = sys_uuid.uuid4()
+    started_at = time.monotonic()
     with contexts.Context().session_manager() as session:
         session.execute(
             """
@@ -1722,18 +1704,23 @@ def test_fanout_is_derived_before_old_read_outbox(api, monkeypatch):
             """,
             (fanout_uuid, api.project_id, f"{api.project_id}:derive-fanout"),
         )
-        assert v2_projection.derive_projection_tasks(session, 1) == 1
-        derived = session.execute(
+        task_counts = session.execute(
             """
-            SELECT task_kind, outbox_event_uuid
+            SELECT task_kind, count(*) AS task_count
             FROM messenger_projection_tasks
+            WHERE project_id = %s
+            GROUP BY task_kind
+            ORDER BY task_kind
             """,
-            (),
+            (api.project_id,),
         ).fetchall()
+    elapsed = time.monotonic() - started_at
 
-    assert [(row["task_kind"], row["outbox_event_uuid"]) for row in derived] == [
-        ("fanout", fanout_uuid)
+    assert [(row["task_kind"], row["task_count"]) for row in task_counts] == [
+        ("fanout", 1),
+        ("read_counters", 10000),
     ]
+    assert elapsed < 10
 
 
 def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch):
@@ -1803,7 +1790,6 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
                     json.dumps(payload),
                 ),
             )
-        assert v2_projection.derive_projection_tasks(session, 40000) == 30004
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task
@@ -1940,7 +1926,6 @@ def test_fair_scheduler_scans_past_dense_locked_project(api, monkeypatch):
             """,
             (available_project_id, f"{available_project_id}:available"),
         )
-        assert v2_projection.derive_projection_tasks(session, 3000) == 2001
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task
@@ -2285,7 +2270,6 @@ def test_fair_scheduler_skips_project_with_retry_blocked_predecessor(
                 available_scope_key,
             ),
         )
-        assert v2_projection.derive_projection_tasks(session, 10) == 3
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task
@@ -2366,9 +2350,6 @@ def test_fair_scheduler_filters_blocked_rows_before_candidate_limit(
             )
             """,
             (project_id, available_scope_key),
-        )
-        assert v2_projection.derive_projection_tasks(session, 1000) == (
-            v2_projection.CLAIM_CANDIDATE_LIMIT + 1
         )
         session.execute(
             """

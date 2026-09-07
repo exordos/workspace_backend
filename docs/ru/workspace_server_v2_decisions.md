@@ -338,6 +338,22 @@ fields в каждом событии.
 поэтому уже принятые строки обновляются, а не дублируются. При новой установке
 остановленный Bridge видит только итоговое generation и выполняет один импорт.
 
+## Транзакционная постановка projection-задач
+
+Миграция `0182` создаёт durable projection task в той же транзакции базы данных,
+что и domain outbox event. Statement-level trigger охватывает всех producers,
+включая массовый импорт истории и repair-записи, и сохраняет существующую
+идентичность «одна task на один outbox event» и поля ordering. Миграция `0183`
+заполняет существующие пробелы в отдельной транзакции после commit trigger DDL и
+до отключения выведения tasks из исторических outbox rows.
+
+После добавления работы trigger отправляет PostgreSQL notification. Уведомление
+только пробуждает workers; источником истины остаётся durable task table.
+Короткий timeout продолжает polling для retry deadlines и покрывает потерянные
+или задержанные notifications. Благодаря этому каждый idle worker pass больше
+не выполняет полный outbox anti-join, а восстановление после перезапуска и потери
+уведомления сохраняется.
+
 ## Объединение folder snapshots при восстановлении legacy read-state
 
 Восстановление legacy read-state может поставить отдельную folder projection

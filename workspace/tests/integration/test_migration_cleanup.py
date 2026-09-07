@@ -468,7 +468,7 @@ def test_current_migrations_have_a_single_head(_database, db):
 
     assert (
         engine.get_latest_migration()
-        == "0181-Index-Messenger-projection-partitions-81bfd9.py"
+        == "0183-Backfill-Messenger-projection-task-gaps-bf0cd6.py"
     )
     with db.cursor() as cur:
         cur.execute(

@@ -12,6 +12,7 @@ import uuid as sys_uuid
 from workspace.cmd import messenger_worker
 from workspace.common import messenger_worker_opts
 from workspace.services.messenger_workers import agents
+from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 
 
@@ -110,12 +111,6 @@ def test_worker_entrypoint_builds_one_primary_and_projection_only_peers():
         True,
         True,
     ]
-    assert [service._projection_deriver for service in services] == [
-        False,
-        True,
-        False,
-        False,
-    ]
     assert len({service._v2_worker_id for service in services}) == 4
     assert all(service._iter_min_period == 0 for service in services)
     assert all(service._iter_pause == 0 for service in services)
@@ -142,7 +137,7 @@ def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):
     assert sleeps == [0.5]
 
 
-def test_projection_pass_derives_and_checks_cleanup_once(monkeypatch):
+def test_projection_pass_checks_cleanup_once_without_deriving(monkeypatch):
     calls = []
     outcomes = iter((True, True, True, False))
 
@@ -175,13 +170,71 @@ def test_projection_pass_derives_and_checks_cleanup_once(monkeypatch):
         v2_projection_enabled=True,
         v2_projection_max_tasks_per_iteration=10,
         v2_metrics_log_interval_seconds=300,
-        projection_deriver=True,
     )
 
     assert worker._run_v2_projection_tasks() is True
     assert calls.count("cleanup") == 1
-    assert calls.count("derive") == 1
+    assert calls.count("derive") == 0
     assert calls.count("process") == 4
+
+
+def test_projection_worker_waits_for_database_notification(monkeypatch):
+    waits = []
+    wakeup = types.SimpleNamespace(
+        wait=lambda timeout: waits.append(timeout),
+        close=lambda: None,
+    )
+    worker = agents.MessengerWorkerAgent(
+        v2_projection_enabled=True,
+        projection_only=True,
+        v2_idle_sleep_seconds=0.5,
+        v2_projection_db_url="postgresql://test",
+    )
+    worker._v2_projection_wakeup = wakeup
+    monkeypatch.setattr(worker, "_run_v2_projection_tasks", lambda: False)
+
+    worker._iteration()
+
+    assert waits == [0.5]
+
+
+def test_projection_queue_wakeup_reuses_listener_connection(monkeypatch):
+    executed = []
+    closed = []
+    delivered = []
+
+    class Connection:
+        def execute(self, query):
+            executed.append(query)
+
+        def notifies(self, *, timeout, stop_after):
+            assert timeout == 0.5
+            assert stop_after == 1
+            for payload in ("1", "1", "4"):
+                delivered.append(payload)
+                yield types.SimpleNamespace(payload=payload)
+
+        def close(self):
+            closed.append(True)
+
+    connection = Connection()
+    connections = []
+
+    def connect(db_url, *, autocommit):
+        connections.append((db_url, autocommit))
+        return connection
+
+    monkeypatch.setattr(projection_wakeup.psycopg, "connect", connect)
+    wakeup = projection_wakeup.ProjectionQueueWakeup("postgresql://test")
+
+    assert wakeup.wait(0.5) is True
+    assert wakeup.wait(0.5) is True
+    wakeup.close()
+
+    assert connections == [("postgresql://test", True)]
+    assert executed == [f"LISTEN {projection_wakeup.CHANNEL}"]
+    assert delivered == ["1", "1", "4", "1", "1", "4"]
+    assert closed == [True]
 
 
 def test_projection_pass_keeps_earlier_progress_after_event_lock_contention(
