@@ -35,6 +35,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import events as messenger_events
 from workspace.external_bridge_control import sql_state
+from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
@@ -98,8 +99,8 @@ class MessengerWorkerAgent(basic.BasicService):
         v2_fanout_batch_size: int = v2_projection.DEFAULT_FANOUT_BATCH_SIZE,
         v2_metrics_log_interval_seconds: int = V2_METRICS_LOG_INTERVAL_SECONDS,
         v2_idle_sleep_seconds: float = V2_IDLE_SLEEP_SECONDS,
+        v2_projection_db_url: str | None = None,
         projection_only: bool = False,
-        projection_deriver: bool = True,
         summary_secret_key: str | None = None,
         summary_connect_timeout_seconds: int = (
             topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -137,8 +138,12 @@ class MessengerWorkerAgent(basic.BasicService):
         self._v2_metrics: dict[str, float] = {}
         self._v2_metrics_started_at = time.monotonic()
         self._v2_idle_sleep_seconds = v2_idle_sleep_seconds
+        self._v2_projection_wakeup = (
+            projection_wakeup.ProjectionQueueWakeup(v2_projection_db_url)
+            if v2_projection_db_url is not None
+            else None
+        )
         self._projection_only = projection_only
-        self._projection_deriver = projection_deriver
         self._summary_secret_key = summary_secret_key
         self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
         self._summary_request_timeout_seconds = summary_request_timeout_seconds
@@ -175,7 +180,7 @@ class MessengerWorkerAgent(basic.BasicService):
             processed_v2 = self._run_v2_projection_tasks()
         if self._projection_only:
             if not processed_v2:
-                time.sleep(self._v2_idle_sleep_seconds)
+                self._wait_for_v2_projection_work()
             return
         now = datetime.datetime.now(datetime.timezone.utc)
         monotonic_now = time.monotonic()
@@ -299,7 +304,13 @@ class MessengerWorkerAgent(basic.BasicService):
 
         self._summarize_one_topic()
         if self._v2_projection_enabled and not processed_v2:
+            self._wait_for_v2_projection_work()
+
+    def _wait_for_v2_projection_work(self) -> None:
+        if self._v2_projection_wakeup is None:
             time.sleep(self._v2_idle_sleep_seconds)
+            return
+        self._v2_projection_wakeup.wait(self._v2_idle_sleep_seconds)
 
     def _run_v2_projection_tasks(self) -> bool:
         metrics: dict[str, float] = {}
@@ -317,9 +328,6 @@ class MessengerWorkerAgent(basic.BasicService):
                         if task_index == 0 and not self._projection_only
                         else False
                     )
-                    if task_index == 0 and self._projection_deriver:
-                        derived = v2_projection.derive_projection_tasks(session)
-                        metrics["derived"] = metrics.get("derived", 0.0) + derived
                     contention_before = metrics.get("event_lock_contention", 0.0)
                     scan_continuation_before = metrics.get(
                         "partition_scan_continuation",
@@ -347,6 +355,11 @@ class MessengerWorkerAgent(basic.BasicService):
                 break
         self._record_v2_projection_metrics(metrics)
         return processed_any
+
+    def stop(self) -> None:
+        super().stop()
+        if self._v2_projection_wakeup is not None:
+            self._v2_projection_wakeup.close()
 
     def _record_v2_projection_metrics(self, metrics: dict[str, float]) -> None:
         for name, value in metrics.items():

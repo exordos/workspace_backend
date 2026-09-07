@@ -5,9 +5,10 @@
 
 """Bounded, exact-scope projection worker for Messenger v2.
 
-Request transactions append immutable domain outbox rows.  This module derives
-exactly one durable task for every outbox row and processes tasks under a
-fenced scope lease.  All projection writes and the corresponding public event
+Request transactions append immutable domain outbox rows, and a database
+trigger creates exactly one durable task for every outbox row.  This module
+processes tasks under a fenced scope lease and retains bounded derivation for
+operator repair.  All projection writes and the corresponding public event
 snapshot commit in the same worker transaction.
 """
 

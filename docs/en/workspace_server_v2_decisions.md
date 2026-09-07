@@ -336,6 +336,21 @@ complete retry. Provider keys remain idempotent, so already accepted rows are
 updated rather than duplicated. On a fresh upgrade the stopped Bridge observes
 only the final generation and performs one import.
 
+## Transactional projection admission
+
+Migration `0182` creates the durable projection task in the same database
+transaction as each domain outbox event. A statement-level trigger covers every
+producer, including bulk history and repair writes, and preserves the existing
+one-task-per-outbox-event identity and ordering fields. Migration `0183`
+backfills any pre-existing gap in a separate transaction after the trigger DDL
+has committed, before workers stop deriving tasks from historical outbox rows.
+
+The trigger sends a PostgreSQL notification after it inserts work. Notifications
+only wake the workers; the durable task table remains the source of truth. A
+short timeout continues to poll for retry deadlines and covers lost or delayed
+notifications. This removes the full outbox anti-join from every idle worker
+pass while retaining restart and notification-loss recovery.
+
 ## Coalescing legacy read-state folder snapshots
 
 Legacy read-state repair may enqueue one folder projection for every repaired

@@ -128,7 +128,6 @@ def main():
             while not stopped.is_set():
                 try:
                     with contexts.Context().session_manager() as session:
-                        v2_projection.derive_projection_tasks(session, limit=20)
                         worked = v2_projection.process_one_projection_task(
                             session, "cassi-history-benchmark"
                         )

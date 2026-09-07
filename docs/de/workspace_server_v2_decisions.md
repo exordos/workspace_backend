@@ -346,6 +346,25 @@ gestartet. Provider-Schlüssel bleiben idempotent; bereits angenommene Zeilen
 werden aktualisiert statt dupliziert. Bei einer frischen Aktualisierung sieht
 die gestoppte Bridge nur die finale Generation und führt einen Import aus.
 
+## Transaktionale Aufnahme von Projektionsaufgaben
+
+Migration `0182` erstellt die dauerhafte Projektionsaufgabe in derselben
+Datenbanktransaktion wie jedes Domain-Outbox-Ereignis. Ein Trigger auf
+Anweisungsebene deckt alle Producer ab, einschließlich Massenimporten und
+Reparatur-Schreibvorgängen, und behält die bestehende Identität mit genau einer
+Aufgabe pro Outbox-Ereignis sowie die Sortierfelder bei. Migration `0183` füllt
+vorhandene Lücken in einer separaten Transaktion, nachdem die Trigger-DDL
+festgeschrieben wurde und bevor Worker keine Aufgaben mehr aus historischen
+Outbox-Zeilen ableiten.
+
+Der Trigger sendet eine PostgreSQL-Benachrichtigung, nachdem er Arbeit eingefügt
+hat. Benachrichtigungen wecken nur die Worker; die dauerhafte Aufgabentabelle
+bleibt die Quelle der Wahrheit. Ein kurzes Timeout fragt weiterhin fällige
+Wiederholungen ab und deckt verlorene oder verzögerte Benachrichtigungen ab.
+Dadurch entfällt der vollständige Outbox-Anti-Join in jedem inaktiven
+Worker-Durchlauf, während Neustart- und Benachrichtigungsverlust-Wiederherstellung
+erhalten bleiben.
+
 ## Zusammenführen von Ordner-Snapshots bei der Legacy-Lesestatus-Reparatur
 
 Die Reparatur des Legacy-Lesestatus kann für jedes korrigierte Nachrichten-Flag
