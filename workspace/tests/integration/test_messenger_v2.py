@@ -163,6 +163,7 @@ def _isolate_v2_module(_database):
         engine.apply_migration(EXPIRED_PROVIDER_READ_RETRY_MIGRATION)
         engine.apply_migration(PROJECTION_ACCELERATION_MIGRATION)
         engine.apply_migration(LEGACY_BACKFILL_COUNTER_MIGRATION)
+        engine.apply_migration(engine.get_latest_migration())
 
 
 @pytest.fixture(autouse=True)
@@ -8534,7 +8535,8 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
                 SELECT uuid
                 FROM messenger_projection_tasks
                 WHERE project_id = %s AND outbox_event_uuid = ANY(%s::uuid[])
-                ORDER BY created_at DESC, uuid DESC
+                ORDER BY created_at DESC, ordering_created_at DESC,
+                         outbox_event_uuid DESC
                 LIMIT 1
                 FOR UPDATE
                 """,
@@ -8667,7 +8669,8 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
                       (payload->>'emit_message_read')::boolean,
                       FALSE
                   ) = FALSE
-                ORDER BY created_at DESC, uuid DESC
+                ORDER BY created_at DESC, ordering_created_at DESC,
+                         outbox_event_uuid DESC
                 LIMIT 1
                 FOR UPDATE
                 """,
