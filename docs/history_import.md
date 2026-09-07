@@ -61,10 +61,11 @@ provider routes keep their existing single request transaction. Wrapping the
 history route in that transaction would retain its connection and locks across
 storage I/O, contrary to the import contract.
 
-One import scope supports at most 128 selected account/chat sources. Larger
+One import scope supports at most 512 selected account/chat sources. Larger
 source sets are rejected before storage or account locks; the message volume
-itself remains unbounded across successive batches. This bounds authority work
-that cannot be reduced by shrinking a message part.
+itself remains unbounded across successive batches. The maximum source envelope
+remains below 100 KiB while the private import endpoint allows a 50 MiB request.
+This bounds authority work that cannot be reduced by shrinking a message part.
 Message content must satisfy the canonical Markdown domain (1–40,000 characters),
 both at admission and after conversion, before any canonical message is written.
 
