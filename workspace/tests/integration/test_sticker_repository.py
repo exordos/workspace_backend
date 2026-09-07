@@ -204,18 +204,28 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         filtered = repository.list_stickers(
             db,
             user_uuid,
-            uuid=[third, third, first],
-            category="sticker",
-            format="png",
+            sticker_catalog.build_list_query(
+                uuids=[third, third, first],
+                category="sticker",
+                format="png",
+            ),
         )
         assert {item.uuid for item in filtered.items} == {first, third}
         assert {
             item.uuid
-            for item in repository.list_stickers(db, user_two, favorite=True).items
+            for item in repository.list_stickers(
+                db,
+                user_two,
+                sticker_catalog.build_list_query(favorite=True),
+            ).items
         } == {typo}
         assert typo not in {
             item.uuid
-            for item in repository.list_stickers(db, user_uuid, favorite=True).items
+            for item in repository.list_stickers(
+                db,
+                user_uuid,
+                sticker_catalog.build_list_query(favorite=True),
+            ).items
         }
 
         equal_rank_uuid_order = sorted((equal_old, equal_new), key=str, reverse=True)
@@ -244,10 +254,12 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 page = repository.list_stickers(
                     db,
                     user_uuid,
-                    q=q,
-                    favorite=favorite,
-                    page_limit=1,
-                    page_marker=marker,
+                    sticker_catalog.build_list_query(
+                        q=q,
+                        favorite=favorite,
+                        page_limit=1,
+                        page_marker=marker,
+                    ),
                 )
                 actual.extend(item.uuid for item in page.items)
                 if page.next_marker is None:
@@ -259,7 +271,9 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 assert all(
                     item.is_favorite
                     for item in repository.list_stickers(
-                        db, user_uuid, q=q, favorite=True
+                        db,
+                        user_uuid,
+                        sticker_catalog.build_list_query(q=q, favorite=True),
                     ).items
                 )
 
@@ -283,7 +297,11 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 )
             ],
         )
-        english_page = repository.list_stickers(db, user_uuid, q="CAT")
+        english_page = repository.list_stickers(
+            db,
+            user_uuid,
+            sticker_catalog.build_list_query(q="CAT"),
+        )
         assert [item.uuid for item in english_page.items] == [english]
 
         updated_text = repository.update(
@@ -292,10 +310,20 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         assert updated_text is not None
         assert updated_text.sticker.search_text == "еж кот лиса"
         assert [
-            item.uuid for item in repository.list_stickers(db, user_uuid, q="ёж").items
+            item.uuid
+            for item in repository.list_stickers(
+                db,
+                user_uuid,
+                sticker_catalog.build_list_query(q="ёж"),
+            ).items
         ] == [third]
         assert [
-            item.uuid for item in repository.list_stickers(db, user_uuid, q="еж").items
+            item.uuid
+            for item in repository.list_stickers(
+                db,
+                user_uuid,
+                sticker_catalog.build_list_query(q="еж"),
+            ).items
         ] == [third]
 
         hidden = repository.update(db, first, {"active": False})
@@ -319,7 +347,9 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         with pytest.raises(sticker_repository.StickerRepositoryValidationError):
             repository.update(db, third, {"active": True, "blocked": True})
         assert repository.get_active(db, user_uuid, second) is None
-        normal_after_hide = repository.list_stickers(db, user_uuid)
+        normal_after_hide = repository.list_stickers(
+            db, user_uuid, sticker_catalog.build_list_query()
+        )
         assert first not in {item.uuid for item in normal_after_hide.items}
         assert second not in {item.uuid for item in normal_after_hide.items}
         with pytest.raises(sticker_repository.StickerNotVisibleError):
@@ -344,7 +374,11 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
         assert restored_first is not None and restored_first.sticker.active is True
         assert restored_second is not None and restored_second.sticker.blocked is False
         assert repository.get_active(db, user_uuid, first) is not None
-        restored_favorites = repository.list_stickers(db, user_uuid, favorite=True)
+        restored_favorites = repository.list_stickers(
+            db,
+            user_uuid,
+            sticker_catalog.build_list_query(favorite=True),
+        )
         assert {item.uuid for item in restored_favorites.items} >= {first, second}
 
         def star_from_new_connection(_: int) -> bool:

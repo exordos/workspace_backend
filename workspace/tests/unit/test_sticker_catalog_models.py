@@ -95,23 +95,58 @@ def test_normalization_preserves_order_and_excludes_emoji_from_search() -> None:
 
 
 def test_gate_g0_query_page_and_uuid_limits() -> None:
-    assert sticker_catalog.validate_query("  ЁЖ  ") == "еж"
-    assert sticker_catalog.validate_page_limit(None) == stickers.DEFAULT_PAGE_LIMIT
-    assert sticker_catalog.validate_page_limit(100) == 100
-    with pytest.raises(ValueError):
-        sticker_catalog.validate_query("x" * (stickers.MAX_QUERY_LENGTH + 1))
-    with pytest.raises(ValueError):
-        sticker_catalog.validate_page_limit(0)
-    with pytest.raises(ValueError):
-        sticker_catalog.validate_uuid_filter([sys_uuid.uuid4()] * 101)
-
     first = sys_uuid.UUID("10000000-0000-0000-0000-000000000002")
     second = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
-    assert sticker_catalog.validate_uuid_filter([first, second, first]) == [
-        second,
-        first,
-    ]
-    assert sticker_catalog.validate_uuid_filter([second, first]) == [second, first]
+    query = sticker_catalog.build_list_query(
+        q="  ЁЖ  ",
+        favorite="true",
+        uuids=[first, second, first],
+        category="sticker",
+        format="webp",
+        page_limit="100",
+        page_marker="next",
+    )
+
+    assert isinstance(query, stickers.StickerListQuery)
+    assert query.q == "еж"
+    assert query.tag_query == "ёж"
+    assert query.favorite is True
+    assert query.uuids == [second, first]
+    assert query.category == "sticker"
+    assert query.format == "webp"
+    assert query.page_limit == 100
+    assert query.page_marker == "next"
+
+    defaults = sticker_catalog.build_list_query()
+    assert defaults.q == ""
+    assert defaults.tag_query == ""
+    assert defaults.favorite is False
+    assert defaults.uuids == []
+    assert defaults.page_limit == stickers.DEFAULT_PAGE_LIMIT
+    assert defaults.page_marker is None
+
+    with pytest.raises(ValueError):
+        sticker_catalog.build_list_query(q="x" * (stickers.MAX_QUERY_LENGTH + 1))
+    with pytest.raises((TypeError, ValueError)):
+        sticker_catalog.build_list_query(page_limit="0")
+    with pytest.raises(ValueError):
+        sticker_catalog.build_list_query(uuids=[first] * 101)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"favorite": "1"},
+        {"category": "video"},
+        {"format": "jpeg"},
+        {"page_limit": "101"},
+        {"page_marker": ""},
+        {"uuids": ["invalid"]},
+    ],
+)
+def test_list_query_rejects_invalid_values(values) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        sticker_catalog.build_list_query(**values)
 
 
 def test_public_card_has_no_storage_fields_and_uses_exact_download_action() -> None:

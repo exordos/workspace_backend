@@ -11,6 +11,8 @@ import webob
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import constants as ra_constants
 from restalchemy.api import controllers as ra_controllers
+from restalchemy.api import field_permissions as ra_field_permissions
+from restalchemy.api import packers as ra_packers
 from restalchemy.api import resources as ra_resources
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
@@ -29,15 +31,18 @@ _QUERY_PARAMETERS = frozenset(
 )
 
 
-def _json_response(value: object, status: int = 200) -> webob.Response:
-    body = json.dumps(
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(
         value,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _json_response(value: object, status: int = 200) -> webob.Response:
     return webob.Response(
-        body=body,
+        body=_json_bytes(value),
         status=status,
         headers={"Content-Type": "application/json; charset=UTF-8"},
     )
@@ -51,6 +56,19 @@ def _http_response(result: sticker_catalog.StickerHttpResponse) -> webob.Respons
     )
 
 
+class StickerJSONPackerPreEncoded(ra_packers.JSONPackerPreEncoded):
+    """Keep pre-encoded responses while requiring JSON objects for writes."""
+
+    def unpack(self, value: typing.Any) -> dict[str, typing.Any]:
+        try:
+            decoded = json.loads(value)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            raise ra_exceptions.ParseBodyError() from None
+        if not isinstance(decoded, dict):
+            raise ra_exceptions.ValidationErrorException()
+        return typing.cast(dict[str, typing.Any], super().unpack(value))
+
+
 class StickerController(ra_controllers.BaseResourceController):
     """HTTP boundary for the global sticker catalog."""
 
@@ -58,7 +76,16 @@ class StickerController(ra_controllers.BaseResourceController):
         model_class=stickers.Sticker,
         convert_underscore=False,
         process_filters=False,
+        fields_permissions=ra_field_permissions.FieldsPermissions(
+            fields={
+                field: {
+                    ra_constants.ALL: ra_field_permissions.Permissions.RO,
+                }
+                for field in stickers.STICKER_READ_ONLY_FIELDS
+            },
+        ),
     )
+    __packer__ = StickerJSONPackerPreEncoded
     __filter_param__ = None
     __generate_location_for__ = ()
 
@@ -73,6 +100,18 @@ class StickerController(ra_controllers.BaseResourceController):
 
     def _user_uuid(self) -> sys_uuid.UUID:
         return typing.cast(sys_uuid.UUID, self.get_context().user_uuid)
+
+    def get_packer(
+        self,
+        content_type: typing.Any,
+        resource_type: typing.Any = None,
+    ) -> typing.Any:
+        if self.request.api_context.get_active_method() == ra_constants.UPDATE:
+            permission_guards.require_iam_permission(
+                self.get_context(),
+                sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,
+            )
+        return super().get_packer(content_type, resource_type)
 
     def _parse_uuid(self, value: object) -> sys_uuid.UUID:
         return typing.cast(
@@ -90,89 +129,61 @@ class StickerController(ra_controllers.BaseResourceController):
             raise ra_exceptions.ValidationErrorException()
         return values[0] if values else None
 
-    def _list_response(self) -> webob.Response:
+    def filter(
+        self, filters: typing.Any, order_by: typing.Any = None
+    ) -> tuple[bytes | None, int, dict[str, str]]:
+        # Read the original query to validate reserved parameters and repeats.
+        del filters, order_by
         if set(self.request.GET).difference(_QUERY_PARAMETERS):
             raise ra_exceptions.ValidationErrorException()
-        favorite_value = self._query_value("favorite")
-        if favorite_value is None:
-            favorite = False
-        elif favorite_value == "true":
-            favorite = True
-        elif favorite_value == "false":
-            favorite = False
-        else:
-            raise ra_exceptions.ValidationErrorException()
-        page_limit_value = self._query_value("page_limit")
         try:
-            page_limit = int(page_limit_value) if page_limit_value is not None else None
-            uuids = [sys_uuid.UUID(value) for value in self.request.GET.getall("uuid")]
+            query = sticker_catalog.build_list_query(
+                q=self._query_value("q"),
+                favorite=self._query_value("favorite"),
+                uuids=self.request.GET.getall("uuid"),
+                category=self._query_value("category"),
+                format=self._query_value("format"),
+                page_limit=self._query_value("page_limit"),
+                page_marker=self._query_value("page_marker"),
+            )
         except (TypeError, ValueError):
             raise ra_exceptions.ValidationErrorException() from None
         result = sticker_catalog.list_public_stickers(
             self._session(),
             self._user_uuid(),
             self._repository(),
-            q=self._query_value("q"),
-            favorite=favorite,
-            uuids=uuids,
-            category=self._query_value("category"),
-            format=self._query_value("format"),
-            page_limit=page_limit,
-            page_marker=self._query_value("page_marker"),
+            query=query,
             if_none_match=self.request.headers.get("If-None-Match"),
         )
-        return _http_response(result)
+        return result.body, result.status, result.headers
 
-    def do_collection(self, parent_resource: typing.Any = None) -> webob.Response:
-        del parent_resource
-        if self.request.method != "GET":
-            raise ra_exceptions.UnsupportedHttpMethod(method=self.request.method)
-        self.request.api_context.set_active_method(ra_constants.FILTER)
-        return self._list_response()
-
-    def do_resource(
-        self,
-        uuid: object,
-        parent_resource: typing.Any = None,
-    ) -> webob.Response:
-        del parent_resource
-        sticker_uuid = self._parse_uuid(uuid)
-        if self.request.method == "GET":
-            self.request.api_context.set_active_method(ra_constants.GET)
-            return _json_response(
-                sticker_catalog.get_public_sticker(
-                    self._session(),
-                    self._user_uuid(),
-                    self._repository(),
-                    sticker_uuid,
-                )
-            )
-        if self.request.method == "PUT":
-            self.request.api_context.set_active_method(ra_constants.UPDATE)
-            permission_guards.require_iam_permission(
-                self.get_context(),
-                sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,
-            )
-            try:
-                values = json.loads(self.request.body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                raise ra_exceptions.ValidationErrorException() from None
-            updated = sticker_catalog.update_sticker(
+    def get(self, uuid: object, **kwargs: typing.Any) -> bytes:
+        del kwargs
+        return _json_bytes(
+            sticker_catalog.get_public_sticker(
                 self._session(),
                 self._user_uuid(),
                 self._repository(),
-                sticker_uuid,
-                values,
+                typing.cast(sys_uuid.UUID, uuid),
             )
-            return _json_response(
-                sticker_catalog.public_card_dict(
-                    sticker_catalog.build_public_card(
-                        updated.sticker,
-                        is_favorite=updated.is_favorite,
-                    )
+        )
+
+    def update(self, uuid: object, **kwargs: typing.Any) -> bytes:
+        updated = sticker_catalog.update_sticker(
+            self._session(),
+            self._user_uuid(),
+            self._repository(),
+            typing.cast(sys_uuid.UUID, uuid),
+            kwargs,
+        )
+        return _json_bytes(
+            sticker_catalog.public_card_dict(
+                sticker_catalog.build_public_card(
+                    updated.sticker,
+                    is_favorite=updated.is_favorite,
                 )
             )
-        raise ra_exceptions.UnsupportedHttpMethod(method=self.request.method)
+        )
 
     def get_resource_by_uuid(
         self,
@@ -196,10 +207,14 @@ class StickerController(ra_controllers.BaseResourceController):
         headers: dict[str, str] | None = None,
         add_location: bool = False,
     ) -> webob.Response:
-        del status_code, headers, add_location
         if isinstance(result, webob.Response):
             return result
-        return _json_response(result)
+        return super().process_result(
+            result,
+            status_code=status_code,
+            headers=headers,
+            add_location=add_location,
+        )
 
     @ra_actions.get
     def download(

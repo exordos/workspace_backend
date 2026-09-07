@@ -5,6 +5,7 @@ import uuid as sys_uuid
 
 import pytest
 
+from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
 
 
@@ -50,26 +51,22 @@ def test_marker_rejects_malformed_values(value: str) -> None:
         sticker_repository.decode_page_marker(value)
 
 
-def test_fingerprint_canonicalizes_uuid_order_and_duplicates() -> None:
+def test_fingerprint_uses_canonical_list_query() -> None:
     first = sys_uuid.UUID("00000000-0000-0000-0000-000000000002")
     second = sys_uuid.UUID("00000000-0000-0000-0000-000000000001")
     left = sticker_repository.filters_fingerprint(
-        q="кот",
-        favorite=False,
-        category=None,
-        format=None,
-        uuids=[first, second, first],
+        query=sticker_catalog.build_list_query(
+            q="кот",
+            uuids=[first, second, first],
+        ),
         sort=sticker_repository.SORT_CREATED,
     )
     right = sticker_repository.filters_fingerprint(
-        q="кот",
-        favorite=False,
-        category=None,
-        format=None,
-        uuids=[second, first],
+        query=sticker_catalog.build_list_query(q="кот", uuids=[second, first]),
         sort=sticker_repository.SORT_CREATED,
     )
     assert left == right
+    assert left == ("83d81dd61b3c7ff19478880d1ec379a6e9f8e376710b075942496e29392c4b38")
 
 
 def test_query_selects_each_d01_sort_and_parameterizes_search() -> None:
@@ -83,12 +80,11 @@ def test_query_selects_each_d01_sort_and_parameterizes_search() -> None:
     }
     for has_q, favorite in expected:
         query = repository._query(
-            q="кот" if has_q else None,
-            favorite=favorite,
-            category=None,
-            format=None,
-            uuids=None,
-            page_limit=10,
+            sticker_catalog.build_list_query(
+                q="кот" if has_q else None,
+                favorite=favorite,
+                page_limit=10,
+            )
         )
         statement, params = repository._list_statement(query, user_uuid, None)
         assert query.sort == expected[(has_q, favorite)]
@@ -102,12 +98,13 @@ def test_search_parameter_order_matches_cte_placeholder_order() -> None:
     user_uuid = sys_uuid.uuid4()
     first = sys_uuid.uuid4()
     query = repository._query(
-        q="кот",
-        favorite=False,
-        category="sticker",
-        format="png",
-        uuids=[first],
-        page_limit=10,
+        sticker_catalog.build_list_query(
+            q="кот",
+            category="sticker",
+            format="png",
+            uuids=[first],
+            page_limit=10,
+        )
     )
     statement, params = repository._list_statement(query, user_uuid, None)
     assert statement.count("%s") == len(params)
@@ -125,12 +122,7 @@ def test_search_parameter_order_matches_cte_placeholder_order() -> None:
 
 def test_search_keeps_raw_yo_spelling_for_exact_tag_candidates() -> None:
     query = sticker_repository.StickerRepository()._query(
-        q="берёза",
-        favorite=False,
-        category=None,
-        format=None,
-        uuids=None,
-        page_limit=10,
+        sticker_catalog.build_list_query(q="берёза", page_limit=10)
     )
     assert query.q == "береза"
     assert query.tag_query == "берёза"
@@ -142,12 +134,7 @@ def test_uuid_only_batch_allows_hidden_but_search_and_favorite_do_not() -> None:
     sticker_uuid = sys_uuid.uuid4()
 
     uuid_query = repository._query(
-        q=None,
-        favorite=False,
-        category=None,
-        format=None,
-        uuids=[sticker_uuid],
-        page_limit=10,
+        sticker_catalog.build_list_query(uuids=[sticker_uuid], page_limit=10)
     )
     uuid_statement, _ = repository._list_statement(uuid_query, user_uuid, None)
     assert "s.blocked = FALSE" in uuid_statement
@@ -155,12 +142,12 @@ def test_uuid_only_batch_allows_hidden_but_search_and_favorite_do_not() -> None:
 
     for favorite, q in ((False, "кот"), (True, None)):
         query = repository._query(
-            q=q,
-            favorite=favorite,
-            category=None,
-            format=None,
-            uuids=[sticker_uuid],
-            page_limit=10,
+            sticker_catalog.build_list_query(
+                q=q,
+                favorite=favorite,
+                uuids=[sticker_uuid],
+                page_limit=10,
+            )
         )
         statement, _ = repository._list_statement(query, user_uuid, None)
         assert "s.active = TRUE" in statement

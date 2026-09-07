@@ -116,24 +116,18 @@ def _canonical_json(value: typing.Any) -> str:
 
 def filters_fingerprint(
     *,
-    q: str,
-    favorite: bool,
-    category: str | None,
-    format: str | None,
-    uuids: typing.Iterable[sys_uuid.UUID],
+    query: sticker_models.StickerListQuery,
     sort: str,
 ) -> str:
     """Return the D-01 canonical query fingerprint."""
 
-    canonical_q = sticker_catalog.validate_query(q)
-    canonical_uuids = sorted({str(value) for value in uuids})
     payload = {
-        "category": category,
-        "favorite": favorite,
-        "format": format,
-        "q": canonical_q,
+        "category": query.category,
+        "favorite": query.favorite,
+        "format": query.format,
+        "q": query.q,
         "sort": sort,
-        "uuid": canonical_uuids,
+        "uuid": [str(value) for value in query.uuids],
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
@@ -246,57 +240,29 @@ class StickerRepository:
 
     def _query(
         self,
-        *,
-        q: str | None,
-        favorite: bool,
-        category: str | None,
-        format: str | None,
-        uuids: typing.Iterable[sys_uuid.UUID] | None,
-        page_limit: int | None,
+        query: sticker_models.StickerListQuery,
     ) -> _Query:
-        try:
-            if q is not None and type(q) is not str:
-                raise ValueError("q must be a string")
-            if type(favorite) is not bool:
-                raise ValueError("favorite must be a boolean")
-            raw_q = sticker_catalog.normalize_whitespace(q or "").lower()
-            normalized_q = sticker_catalog.validate_query(q or "")
-            normalized_limit = sticker_catalog.validate_page_limit(page_limit)
-            if (
-                category is not None
-                and category not in sticker_models.STICKER_CATEGORIES
-            ):
-                raise ValueError("invalid category")
-            if format is not None and format not in sticker_models.STICKER_FORMATS:
-                raise ValueError("invalid format")
-            canonical_uuids = tuple(sticker_catalog.validate_uuid_filter(uuids or ()))
-        except (TypeError, ValueError):
-            raise StickerRepositoryValidationError() from None
-        has_query = bool(normalized_q)
-        if has_query and favorite:
+        has_query = bool(query.q)
+        if has_query and query.favorite:
             sort = SORT_RANK_FAVORITE
         elif has_query:
             sort = SORT_RANK_UPDATED
-        elif favorite:
+        elif query.favorite:
             sort = SORT_FAVORITE
         else:
             sort = SORT_CREATED
         fingerprint = filters_fingerprint(
-            q=normalized_q,
-            favorite=bool(favorite),
-            category=category,
-            format=format,
-            uuids=canonical_uuids,
+            query=query,
             sort=sort,
         )
         return _Query(
-            q=normalized_q,
-            tag_query=raw_q,
-            favorite=bool(favorite),
-            category=category,
-            format=format,
-            uuids=canonical_uuids,
-            page_limit=normalized_limit,
+            q=query.q,
+            tag_query=query.tag_query,
+            favorite=query.favorite,
+            category=query.category,
+            format=query.format,
+            uuids=tuple(query.uuids),
+            page_limit=query.page_limit,
             sort=sort,
             fingerprint=fingerprint,
         )
@@ -305,31 +271,14 @@ class StickerRepository:
         self,
         session: typing.Any,
         user_uuid: sys_uuid.UUID,
-        *,
-        q: str | None = None,
-        favorite: bool = False,
-        uuid: typing.Iterable[sys_uuid.UUID] | None = None,
-        uuids: typing.Iterable[sys_uuid.UUID] | None = None,
-        category: str | None = None,
-        format: str | None = None,
-        page_limit: int | None = None,
-        page_marker: str | None = None,
+        list_query: sticker_models.StickerListQuery,
     ) -> StickerPage:
         """List visible rows and compute favorite state in the same query."""
 
-        if uuid is not None and uuids is not None:
-            raise StickerRepositoryValidationError()
-        query = self._query(
-            q=q,
-            favorite=favorite,
-            category=category,
-            format=format,
-            uuids=uuid if uuid is not None else uuids,
-            page_limit=page_limit,
-        )
+        query = self._query(list_query)
         marker_values: tuple[typing.Any, ...] | None = None
-        if page_marker is not None:
-            payload = decode_page_marker(page_marker)
+        if list_query.page_marker is not None:
+            payload = decode_page_marker(list_query.page_marker)
             if payload["filters_sha256"] != query.fingerprint:
                 raise StickerRepositoryValidationError()
             marker_values = _parse_marker_values(payload, query.sort)
@@ -634,7 +583,13 @@ class StickerRepository:
         elif uuids is not None:
             raise StickerRepositoryValidationError()
         try:
-            canonical = sticker_catalog.validate_uuid_filter(sticker_uuids)
+            raw_uuids = list(sticker_uuids)
+            if len(raw_uuids) > sticker_models.MAX_UUID_FILTER_COUNT:
+                raise ValueError("too many sticker UUIDs")
+            canonical = [
+                sys_uuid.UUID(value)
+                for value in sorted({str(value) for value in raw_uuids})
+            ]
         except (TypeError, ValueError):
             raise StickerRepositoryValidationError() from None
         if not canonical:

@@ -78,7 +78,7 @@ def _build_openapi(app_module):
     return application.openapi_engine.build_openapi_specification("3.0.3", request)
 
 
-def test_list_uses_only_explicit_query_contract_and_passthrough_response(monkeypatch):
+def test_list_uses_explicit_query_contract_and_standard_response(monkeypatch):
     request = _request(
         f"/v1/stickers/?q=%D0%B4%D0%B0&favorite=true&uuid={STICKER_UUID}&page_limit=25"
     )
@@ -108,25 +108,88 @@ def test_list_uses_only_explicit_query_contract_and_passthrough_response(monkeyp
     assert response.status_int == 304
     assert response.body == b""
     assert response.headers["ETag"] == '"etag"'
-    assert calls == [
-        (
-            (session, USER_UUID, repository),
-            {
-                "q": "да",
-                "favorite": True,
-                "uuids": [STICKER_UUID],
-                "category": None,
-                "format": None,
-                "page_limit": 25,
-                "page_marker": None,
-                "if_none_match": None,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (session, USER_UUID, repository)
+    assert kwargs["if_none_match"] is None
+    query = kwargs["query"]
+    assert isinstance(query, stickers.StickerListQuery)
+    assert query.q == "да"
+    assert query.tag_query == "да"
+    assert query.favorite is True
+    assert query.uuids == [STICKER_UUID]
+    assert query.category is None
+    assert query.format is None
+    assert query.page_limit == 25
+    assert query.page_marker is None
 
     invalid = _request("/v1/stickers/?sort_key=uuid")
     with pytest.raises(ra_exceptions.ValidationErrorException):
         sticker_controllers.StickerController(invalid).do_collection()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "unknown=value",
+        "fields=title",
+        "sort_key=uuid",
+        "sort_dir=asc",
+        "q=first&q=second",
+        "favorite=true&favorite=false",
+        "favorite=1",
+        "uuid=invalid",
+        "category=video",
+        "category=gif&category=sticker",
+        "format=jpeg",
+        "format=gif&format=png",
+        "page_limit=1&page_limit=2",
+        "page_limit=invalid",
+        "page_marker=first&page_marker=second",
+    ],
+)
+def test_list_rejects_invalid_query_before_service(monkeypatch, query):
+    controller = sticker_controllers.StickerController(
+        _request(f"/v1/stickers/?{query}")
+    )
+    monkeypatch.setattr(controller, "_session", lambda: object())
+    monkeypatch.setattr(controller, "_repository", lambda: object())
+
+    def unexpected_service(*args, **kwargs):
+        pytest.fail("Invalid query reached the catalog service")
+
+    monkeypatch.setattr(sticker_catalog, "list_public_stickers", unexpected_service)
+    with pytest.raises(ra_exceptions.ValidationErrorException):
+        controller.do_collection()
+
+
+def test_list_preserves_json_bytes_etag_and_pagination_through_framework(monkeypatch):
+    body = b'[{"title":"example"}]'
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Cache-Control": "private, no-cache",
+        "ETag": '"catalog-etag"',
+        "X-Pagination-Limit": "25",
+        "X-Pagination-Marker": "next-page",
+    }
+    request = _request("/v1/stickers/?page_limit=25&page_marker=current-page")
+    request.headers["If-None-Match"] = '"previous-etag"'
+    controller = sticker_controllers.StickerController(request)
+    monkeypatch.setattr(controller, "_session", lambda: object())
+    monkeypatch.setattr(controller, "_repository", lambda: object())
+
+    def list_stickers(*args, **kwargs):
+        assert kwargs["query"].page_limit == 25
+        assert kwargs["query"].page_marker == "current-page"
+        assert kwargs["if_none_match"] == '"previous-etag"'
+        return sticker_catalog.StickerHttpResponse(body, 200, headers)
+
+    monkeypatch.setattr(sticker_catalog, "list_public_stickers", list_stickers)
+    response = controller.do_collection()
+    assert response.status_int == 200
+    assert response.body == body
+    for name, value in headers.items():
+        assert response.headers[name] == value
 
 
 def test_uuid_batch_route_serializes_hidden_record_and_requests_blocked_filtering(
@@ -137,10 +200,10 @@ def test_uuid_batch_route_serializes_hidden_record_and_requests_blocked_filterin
     hidden = _sticker(active=False, blocked=False)
 
     class Repository:
-        def list_stickers(self, session, user_uuid, **kwargs):
+        def list_stickers(self, session, user_uuid, query):
             assert session is expected_session
             assert user_uuid == USER_UUID
-            assert kwargs["uuids"] == [hidden_uuid, blocked_uuid]
+            assert query.uuids == [hidden_uuid, blocked_uuid]
             return sticker_repository.StickerPage(
                 [sticker_repository.StickerRecord(hidden, is_favorite=False)]
             )
@@ -160,6 +223,33 @@ def test_uuid_batch_route_serializes_hidden_record_and_requests_blocked_filterin
         f"/api/workspace/v1/messenger/stickers/{hidden_uuid}/actions/download"
     )
     assert str(blocked_uuid) not in response.text
+
+
+def test_item_get_uses_standard_hook_and_returns_public_allowlist(monkeypatch):
+    request = _request(f"/v1/stickers/{STICKER_UUID}")
+    controller = sticker_controllers.StickerController(request)
+    session = object()
+    repository = object()
+    monkeypatch.setattr(controller, "_session", lambda: session)
+    monkeypatch.setattr(controller, "_repository", lambda: repository)
+    calls = []
+
+    def get_sticker(*args):
+        calls.append(args)
+        return sticker_catalog.public_card_dict(
+            sticker_catalog.build_public_card(_sticker(), is_favorite=True)
+        )
+
+    monkeypatch.setattr(sticker_catalog, "get_public_sticker", get_sticker)
+
+    response = controller.do_resource(str(STICKER_UUID))
+
+    assert "do_resource" not in sticker_controllers.StickerController.__dict__
+    assert response.status_int == 200
+    assert calls == [(session, USER_UUID, repository, STICKER_UUID)]
+    assert response.json["id"] == str(STICKER_UUID)
+    assert response.json["is_favorite"] is True
+    assert "media_object_id" not in response.text
 
 
 def test_admin_update_checks_permission_before_body_and_returns_public_allowlist(
@@ -212,6 +302,85 @@ def test_admin_update_checks_permission_before_body_and_returns_public_allowlist
     assert payload["is_favorite"] is True
     assert "media_object_id" not in response.text
     assert "private" not in response.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"title": None},
+        {"title": 123},
+        {"tags": "ab"},
+        {"tags": ["valid", 123]},
+        {"active": "false"},
+        {"category": 123},
+    ],
+)
+def test_admin_update_rejects_wrong_json_types_before_service(monkeypatch, body):
+    request = _request(
+        f"/v1/stickers/{STICKER_UUID}",
+        method="PUT",
+        permissions=(sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,),
+    )
+    request.body = json.dumps(body).encode()
+    controller = sticker_controllers.StickerController(request)
+
+    def unexpected_service(*args, **kwargs):
+        pytest.fail("Invalid update reached the catalog service")
+
+    monkeypatch.setattr(sticker_catalog, "update_sticker", unexpected_service)
+
+    with pytest.raises(ra_exceptions.ParseError):
+        controller.do_resource(str(STICKER_UUID))
+
+
+@pytest.mark.parametrize("body", [b"[]", b"null", b"invalid-json"])
+def test_admin_update_rejects_non_object_body_before_service(monkeypatch, body):
+    request = _request(
+        f"/v1/stickers/{STICKER_UUID}",
+        method="PUT",
+        permissions=(sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,),
+    )
+    request.body = body
+    controller = sticker_controllers.StickerController(request)
+
+    def unexpected_service(*args, **kwargs):
+        pytest.fail("Invalid update reached the catalog service")
+
+    monkeypatch.setattr(sticker_catalog, "update_sticker", unexpected_service)
+
+    with pytest.raises(ra_exceptions.RestAlchemyException) as invalid:
+        controller.do_resource(str(STICKER_UUID))
+    assert invalid.value.code == 400
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"unknown": True},
+        {"uuid": str(STICKER_UUID)},
+        {"format": "png"},
+        {"media_object_id": "stickers/private/other.gif"},
+    ],
+)
+def test_admin_update_rejects_unknown_and_read_only_fields_before_service(
+    monkeypatch, body
+):
+    request = _request(
+        f"/v1/stickers/{STICKER_UUID}",
+        method="PUT",
+        permissions=(sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,),
+    )
+    request.body = json.dumps(body).encode()
+    controller = sticker_controllers.StickerController(request)
+
+    def unexpected_service(*args, **kwargs):
+        pytest.fail("Invalid update reached the catalog service")
+
+    monkeypatch.setattr(sticker_catalog, "update_sticker", unexpected_service)
+
+    with pytest.raises(ra_exceptions.RestAlchemyException) as invalid:
+        controller.do_resource(str(STICKER_UUID))
+    assert invalid.value.code in {400, 403}
 
 
 @pytest.mark.parametrize("active,blocked", [(False, False), (False, True)])

@@ -66,6 +66,31 @@ STICKER_READ_ONLY_FIELDS = STICKER_INTERNAL_FIELDS | {
 }
 
 
+class _StrictInputTypeMixin:
+    """Reject JSON values whose type does not match the declared RA type."""
+
+    def from_simple_type(self, value: typing.Any) -> typing.Any:
+        if not self.validate(value):
+            raise TypeError("Invalid value type")
+        return super().from_simple_type(value)
+
+
+class _StrictString(_StrictInputTypeMixin, types.String):
+    pass
+
+
+class _StrictBoolean(_StrictInputTypeMixin, types.Boolean):
+    pass
+
+
+class _StrictTypedList(_StrictInputTypeMixin, types.TypedList):
+    pass
+
+
+class _StrictEnum(_StrictInputTypeMixin, types.Enum):
+    pass
+
+
 class _StrictFieldsMixin:
     """A model that rejects fields not declared by its contract."""
 
@@ -82,6 +107,44 @@ class _StrictModel(_StrictFieldsMixin, models.Model):
     pass
 
 
+class StickerListQuery(_StrictModel):
+    """Normalized parameters for one public sticker catalog page."""
+
+    q = properties.property(
+        _StrictString(max_length=MAX_QUERY_LENGTH),
+        default="",
+    )
+    tag_query = properties.property(
+        _StrictString(max_length=MAX_QUERY_LENGTH),
+        default="",
+    )
+    favorite = properties.property(_StrictBoolean(), default=False)
+    uuids = properties.property(
+        _StrictTypedList(types.UUID()),
+        default=list,
+    )
+    category = properties.property(
+        types.AllowNone(_StrictEnum(STICKER_CATEGORIES)),
+        default=None,
+    )
+    format = properties.property(
+        types.AllowNone(_StrictEnum(STICKER_FORMATS)),
+        default=None,
+    )
+    page_limit = properties.property(
+        types.Integer(min_value=1, max_value=MAX_PAGE_LIMIT),
+        default=DEFAULT_PAGE_LIMIT,
+    )
+    page_marker = properties.property(
+        types.AllowNone(_StrictString(min_length=1)),
+        default=None,
+    )
+
+    def validate(self) -> None:
+        if len(self.uuids) > MAX_UUID_FILTER_COUNT:
+            raise ValueError("uuid cannot contain more than 100 values")
+
+
 class Sticker(
     _StrictFieldsMixin,
     models.ModelWithUUID,
@@ -93,19 +156,19 @@ class Sticker(
     __tablename__ = "m_workspace_stickers"
 
     title = properties.property(
-        types.String(min_length=1, max_length=MAX_TITLE_LENGTH),
+        _StrictString(min_length=1, max_length=MAX_TITLE_LENGTH),
         required=True,
     )
     alt_text = properties.property(
-        types.String(max_length=MAX_ALT_TEXT_LENGTH),
+        _StrictString(max_length=MAX_ALT_TEXT_LENGTH),
         required=True,
     )
     emoji = properties.property(
-        types.TypedList(types.String(min_length=1, max_length=128)),
+        _StrictTypedList(_StrictString(min_length=1, max_length=128)),
         default=list,
     )
     tags = properties.property(
-        types.TypedList(types.String(min_length=1, max_length=MAX_TAG_LENGTH)),
+        _StrictTypedList(_StrictString(min_length=1, max_length=MAX_TAG_LENGTH)),
         default=list,
     )
     search_text = properties.property(
@@ -114,7 +177,7 @@ class Sticker(
         read_only=True,
     )
     category = properties.property(
-        types.Enum(STICKER_CATEGORIES),
+        _StrictEnum(STICKER_CATEGORIES),
         default=DEFAULT_STICKER_CATEGORY,
     )
     format = properties.property(
@@ -147,8 +210,8 @@ class Sticker(
         required=True,
         read_only=True,
     )
-    active = properties.property(types.Boolean(), default=True)
-    blocked = properties.property(types.Boolean(), default=False)
+    active = properties.property(_StrictBoolean(), default=True)
+    blocked = properties.property(_StrictBoolean(), default=False)
 
     def validate(self) -> None:
         if self.active and self.blocked:

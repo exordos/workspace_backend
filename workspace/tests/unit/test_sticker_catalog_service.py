@@ -62,8 +62,8 @@ class _Repository:
         self.page = page or sticker_repository.StickerPage([])
         self.calls = []
 
-    def list_stickers(self, session, user_uuid, **kwargs):
-        self.calls.append(("list", session, user_uuid, kwargs))
+    def list_stickers(self, session, user_uuid, query):
+        self.calls.append(("list", session, user_uuid, query))
         return self.page
 
     def get_active(self, session, user_uuid, sticker_uuid):
@@ -108,14 +108,17 @@ def test_list_response_is_stable_private_json_with_exact_pagination_headers():
         page=sticker_repository.StickerPage([_record()], next_marker=marker)
     )
     session = object()
+    query = sticker_catalog.build_list_query(
+        q="да",
+        favorite=True,
+        page_limit=25,
+    )
 
     response = sticker_catalog.list_public_stickers(
         session,
         USER_UUID,
         repository,
-        q="да",
-        favorite=True,
-        page_limit=25,
+        query=query,
     )
 
     expected = json.dumps(
@@ -156,17 +159,10 @@ def test_list_response_is_stable_private_json_with_exact_pagination_headers():
             "list",
             session,
             USER_UUID,
-            {
-                "q": "да",
-                "favorite": True,
-                "uuids": None,
-                "category": None,
-                "format": None,
-                "page_limit": 25,
-                "page_marker": None,
-            },
+            query,
         )
     ]
+    assert isinstance(repository.calls[0][3], sticker_models.StickerListQuery)
     assert b"media_object_id" not in response.body
     assert b"stickers/moved" not in response.body
 
@@ -174,14 +170,14 @@ def test_list_response_is_stable_private_json_with_exact_pagination_headers():
 def test_list_matching_if_none_match_returns_304_without_body():
     repository = _Repository(page=sticker_repository.StickerPage([_record()]))
     first = sticker_catalog.list_public_stickers(
-        object(), USER_UUID, repository, page_limit=None
+        object(), USER_UUID, repository, query=sticker_catalog.build_list_query()
     )
 
     cached = sticker_catalog.list_public_stickers(
         object(),
         USER_UUID,
         repository,
-        page_limit=None,
+        query=sticker_catalog.build_list_query(),
         if_none_match=first.headers["ETag"],
     )
 

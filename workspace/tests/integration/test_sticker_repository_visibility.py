@@ -7,6 +7,7 @@ import uuid as sys_uuid
 
 import psycopg
 
+from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
 
 
@@ -116,7 +117,9 @@ def test_uuid_batch_includes_hidden_unblocked_but_not_blocked(
         batch = repository.list_stickers(
             db,
             user_uuid,
-            uuid=[hidden_uuid, blocked_uuid, visible_uuid],
+            sticker_catalog.build_list_query(
+                uuids=[hidden_uuid, blocked_uuid, visible_uuid]
+            ),
         )
         assert {record.uuid for record in batch.items} == {
             hidden_uuid,
@@ -124,22 +127,28 @@ def test_uuid_batch_includes_hidden_unblocked_but_not_blocked(
         }
         assert blocked_uuid not in {record.uuid for record in batch.items}
 
-        ordinary = repository.list_stickers(db, user_uuid)
+        ordinary = repository.list_stickers(
+            db, user_uuid, sticker_catalog.build_list_query()
+        )
         assert {record.uuid for record in ordinary.items} == {visible_uuid}
 
         hidden_search = repository.list_stickers(
             db,
             user_uuid,
-            uuid=[hidden_uuid],
-            q="hidden",
+            sticker_catalog.build_list_query(
+                uuids=[hidden_uuid],
+                q="hidden",
+            ),
         )
         assert hidden_search.items == []
 
         favorite = repository.list_stickers(
             db,
             user_uuid,
-            uuid=[hidden_uuid, visible_uuid],
-            favorite=True,
+            sticker_catalog.build_list_query(
+                uuids=[hidden_uuid, visible_uuid],
+                favorite=True,
+            ),
         )
         assert [record.uuid for record in favorite.items] == [visible_uuid]
     finally:
@@ -196,7 +205,11 @@ def test_search_ranks_mixed_yo_exact_tag_above_title_exact(
                 ],
             )
         repository = sticker_repository.StickerRepository()
-        result = repository.list_stickers(db, user_uuid, q="береза")
+        result = repository.list_stickers(
+            db,
+            user_uuid,
+            sticker_catalog.build_list_query(q="береза"),
+        )
         assert [record.uuid for record in result.items] == [tag_uuid, title_uuid]
         assert result.items[0].rank == 4.0
         assert result.items[1].rank == 3.0

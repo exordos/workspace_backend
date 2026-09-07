@@ -101,6 +101,67 @@ def normalize_search_text(value: str) -> str:
     return normalize_whitespace(value).lower().replace("ё", "е")
 
 
+def build_list_query(
+    *,
+    q: str | None = None,
+    favorite: str | bool | None = None,
+    uuids: typing.Iterable[str | sys_uuid.UUID] = (),
+    category: str | None = None,
+    format: str | None = None,
+    page_limit: str | int | None = None,
+    page_marker: str | None = None,
+) -> sticker_models.StickerListQuery:
+    """Parse and normalize the public sticker list parameters once."""
+
+    if q is not None and type(q) is not str:
+        raise TypeError("q must be a string")
+    normalized_query = normalize_whitespace(q or "").lower()
+    if len(normalized_query) > sticker_models.MAX_QUERY_LENGTH:
+        raise ValueError("q cannot exceed 200 characters")
+
+    if favorite is None:
+        normalized_favorite = False
+    elif type(favorite) is bool:
+        normalized_favorite = favorite
+    elif favorite == "true":
+        normalized_favorite = True
+    elif favorite == "false":
+        normalized_favorite = False
+    else:
+        raise ValueError("favorite must be true or false")
+
+    raw_uuids = list(uuids)
+    if len(raw_uuids) > sticker_models.MAX_UUID_FILTER_COUNT:
+        raise ValueError("uuid cannot contain more than 100 values")
+    parsed_uuids = [
+        value if isinstance(value, sys_uuid.UUID) else sys_uuid.UUID(value)
+        for value in raw_uuids
+    ]
+    canonical_uuids = [
+        sys_uuid.UUID(value) for value in sorted({str(value) for value in parsed_uuids})
+    ]
+
+    if page_limit is None:
+        normalized_page_limit = sticker_models.DEFAULT_PAGE_LIMIT
+    elif type(page_limit) is int:
+        normalized_page_limit = page_limit
+    elif type(page_limit) is str:
+        normalized_page_limit = int(page_limit)
+    else:
+        raise TypeError("page_limit must be an integer")
+
+    return sticker_models.StickerListQuery(
+        q=normalized_query.replace("ё", "е"),
+        tag_query=normalized_query,
+        favorite=normalized_favorite,
+        uuids=canonical_uuids,
+        category=category,
+        format=format,
+        page_limit=normalized_page_limit,
+        page_marker=page_marker,
+    )
+
+
 def build_search_text(title: str, alt_text: str, tags: typing.Iterable[str]) -> str:
     parts = [
         normalize_title(title),
@@ -213,39 +274,19 @@ def list_public_stickers(
     user_uuid: sys_uuid.UUID,
     repository: typing.Any,
     *,
-    q: str | None = None,
-    favorite: bool = False,
-    uuids: typing.Iterable[sys_uuid.UUID] | None = None,
-    category: str | None = None,
-    format: str | None = None,
-    page_limit: int | None = None,
-    page_marker: str | None = None,
+    query: sticker_models.StickerListQuery,
     if_none_match: str | None = None,
 ) -> StickerHttpResponse:
     """Build one private, stable JSON catalog page for the current user."""
 
-    try:
-        actual_page_limit = validate_page_limit(page_limit)
-    except (TypeError, ValueError):
-        raise ra_exc.ValidationErrorException() from None
-    page = repository.list_stickers(
-        session,
-        user_uuid,
-        q=q,
-        favorite=favorite,
-        uuids=uuids,
-        category=category,
-        format=format,
-        page_limit=actual_page_limit,
-        page_marker=page_marker,
-    )
+    page = repository.list_stickers(session, user_uuid, query)
     body = _stable_json_bytes([_public_record(record) for record in page.items])
     etag = _etag(body)
     headers = {
         "Cache-Control": "private, no-cache",
         "Content-Type": "application/json; charset=UTF-8",
         "ETag": etag,
-        "X-Pagination-Limit": str(actual_page_limit),
+        "X-Pagination-Limit": str(query.page_limit),
     }
     if page.next_marker is not None:
         headers["X-Pagination-Marker"] = page.next_marker
@@ -361,29 +402,6 @@ def update_sticker(
             path=str(sticker_uuid),
         )
     return record
-
-
-def validate_query(value: str) -> str:
-    normalized = normalize_whitespace(value)
-    if len(normalized) > sticker_models.MAX_QUERY_LENGTH:
-        raise ValueError("q cannot exceed 200 characters")
-    return normalize_search_text(normalized)
-
-
-def validate_page_limit(value: int | None) -> int:
-    if value is None:
-        return sticker_models.DEFAULT_PAGE_LIMIT
-    if type(value) is not int or not 1 <= value <= sticker_models.MAX_PAGE_LIMIT:
-        raise ValueError("page_limit must be between 1 and 100")
-    return value
-
-
-def validate_uuid_filter(values: typing.Iterable[sys_uuid.UUID]) -> list[sys_uuid.UUID]:
-    raw_values = list(values)
-    if len(raw_values) > sticker_models.MAX_UUID_FILTER_COUNT:
-        raise ValueError("uuid cannot contain more than 100 values")
-    result = sorted({str(value) for value in raw_values})
-    return [sys_uuid.UUID(value) for value in result]
 
 
 def _stable_dedupe(values: typing.Iterable[str]) -> list[str]:

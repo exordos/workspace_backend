@@ -7,6 +7,7 @@ import uuid as sys_uuid
 
 import psycopg
 
+from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
 
 
@@ -76,12 +77,11 @@ def test_representative_search_volume_uses_tag_and_trigram_indexes(
             plans: dict[bool, str] = {}
             for favorite in (False, True):
                 query = repository._query(
-                    q="needle",
-                    favorite=favorite,
-                    category=None,
-                    format=None,
-                    uuids=None,
-                    page_limit=50,
+                    sticker_catalog.build_list_query(
+                        q="needle",
+                        favorite=favorite,
+                        page_limit=50,
+                    )
                 )
                 statement, params = repository._list_statement(
                     query,
@@ -98,12 +98,10 @@ def test_representative_search_volume_uses_tag_and_trigram_indexes(
                 )
                 cursor.execute("SELECT set_limit(%s::real)", (0.3,))
             favorite_query = repository._query(
-                q=None,
-                favorite=True,
-                category=None,
-                format=None,
-                uuids=None,
-                page_limit=1,
+                sticker_catalog.build_list_query(
+                    favorite=True,
+                    page_limit=1,
+                )
             )
             favorite_statement, favorite_params = repository._list_statement(
                 favorite_query,
@@ -129,9 +127,11 @@ def test_representative_search_volume_uses_tag_and_trigram_indexes(
             page = repository.list_stickers(
                 db,
                 favorite_user_uuid,
-                favorite=True,
-                page_limit=1,
-                page_marker=marker,
+                sticker_catalog.build_list_query(
+                    favorite=True,
+                    page_limit=1,
+                    page_marker=marker,
+                ),
             )
             actual_order.extend(record.uuid for record in page.items)
             if page.next_marker is None:
