@@ -44,6 +44,10 @@ class WriteBudgetExceeded(Exception):
     pass
 
 
+def _configure_worker_transaction(session: typing.Any) -> None:
+    writer.configure_transaction(session, defer_wal_flush=True)
+
+
 def transient_storage_error(error: BaseException | None) -> bool:
     seen = set()
     while error is not None and id(error) not in seen:
@@ -155,7 +159,7 @@ class HistoryImportWorker:
 
     def run_once(self) -> bool:
         with self.session_factory() as session:
-            writer.configure_transaction(session)
+            _configure_worker_transaction(session)
             pressure = session.execute(
                 """SELECT count(*) AS count FROM (
                        SELECT 1 FROM messenger_projection_tasks
@@ -198,7 +202,7 @@ class HistoryImportWorker:
                 "history_observer_not_assigned",
             }
             with self.session_factory() as session:
-                writer.configure_transaction(session)
+                _configure_worker_transaction(session)
                 repository.release(
                     session,
                     job,
@@ -218,7 +222,7 @@ class HistoryImportWorker:
             ra_exceptions.ValidationErrorException,
         ):
             with self.session_factory() as session:
-                writer.configure_transaction(session)
+                _configure_worker_transaction(session)
                 repository.release(
                     session, job, error="history_invalid_domain_value", permanent=True
                 )
@@ -242,7 +246,7 @@ class HistoryImportWorker:
         self.preferred_uuid = None
         size = max(1, job["part_size"] // 2) if shrink else job["part_size"]
         with self.session_factory() as session:
-            writer.configure_transaction(session)
+            _configure_worker_transaction(session)
             repository.release(
                 session,
                 job,
@@ -265,6 +269,7 @@ class HistoryImportWorker:
     ) -> typing.Any:
         started = self.clock()
         with self.session_factory() as session:
+            _configure_worker_transaction(session)
             result = operation(session)
             # statement_timeout bounds each SQL operation; this additional
             # whole-transaction budget rolls back an oversized prepared part.
@@ -272,7 +277,7 @@ class HistoryImportWorker:
                 raise WriteBudgetExceeded()
         duration = self.clock() - started
         with self.session_factory() as session:
-            writer.configure_transaction(session)
+            _configure_worker_transaction(session)
             session.execute(
                 """UPDATE m_external_history_imports_v1
                    SET write_seconds = write_seconds + %s,
@@ -332,7 +337,7 @@ class HistoryImportWorker:
             for offset in range(0, len(eligible), 100):
                 page = eligible[offset : offset + 100]
                 with self.session_factory() as session:
-                    writer.configure_transaction(session)
+                    _configure_worker_transaction(session)
                     existing = preparation.existing_message_ids(session, batch, page)
                 missing.extend(
                     message for message in page if message["id"] not in existing
@@ -352,14 +357,14 @@ class HistoryImportWorker:
 
     def process(self, identity: typing.Any, job: dict) -> None:
         with self.session_factory() as session:
-            writer.configure_transaction(session)
+            _configure_worker_transaction(session)
             sources = repository.guard(session, identity, job, lease=True)
         batch = self.load_batch(job)
         repository.validate_observers(batch, sources)
         if not job["files_discovered"]:
 
             def discover(session: typing.Any) -> None:
-                writer.configure_transaction(session)
+                _configure_worker_transaction(session)
                 repository.guard(session, identity, job, lease=True)
                 session.execute(
                     """UPDATE m_external_history_imports_v1
@@ -401,7 +406,7 @@ class HistoryImportWorker:
                 },
             )
             with self.session_factory() as session:
-                writer.configure_transaction(session)
+                _configure_worker_transaction(session)
                 resolved = preparation.load_identities(session, page)
                 repository.release(session, job, delay=0.1)
             self.identities.update(resolved)
@@ -455,7 +460,7 @@ class HistoryImportWorker:
             if preparation.eligible_accesses(message, sources, job["created_at"])
         ]
         with self.session_factory() as session:
-            writer.configure_transaction(session)
+            _configure_worker_transaction(session)
             references = preparation.referenced_message_ids(eligible_messages)
             references.update(message["id"] for message in messages)
             existing = preparation.existing_messages(
@@ -469,7 +474,7 @@ class HistoryImportWorker:
         files: dict[str, dict] = {}
         for offset in range(0, len(file_uuids), 100):
             with self.session_factory() as session:
-                writer.configure_transaction(session)
+                _configure_worker_transaction(session)
                 files.update(
                     (row["source_path"], dict(row))
                     for row in session.execute(

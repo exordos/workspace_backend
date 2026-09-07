@@ -127,8 +127,13 @@ lookups so PostgreSQL cannot turn them into full-project scans as data grows.
 pre-commit budget rolls back oversized work and reduces its part size; a fast
 successful write gradually restores it. Lock contention yields quickly and
 retries without collapsing the part size. These are budgets, not hard bounds
-on commit/fsync latency. The dedicated process uses a maximum of two database
-connections and pauses behind more than 2000 pending projection tasks.
+on commit/fsync latency. Background worker transactions use asynchronous commit
+so each small part does not force a WAL flush or retain its locks while waiting
+for storage. Ingress registration and foreground APIs keep their normal durable
+commit policy. A database or host crash can lose the latest background part or
+checkpoint; the lease, content hashes and idempotent writes replay it safely.
+The dedicated process uses a maximum of two database connections and pauses
+behind more than 2000 pending projection tasks.
 
 Imported counters are updated incrementally. Notifications are coalesced per
 user/topic or user/stream and drained in bounded groups; no per-message live
