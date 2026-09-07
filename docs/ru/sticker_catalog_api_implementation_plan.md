@@ -129,7 +129,7 @@ workspace/messenger_api/
   sticker_storage.py             # object id, save/read/delete
   sticker_import.py              # разбор и полная валидация ZIP
   api/sticker_controllers.py     # тонкие RestAlchemy-контроллеры
-  api/sticker_routes.py          # ресурс, действия и collection action
+  api/routes.py                  # shared routes, including sticker actions
 ```
 
 Эти границы обязательны для следующих пакетов. Субагенты работают в новых файлах, а интегратор один раз изменяет общие точки подключения.

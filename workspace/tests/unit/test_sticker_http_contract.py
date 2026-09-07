@@ -22,8 +22,8 @@ from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_import
 from workspace.messenger_api import sticker_repository
 from workspace.messenger_api.api import app as messenger_app
+from workspace.messenger_api.api import routes as messenger_routes
 from workspace.messenger_api.api import sticker_controllers
-from workspace.messenger_api.api import sticker_routes
 from workspace.messenger_api.dm import stickers
 from workspace.workspace_api.api import app as workspace_app
 from workspace.workspace_api.api import routes as workspace_routes
@@ -307,7 +307,7 @@ def test_collection_import_permission_precedes_multipart_access():
     request.environ["wsgi.input"] = BodySentinel()
 
     with pytest.raises(messenger_exceptions.ExternalResourceForbiddenError):
-        sticker_routes.StickerRoute(request).do()
+        messenger_routes.StickerRoute(request).do()
 
 
 def test_collection_import_passes_only_archive_file_to_service(monkeypatch):
@@ -354,7 +354,7 @@ def test_collection_import_passes_only_archive_file_to_service(monkeypatch):
 
     monkeypatch.setattr(sticker_import, "import_archive", import_archive)
 
-    response = sticker_routes.StickerRoute(request).do()
+    response = messenger_routes.StickerRoute(request).do()
 
     assert response.status_int == 200
     assert response.json == {"created": 0, "duplicates": 0, "items": []}
@@ -374,33 +374,33 @@ def test_collection_import_rejects_wrong_method_or_missing_invoke(
     error,
 ):
     with pytest.raises(error):
-        sticker_routes.StickerRoute(_request(path, method=method)).do()
+        messenger_routes.StickerRoute(_request(path, method=method)).do()
 
 
 def test_collection_import_is_not_an_item_action_and_fallback_is_unmodified():
-    assert not hasattr(sticker_routes.StickerRoute, "import_archive")
+    assert not hasattr(messenger_routes.StickerRoute, "import_archive")
     request = _request(f"/{STICKER_UUID}")
     original_path = request.path_info
     result = object()
 
     with mock.patch.object(ra_routes.Route, "do", return_value=result) as parent_do:
-        assert sticker_routes.StickerRoute(request).do() is result
+        assert messenger_routes.StickerRoute(request).do() is result
 
     assert request.path_info == original_path
     parent_do.assert_called_once_with(parent_resource=None)
 
 
 def test_runtime_routes_mount_same_catalog_under_both_api_roots():
-    assert messenger_app.MessengerApiApp.v1.stickers is sticker_routes.StickerRoute
-    assert workspace_routes.MessengerRoute.stickers is sticker_routes.StickerRoute
-    assert set(sticker_routes.StickerRoute.__allow_methods__) == {
+    assert messenger_app.MessengerApiApp.v1.stickers is messenger_routes.StickerRoute
+    assert workspace_routes.MessengerRoute.stickers is messenger_routes.StickerRoute
+    assert set(messenger_routes.StickerRoute.__allow_methods__) == {
         ra_routes.FILTER,
         ra_routes.GET,
         ra_routes.UPDATE,
     }
-    assert sticker_routes.StickerRoute.download.is_invoke() is False
-    assert sticker_routes.StickerRoute.star.is_invoke() is True
-    assert sticker_routes.StickerRoute.unstar.is_invoke() is True
+    assert messenger_routes.StickerRoute.download.is_invoke() is False
+    assert messenger_routes.StickerRoute.star.is_invoke() is True
+    assert messenger_routes.StickerRoute.unstar.is_invoke() is True
     assert sticker_controllers.StickerController.__filter_param__ is None
 
 
