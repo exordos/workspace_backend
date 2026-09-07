@@ -14,6 +14,7 @@ import webob
 from restalchemy.api import applications
 from restalchemy.api import contexts as ra_contexts
 from restalchemy.api import routes as ra_routes
+from restalchemy.api.middlewares import errors
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.storage import exceptions as storage_exceptions
 
@@ -22,6 +23,7 @@ from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_import
 from workspace.messenger_api import sticker_repository
 from workspace.messenger_api.api import app as messenger_app
+from workspace.messenger_api.api import openapi_contract
 from workspace.messenger_api.api import routes as messenger_routes
 from workspace.messenger_api.api import sticker_controllers
 from workspace.messenger_api.dm import stickers
@@ -660,7 +662,7 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
     }
     assert parameters[("query", "page_marker")]["schema"] == {"type": "string"}
     assert "filter" not in {name for _, name in parameters}
-    assert set(list_operation["responses"]) == {200, 304}
+    assert set(list_operation["responses"]) == {200, 304, 400}
     assert set(list_operation["responses"][200]["headers"]) == {
         "ETag",
         "Cache-Control",
@@ -672,6 +674,24 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
         for operation in paths[path].values():
             assert operation["security"] == [{"bearerAuth": []}]
     update = paths[item]["put"]
+    item_get = paths[item]["get"]
+    download = paths[f"{item}/actions/download"]["get"]
+    assert set(item_get["responses"]) == {200, 400, 404}
+    assert set(download["responses"]) == {200, 400, 404}
+    assert set(update["responses"]) == {200, 400, 403, 404}
+    for operation, statuses in (
+        (list_operation, (400,)),
+        (item_get, (400, 404)),
+        (download, (400, 404)),
+        (update, (400, 403, 404)),
+    ):
+        for status in statuses:
+            assert operation["responses"][status]["content"]["application/json"][
+                "schema"
+            ] == {"$ref": "#/components/schemas/RestAlchemyError"}
+    assert specification["components"]["schemas"]["RestAlchemyError"] == (
+        openapi_contract.RESTALCHEMY_ERROR_SCHEMA
+    )
     assert update["x-required-permission"] == "workspace.sticker_catalog.manage"
     assert set(
         update["requestBody"]["content"]["application/json"]["schema"]["properties"]
@@ -707,3 +727,27 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
         assert internal not in properties
     assert "Sticker_Get" not in specification["components"]["schemas"]
     assert "Sticker_Update" not in specification["components"]["schemas"]
+
+
+@pytest.mark.parametrize("rank", [10**400, -(10**400), 1e300, -1e300])
+def test_list_invalid_rank_cursor_returns_http_400(monkeypatch, rank):
+    repository = sticker_repository.StickerRepository()
+    query = repository._query(sticker_catalog.build_list_query(q="cat"))
+    marker = sticker_repository.encode_page_marker(
+        sort=query.sort,
+        filters_sha256=query.fingerprint,
+        values=(rank, "2026-01-01T00:00:00+00:00", STICKER_UUID),
+    )
+    controller = sticker_controllers.StickerController(
+        _request(f"/v1/stickers/?q=cat&page_marker={marker}")
+    )
+    monkeypatch.setattr(controller, "_session", lambda: None)
+
+    def application(environ, start_response):
+        return controller.do_collection()(environ, start_response)
+
+    response = controller.request.get_response(
+        errors.ErrorsHandlerMiddleware(application)
+    )
+    assert response.status_int == 400
+    assert response.json["type"] == "StickerRepositoryValidationError"

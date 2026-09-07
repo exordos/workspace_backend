@@ -226,13 +226,15 @@ def _parse_marker_values(
     if expected_count == 2:
         return marker_time, marker_uuid
     rank = values[0]
-    if (
-        isinstance(rank, bool)
-        or not isinstance(rank, (int, float))
-        or not math.isfinite(float(rank))
-    ):
+    if isinstance(rank, bool) or not isinstance(rank, (int, float)):
         raise StickerRepositoryValidationError()
-    return float(rank), marker_time, marker_uuid
+    try:
+        rank = float(rank)
+    except OverflowError:
+        raise StickerRepositoryValidationError() from None
+    if not math.isfinite(rank) or not 0 <= rank <= 4:
+        raise StickerRepositoryValidationError()
+    return rank, marker_time, marker_uuid
 
 
 class StickerRepository:
@@ -360,6 +362,9 @@ class StickerRepository:
             # Tags retain their original ё spelling, while search_text stores
             # the canonical е spelling.  Ranking keeps tag normalization; the
             # candidate branches use only raw indexed search predicates.
+            like_query = (
+                query.q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            )
             tag_match = "replace(lower(tag.value), 'ё', 'е') = %s"
             query_rank = """
                 CASE
@@ -368,13 +373,13 @@ class StickerRepository:
                     WHERE {tag_match}
                   ) THEN 4.0
                   WHEN replace(lower(s.title), 'ё', 'е') = %s THEN 3.0
-                  WHEN replace(lower(s.title), 'ё', 'е') LIKE %s || '%%' THEN 2.0
-                  WHEN s.search_text LIKE '%%' || %s || '%%'
+                  WHEN replace(lower(s.title), 'ё', 'е') LIKE %s || '%%' ESCAPE '!' THEN 2.0
+                  WHEN s.search_text LIKE '%%' || %s || '%%' ESCAPE '!'
                     THEN 1.0
                   ELSE similarity(s.search_text, %s)
                 END
             """.format(tag_match=tag_match)
-            rank_params = [query.q] * 5
+            rank_params = [query.q, query.q, like_query, like_query, query.q]
 
         where = ["s.blocked = FALSE"]
         uuid_batch = bool(query.uuids and not query.q and not query.favorite)
@@ -404,7 +409,7 @@ class StickerRepository:
                 UNION
                 SELECT candidate.*
                   FROM m_workspace_stickers AS candidate
-                 WHERE {where} AND candidate.search_text LIKE '%%' || %s || '%%'
+                 WHERE {where} AND candidate.search_text LIKE '%%' || %s || '%%' ESCAPE '!'
                 UNION
                 SELECT candidate.*
                   FROM m_workspace_stickers AS candidate
@@ -413,7 +418,7 @@ class StickerRepository:
             for value in (
                 query.q,
                 query.tag_query,
-                query.q,
+                like_query,
                 query.q,
             ):
                 if query.category:
@@ -680,7 +685,8 @@ class StickerRepository:
         if unknown:
             raise StickerRepositoryValidationError()
         current_rows = session.execute(
-            "SELECT * FROM m_workspace_stickers WHERE uuid = %s", (sticker_uuid,)
+            "SELECT * FROM m_workspace_stickers WHERE uuid = %s FOR UPDATE",
+            (sticker_uuid,),
         ).fetchall()
         if not current_rows:
             return None

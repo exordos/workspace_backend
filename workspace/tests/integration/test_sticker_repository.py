@@ -3,6 +3,7 @@
 import concurrent.futures
 import datetime
 import os
+import threading
 import uuid as sys_uuid
 
 import psycopg
@@ -63,6 +64,7 @@ def _model(
         ["🐈"],
         tags if tags is not None else ["новый", "кот"],
     )
+
     return sticker_models.Sticker(
         uuid=sticker_uuid,
         **fields,
@@ -76,6 +78,99 @@ def _model(
         active=True,
         blocked=False,
     )
+
+
+@pytest.mark.usefixtures("_database")
+def test_concurrent_partial_updates_keep_search_text_consistent(db) -> None:
+    repository = sticker_repository.StickerRepository()
+    sticker_uuid = sys_uuid.uuid4()
+    sha256 = sys_uuid.uuid4().hex * 2
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stickers
+              (uuid,title,alt_text,emoji,tags,search_text,category,format,
+               size_bytes,sha256,media_object_id,active,blocked)
+            VALUES (%s,'Old title','Old alt','{}',ARRAY['old'],
+                    'old title old alt old','sticker','png',1,%s,%s,TRUE,FALSE)
+            """,
+            (sticker_uuid, sha256, f"stickers/{sticker_uuid}/media.png"),
+        )
+
+    first_locked = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    class UpdateSession:
+        def __init__(self, connection, *, pause_after_lock=False, signal_start=False):
+            self.connection = connection
+            self.pause_after_lock = pause_after_lock
+            self.signal_start = signal_start
+
+        def execute(self, statement, params):
+            if "FOR UPDATE" in statement and self.signal_start:
+                second_started.set()
+            result = self.connection.execute(statement, params)
+            if "FOR UPDATE" in statement and self.pause_after_lock:
+                first_locked.set()
+                assert release_first.wait(timeout=5)
+            return result
+
+    def update(fields, *, pause_after_lock=False, signal_start=False):
+        connection = psycopg.connect(
+            os.environ.get(
+                "WORKSPACE_TEST_DB_URL",
+                "postgresql://workspace:pass@localhost:5432/workspace_test",
+            ),
+            autocommit=False,
+            row_factory=psycopg.rows.dict_row,
+        )
+        try:
+            result = repository.update(
+                UpdateSession(
+                    connection,
+                    pause_after_lock=pause_after_lock,
+                    signal_start=signal_start,
+                ),
+                sticker_uuid,
+                fields,
+            )
+            connection.commit()
+            return result
+        finally:
+            connection.close()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                update, {"title": "New title"}, pause_after_lock=True
+            )
+            assert first_locked.wait(timeout=5)
+            second = executor.submit(update, {"tags": ["new"]}, signal_start=True)
+            assert second_started.wait(timeout=5)
+            assert not second.done()
+            release_first.set()
+            first.result(timeout=5)
+            second.result(timeout=5)
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, tags, search_text "
+                "FROM m_workspace_stickers WHERE uuid = %s",
+                (sticker_uuid,),
+            )
+            assert cursor.fetchone() == (
+                "New title",
+                ["new"],
+                "new title old alt new",
+            )
+    finally:
+        release_first.set()
+        with db.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM m_workspace_stickers WHERE uuid = %s",
+                (sticker_uuid,),
+            )
 
 
 @pytest.mark.usefixtures("_database")
@@ -438,3 +533,50 @@ def test_repository_visibility_favorite_and_keyset(db) -> None:
                 "DELETE FROM m_workspace_stickers WHERE uuid = ANY(%s::uuid[])",
                 (list(cleanup_uuids),),
             )
+
+
+@pytest.mark.usefixtures("_database")
+@pytest.mark.parametrize("text", ["%", "_", "\\", "!"])
+def test_search_treats_like_metacharacters_as_literal_text(db, text) -> None:
+    db.row_factory = psycopg.rows.dict_row
+    repository = sticker_repository.StickerRepository()
+    sticker_uuids = [sys_uuid.uuid4() for _ in range(4)]
+    texts = [
+        (text, text),
+        (text + "prefix", text + "prefix"),
+        ("other", "before" + text + "after"),
+        ("unrelated", "unrelated"),
+    ]
+    try:
+        for sticker_uuid, (title, search_text) in zip(sticker_uuids, texts):
+            db.execute(
+                """
+                INSERT INTO m_workspace_stickers
+                  (uuid,title,alt_text,emoji,tags,search_text,category,format,
+                   size_bytes,sha256,media_object_id,active,blocked,created_at,updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                _row(
+                    sticker_uuid,
+                    sticker_uuid.hex * 2,
+                    title=title,
+                    alt_text=search_text,
+                    tags=[],
+                    search_text=search_text,
+                ),
+            )
+        page = repository.list_stickers(
+            db,
+            sys_uuid.uuid4(),
+            sticker_catalog.build_list_query(q=text, uuids=sticker_uuids),
+        )
+        assert [(record.uuid, record.rank) for record in page.items] == [
+            (sticker_uuids[0], 3.0),
+            (sticker_uuids[1], 2.0),
+            (sticker_uuids[2], 1.0),
+        ]
+    finally:
+        db.execute(
+            "DELETE FROM m_workspace_stickers WHERE uuid = ANY(%s::uuid[])",
+            (sticker_uuids,),
+        )

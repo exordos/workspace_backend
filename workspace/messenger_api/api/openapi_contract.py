@@ -130,6 +130,29 @@ TOPIC_SUMMARY_ERROR_SCHEMA = {
     "properties": {"message": {"type": "string"}},
 }
 
+RESTALCHEMY_ERROR_SCHEMA = {
+    "type": "object",
+    "required": ["type", "code", "message"],
+    "additionalProperties": False,
+    "properties": {
+        "type": {"type": "string"},
+        "code": {"type": "integer"},
+        "message": {"type": "string"},
+    },
+}
+
+
+def _restalchemy_error_response(description: str) -> dict[str, typing.Any]:
+    return {
+        "description": description,
+        "content": {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/RestAlchemyError"},
+            }
+        },
+    }
+
+
 DRAFT_SIDE_EFFECTS_DESCRIPTION = (
     "Drafts are PostgreSQL-only client state. This operation emits no Workspace "
     "events, websocket or desktop notifications, or messages. Other clients "
@@ -1449,6 +1472,10 @@ def add_sticker_catalog_contract(
         "bearerFormat": "JWT",
     }
     schemas = component_values["schemas"]
+    schemas.setdefault(
+        "RestAlchemyError",
+        copy.deepcopy(RESTALCHEMY_ERROR_SCHEMA),
+    )
     schemas["StickerMedia"] = _object_schema(
         {
             "format": {"type": "string", "enum": ["gif", "webp", "png"]},
@@ -1521,6 +1548,7 @@ def add_sticker_catalog_contract(
             specification["paths"].pop(path)
 
     security: list[dict[str, list[str]]] = [{"bearerAuth": []}]
+
     json_card = {
         "description": "Public sticker card.",
         "content": {
@@ -1615,6 +1643,9 @@ def add_sticker_catalog_contract(
             ],
             "responses": {
                 200: json_list,
+                400: _restalchemy_error_response(
+                    "Invalid catalog query or continuation marker."
+                ),
                 304: {
                     "description": "The private catalog representation is unchanged.",
                     "headers": copy.deepcopy(json_list["headers"]),
@@ -1627,7 +1658,11 @@ def add_sticker_catalog_contract(
             "operationId": "GetSticker",
             "security": security,
             "parameters": [copy.deepcopy(sticker_uuid_parameter)],
-            "responses": {200: copy.deepcopy(json_card)},
+            "responses": {
+                200: copy.deepcopy(json_card),
+                400: _restalchemy_error_response("Invalid sticker UUID."),
+                404: _restalchemy_error_response("Sticker is not available."),
+            },
         },
         "put": {
             "operationId": "UpdateSticker",
@@ -1657,7 +1692,16 @@ def add_sticker_catalog_contract(
                     },
                 }
             ),
-            "responses": {200: copy.deepcopy(json_card)},
+            "responses": {
+                200: copy.deepcopy(json_card),
+                400: _restalchemy_error_response(
+                    "Invalid sticker UUID or request body."
+                ),
+                403: _restalchemy_error_response(
+                    "Sticker catalog management is forbidden."
+                ),
+                404: _restalchemy_error_response("Sticker was not found."),
+            },
         },
     }
     download_path = f"{item_path}/actions/download"
@@ -1677,7 +1721,11 @@ def add_sticker_catalog_contract(
                         content_type: {"schema": {"type": "string", "format": "binary"}}
                         for content_type in ("image/gif", "image/webp", "image/png")
                     },
-                }
+                },
+                400: _restalchemy_error_response("Invalid sticker UUID."),
+                404: _restalchemy_error_response(
+                    "Sticker or media object is not available."
+                ),
             },
         }
     }

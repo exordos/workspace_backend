@@ -9,6 +9,24 @@ from workspace.messenger_api import sticker_catalog
 from workspace.messenger_api import sticker_repository
 
 
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _UpdateSession:
+    def __init__(self, row):
+        self.row = row
+        self.calls = []
+
+    def execute(self, statement, params):
+        self.calls.append((statement, params))
+        return _Rows([] if self.row is None else [self.row])
+
+
 def test_marker_is_unpadded_canonical_json_and_round_trips() -> None:
     marker = sticker_repository.encode_page_marker(
         sort=sticker_repository.SORT_RANK_UPDATED,
@@ -167,3 +185,111 @@ def test_rank_marker_rejects_non_finite_values() -> None:
         sticker_repository._parse_marker_values(
             decoded, sticker_repository.SORT_RANK_UPDATED
         )
+
+
+def test_update_locks_row_before_rebuilding_search_text() -> None:
+    sticker_uuid = sys_uuid.uuid4()
+    timestamp = datetime.datetime.now(datetime.timezone.utc)
+    row = {
+        "uuid": sticker_uuid,
+        "title": "Old title",
+        "alt_text": "Old alt text",
+        "emoji": [],
+        "tags": ["old"],
+        "search_text": "old title old alt text old",
+        "category": "sticker",
+        "format": "png",
+        "width": None,
+        "height": None,
+        "size_bytes": 1,
+        "sha256": "a" * 64,
+        "media_object_id": "stickers/internal/media.png",
+        "active": True,
+        "blocked": False,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    }
+    session = _UpdateSession(row)
+
+    sticker_repository.StickerRepository().update(
+        session,
+        sticker_uuid,
+        {"title": "New title"},
+    )
+
+    first_statement, first_params = session.calls[0]
+    assert "SELECT * FROM m_workspace_stickers WHERE uuid = %s FOR UPDATE" in (
+        first_statement
+    )
+    assert first_params == (sticker_uuid,)
+    assert session.calls[1][0].startswith("UPDATE m_workspace_stickers")
+
+    no_op_session = _UpdateSession(row)
+    no_op = sticker_repository.StickerRepository().update(
+        no_op_session,
+        sticker_uuid,
+        {},
+    )
+    assert no_op is not None
+    assert len(no_op_session.calls) == 1
+
+    missing_session = _UpdateSession(None)
+    assert (
+        sticker_repository.StickerRepository().update(
+            missing_session,
+            sticker_uuid,
+            {"title": "New title"},
+        )
+        is None
+    )
+    assert len(missing_session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "text, escaped",
+    [("%", "!%"), ("_", "!_"), ("\\", "\\"), ("!", "!!"), ("a!%_\\b", "a!!!%!_\\b")],
+)
+def test_search_escapes_only_like_parameters(text, escaped) -> None:
+    repository = sticker_repository.StickerRepository()
+    query = repository._query(sticker_catalog.build_list_query(q=text))
+    statement, params = repository._list_statement(query, sys_uuid.UUID(int=1), None)
+
+    assert statement.count("ESCAPE '!'") == 3
+    assert params[:5] == (text, text, escaped, escaped, text)
+    assert params[5:9] == (text, text, escaped, text)
+
+
+@pytest.mark.parametrize("favorite", [False, True])
+@pytest.mark.parametrize("rank", [10**400, -(10**400), 1e300, -1e300, -0.1, 4.1])
+def test_list_rejects_out_of_range_rank_before_sql(favorite, rank) -> None:
+    repository = sticker_repository.StickerRepository()
+    query = sticker_catalog.build_list_query(q="cat", favorite=favorite)
+    prepared = repository._query(query)
+    marker = sticker_repository.encode_page_marker(
+        sort=prepared.sort,
+        filters_sha256=prepared.fingerprint,
+        values=(rank, "2026-01-01T00:00:00+00:00", sys_uuid.UUID(int=1)),
+    )
+    query = sticker_catalog.build_list_query(
+        q="cat", favorite=favorite, page_marker=marker
+    )
+    with pytest.raises(sticker_repository.StickerRepositoryValidationError):
+        repository.list_stickers(None, sys_uuid.UUID(int=2), query)
+
+
+@pytest.mark.parametrize("rank", [0, 4])
+@pytest.mark.parametrize(
+    "sort",
+    [sticker_repository.SORT_RANK_UPDATED, sticker_repository.SORT_RANK_FAVORITE],
+)
+def test_rank_marker_accepts_inclusive_bounds(rank, sort) -> None:
+    timestamp = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    sticker_uuid = sys_uuid.UUID(int=1)
+    marker = sticker_repository.encode_page_marker(
+        sort=sort,
+        filters_sha256="a" * 64,
+        values=(rank, timestamp, sticker_uuid),
+    )
+    assert sticker_repository._parse_marker_values(
+        sticker_repository.decode_page_marker(marker), sort
+    ) == (float(rank), timestamp, sticker_uuid)
