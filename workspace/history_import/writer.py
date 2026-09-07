@@ -29,10 +29,17 @@ class PreparationChanged(Exception):
     pass
 
 
-def configure_transaction(session: typing.Any) -> None:
+def configure_transaction(
+    session: typing.Any, *, defer_wal_flush: bool = False
+) -> None:
     session.execute("SET LOCAL jit = off", ())
     session.execute("SET LOCAL lock_timeout = '50ms'", ())
     session.execute("SET LOCAL statement_timeout = '500ms'", ())
+    if defer_wal_flush:
+        # A committed import part and its checkpoint are idempotent and may be
+        # replayed after a database crash. Avoid making foreground API commits
+        # queue behind a WAL flush for every small background part.
+        session.execute("SET LOCAL synchronous_commit = off", ())
 
 
 def _lock_users(session: typing.Any, identities: dict) -> None:

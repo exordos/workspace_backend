@@ -997,6 +997,50 @@ def test_rollback_keeps_checkpoint_and_counters_atomic(history_setup, monkeypatc
     assert finish(s, job_uuid)["inserted_messages"] == 101
 
 
+def test_background_worker_transactions_do_not_wait_for_wal_flush(
+    history_setup, monkeypatch
+):
+    s = history_setup
+    claim_modes = []
+    write_modes = []
+    original_claim = repository.claim
+    original_write = writer.write_part
+
+    def claim(session, worker_uuid, preferred_uuid=None):
+        claim_modes.append(
+            session.execute("SHOW synchronous_commit", ()).fetchone()[
+                "synchronous_commit"
+            ]
+        )
+        return original_claim(session, worker_uuid, preferred_uuid)
+
+    def write_part(session, identity, job, part):
+        write_modes.append(
+            session.execute("SHOW synchronous_commit", ()).fetchone()[
+                "synchronous_commit"
+            ]
+        )
+        return original_write(session, identity, job, part)
+
+    monkeypatch.setattr(repository, "claim", claim)
+    monkeypatch.setattr(writer, "write_part", write_part)
+    job_uuid = accept(s, envelope(s, count=1))
+    for _ in range(100):
+        with s.session_factory() as session:
+            session.execute(
+                "UPDATE m_external_history_imports_v1 SET available_at=now() WHERE uuid=%s",
+                (job_uuid,),
+            )
+            job = repository.get_job(session, s.identity, job_uuid)
+        if job["status"] == "complete":
+            break
+        assert s.worker.run_once()
+    else:
+        pytest.fail("Import did not complete")
+    assert claim_modes and set(claim_modes) == {"off"}
+    assert write_modes == ["off"]
+
+
 def test_large_batch_records_bounded_transactions(history_setup):
     s = history_setup
     job_uuid = accept(s, envelope(s, count=5000))
