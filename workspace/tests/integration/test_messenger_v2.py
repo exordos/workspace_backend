@@ -293,10 +293,23 @@ def test_concurrent_first_requests_share_one_iam_user_import(db, monkeypatch):
         assert cursor.fetchone()[0] == 1
 
 
-def _seed_v2_provider_route(db, project_uuid, owner_uuid, stream_uuid):
+def _seed_v2_provider_route(
+    db,
+    project_uuid,
+    owner_uuid,
+    stream_uuid,
+    *,
+    chat_type="channel",
+    topic_uuids=(),
+):
     bridge_uuid = sys_uuid.uuid4()
     account_uuid = sys_uuid.uuid4()
     chat_uuid = sys_uuid.uuid4()
+    provider_chat_id = {
+        "channel": "channel:42",
+        "personal": "direct:1,2",
+        "group": "direct:1,2,3",
+    }[chat_type]
     capabilities = {
         name: {"available": True, "revision": revision, "limits": {}}
         for name, revision in (
@@ -394,7 +407,7 @@ def _seed_v2_provider_route(db, project_uuid, owner_uuid, stream_uuid):
                 projection_stream_uuid, status, capabilities,
                 catalog_capabilities
             ) VALUES (
-                %s, %s, %s, 'zulip', 'channel:42', %s::jsonb,
+                %s, %s, %s, 'zulip', %s, %s::jsonb,
                 'Provider v2 outbound', TRUE, %s, %s, 'live',
                 %s::jsonb, %s::jsonb
             )
@@ -403,12 +416,21 @@ def _seed_v2_provider_route(db, project_uuid, owner_uuid, stream_uuid):
                 chat_uuid,
                 account_uuid,
                 owner_uuid,
+                provider_chat_id,
                 json.dumps(
                     {
                         "kind": "zulip",
-                        "chat_type": "channel",
+                        "chat_type": chat_type,
                         "participants": [],
-                        "topics": [],
+                        "topics": [
+                            {
+                                "topic_uuid": str(topic_uuid),
+                                "provider_topic_id": "direct",
+                                "name": "Zulip",
+                                "is_default": True,
+                            }
+                            for topic_uuid in topic_uuids
+                        ],
                     }
                 ),
                 project_uuid,
@@ -422,7 +444,7 @@ def _seed_v2_provider_route(db, project_uuid, owner_uuid, stream_uuid):
             UPDATE m_workspace_streams
             SET source_name = 'zulip', source = %s::jsonb,
                 external_account_uuid = %s,
-                provider_external_id = 'channel:42'
+                provider_external_id = %s
             WHERE project_id = %s AND uuid = %s
             """,
             (
@@ -435,12 +457,79 @@ def _seed_v2_provider_route(db, project_uuid, owner_uuid, stream_uuid):
                     }
                 ),
                 account_uuid,
+                provider_chat_id,
                 project_uuid,
                 stream_uuid,
             ),
         )
     db.commit()
     return account_uuid
+
+
+@pytest.mark.parametrize("chat_type", ("personal", "group"))
+def test_v2_direct_messages_route_only_from_provider_topic(api, db, chat_type):
+    stream_response = api.post(
+        STREAMS,
+        json={
+            "name": f"Provider {chat_type} topic routing",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert stream_response.status_code == 201, stream_response.text
+    stream = stream_response.json()
+    local_topic_response = api.post(
+        STREAM_TOPICS,
+        json={
+            "stream_uuid": stream["uuid"],
+            "name": "Workspace only",
+            "source": {"kind": "native"},
+        },
+    )
+    assert local_topic_response.status_code == 201, local_topic_response.text
+    local_topic = local_topic_response.json()
+    account_uuid = _seed_v2_provider_route(
+        db,
+        api.project_id,
+        api.user_uuid,
+        stream["uuid"],
+        chat_type=chat_type,
+        topic_uuids=(stream["default_topic_uuid"],),
+    )
+
+    local_message_response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": local_topic["uuid"],
+            "payload": {"kind": "markdown", "content": "local only"},
+        },
+    )
+    assert local_message_response.status_code == 201, local_message_response.text
+    provider_message_response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "provider topic"},
+        },
+    )
+    assert provider_message_response.status_code == 201, provider_message_response.text
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT target_uuid
+            FROM m_external_operations_v2
+            WHERE external_account_uuid = %s AND action = 'message.create'
+            ORDER BY target_uuid
+            """,
+            (account_uuid,),
+        )
+        routed_message_uuids = [row[0] for row in cursor.fetchall()]
+    assert routed_message_uuids == [
+        sys_uuid.UUID(provider_message_response.json()["uuid"])
+    ]
 
 
 def test_v2_store_preserves_existing_provider_outbound_actions(api, db):

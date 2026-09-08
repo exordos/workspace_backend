@@ -1310,6 +1310,45 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             return (stream.external_account_uuid,)
         return ()
 
+    def _provider_user_account_uuids_for_message(
+        self,
+        stream: models.WorkspaceStream,
+        topic_uuid: object,
+    ) -> tuple[object, ...]:
+        """Resolve provider routes that own the message's topic."""
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            """
+            SELECT DISTINCT chat.external_account_uuid
+            FROM m_external_chats_v2 AS chat
+            WHERE chat.owner_user_uuid = %s AND chat.project_id = %s
+              AND chat.projection_stream_uuid = %s AND chat.selected
+              AND chat.status IN ('syncing', 'live', 'degraded')
+              AND NOT chat.transition_pending
+              AND (
+                  chat.source->>'chat_type' = 'channel'
+                  OR (
+                      chat.source->>'chat_type' IN ('personal', 'group')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                              COALESCE(chat.source->'topics', '[]'::jsonb)
+                          ) AS topic
+                          WHERE topic->>'topic_uuid' = %s
+                      )
+                  )
+              )
+            ORDER BY chat.external_account_uuid
+            """,
+            (
+                self.user_uuid,
+                self.project_uuid,
+                stream.uuid,
+                str(topic_uuid),
+            ),
+        ).fetchall()
+        return tuple(row["external_account_uuid"] for row in rows)
+
     def _provider_account_uuid_for_stream(
         self,
         stream: models.WorkspaceStream,
@@ -1318,12 +1357,13 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         account_uuids = self._provider_account_uuids_for_stream(stream)
         return account_uuids[0] if len(account_uuids) == 1 else None
 
-    def _provider_targets_for_stream(
+    def _provider_targets_for_message(
         self,
         stream_uuid: object,
+        topic_uuid: object | None,
         operation_kind: str,
     ) -> tuple[typing.Any, ...]:
-        """Resolve the author's selected provider routes before message creation."""
+        """Resolve the author's provider routes before message creation."""
         stream = models.WorkspaceStream.objects.get_one(
             filters={
                 "project_id": dm_filters.EQ(self.project_uuid),
@@ -1331,7 +1371,11 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             },
             session=contexts.Context().get_session(),
         )
-        account_uuids = self._provider_user_account_uuids_for_stream(stream)
+        topic_uuid = topic_uuid or stream.default_topic_uuid
+        account_uuids = self._provider_user_account_uuids_for_message(
+            stream,
+            topic_uuid,
+        )
         if not account_uuids:
             return ()
         self._lock_provider_accounts(account_uuids)
@@ -2349,8 +2393,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
-        provider_targets = self._provider_targets_for_stream(
+        provider_targets = self._provider_targets_for_message(
             values["stream_uuid"],
+            values.get("topic_uuid"),
             "message.create",
         )
         session = contexts.Context().get_session()

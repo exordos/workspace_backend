@@ -793,7 +793,12 @@ def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
         PROJECT_UUID,
         USER_UUID,
     )
-    monkeypatch.setattr(store, "_provider_targets_for_stream", lambda *args: ())
+    provider_calls = []
+    monkeypatch.setattr(
+        store,
+        "_provider_targets_for_message",
+        lambda *args: provider_calls.append(args) or (),
+    )
     monkeypatch.setattr(store, "_queue_provider_operation", lambda **kwargs: None)
 
     result = store.create_message(
@@ -806,6 +811,7 @@ def test_canonical_message_write_uses_db_helper_in_request_scope(monkeypatch):
     )
 
     assert result == {"uuid": message_uuid, "resource": "messages"}
+    assert provider_calls == [(stream_uuid, topic_uuid, "message.create")]
     assert calls == [
         {
             "project_id": PROJECT_UUID,
@@ -1591,7 +1597,7 @@ def test_provider_capability_rejection_precedes_canonical_message_mutation(
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
     monkeypatch.setattr(
         store,
-        "_provider_targets_for_stream",
+        "_provider_targets_for_message",
         lambda *args: (_ for _ in ()).throw(
             sql_canonical_store.ra_exceptions.ValidationErrorException()
         ),
@@ -2255,7 +2261,7 @@ def test_message_create_fans_out_to_every_selected_self_dm_account(monkeypatch):
     )
     monkeypatch.setattr(
         store,
-        "_provider_targets_for_stream",
+        "_provider_targets_for_message",
         lambda *_args: provider_targets,
     )
     monkeypatch.setattr(
@@ -2925,6 +2931,42 @@ def test_provider_user_route_does_not_fallback_to_another_users_account(monkeypa
     assert store._provider_user_account_uuids_for_stream(stream) == ()
 
 
+def test_provider_message_route_filters_direct_chats_by_topic(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    statements = []
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        return types.SimpleNamespace(
+            fetchall=lambda: [{"external_account_uuid": account_uuid}]
+        )
+
+    session = types.SimpleNamespace(execute=execute)
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    stream = types.SimpleNamespace(uuid=stream_uuid)
+
+    assert store._provider_user_account_uuids_for_message(
+        stream,
+        topic_uuid,
+    ) == (account_uuid,)
+    assert "chat.source->>'chat_type' = 'channel'" in statements[0][0]
+    assert "chat.source->>'chat_type' IN ('personal', 'group')" in statements[0][0]
+    assert "topic->>'topic_uuid' = %s" in statements[0][0]
+    assert statements[0][1] == (
+        USER_UUID,
+        PROJECT_UUID,
+        stream_uuid,
+        str(topic_uuid),
+    )
+
+
 @pytest.mark.parametrize(
     "operation_kind",
     [
@@ -3180,8 +3222,11 @@ def test_projection_provider_target_is_owned_by_stream_owner(
     assert resolved[0][1]["external_account_uuid"] == account_uuid
 
 
-def test_message_create_has_no_provider_target_without_author_owned_route(monkeypatch):
+def test_message_create_has_no_provider_target_without_selected_topic_route(
+    monkeypatch,
+):
     stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
     canonical_account_uuid = sys_uuid.uuid4()
     session = types.SimpleNamespace(
         execute=lambda *_args: types.SimpleNamespace(fetchall=lambda: [])
@@ -3193,7 +3238,7 @@ def test_message_create_has_no_provider_target_without_author_owned_route(monkey
             [
                 types.SimpleNamespace(
                     uuid=stream_uuid,
-                    user_uuid=PROJECTION_OWNER_UUID,
+                    user_uuid=USER_UUID,
                     external_account_uuid=canonical_account_uuid,
                 )
             ]
@@ -3206,4 +3251,51 @@ def test_message_create_has_no_provider_target_without_author_owned_route(monkey
     )
     store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
 
-    assert store._provider_targets_for_stream(stream_uuid, "message.create") == ()
+    assert (
+        store._provider_targets_for_message(
+            stream_uuid,
+            topic_uuid,
+            "message.create",
+        )
+        == ()
+    )
+
+
+def test_message_create_uses_stream_default_topic_for_provider_route(monkeypatch):
+    stream_uuid = sys_uuid.uuid4()
+    default_topic_uuid = sys_uuid.uuid4()
+    selected_topics = []
+    session = object()
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        FakeObjects(
+            [
+                types.SimpleNamespace(
+                    uuid=stream_uuid,
+                    default_topic_uuid=default_topic_uuid,
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = sql_canonical_store.SQLCanonicalMessengerStore(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_provider_user_account_uuids_for_message",
+        lambda _stream, topic_uuid: selected_topics.append(topic_uuid) or (),
+    )
+
+    assert (
+        store._provider_targets_for_message(
+            stream_uuid,
+            None,
+            "message.create",
+        )
+        == ()
+    )
+    assert selected_topics == [default_topic_uuid]

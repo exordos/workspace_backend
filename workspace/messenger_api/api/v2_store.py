@@ -923,8 +923,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             or existing_placement["source"] != source
         ):
             raise ra_exceptions.ValidationErrorException()
-        provider_targets = self._provider_targets_for_stream(
+        provider_targets = self._provider_targets_for_message(
             stream.uuid,
+            topic.uuid,
             "message.create",
         )
         if existing_placement is not None:
