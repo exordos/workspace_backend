@@ -38,8 +38,9 @@ dass er `urn:sticker:<uuid>` akzeptiert. Die bestehende Zuweisungsautorisierung,
 Idempotenz, der Download-Transport und die Antwortstruktur bleiben erhalten. Bei
 Stickern ist `file_uuid` die Katalog-UUID, `name` ist `<uuid>.<format>`, und Größe,
 Hash und Typ beschreiben das ursprüngliche Katalogmedium. Nur aktive und nicht
-blockierte Sticker innerhalb der aktuellen request session auflösen. Alle
-normalen ACL-Prüfungen für Anhänge bleiben bestehen.
+blockierte Sticker innerhalb der aktuellen request session auflösen. Die Sticker-
+URN ist exakt und enthält niemals einen Query-Suffix. Alle normalen ACL-Prüfungen
+für Anhänge bleiben bestehen.
 
 Kein künstliches WorkspaceFile, kein zusätzlicher Upload-Endpunkt, kein öffentlicher
 Bucket-Zugriff, keine neue Datenbanktabelle und keine separate Request-Transaktion
@@ -100,9 +101,12 @@ der hochgeladenen Datei muss die Markierung nicht enthalten.
 3. Bei bestätigter Übereinstimmung
    `![sticker](urn:sticker:<uuid>)` ohne gewöhnliche Zuweisung einer eingehenden
    Datei und ohne Erzeugung eines WorkspaceFile-Eintrags zurückgeben.
-4. Ohne Markierung, bei einer unbekannten Version, einer fehlerhaften Markierung,
-   einer nicht verfügbaren UUID oder einer bestätigten Abweichung den bestehenden
-   normalen Bildimport mit den heruntergeladenen Bytes fortsetzen.
+4. Ohne Markierung, bei einer unbekannten Version, einer fehlerhaften Markierung
+   oder einer bestätigten Abweichung den bestehenden normalen Bildimport mit den
+   heruntergeladenen Bytes fortsetzen. Bei einer unterstützten gültigen Markierung
+   mit nicht verfügbarer UUID den generischen Platzhalter `Sticker unavailable`
+   darstellen und kein normales Bild importieren; gelöschte, fehlende und
+   blockierte Zustände sind absichtlich nicht unterscheidbar.
 5. Einen Autorisierungs- oder vorübergehenden Netzwerkfehler nicht in eine dauerhafte
    Entscheidung für ein normales Bild umwandeln; das bestehende Fehler-/Retry-
    Verhalten bewahren.
@@ -159,7 +163,8 @@ derselben Normalisierung prüfen.
 | Zweites Konto oder History ohne Send-Cache | Verifizierter Sticker wiederhergestellt |
 | Dieselben Bytes ohne Markierung | Normales Bild |
 | Markierung mit anderen ursprünglichen Bytes | Normales Bild |
-| Unbekannte Version, fehlerhafte Markierung oder nicht verfügbare UUID | Normales Bild |
+| Unbekannte Version oder fehlerhafte Markierung | Normales Bild |
+| Unterstützte Markierung mit nicht verfügbarer UUID | Generischer Platzhalter `Sticker unavailable`; kein normaler Bildimport |
 | Zuweisung verweigert | Autorisierungsfehler, keine Offenlegung von Katalogmetadaten |
 | Vorübergehender Such- oder Downloadfehler | Bestehendes Fehler- und Retry-Verhalten |
 | Gemischter Text, Bilder und mehrere Sticker | Reihenfolge und Elementtypen erhalten |
@@ -175,6 +180,10 @@ das Senden einer Live-Provider-Nachricht. Automatisierte Tests, reale PostgreSQL
 Prüfungen, Prüfungen mit gemocktem Provider/Storage und die manuelle Zulip-Abnahme
 müssen getrennt berichtet werden. Die Sichtbarkeit der Markierung in Zulip-Clients
 muss gemessen werden; sie darf nicht als verborgen versprochen werden.
+
+Zuerst das Backend und danach die kompatible Bridge bereitstellen. Sticker-Versand
+bis zur Bereitstellung der Bridge deaktiviert lassen. Die Delete-Aktion der UI erst
+aktivieren, nachdem die Backend-DELETE-API bereitgestellt wurde.
 
 ## Implementierungsstand: 2026-09-08
 

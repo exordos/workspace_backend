@@ -53,11 +53,51 @@ class MigrationStep(migrations.AbstractMigrationStep):
                     status, next_retry_at, lease_expires_at,
                     created_at, sticker_uuid
                 ) WHERE status IN ('pending', 'running', 'failed');
+
+            REVOKE ALL ON TABLE messenger_sticker_cleanup_tasks FROM PUBLIC;
+
+            DO $migration$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace') THEN
+                    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE '
+                        'messenger_sticker_cleanup_tasks TO workspace';
+                END IF;
+            END
+            $migration$;
             """
         )
 
     def downgrade(self, session):
-        session.execute("DROP TABLE messenger_sticker_cleanup_tasks")
+        session.execute(
+            "LOCK TABLE messenger_sticker_cleanup_tasks IN ACCESS EXCLUSIVE MODE"
+        )
+        unfinished = session.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM messenger_sticker_cleanup_tasks
+                WHERE status IN ('pending', 'running', 'failed')
+            ) AS unfinished
+            """
+        ).fetchone()["unfinished"]
+        if unfinished:
+            raise RuntimeError(
+                "Sticker cleanup tasks must complete before rolling back migration 0185"
+            )
+        session.execute(
+            """
+            DO $migration$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'workspace') THEN
+                    EXECUTE 'REVOKE ALL ON TABLE '
+                        'messenger_sticker_cleanup_tasks FROM workspace';
+                END IF;
+            END
+            $migration$;
+
+            DROP TABLE messenger_sticker_cleanup_tasks;
+            """
+        )
 
 
 migration_step = MigrationStep()

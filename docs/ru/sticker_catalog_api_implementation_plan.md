@@ -80,7 +80,7 @@
 | `D-03` | Ответ при невалидном атомарном импорте | Весь запрос отвечает стандартной ошибкой RestAlchemy `400` (`ValidationErrorException`); постоянные записи и объекты не создаются. Успех — `200` JSON с `created`, `duplicates`, `items`; поля `rejected` нет. |
 | `D-04` | Повторный импорт SHA заблокированного или скрытого стикера | Уникальный SHA возвращает существующий `sticker_uuid` как `duplicate`; копия не создаётся и состояние автоматически не меняется. |
 | `D-05` | Условное обновление каталога | ETag — quoted SHA-256 стабильного UTF-8 JSON тела страницы (с учётом текущего пользователя и всех фильтров); `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` с ETag и без тела. |
-| `D-06` | Кэш медиа | GET download возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, no-cache`, `Content-Type`, выведенным из сохранённого `format`; совпавший `If-None-Match` даёт `304` только после проверки доступности. Редирект не используется и object id не раскрывается. |
+| `D-06` | Кэш медиа | GET download использует URL без версионного query-параметра и возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, no-cache`, `Content-Type`, выведенным из сохранённого `format`; клиент выполняет revalidation, а совпавший `If-None-Match` даёт `304` только после проверки доступности. Редирект не используется и object id не раскрывается. |
 | `D-07` | Заявленные метаданные медиафайла в MVP | `format` допускается только как `gif`, `webp` или `png`, а расширение должно ему соответствовать; сервер не декодирует байты медиафайла и не проверяет его содержимое. `width` и `height` — необязательные метаданные из manifest; при наличии положительное целое, при отсутствии `NULL`, без сравнения с байтами. SHA-256 считает сервер потоково. Реальный формат и визуальная пригодность проверяются администратором до импорта; проверка содержимого изображения — отдельное будущее усиление. |
 | `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. В текущем manifest permission и binding отсутствуют; WP-07 добавляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding` по существующей схеме `project_id: null`, без implicit user assignment. |
 | `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при любом нормальном возврате WSGI response, включая response со статусом 500; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows. Известная ошибка SQL до подтверждённой финальной фиксации требует `session.rollback()` и удаления только объектов текущей попытки. Только при неопределённом исходе финальной фиксации автоматическое удаление запрещено: retry по SHA безопасен и завершается отдельной orphan-repair проверкой. |
@@ -89,8 +89,8 @@
 | `D-12` | Идентичность storage | В строке хранится только `media_object_id`; доступ идёт через единый `sticker_storage` adapter. Production — настроенный S3, local backend только для development/tests; bucket и object key не входят в DTO, error и logs. |
 | `D-13` | Одинаковый SHA внутри одного ZIP | Первый элемент с SHA создаёт одну запись; каждый последующий такой SHA получает тот же `sticker_uuid` и `status: duplicate`, независимо от порядка ZIP. |
 | `D-14` | Favorite после hide/block | Favorite row сохраняется при hide/block. `favorite=true` возвращает только видимые элементы; после unhide/unblock ранее сохранённое favorite снова появляется. Star запрещён для hidden/blocked, unstar идемпотентен. |
-| `D-15` | Административный hard delete | `DELETE /stickers/{uuid}` требует `workspace.sticker_catalog.manage`, удаляет корневую строку и каскадно favorites, возвращает `204`. Исторический UUID перестаёт разрешаться: UI показывает `Стикер удалён`, bridge не выпускает raw URN. Повторный импорт тех же байтов после committed delete создаёт новый UUID. |
-| `D-16` | Конкурентность и cleanup delete | Delete и import используют один advisory transaction lock по SHA. В той же PostgreSQL transaction delete создаёт durable cleanup task; основной Messenger worker идемпотентно удаляет storage object после commit и повторяет failed задачи с backoff до completed. |
+| `D-15` | Административный hard delete | `DELETE /stickers/{uuid}` требует `workspace.sticker_catalog.manage`, удаляет корневую строку и каскадно favorites, возвращает `204`. Исторический UUID перестаёт разрешаться: UI показывает generic-заглушку `Стикер недоступен`, bridge выводит `Sticker unavailable` и не выпускает raw URN. Deleted, missing и blocked состояния снаружи не различаются. Повторный импорт тех же байтов после committed delete создаёт новый UUID. |
+| `D-16` | Конкурентность и cleanup delete | Delete и import используют один advisory transaction lock по SHA. В той же PostgreSQL transaction delete создаёт durable cleanup task; основной Messenger worker идемпотентно удаляет storage object после commit и повторяет failed задачи с backoff до completed. Rollback cleanup migration допускается только после завершения всех pending/running/failed задач. |
 
 Результат `WP-00` — не обсуждение в чате, а короткая зафиксированная таблица решений и контрактные примеры, на которые могут ссылаться все агенты.
 
@@ -642,13 +642,15 @@ Commit: <sha или none>
 - реализует repository interface только для согласованного backend API;
 - заменяет прямую GIPHY-зависимость в выбранном продуктовом режиме, не смешивая два источника;
 - использует lazy media loading и не сохраняет временные redirect URLs;
-- отправляет уже поддерживаемый Markdown `![sticker](urn:sticker:<uuid>)`;
+- отправляет уже поддерживаемый Markdown `![sticker](urn:sticker:<uuid>)` со строгим URN без query suffix;
 - хранит cache с owner/org scope и защитой от stale async writes;
 - не реализует emoji groups до отдельного требования.
 
 ### ADMIN-01 — Панель управления
 
 После MVP можно добавить UI поверх уже существующих import/update/delete операций. Этот поток не меняет таблицы и API без нового требования.
+
+Deployment gate: сначала разворачивается backend, затем совместимый bridge. Отправку стикеров включают только после развёртывания bridge, а UI-действие delete — только после развёртывания backend API. Очистка строк `messenger_sticker_cleanup_tasks` в состоянии `completed` остаётся отдельным operational follow-up и не входит в текущий scope.
 
 ## 14. Definition of Done первой реализации
 

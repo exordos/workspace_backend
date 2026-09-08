@@ -721,6 +721,8 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
     delete = paths[item]["delete"]
     item_get = paths[item]["get"]
     download = paths[f"{item}/actions/download"]["get"]
+    star = paths[f"{item}/actions/star/invoke"]["post"]
+    unstar = paths[f"{item}/actions/unstar/invoke"]["post"]
     assert set(item_get["responses"]) == {200, 400, 404}
     assert set(download["responses"]) == {200, 304, 400, 404}
     download_parameters = {
@@ -736,12 +738,16 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
     }
     assert set(update["responses"]) == {200, 400, 403, 404}
     assert set(delete["responses"]) == {204, 400, 403, 404}
+    assert set(star["responses"]) == {200, 400, 404}
+    assert set(unstar["responses"]) == {200, 400, 404}
     for operation, statuses in (
         (list_operation, (400,)),
         (item_get, (400, 404)),
         (download, (400, 404)),
         (update, (400, 403, 404)),
         (delete, (400, 403, 404)),
+        (star, (400, 404)),
+        (unstar, (400, 404)),
     ):
         for status in statuses:
             assert operation["responses"][status]["content"]["application/json"][
@@ -767,6 +773,11 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
     assert import_operation["x-required-permission"] == (
         "workspace.sticker_catalog.manage"
     )
+    assert set(import_operation["responses"]) == {200, 400, 403}
+    for status in (400, 403):
+        assert import_operation["responses"][status]["content"]["application/json"][
+            "schema"
+        ] == {"$ref": "#/components/schemas/RestAlchemyError"}
 
     public_schema = specification["components"]["schemas"]["StickerCard"]
     properties = public_schema["properties"]

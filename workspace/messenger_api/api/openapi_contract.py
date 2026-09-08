@@ -1763,7 +1763,11 @@ def add_sticker_catalog_contract(
                 "operationId": f"{action.title()}Sticker",
                 "security": security,
                 "parameters": [copy.deepcopy(sticker_uuid_parameter)],
-                "responses": {200: {"description": "Success."}},
+                "responses": {
+                    200: {"description": "Success."},
+                    400: _restalchemy_error_response("Invalid sticker UUID."),
+                    404: _restalchemy_error_response("Sticker was not found."),
+                },
             }
         }
     specification["paths"][f"{root}stickers/actions/import_archive/invoke"] = {
@@ -1797,7 +1801,11 @@ def add_sticker_catalog_contract(
                             }
                         }
                     },
-                }
+                },
+                400: _restalchemy_error_response("Invalid sticker archive."),
+                403: _restalchemy_error_response(
+                    "Sticker catalog management is forbidden."
+                ),
             },
         }
     }

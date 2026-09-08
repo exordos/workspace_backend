@@ -33,7 +33,8 @@ Workspace 消息保留规范的 Markdown 表示
 `urn:sticker:<uuid>`。保留现有的分配授权、幂等性、下载传输和响应封装。
 对于 sticker，`file_uuid` 是目录 UUID，`name` 是 `<uuid>.<format>`，而大小、
 哈希和类型描述目录中的原始媒体。使用当前 request session，只解析 active
-且未 blocked 的 sticker。保留所有普通附件 ACL 检查。
+且未 blocked 的 sticker。Sticker URN 必须精确匹配，且不得包含 query suffix。
+保留所有普通附件 ACL 检查。
 
 不需要合成 WorkspaceFile、额外的上传 endpoint、公开 bucket 访问、新数据库
 表或独立的 request transaction。只有对于 sticker URN，目录查询会替代文件
@@ -80,8 +81,10 @@ sidecar 查询。复用现有的单对象临时授权。签发新授权时重新
    provider MIME label 不能证明身份。
 3. 验证匹配后，返回 `![sticker](urn:sticker:<uuid>)`，不进行普通的入站文件
    分配，也不创建 WorkspaceFile 记录。
-4. 如果没有标记、版本未知或标记格式错误、UUID 不可用，或已确认不匹配，
-   则继续使用下载的字节执行现有的普通图片导入。
+4. 如果没有标记、版本未知、标记格式错误或已确认不匹配，则继续使用下载的
+   字节执行现有的普通图片导入。对于 UUID 不可用的受支持有效标记，显示通用
+   `Sticker unavailable` 占位符，并且不导入普通图片；deleted、missing 和
+   blocked 状态有意保持不可区分。
 5. 不要把授权错误或临时网络错误转换成永久的普通图片判断；保留现有的
    error/retry 行为。
 
@@ -127,7 +130,8 @@ outgoing marker cache。还要检查歧义发送的 reconciliation 以及普通 
 | 没有 send cache 的第二个账号或历史 | 已验证的 sticker 被恢复 |
 | 没有标记但字节相同 | 普通图片 |
 | 标记对应不同的原始字节 | 普通图片 |
-| 未知版本、格式错误的标记或不可用 UUID | 普通图片 |
+| 未知版本或格式错误的标记 | 普通图片 |
+| 受支持标记对应不可用 UUID | 通用 `Sticker unavailable` 占位符；不导入普通图片 |
 | 分配被拒绝 | 授权错误；不泄露目录元数据 |
 | 临时查询或下载错误 | 现有的错误和 retry 行为 |
 | 混合文本、图片和多个 sticker | 顺序和元素类型保留 |
@@ -142,6 +146,9 @@ outgoing marker cache。还要检查歧义发送的 reconciliation 以及普通 
 消息。自动化测试、真实 PostgreSQL 检查、mock provider/storage 检查以及手动
 Zulip 验收必须分别报告。Zulip 客户端中标记的可见性必须实际测量，不能承诺
 它会被隐藏。
+
+先部署 backend，再部署兼容的 bridge。在 bridge 部署完成前保持 sticker 发送
+禁用。只有在 backend DELETE API 部署完成后，才启用 UI delete 操作。
 
 ## 实现检查点：2026-09-08
 

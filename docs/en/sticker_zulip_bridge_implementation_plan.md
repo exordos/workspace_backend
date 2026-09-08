@@ -36,7 +36,8 @@ Extend existing `PUT /v1/file-transfers/outgoing/{transfer_uuid}` to accept
 download transport, and response envelope. For stickers, `file_uuid` is the
 catalog UUID, `name` is `<uuid>.<format>`, and size/hash/type describe the
 original catalog media. Resolve only active, nonblocked stickers using the
-current request session. Preserve all ordinary attachment ACL checks.
+current request session. The sticker URN is exact and never has a query suffix.
+Preserve all ordinary attachment ACL checks.
 
 No synthetic WorkspaceFile, extra upload endpoint, public bucket access, new
 database table, or separate request transaction is needed. A catalog lookup
@@ -87,8 +88,11 @@ filename does not need to contain the marker.
    Never hash a thumbnail; provider MIME labels alone are not identity proof.
 3. On a verified match, return `![sticker](urn:sticker:<uuid>)` without ordinary
    incoming file allocation or creating a WorkspaceFile record.
-4. With no marker, malformed/unknown version, unavailable UUID, or a verified
-   mismatch, continue the existing ordinary image import using downloaded bytes.
+4. With no marker, a malformed/unknown version marker, or a verified mismatch,
+   continue the existing ordinary image import using downloaded bytes. For a
+   supported valid marker whose UUID is unavailable, render the generic
+   `Sticker unavailable` placeholder and do not import an ordinary image;
+   deleted, missing, and blocked states are intentionally indistinguishable.
 5. Do not convert an authorization or transient network failure into a permanent
    ordinary-image decision; preserve the existing error/retry behavior.
 
@@ -137,7 +141,8 @@ as well as normal live events for use of the same normalization.
 | Second account or history without send cache | Verified sticker restored |
 | Same bytes without marker | Ordinary image |
 | Marker with different original bytes | Ordinary image |
-| Unknown version, malformed marker or unavailable UUID | Ordinary image |
+| Unknown version or malformed marker | Ordinary image |
+| Supported marker with unavailable UUID | Generic `Sticker unavailable` placeholder; no ordinary image import |
 | Assignment denied | Authorization failure, no catalog metadata disclosure |
 | Temporary lookup/download failure | Existing failure/retry behavior |
 | Mixed text, images and multiple stickers | Order and element types preserved |
@@ -152,6 +157,10 @@ No commit, push, production deployment, or live provider message is implied by
 this implementation plan. Report automated tests, real PostgreSQL checks,
 mocked provider/storage checks and manual Zulip acceptance separately. Marker
 visibility in Zulip clients must be measured, not promised to be hidden.
+
+Deploy the backend first and the compatible bridge second. Keep sticker sends
+disabled until the bridge is deployed. Enable the UI delete action only after
+the backend DELETE API is deployed.
 
 ## Implementation checkpoint: 2026-09-08
 

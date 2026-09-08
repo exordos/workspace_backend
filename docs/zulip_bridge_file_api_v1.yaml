@@ -65,8 +65,12 @@ paths:
         Only active, nonblocked catalog entries are returned. The response
         contains no storage keys, credentials, or download grant. Bridges
         compare the original provider file SHA-256 and size before restoring
-        a marked attachment to a canonical sticker URN. A 404 allows ordinary
-        image fallback; authorization and transient errors are not mismatches.
+        a marked attachment to a canonical sticker URN. For a recognized
+        supported sticker marker, a 404 produces the generic `Sticker
+        unavailable` placeholder and must not fall back to an ordinary image.
+        Missing, malformed, or unknown-version markers and verified byte
+        mismatches may use ordinary image fallback. Authorization and transient
+        errors are not mismatches.
       parameters:
         - name: sticker_uuid
           in: path
@@ -115,7 +119,10 @@ paths:
         '403':
           $ref: '#/components/responses/AuthorizationDenied'
         '404':
-          description: Sticker does not exist or is unavailable in the catalog.
+          description: >-
+            Sticker does not exist or is unavailable in the catalog. A bridge
+            handling a recognized supported marker renders the generic Sticker
+            unavailable placeholder and does not import an ordinary image.
           content:
             application/json:
               schema:
