@@ -327,7 +327,9 @@ LEGACY_BACKFILL_COUNTER_MIGRATION_FILE = (
     "0174-suppress-legacy-backfill-counters-a2cd99.py"
 )
 STICKER_CATALOG_MIGRATION_UUID = "ba2289b6-0a23-470e-a143-a5b986287601"
-CURRENT_HEAD_MIGRATION_FILE = "0175-add-workspace-sticker-catalog-tables-ba2289.py"
+CURRENT_HEAD_MIGRATION_FILE = (
+    "0184-Merge-sticker-catalog-and-messenger-migrations-76cc47.py"
+)
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_UUID = "8e694871-17e9-4510-941d-c576aee5c2b4"
 COMPACT_LEGACY_GAP_REPAIR_MIGRATION_FILE = (
     "0150-fence-compact-unread-legacy-gaps-8e6948.py"
@@ -643,13 +645,15 @@ def test_current_migrations_have_a_single_head(_database, db):
                 'messenger_domain_outbox_events_kind_created_idx'::regclass,
                 'messenger_projection_tasks_background_created_idx'::regclass,
                 'messenger_projection_tasks_fair_claim_idx'::regclass,
+                'messenger_projection_tasks_global_partition_idx'::regclass,
+                'messenger_projection_tasks_user_partition_idx'::regclass,
                 'messenger_message_reaction_facts_snapshot_idx'::regclass
             )
             ORDER BY indexrelid::regclass::text
             """
         )
         acceleration_indexes = cur.fetchall()
-        assert len(acceleration_indexes) == 4
+        assert len(acceleration_indexes) == 6
         assert all(
             valid and ready for _name, valid, ready, _definition in acceleration_indexes
         )
@@ -666,6 +670,22 @@ def test_current_migrations_have_a_single_head(_database, db):
             in definitions["messenger_projection_tasks_fair_claim_idx"]
         )
         assert "status" in definitions["messenger_projection_tasks_fair_claim_idx"]
+        assert (
+            "(project_id, created_at, ordering_created_at, outbox_event_uuid)"
+            in definitions["messenger_projection_tasks_global_partition_idx"]
+        )
+        assert (
+            "(payload ->> 'user_uuid'::text) IS NOT NULL"
+            in definitions["messenger_projection_tasks_global_partition_idx"]
+        )
+        assert (
+            "project_id, ((payload ->> 'user_uuid'::text)), created_at"
+            in definitions["messenger_projection_tasks_user_partition_idx"]
+        )
+        assert (
+            "(payload ->> 'user_uuid'::text) IS NOT NULL"
+            in definitions["messenger_projection_tasks_user_partition_idx"]
+        )
         assert (
             "(created_at, ordering_created_at, outbox_event_uuid)"
             in definitions["messenger_projection_tasks_background_created_idx"]

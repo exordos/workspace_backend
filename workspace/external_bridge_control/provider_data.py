@@ -2703,6 +2703,87 @@ def _lock_provider_event_projects(
             raise
 
 
+def _provider_message_account_realms(
+    session: typing.Any, identity: typing.Any, account_uuids: list[sys_uuid.UUID]
+) -> dict[sys_uuid.UUID, sys_uuid.UUID | None]:
+    rows = session.execute(
+        """SELECT account.uuid, account.provider_realm_uuid
+           FROM m_external_accounts_v2 AS account
+           JOIN LATERAL (
+               SELECT 1 FROM m_external_bridge_desired_resources_v1 AS desired
+               WHERE desired.bridge_instance_uuid=%s AND desired.provider_kind=%s
+                 AND desired.resource_type='external_account'
+                 AND desired.resource_uuid=account.uuid AND desired.operation='upsert'
+               LIMIT 1
+           ) AS authorized ON true
+           WHERE account.uuid=ANY(%s::uuid[]) AND account.provider=%s""",
+        (
+            identity.bridge_instance_uuid,
+            identity.provider_kind,
+            account_uuids,
+            identity.provider_kind,
+        ),
+    ).fetchall()
+    return {row["uuid"]: row["provider_realm_uuid"] for row in rows}
+
+
+def _lock_provider_event_message_identities(
+    session: typing.Any, identity: typing.Any, events: list[dict]
+) -> tuple[list[sys_uuid.UUID], dict[sys_uuid.UUID, sys_uuid.UUID | None]]:
+    # V1 resolves provider IDs during mutation, after account/project locks.
+    # Fence the complete batch first, in the same order as history publication.
+    if identity.provider_kind != "zulip":
+        return [], {}
+    messages = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") not in {
+            "message.upsert",
+            "message.delete",
+        }:
+            continue
+        payload = event.get("payload")
+        resource = payload.get("resource") if isinstance(payload, dict) else None
+        if (
+            isinstance(resource, dict)
+            and resource.get("provider_external_id") is not None
+        ):
+            metadata = resource.get("provider_metadata")
+            messages.append(
+                (
+                    sys_uuid.UUID(str(event["external_account_uuid"])),
+                    str(resource["provider_external_id"]),
+                    metadata.get("provider_realm_uuid")
+                    if isinstance(metadata, dict)
+                    else None,
+                )
+            )
+    if not messages:
+        return [], {}
+    accounts = sorted({account_uuid for account_uuid, _, _ in messages}, key=str)
+    realms = _provider_message_account_realms(session, identity, accounts)
+    keys = set()
+    for account_uuid, message_id, metadata_realm in messages:
+        if account_uuid not in realms:
+            continue
+        # Legacy accounts may have no linked realm yet. The legacy message
+        # trigger then uses the incoming metadata, just as the v1 mutator does.
+        realm_uuid = realms[account_uuid] or metadata_realm
+        if realm_uuid is not None:
+            keys.add((str(sys_uuid.UUID(str(realm_uuid))), message_id))
+    ordered_keys = sorted(keys)
+    session.execute(
+        """SELECT pg_advisory_xact_lock(hashtextextended(
+               'provider-message-identity-v1:' || realm_uuid || ':' || message_id, 0))
+           FROM unnest(%s::text[], %s::text[]) AS messages(realm_uuid, message_id)
+           ORDER BY realm_uuid, message_id""",
+        (
+            [realm for realm, _ in ordered_keys],
+            [message_id for _, message_id in ordered_keys],
+        ),
+    )
+    return accounts, realms
+
+
 def apply_provider_event_batch(
     session: typing.Any,
     identity: typing.Any,
@@ -2718,13 +2799,22 @@ def apply_provider_event_batch(
     if not isinstance(events, list) or not 1 <= len(events) <= EVENT_MAX_ITEMS:
         raise ProviderBatchError("Provider event batch size is invalid")
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    read_state.lock_read_state_schema_shared(session)
     _bridge_capabilities(session, identity, now)
+    message_accounts, locked_realms = _lock_provider_event_message_identities(
+        session, identity, events
+    )
+    read_state.lock_read_state_schema_shared(session)
     read_state.lock_external_account_resources(
         session,
         (sys_uuid.UUID(str(event["external_account_uuid"])) for event in events),
         shared=True,
     )
+    if (
+        message_accounts
+        and _provider_message_account_realms(session, identity, message_accounts)
+        != locked_realms
+    ):
+        raise ProviderUnavailableError("Provider message account scope changed")
     cache_attribute = "_workspace_provider_event_batch_cache"
     missing_cache = object()
     previous_cache = getattr(session, cache_attribute, missing_cache)

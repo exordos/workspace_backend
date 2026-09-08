@@ -876,8 +876,8 @@ def test_inbound_event_batch_requires_current_heartbeat_before_account_access():
             now=NOW,
         )
 
-    assert len(session.statements) == 2
-    assert "workspace-read-state-schema-v1" in session.statements[0][1]
+    assert len(session.statements) == 1
+    assert 'FROM "m_external_bridge_instances_v2"' in session.statements[0][0]
 
 
 def test_inbound_event_batch_rejects_another_bridge_assignment():
@@ -1170,3 +1170,49 @@ def test_native_message_result_rejects_invalid_zulip_message_identifier(
             },
             provider_entity_id,
         )
+
+
+def test_v1_message_identity_gate_orders_deduplicates_and_scopes_batch():
+    identity = _identity()
+    accounts = [sys_uuid.uuid4() for _ in range(3)]
+    realms = [sys_uuid.UUID(int=1), sys_uuid.UUID(int=2)]
+    session = Session(
+        [
+            [
+                {"uuid": accounts[0], "provider_realm_uuid": realms[1]},
+                {"uuid": accounts[1], "provider_realm_uuid": None},
+            ]
+        ]
+    )
+    events = [
+        {
+            "external_account_uuid": str(account_uuid),
+            "kind": kind,
+            "payload": {
+                "resource": {
+                    "provider_external_id": message_id,
+                    "provider_metadata": {"provider_realm_uuid": str(realms[0])},
+                }
+            },
+        }
+        for account_uuid, kind, message_id in [
+            (accounts[0], "message.upsert", "2"),
+            (accounts[1], "message.upsert", "9"),
+            (accounts[0], "message.delete", "10"),
+            (accounts[0], "message.upsert", "2"),
+            (accounts[2], "message.upsert", "5"),
+            (accounts[1], "reaction.upsert", "8"),
+        ]
+    ]
+    assert provider_data._lock_provider_event_message_identities(
+        session, identity, events
+    ) == (
+        sorted(accounts, key=str),
+        {accounts[0]: realms[1], accounts[1]: None},
+    )
+    assert len(session.statements) == 2
+    assert session.statements[1][1] == (
+        [str(realms[0]), str(realms[1]), str(realms[1])],
+        ["9", "10", "2"],
+    )
+    assert "ORDER BY realm_uuid, message_id" in session.statements[1][0]

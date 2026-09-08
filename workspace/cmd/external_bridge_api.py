@@ -30,6 +30,7 @@ from workspace.external_bridge_control import provider_service
 from workspace.external_bridge_control import server
 from workspace.external_bridge_control import service
 from workspace.external_bridge_control import sql_state
+from workspace.history_import import http_service
 
 
 CONF = cfg.CONF
@@ -148,6 +149,11 @@ def build_runtime(
         private_service,
         control_pki.build_server_ssl_context(),
         request_session_factory=request_context.session_manager,
+        history_service=http_service.HistoryImportService(
+            control_pki,
+            control_state,
+            request_context.session_manager,
+        ),
     )
     return bootstrap_server, private_server
 

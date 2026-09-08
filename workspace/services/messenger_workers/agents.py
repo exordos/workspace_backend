@@ -35,6 +35,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import events as messenger_events
 from workspace.external_bridge_control import sql_state
+from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
@@ -98,8 +99,8 @@ class MessengerWorkerAgent(basic.BasicService):
         v2_fanout_batch_size: int = v2_projection.DEFAULT_FANOUT_BATCH_SIZE,
         v2_metrics_log_interval_seconds: int = V2_METRICS_LOG_INTERVAL_SECONDS,
         v2_idle_sleep_seconds: float = V2_IDLE_SLEEP_SECONDS,
+        v2_projection_db_url: str | None = None,
         projection_only: bool = False,
-        projection_deriver: bool = True,
         summary_secret_key: str | None = None,
         summary_connect_timeout_seconds: int = (
             topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
@@ -137,8 +138,12 @@ class MessengerWorkerAgent(basic.BasicService):
         self._v2_metrics: dict[str, float] = {}
         self._v2_metrics_started_at = time.monotonic()
         self._v2_idle_sleep_seconds = v2_idle_sleep_seconds
+        self._v2_projection_wakeup = (
+            projection_wakeup.ProjectionQueueWakeup(v2_projection_db_url)
+            if v2_projection_db_url is not None
+            else None
+        )
         self._projection_only = projection_only
-        self._projection_deriver = projection_deriver
         self._summary_secret_key = summary_secret_key
         self._summary_connect_timeout_seconds = summary_connect_timeout_seconds
         self._summary_request_timeout_seconds = summary_request_timeout_seconds
@@ -175,7 +180,7 @@ class MessengerWorkerAgent(basic.BasicService):
             processed_v2 = self._run_v2_projection_tasks()
         if self._projection_only:
             if not processed_v2:
-                time.sleep(self._v2_idle_sleep_seconds)
+                self._wait_for_v2_projection_work()
             return
         now = datetime.datetime.now(datetime.timezone.utc)
         monotonic_now = time.monotonic()
@@ -299,11 +304,19 @@ class MessengerWorkerAgent(basic.BasicService):
 
         self._summarize_one_topic()
         if self._v2_projection_enabled and not processed_v2:
+            self._wait_for_v2_projection_work()
+
+    def _wait_for_v2_projection_work(self) -> None:
+        if self._v2_projection_wakeup is None:
             time.sleep(self._v2_idle_sleep_seconds)
+            return
+        self._v2_projection_wakeup.wait(self._v2_idle_sleep_seconds)
 
     def _run_v2_projection_tasks(self) -> bool:
         metrics: dict[str, float] = {}
         processed_any = False
+        deferred = False
+        scan_continued = False
         for task_index in range(self._v2_projection_max_tasks_per_iteration):
             try:
                 with database_session_context() as session:
@@ -315,24 +328,38 @@ class MessengerWorkerAgent(basic.BasicService):
                         if task_index == 0 and not self._projection_only
                         else False
                     )
-                    if task_index == 0 and self._projection_deriver:
-                        derived = v2_projection.derive_projection_tasks(session)
-                        metrics["derived"] = metrics.get("derived", 0.0) + derived
+                    contention_before = metrics.get("event_lock_contention", 0.0)
+                    scan_continuation_before = metrics.get(
+                        "partition_scan_continuation",
+                        0.0,
+                    )
                     processed = v2_projection.process_one_projection_task(
                         session,
                         self._v2_worker_id,
                         fanout_batch_size=self._v2_fanout_batch_size,
                         metrics=metrics,
                     )
+                    deferred = (
+                        metrics.get("event_lock_contention", 0.0) > contention_before
+                    )
+                    scan_continued = (
+                        metrics.get("partition_scan_continuation", 0.0)
+                        > scan_continuation_before
+                    )
                     processed_any = processed_any or processed
             except Exception:
                 LOG.exception("Failed to run the Messenger v2 projection queue")
                 metrics["worker_failures"] = metrics.get("worker_failures", 0.0) + 1
                 break
-            if not cleaned and not processed:
+            if deferred or (not cleaned and not processed and not scan_continued):
                 break
         self._record_v2_projection_metrics(metrics)
         return processed_any
+
+    def stop(self) -> None:
+        super().stop()
+        if self._v2_projection_wakeup is not None:
+            self._v2_projection_wakeup.close()
 
     def _record_v2_projection_metrics(self, metrics: dict[str, float]) -> None:
         for name, value in metrics.items():
@@ -357,6 +384,29 @@ class MessengerWorkerAgent(basic.BasicService):
                 self._v2_metrics.get("claimed", 0.0) > 0
             ),
         }
+        claim_samples = self._v2_metrics.get("claimed", 0.0) + self._v2_metrics.get(
+            "empty_claims", 0.0
+        )
+        fields.update(
+            {
+                "projection_claim_duration_ms_avg": (
+                    self._v2_metrics.get("claim_seconds", 0.0)
+                    / max(claim_samples, 1.0)
+                    * 1000
+                ),
+                "projection_claim_duration_ms_max": (
+                    self._v2_metrics.get("claim_seconds_max", 0.0) * 1000
+                ),
+                "projection_processing_duration_ms_avg": (
+                    self._v2_metrics.get("processing_seconds", 0.0)
+                    / max(self._v2_metrics.get("claimed", 0.0), 1.0)
+                    * 1000
+                ),
+                "projection_task_age_seconds_max": self._v2_metrics.get(
+                    "task_age_seconds_max", 0.0
+                ),
+            }
+        )
         fields.update(
             {
                 f"projection_{name}": value
@@ -376,7 +426,26 @@ class MessengerWorkerAgent(basic.BasicService):
                         for name, value in queue_metrics.items()
                     }
                 )
-        LOG.info("Messenger v2 projection worker metrics", extra=fields)
+        LOG.info(
+            "Messenger v2 projection worker metrics worker=%s role=%s "
+            "claimed=%.0f completed=%.0f user_partitions=%.0f "
+            "project_partitions=%.0f partition_contention=%.0f "
+            "event_lock_contention=%.0f claim_ms_avg=%.3f "
+            "claim_ms_max=%.3f processing_ms_avg=%.3f task_age_max_s=%.3f",
+            self._v2_worker_id,
+            fields["projection_worker_role"],
+            self._v2_metrics.get("claimed", 0.0),
+            self._v2_metrics.get("completed", 0.0),
+            self._v2_metrics.get("claimed_partition_user", 0.0),
+            self._v2_metrics.get("claimed_partition_project", 0.0),
+            self._v2_metrics.get("partition_contention", 0.0),
+            self._v2_metrics.get("event_lock_contention", 0.0),
+            fields["projection_claim_duration_ms_avg"],
+            fields["projection_claim_duration_ms_max"],
+            fields["projection_processing_duration_ms_avg"],
+            fields["projection_task_age_seconds_max"],
+            extra=fields,
+        )
         self._v2_metrics = {}
         self._v2_metrics_started_at = now
 
