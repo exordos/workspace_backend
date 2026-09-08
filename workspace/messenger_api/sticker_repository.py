@@ -346,8 +346,6 @@ class StickerRepository:
             )
         return StickerPage(items=records, next_marker=next_marker)
 
-    list = list_stickers
-
     def _list_statement(
         self,
         query: _Query,
@@ -550,8 +548,6 @@ class StickerRepository:
         ).fetchall()
         return self._record_from_row(rows[0]) if rows else None
 
-    get = get_active
-
     def get_any(
         self,
         session: typing.Any,
@@ -613,8 +609,6 @@ class StickerRepository:
         ).fetchall()
         return [self._record_from_row(row) for row in rows]
 
-    batch_resolve = resolve_batch
-
     def find_duplicates(
         self,
         session: typing.Any,
@@ -628,8 +622,6 @@ class StickerRepository:
             (values,),
         ).fetchall()
         return {str(row["sha256"]): sys_uuid.UUID(str(row["uuid"])) for row in rows}
-
-    find_existing_by_sha = find_duplicates
 
     def insert_batch(
         self,

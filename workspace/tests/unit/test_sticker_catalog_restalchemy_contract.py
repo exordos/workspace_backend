@@ -3,7 +3,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License.
 
-import inspect
 import types
 
 import pytest
@@ -66,9 +65,6 @@ def test_stock_route_does_not_dispatch_collection_actions():
     )
     with pytest.raises(ResourceLookupCalled):
         CollectionRoute(request).do()
-
-    source = inspect.getsource(ra_routes.Route.do)
-    assert "get_resource_by_uuid(name, parent_resource)" in source
 
 
 def test_collection_action_route_override_dispatches_the_selected_shape():

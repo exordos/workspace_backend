@@ -162,15 +162,6 @@ def build_list_query(
     )
 
 
-def build_search_text(title: str, alt_text: str, tags: typing.Iterable[str]) -> str:
-    parts = [
-        normalize_title(title),
-        normalize_alt_text(alt_text),
-        *normalize_tags(tags),
-    ]
-    return normalize_search_text(" ".join(part for part in parts if part))
-
-
 def normalize_sticker_fields(
     title: str,
     alt_text: str,

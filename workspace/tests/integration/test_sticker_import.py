@@ -22,7 +22,6 @@ TEST_DB_URL = os.environ.get(
     "WORKSPACE_TEST_DB_URL",
     "postgresql://workspace:pass@localhost:5432/workspace_test",
 )
-USER_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000000")
 
 
 def _archive(items: list[dict[str, object]], files: dict[str, bytes]) -> bytes:
@@ -89,7 +88,6 @@ def test_real_postgres_import_created_mixed_and_hidden_blocked_duplicates(
         result = sticker_import.import_archive(
             archive,
             connection,
-            USER_UUID,
             repository,
             storage,
         )
@@ -101,7 +99,6 @@ def test_real_postgres_import_created_mixed_and_hidden_blocked_duplicates(
         duplicate = sticker_import.import_archive(
             archive,
             connection,
-            USER_UUID,
             repository,
             storage,
         )
@@ -127,7 +124,6 @@ def test_real_postgres_import_created_mixed_and_hidden_blocked_duplicates(
         hidden_duplicate = sticker_import.import_archive(
             archive,
             connection,
-            USER_UUID,
             repository,
             storage,
         )
@@ -156,7 +152,6 @@ def test_real_postgres_concurrent_same_sha_has_one_winner(
             result = sticker_import.import_archive(
                 archive,
                 connection,
-                USER_UUID,
                 sticker_repository.StickerRepository(),
                 sticker_storage.LocalStickerStorage(str(tmp_path)),
             )
@@ -216,7 +211,6 @@ def test_real_postgres_mixed_existing_and_new_sha_writes_only_new_storage_object
         first = sticker_import.import_archive(
             existing_archive,
             connection,
-            USER_UUID,
             repository,
             existing_storage,
         )
@@ -227,7 +221,6 @@ def test_real_postgres_mixed_existing_and_new_sha_writes_only_new_storage_object
         result = sticker_import.import_archive(
             mixed_archive,
             connection,
-            USER_UUID,
             repository,
             new_storage,
         )

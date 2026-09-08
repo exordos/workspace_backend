@@ -13,7 +13,6 @@ from workspace.messenger_api import sticker_storage
 from workspace.messenger_api.dm import stickers
 
 
-USER_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000000")
 SHA_ONE = "a" * 64
 SHA_TWO = "b" * 64
 
@@ -170,7 +169,6 @@ def test_import_uses_first_manifest_sha_item_and_returns_manifest_order(
     result = sticker_import.import_archive(
         b"ignored",
         _Session(),
-        USER_UUID,
         repository,
         storage,
     )
@@ -216,7 +214,6 @@ def test_import_storage_failure_rolls_back_and_cleans_owned_objects(
         sticker_import.import_archive(
             b"ignored",
             session,
-            USER_UUID,
             _Repository(),
             storage,
         )
@@ -239,7 +236,6 @@ def test_import_validation_failure_does_not_touch_session_or_storage(
         sticker_import.import_archive(
             b"invalid",
             session,
-            USER_UUID,
             _Repository(),
             storage,
         )
@@ -269,7 +265,6 @@ def test_success_does_not_delete_before_caller_commit(
     result = sticker_import.import_archive(
         b"ignored",
         _Session(),
-        USER_UUID,
         _Repository(),
         storage,
     )
@@ -301,7 +296,6 @@ def test_known_sql_failure_rolls_back_without_storage_writes(
         sticker_import.import_archive(
             b"ignored",
             session,
-            USER_UUID,
             _FailingRepository(),
             storage,
         )
@@ -339,7 +333,6 @@ def test_insert_failure_after_multiple_saves_cleans_exact_owned_objects(
         sticker_import.import_archive(
             b"ignored",
             session,
-            USER_UUID,
             _FailingInsertRepository(),
             storage,
         )
@@ -373,7 +366,6 @@ def test_cleanup_failure_is_logged_without_masking_original_error(
         sticker_import.import_archive(
             b"ignored",
             _Session(),
-            USER_UUID,
             _FailingInsertRepository(),
             storage,
         )
@@ -403,7 +395,7 @@ def test_uncertain_caller_commit_does_not_delete_and_retry_is_duplicate(
     session = _UncertainSession()
     repository = _Repository()
     result = sticker_import.import_archive(
-        b"ignored", session, USER_UUID, repository, storage
+        b"ignored", session, repository, storage
     )
     assert result.created == 1
     assert storage.deleted == []
@@ -411,7 +403,7 @@ def test_uncertain_caller_commit_does_not_delete_and_retry_is_duplicate(
     with pytest.raises(OSError):
         session.commit()
     retry = sticker_import.import_archive(
-        b"ignored", session, USER_UUID, repository, storage
+        b"ignored", session, repository, storage
     )
     assert retry.created == 0
     assert retry.duplicates == 1
@@ -423,7 +415,7 @@ def test_uncertain_caller_commit_does_not_delete_and_retry_is_duplicate(
     # the object whose commit outcome was uncertain.
     repository.existing.pop(SHA_ONE)
     rolled_back_retry = sticker_import.import_archive(
-        b"ignored", _Session(), USER_UUID, repository, storage
+        b"ignored", _Session(), repository, storage
     )
     assert rolled_back_retry.created == 1
     assert rolled_back_retry["items"][0].status == "created"
@@ -461,7 +453,6 @@ def test_mixed_existing_and_new_sha_has_per_item_status(
     result = sticker_import.import_archive(
         b"ignored",
         _Session(),
-        USER_UUID,
         _Repository({SHA_ONE: existing_uuid}),
         storage,
     )

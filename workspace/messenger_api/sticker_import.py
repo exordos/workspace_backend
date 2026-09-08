@@ -501,7 +501,6 @@ def _import_validated_archive(
 def import_archive(
     source: bytes | typing.BinaryIO,
     session: typing.Any,
-    user_uuid: sys_uuid.UUID,
     repository: typing.Any | None = None,
     storage: sticker_storage.StickerStorage | None = None,
 ) -> stickers.StickerImportResult:
@@ -512,7 +511,6 @@ def import_archive(
     only known failures trigger rollback and compensation.
     """
 
-    del user_uuid
     active_repository = (
         repository if repository is not None else sticker_repository.StickerRepository()
     )

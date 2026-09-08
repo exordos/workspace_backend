@@ -274,7 +274,6 @@ class StickerController(ra_controllers.BaseResourceController):
             result = sticker_import.import_archive(
                 source,
                 self._session(),
-                self._user_uuid(),
                 self._repository(),
                 self._storage(),
             )

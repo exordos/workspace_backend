@@ -529,7 +529,7 @@ def test_collection_import_passes_only_archive_file_to_service(monkeypatch):
 
     assert response.status_int == 200
     assert response.json == {"created": 0, "duplicates": 0, "items": []}
-    assert calls == [(archive_file, (session, USER_UUID, repository, storage))]
+    assert calls == [(archive_file, (session, repository, storage))]
 
 
 @pytest.mark.parametrize(

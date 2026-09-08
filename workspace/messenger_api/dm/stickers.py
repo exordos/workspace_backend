@@ -225,22 +225,6 @@ class Sticker(
             raise ValueError("emoji cannot contain more than 5 values")
 
 
-class StickerFavorite(models.ModelWithTimestamp, orm.SQLStorableMixin):
-    """The global user-to-sticker favorite mapping."""
-
-    __tablename__ = "m_workspace_sticker_favorites"
-
-    user_uuid = properties.property(types.UUID(), required=True, read_only=True)
-    sticker_uuid = properties.property(types.UUID(), required=True, read_only=True)
-
-    @classmethod
-    def get_id_property(cls) -> dict[str, typing.Any]:
-        return {
-            "user_uuid": cls.properties.properties["user_uuid"],
-            "sticker_uuid": cls.properties.properties["sticker_uuid"],
-        }
-
-
 class StickerMedia(_StrictModel):
     """The media portion of a public sticker card."""
 
@@ -489,12 +473,3 @@ def _validate_tags(tags: typing.Iterable[str]) -> None:
         raise ValueError("tags cannot contain more than 64 values")
     if sum(len(tag.encode("utf-8")) for tag in tags_list) > MAX_TAGS_BYTES:
         raise ValueError("tags exceed 4096 UTF-8 bytes")
-
-
-# Names used by the API work packages remain explicit aliases rather than
-# duplicate models, so SQL mappings and public contracts have one owner.
-WorkspaceSticker = Sticker
-StickerPublicCard = StickerCard
-StickerManifestV1 = StickerManifest
-StickerManifestV1Item = StickerManifestItem
-StickerImportItem = StickerImportItemResult
