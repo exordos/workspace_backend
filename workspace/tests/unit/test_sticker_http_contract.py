@@ -12,6 +12,7 @@ from unittest import mock
 import pytest
 import webob
 from restalchemy.api import applications
+from restalchemy.api import constants as ra_constants
 from restalchemy.api import contexts as ra_contexts
 from restalchemy.api import routes as ra_routes
 from restalchemy.api.middlewares import errors
@@ -77,6 +78,7 @@ def _build_openapi(app_module):
     request = webob.Request.blank("/specifications/3.0.3")
     request.application = application
     request.api_context = ra_contexts.RequestContext(request)
+    request.api_context.set_active_method(ra_constants.GET)
     return application.openapi_engine.build_openapi_specification("3.0.3", request)
 
 
