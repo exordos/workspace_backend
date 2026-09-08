@@ -26,7 +26,7 @@ ALLOCATION_LIFETIME = datetime.timedelta(minutes=15)
 MAX_FILE_SIZE = 50 * 1024 * 1024
 _CONTENT_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
 _URN_RE = re.compile(
-    r"^urn:(file|image|video):([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:\?.*)?$"
+    r"^urn:(file|image|video|sticker):([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:\?.*)?$"
 )
 
 
@@ -111,6 +111,8 @@ class ExternalFileTransferManager:
             [str, int], file_storage.WorkspaceFileStorageInfo | None
         ]
         | None = None,
+        resolve_workspace_sticker: Callable[[sys_uuid.UUID], dict[str, Any] | None]
+        | None = None,
     ) -> None:
         self.control_state = control_state
         self.public_base_url = public_base_url.rstrip("/")
@@ -118,6 +120,7 @@ class ExternalFileTransferManager:
         self.resolve_workspace_file = (
             resolve_workspace_file or self._resolve_workspace_file_sidecar
         )
+        self.resolve_workspace_sticker = resolve_workspace_sticker or (lambda _: None)
         self.commit_file_projection = commit_file_projection or (lambda *_: None)
         self.resolve_workspace_content = resolve_workspace_content or (lambda *_: None)
 
@@ -403,6 +406,26 @@ class ExternalFileTransferManager:
         transfer["phase"] = "invalidated"
         self.control_state.file_transfer_put(key, transfer)
 
+    def sticker_metadata(
+        self,
+        identity: Any,
+        sticker_uuid: sys_uuid.UUID | str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._authorize_assignment(identity, request)
+        sticker_uuid = sys_uuid.UUID(str(sticker_uuid))
+        metadata = self.resolve_workspace_sticker(sticker_uuid)
+        if metadata is None:
+            raise FileTransferError(
+                "resource_not_found", "Workspace sticker was not found", 404
+            )
+        return {
+            "uuid": str(sticker_uuid),
+            "sha256": metadata["sha256"],
+            "size_bytes": metadata["size_bytes"],
+            "content_type": metadata["content_type"],
+        }
+
     def authorize_outgoing(
         self,
         identity: Any,
@@ -420,18 +443,23 @@ class ExternalFileTransferManager:
             )
         kind, file_uuid_text = match.groups()
         file_uuid = sys_uuid.UUID(file_uuid_text)
-        metadata = self.resolve_workspace_file(file_uuid)
+        metadata = (
+            self.resolve_workspace_sticker(file_uuid)
+            if kind == "sticker"
+            else self.resolve_workspace_file(file_uuid)
+        )
         if metadata is None:
             raise FileTransferError(
                 "resource_not_found", "Workspace file was not found", 404
             )
-        if kind != _urn_kind(metadata["content_type"]):
+        if kind != "sticker" and kind != _urn_kind(metadata["content_type"]):
             raise FileTransferError(
                 "urn_kind_mismatch", "Workspace URN kind does not match file", 422
             )
         projection_stream_uuid = _projection_stream_uuid(assignment["chat"])
         acl = metadata.get("acl")
-        if (
+        # Catalog visibility is resolved above; ordinary files retain stream ACLs.
+        if kind != "sticker" and (
             projection_stream_uuid is None
             or metadata.get("project_id") != assignment["chat"]["project_id"]
             or metadata.get("stream_uuid") != projection_stream_uuid

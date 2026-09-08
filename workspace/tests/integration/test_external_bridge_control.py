@@ -5564,3 +5564,42 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
             (file_uuid,),
         )
     assert _request_call(repository.resolve, file_uuid)["authorized_user_uuids"] == []
+
+
+@pytest.mark.parametrize(
+    "active,blocked", [(True, False), (False, False), (False, True)]
+)
+def test_bridge_sticker_resolution_uses_catalog_visibility(
+    _database, db, active, blocked
+):
+    sticker_uuid = sys_uuid.uuid4()
+    object_id = f"stickers/{sticker_uuid}/media.webp"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stickers
+                (uuid, title, alt_text, emoji, tags, search_text, format, size_bytes, sha256,
+                 media_object_id, active, blocked)
+            VALUES (%s, 'Sticker', 'Accessible sticker', '{}', '{}', 'sticker',
+                    'webp', 42, %s, %s, %s, %s)
+            """,
+            (
+                sticker_uuid,
+                hashlib.sha256(sticker_uuid.bytes).hexdigest(),
+                object_id,
+                active,
+                blocked,
+            ),
+        )
+    repository = file_repository.CanonicalFileRepository()
+    resolved = _request_call(repository.resolve_sticker, sticker_uuid)
+    if active and not blocked:
+        assert resolved["uuid"] == str(sticker_uuid)
+        assert resolved["name"] == f"{sticker_uuid}.webp"
+        assert resolved["content_type"] == "image/webp"
+        assert resolved["storage_object_id"] == object_id
+        assert resolved["size_bytes"] == 42
+        assert resolved["sha256"] == hashlib.sha256(sticker_uuid.bytes).hexdigest()
+    else:
+        assert resolved is None
+    assert _request_call(repository.resolve_sticker, sys_uuid.uuid4()) is None
