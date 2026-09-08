@@ -99,6 +99,19 @@ class _Repository:
     def __init__(self, existing: dict[str, sys_uuid.UUID] | None = None) -> None:
         self.existing = dict(existing or {})
         self.inserted: list[stickers.Sticker] = []
+        self.locked: list[str] = []
+
+    def lock_sha256_values(
+        self,
+        session: _Session,
+        sha256_values: list[str],
+    ) -> None:
+        for value in sorted(set(sha256_values)):
+            self.locked.append(value)
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (value,),
+            )
 
     def find_duplicates(
         self,
@@ -179,6 +192,7 @@ def test_import_uses_first_manifest_sha_item_and_returns_manifest_order(
     assert result["items"][0].sticker_uuid == result["items"][1].sticker_uuid
     assert result["items"][0].file == first.manifest.file
     assert len(storage.saved) == 1
+    assert repository.locked == [SHA_ONE]
     assert repository.inserted[0].title == "Ёжик"
     assert repository.inserted[0].search_text == "ежик test еж еж"
 
@@ -394,17 +408,13 @@ def test_uncertain_caller_commit_does_not_delete_and_retry_is_duplicate(
     storage = _Storage()
     session = _UncertainSession()
     repository = _Repository()
-    result = sticker_import.import_archive(
-        b"ignored", session, repository, storage
-    )
+    result = sticker_import.import_archive(b"ignored", session, repository, storage)
     assert result.created == 1
     assert storage.deleted == []
 
     with pytest.raises(OSError):
         session.commit()
-    retry = sticker_import.import_archive(
-        b"ignored", session, repository, storage
-    )
+    retry = sticker_import.import_archive(b"ignored", session, repository, storage)
     assert retry.created == 0
     assert retry.duplicates == 1
     assert retry["items"][0].status == "duplicate"

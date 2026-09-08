@@ -27,6 +27,23 @@ class _UpdateSession:
         return _Rows([] if self.row is None else [self.row])
 
 
+class _DeleteSession:
+    def __init__(self, *, candidate=True, deleted=True):
+        self.candidate = candidate
+        self.deleted = deleted
+        self.calls = []
+
+    def execute(self, statement, params):
+        self.calls.append((statement, params))
+        if "SELECT sha256 FROM m_workspace_stickers" in statement:
+            rows = [{"sha256": "a" * 64}] if self.candidate else []
+        elif "INSERT INTO messenger_sticker_cleanup_tasks" in statement:
+            rows = [{"sticker_uuid": params[0]}] if self.deleted else []
+        else:
+            rows = []
+        return _Rows(rows)
+
+
 def test_marker_is_unpadded_canonical_json_and_round_trips() -> None:
     marker = sticker_repository.encode_page_marker(
         sort=sticker_repository.SORT_RANK_UPDATED,
@@ -243,6 +260,46 @@ def test_update_locks_row_before_rebuilding_search_text() -> None:
         is None
     )
     assert len(missing_session.calls) == 1
+
+
+def test_delete_locks_sha_then_atomically_enqueues_root_cleanup() -> None:
+    sticker_uuid = sys_uuid.uuid4()
+    session = _DeleteSession()
+
+    result = sticker_repository.StickerRepository().delete(session, sticker_uuid)
+
+    assert result is True
+    assert "SELECT sha256 FROM m_workspace_stickers" in session.calls[0][0]
+    assert "pg_advisory_xact_lock" in session.calls[1][0]
+    assert session.calls[1][1] == ("a" * 64,)
+    assert "DELETE FROM m_workspace_stickers" in session.calls[2][0]
+    assert "INSERT INTO messenger_sticker_cleanup_tasks" in session.calls[2][0]
+    assert session.calls[2][1] == (sticker_uuid,)
+
+
+def test_delete_returns_false_for_missing_row() -> None:
+    session = _DeleteSession(candidate=False)
+
+    assert (
+        sticker_repository.StickerRepository().delete(session, sys_uuid.uuid4())
+        is False
+    )
+    assert len(session.calls) == 1
+
+
+def test_sha_locks_are_deduplicated_and_sorted() -> None:
+    session = _DeleteSession()
+
+    sticker_repository.StickerRepository().lock_sha256_values(
+        session,
+        ["b" * 64, "a" * 64, "b" * 64],
+    )
+
+    assert [params for _statement, params in session.calls] == [
+        ("a" * 64,),
+        ("b" * 64,),
+    ]
+    assert all("pg_advisory_xact_lock" in statement for statement, _ in session.calls)
 
 
 @pytest.mark.parametrize(

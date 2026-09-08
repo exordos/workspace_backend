@@ -1703,13 +1703,34 @@ def add_sticker_catalog_contract(
                 404: _restalchemy_error_response("Sticker was not found."),
             },
         },
+        "delete": {
+            "operationId": "DeleteSticker",
+            "security": security,
+            "x-required-permission": "workspace.sticker_catalog.manage",
+            "parameters": [copy.deepcopy(sticker_uuid_parameter)],
+            "responses": {
+                204: {"description": "Sticker deleted."},
+                400: _restalchemy_error_response("Invalid sticker UUID."),
+                403: _restalchemy_error_response(
+                    "Sticker catalog management is forbidden."
+                ),
+                404: _restalchemy_error_response("Sticker was not found."),
+            },
+        },
     }
     download_path = f"{item_path}/actions/download"
     specification["paths"][download_path] = {
         "get": {
             "operationId": "DownloadSticker",
             "security": security,
-            "parameters": [copy.deepcopy(sticker_uuid_parameter)],
+            "parameters": [
+                copy.deepcopy(sticker_uuid_parameter),
+                {
+                    "name": "If-None-Match",
+                    "in": "header",
+                    "schema": {"type": "string"},
+                },
+            ],
             "responses": {
                 200: {
                     "description": "Raw sticker media bytes.",
@@ -1720,6 +1741,13 @@ def add_sticker_catalog_contract(
                     "content": {
                         content_type: {"schema": {"type": "string", "format": "binary"}}
                         for content_type in ("image/gif", "image/webp", "image/png")
+                    },
+                },
+                304: {
+                    "description": "Media is unchanged and still downloadable.",
+                    "headers": {
+                        "ETag": {"schema": {"type": "string"}},
+                        "Cache-Control": {"schema": {"type": "string"}},
                     },
                 },
                 400: _restalchemy_error_response("Invalid sticker UUID."),

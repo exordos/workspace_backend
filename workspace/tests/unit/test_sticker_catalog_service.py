@@ -88,18 +88,26 @@ class _Repository:
         self.calls.append(("update", session, sticker_uuid, values))
         return self.active
 
+    def delete(self, session, sticker_uuid):
+        self.calls.append(("delete", session, sticker_uuid))
+        return self.active is not None
+
 
 class _Storage:
     def __init__(self, body=b"media", error=None):
         self.body = body
         self.error = error
         self.calls = []
+        self.deleted = []
 
     def read(self, storage_object_id):
         self.calls.append(storage_object_id)
         if self.error is not None:
             raise self.error
         return self.body
+
+    def delete(self, storage_object_id):
+        self.deleted.append(storage_object_id)
 
 
 def test_list_response_is_stable_private_json_with_exact_pagination_headers():
@@ -236,10 +244,34 @@ def test_download_checks_database_before_storage_and_uses_stored_object_id(avail
     assert response.body == b"media"
     assert response.status == 200
     assert response.headers == {
-        "Cache-Control": "private, max-age=31536000, immutable",
+        "Cache-Control": "private, no-cache",
         "Content-Type": "image/gif",
         "ETag": f'"{SHA256}"',
     }
+
+
+def test_download_matching_if_none_match_revalidates_before_storage_read():
+    repository = _Repository(resolved=[_record(active=False)])
+    storage = _Storage()
+
+    response = sticker_catalog.download_sticker(
+        object(),
+        USER_UUID,
+        repository,
+        storage,
+        STICKER_UUID,
+        if_none_match=f'"{SHA256}"',
+    )
+
+    assert response == sticker_catalog.StickerHttpResponse(
+        body=None,
+        status=304,
+        headers={
+            "Cache-Control": "private, no-cache",
+            "ETag": f'"{SHA256}"',
+        },
+    )
+    assert storage.calls == []
 
 
 def test_download_never_reads_storage_for_blocked_record():
@@ -252,6 +284,7 @@ def test_download_never_reads_storage_for_blocked_record():
             _Repository(resolved=[_record(active=False, blocked=True)]),
             storage,
             STICKER_UUID,
+            if_none_match=f'"{SHA256}"',
         )
 
     assert storage.calls == []
@@ -381,6 +414,29 @@ def test_admin_update_uses_user_favorite_but_no_storage_or_project_boundary():
     )
     assert "storage" not in parameters
     assert "project_id" not in parameters
+
+
+def test_admin_delete_enqueues_catalog_row_cleanup_in_caller_transaction():
+    session = object()
+    repository = _Repository(active=_record())
+
+    result = sticker_catalog.delete_sticker(
+        session,
+        repository,
+        STICKER_UUID,
+    )
+
+    assert result is None
+    assert repository.calls == [("delete", session, STICKER_UUID)]
+
+
+def test_admin_delete_returns_not_found_without_external_side_effects():
+    with pytest.raises(ra_exc.ResourceNotFoundError):
+        sticker_catalog.delete_sticker(
+            object(),
+            _Repository(),
+            STICKER_UUID,
+        )
 
 
 def test_admin_update_returns_safe_not_found():

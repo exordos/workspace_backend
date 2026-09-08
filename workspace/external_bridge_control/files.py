@@ -25,8 +25,11 @@ URL_LIFETIME = datetime.timedelta(minutes=5)
 ALLOCATION_LIFETIME = datetime.timedelta(minutes=15)
 MAX_FILE_SIZE = 50 * 1024 * 1024
 _CONTENT_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
-_URN_RE = re.compile(
-    r"^urn:(file|image|video|sticker):([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:\?.*)?$"
+_FILE_URN_RE = re.compile(
+    r"^urn:(file|image|video):([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:\?.*)?$"
+)
+_STICKER_URN_RE = re.compile(
+    r"^urn:(sticker):([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$"
 )
 
 
@@ -436,7 +439,9 @@ class ExternalFileTransferManager:
         now = now or _utcnow()
         transfer_uuid = sys_uuid.UUID(str(transfer_uuid))
         assignment = self._authorize_assignment(identity, request)
-        match = _URN_RE.fullmatch(request["file_urn"])
+        match = _FILE_URN_RE.fullmatch(
+            request["file_urn"]
+        ) or _STICKER_URN_RE.fullmatch(request["file_urn"])
         if match is None:
             raise FileTransferError(
                 "invalid_workspace_urn", "Workspace file URN is invalid", 422

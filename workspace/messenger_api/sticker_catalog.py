@@ -317,6 +317,8 @@ def download_sticker(
     repository: typing.Any,
     storage: typing.Any,
     sticker_uuid: sys_uuid.UUID,
+    *,
+    if_none_match: str | None = None,
 ) -> StickerHttpResponse:
     """Read media only after the catalog row is known to be downloadable."""
 
@@ -327,6 +329,13 @@ def download_sticker(
             path=str(sticker_uuid),
         )
     sticker = records[0].sticker
+    etag = '"%s"' % sticker.sha256
+    cache_headers = {
+        "Cache-Control": "private, no-cache",
+        "ETag": etag,
+    }
+    if if_none_match == etag:
+        return StickerHttpResponse(body=None, status=304, headers=cache_headers)
     try:
         body = storage.read(sticker.media_object_id)
     except sticker_storage.StickerStorageNotFoundError:
@@ -337,10 +346,9 @@ def download_sticker(
     return StickerHttpResponse(
         body=body,
         status=200,
-        headers={
-            "Cache-Control": "private, max-age=31536000, immutable",
+        headers=cache_headers
+        | {
             "Content-Type": MEDIA_CONTENT_TYPES[sticker.format],
-            "ETag": '"%s"' % sticker.sha256,
         },
     )
 
@@ -393,6 +401,20 @@ def update_sticker(
             path=str(sticker_uuid),
         )
     return record
+
+
+def delete_sticker(
+    session: typing.Any,
+    repository: typing.Any,
+    sticker_uuid: sys_uuid.UUID,
+) -> None:
+    """Delete one catalog row and enqueue post-commit media cleanup."""
+
+    if not repository.delete(session, sticker_uuid):
+        raise ra_exc.ResourceNotFoundError(
+            resource="Sticker",
+            path=str(sticker_uuid),
+        )
 
 
 def _stable_dedupe(values: typing.Iterable[str]) -> list[str]:

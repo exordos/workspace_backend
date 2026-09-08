@@ -174,6 +174,99 @@ def test_concurrent_partial_updates_keep_search_text_consistent(db) -> None:
 
 
 @pytest.mark.usefixtures("_database")
+def test_delete_cascades_favorite_and_atomically_enqueues_cleanup() -> None:
+    repository = sticker_repository.StickerRepository()
+    sticker_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    sha256 = sys_uuid.uuid4().hex * 2
+    connection = psycopg.connect(
+        os.environ.get(
+            "WORKSPACE_TEST_DB_URL",
+            "postgresql://workspace:pass@localhost:5432/workspace_test",
+        ),
+        autocommit=False,
+        row_factory=psycopg.rows.dict_row,
+    )
+    observer = psycopg.connect(
+        os.environ.get(
+            "WORKSPACE_TEST_DB_URL",
+            "postgresql://workspace:pass@localhost:5432/workspace_test",
+        ),
+        autocommit=True,
+        row_factory=psycopg.rows.dict_row,
+    )
+    try:
+        connection.execute(
+            """
+            INSERT INTO m_workspace_stickers
+              (uuid,title,alt_text,emoji,tags,search_text,category,format,
+               size_bytes,sha256,media_object_id,active,blocked)
+            VALUES (%s,'Delete','Delete','{}','{}','delete','sticker','png',
+                    1,%s,%s,TRUE,FALSE)
+            """,
+            (sticker_uuid, sha256, f"stickers/{sticker_uuid}/media.png"),
+        )
+        connection.execute(
+            "INSERT INTO m_workspace_sticker_favorites (user_uuid, sticker_uuid) "
+            "VALUES (%s, %s)",
+            (user_uuid, sticker_uuid),
+        )
+        connection.commit()
+
+        assert repository.delete(connection, sticker_uuid)
+        assert (
+            observer.execute(
+                "SELECT COUNT(*) AS count FROM m_workspace_stickers WHERE uuid = %s",
+                (sticker_uuid,),
+            ).fetchone()["count"]
+            == 1
+        )
+        assert (
+            observer.execute(
+                "SELECT COUNT(*) AS count FROM messenger_sticker_cleanup_tasks "
+                "WHERE sticker_uuid = %s",
+                (sticker_uuid,),
+            ).fetchone()["count"]
+            == 0
+        )
+
+        connection.commit()
+        assert (
+            observer.execute(
+                "SELECT COUNT(*) AS count FROM m_workspace_stickers WHERE uuid = %s",
+                (sticker_uuid,),
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            observer.execute(
+                "SELECT COUNT(*) AS count FROM m_workspace_sticker_favorites "
+                "WHERE sticker_uuid = %s",
+                (sticker_uuid,),
+            ).fetchone()["count"]
+            == 0
+        )
+        task = observer.execute(
+            "SELECT storage_object_id, status, attempts "
+            "FROM messenger_sticker_cleanup_tasks WHERE sticker_uuid = %s",
+            (sticker_uuid,),
+        ).fetchone()
+        assert task == {
+            "storage_object_id": f"stickers/{sticker_uuid}/media.png",
+            "status": "pending",
+            "attempts": 0,
+        }
+    finally:
+        connection.rollback()
+        observer.execute(
+            "DELETE FROM messenger_sticker_cleanup_tasks WHERE sticker_uuid = %s",
+            (sticker_uuid,),
+        )
+        connection.close()
+        observer.close()
+
+
+@pytest.mark.usefixtures("_database")
 def test_repository_visibility_favorite_and_keyset(db) -> None:
     repository = sticker_repository.StickerRepository()
     db.row_factory = psycopg.rows.dict_row

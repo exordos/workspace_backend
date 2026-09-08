@@ -308,6 +308,36 @@ def test_admin_update_checks_permission_before_body_and_returns_public_allowlist
     assert "private" not in response.text
 
 
+def test_admin_delete_checks_permission_and_enqueues_cleanup(monkeypatch):
+    unauthorized = _request(f"/v1/stickers/{STICKER_UUID}", method="DELETE")
+    with pytest.raises(messenger_exceptions.ExternalResourceForbiddenError):
+        sticker_controllers.StickerController(unauthorized).do_resource(
+            str(STICKER_UUID)
+        )
+
+    authorized = _request(
+        f"/v1/stickers/{STICKER_UUID}",
+        method="DELETE",
+        permissions=(sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,),
+    )
+    controller = sticker_controllers.StickerController(authorized)
+    session = object()
+    repository = object()
+    monkeypatch.setattr(controller, "_session", lambda: session)
+    monkeypatch.setattr(controller, "_repository", lambda: repository)
+    calls = []
+    monkeypatch.setattr(
+        sticker_catalog,
+        "delete_sticker",
+        lambda *args: calls.append(args),
+    )
+
+    response = controller.do_resource(str(STICKER_UUID))
+
+    assert response.status_int == 204
+    assert calls == [(session, repository, STICKER_UUID)]
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -438,22 +468,30 @@ def test_item_action_preload_normalizes_absent_record_but_preserves_uuid_validat
 
 
 def test_download_action_preserves_raw_binary_response(monkeypatch):
-    controller = sticker_controllers.StickerController(_request())
+    request = _request()
+    request.headers["If-None-Match"] = '"previous"'
+    controller = sticker_controllers.StickerController(request)
     monkeypatch.setattr(controller, "_session", lambda: object())
     monkeypatch.setattr(controller, "_repository", lambda: object())
     monkeypatch.setattr(controller, "_storage", lambda: object())
-    monkeypatch.setattr(
-        sticker_catalog,
-        "download_sticker",
-        lambda *args: sticker_catalog.StickerHttpResponse(
+    calls = []
+
+    def download_sticker(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sticker_catalog.StickerHttpResponse(
             body=b"GIF89a",
             status=200,
             headers={
                 "Content-Type": "image/gif",
                 "ETag": '"hash"',
-                "Cache-Control": "private, max-age=31536000, immutable",
+                "Cache-Control": "private, no-cache",
             },
-        ),
+        )
+
+    monkeypatch.setattr(
+        sticker_catalog,
+        "download_sticker",
+        download_sticker,
     )
 
     response = controller.download._get(controller, _sticker())
@@ -461,6 +499,8 @@ def test_download_action_preserves_raw_binary_response(monkeypatch):
     assert response.body == b"GIF89a"
     assert response.content_type == "image/gif"
     assert response.headers["ETag"] == '"hash"'
+    assert response.headers["Cache-Control"] == "private, no-cache"
+    assert calls[0][1] == {"if_none_match": '"previous"'}
 
 
 def test_collection_import_permission_precedes_multipart_access():
@@ -570,6 +610,7 @@ def test_runtime_routes_mount_same_catalog_under_both_api_roots():
         ra_routes.FILTER,
         ra_routes.GET,
         ra_routes.UPDATE,
+        ra_routes.DELETE,
     }
     assert messenger_routes.StickerRoute.download.is_invoke() is False
     assert messenger_routes.StickerRoute.star.is_invoke() is True
@@ -641,11 +682,12 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
     actual = {path for path in paths if path.startswith(f"{root}stickers")}
     assert actual == expected
     assert set(paths[f"{root}stickers/"]) == {"get"}
-    assert set(paths[item]) == {"get", "put"}
+    assert set(paths[item]) == {"get", "put", "delete"}
     assert {method for path in expected for method in paths[path]} <= {
         "get",
         "post",
         "put",
+        "delete",
     }
 
     list_operation = paths[f"{root}stickers/"]["get"]
@@ -676,16 +718,30 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
         for operation in paths[path].values():
             assert operation["security"] == [{"bearerAuth": []}]
     update = paths[item]["put"]
+    delete = paths[item]["delete"]
     item_get = paths[item]["get"]
     download = paths[f"{item}/actions/download"]["get"]
     assert set(item_get["responses"]) == {200, 400, 404}
-    assert set(download["responses"]) == {200, 400, 404}
+    assert set(download["responses"]) == {200, 304, 400, 404}
+    download_parameters = {
+        (value["in"], value["name"]): value for value in download["parameters"]
+    }
+    assert set(download_parameters) == {
+        ("path", "sticker_uuid"),
+        ("header", "If-None-Match"),
+    }
+    assert set(download["responses"][304]["headers"]) == {
+        "ETag",
+        "Cache-Control",
+    }
     assert set(update["responses"]) == {200, 400, 403, 404}
+    assert set(delete["responses"]) == {204, 400, 403, 404}
     for operation, statuses in (
         (list_operation, (400,)),
         (item_get, (400, 404)),
         (download, (400, 404)),
         (update, (400, 403, 404)),
+        (delete, (400, 403, 404)),
     ):
         for status in statuses:
             assert operation["responses"][status]["content"]["application/json"][
@@ -695,6 +751,7 @@ def test_openapi_exposes_exact_public_sticker_contract(app_module, root):
         openapi_contract.RESTALCHEMY_ERROR_SCHEMA
     )
     assert update["x-required-permission"] == "workspace.sticker_catalog.manage"
+    assert delete["x-required-permission"] == "workspace.sticker_catalog.manage"
     assert set(
         update["requestBody"]["content"]["application/json"]["schema"]["properties"]
     ) == {"title", "alt_text", "emoji", "tags", "category", "active", "blocked"}

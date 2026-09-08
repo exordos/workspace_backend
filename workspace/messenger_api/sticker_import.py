@@ -348,16 +348,6 @@ def validate_archive(
         yield result
 
 
-def _lock_sha256_values(session: typing.Any, values: typing.Iterable[str]) -> None:
-    """Serialize imports for each SHA without taking a process-local lock."""
-
-    for value in values:
-        session.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (value,),
-        )
-
-
 def _build_sticker(
     item: StickerImportItem,
     sticker_uuid: sys_uuid.UUID,
@@ -426,12 +416,8 @@ def _import_validated_archive(
         # D-13 makes the first manifest item the deterministic winner for a SHA.
         representatives = {sha: group[0] for sha, group in by_sha.items()}
         sha_values = sorted(by_sha)
+        repository.lock_sha256_values(session, sha_values)
         existing = repository.find_duplicates(session, sha_values)
-        missing = [value for value in sha_values if value not in existing]
-
-        if missing:
-            _lock_sha256_values(session, missing)
-            existing.update(repository.find_duplicates(session, missing))
         missing = [value for value in sha_values if value not in existing]
 
         candidates: list[stickers.Sticker] = []

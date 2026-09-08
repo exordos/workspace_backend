@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import threading
 import uuid as sys_uuid
 import zipfile
 
@@ -181,6 +182,108 @@ def test_real_postgres_concurrent_same_sha_has_one_winner(
             _delete_stickers(connection)
         finally:
             connection.close()
+
+
+def test_real_postgres_delete_serializes_reimport_and_enqueues_cleanup(
+    _database: None,
+    tmp_path: pathlib.Path,
+) -> None:
+    data = b"delete and reimport race"
+    digest = hashlib.sha256(data).hexdigest()
+    client_id = sys_uuid.uuid4()
+    archive = _archive(
+        [_item(client_id, data)],
+        {"media/%s.gif" % client_id: data},
+    )
+    repository = sticker_repository.StickerRepository()
+    storage = sticker_storage.LocalStickerStorage(str(tmp_path))
+    setup = _connection()
+    first = sticker_import.import_archive(archive, setup, repository, storage)
+    setup.commit()
+    deleted_uuid = first["items"][0].sticker_uuid
+    setup.close()
+
+    delete_done = threading.Event()
+    release_delete = threading.Event()
+    import_lock_attempted = threading.Event()
+
+    class ImportSession:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, statement, params):
+            if "pg_advisory_xact_lock" in statement:
+                import_lock_attempted.set()
+            return self.connection.execute(statement, params)
+
+        def rollback(self):
+            self.connection.rollback()
+
+    def delete_sticker() -> None:
+        connection = _connection()
+        try:
+            assert repository.delete(connection, deleted_uuid)
+            delete_done.set()
+            assert release_delete.wait(timeout=5)
+            connection.commit()
+        finally:
+            connection.close()
+
+    def reimport_sticker():
+        connection = _connection()
+        try:
+            result = sticker_import.import_archive(
+                archive,
+                ImportSession(connection),
+                repository,
+                storage,
+            )
+            connection.commit()
+            return result
+        finally:
+            connection.close()
+
+    cleanup = _connection()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            deleted = executor.submit(delete_sticker)
+            assert delete_done.wait(timeout=5)
+            imported = executor.submit(reimport_sticker)
+            assert import_lock_attempted.wait(timeout=5)
+            assert not imported.done()
+            release_delete.set()
+            deleted.result(timeout=5)
+            result = imported.result(timeout=5)
+
+        assert result.created == 1
+        assert result.duplicates == 0
+        recreated_uuid = result["items"][0].sticker_uuid
+        assert recreated_uuid != deleted_uuid
+        with cleanup.cursor() as cursor:
+            cursor.execute(
+                "SELECT uuid FROM m_workspace_stickers WHERE sha256 = %s",
+                (digest,),
+            )
+            assert cursor.fetchone()["uuid"] == recreated_uuid
+            cursor.execute(
+                "SELECT status FROM messenger_sticker_cleanup_tasks "
+                "WHERE sticker_uuid = %s",
+                (deleted_uuid,),
+            )
+            assert cursor.fetchone()["status"] == "pending"
+    finally:
+        release_delete.set()
+        with cleanup.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM m_workspace_stickers WHERE sha256 = %s",
+                (digest,),
+            )
+            cursor.execute(
+                "DELETE FROM messenger_sticker_cleanup_tasks WHERE sticker_uuid = %s",
+                (deleted_uuid,),
+            )
+        cleanup.commit()
+        cleanup.close()
 
 
 def test_real_postgres_mixed_existing_and_new_sha_writes_only_new_storage_object(

@@ -536,6 +536,28 @@ def test_sticker_authorization_requires_assignment_before_catalog_lookup(
     manager.resolve_workspace_sticker.assert_not_called()
 
 
+def test_outgoing_sticker_rejects_query_suffix(tmp_path, monkeypatch):
+    manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
+    manager.resolve_workspace_sticker = mock.Mock()
+    sticker_uuid = sys_uuid.uuid4()
+
+    with pytest.raises(files.FileTransferError) as raised:
+        manager.authorize_outgoing(
+            _identity(),
+            sys_uuid.uuid4(),
+            {
+                "operation_uuid": str(sys_uuid.uuid4()),
+                "external_account_uuid": str(account_uuid),
+                "external_chat_uuid": str(chat_uuid),
+                "file_urn": f"urn:sticker:{sticker_uuid}?v=1",
+            },
+        )
+
+    assert raised.value.status == 422
+    assert raised.value.error == "invalid_workspace_urn"
+    manager.resolve_workspace_sticker.assert_not_called()
+
+
 def test_outgoing_sticker_presigns_original_s3_object(tmp_path, monkeypatch):
     manager, _, account_uuid, chat_uuid, _ = _manager(tmp_path, monkeypatch)
     sticker_uuid = sys_uuid.uuid4()

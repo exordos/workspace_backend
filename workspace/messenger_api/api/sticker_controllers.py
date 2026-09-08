@@ -106,7 +106,10 @@ class StickerController(ra_controllers.BaseResourceController):
         content_type: typing.Any,
         resource_type: typing.Any = None,
     ) -> typing.Any:
-        if self.request.api_context.get_active_method() == ra_constants.UPDATE:
+        if self.request.api_context.get_active_method() in {
+            ra_constants.UPDATE,
+            ra_constants.DELETE,
+        }:
             permission_guards.require_iam_permission(
                 self.get_context(),
                 sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,
@@ -185,6 +188,18 @@ class StickerController(ra_controllers.BaseResourceController):
             )
         )
 
+    def delete(self, uuid: object) -> webob.Response:
+        permission_guards.require_iam_permission(
+            self.get_context(),
+            sticker_catalog.STICKER_CATALOG_MANAGE_PERMISSION,
+        )
+        sticker_catalog.delete_sticker(
+            self._session(),
+            self._repository(),
+            typing.cast(sys_uuid.UUID, uuid),
+        )
+        return webob.Response(status=204)
+
     def get_resource_by_uuid(
         self,
         uuid: object,
@@ -230,6 +245,7 @@ class StickerController(ra_controllers.BaseResourceController):
             self._repository(),
             self._storage(),
             resource.uuid,
+            if_none_match=self.request.headers.get("If-None-Match"),
         )
         return _http_response(result)
 

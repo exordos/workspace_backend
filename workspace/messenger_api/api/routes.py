@@ -470,7 +470,7 @@ class StickerRoute(routes.Route):
     """Sticker resource plus the one explicit collection command."""
 
     __controller__ = sticker_controllers.StickerController
-    __allow_methods__ = [routes.FILTER, routes.GET, routes.UPDATE]
+    __allow_methods__ = [routes.FILTER, routes.GET, routes.UPDATE, routes.DELETE]
 
     download = routes.action(StickerDownloadAction)
     star = routes.action(StickerStarAction, invoke=True)

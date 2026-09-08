@@ -250,14 +250,21 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             "width": 240,
         }
 
-        downloaded = workspace_api.get(f"{UNIFIED_ROOT}/{first_uuid}/actions/download")
+        media_download_path = f"{UNIFIED_ROOT}/{first_uuid}/actions/download"
+        downloaded = workspace_api.get(media_download_path)
         assert downloaded.status_code == 200, downloaded.text
         assert downloaded.content == first_data
         assert downloaded.headers["Content-Type"] == "image/gif"
         assert downloaded.headers["ETag"] == f'"{digests[0]}"'
-        assert downloaded.headers["Cache-Control"] == (
-            "private, max-age=31536000, immutable"
+        assert downloaded.headers["Cache-Control"] == "private, no-cache"
+        not_modified_media = workspace_api.get(
+            media_download_path,
+            headers={"If-None-Match": downloaded.headers["ETag"]},
         )
+        assert not_modified_media.status_code == 304
+        assert not_modified_media.content == b""
+        assert not_modified_media.headers["ETag"] == downloaded.headers["ETag"]
+        assert not_modified_media.headers["Cache-Control"] == "private, no-cache"
 
         forbidden_update = workspace_api.put(
             f"{UNIFIED_ROOT}/{first_uuid}",
@@ -404,7 +411,8 @@ def test_real_http_catalog_full_flow_through_unified_mount(
             lambda: storage_sentinel,
         )
         blocked_download = workspace_api.get(
-            f"{UNIFIED_ROOT}/{first_uuid}/actions/download"
+            f"{UNIFIED_ROOT}/{first_uuid}/actions/download",
+            headers={"If-None-Match": downloaded.headers["ETag"]},
         )
         assert blocked_download.status_code == 404, blocked_download.text
         assert storage_sentinel.calls == []
@@ -438,6 +446,88 @@ def test_real_http_catalog_full_flow_through_unified_mount(
         _assert_public_card(standalone.json()[0])
     finally:
         _delete_imported_stickers(db, digests)
+
+
+def test_real_http_admin_delete_is_atomic_and_hides_storage_identity(
+    workspace_api,
+    db,
+    tmp_path: pathlib.Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    client_id = sys_uuid.uuid4()
+    data = b"hard delete contract"
+    item = _manifest_item(
+        client_id,
+        data,
+        format="gif",
+        title="Delete me",
+        category="gif",
+        tags=["delete"],
+    )
+    archive = _archive([item], {str(item["file"]): data})
+    imported = workspace_api.post(
+        f"{UNIFIED_ROOT}/actions/import_archive/invoke",
+        permissions=(MANAGE_PERMISSION,),
+        files={"archive": ("stickers.zip", io.BytesIO(archive), "application/zip")},
+    )
+    assert imported.status_code == 200, imported.text
+    sticker_uuid = imported.json()["items"][0]["sticker_uuid"]
+    assert (
+        workspace_api.post(
+            f"{UNIFIED_ROOT}/{sticker_uuid}/actions/star/invoke"
+        ).status_code
+        == 200
+    )
+
+    forbidden = workspace_api.delete(f"{UNIFIED_ROOT}/{sticker_uuid}")
+    assert forbidden.status_code == 403, forbidden.text
+    assert "storage_object_id" not in forbidden.text
+    assert (
+        db.execute(
+            "SELECT COUNT(*) FROM m_workspace_stickers WHERE uuid = %s",
+            (sticker_uuid,),
+        ).fetchone()[0]
+        == 1
+    )
+
+    deleted = workspace_api.delete(
+        f"{UNIFIED_ROOT}/{sticker_uuid}",
+        permissions=(MANAGE_PERMISSION,),
+    )
+    assert deleted.status_code == 204, deleted.text
+    assert deleted.content == b""
+    assert (
+        db.execute(
+            "SELECT COUNT(*) FROM m_workspace_stickers WHERE uuid = %s",
+            (sticker_uuid,),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute(
+            "SELECT COUNT(*) FROM m_workspace_sticker_favorites WHERE sticker_uuid = %s",
+            (sticker_uuid,),
+        ).fetchone()[0]
+        == 0
+    )
+    task = db.execute(
+        "SELECT status, attempts FROM messenger_sticker_cleanup_tasks "
+        "WHERE sticker_uuid = %s",
+        (sticker_uuid,),
+    ).fetchone()
+    assert task == ("pending", 0)
+
+    missing = workspace_api.delete(
+        f"{UNIFIED_ROOT}/{sticker_uuid}",
+        permissions=(MANAGE_PERMISSION,),
+    )
+    assert missing.status_code == 404, missing.text
+    assert "storage_object_id" not in missing.text
+    db.execute(
+        "DELETE FROM messenger_sticker_cleanup_tasks WHERE sticker_uuid = %s",
+        (sticker_uuid,),
+    )
 
 
 def test_real_http_import_checks_permission_before_multipart_parsing(

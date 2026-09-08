@@ -301,8 +301,10 @@ paths:
 
         Workspace `urn:file`, `urn:image`, `urn:video`, and `urn:sticker` values are
         accepted. URL, Gravatar, and arbitrary schemes are rejected. Query
-        metadata is not trusted for authorization. The stored UUID, media type,
-        size, SHA-256, URN kind, and sidecar determine the response.
+        metadata is accepted only for ordinary file URNs and is not trusted for
+        authorization. Sticker URNs are canonical and contain only the catalog
+        UUID. The stored UUID, media type, size, SHA-256, URN kind, and sidecar
+        determine the response.
 
         Sticker URNs resolve the global catalog instead of a WorkspaceFile
         sidecar. The current bridge/account/chat assignment is still required;
@@ -707,13 +709,14 @@ components:
       minLength: 46
       maxLength: 2048
       # yamllint disable-line rule:line-length
-      pattern: '^urn:(file|image|video|sticker):[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}(\\?.*)?$'
+      pattern: '^urn:((file|image|video):[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}(\\?.*)?|sticker:[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})$'
       description: |
-        Workspace file/media URN. Query parameters are display metadata only
-        and are ignored for identity and authorization. The URN kind must match
-        the stored content type: image/* uses image, video/* uses video, and all
-        other media types use file. The sticker kind is supported for outgoing
-        catalog authorization; its UUID identifies a Sticker, not a
+        Workspace file/media URN. Query parameters on file, image, and video
+        values are display metadata only and are ignored for identity and
+        authorization. Sticker values have no query suffix. The URN kind must
+        match the stored content type: image/* uses image, video/* uses video,
+        and all other media types use file. The sticker kind is supported for
+        outgoing catalog authorization; its UUID identifies a Sticker, not a
         WorkspaceFile. Ordinary incoming file allocation never creates stickers.
 
     PresignedHttpsUrl:

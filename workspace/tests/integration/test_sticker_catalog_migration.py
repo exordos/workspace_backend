@@ -16,20 +16,30 @@ MIGRATION_ID = "ba2289b6-0a23-470e-a143-a5b986287601"
 @pytest.fixture(scope="module")
 def _sticker_catalog_migration(_database):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    current_head = engine.get_latest_migration()
     engine.rollback_migration(MIGRATION_FILE)
     try:
-        yield engine
+        yield engine, current_head
     finally:
         engine.rollback_migration(MIGRATION_FILE)
-        engine.apply_migration(MIGRATION_FILE)
+        engine.apply_migration(current_head)
 
 
 def test_sticker_catalog_migration_round_trip_schema_constraints_indexes_and_grants(
     _sticker_catalog_migration,
     db,
 ):
-    engine = _sticker_catalog_migration
-    assert engine.get_latest_migration() == MIGRATION_FILE
+    engine, current_head = _sticker_catalog_migration
+    migrations = engine._load_migrations()
+    pending = [current_head]
+    dependencies = set()
+    while pending:
+        migration_file = pending.pop()
+        for dependency in migrations[migration_file].depends:
+            if dependency not in dependencies:
+                dependencies.add(dependency)
+                pending.append(dependency)
+    assert MIGRATION_FILE in dependencies
     assert engine._load_migrations()[MIGRATION_FILE].depends == [
         "0174-suppress-legacy-backfill-counters-a2cd99.py"
     ]

@@ -623,6 +623,19 @@ class StickerRepository:
         ).fetchall()
         return {str(row["sha256"]): sys_uuid.UUID(str(row["uuid"])) for row in rows}
 
+    def lock_sha256_values(
+        self,
+        session: typing.Any,
+        sha256_values: typing.Iterable[str],
+    ) -> None:
+        """Serialize catalog mutations by SHA in one deterministic order."""
+
+        for value in sorted(set(sha256_values)):
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (value,),
+            )
+
     def insert_batch(
         self,
         session: typing.Any,
@@ -731,6 +744,37 @@ class StickerRepository:
         return self._record_from_row(updated_rows[0]) if updated_rows else None
 
     update_admin_fields = update
+
+    def delete(
+        self,
+        session: typing.Any,
+        sticker_uuid: sys_uuid.UUID,
+    ) -> bool:
+        """Delete one row and atomically enqueue its storage cleanup."""
+
+        candidates = session.execute(
+            "SELECT sha256 FROM m_workspace_stickers WHERE uuid = %s",
+            (sticker_uuid,),
+        ).fetchall()
+        if not candidates:
+            return False
+        self.lock_sha256_values(session, [str(candidates[0]["sha256"])])
+        rows = session.execute(
+            """
+            WITH deleted AS (
+                DELETE FROM m_workspace_stickers
+                WHERE uuid = %s
+                RETURNING uuid, media_object_id
+            )
+            INSERT INTO messenger_sticker_cleanup_tasks (
+                sticker_uuid, storage_object_id
+            )
+            SELECT uuid, media_object_id FROM deleted
+            RETURNING sticker_uuid
+            """,
+            (sticker_uuid,),
+        ).fetchall()
+        return bool(rows)
 
     def star(
         self,
