@@ -66,7 +66,7 @@ STICKER_READ_ONLY_FIELDS = STICKER_INTERNAL_FIELDS | {
 }
 
 
-class _StrictInputTypeMixin:
+class _StrictInputTypeMixin(types.BaseType):
     """Reject JSON values whose type does not match the declared RA type."""
 
     def from_simple_type(self, value: typing.Any) -> typing.Any:
