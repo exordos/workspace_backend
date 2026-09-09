@@ -21,6 +21,7 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.external_bridge_control import provider_event_apply
@@ -2114,6 +2115,104 @@ def test_native_v2_canonical_message_supports_multiple_placements(
             (api.project_id, canonical_uuid, api.project_id, canonical_uuid),
         )
         assert cursor.fetchone() == (0, 0)
+
+
+def test_compact_created_event_resolves_legacy_public_message_state(
+    api,
+    db,
+    monkeypatch,
+):
+    peer_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
+    _register_project_user(db, api.project_id, peer_uuid)
+    stream = api.post(
+        STREAMS,
+        json={
+            "name": "Legacy event state",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    ).json()
+    _drain()
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream["uuid"],
+            "topic_uuid": stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "persisted flags"},
+        },
+    )
+    assert message.status_code == 201, message.text
+    placement_uuid = sys_uuid.UUID(message.json()["uuid"])
+    legacy_public_uuid = sys_uuid.uuid4()
+    _drain()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_message_placements
+            SET legacy_public_uuid = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (legacy_public_uuid, api.project_id, placement_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE messenger_user_message_states
+            SET read_at = NOW(), mentioned = true, starred = true, pinned = true
+            WHERE project_id = %s AND placement_uuid = %s AND user_uuid = %s
+            RETURNING uuid
+            """,
+            (api.project_id, placement_uuid, peer_uuid),
+        )
+        assert cursor.fetchone() is not None
+
+    captured = {}
+
+    def capture_compact_events(project_id, user_messages, session=None):
+        captured["project_id"] = project_id
+        captured["user_messages"] = user_messages
+        captured["session"] = session
+        return [91]
+
+    monkeypatch.setattr(
+        messenger_events,
+        "create_compact_message_events",
+        capture_compact_events,
+    )
+    event_message = types.SimpleNamespace(
+        uuid=legacy_public_uuid,
+        stream_uuid=sys_uuid.UUID(stream["uuid"]),
+        topic_uuid=sys_uuid.UUID(stream["default_topic_uuid"]),
+        user_uuid=api.user_uuid,
+        payload={"kind": "markdown", "content": "persisted flags"},
+        created_at=datetime.datetime.now(datetime.timezone.utc),
+        updated_at=datetime.datetime.now(datetime.timezone.utc),
+        source_name="native",
+        source={"kind": "native"},
+        reaction_users={},
+    )
+    with contexts.Context().session_manager() as session:
+        result = messenger_events.create_message_events(
+            api.project_id,
+            event_message,
+            [peer_uuid],
+            session=session,
+            compact=True,
+        )
+
+    assert result == [91]
+    snapshot = captured["user_messages"][0]
+    assert snapshot["uuid"] == legacy_public_uuid
+    assert snapshot["read"] is True
+    assert snapshot["mentioned"] is True
+    assert snapshot["starred"] is True
+    assert snapshot["pinned"] is True
 
 
 def test_native_v2_actions_converge_counters_notifications_and_events(
