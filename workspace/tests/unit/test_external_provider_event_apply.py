@@ -36,6 +36,11 @@ def _legacy_read_state(monkeypatch):
         "_assign_legacy_ingest_sequences",
         lambda *_args, **_kwargs: 0,
     )
+    monkeypatch.setattr(
+        read_state,
+        "lock_counter_projection_scopes",
+        lambda *_args, **_kwargs: None,
+    )
     # Handler-focused unit tests use lightweight message stubs without the
     # canonical provenance columns. Account isolation is exercised with real
     # PostgreSQL rows in the integration suite.
@@ -2152,6 +2157,7 @@ def test_message_upsert_scopes_three_ui_events_to_projection_participants(monkey
             None,
             None,
             None,
+            {"value": None},
             user_topics,
             user_streams,
         ]
@@ -2405,6 +2411,78 @@ def test_provider_read_state_updates_exact_owner_messages(monkeypatch):
     lock_statement, lock_params = session.statements[1]
     assert "pg_advisory_xact_lock" in lock_statement
     assert lock_params == (project_uuid,)
+
+
+def test_provider_read_state_locks_project_then_counter_scopes_before_mutation(
+    monkeypatch,
+):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    stored_rows = [
+        {
+            "uuid": message_uuid,
+            "placement_uuid": message_uuid,
+            "author_uuid": sys_uuid.uuid4(),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "read": False,
+            "canonical_read": False,
+        }
+    ]
+    session = Session([None, stored_rows, [{"uuid": message_uuid}]])
+    calls = []
+    original_execute = session.execute
+
+    def execute(statement, params):
+        if "pg_advisory_xact_lock" in statement:
+            calls.append("event-lock")
+        elif "UPDATE messenger_user_message_states" in statement:
+            calls.append("state-update")
+        return original_execute(statement, params)
+
+    session.execute = execute
+    monkeypatch.setattr(
+        read_state,
+        "lock_counter_projection_scopes",
+        lambda *args: calls.append(("scope-lock", args)),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers.messenger_events,
+        "create_messages_read_event",
+        lambda *args, **kwargs: calls.append("event"),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "_create_compact_messages_unread_updated_events",
+        lambda *args, **kwargs: None,
+    )
+
+    provider_event_apply._sync_provider_read_state(
+        session,
+        project_uuid,
+        owner_uuid,
+        stream_uuid,
+        topic_uuid,
+        [message_uuid],
+        True,
+    )
+
+    assert calls == [
+        "event-lock",
+        (
+            "scope-lock",
+            (session, project_uuid, owner_uuid, stream_uuid),
+        ),
+        (
+            "scope-lock",
+            (session, project_uuid, owner_uuid, stream_uuid, {topic_uuid}),
+        ),
+        "state-update",
+        "event",
+    ]
 
 
 def test_provider_unread_state_emits_exact_owner_message_snapshots(monkeypatch):

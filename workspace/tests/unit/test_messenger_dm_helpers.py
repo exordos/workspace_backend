@@ -2758,6 +2758,8 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 get_all=mock.Mock(return_value=[custom_item])
             )
 
+        lock_order = []
+
         with (
             mock.patch.object(dm_helpers.read_state, "lock_projects"),
             mock.patch.object(dm_helpers.read_state, "lock_message_structure"),
@@ -2776,6 +2778,11 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
                 dm_helpers, "get_workspace_user_folder", return_value=object()
             ) as get_user_folder,
             mock.patch.object(
+                dm_helpers.read_state,
+                "lock_stream_counter_projection_scopes",
+                side_effect=lambda *_args: lock_order.append("counter-scopes"),
+            ) as lock_stream_counter_scopes,
+            mock.patch.object(
                 dm_helpers.models, "WorkspaceStream", FakeWorkspaceStream
             ),
             mock.patch.object(
@@ -2783,7 +2790,9 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
             ),
             mock.patch.object(dm_helpers.models, "FolderItem", FakeFolderItem),
             mock.patch.object(
-                dm_helpers.messenger_events, "create_stream_deleted_event"
+                dm_helpers.messenger_events,
+                "create_stream_deleted_event",
+                side_effect=lambda **_kwargs: lock_order.append("stream.deleted"),
             ) as create_stream_deleted,
             mock.patch.object(
                 dm_helpers.messenger_events, "create_folder_updated_event"
@@ -2799,6 +2808,15 @@ class MessengerDMHelpersTestCase(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIs(session, existing_stream.delete_session)
         self.assertFalse(session.execute.called)
+        lock_stream_counter_scopes.assert_called_once_with(
+            session,
+            project_id,
+            stream_uuid,
+        )
+        self.assertEqual(
+            ["counter-scopes", "stream.deleted", "stream.deleted"],
+            lock_order,
+        )
         get_user_stream.assert_called_once_with(
             project_id=project_id,
             user_uuid=user_uuid,

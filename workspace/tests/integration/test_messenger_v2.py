@@ -85,9 +85,7 @@ EXPIRED_PROVIDER_READ_RETRY_MIGRATION = (
     "0172-retry-expired-provider-read-pages-05d036.py"
 )
 PROJECTION_ACCELERATION_MIGRATION = "0173-accelerate-Messenger-v2-projections-8cda92.py"
-LEGACY_BACKFILL_COUNTER_MIGRATION = (
-    "0174-suppress-legacy-backfill-counters-a2cd99.py"
-)
+LEGACY_BACKFILL_COUNTER_MIGRATION = "0174-suppress-legacy-backfill-counters-a2cd99.py"
 
 
 def _truncate_messenger_test_data():
@@ -2346,6 +2344,335 @@ def test_native_v2_idempotent_reads_repair_stale_counters(api, db):
         current_stream = api.get(f"{STREAMS}{stream['uuid']}", user=peer_uuid).json()
         assert topic["unread_count"] == 0
         assert current_stream["unread_count"] == 0
+
+
+def test_native_v2_read_up_to_closes_a_late_fanout_gap(api, db):
+    peer_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
+    _register_project_user(db, api.project_id, peer_uuid)
+    stream = api.post(
+        STREAMS,
+        json={
+            "name": "Late fanout read boundary",
+            "description": "",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    ).json()
+    _drain()
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    _drain()
+    topic_uuid = stream["default_topic_uuid"]
+    messages = []
+    for content in ("fanout gap", "visible boundary"):
+        response = api.post(
+            MESSAGES,
+            json={
+                "stream_uuid": stream["uuid"],
+                "topic_uuid": topic_uuid,
+                "payload": {"kind": "markdown", "content": content},
+            },
+        )
+        assert response.status_code == 201, response.text
+        messages.append(response.json())
+        _drain()
+
+    missing_placement_uuid = messages[0]["uuid"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM messenger_user_message_states
+            WHERE project_id = %s AND user_uuid = %s AND placement_uuid = %s
+            """,
+            (api.project_id, peer_uuid, missing_placement_uuid),
+        )
+        cursor.execute(
+            """
+            DELETE FROM messenger_user_message_bindings
+            WHERE project_id = %s AND user_uuid = %s AND placement_uuid = %s
+            """,
+            (api.project_id, peer_uuid, missing_placement_uuid),
+        )
+    db.commit()
+
+    replay_event_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key, payload
+            ) VALUES (%s, %s, 'fanout', 'topic', %s, %s::jsonb)
+            """,
+            (
+                replay_event_uuid,
+                api.project_id,
+                f"{api.project_id}:{topic_uuid}",
+                json.dumps(
+                    {
+                        "source_kind": "message.created",
+                        "placement_uuid": missing_placement_uuid,
+                        "emit_public_event": True,
+                    }
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO messenger_projection_tasks (
+                uuid, project_id, outbox_event_uuid, task_kind,
+                scope_kind, scope_key, ordering_key, ordering_created_at, payload
+            ) VALUES (
+                messenger_uuid_v5(%s, 'projection-task:fanout'),
+                %s, %s, 'fanout', 'topic', %s, %s, NOW(), %s::jsonb
+            )
+            ON CONFLICT (project_id, outbox_event_uuid) DO NOTHING
+            """,
+            (
+                replay_event_uuid,
+                api.project_id,
+                replay_event_uuid,
+                f"{api.project_id}:{topic_uuid}",
+                missing_placement_uuid,
+                json.dumps(
+                    {
+                        "source_kind": "message.created",
+                        "placement_uuid": missing_placement_uuid,
+                        "emit_public_event": True,
+                    }
+                ),
+            ),
+        )
+    db.commit()
+
+    read_response = api.post(
+        f"{MESSAGES}{messages[1]['uuid']}/actions/read_up_to/invoke",
+        user=peer_uuid,
+    )
+    assert read_response.status_code == 200, read_response.text
+    with contexts.Context().session_manager() as session:
+        v2_projection.derive_projection_tasks(session)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT binding.membership_generation, state.read_at IS NOT NULL
+            FROM messenger_user_message_bindings AS binding
+            JOIN messenger_user_message_states AS state
+              ON state.project_id = binding.project_id
+             AND state.placement_uuid = binding.placement_uuid
+             AND state.user_uuid = binding.user_uuid
+             AND state.membership_generation = binding.membership_generation
+            WHERE binding.project_id = %s AND binding.user_uuid = %s
+              AND binding.placement_uuid = %s
+            """,
+            (api.project_id, peer_uuid, missing_placement_uuid),
+        )
+        assert cursor.fetchone() == (1, True)
+        cursor.execute(
+            """
+            SELECT folder_uuid
+            FROM messenger_folder_items
+            WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+            ORDER BY folder_uuid
+            LIMIT 1
+            """,
+            (api.project_id, peer_uuid, stream["uuid"]),
+        )
+        folder_uuid = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT unread_count
+            FROM messenger_stream_bindings
+            WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+            """,
+            (api.project_id, peer_uuid, stream["uuid"]),
+        )
+        assert cursor.fetchone()[0] == 2
+
+    with contexts.Context().session_manager() as session:
+        v2_projection._process_folder_projection(
+            session,
+            {
+                "project_id": api.project_id,
+                "payload": {
+                    "source_kind": "message.created",
+                    "user_uuid": peer_uuid,
+                    "stream_uuid": stream["uuid"],
+                    "folder_uuid": folder_uuid,
+                    "emit_public_event": False,
+                },
+            },
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT stream_binding.unread_count, folder_binding.unread_count
+            FROM messenger_stream_bindings AS stream_binding
+            JOIN messenger_user_folder_bindings AS folder_binding
+              ON folder_binding.project_id = stream_binding.project_id
+             AND folder_binding.user_uuid = stream_binding.user_uuid
+             AND folder_binding.folder_uuid = %s
+            WHERE stream_binding.project_id = %s
+              AND stream_binding.user_uuid = %s
+              AND stream_binding.stream_uuid = %s
+            """,
+            (folder_uuid, api.project_id, peer_uuid, stream["uuid"]),
+        )
+        assert cursor.fetchone() == (0, 0)
+
+    with contexts.Context().session_manager() as session:
+        completed = v2_projection._process_fanout(
+            session,
+            {
+                "project_id": api.project_id,
+                "outbox_event_uuid": replay_event_uuid,
+                "payload": {
+                    "placement_uuid": missing_placement_uuid,
+                    "emit_public_event": True,
+                },
+            },
+            batch_size=1000,
+        )
+        assert completed
+    _drain()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT read_at IS NOT NULL
+            FROM messenger_user_message_states
+            WHERE project_id = %s AND user_uuid = %s AND placement_uuid = %s
+            """,
+            (api.project_id, peer_uuid, missing_placement_uuid),
+        )
+        assert cursor.fetchone() == (True,)
+    assert (
+        api.get(f"{STREAM_TOPICS}{topic_uuid}", user=peer_uuid).json()["unread_count"]
+        == 0
+    )
+    assert (
+        api.get(f"{STREAMS}{stream['uuid']}", user=peer_uuid).json()["unread_count"]
+        == 0
+    )
+
+
+def test_folder_projection_refreshes_dirty_contributing_stream_counters(api, db):
+    streams = []
+    for name in ("First folder counter", "Second folder counter"):
+        response = api.post(
+            STREAMS,
+            json={
+                "name": name,
+                "description": "",
+                "source_name": "native",
+                "source": {"kind": "native"},
+            },
+        )
+        assert response.status_code == 201, response.text
+        streams.append(response.json())
+    _drain()
+
+    stream_uuids = [stream["uuid"] for stream in streams]
+    folder = api.post(FOLDERS, json={"title": "Counter reconciliation"})
+    assert folder.status_code == 201, folder.text
+    folder_uuid = folder.json()["uuid"]
+    for stream_uuid in stream_uuids:
+        item = api.post(
+            FOLDER_ITEMS,
+            json={
+                "folder_uuid": folder_uuid,
+                "stream_uuid": stream_uuid,
+                "chat_type": "stream",
+            },
+        )
+        assert item.status_code == 201, item.text
+    _drain()
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*)
+            FROM messenger_folder_items
+            WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
+              AND stream_uuid = ANY(%s::uuid[])
+            """,
+            (api.project_id, api.user_uuid, folder_uuid, stream_uuids),
+        )
+        assert cursor.fetchone()[0] == 2
+        cursor.execute(
+            """
+            UPDATE messenger_stream_bindings
+            SET unread_count = 4, active_unread_count = 3,
+                passive_unread_count = 1
+            WHERE project_id = %s AND user_uuid = %s
+              AND stream_uuid = %s
+            """,
+            (api.project_id, api.user_uuid, stream_uuids[0]),
+        )
+        cursor.execute(
+            """
+            INSERT INTO messenger_domain_outbox_events (
+                uuid, project_id, event_kind, scope_kind, scope_key, payload
+            ) VALUES (
+                %s, %s, 'read_counters', 'user-stream', %s, %s::jsonb
+            )
+            """,
+            (
+                sys_uuid.uuid4(),
+                api.project_id,
+                f"{api.project_id}:{api.user_uuid}:{stream_uuids[0]}",
+                json.dumps(
+                    {
+                        "source_kind": "messages.read",
+                        "user_uuid": api.user_uuid,
+                        "stream_uuid": stream_uuids[0],
+                        "topic_uuid": streams[0]["default_topic_uuid"],
+                    }
+                ),
+            ),
+        )
+    db.commit()
+
+    with contexts.Context().session_manager() as session:
+        v2_projection.derive_projection_tasks(session)
+    with contexts.Context().session_manager() as session:
+        v2_projection._process_folder_projection(
+            session,
+            {
+                "project_id": api.project_id,
+                "payload": {
+                    "source_kind": "messages.read",
+                    "user_uuid": api.user_uuid,
+                    "stream_uuid": stream_uuids[1],
+                    "folder_uuid": folder_uuid,
+                    "emit_public_event": False,
+                },
+            },
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT unread_count, active_unread_count, passive_unread_count
+            FROM messenger_stream_bindings
+            WHERE project_id = %s AND user_uuid = %s
+              AND stream_uuid = ANY(%s::uuid[])
+            ORDER BY stream_uuid
+            """,
+            (api.project_id, api.user_uuid, stream_uuids),
+        )
+        assert cursor.fetchall() == [(0, 0, 0), (0, 0, 0)]
+        cursor.execute(
+            """
+            SELECT unread_count
+            FROM messenger_user_folder_bindings
+            WHERE project_id = %s AND user_uuid = %s AND folder_uuid = %s
+            """,
+            (api.project_id, api.user_uuid, folder_uuid),
+        )
+        assert cursor.fetchone() == (0,)
 
 
 def test_projection_claim_bounds_interactive_read_priority(
