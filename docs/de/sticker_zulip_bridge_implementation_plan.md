@@ -132,27 +132,21 @@ Neustart dürfen nicht von einem In-Memory-Outgoing-Marker-Cache abhängen. Auch
 Reconciliation mehrdeutiger Sendungen und normale Live-Events auf die Verwendung
 derselben Normalisierung prüfen.
 
-## Arbeitspakete und Abhängigkeiten
+## Komponentenverantwortung und Abhängigkeiten
 
-1. **Backend-Medien und -Metadaten, Agent A:** Scoped Resolver, private Endpunkte,
-   Runtime-Einbindung sowie Local-/S3- und Autorisierungs-Regressionstests
-   implementieren.
-2. **Bridge-Konvertierung, Agent B (parallel nach Vereinbarung des Wire-Vertrags):**
-   bestehenden File-Client und ausgehende/eingehende Converter erweitern;
-   Kompatibilität normaler Anhänge, Fehler, History und Reconciliation abdecken.
-3. **Provider-Regressionen, Agent C (parallel):** nachweisen, dass Sticker-URNs bei
-   Provider-Aktualisierungen und projektübergreifender Projektion ohne Dateisuche
-   erhalten bleiben.
-4. **Integration und Vertragsverantwortung, Koordinator:** private API-Spezifikation
-   und diesen Plan pflegen, beide Diffs prüfen, fokussierte Backend- und Bridge-
-   Checks sowie PostgreSQL-Tests gegen eine separate Testdatenbank ausführen.
-5. **Unabhängige Prüfung (nach den Änderungen):** beide Repositorys prüfen und
-   Findings beheben, danach betroffene Checks erneut ausführen. Selbsttests der
-   Agenten gelten nicht als unabhängige Prüfung.
-6. **Manuelle Abnahme (separater Nachweis):** tatsächliche Darstellung im Zulip-
-   Client, Upload-/Download-Roundtrip, zweiten Benutzer, Bearbeitungen und Replay
-   in einer konfigurierten Integration prüfen. Unit-Fakes und S3-Presign-Mocks
-   beweisen dies nicht.
+1. **Backend-Medien und -Metadaten:** Scoped Resolver und private Endpunkte sind
+   für Autorisierung, Katalogsichtbarkeit, Medienzugriff und das stabile
+   Antwortschema der Bridge verantwortlich.
+2. **Bridge-Konvertierung:** File-Client und ausgehende/eingehende Converter sind
+   für Markierungen, Provider-Uploads, Byte-Verifikation, History und
+   Reconciliation verantwortlich und bewahren das Verhalten normaler Anhänge.
+3. **Provider-Ereignisverarbeitung:** Aktualisierungen und projektübergreifende
+   Projektion bewahren kanonische Sticker-URNs ohne gewöhnliche WorkspaceFile-Suche.
+4. **Vertragsprüfung:** Backend- und Bridge-Tests decken das gemeinsame private
+   API-Schema, Autorisierung, PostgreSQL-Verhalten, Konvertierung, Retry-Pfade und
+   Storage-Adapter ab. Die manuelle Zulip-Abnahme bleibt ein separater Nachweis,
+   da Unit-Fakes und S3-Presign-Mocks weder die Client-Darstellung noch einen
+   vollständigen Provider-Roundtrip beweisen.
 
 ## Abnahmematrix
 
@@ -173,43 +167,17 @@ derselben Normalisierung prüfen.
 | Sticker vor einem neuen Grant blockiert | Neuer Grant verweigert |
 | Nachricht zwischen Projekten verschoben | Globale Stickerreferenz unverändert |
 
-## Liefergrenzen
+## Bereitstellung und Verifikation
 
-Dieser Implementierungsplan bedeutet weder Commit, Push, Production-Deployment noch
-das Senden einer Live-Provider-Nachricht. Automatisierte Tests, reale PostgreSQL-
-Prüfungen, Prüfungen mit gemocktem Provider/Storage und die manuelle Zulip-Abnahme
-müssen getrennt berichtet werden. Die Sichtbarkeit der Markierung in Zulip-Clients
-muss gemessen werden; sie darf nicht als verborgen versprochen werden.
+Automatisierte Tests, reale PostgreSQL-Prüfungen, Prüfungen mit gemocktem
+Provider/Storage und die manuelle Zulip-Abnahme liefern unterschiedliche Nachweise
+und werden getrennt dokumentiert. Die Sichtbarkeit der Markierung in Zulip-Clients
+muss gemessen und darf nicht als verborgen angenommen werden.
 
 Zuerst das Backend und danach die kompatible Bridge bereitstellen. Sticker-Versand
 bis zur Bereitstellung der Bridge deaktiviert lassen. Die Delete-Aktion der UI erst
 aktivieren, nachdem die Backend-DELETE-API bereitgestellt wurde.
 
-## Implementierungsstand: 2026-09-08
-
-Die Arbeitspakete 1-5 sind im Backend und im benachbarten Bridge-Working-Tree
-implementiert und geprüft. Commit und Deployment wurden nicht ausgeführt. Die
-manuelle Abnahme an einer echten Zulip-Integration steht noch aus.
-
-- Backend: 93 fokussierte Unit-Tests bestanden; drei Katalog-Sichtbarkeits-
-  Regressionen bestanden auf einer separaten PostgreSQL-Testdatenbank.
-- Bridge: 24 neue Sticker-Regressionstests bestanden, einschließlich echter
-  Converter-Bearbeitungspfade und der Wiederverwendung gespeicherter ausgehender
-  Darstellung während der Reconciliation. Bestehende fokussierte Adapter-/Converter-
-  und File-Client-Tests bestanden ebenfalls.
-- Vollständige Bridge-Suite: 898 bestanden, 392 übersprungen, sechs fehlgeschlagen.
-  Dieselben sechs Fehler wurden auf einem sauberen HEAD reproduziert: Linux-
-  orientierte Bootstrap-/CI-Shell-Tests schlagen unter macOS fehl. Datenbankabhängige
-  Bridge-Tests wurden ohne DSN nicht ausgeführt.
-- Die unabhängige Prüfung beider Production-Diffs fand keine blockierenden Probleme.
-  Der Koordinator entdeckte und behob beim Review eine Wire-Abweichung: Der private
-  Metadata-GET muss ausdrücklich `Content-Length: 0` senden.
-- Ruff-Prüfungen der geänderten Bridge-Dateien bestanden. Backend-Ruff meldet 22
-  Diagnosen in den geprüften geänderten Dateien; der Vergleich mit HEAD über denselben
-  Checker ergab dieselben 22 Diagnose-Signaturen und keine neuen.
-- Das private API-YAML lässt sich parsen, lokale Referenzen werden aufgelöst. Beide
-  Repository-Diffs bestehen die Whitespace-Prüfungen.
-
-Diese Ergebnisse beweisen weder die echte Zulip-Darstellung noch das Verhalten bei
-Netzwerk-Rennen oder einen vollständigen mTLS-/S3-/Provider-Roundtrip. Das bleibt
-Teil der manuellen Abnahme.
+Die Release-Abnahme umfasst die echte Zulip-Darstellung, das Verhalten bei
+Netzwerk-Retries und den vollständigen mTLS-/S3-/Provider-Roundtrip.
+Automatisierte oder gemockte Prüfungen ersetzen diese Integrationsprüfungen nicht.

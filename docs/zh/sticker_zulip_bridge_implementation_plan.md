@@ -103,23 +103,18 @@ operation/provider identity 映射进行消息去重；绝不能把标记当作 
 outgoing marker cache。还要检查歧义发送的 reconciliation 以及普通 live events
 是否使用同一套规范化逻辑。
 
-## 工作包与依赖
+## 组件职责与依赖
 
-1. **Backend 媒体与元数据，agent A：** 实现 scoped resolvers、private
-   endpoints、runtime 接线，以及 local/S3 和授权回归测试。
-2. **Bridge 转换，agent B（线路契约达成后并行）：** 扩展现有的 file client
-   和 outgoing/incoming converters；覆盖普通附件兼容性、错误、历史与
-   reconciliation。
-3. **Provider 回归，agent C（并行）：** 证明 sticker URN 在 provider 更新和
-   跨项目重投影中无需文件查询即可保留。
-4. **集成与契约负责，协调者：** 维护 private API schema 和本计划，检查两个
-   diff，运行 focused backend 与 bridge checks，并在独立 test database 上运行
-   PostgreSQL 测试。
-5. **独立审查（编辑后）：** 审查两个仓库并修复 findings，然后重新运行受影响
-   的检查。不能把 agent 自己的测试视为独立审查。
-6. **手动验收（单独的证据）：** 在已配置的集成环境中验证真实 Zulip 客户端
-   的显示、上传/下载 roundtrip、第二个用户、编辑和 replay。Unit fake 与
-   S3 presign mock 无法证明这些行为。
+1. **Backend 媒体与元数据：** scoped resolvers 和 private endpoints 负责授权、
+   目录可见性、媒体访问，以及 bridge 使用的稳定响应 schema。
+2. **Bridge 转换：** file client 和 outgoing/incoming converters 负责标记处理、
+   provider 上传、字节验证、历史与 reconciliation，同时保持普通附件行为。
+3. **Provider 事件处理：** 更新和跨项目重投影保留规范 sticker URN，无需普通
+   WorkspaceFile 查询。
+4. **契约验证：** backend 和 bridge 测试覆盖共享 private API schema、授权、
+   PostgreSQL 行为、转换、retry paths 和 storage adapters。手动 Zulip 验收仍是
+   独立证据，因为 unit fake 和 S3 presign mock 不能证明客户端显示或完整的
+   provider roundtrip。
 
 ## 验收矩阵
 
@@ -140,37 +135,14 @@ outgoing marker cache。还要检查歧义发送的 reconciliation 以及普通 
 | sticker 在新 grant 前变为 blocked | 新 grant 被拒绝 |
 | 跨项目移动消息 | 全局 sticker 引用不变 |
 
-## 交付限制
+## 部署与验证
 
-本实现计划不意味着 commit、push、production deployment 或发送 live provider
-消息。自动化测试、真实 PostgreSQL 检查、mock provider/storage 检查以及手动
-Zulip 验收必须分别报告。Zulip 客户端中标记的可见性必须实际测量，不能承诺
-它会被隐藏。
+自动化测试、真实 PostgreSQL 检查、mock provider/storage 检查以及手动 Zulip
+验收提供不同证据，需要分别记录。Zulip 客户端中标记的可见性必须实际测量，
+不能假定它会被隐藏。
 
 先部署 backend，再部署兼容的 bridge。在 bridge 部署完成前保持 sticker 发送
 禁用。只有在 backend DELETE API 部署完成后，才启用 UI delete 操作。
 
-## 实现检查点：2026-09-08
-
-工作包 1-5 已在 backend 和相邻的 bridge working tree 中实现并审查。没有执行
-commit 或 deployment。在真实 Zulip 集成上的手动验收仍未完成。
-
-- Backend：93 个 focused unit 测试通过；三个目录可见性回归测试在独立的
-  disposable PostgreSQL database 上通过。
-- Bridge：24 个新的 sticker 回归用例通过，包括真实的 converter 编辑路径，
-  以及 reconciliation 期间复用已持久化的出站 rendering。现有 focused
-  adapter/converter/file client 测试也通过。
-- 完整 bridge suite：898 passed、392 skipped、6 failed。同样的 6 个失败在
-  clean HEAD 上重现：面向 Linux 的 bootstrap/CI shell 测试在 macOS 上失败。
-  没有 DSN 时未运行依赖数据库的 bridge 测试。
-- 对两个 production diff 的独立审查没有发现 blocking issues。协调者在审查
-  时发现并修复了一处 wire mismatch：private metadata GET 必须明确发送
-  `Content-Length: 0`。
-- 修改过的 bridge 文件 Ruff 检查通过。Backend Ruff 在检查到的修改文件中
-  报告 22 个 diagnostics；使用同一 checker 与 HEAD 比较得到相同的 22 个
-  diagnostic signatures，没有发现新的问题。
-- Private API YAML 可以解析，本地引用可以解析。两个 repository diff 都通过
-  whitespace 检查。
-
-这些结果不能证明真实 Zulip 显示、网络竞争行为或完整的 mTLS/S3/provider
-roundtrip。这些仍属于手动验收范围。
+发布验收包括真实 Zulip 显示、网络 retry 行为和完整的 mTLS/S3/provider
+roundtrip。自动化或 mock 检查不能替代这些集成检查。

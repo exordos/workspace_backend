@@ -113,24 +113,21 @@ History, second-account delivery, early events, and restart recovery must not
 depend on an in-memory outgoing marker cache. Audit ambiguous-send reconciliation
 as well as normal live events for use of the same normalization.
 
-## Work packages and dependencies
+## Component responsibilities and dependencies
 
-1. **Backend media and metadata, agent A:** implement scoped resolvers, private
-   endpoints, runtime wiring, local/S3 and authorization regression tests.
-2. **Bridge conversion, agent B (parallel after wire contract agreement):**
-   extend the existing file client and outgoing/incoming converters; cover
-   ordinary attachment compatibility, errors, history and reconciliation.
-3. **Provider regressions, agent C (parallel):** prove sticker URNs survive
-   provider updates and cross-project reprojection without file lookup.
-4. **Integration and contract ownership, coordinator:** maintain the private
-   API schema and this plan, inspect both diffs, run focused backend and bridge
-   checks and PostgreSQL tests against a disposable test database.
-5. **Independent review (after edits):** review both repositories and fix
-   findings, then rerun affected checks. Do not treat agents' self-tests as the
-   independent review.
-6. **Manual acceptance (separate evidence):** verify the actual Zulip client
-   rendering, upload/download roundtrip, second user, edits and replay on a
-   configured integration. Unit fakes and S3 presign mocks do not prove this.
+1. **Backend media and metadata:** scoped resolvers and private endpoints own
+   authorization, catalog visibility, media access, and the stable response
+   schema used by the bridge.
+2. **Bridge conversion:** the file client and outgoing/incoming converters own
+   marker handling, provider upload, byte verification, history, and
+   reconciliation while preserving ordinary attachment behavior.
+3. **Provider event processing:** updates and cross-project reprojection preserve
+   canonical sticker URNs without requiring ordinary WorkspaceFile lookup.
+4. **Contract verification:** backend and bridge tests cover the shared private
+   API schema, authorization, PostgreSQL behavior, conversion, retry paths, and
+   storage adapters. Manual Zulip acceptance remains separate evidence because
+   unit fakes and S3 presign mocks do not prove client rendering or a complete
+   provider roundtrip.
 
 ## Acceptance matrix
 
@@ -151,39 +148,16 @@ as well as normal live events for use of the same normalization.
 | Sticker becomes blocked before renewed grant | New grant denied |
 | Cross-project message move | Global sticker reference unchanged |
 
-## Delivery limits
+## Deployment and verification
 
-No commit, push, production deployment, or live provider message is implied by
-this implementation plan. Report automated tests, real PostgreSQL checks,
-mocked provider/storage checks and manual Zulip acceptance separately. Marker
-visibility in Zulip clients must be measured, not promised to be hidden.
+Automated tests, real PostgreSQL checks, mocked provider/storage checks, and
+manual Zulip acceptance provide different evidence and are reported separately.
+Marker visibility in Zulip clients must be measured, not assumed to be hidden.
 
 Deploy the backend first and the compatible bridge second. Keep sticker sends
 disabled until the bridge is deployed. Enable the UI delete action only after
 the backend DELETE API is deployed.
 
-## Implementation checkpoint: 2026-09-08
-
-Work packages 1-5 are implemented and reviewed in the backend and sibling
-bridge working trees. No commits or deployments were made. Manual acceptance
-on a real Zulip integration remains outstanding.
-
-- Backend: 93 focused unit tests passed; three catalog visibility regressions
-  passed on the separate disposable PostgreSQL database.
-- Bridge: 24 new sticker regression cases passed, including real converter
-  edit paths and reuse of persisted outgoing rendering during reconciliation.
-  Existing focused adapter/converter/file client tests also passed.
-- Full bridge suite: 898 passed, 392 skipped, six failed. The same six failures
-  were reproduced on clean HEAD: Linux-oriented bootstrap/CI shell tests fail
-  on macOS. Database-dependent bridge tests were not exercised without a DSN.
-- Independent review of both production diffs found no blocking issues. The
-  coordinator identified and fixed a wire mismatch during review: the private
-  metadata GET must explicitly send `Content-Length: 0`.
-- Bridge changed-file Ruff checks passed. Backend Ruff reports 22 diagnostics
-  across the inspected changed files; comparison with HEAD using the same
-  checker found the same 22 diagnostic signatures and no new ones.
-- The private API YAML parses and local references resolve. Both repository
-  diffs pass whitespace checks.
-
-These results do not establish real Zulip rendering, network race behavior,
-or a complete mTLS/S3/provider roundtrip. Those remain manual acceptance items.
+Release acceptance includes real Zulip rendering, network retry behavior, and
+the complete mTLS/S3/provider roundtrip. Automated or mocked checks do not
+replace these integration checks.
