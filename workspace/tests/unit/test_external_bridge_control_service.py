@@ -423,3 +423,49 @@ def test_pruned_cursor_returns_typed_410_over_private_service(tmp_path, monkeypa
     assert response.status == 410
     assert problem["type"] == "ControlCursorExpiredError"
     assert problem["reason"] == "retention"
+
+
+def test_private_sticker_metadata_requires_identity_and_assignment_query(
+    tmp_path, monkeypatch
+):
+    private_service, _, _ = _runtime(tmp_path, monkeypatch)
+    _, certificate_der = _enroll(private_service)
+    sticker_uuid = sys_uuid.uuid4()
+    account_uuid = str(sys_uuid.uuid4())
+    chat_uuid = str(sys_uuid.uuid4())
+    expected = {
+        "uuid": str(sticker_uuid),
+        "sha256": "a" * 64,
+        "size_bytes": 42,
+        "content_type": "image/webp",
+    }
+    calls = []
+
+    def metadata(identity, uuid, request):
+        calls.append((identity, uuid, request))
+        return expected
+
+    monkeypatch.setattr(private_service.file_manager, "sticker_metadata", metadata)
+    path = f"/v1/stickers/{sticker_uuid}"
+    query = f"?external_account_uuid={account_uuid}&external_chat_uuid={chat_uuid}"
+    assert private_service.handle("GET", path + query, {}, b"", None).status == 401
+    for malformed in (
+        "",
+        f"?external_account_uuid={account_uuid}",
+        query + f"&external_chat_uuid={chat_uuid}",
+    ):
+        assert (
+            private_service.handle(
+                "GET", path + malformed, {}, b"", certificate_der
+            ).status
+            == 400
+        )
+    assert calls == []
+    response = private_service.handle("GET", path + query, {}, b"", certificate_der)
+    assert response.status == 200
+    assert json.loads(response.body) == expected
+    assert response.headers["Cache-Control"] == "no-store"
+    assert calls[0][1:] == (
+        str(sticker_uuid),
+        {"external_account_uuid": account_uuid, "external_chat_uuid": chat_uuid},
+    )

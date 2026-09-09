@@ -36,6 +36,7 @@ from workspace.messenger_api import topic_summarization
 from workspace.messenger_api import events as messenger_events
 from workspace.external_bridge_control import sql_state
 from workspace.services.messenger_workers import projection_wakeup
+from workspace.services.messenger_workers import sticker_cleanup
 from workspace.services.messenger_workers import v2_projection
 
 LOG = logging.getLogger(__name__)
@@ -175,6 +176,8 @@ class MessengerWorkerAgent(basic.BasicService):
         )
 
     def _iteration(self) -> None:
+        if not self._projection_only:
+            self._run_sticker_cleanup_task()
         processed_v2 = False
         if self._v2_projection_enabled:
             processed_v2 = self._run_v2_projection_tasks()
@@ -305,6 +308,17 @@ class MessengerWorkerAgent(basic.BasicService):
         self._summarize_one_topic()
         if self._v2_projection_enabled and not processed_v2:
             self._wait_for_v2_projection_work()
+
+    def _run_sticker_cleanup_task(self) -> bool:
+        try:
+            with database_session_context() as session:
+                return sticker_cleanup.process_one_sticker_cleanup_task(
+                    session,
+                    self._v2_worker_id,
+                )
+        except Exception:
+            LOG.exception("Failed to run the sticker cleanup queue")
+            return False
 
     def _wait_for_v2_projection_work(self) -> None:
         if self._v2_projection_wakeup is None:
