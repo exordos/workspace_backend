@@ -198,22 +198,25 @@ def _isolate_projection_queue(db):
 
 
 def _drain() -> int:
-    with contexts.Context().session_manager() as session:
-        processed = v2_projection.drain_projection_queue(
-            session,
-            f"integration:{sys_uuid.uuid4()}",
-        )
-        failures = session.execute(
-            """
-            SELECT task_kind, status, last_error
-            FROM messenger_projection_tasks
-            WHERE status IN ('failed', 'dead_letter')
-            ORDER BY created_at, uuid
-            """,
-            (),
-        ).fetchall()
-        assert failures == []
-        return processed
+    worker_id = f"integration:{sys_uuid.uuid4()}"
+    processed = 0
+    idle_turns = 0
+    while idle_turns < len(v2_projection.FAIR_SCHEDULER_LANES):
+        with contexts.Context().session_manager() as session:
+            current = v2_projection.drain_projection_queue(session, worker_id)
+            failures = session.execute(
+                """
+                SELECT task_kind, status, last_error
+                FROM messenger_projection_tasks
+                WHERE status IN ('failed', 'dead_letter')
+                ORDER BY created_at, uuid
+                """,
+                (),
+            ).fetchall()
+            assert failures == []
+        processed += current
+        idle_turns = 0 if current else idle_turns + 1
+    return processed
 
 
 def _register_project_user(db, project_uuid, user_uuid):
@@ -252,6 +255,33 @@ def test_first_request_materializes_iam_user_before_native_write(http_server, db
             (user_uuid, project_uuid),
         )
         assert cursor.fetchone() == (f"user-{user_uuid}", user_uuid)
+
+
+def test_opening_store_does_not_refresh_existing_project_user(api, db):
+    assert api.get(STREAMS).status_code == 200
+    frozen_at = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE messenger_project_users
+            SET updated_at = %s
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (frozen_at, api.project_id, api.user_uuid),
+        )
+    response = api.get(STREAMS)
+    assert response.status_code == 200
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT updated_at
+            FROM messenger_project_users
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (api.project_id, api.user_uuid),
+        )
+        assert cursor.fetchone()[0] == frozen_at
 
 
 def test_concurrent_first_requests_share_one_iam_user_import(db, monkeypatch):
@@ -8673,7 +8703,16 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
         assert cursor.fetchone()[0] == snapshot_version + 2
 
 
-def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
+def test_native_v2_coalesces_snapshot_only_read_counter_bursts(
+    api,
+    db,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.repeat("read_state"),
+    )
     stream_response = api.post(
         STREAMS,
         json={

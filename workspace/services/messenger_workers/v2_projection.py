@@ -383,13 +383,23 @@ def _claim_task(
         cursors,
     )
     if task is None and deferred_project_id is None:
+        fallback_candidate_predicate = (
+            "TRUE"
+            if preferred_lane == "read_state"
+            else f"NOT ({_lane_predicate('candidate', 'task_kind', 'read_state')})"
+        )
+        fallback_task_predicate = (
+            "TRUE"
+            if preferred_lane == "read_state"
+            else f"NOT ({_lane_predicate('task', 'task_kind', 'read_state')})"
+        )
         task, scan_state, deferred_project_id = _claim_task_for_lane(
             session,
             worker_id,
             lease_seconds,
             "fallback",
-            "TRUE",
-            "TRUE",
+            fallback_candidate_predicate,
+            fallback_task_predicate,
             metrics,
             cursors,
         )
