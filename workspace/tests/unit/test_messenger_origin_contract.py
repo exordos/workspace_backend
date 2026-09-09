@@ -34,7 +34,12 @@ ROUTE_MANIFEST = {
     "stickers": (
         routes.StickerRoute,
         sticker_controllers.StickerController,
-        {ra_routes.FILTER, ra_routes.GET, ra_routes.UPDATE},
+        {
+            ra_routes.FILTER,
+            ra_routes.GET,
+            ra_routes.UPDATE,
+            ra_routes.DELETE,
+        },
     ),
     "folders": (
         routes.FolderRoute,
