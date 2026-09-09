@@ -16,6 +16,104 @@ from workspace.services.messenger_workers import projection_wakeup
 from workspace.services.messenger_workers import v2_projection
 
 
+def test_folder_snapshot_locks_all_streams_and_refreshes_only_dirty_ones(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    first_stream_uuid = sys_uuid.UUID("10000000-0000-0000-0000-000000000000")
+    second_stream_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000000")
+    folder_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    rows = types.SimpleNamespace(
+        fetchall=lambda: [
+            {"stream_uuid": second_stream_uuid},
+            {"stream_uuid": first_stream_uuid},
+            {"stream_uuid": second_stream_uuid},
+        ]
+    )
+    dirty_rows = types.SimpleNamespace(
+        fetchall=lambda: [{"stream_uuid": second_stream_uuid}]
+    )
+    results = iter((rows, dirty_rows))
+    statements = []
+
+    def execute(statement, values):
+        statements.append((statement, values))
+        return next(results)
+
+    session = types.SimpleNamespace(execute=execute)
+    calls = []
+    monkeypatch.setattr(
+        v2_projection,
+        "_refresh_recipient_counters",
+        lambda *args: calls.append(("refresh", args)),
+    )
+
+    v2_projection._refresh_folder_stream_counters(
+        session,
+        project_uuid,
+        user_uuid,
+        folder_uuid,
+    )
+
+    assert [call[0] for call in calls] == ["refresh"]
+    assert calls[0][1][2] == second_stream_uuid
+    assert "ORDER BY item.stream_uuid" in statements[0][0]
+    assert "FOR UPDATE OF stream_binding" in statements[0][0]
+    assert "status NOT IN ('completed', 'dead_letter')" in statements[1][0]
+
+
+def test_topic_counter_snapshot_locks_its_binding_before_refresh(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    calls = []
+    monkeypatch.setattr(
+        v2_projection.read_state,
+        "lock_counter_projection_scopes",
+        lambda *args: calls.append(("scope-lock", args)),
+    )
+    monkeypatch.setattr(
+        v2_projection,
+        "_refresh_recipient_counters",
+        lambda *args: calls.append(("refresh", args)),
+    )
+    monkeypatch.setattr(
+        v2_projection,
+        "_emit_unread_snapshots",
+        lambda *args: calls.append(("emit", args)),
+    )
+    monkeypatch.setattr(
+        v2_projection, "_try_lock_project_event_tail", lambda *_args: None
+    )
+    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: None)
+
+    v2_projection._process_read_counters(
+        session,
+        {
+            "uuid": sys_uuid.uuid4(),
+            "project_id": project_uuid,
+            "scope_kind": "user-topic",
+            "scope_key": f"{project_uuid}:{user_uuid}:{topic_uuid}",
+            "outbox_event_uuid": sys_uuid.uuid4(),
+            "payload": {
+                "source_kind": "messages.read",
+                "user_uuid": str(user_uuid),
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+            },
+        },
+    )
+
+    assert [call[0] for call in calls] == ["scope-lock", "refresh", "emit"]
+    assert calls[0][1] == (
+        session,
+        project_uuid,
+        user_uuid,
+        stream_uuid,
+        (topic_uuid,),
+    )
+
+
 def test_stream_counter_snapshot_accepts_no_default_topic(monkeypatch):
     project_uuid = sys_uuid.uuid4()
     stream_uuid = sys_uuid.uuid4()

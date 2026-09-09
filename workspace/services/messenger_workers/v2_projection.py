@@ -28,6 +28,7 @@ from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import resource_projection
+from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import v2_models
 from workspace.external_bridge_control import file_repository
 
@@ -2076,6 +2077,13 @@ def _process_read_counters(
     topic_uuid = None if topic_value is None else _uuid(topic_value)
     if task["scope_kind"] == "user-topic" and topic_uuid is None:
         raise ValueError("Topic counter task is missing its topic UUID")
+    read_state.lock_counter_projection_scopes(
+        session,
+        task["project_id"],
+        user_uuid,
+        _uuid(payload["stream_uuid"]),
+        () if task["scope_kind"] == "user-stream" else (topic_uuid,),
+    )
     if payload.get("source_kind") == "history.imported":
         # The import transaction already applied bounded counter deltas. Never
         # scan message history again to publish its completion snapshot.
@@ -2188,6 +2196,8 @@ def _process_folder_projection(
     user_uuid = _uuid(payload["user_uuid"])
     source_kind = payload["source_kind"]
     stream_uuid = payload.get("stream_uuid")
+    if stream_uuid is not None:
+        stream_uuid = _uuid(stream_uuid)
     if source_kind in LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS:
         # Legacy flag repair can enqueue the same authoritative folder rebuild
         # once per message.  The claimed rebuild absorbs every idle sibling for
@@ -2313,6 +2323,7 @@ def _process_folder_projection(
                 rule,
             ),
         )
+    _refresh_folder_stream_counters(session, project_id, user_uuid, folder_uuid)
     session.execute(
         """
         WITH snapshot AS (
@@ -2426,6 +2437,58 @@ def _process_folder_projection(
         stream_uuid=stream_uuid,
         control_effect=stream_uuid is None or source_kind == "stream.deleted",
     )
+
+
+def _refresh_folder_stream_counters(
+    session: typing.Any,
+    project_id: object,
+    user_uuid: sys_uuid.UUID,
+    folder_uuid: sys_uuid.UUID,
+) -> None:
+    """Lock a folder's streams and refresh scopes with outstanding counter work."""
+    rows = session.execute(
+        """
+        SELECT item.stream_uuid
+        FROM messenger_folder_items AS item
+        JOIN messenger_stream_bindings AS stream_binding
+          ON stream_binding.project_id = item.project_id
+         AND stream_binding.user_uuid = item.user_uuid
+         AND stream_binding.stream_uuid = item.stream_uuid
+         AND stream_binding.active
+        JOIN messenger_streams AS visible_stream
+          ON visible_stream.project_id = item.project_id
+         AND visible_stream.uuid = item.stream_uuid
+         AND NOT visible_stream.is_archived
+         AND visible_stream.deleted_at IS NULL
+        WHERE item.project_id = %s AND item.user_uuid = %s
+          AND item.folder_uuid = %s
+        ORDER BY item.stream_uuid
+        FOR UPDATE OF stream_binding
+        """,
+        (project_id, user_uuid, folder_uuid),
+    ).fetchall()
+    stream_uuids = sorted({_uuid(row["stream_uuid"]) for row in rows}, key=str)
+    dirty_rows = session.execute(
+        """
+        SELECT DISTINCT task.payload->>'stream_uuid' AS stream_uuid
+        FROM messenger_projection_tasks AS task
+        WHERE task.project_id = %s AND task.task_kind = 'read_counters'
+          AND task.status NOT IN ('completed', 'dead_letter')
+          AND task.payload->>'user_uuid' = %s::text
+          AND task.payload->>'stream_uuid' = ANY(%s::text[])
+        ORDER BY task.payload->>'stream_uuid'
+        """,
+        (project_id, user_uuid, [str(value) for value in stream_uuids]),
+    ).fetchall()
+    for stream_uuid in (_uuid(row["stream_uuid"]) for row in dirty_rows):
+        _refresh_recipient_counters(
+            session,
+            project_id,
+            stream_uuid,
+            None,
+            [user_uuid],
+            "user-stream",
+        )
 
 
 def _process_stream_folder_projection(

@@ -4388,6 +4388,14 @@ def delete_workspace_user_stream(
             user_streams=user_streams,
         )
 
+        # The project lock above is already held. Lock every active canonical
+        # membership before stream.deleted events and the stream cascade so
+        # blocking writers share the same project-before-binding order.
+        read_state.lock_stream_counter_projection_scopes(
+            s,
+            project_id,
+            stream_uuid,
+        )
         for user_stream in user_streams:
             messenger_events.create_stream_deleted_event(
                 project_id=project_id,
@@ -5348,9 +5356,8 @@ def ensure_workspace_message_recipients(
             (sys_uuid.UUID(str(row["user_uuid"])) for row in inserted_rows),
             key=str,
         )
-        if (
-            message.user_uuid in inserted_recipients
-            and read_state.writes_compact_state(session, project_id)
+        if message.user_uuid in inserted_recipients and read_state.writes_compact_state(
+            session, project_id
         ):
             read_state.set_message_read(
                 session,

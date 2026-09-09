@@ -1829,8 +1829,7 @@ def _message_event(
                         previous_topic_uuid,
                         sys_uuid.UUID(str(event["provider_event_uuid"])),
                         include_stream=(
-                            cross_project_move
-                            or previous_stream_uuid != stream_uuid
+                            cross_project_move or previous_stream_uuid != stream_uuid
                         ),
                     )
             if not quiet_backfill:
@@ -2060,14 +2059,21 @@ def _sync_provider_read_state(
     emit_events: bool = True,
     schedule_counters: bool = True,
 ) -> None:
-    # Workspace events acquire this project-scoped lock after mutating message
-    # flags. Take it first for imported read-state batches so a concurrent
-    # writer cannot hold the event lock while waiting for one of those rows.
+    # Global fanout work already holds the project lock when it reaches a
+    # recipient binding. Provider reads must follow that order before changing
+    # imported state; counter workers use a nonblocking event-tail acquisition
+    # when they start from the binding side and can therefore retry safely.
     session.execute(
         """
         SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))
         """,
         (project_id,),
+    )
+    read_state.lock_counter_projection_scopes(
+        session,
+        project_id,
+        reader_uuid,
+        stream_uuid,
     )
     mode = read_state.project_mode(session, project_id)
     # A shared provider message can already exist because another account in
@@ -2152,6 +2158,13 @@ def _sync_provider_read_state(
         ).fetchall()
     if any(message["stream_uuid"] != stream_uuid for message in messages):
         raise ValueError("Provider read state message is outside the selected chat")
+    read_state.lock_counter_projection_scopes(
+        session,
+        project_id,
+        reader_uuid,
+        stream_uuid,
+        {message["topic_uuid"] for message in messages},
+    )
     changed_message_uuids_by_read: dict[bool, list[sys_uuid.UUID]] = {
         True: [],
         False: [],

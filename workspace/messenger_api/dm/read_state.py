@@ -49,6 +49,67 @@ READ_STATE_STRUCTURE_LOCK_KEY = "workspace-read-state-structure-v1"
 EXTERNAL_ACCOUNT_RESOURCE_LOCK_KEY = "workspace-external-account-resource-v1"
 
 
+def lock_counter_projection_scopes(
+    session: typing.Any,
+    project_id: object,
+    user_uuid: object,
+    stream_uuid: object,
+    topic_uuids: collections.abc.Iterable[object] = (),
+) -> None:
+    """Serialize a read mutation with snapshots for the same UI counters."""
+    execute = getattr(session, "execute", None)
+    if not callable(execute):
+        return
+    execute(
+        """
+        SELECT uuid
+        FROM messenger_stream_bindings
+        WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+          AND active
+        FOR UPDATE
+        """,
+        (project_id, user_uuid, stream_uuid),
+    )
+    topics = sorted(
+        {sys_uuid.UUID(str(topic_uuid)) for topic_uuid in topic_uuids},
+        key=str,
+    )
+    if not topics:
+        return
+    execute(
+        """
+        SELECT uuid
+        FROM messenger_user_topic_bindings
+        WHERE project_id = %s AND user_uuid = %s
+          AND topic_uuid = ANY(%s::uuid[])
+        ORDER BY topic_uuid
+        FOR UPDATE
+        """,
+        (project_id, user_uuid, topics),
+    )
+
+
+def lock_stream_counter_projection_scopes(
+    session: typing.Any,
+    project_id: object,
+    stream_uuid: object,
+) -> None:
+    """Serialize stream deletion with every counter snapshot for the chat."""
+    execute = getattr(session, "execute", None)
+    if not callable(execute):
+        return
+    execute(
+        """
+        SELECT uuid
+        FROM messenger_stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND active
+        ORDER BY user_uuid
+        FOR UPDATE
+        """,
+        (project_id, stream_uuid),
+    )
+
+
 def _project_structure_lock_key(project_id: object) -> str:
     return f"{READ_STATE_STRUCTURE_LOCK_KEY}:{project_id}"
 
