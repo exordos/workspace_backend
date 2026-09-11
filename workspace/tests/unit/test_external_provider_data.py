@@ -858,6 +858,7 @@ def test_publish_operation_event_updates_target_delivery_in_same_transaction(
     operation = types.SimpleNamespace(
         uuid=sys_uuid.uuid4(),
         owner_user_uuid=owner_uuid,
+        action="message.create",
         target_type="message",
         target_uuid=target_uuid,
         status="succeeded",
@@ -933,6 +934,7 @@ def test_multi_placement_delivery_updates_canonical_snapshot(monkeypatch):
     updated_at = datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc)
     operation = types.SimpleNamespace(
         uuid=sys_uuid.uuid4(),
+        action="message.create",
         target_type="message",
         target_uuid=target_uuid,
         status="succeeded",
@@ -1001,6 +1003,7 @@ def test_delivery_projection_change_guard_uses_public_fields(monkeypatch):
     target_uuid = sys_uuid.uuid4()
     operation = types.SimpleNamespace(
         uuid=sys_uuid.uuid4(),
+        action="message.create",
         target_type="message",
         target_uuid=target_uuid,
         status="running",
@@ -1095,6 +1098,7 @@ def test_direct_target_sync_locks_project_before_snapshot(monkeypatch):
     updated_at = datetime.datetime(2026, 8, 27, tzinfo=datetime.timezone.utc)
     operation = types.SimpleNamespace(
         uuid=sys_uuid.uuid4(),
+        action="stream.update",
         target_type="stream",
         target_uuid=target_uuid,
         status="succeeded",
@@ -1130,6 +1134,118 @@ def test_direct_target_sync_locks_project_before_snapshot(monkeypatch):
     assert "pg_advisory_xact_lock(" in order[1][1]
     assert "UPDATE m_workspace_streams" in order[2][1]
     assert order[3][0] == "snapshot"
+
+
+@pytest.mark.parametrize(
+    ("action", "target_type"),
+    [
+        ("read_state.set", "message"),
+        ("read_state.set", "stream"),
+        ("read_state.set", "topic"),
+        ("stream.notification.update", "stream"),
+        ("topic.notification.update", "topic"),
+    ],
+)
+def test_per_user_operation_does_not_project_target_delivery(action, target_type):
+    operation = types.SimpleNamespace(
+        action=action,
+        target_type=target_type,
+        target_uuid=sys_uuid.uuid4(),
+    )
+    session = types.SimpleNamespace(
+        execute=lambda *_args, **_kwargs: pytest.fail(
+            "per-user synchronization must not touch target delivery"
+        )
+    )
+
+    provider_data.sync_operation_target_delivery(
+        session,
+        operation,
+        sys_uuid.uuid4(),
+    )
+
+
+def test_discarded_operation_restores_previous_target_delivery(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    operation = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        target_type="stream",
+        target_uuid=target_uuid,
+    )
+    replacement = types.SimpleNamespace(uuid=sys_uuid.uuid4())
+    responses = iter(
+        (
+            LeaseResponse(one={"uuid": target_uuid}),
+            LeaseResponse(one={"uuid": replacement.uuid}),
+        )
+    )
+    session = types.SimpleNamespace(execute=lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(provider_data.read_state, "lock_projects", lambda *_args: None)
+    monkeypatch.setattr(
+        type(provider_data.external_models.ExternalOperation.objects),
+        "get_one",
+        lambda _objects, **_kwargs: replacement,
+    )
+    restored = []
+    monkeypatch.setattr(
+        provider_data,
+        "sync_operation_target_delivery",
+        lambda *args, **kwargs: restored.append((args, kwargs)),
+    )
+
+    provider_data.restore_operation_target_delivery(
+        session,
+        operation,
+        project_uuid,
+    )
+
+    assert restored == [
+        (
+            (session, replacement, project_uuid),
+            {"_event_order_locked": True},
+        )
+    ]
+
+
+def test_discarded_operation_clears_orphaned_target_delivery(monkeypatch):
+    project_uuid = sys_uuid.uuid4()
+    target_uuid = sys_uuid.uuid4()
+    operation = types.SimpleNamespace(
+        uuid=sys_uuid.uuid4(),
+        target_type="topic",
+        target_uuid=target_uuid,
+    )
+    responses = iter(
+        (
+            LeaseResponse(one={"uuid": target_uuid}),
+            LeaseResponse(one=None),
+            LeaseResponse(one={"uuid": target_uuid}),
+        )
+    )
+    statements = []
+
+    def execute(statement, params):
+        statements.append((statement, params))
+        return next(responses)
+
+    session = types.SimpleNamespace(execute=execute)
+    monkeypatch.setattr(provider_data.read_state, "lock_projects", lambda *_args: None)
+    emitted = []
+    monkeypatch.setattr(
+        provider_data,
+        "_emit_target_updated_events",
+        lambda *args: emitted.append(args),
+    )
+
+    provider_data.restore_operation_target_delivery(
+        session,
+        operation,
+        project_uuid,
+    )
+
+    assert "UPDATE m_workspace_stream_topics" in statements[2][0]
+    assert emitted == [(session, project_uuid, "topic", target_uuid)]
 
 
 @pytest.mark.parametrize("target_type", ["stream", "topic"])

@@ -21892,6 +21892,7 @@ def test_delivery_projection_skips_timestamp_only_pending_transition(api, db):
     def sync(status, updated_at):
         operation = types.SimpleNamespace(
             uuid=operation_uuid,
+            action="message.create",
             target_type="message",
             target_uuid=message_uuid,
             status=status,
@@ -21953,3 +21954,201 @@ def test_delivery_projection_skips_timestamp_only_pending_transition(api, db):
         delivery_events = cursor.fetchall()
 
     assert delivery_events == [("pending",), ("delivered",)]
+
+
+def test_read_state_delivery_does_not_overwrite_message_snapshot(api, db):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Read delivery isolation",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "read delivery",
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "read isolation"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+
+    for status in ("queued", "running", "succeeded"):
+        operation = types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            action="read_state.set",
+            target_type="message",
+            target_uuid=message_uuid,
+            status=status,
+            safe_error=None,
+            can_retry=False,
+            can_discard=False,
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+            duplicate_risk=False,
+            retry_requires_confirmation=False,
+            original_url=None,
+            reconciliation_reason=None,
+        )
+        _run_database_operation(
+            lambda session: provider_data.sync_operation_target_delivery(
+                session,
+                operation,
+                project_uuid,
+            )
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_metadata
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (None, None)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_broadcast_message_events_v1 AS event
+            JOIN m_workspace_event_audience_members_v1 AS member
+              ON member.audience_snapshot_uuid = event.audience_snapshot_uuid
+            WHERE event.project_id = %s
+              AND member.user_uuid = %s
+              AND event.payload->>'kind' = 'message.updated'
+              AND event.payload->'payload'->>'content' = 'read isolation'
+            """,
+            (project_uuid, api.user_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_discarded_operation_restores_previous_message_delivery(api, db):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Discarded delivery restoration",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "discarded delivery",
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "restore delivery"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    account_uuid = sys_uuid.uuid4()
+    previous_operation_uuid = sys_uuid.uuid4()
+    discarded_operation_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, FALSE, 'live', TRUE)
+            """,
+            (account_uuid, api.user_uuid),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, target_uuid, status, updated_at
+            ) VALUES (%s, %s, %s, %s, 'message', %s, %s, %s)
+            """,
+            (
+                (
+                    previous_operation_uuid,
+                    account_uuid,
+                    api.user_uuid,
+                    "message.create",
+                    message_uuid,
+                    "succeeded",
+                    datetime.datetime(2026, 9, 11, tzinfo=datetime.timezone.utc),
+                ),
+                (
+                    discarded_operation_uuid,
+                    account_uuid,
+                    api.user_uuid,
+                    "message.update",
+                    message_uuid,
+                    "discarded",
+                    datetime.datetime(
+                        2026, 9, 11, 0, 0, 1, tzinfo=datetime.timezone.utc
+                    ),
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET delivery_metadata = jsonb_build_object(
+                    'external_operation_uuid', %s::text,
+                    'status', 'discarded'
+                ),
+                delivery_status = 'failed',
+                delivery_updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (discarded_operation_uuid, project_uuid, message_uuid),
+        )
+    db.commit()
+
+    operation = types.SimpleNamespace(
+        uuid=discarded_operation_uuid,
+        target_type="message",
+        target_uuid=message_uuid,
+    )
+    _run_database_operation(
+        lambda session: provider_data.restore_operation_target_delivery(
+            session,
+            operation,
+            project_uuid,
+        )
+    )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_metadata->>'external_operation_uuid',
+                   delivery_metadata->>'status', delivery_status
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (
+            str(previous_operation_uuid),
+            "delivered",
+            "delivered",
+        )
+        cursor.execute(
+            """
+            SELECT delivery->>'external_operation_uuid', delivery->>'status'
+            FROM messenger_messages
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (str(previous_operation_uuid), "delivered")

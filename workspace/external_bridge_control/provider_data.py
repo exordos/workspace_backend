@@ -70,6 +70,18 @@ _DELIVERY_STATUS_BY_OPERATION_STATUS = {
     "manual_reconciliation_required": "manual_reconciliation_required",
     "discarded": "discarded",
 }
+_PER_USER_OPERATION_ACTIONS = frozenset(
+    {
+        "read_state.set",
+        "stream.notification.update",
+        "topic.notification.update",
+    }
+)
+_TARGET_DELIVERY_ACTIONS = {
+    "message": ("message.create", "message.update", "message.delete"),
+    "stream": ("stream.update", "stream.delete"),
+    "topic": ("topic.create", "topic.update", "topic.delete"),
+}
 
 
 def _is_quiet_backfill_event(event: object) -> bool:
@@ -1361,6 +1373,10 @@ def sync_operation_target_delivery(
     _event_order_locked: bool = False,
 ) -> None:
     """Project one public operation status onto its canonical target."""
+    # Per-user synchronization has its own operation event and must not replace
+    # the shared target resource's delivery state.
+    if operation.action in _PER_USER_OPERATION_ACTIONS:
+        return
     # A direct caller may not have entered the normal messenger event path.
     # Fence downgrade and serialize the target snapshot before it is prepared.
     if not _event_order_locked:
@@ -1469,6 +1485,148 @@ def sync_operation_target_delivery(
             operation.safe_error,
         ),
     ).fetchone()
+    if changed is not None:
+        _emit_target_updated_events(
+            session,
+            project_id,
+            operation.target_type,
+            operation.target_uuid,
+        )
+
+
+def restore_operation_target_delivery(
+    session: typing.Any,
+    operation: external_models.ExternalOperation,
+    project_id: object,
+) -> None:
+    """Restore target delivery when its current operation is discarded."""
+    actions = _TARGET_DELIVERY_ACTIONS.get(operation.target_type)
+    if actions is None or operation.target_uuid is None:
+        return
+    read_state.lock_projects(session, (project_id,))
+    table = {
+        "message": "m_workspace_messages",
+        "stream": "m_workspace_streams",
+        "topic": "m_workspace_stream_topics",
+    }[operation.target_type]
+    legacy = session.execute(
+        f"""
+        SELECT uuid
+        FROM {table}
+        WHERE project_id = %s AND uuid = %s
+          AND delivery_metadata->>'external_operation_uuid' = %s
+        """,
+        (project_id, operation.target_uuid, str(operation.uuid)),
+    ).fetchone()
+    canonical_message_uuid = None
+    if operation.target_type == "message":
+        canonical = session.execute(
+            """
+            SELECT target.uuid
+            FROM messenger_messages AS target
+            WHERE target.project_id = %s
+              AND target.delivery->>'external_operation_uuid' = %s
+              AND (
+                  target.uuid = %s
+                  OR EXISTS (
+                      SELECT 1
+                      FROM messenger_message_placements AS placement
+                      WHERE placement.project_id = target.project_id
+                        AND placement.message_uuid = target.uuid
+                        AND %s IN (
+                            placement.uuid,
+                            placement.legacy_public_uuid
+                        )
+                  )
+              )
+            ORDER BY target.uuid
+            LIMIT 1
+            """,
+            (
+                project_id,
+                str(operation.uuid),
+                operation.target_uuid,
+                operation.target_uuid,
+            ),
+        ).fetchone()
+        if canonical is not None:
+            canonical_message_uuid = canonical["uuid"]
+    if legacy is None and canonical_message_uuid is None:
+        return
+    replacement = session.execute(
+        """
+        SELECT candidate.uuid
+        FROM m_external_operations_v2 AS candidate
+        WHERE candidate.uuid <> %s
+          AND candidate.target_type = %s
+          AND candidate.action = ANY(%s::text[])
+          AND candidate.status <> 'discarded'
+          AND (
+              candidate.target_uuid = %s
+              OR (
+                  %s::uuid IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM messenger_message_placements AS placement
+                      WHERE placement.project_id = %s
+                        AND placement.message_uuid = %s
+                        AND candidate.target_uuid IN (
+                            placement.uuid,
+                            placement.legacy_public_uuid
+                        )
+                  )
+              )
+          )
+        ORDER BY candidate.updated_at DESC, candidate.uuid DESC
+        LIMIT 1
+        """,
+        (
+            operation.uuid,
+            operation.target_type,
+            list(actions),
+            operation.target_uuid,
+            canonical_message_uuid,
+            project_id,
+            canonical_message_uuid,
+        ),
+    ).fetchone()
+    if replacement is not None:
+        replacement_operation = external_models.ExternalOperation.objects.get_one(
+            filters={"uuid": dm_filters.EQ(replacement["uuid"])},
+            session=session,
+        )
+        sync_operation_target_delivery(
+            session,
+            replacement_operation,
+            project_id,
+            _event_order_locked=True,
+        )
+        return
+    changed = session.execute(
+        f"""
+        UPDATE {table}
+        SET delivery_metadata = NULL,
+            delivery_status = NULL,
+            delivery_error = NULL,
+            delivery_updated_at = NULL
+        WHERE project_id = %s AND uuid = %s
+          AND delivery_metadata->>'external_operation_uuid' = %s
+        RETURNING uuid
+        """,
+        (project_id, operation.target_uuid, str(operation.uuid)),
+    ).fetchone()
+    if canonical_message_uuid is not None:
+        canonical_changed = session.execute(
+            """
+            UPDATE messenger_messages
+            SET delivery = NULL
+            WHERE project_id = %s AND uuid = %s
+              AND delivery->>'external_operation_uuid' = %s
+            RETURNING uuid
+            """,
+            (project_id, canonical_message_uuid, str(operation.uuid)),
+        ).fetchone()
+        changed = canonical_changed if changed is None else changed
     if changed is not None:
         _emit_target_updated_events(
             session,

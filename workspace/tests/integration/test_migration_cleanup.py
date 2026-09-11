@@ -154,6 +154,10 @@ EXTERNAL_STREAM_ACCESS_MIGRATION_FILE = (
 EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE = (
     "0184-allow-external-stream-snapshot-visibility-51c501.py"
 )
+PER_USER_DELIVERY_REPAIR_MIGRATION_UUID = "e1f5ca44-b5b5-4bdc-bfdd-bf5996a34b4f"
+PER_USER_DELIVERY_REPAIR_MIGRATION_FILE = (
+    "0185-Repair-per-user-operation-delivery-projections-e1f5ca.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -464,6 +468,9 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[LEGACY_BACKFILL_COUNTER_MIGRATION_FILE]._depends == [
         PROJECTION_ACCELERATION_MIGRATION_FILE
     ]
+    assert migrations[PER_USER_DELIVERY_REPAIR_MIGRATION_FILE]._depends == [
+        EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
@@ -471,7 +478,7 @@ def test_current_migrations_have_a_single_head(_database, db):
 
     assert (
         engine.get_latest_migration()
-        == "0184-allow-external-stream-snapshot-visibility-51c501.py"
+        == PER_USER_DELIVERY_REPAIR_MIGRATION_FILE
     )
     with db.cursor() as cur:
         cur.execute(
@@ -540,6 +547,7 @@ def test_current_migrations_have_a_single_head(_database, db):
                     EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID,
                     PROJECTION_ACCELERATION_MIGRATION_UUID,
                     LEGACY_BACKFILL_COUNTER_MIGRATION_UUID,
+                    PER_USER_DELIVERY_REPAIR_MIGRATION_UUID,
                 ],
             ),
         )
@@ -606,6 +614,7 @@ def test_current_migrations_have_a_single_head(_database, db):
             (EXPIRED_PROVIDER_READ_RETRY_MIGRATION_UUID, True),
             (PROJECTION_ACCELERATION_MIGRATION_UUID, True),
             (LEGACY_BACKFILL_COUNTER_MIGRATION_UUID, True),
+            (PER_USER_DELIVERY_REPAIR_MIGRATION_UUID, True),
         }
         cur.execute(
             """
@@ -983,6 +992,423 @@ def test_external_stream_snapshot_migration_resets_affected_event_cursors(
         _database,
         db,
     )
+
+
+def test_per_user_delivery_migration_repairs_shared_resource_snapshots(
+    _database,
+    db,
+):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    stream_operation_uuid = sys_uuid.uuid4()
+    stream_delivery_operation_uuid = sys_uuid.uuid4()
+    topic_operation_uuid = sys_uuid.uuid4()
+    message_operation_uuid = sys_uuid.uuid4()
+    message_delivery_operation_uuid = sys_uuid.uuid4()
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        project_uuid,
+        owner_uuid,
+        "Per-user delivery repair",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        project_uuid,
+        stream_uuid,
+        owner_uuid,
+        "delivery repair",
+    )
+    message_uuid = sys_uuid.uuid4()
+    migration = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )._load_migrations()[PER_USER_DELIVERY_REPAIR_MIGRATION_FILE]
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            DROP TRIGGER IF EXISTS
+                workspace_reject_per_user_message_delivery_v1
+            ON m_workspace_messages;
+            DROP TRIGGER IF EXISTS
+                workspace_reject_per_user_canonical_delivery_v1
+            ON messenger_messages;
+            DROP TRIGGER IF EXISTS
+                workspace_reject_per_user_stream_delivery_v1
+            ON m_workspace_streams;
+            DROP TRIGGER IF EXISTS
+                workspace_reject_per_user_topic_delivery_v1
+            ON m_workspace_stream_topics;
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, FALSE, 'live', TRUE)
+            """,
+            (account_uuid, owner_uuid),
+        )
+        cur.executemany(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, target_uuid, status,
+                safe_error, can_retry, can_discard
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                (
+                    stream_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "stream.update",
+                    "stream",
+                    stream_uuid,
+                    "discarded",
+                    None,
+                    False,
+                    False,
+                ),
+                (
+                    stream_delivery_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "stream.update",
+                    "stream",
+                    stream_uuid,
+                    "succeeded",
+                    None,
+                    False,
+                    False,
+                ),
+                (
+                    topic_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "topic.notification.update",
+                    "topic",
+                    topic_uuid,
+                    "succeeded",
+                    None,
+                    False,
+                    False,
+                ),
+                (
+                    message_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "read_state.set",
+                    "message",
+                    message_uuid,
+                    "succeeded",
+                    None,
+                    False,
+                    False,
+                ),
+                (
+                    message_delivery_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "message.create",
+                    "message",
+                    message_uuid,
+                    "failed",
+                    "provider temporarily unavailable",
+                    True,
+                    True,
+                ),
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_messages (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid,
+                payload, source_name, source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"delivery repair"}',
+                'native', '{"kind":"native"}'
+            )
+            """,
+            (message_uuid, project_uuid, stream_uuid, topic_uuid, owner_uuid),
+        )
+        for table, target_uuid, operation_uuid, delivery_status in (
+            (
+                "m_workspace_streams",
+                stream_uuid,
+                stream_operation_uuid,
+                "discarded",
+            ),
+            (
+                "m_workspace_stream_topics",
+                topic_uuid,
+                topic_operation_uuid,
+                "delivered",
+            ),
+            (
+                "m_workspace_messages",
+                message_uuid,
+                message_operation_uuid,
+                "delivered",
+            ),
+        ):
+            cur.execute(
+                f"""
+                UPDATE {table}
+                SET delivery_metadata = jsonb_build_object(
+                        'external_operation_uuid', %s::text,
+                        'status', %s::text
+                    ),
+                    delivery_status = %s,
+                    delivery_error = 'stale per-user delivery',
+                    delivery_updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (
+                    operation_uuid,
+                    delivery_status,
+                    (
+                        "failed"
+                        if delivery_status == "discarded"
+                        else delivery_status
+                    ),
+                    project_uuid,
+                    target_uuid,
+                ),
+            )
+        cur.execute(
+            """
+            UPDATE messenger_messages
+            SET delivery = jsonb_build_object(
+                'external_operation_uuid', %s::text,
+                'status', 'delivered'
+            )
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            """,
+            (message_operation_uuid, project_uuid, message_uuid),
+        )
+        # Simulate operations whose deletion events are already outside the
+        # bounded event-retention window. The genuine stream operation must
+        # be restored just as safely as the stale per-user message operation.
+        cur.execute(
+            "DELETE FROM m_external_operations_v2 WHERE uuid = ANY(%s::uuid[])",
+            ([stream_operation_uuid, message_operation_uuid],),
+        )
+        cur.execute(
+            """
+            INSERT INTO m_workspace_event_cursors (
+                project_id, user_uuid, current_epoch_version,
+                pruned_through_epoch_version
+            ) VALUES (%s, %s, 17, 3)
+            RETURNING epoch_generation
+            """,
+            (project_uuid, owner_uuid),
+        )
+        cursor_generation_before = cur.fetchone()[0]
+
+        migration.upgrade(cur)
+
+        cur.execute(
+            """
+            SELECT delivery_metadata->>'external_operation_uuid',
+                   delivery_metadata->>'status', delivery_status,
+                   delivery_error
+            FROM m_workspace_streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, stream_uuid),
+        )
+        assert cur.fetchone() == (
+            str(stream_delivery_operation_uuid),
+            "delivered",
+            "delivered",
+            None,
+        )
+        cur.execute(
+            """
+            SELECT delivery_metadata, delivery_status,
+                   delivery_error, delivery_updated_at
+            FROM m_workspace_stream_topics
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, topic_uuid),
+        )
+        assert cur.fetchone() == (None, None, None, None)
+        cur.execute(
+            """
+            SELECT delivery_metadata->>'external_operation_uuid',
+                   delivery_metadata->>'status', delivery_status,
+                   delivery_error
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cur.fetchone() == (
+            str(message_delivery_operation_uuid),
+            "failed",
+            "failed",
+            "provider temporarily unavailable",
+        )
+        cur.execute(
+            """
+            SELECT delivery->>'external_operation_uuid',
+                   delivery->>'status', delivery->>'safe_error'
+            FROM messenger_messages
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cur.fetchone() == (
+            str(message_delivery_operation_uuid),
+            "failed",
+            "provider temporarily unavailable",
+        )
+        cur.execute(
+            """
+            SELECT epoch_generation, current_epoch_version,
+                   pruned_through_epoch_version
+            FROM m_workspace_event_cursors
+            WHERE project_id = %s AND user_uuid = %s
+            """,
+            (project_uuid, owner_uuid),
+        )
+        generation_after, current_epoch, pruned_epoch = cur.fetchone()
+        assert generation_after != cursor_generation_before
+        assert (current_epoch, pruned_epoch) == (17, 17)
+
+        late_message_operation_uuid = sys_uuid.uuid4()
+        late_stream_operation_uuid = sys_uuid.uuid4()
+        late_topic_operation_uuid = sys_uuid.uuid4()
+        cur.executemany(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, target_uuid, status
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'succeeded')
+            """,
+            (
+                (
+                    late_message_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "read_state.set",
+                    "message",
+                    message_uuid,
+                ),
+                (
+                    late_stream_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "stream.notification.update",
+                    "stream",
+                    stream_uuid,
+                ),
+                (
+                    late_topic_operation_uuid,
+                    account_uuid,
+                    owner_uuid,
+                    "topic.notification.update",
+                    "topic",
+                    topic_uuid,
+                ),
+            ),
+        )
+        for table, target_uuid, operation_uuid in (
+            ("m_workspace_messages", message_uuid, late_message_operation_uuid),
+            ("m_workspace_streams", stream_uuid, late_stream_operation_uuid),
+            (
+                "m_workspace_stream_topics",
+                topic_uuid,
+                late_topic_operation_uuid,
+            ),
+        ):
+            cur.execute(
+                f"""
+                UPDATE {table}
+                SET delivery_metadata = jsonb_build_object(
+                        'external_operation_uuid', %s::text,
+                        'status', 'delivered'
+                    ),
+                    delivery_status = 'delivered',
+                    delivery_error = NULL,
+                    delivery_updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s
+                RETURNING uuid
+                """,
+                (operation_uuid, project_uuid, target_uuid),
+            )
+            assert cur.fetchone() is None
+        cur.execute(
+            """
+            UPDATE messenger_messages
+            SET delivery = jsonb_build_object(
+                'external_operation_uuid', %s::text,
+                'status', 'delivered'
+            )
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            RETURNING uuid
+            """,
+            (late_message_operation_uuid, project_uuid, message_uuid),
+        )
+        assert cur.fetchone() is None
+        cur.execute(
+            """
+            SELECT count(*)
+            FROM (
+                SELECT delivery_metadata->>'external_operation_uuid' AS uuid
+                FROM m_workspace_messages
+                WHERE project_id = %s AND uuid = %s
+                UNION ALL
+                SELECT delivery->>'external_operation_uuid'
+                FROM messenger_messages
+                WHERE project_id = %s AND legacy_public_uuid = %s
+                UNION ALL
+                SELECT delivery_metadata->>'external_operation_uuid'
+                FROM m_workspace_streams
+                WHERE project_id = %s AND uuid = %s
+                UNION ALL
+                SELECT delivery_metadata->>'external_operation_uuid'
+                FROM m_workspace_stream_topics
+                WHERE project_id = %s AND uuid = %s
+            ) AS projection
+            WHERE projection.uuid = ANY(%s::text[])
+            """,
+            (
+                project_uuid,
+                message_uuid,
+                project_uuid,
+                message_uuid,
+                project_uuid,
+                stream_uuid,
+                project_uuid,
+                topic_uuid,
+                [
+                    str(late_message_operation_uuid),
+                    str(late_stream_operation_uuid),
+                    str(late_topic_operation_uuid),
+                ],
+            ),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "DELETE FROM m_external_accounts_v2 WHERE uuid = %s",
+            (account_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_events WHERE project_id = %s",
+            (project_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_event_cursors WHERE project_id = %s",
+            (project_uuid,),
+        )
+        cur.execute(
+            "DELETE FROM m_workspace_streams WHERE project_id = %s AND uuid = %s",
+            (project_uuid, stream_uuid),
+        )
 
 
 def test_cancelled_provider_read_migration_unblocks_later_lane_state(_database, db):
