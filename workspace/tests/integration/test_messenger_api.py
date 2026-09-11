@@ -10131,11 +10131,12 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     assert next_page == []
 
 
-def test_events_keep_native_message_visible_through_confirmed_external_stream_access(
+def test_events_keep_native_message_and_snapshots_visible_through_external_stream_access(
     api, workspace_api, db
 ):
-    """A native outgoing message inherits the visibility of its external stream."""
+    """A native outgoing message and its snapshots inherit stream visibility."""
     account_owner_uuid = sys_uuid.uuid4()
+    recipient_uuid = sys_uuid.uuid4()
     external_account_uuid = sys_uuid.uuid4()
     external_chat_uuid = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
@@ -10144,6 +10145,7 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, recipient_uuid)
     conftest.seed_workspace_user(
         db, account_owner_uuid, f"external-owner-{account_owner_uuid}"
     )
@@ -10211,6 +10213,30 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
         )
         cursor.execute(
             """
+            UPDATE m_workspace_stream_topics
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42:general'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.test",
+                        "source_scope": "legacy-shared-scope",
+                        "topic_name": "general",
+                    }
+                ),
+                str(external_account_uuid),
+                api.project_id,
+                topic_uuid,
+            ),
+        )
+        cursor.execute(
+            """
             SELECT
                 EXISTS (
                     SELECT 1
@@ -10228,9 +10254,9 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
             """,
             (
                 api.project_id,
-                api.user_uuid,
+                recipient_uuid,
                 api.project_id,
-                api.user_uuid,
+                recipient_uuid,
                 stream_uuid,
             ),
         )
@@ -10267,6 +10293,161 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
         if event["payload"]["kind"] == "message.created"
     }
     assert public_message_uuid in visible_messages
+
+    recipient_cursor = workspace_api.get(EPOCH, user=recipient_uuid)
+    assert recipient_cursor.status_code == 200, recipient_cursor.text
+    recipient_events = workspace_api.get(
+        EVENTS,
+        user=recipient_uuid,
+        params={
+            "page_limit": 100,
+            "page_marker": 0,
+            "epoch_generation": recipient_cursor.json()["epoch_generation"],
+        },
+    )
+    assert recipient_events.status_code == 200, recipient_events.text
+    assert [event["payload"]["kind"] for event in recipient_events.json()] == [
+        "message.created",
+        "topic.updated",
+        "stream.updated",
+    ]
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM messenger_message_placements
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        placement_uuid = cursor.fetchone()[0]
+    assert str(placement_uuid) == public_message_uuid
+
+    reaction_event_uuid = sys_uuid.uuid4()
+    external_source = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.test",
+        "source_scope": "legacy-shared-scope",
+    }
+    _run_database_operation(
+        lambda session: messenger_models.WorkspaceEvent(
+            schema_version=messenger_models.WORKSPACE_EVENT_SCHEMA_VERSION,
+            uuid=reaction_event_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=recipient_uuid,
+            object_type="message_reaction",
+            action="updated",
+            payload={
+                "kind": "message_reaction.updated",
+                "uuid": str(sys_uuid.uuid4()),
+                "project_id": api.project_id,
+                "user_uuid": str(recipient_uuid),
+                "message_uuid": str(placement_uuid),
+                "old_message_uuid": str(placement_uuid),
+                "emoji_name": "heart",
+                "old_emoji_name": "thumbs_up",
+                "source_name": "zulip",
+                "source": external_source,
+                "old_source_name": "zulip",
+                "old_source": external_source,
+            },
+        ).insert(session=session)
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_visible_events_pre_messenger_v2
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, recipient_uuid, reaction_event_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+
+    last_epoch = recipient_events.json()[-1]["epoch_version"]
+    reaction_events = workspace_api.get(
+        EVENTS,
+        user=recipient_uuid,
+        params={
+            "page_limit": 100,
+            "page_marker": last_epoch,
+            "epoch_generation": recipient_cursor.json()["epoch_generation"],
+        },
+    )
+    assert reaction_events.status_code == 200, reaction_events.text
+    assert [event["payload"]["kind"] for event in reaction_events.json()] == [
+        "message_reaction.updated"
+    ]
+
+    snapshot_epoch = recipient_events.json()[1]["epoch_version"]
+    reaction_epoch = reaction_events.json()[0]["epoch_version"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_broadcast_message_events_v1
+            WHERE project_id = %s AND epoch_version = %s
+            """,
+            (api.project_id, snapshot_epoch),
+        )
+        snapshot_event_uuid = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT membership_generation
+            FROM messenger_stream_bindings
+            WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+            """,
+            (api.project_id, recipient_uuid, stream_uuid),
+        )
+        membership_generation = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            INSERT INTO messenger_event_membership_guards (
+                event_uuid, project_id, user_uuid, stream_uuid,
+                membership_generation, control_effect
+            ) VALUES (%s, %s, %s, %s, %s, FALSE),
+                     (%s, %s, %s, %s, %s, FALSE)
+            ON CONFLICT (event_uuid, user_uuid) DO UPDATE
+            SET stream_uuid = EXCLUDED.stream_uuid,
+                membership_generation = EXCLUDED.membership_generation,
+                control_effect = EXCLUDED.control_effect
+            """,
+            (
+                snapshot_event_uuid,
+                api.project_id,
+                recipient_uuid,
+                stream_uuid,
+                membership_generation,
+                reaction_event_uuid,
+                api.project_id,
+                recipient_uuid,
+                stream_uuid,
+                membership_generation,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE messenger_stream_bindings
+            SET membership_generation = membership_generation + 1
+            WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+            """,
+            (api.project_id, recipient_uuid, stream_uuid),
+        )
+
+    stale_snapshot_events = workspace_api.get(
+        EVENTS,
+        user=recipient_uuid,
+        params={
+            "page_limit": 100,
+            "page_marker": 0,
+            "epoch_generation": recipient_cursor.json()["epoch_generation"],
+        },
+    )
+    assert stale_snapshot_events.status_code == 200, stale_snapshot_events.text
+    visible_epochs = {event["epoch_version"] for event in stale_snapshot_events.json()}
+    assert snapshot_epoch not in visible_epochs
+    assert reaction_epoch not in visible_epochs
 
 
 def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):

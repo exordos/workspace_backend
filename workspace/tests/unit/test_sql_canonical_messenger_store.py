@@ -2656,7 +2656,16 @@ def test_canonical_store_events_preserve_cursor_scope_order_and_limit(monkeypatc
     assert 'FROM "m_workspace_events"' in statement
     assert 'FROM "m_workspace_broadcast_message_events_v1"' in statement
     assert statement.count('FROM "m_workspace_stream_bindings" AS binding') == 2
-    assert statement.count("(event.\"payload\"->>'stream_uuid')::uuid") == 6
+    assert statement.count("LEFT JOIN LATERAL") == 2
+    assert statement.count('FROM "m_workspace_messages" AS message') == 4
+    assert statement.count('FROM "messenger_message_placements" AS placement') == 4
+    assert (
+        statement.count('FROM "m_confirmed_external_stream_access" AS source_access')
+        == 2
+    )
+    assert statement.count("AS old_source_access") == 2
+    assert statement.count('FROM "messenger_event_membership_guards" AS guard') == 4
+    assert statement.count('LEFT JOIN "messenger_stream_bindings" AS binding') == 2
     assert (
         statement.count('FROM "m_confirmed_external_stream_access" AS stream_access')
         == 2
