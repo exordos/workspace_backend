@@ -1373,6 +1373,8 @@ def sync_operation_target_delivery(
     if target is None or operation.target_uuid is None:
         return
     delivery = _operation_delivery(operation)
+    # ``queued`` and ``running`` both project as ``pending``. Keep the target
+    # timestamp tied to public delivery changes, not provider-worker bookkeeping.
     if operation.target_type == "message":
         canonical = session.execute(
             """
@@ -1405,7 +1407,8 @@ def sync_operation_target_delivery(
                 UPDATE messenger_messages
                 SET delivery = %s::jsonb
                 WHERE project_id = %s AND uuid = %s
-                  AND delivery IS DISTINCT FROM %s::jsonb
+                  AND (delivery - 'updated_at')
+                      IS DISTINCT FROM (%s::jsonb - 'updated_at')
                 RETURNING uuid
                 """,
                 (
@@ -1446,6 +1449,12 @@ def sync_operation_target_delivery(
             delivery_error = %s,
             delivery_updated_at = %s
         WHERE project_id = %s AND {uuid_column} = %s
+          AND (
+              (delivery_metadata - 'updated_at')
+                  IS DISTINCT FROM (%s::jsonb - 'updated_at')
+              OR delivery_status IS DISTINCT FROM %s
+              OR delivery_error IS DISTINCT FROM %s
+          )
         RETURNING {uuid_column}
         """,
         (
@@ -1455,6 +1464,9 @@ def sync_operation_target_delivery(
             operation.updated_at,
             project_id,
             operation.target_uuid,
+            _canonical_json(delivery),
+            legacy_status,
+            operation.safe_error,
         ),
     ).fetchone()
     if changed is not None:
