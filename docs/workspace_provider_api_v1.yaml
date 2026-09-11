@@ -29,7 +29,10 @@ paths:
         `FOR UPDATE SKIP LOCKED`. Expired leases return to the queue. Repeating
         the same request UUID while its lease remains active returns the same
         batch. Known operation kinds whose required named capability is absent
-        remain queued and are never disclosed to the bridge.
+        remain queued and are never disclosed to the bridge. A bounded optional
+        wait keeps the request outside a database transaction until durable
+        queue state changes, then repeats the lease in a new transaction. The
+        wait also ends at the next queued retry or active lease expiry.
       requestBody:
         required: true
         content:
@@ -39,6 +42,13 @@ paths:
       responses:
         '200':
           description: A possibly empty leased operation batch.
+          headers:
+            X-Workspace-Provider-Lease-Wait-Supported:
+              schema: {type: string, const: '1'}
+              description: Present when notification-backed lease waiting is supported.
+            X-Workspace-Provider-Lease-Wait-Seconds:
+              schema: {type: string}
+              description: Present on an empty response selected for server-side waiting.
           content:
             application/json:
               schema:
@@ -158,6 +168,12 @@ components:
         request_uuid: {type: string, format: uuid}
         limit: {type: integer, minimum: 1, maximum: 100, default: 50}
         lease_seconds: {type: integer, minimum: 10, maximum: 300, default: 30}
+        wait_seconds:
+          type: number
+          minimum: 0
+          maximum: 25
+          default: 0
+          description: Maximum notification-backed wait before an empty response.
     OperationLeaseResponse:
       type: object
       additionalProperties: false

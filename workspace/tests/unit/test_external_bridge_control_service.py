@@ -195,18 +195,33 @@ def test_provider_route_reuses_authenticated_identity_and_request_session(
             calls.append((session, identity, method, path, query, payload))
             return {"operations": []}
 
+        def empty_lease_wait_seconds(self, session, identity, maximum_seconds):
+            calls.append(("wait", session, identity, maximum_seconds))
+            return 0.375
+
     private_service.provider_data_service = ProviderDataService()
     response = private_service.handle(
         "POST",
         f"{provider_service.API_ROOT}/operations/actions/lease",
         {},
-        json.dumps({"request_uuid": str(sys_uuid.uuid4())}).encode(),
+        json.dumps(
+            {
+                "request_uuid": str(sys_uuid.uuid4()),
+                "wait_seconds": 5,
+            }
+        ).encode(),
         certificate_der,
         request_session=request_session,
     )
 
     assert response.status == 200
     assert json.loads(response.body) == {"operations": []}
+    assert response.headers == {
+        "Cache-Control": "no-store",
+        provider_service.LEASE_WAIT_SUPPORTED_HEADER: "1",
+        provider_service.LEASE_WAIT_HEADER: "0.375",
+    }
+    assert response.provider_wait_key == str(INSTANCE_UUID)
     assert calls[0][0] is request_session
     assert calls[0][1].bridge_instance_uuid == INSTANCE_UUID
     assert calls[0][1].provider_kind == "zulip"
@@ -215,6 +230,7 @@ def test_provider_route_reuses_authenticated_identity_and_request_session(
         f"{provider_service.API_ROOT}/operations/actions/lease",
         {},
     )
+    assert calls[1] == ("wait", request_session, calls[0][1], 5.0)
 
 
 @pytest.mark.parametrize("raw_body", [b"null", b"[]", b'"text"', b"42"])

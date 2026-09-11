@@ -33,6 +33,20 @@ messenger_worker_opts = [
         min=60 * 60,
         help="Private bridge heartbeat idempotency history in seconds",
     ),
+    cfg.FloatOpt(
+        "capability-refresh-interval-seconds",
+        default=5.0,
+        min=1.0,
+        max=300.0,
+        help="Seconds between external account capability refresh passes",
+    ),
+    cfg.FloatOpt(
+        "capability-projection-refresh-interval-seconds",
+        default=5.0,
+        min=1.0,
+        max=300.0,
+        help="Seconds between stale projected capability refresh passes",
+    ),
     cfg.BoolOpt(
         "read-state-compaction-enabled",
         default=False,

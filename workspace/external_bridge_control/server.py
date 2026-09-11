@@ -18,6 +18,7 @@ from typing import Any, cast
 from workspace.external_bridge_control import pki
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import provider_service
+from workspace.external_bridge_control import provider_wakeup
 from workspace.external_bridge_control import service
 from workspace.history_import import contract as history_contract
 
@@ -136,6 +137,7 @@ class BootstrapServer(_ThreadingServer):
 
 class PrivateHandler(http.server.BaseHTTPRequestHandler):
     server_version = "WorkspaceExternalBridgeAPI/1"
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
         self._dispatch()
@@ -198,58 +200,59 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
             provider_request = provider_service.ProviderDataService.matches(
                 request_path
             )
-            for attempt in range(1, PROVIDER_DEADLOCK_MAX_ATTEMPTS + 1):
-                try:
-                    commit_started_at = None
-                    with server.request_session_factory() as request_session:
-                        response = server.private_service.handle(
-                            self.command,
-                            self.path,
-                            dict(self.headers.items()),
-                            body,
-                            certificate_der,
-                            request_session=request_session,
-                        )
-                        if response.status >= 400:
-                            raise _RollbackResponse(response)
-                        commit_started_at = time.monotonic()
-                    if self.command == "POST" and request_path in {
-                        "/api/workspace-provider/v1/events",
-                        "/api/workspace-provider/v2/commands",
-                    }:
-                        commit_duration = time.monotonic() - commit_started_at
-                        LOG.info(
-                            "Committed provider event batch: duration_seconds=%.3f",
-                            commit_duration,
-                            extra={
-                                "provider_batch_commit_duration_seconds": (
-                                    commit_duration
-                                ),
-                            },
-                        )
-                    break
-                except _RollbackResponse as rollback:
-                    response = rollback.response
-                    break
-                except Exception as error:
-                    if not provider_request or not _is_database_deadlock(error):
-                        raise
-                    if attempt == PROVIDER_DEADLOCK_MAX_ATTEMPTS:
-                        raise _ProviderDeadlockRetryExhausted(
-                            "The provider request could not complete due to "
-                            "concurrent database activity"
-                        ) from error
-                    delay = PROVIDER_DEADLOCK_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-                    delay *= random.uniform(0.75, 1.25)
-                    LOG.warning(
-                        "Retrying provider request after PostgreSQL deadlock",
-                        extra={
-                            "provider_deadlock_retry_attempt": attempt,
-                            "provider_request_path": request_path,
-                            "provider_deadlock_retry_delay_seconds": delay,
-                        },
+            wakeup = None
+            wait_deadline = None
+            wait_key = None
+            try:
+                while True:
+                    response = self._run_request_transaction(
+                        server,
+                        request_path,
+                        provider_request,
+                        body,
+                        certificate_der,
                     )
-                    time.sleep(delay)
+                    wait_header = response.headers.get(
+                        provider_service.LEASE_WAIT_HEADER
+                    )
+                    wakeup_factory = getattr(
+                        server,
+                        "provider_operation_wakeup_factory",
+                        None,
+                    )
+                    if (
+                        response.status >= 400
+                        or wait_header is None
+                        or wakeup_factory is None
+                    ):
+                        break
+                    response_wait_deadline = time.monotonic() + float(wait_header)
+                    if wakeup is None:
+                        wait_key = response.provider_wait_key
+                        if wait_key is None:
+                            break
+                        wait_deadline = response_wait_deadline
+                        wakeup = wakeup_factory(
+                            wait_key,
+                            max(0.0, wait_deadline - time.monotonic()),
+                        )
+                        wakeup.subscribe(
+                            max(0.0, wait_deadline - time.monotonic())
+                        )
+                        # LISTEN is active now. Recheck once before waiting so an
+                        # operation committed after the first empty lease cannot
+                        # be lost in the registration window.
+                        continue
+                    assert wait_deadline is not None
+                    wait_deadline = min(wait_deadline, response_wait_deadline)
+                    remaining = wait_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    assert wait_key is not None
+                    wakeup.wait(remaining, wait_key)
+            finally:
+                if wakeup is not None:
+                    wakeup.close()
         except provider_data.ProviderDataError as error:
             response = service.Response.json(
                 error.status,
@@ -261,6 +264,70 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
                 },
             )
         self._send_response(response)
+
+    def _run_request_transaction(
+        self,
+        server: "PrivateServer",
+        request_path: str,
+        provider_request: bool,
+        body: bytes,
+        certificate_der: bytes,
+    ) -> service.Response:
+        request_session_factory = server.request_session_factory
+        if request_session_factory is None:
+            raise provider_service.ProviderIngressUnavailableError(
+                "Private API request transaction is not configured"
+            )
+        for attempt in range(1, PROVIDER_DEADLOCK_MAX_ATTEMPTS + 1):
+            try:
+                commit_started_at = None
+                with request_session_factory() as request_session:
+                    response = server.private_service.handle(
+                        self.command,
+                        self.path,
+                        dict(self.headers.items()),
+                        body,
+                        certificate_der,
+                        request_session=request_session,
+                    )
+                    if response.status >= 400:
+                        raise _RollbackResponse(response)
+                    commit_started_at = time.monotonic()
+                if self.command == "POST" and request_path in {
+                    "/api/workspace-provider/v1/events",
+                    "/api/workspace-provider/v2/commands",
+                }:
+                    commit_duration = time.monotonic() - commit_started_at
+                    LOG.info(
+                        "Committed provider event batch: duration_seconds=%.3f",
+                        commit_duration,
+                        extra={
+                            "provider_batch_commit_duration_seconds": commit_duration,
+                        },
+                    )
+                return response
+            except _RollbackResponse as rollback:
+                return rollback.response
+            except Exception as error:
+                if not provider_request or not _is_database_deadlock(error):
+                    raise
+                if attempt == PROVIDER_DEADLOCK_MAX_ATTEMPTS:
+                    raise _ProviderDeadlockRetryExhausted(
+                        "The provider request could not complete due to "
+                        "concurrent database activity"
+                    ) from error
+                delay = PROVIDER_DEADLOCK_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                delay *= random.uniform(0.75, 1.25)
+                LOG.warning(
+                    "Retrying provider request after PostgreSQL deadlock",
+                    extra={
+                        "provider_deadlock_retry_attempt": attempt,
+                        "provider_request_path": request_path,
+                        "provider_deadlock_retry_delay_seconds": delay,
+                    },
+                )
+                time.sleep(delay)
+        raise RuntimeError("Provider request retry loop did not return")
 
     def _dispatch_history(self, length: int, certificate_der: bytes) -> None:
         server = cast(PrivateServer, self.server)
@@ -275,10 +342,14 @@ class PrivateHandler(http.server.BaseHTTPRequestHandler):
         # Acquire admission before allocating the body. Realtime requests never
         # wait on this semaphore and keep their existing request transaction.
         if not server.history_admission.acquire(blocking=False):
-            self._send_response(
-                service.Response.json(503, {"error": "history_import_busy"})
-            )
             self.close_connection = True
+            self._send_response(
+                service.Response.json(
+                    503,
+                    {"error": "history_import_busy"},
+                    headers={"Connection": "close"},
+                )
+            )
             return
         try:
             try:
@@ -326,10 +397,21 @@ class PrivateServer(_ThreadingServer):
         ssl_context: ssl.SSLContext,
         request_session_factory: Callable[[], Any] | None = None,
         history_service: Any = None,
+        provider_operation_wakeup_factory: Callable[
+            [str, float], provider_wakeup.ProviderOperationWaitHandle
+        ]
+        | None = None,
     ) -> None:
         super().__init__(address, PrivateHandler)
         self.private_service = private_service
         self.request_session_factory = request_session_factory
         self.history_service = history_service
+        self.provider_operation_wakeup_factory = provider_operation_wakeup_factory
         self.history_admission = threading.BoundedSemaphore(2)
         self.socket = ssl_context.wrap_socket(self.socket, server_side=True)
+
+    def server_close(self) -> None:
+        close_wakeups = getattr(self.provider_operation_wakeup_factory, "close", None)
+        if callable(close_wakeups):
+            close_wakeups()
+        super().server_close()

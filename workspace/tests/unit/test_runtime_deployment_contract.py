@@ -135,6 +135,34 @@ def test_postgresql_runtime_has_import_scale_session_tuning():
         assert "?options=-c%20work_mem%3D32MB%20-c%20jit%3Doff" in config
 
 
+def test_provider_snapshot_wakeup_tracks_only_leasability_changes():
+    migration = _read("migrations/0184-Notify-provider-operation-waiters-2ef140.py")
+    snapshot_trigger = migration.split("CREATE_SNAPSHOT_TRIGGER", 1)[1].split(
+        '"""', 2
+    )[1]
+
+    assert (
+        "AFTER INSERT OR DELETE ON m_external_provider_read_snapshots_v1"
+        in snapshot_trigger
+    )
+    assert "UPDATE" not in snapshot_trigger
+
+
+def test_provider_eligibility_changes_wake_operation_waiters():
+    migration = _read("migrations/0184-Notify-provider-operation-waiters-2ef140.py")
+
+    assert "AFTER INSERT OR UPDATE OF enabled, emergency_suspended" in migration
+    assert "ON m_external_provider_policies_v1" in migration
+    assert (
+        "AFTER INSERT OR UPDATE OF status, capabilities, last_heartbeat_at"
+        in migration
+    )
+    assert "ON m_external_bridge_instances_v2" in migration
+    assert "OLD.last_heartbeat_at IS NOT NULL" in migration
+    assert "statement_timestamp() - interval '60 seconds'" in migration
+    assert "TG_TABLE_NAME <> 'm_external_bridge_instances_v2'" in migration
+
+
 def test_reaction_user_lists_have_bounded_runtime_defaults():
     for config_path in (
         "etc/workspace/workspace.conf",

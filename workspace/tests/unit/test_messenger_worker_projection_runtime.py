@@ -86,6 +86,19 @@ def test_projection_worker_count_is_bounded_and_defaults_to_four():
     assert idle_option.type.min == 0.1
     assert idle_option.type.max == 3.0
 
+    capability_option = next(
+        option
+        for option in messenger_worker_opts.messenger_worker_opts
+        if option.name == "capability-refresh-interval-seconds"
+    )
+    capability_projection_option = next(
+        option
+        for option in messenger_worker_opts.messenger_worker_opts
+        if option.name == "capability-projection-refresh-interval-seconds"
+    )
+    assert capability_option.default == 5.0
+    assert capability_projection_option.default == 5.0
+
 
 def test_worker_entrypoint_builds_one_primary_and_projection_only_peers():
     messenger_worker.CONF.set_override(
@@ -115,6 +128,13 @@ def test_worker_entrypoint_builds_one_primary_and_projection_only_peers():
     assert all(service._iter_min_period == 0 for service in services)
     assert all(service._iter_pause == 0 for service in services)
     assert all(service._v2_idle_sleep_seconds == 0.5 for service in services)
+    assert all(
+        service._capability_refresh_interval_seconds == 5.0 for service in services
+    )
+    assert all(
+        service._capability_projection_refresh_interval_seconds == 5.0
+        for service in services
+    )
 
 
 def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):

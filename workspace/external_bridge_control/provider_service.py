@@ -15,6 +15,25 @@ from workspace.external_bridge_control import provider_v2
 
 API_ROOT = "/api/workspace-provider/v1"
 API_ROOT_V2 = "/api/workspace-provider/v2"
+LEASE_WAIT_MAX_SECONDS = 25.0
+LEASE_WAIT_SUPPORTED_HEADER = "X-Workspace-Provider-Lease-Wait-Supported"
+LEASE_WAIT_HEADER = "X-Workspace-Provider-Lease-Wait-Seconds"
+
+
+def lease_wait_seconds(method: str, path: str, payload: object) -> float:
+    if method != "POST" or path not in {
+        f"{API_ROOT}/operations/actions/lease",
+        f"{API_ROOT_V2}/operations/actions/lease",
+    }:
+        return 0.0
+    if not isinstance(payload, dict):
+        raise TypeError("Provider API request payload must be an object")
+    value = payload.get("wait_seconds", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("Provider lease wait must be numeric")
+    if not 0.0 <= value <= LEASE_WAIT_MAX_SECONDS:
+        raise ValueError("Provider lease wait is outside the supported range")
+    return float(value)
 
 
 class ProviderIngressUnavailableError(provider_data.ProviderDataError):
@@ -32,6 +51,18 @@ class ProviderDataService:
         | None = None,
     ) -> None:
         self.apply_event = apply_event
+
+    @staticmethod
+    def empty_lease_wait_seconds(
+        session: typing.Any,
+        identity: typing.Any,
+        maximum_seconds: float,
+    ) -> float:
+        return provider_data.provider_operation_wait_seconds(
+            session,
+            identity,
+            maximum_seconds,
+        )
 
     @staticmethod
     def matches(path: str) -> bool:
@@ -57,6 +88,7 @@ class ProviderDataService:
             raise ValueError("Provider API routes do not accept query parameters")
         if not isinstance(payload, dict):
             raise TypeError("Provider API request payload must be an object")
+        lease_wait_seconds(method, path, payload)
         if method == "POST" and path in {
             f"{API_ROOT}/operations/actions/lease",
             f"{API_ROOT_V2}/operations/actions/lease",

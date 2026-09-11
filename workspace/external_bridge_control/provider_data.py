@@ -1675,6 +1675,94 @@ def _emit_operation_event(
     publish_operation_event(session, operation, project_id, event_kind)
 
 
+def provider_operation_wait_seconds(
+    session: typing.Any,
+    identity: typing.Any,
+    maximum_seconds: float,
+) -> float:
+    """Bound an empty lease wait by the next queued retry or lease expiry."""
+    now = _database_now(session)
+    capabilities = _bridge_capabilities(session, identity, now)
+    allowed_kinds = tuple(
+        operation_kind
+        for operation_kind, capability in _OPERATION_CAPABILITIES.items()
+        if _advertises_capability(capabilities, capability)
+    )
+    if not allowed_kinds:
+        return maximum_seconds
+    supports_provider_read_paging = (
+        _capability_revision(capabilities, PROVIDER_READ_PAGING_CAPABILITY)
+        >= PROVIDER_READ_PAGING_REVISION
+    )
+    row = session.execute(
+        """
+        SELECT EXTRACT(
+                   EPOCH FROM (
+                       MIN(
+                           CASE operation.status
+                               WHEN 'queued' THEN operation.available_at
+                               ELSE operation.lease_expires_at
+                           END
+                       ) - statement_timestamp()
+                   )
+               ) AS next_due_seconds
+        FROM m_external_provider_operations_v1 AS operation
+        JOIN m_external_accounts_v2 AS account
+          ON account.uuid = operation.external_account_uuid
+        JOIN m_external_provider_policies_v1 AS policy
+          ON policy.provider = account.provider
+         AND policy.enabled = TRUE
+         AND policy.emergency_suspended = FALSE
+        WHERE operation.bridge_instance_uuid = %s
+          AND operation.status IN ('queued', 'leased')
+          AND operation.operation_kind = ANY(%s::text[])
+          AND (
+                operation.operation_kind <> 'read_state.set'
+                OR %s
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM m_external_provider_read_snapshots_v1 AS page_snapshot
+                    WHERE page_snapshot.external_operation_uuid =
+                            operation.external_operation_uuid
+                )
+          )
+          AND NOT EXISTS (
+                SELECT 1
+                FROM m_external_provider_read_snapshots_v1 AS barrier
+                WHERE barrier.bridge_instance_uuid =
+                        operation.bridge_instance_uuid
+                  AND barrier.external_account_uuid =
+                        operation.external_account_uuid
+                  AND barrier.queue_sequence < COALESCE(
+                        (
+                            SELECT page_snapshot.queue_sequence
+                            FROM m_external_provider_read_snapshots_v1
+                                AS page_snapshot
+                            WHERE page_snapshot.external_operation_uuid =
+                                    operation.external_operation_uuid
+                        ),
+                        operation.sequence
+                  )
+                  AND (
+                        operation.causal_lane IS NULL
+                        OR barrier.causal_lane = operation.causal_lane
+                  )
+                  AND barrier.external_operation_uuid <>
+                        operation.external_operation_uuid
+          )
+        """,
+        (
+            identity.bridge_instance_uuid,
+            list(allowed_kinds),
+            supports_provider_read_paging,
+        ),
+    ).fetchone()
+    next_due_seconds = row["next_due_seconds"] if row is not None else None
+    if next_due_seconds is None:
+        return maximum_seconds
+    return min(maximum_seconds, max(0.0, float(next_due_seconds)))
+
+
 def lease_provider_operations(
     session: typing.Any,
     identity: typing.Any,

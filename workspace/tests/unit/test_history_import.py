@@ -156,6 +156,8 @@ def test_history_admission_precedes_body_allocation():
     handler.rfile.read.assert_not_called()
     handler.server.history_service.handle.assert_not_called()
     handler.send_response.assert_called_once_with(503)
+    handler.send_header.assert_any_call("Connection", "close")
+    assert handler.close_connection is True
 
 
 def test_file_discovery_ignores_fenced_code_and_rejects_traversal():
