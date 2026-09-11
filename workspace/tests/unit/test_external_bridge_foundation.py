@@ -405,11 +405,11 @@ def test_external_operation_discard_uses_provider_queue_transaction(monkeypatch)
             setattr(resource, name, value) for name, value in values.items()
         ],
     )
-    synced = []
+    restored = []
     monkeypatch.setattr(
         controllers.provider_data,
-        "sync_operation_target_delivery",
-        lambda session, resource, project_id: synced.append(
+        "restore_operation_target_delivery",
+        lambda session, resource, project_id: restored.append(
             (session, resource, project_id)
         ),
     )
@@ -433,7 +433,7 @@ def test_external_operation_discard_uses_provider_queue_transaction(monkeypatch)
         {"external_operation_uuid": operation.uuid},
     )
     assert operation.status == "discarded"
-    assert synced == [(request_session, operation, request.context.project_id)]
+    assert restored == [(request_session, operation, request.context.project_id)]
     assert calls[1] == ("delete", request_session)
     assert emitted[0][3] is request_session
 
