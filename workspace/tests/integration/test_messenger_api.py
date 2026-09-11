@@ -21857,3 +21857,99 @@ def test_compact_provider_read_state_uses_bitmaps_and_preserves_own_unread(
         assert cursor.fetchone()[0] == (
             0 if mode == read_state.PROJECT_MODE_COMPACT else 4
         )
+
+
+def test_delivery_projection_skips_timestamp_only_pending_transition(api, db):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Delivery projection transition",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "delivery",
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "delivery state"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    operation_uuid = sys_uuid.uuid4()
+    queued_at = datetime.datetime(2026, 9, 11, 10, tzinfo=datetime.timezone.utc)
+    running_at = queued_at + datetime.timedelta(seconds=1)
+    delivered_at = running_at + datetime.timedelta(seconds=1)
+
+    def sync(status, updated_at):
+        operation = types.SimpleNamespace(
+            uuid=operation_uuid,
+            target_type="message",
+            target_uuid=message_uuid,
+            status=status,
+            safe_error=None,
+            can_retry=False,
+            can_discard=False,
+            updated_at=updated_at,
+            duplicate_risk=False,
+            retry_requires_confirmation=False,
+            original_url=None,
+            reconciliation_reason=None,
+        )
+        _run_database_operation(
+            lambda session: provider_data.sync_operation_target_delivery(
+                session,
+                operation,
+                project_uuid,
+            )
+        )
+
+    sync("queued", queued_at)
+    sync("running", running_at)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_updated_at
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == ("pending", queued_at)
+    sync("succeeded", delivered_at)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_updated_at
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == ("delivered", delivered_at)
+        cursor.execute(
+            """
+            SELECT payload->'delivery'->>'status'
+            FROM m_workspace_broadcast_message_events_v1 AS event
+            JOIN m_workspace_event_audience_members_v1 AS member
+              ON member.audience_snapshot_uuid = event.audience_snapshot_uuid
+            WHERE event.project_id = %s
+              AND member.user_uuid = %s
+              AND event.payload->>'kind' = 'message.updated'
+              AND event.payload->'payload'->>'content' = 'delivery state'
+            ORDER BY event.epoch_version
+            """,
+            (project_uuid, api.user_uuid),
+        )
+        delivery_events = cursor.fetchall()
+
+    assert delivery_events == [("pending",), ("delivered",)]
