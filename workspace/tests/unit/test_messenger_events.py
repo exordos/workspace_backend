@@ -1497,6 +1497,143 @@ class MessengerEventsTestCase(unittest.TestCase):
             session=session,
         )
 
+    def test_create_message_events_uses_persisted_state_for_late_fanout(self):
+        project_id = sys_uuid.uuid4()
+        placement_uuid = sys_uuid.uuid4()
+        author_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        message = types.SimpleNamespace(
+            uuid=placement_uuid,
+            stream_uuid=sys_uuid.uuid4(),
+            topic_uuid=sys_uuid.uuid4(),
+            user_uuid=author_uuid,
+            payload={"kind": "markdown", "content": "hello"},
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+            source_name="native",
+            source={"kind": "native"},
+            reaction_users={},
+        )
+        state_result = types.SimpleNamespace(
+            fetchall=lambda: [
+                {
+                    "user_uuid": recipient_uuid,
+                    "read": True,
+                    "mentioned": True,
+                    "starred": True,
+                    "pinned": True,
+                }
+            ]
+        )
+        session = types.SimpleNamespace(
+            execute=mock.Mock(
+                side_effect=(
+                    types.SimpleNamespace(
+                        fetchone=lambda: {"value": "messenger_user_message_states"}
+                    ),
+                    state_result,
+                )
+            )
+        )
+
+        with mock.patch.object(
+            events,
+            "create_compact_message_events",
+            return_value=[76],
+        ) as create_compact:
+            result = events.create_message_events(
+                project_id,
+                message,
+                [recipient_uuid],
+                session=session,
+                compact=True,
+            )
+
+        self.assertEqual([76], result)
+        snapshots = create_compact.call_args.args[1]
+        self.assertEqual(1, len(snapshots))
+        self.assertTrue(snapshots[0]["read"])
+        self.assertTrue(snapshots[0]["mentioned"])
+        self.assertTrue(snapshots[0]["starred"])
+        self.assertTrue(snapshots[0]["pinned"])
+        statement, values = session.execute.call_args_list[1].args
+        self.assertIn("FROM messenger_message_placements AS placement", statement)
+        self.assertIn("JOIN messenger_user_message_states", statement)
+        self.assertIn("COALESCE(placement.legacy_public_uuid", statement)
+        self.assertEqual(
+            (project_id, placement_uuid, placement_uuid, [recipient_uuid]),
+            values,
+        )
+
+    def test_create_message_events_resolves_legacy_uuid_to_persisted_state(self):
+        project_id = sys_uuid.uuid4()
+        legacy_message_uuid = sys_uuid.uuid4()
+        recipient_uuid = sys_uuid.uuid4()
+        message = types.SimpleNamespace(
+            uuid=legacy_message_uuid,
+            stream_uuid=sys_uuid.uuid4(),
+            topic_uuid=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            payload={"kind": "markdown", "content": "hello"},
+            created_at=datetime.datetime.now(datetime.timezone.utc),
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+            source_name="zulip",
+            source={"kind": "zulip"},
+            reaction_users={},
+        )
+        session = types.SimpleNamespace(
+            execute=mock.Mock(
+                side_effect=(
+                    types.SimpleNamespace(
+                        fetchone=lambda: {"value": "messenger_user_message_states"}
+                    ),
+                    types.SimpleNamespace(
+                        fetchall=lambda: [
+                            {
+                                "user_uuid": recipient_uuid,
+                                "read": True,
+                                "mentioned": True,
+                                "starred": True,
+                                "pinned": True,
+                            }
+                        ]
+                    ),
+                )
+            )
+        )
+
+        with mock.patch.object(
+            events,
+            "create_compact_message_events",
+            return_value=[77],
+        ) as create_compact:
+            result = events.create_message_events(
+                project_id,
+                message,
+                [recipient_uuid],
+                session=session,
+                compact=True,
+            )
+
+        self.assertEqual([77], result)
+        snapshot = create_compact.call_args.args[1][0]
+        self.assertTrue(snapshot["read"])
+        self.assertTrue(snapshot["mentioned"])
+        self.assertTrue(snapshot["starred"])
+        self.assertTrue(snapshot["pinned"])
+        statement, values = session.execute.call_args_list[1].args
+        self.assertIn("FROM messenger_message_placements AS placement", statement)
+        self.assertIn("COALESCE(placement.legacy_public_uuid", statement)
+        self.assertEqual(
+            (
+                project_id,
+                legacy_message_uuid,
+                legacy_message_uuid,
+                [recipient_uuid],
+            ),
+            values,
+        )
+
     def test_source_provenance_keeps_nullable_provider_delivery_extensions(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -2333,6 +2470,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "_call_with_database_session",
                 new=_call_without_database_session,
             ):
+
                 async def catch_up_connections():
                     for connection in connections:
                         server._request_catch_up(connection)

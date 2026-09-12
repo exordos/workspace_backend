@@ -7,7 +7,123 @@ import types
 import unittest.mock
 import uuid as sys_uuid
 
+from workspace.messenger_api.api import v2_store
 from workspace.messenger_api.dm import read_state
+
+
+def test_counter_projection_scopes_lock_stream_before_sorted_topics():
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    first_topic_uuid = sys_uuid.UUID("10000000-0000-0000-0000-000000000000")
+    second_topic_uuid = sys_uuid.UUID("20000000-0000-0000-0000-000000000000")
+    session = types.SimpleNamespace(execute=unittest.mock.Mock())
+
+    read_state.lock_counter_projection_scopes(
+        session,
+        project_id,
+        user_uuid,
+        stream_uuid,
+        (second_topic_uuid, first_topic_uuid, second_topic_uuid),
+    )
+
+    assert session.execute.call_count == 2
+    stream_statement, stream_values = session.execute.call_args_list[0].args
+    topic_statement, topic_values = session.execute.call_args_list[1].args
+    assert "FROM messenger_stream_bindings" in stream_statement
+    assert "FOR UPDATE" in stream_statement
+    assert stream_values == (project_id, user_uuid, stream_uuid)
+    assert "FROM messenger_user_topic_bindings" in topic_statement
+    assert "ORDER BY topic_uuid" in topic_statement
+    assert topic_values == (
+        project_id,
+        user_uuid,
+        [first_topic_uuid, second_topic_uuid],
+    )
+
+
+def test_stream_counter_projection_scopes_lock_active_users_in_order():
+    project_id = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(execute=unittest.mock.Mock())
+
+    read_state.lock_stream_counter_projection_scopes(
+        session,
+        project_id,
+        stream_uuid,
+    )
+
+    session.execute.assert_called_once()
+    statement, values = session.execute.call_args.args
+    assert "FROM messenger_stream_bindings" in statement
+    assert "AND active" in statement
+    assert "ORDER BY user_uuid" in statement
+    assert "FOR UPDATE" in statement
+    assert values == (project_id, stream_uuid)
+
+
+def test_read_scope_repair_uses_active_projection_task_index(monkeypatch):
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    session = types.SimpleNamespace(execute=unittest.mock.Mock())
+    monkeypatch.setattr(
+        v2_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = v2_store.MessengerV2Store(project_id, user_uuid)
+
+    store._materialize_read_scope_message_states(stream_uuid=stream_uuid)
+
+    statement, _values = session.execute.call_args.args
+    assert "status NOT IN ('completed', 'dead_letter')" in statement
+    assert "status <> 'completed'" not in statement
+
+
+def test_v2_read_locks_provider_accounts_and_project_before_counter_scopes(
+    monkeypatch,
+):
+    project_id = sys_uuid.uuid4()
+    user_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    session = object()
+    calls = []
+    monkeypatch.setattr(
+        v2_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: session),
+    )
+    store = v2_store.MessengerV2Store(project_id, user_uuid)
+    monkeypatch.setattr(
+        store,
+        "_lock_provider_read_accounts_for_stream",
+        lambda value: calls.append(("account-lock", value)) or (account_uuid,),
+    )
+    monkeypatch.setattr(
+        v2_store.read_state,
+        "lock_projects",
+        lambda *args: calls.append(("project-lock", args)),
+    )
+    monkeypatch.setattr(
+        v2_store.read_state,
+        "lock_counter_projection_scopes",
+        lambda *args: calls.append(("counter-lock", args)),
+    )
+
+    result = store._lock_read_counter_scopes(stream_uuid, (topic_uuid,))
+
+    assert result == (account_uuid,)
+    assert calls == [
+        ("account-lock", stream_uuid),
+        ("project-lock", (session, (project_id,))),
+        (
+            "counter-lock",
+            (session, project_id, user_uuid, stream_uuid, (topic_uuid,)),
+        ),
+    ]
 
 
 def test_clear_message_uses_exact_negative_read_counter_deltas(monkeypatch):

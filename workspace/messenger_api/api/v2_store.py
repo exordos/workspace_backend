@@ -303,6 +303,149 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             {**common, "emit_message_read": emit_message_read},
         )
 
+    def _materialize_read_scope_message_states(
+        self,
+        *,
+        stream_uuid: object,
+        topic_uuid: object | None = None,
+        boundary_created_at: object | None = None,
+        boundary_uuid: object | None = None,
+    ) -> None:
+        """Close a late-fanout gap before applying an acknowledged read."""
+        session = contexts.Context().get_session()
+        session.execute(
+            """
+            WITH membership AS MATERIALIZED (
+                SELECT user_uuid, membership_generation, membership_started_at
+                FROM messenger_stream_bindings
+                WHERE project_id = %s AND user_uuid = %s
+                  AND stream_uuid = %s AND active
+            ), pending_placements AS MATERIALIZED (
+                SELECT DISTINCT (payload->>'placement_uuid')::uuid AS placement_uuid
+                FROM messenger_projection_tasks
+                WHERE project_id = %s AND task_kind = 'fanout'
+                  AND status NOT IN ('completed', 'dead_letter')
+                  AND payload ? 'placement_uuid'
+            ), targets AS MATERIALIZED (
+                SELECT placement.uuid AS placement_uuid,
+                       membership.user_uuid,
+                       membership.membership_generation,
+                       canonical.author_uuid, canonical.payload
+                FROM pending_placements AS pending
+                JOIN messenger_message_placements AS placement
+                  ON placement.project_id = %s
+                 AND placement.uuid = pending.placement_uuid
+                JOIN messenger_messages AS canonical
+                  ON canonical.project_id = placement.project_id
+                 AND canonical.uuid = placement.message_uuid
+                 AND canonical.deleted_at IS NULL
+                JOIN messenger_topics AS topic
+                  ON topic.project_id = placement.project_id
+                 AND topic.uuid = placement.topic_uuid
+                 AND topic.deleted_at IS NULL
+                CROSS JOIN membership
+                LEFT JOIN messenger_user_message_bindings AS current_binding
+                  ON current_binding.project_id = placement.project_id
+                 AND current_binding.placement_uuid = placement.uuid
+                 AND current_binding.user_uuid = membership.user_uuid
+                LEFT JOIN messenger_user_message_states AS current_state
+                  ON current_state.project_id = placement.project_id
+                 AND current_state.placement_uuid = placement.uuid
+                 AND current_state.user_uuid = membership.user_uuid
+                WHERE placement.project_id = %s
+                  AND placement.stream_uuid = %s
+                  AND canonical.created_at >= membership.membership_started_at
+                  AND (%s::uuid IS NULL OR placement.topic_uuid = %s::uuid)
+                  AND (
+                      %s::timestamptz IS NULL
+                      OR (canonical.created_at, placement.uuid)
+                         <= (%s::timestamptz, %s::uuid)
+                  )
+                  AND (
+                      current_binding.uuid IS NULL
+                      OR current_binding.membership_generation
+                         <> membership.membership_generation
+                      OR current_state.uuid IS NULL
+                      OR current_state.membership_generation
+                         <> membership.membership_generation
+                  )
+            ), inserted_bindings AS (
+                INSERT INTO messenger_user_message_bindings (
+                    uuid, project_id, placement_uuid, user_uuid,
+                    membership_generation, relation_role, visibility,
+                    permissions, created_at, updated_at
+                )
+                SELECT messenger_uuid_v5(
+                           target.placement_uuid,
+                           target.user_uuid::text
+                       ),
+                       %s, target.placement_uuid, target.user_uuid,
+                       target.membership_generation,
+                       CASE WHEN target.author_uuid = target.user_uuid
+                            THEN 'author' ELSE 'member' END,
+                       'visible',
+                       '{"read":true,"react":true,"star":true,"pin":true}'::jsonb,
+                       NOW(), NOW()
+                FROM targets AS target
+                ON CONFLICT (project_id, placement_uuid, user_uuid) DO UPDATE
+                SET membership_generation = EXCLUDED.membership_generation,
+                    relation_role = EXCLUDED.relation_role,
+                    visibility = EXCLUDED.visibility,
+                    permissions = EXCLUDED.permissions,
+                    updated_at = NOW()
+                WHERE messenger_user_message_bindings.membership_generation
+                      <> EXCLUDED.membership_generation
+                RETURNING placement_uuid
+            ), inserted_states AS (
+                INSERT INTO messenger_user_message_states (
+                    uuid, project_id, placement_uuid, user_uuid,
+                    membership_generation, read_at, mentioned,
+                    created_at, updated_at
+                )
+                SELECT messenger_uuid_v5(
+                           target.placement_uuid,
+                           target.user_uuid::text
+                       ),
+                       %s, target.placement_uuid, target.user_uuid,
+                       target.membership_generation,
+                       CASE WHEN target.author_uuid = target.user_uuid THEN NOW() END,
+                       POSITION(
+                           '](urn:user:' || lower(target.user_uuid::text) || ')'
+                           IN lower(COALESCE(target.payload->>'content', ''))
+                       ) > 0,
+                       NOW(), NOW()
+                FROM targets AS target
+                ON CONFLICT (project_id, user_uuid, placement_uuid) DO UPDATE
+                SET membership_generation = EXCLUDED.membership_generation,
+                    read_at = EXCLUDED.read_at,
+                    mentioned = EXCLUDED.mentioned,
+                    starred = FALSE,
+                    pinned = FALSE,
+                    updated_at = NOW()
+                WHERE messenger_user_message_states.membership_generation
+                      <> EXCLUDED.membership_generation
+                RETURNING placement_uuid
+            )
+            SELECT count(*) FROM inserted_states
+            """,
+            (
+                self.project_uuid,
+                self.user_uuid,
+                stream_uuid,
+                self.project_uuid,
+                self.project_uuid,
+                self.project_uuid,
+                stream_uuid,
+                topic_uuid,
+                topic_uuid,
+                boundary_created_at,
+                boundary_created_at,
+                boundary_uuid,
+                self.project_uuid,
+                self.project_uuid,
+            ),
+        )
+
     def _require_project_user(self, user_uuid: object) -> sys_uuid.UUID:
         value = sys_uuid.UUID(str(user_uuid))
         session = contexts.Context().get_session()
@@ -1861,9 +2004,32 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         return _public(self._message(message.uuid), "messages")
 
+    def _lock_read_counter_scopes(
+        self,
+        stream_uuid: object,
+        topic_uuids: typing.Iterable[object] = (),
+    ) -> tuple[object, ...]:
+        provider_account_uuids = self._lock_provider_read_accounts_for_stream(
+            stream_uuid
+        )
+        session = contexts.Context().get_session()
+        # Global fanout work already holds this project lock when it reaches
+        # recipient bindings. Take it first here as well so a read cannot hold
+        # a binding while waiting for fanout to release the project.
+        read_state.lock_projects(session, (self.project_uuid,))
+        read_state.lock_counter_projection_scopes(
+            session,
+            self.project_uuid,
+            self.user_uuid,
+            stream_uuid,
+            topic_uuids,
+        )
+        return provider_account_uuids
+
     def _queue_v2_provider_read_snapshot(
         self,
         *,
+        provider_account_uuids: typing.Sequence[object],
         stream_uuid: object,
         topic_uuid: object | None,
         target_type: str,
@@ -1875,9 +2041,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
     ) -> bool:
         """Snapshot exact unread placements without materializing them in Python."""
         session = contexts.Context().get_session()
-        provider_account_uuids = self._lock_provider_read_accounts_for_stream(
-            stream_uuid
-        )
         changed = (
             session.execute(
                 f"SELECT 1 FROM ({candidate_sql}) AS candidate LIMIT 1",
@@ -2142,8 +2305,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             ]
         if resource == "messages" and action == "read":
             message = self._message(resource_uuid)
-            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
-                message.stream_uuid
+            provider_account_uuids = self._lock_read_counter_scopes(
+                message.stream_uuid,
+                (message.topic_uuid,),
             )
             changed = session.execute(
                 """
@@ -2196,6 +2360,16 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._message(message.uuid), "messages")
         if resource == "messages" and action == "read_up_to":
             message = self._message(resource_uuid)
+            provider_account_uuids = self._lock_read_counter_scopes(
+                message.stream_uuid,
+                (message.topic_uuid,),
+            )
+            self._materialize_read_scope_message_states(
+                stream_uuid=message.stream_uuid,
+                topic_uuid=message.topic_uuid,
+                boundary_created_at=message.created_at,
+                boundary_uuid=message.uuid,
+            )
             candidate_sql = """
                 SELECT placement.uuid, canonical.created_at
                 FROM messenger_user_message_states AS state
@@ -2233,6 +2407,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 message.topic_uuid,
             )
             changed = self._queue_v2_provider_read_snapshot(
+                provider_account_uuids=provider_account_uuids,
                 stream_uuid=message.stream_uuid,
                 topic_uuid=message.topic_uuid,
                 target_type="message",
@@ -2354,6 +2529,19 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._stream(stream.uuid), "streams")
         if resource == "streams" and action == "read":
             stream = self._stream(resource_uuid)
+            topics = session.execute(
+                """
+                SELECT uuid FROM messenger_topics
+                WHERE project_id = %s AND stream_uuid = %s
+                ORDER BY created_at, uuid
+                """,
+                (self.project_uuid, stream.uuid),
+            ).fetchall()
+            provider_account_uuids = self._lock_read_counter_scopes(
+                stream.uuid,
+                (topic["uuid"] for topic in topics),
+            )
+            self._materialize_read_scope_message_states(stream_uuid=stream.uuid)
             candidate_sql = """
                 SELECT placement.uuid, canonical.created_at
                 FROM messenger_user_message_states AS state
@@ -2381,6 +2569,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 stream.uuid,
             )
             changed = self._queue_v2_provider_read_snapshot(
+                provider_account_uuids=provider_account_uuids,
                 stream_uuid=stream.uuid,
                 topic_uuid=None,
                 target_type="stream",
@@ -2410,14 +2599,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     stream.uuid,
                     collect_message_rows=False,
                 )
-            topics = session.execute(
-                """
-                SELECT uuid FROM messenger_topics
-                WHERE project_id = %s AND stream_uuid = %s
-                ORDER BY created_at, uuid
-                """,
-                (self.project_uuid, stream.uuid),
-            ).fetchall()
             if topics:
                 self._enqueue(
                     "read_counters",
@@ -2541,6 +2722,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._topic(topic.uuid), "stream_topics")
         if resource == "stream_topics" and action == "read":
             topic = self._topic(resource_uuid)
+            provider_account_uuids = self._lock_read_counter_scopes(
+                topic.stream_uuid,
+                (topic.uuid,),
+            )
+            self._materialize_read_scope_message_states(
+                stream_uuid=topic.stream_uuid,
+                topic_uuid=topic.uuid,
+            )
             candidate_sql = """
                 SELECT placement.uuid, canonical.created_at
                 FROM messenger_user_message_states AS state
@@ -2568,6 +2757,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 topic.uuid,
             )
             changed = self._queue_v2_provider_read_snapshot(
+                provider_account_uuids=provider_account_uuids,
                 stream_uuid=topic.stream_uuid,
                 topic_uuid=topic.uuid,
                 target_type="topic",

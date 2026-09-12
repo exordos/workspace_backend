@@ -586,6 +586,33 @@ def create_message_events(
         )
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
     author_uuid = sys_uuid.UUID(str(message.user_uuid))
+    active_session = session or contexts.Context().get_session()
+    state_table = active_session.execute(
+        "SELECT to_regclass('messenger_user_message_states') AS value",
+        (),
+    ).fetchone()["value"]
+    state_rows = []
+    if state_table is not None:
+        state_rows = active_session.execute(
+            """
+            SELECT state.user_uuid, state.read_at IS NOT NULL AS read,
+                   state.mentioned, state.starred, state.pinned
+            FROM messenger_message_placements AS placement
+            JOIN messenger_user_message_states AS state
+              ON state.project_id = placement.project_id
+             AND state.placement_uuid = placement.uuid
+            WHERE placement.project_id = %s
+              AND (
+                    placement.uuid = %s
+                    OR COALESCE(placement.legacy_public_uuid, placement.uuid) = %s
+                  )
+              AND state.user_uuid = ANY(%s::uuid[])
+            """,
+            (project_id, message.uuid, message.uuid, recipients),
+        ).fetchall()
+    states_by_user_uuid = {
+        sys_uuid.UUID(str(row["user_uuid"])): row for row in state_rows
+    }
     content = _event_payload_get(message.payload, "content")
     normalized_content = str(content or "").lower()
     shared = {
@@ -608,10 +635,26 @@ def create_message_events(
         {
             **shared,
             "user_uuid": recipient_uuid,
-            "read": recipient_uuid == author_uuid,
+            "read": (
+                states_by_user_uuid[recipient_uuid]["read"]
+                if recipient_uuid in states_by_user_uuid
+                else recipient_uuid == author_uuid
+            ),
             "is_own": recipient_uuid == author_uuid,
             "mentioned": (
-                f"](urn:user:{str(recipient_uuid).lower()})" in normalized_content
+                states_by_user_uuid[recipient_uuid]["mentioned"]
+                if recipient_uuid in states_by_user_uuid
+                else f"](urn:user:{str(recipient_uuid).lower()})" in normalized_content
+            ),
+            "starred": (
+                states_by_user_uuid[recipient_uuid]["starred"]
+                if recipient_uuid in states_by_user_uuid
+                else False
+            ),
+            "pinned": (
+                states_by_user_uuid[recipient_uuid]["pinned"]
+                if recipient_uuid in states_by_user_uuid
+                else False
             ),
         }
         for recipient_uuid in recipients
