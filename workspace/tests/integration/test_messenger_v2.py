@@ -8619,6 +8619,8 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
     competing_claim = psycopg.connect(conftest.TEST_DB_URL)
     try:
         with competing_claim.cursor() as cursor:
+            # Lock the last sibling in the worker's FIFO order, leaving the
+            # head claimable even when task UUIDs sort in a different order.
             cursor.execute(
                 """
                 SELECT uuid
@@ -8673,7 +8675,7 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
         assert cursor.fetchone()[0] == snapshot_version + 2
 
 
-def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
+def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db, monkeypatch):
     stream_response = api.post(
         STREAMS,
         json={
@@ -8732,6 +8734,13 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
         )
     with contexts.Context().session_manager() as session:
         assert v2_projection.derive_projection_tasks(session) == 4
+    # This scenario checks a snapshot turn followed by an interactive read;
+    # setup and earlier tests must not choose those turns for it.
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        itertools.cycle(("read_state", "interactive_read")),
+    )
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -8791,9 +8800,9 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
             """,
             (api.project_id, event_uuids),
         )
-        # The overdue snapshot batch gets one bounded turn before the fresh
-        # interactive read. Its unlocked sibling coalesces while the row held
-        # by a competing claim remains pending without blocking this worker.
+        # The selected snapshot turn precedes the interactive read. Its
+        # unlocked sibling coalesces while the row held by a competing claim
+        # remains pending without blocking this worker.
         assert cursor.fetchone() == (2, 2, 1, 3, 1)
     with contexts.Context().session_manager() as session:
         assert v2_projection.process_one_projection_task(
