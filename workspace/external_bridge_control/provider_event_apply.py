@@ -52,6 +52,10 @@ _MESSAGE_FILE_URN_RE = re.compile(
 )
 
 
+class ProviderMessageBaseMissing(ValueError):
+    """An authorized partial update has no stored message to update."""
+
+
 def _assignment_cache_key(
     identity: typing.Any,
     account_uuid: object,
@@ -375,7 +379,7 @@ def _message_projection_is_unchanged(
         if isinstance(current_payload, collections.abc.Mapping)
         else getattr(current_payload, "content", None)
     )
-    if (
+    if "payload" in values and (
         not isinstance(incoming_payload, message_payloads.MarkdownPayload)
         or incoming_payload.content != current_content
     ):
@@ -1427,6 +1431,40 @@ def _missing_provider_message_is_tombstoned(
     return bool(matching[0]["deleted"])
 
 
+def _retained_provider_realm_matches(
+    session: typing.Any,
+    project_id: sys_uuid.UUID,
+    existing: models.WorkspaceMessage,
+    realm_uuid: sys_uuid.UUID,
+) -> bool:
+    """Use repaired canonical provenance for legacy rows without a JSON realm."""
+    return (
+        session.execute(
+            """SELECT 1
+           FROM messenger_message_placements AS placement
+           JOIN messenger_messages AS message
+             ON message.uuid=placement.message_uuid AND message.project_id=placement.project_id
+           JOIN m_external_accounts_v2 AS account
+             ON account.uuid=%s AND account.provider='zulip'
+            AND account.provider_realm_uuid=message.provider_realm_uuid
+           WHERE placement.project_id=%s
+             AND (placement.legacy_public_uuid=%s OR placement.uuid=%s OR placement.message_uuid=%s)
+             AND message.provider_realm_uuid=%s AND message.provider_message_id=%s
+           LIMIT 1""",
+            (
+                existing.external_account_uuid,
+                project_id,
+                existing.uuid,
+                existing.uuid,
+                existing.uuid,
+                realm_uuid,
+                existing.provider_external_id,
+            ),
+        ).fetchone()
+        is not None
+    )
+
+
 def _message_event(
     session: typing.Any,
     event: dict[str, typing.Any],
@@ -1486,6 +1524,26 @@ def _message_event(
         # newer provider sequence is stored, the delayed snapshot must not
         # regress content, reactions, or read state.
         return message_uuid
+    if (resource.get("provider_metadata") or {}).get("missing_base_recovery") is True:
+        stored_sequence = _provider_sequence(
+            getattr(existing, "provider_metadata", None)
+        )
+        incoming_sequence = _provider_sequence(resource.get("provider_metadata"))
+        if stored_sequence is not None and (
+            incoming_sequence is None or incoming_sequence <= stored_sequence
+        ):
+            # Missing, unparseable and equal revisions cannot prove that a
+            # fetched snapshot is newer than another live observer.
+            raise ValueError("Recovery snapshot does not advance stored provider state")
+        # Recovery snapshots must not recreate a provider message deleted since
+        # capture, including tombstones whose legacy projection was removed.
+        tombstone = session.execute(
+            """SELECT 1 FROM m_external_history_tombstones_v1
+               WHERE provider_realm_uuid=%s AND provider_message_id=%s""",
+            (assignment["provider_realm_uuid"], resource["provider_external_id"]),
+        ).fetchone()
+        if tombstone is not None:
+            return message_uuid
     if event["kind"] == "message.delete":
         if existing is None:
             return message_uuid
@@ -1618,6 +1676,15 @@ def _message_event(
                 "user_uuid": sys_uuid.UUID(str(resource["user_uuid"])),
             }
         )
+        if "payload" not in values:
+            # Validate the supplied fields and destination through the domain
+            # schema before assigning the narrowly recoverable classification.
+            models.WorkspaceMessage.validate_partial_provider_values(
+                {"project_id": project_id, **values}, session=session
+            )
+            raise ProviderMessageBaseMissing(
+                "Provider partial update has no base message"
+            )
         create_options = {"emit_events": False} if quiet_backfill else {}
         batch_validation_token: (
             contextvars.Token[set[tuple[object, ...]] | None] | None
@@ -1684,6 +1751,47 @@ def _message_event(
                 "topic_uuid",
             },
         )
+        current_metadata = getattr(existing, "provider_metadata", None) or {}
+        incoming_metadata = update_values["provider_metadata"]
+        if (
+            "provider_original_url" not in incoming_metadata
+            and current_metadata.get("provider_original_url") is not None
+            and getattr(existing, "source_name", None)
+            == identity.provider_kind
+            == models.SourceName.ZULIP.value
+            and isinstance(existing.source, models.ZulipSource)
+            and getattr(existing, "external_account_uuid", None)
+            == projection_account_uuid
+            and current_metadata.get("account_uuid") == str(projection_account_uuid)
+            and current_metadata.get("kind") == identity.provider_kind
+            and current_metadata.get("external_id")
+            == existing.provider_external_id
+            == update_values["provider_external_id"]
+            and (
+                existing.source.message_id is None
+                or str(existing.source.message_id) == existing.provider_external_id
+            )
+            and assignment.get("provider_realm_uuid") is not None
+            and (
+                current_metadata.get("provider_realm_uuid")
+                == str(assignment["provider_realm_uuid"])
+                or (
+                    current_metadata.get("provider_realm_uuid") is None
+                    and _retained_provider_realm_matches(
+                        session,
+                        source_project_id,
+                        existing,
+                        assignment["provider_realm_uuid"],
+                    )
+                )
+            )
+        ):
+            # Topic-only records omit the original-message link. Retain only
+            # that field from the same validated provider identity, not stale
+            # capabilities, delivery state, or other snapshot metadata.
+            incoming_metadata["provider_original_url"] = current_metadata[
+                "provider_original_url"
+            ]
         previous_stream_uuid = existing.stream_uuid
         previous_topic_uuid = existing.topic_uuid
         reported_topic_uuid = update_values.get("topic_uuid", previous_topic_uuid)

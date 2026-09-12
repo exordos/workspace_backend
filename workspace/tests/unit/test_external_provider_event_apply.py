@@ -2870,6 +2870,148 @@ def test_message_update_moves_existing_provider_message_to_reported_topic(
     ]
 
 
+@pytest.fixture
+def partial_move(monkeypatch):
+    identity = _identity()
+    stream_uuid, owner_uuid, realm_uuid = (sys_uuid.uuid4() for _ in range(3))
+    event = _message_event(stream_uuid)
+    resource = event["payload"]["resource"]
+    for name in ("payload", "source", "source_name"):
+        resource.pop(name)
+    resource["provider_external_id"] = "42"
+    resource["provider_metadata"] = {}
+    account_uuid = sys_uuid.UUID(event["external_account_uuid"])
+    existing = types.SimpleNamespace(
+        uuid=sys_uuid.UUID(resource["uuid"]),
+        user_uuid=sys_uuid.UUID(resource["user_uuid"]),
+        stream_uuid=stream_uuid,
+        topic_uuid=sys_uuid.uuid4(),
+        created_at=datetime.datetime(2026, 7, 23, 12),
+        payload=message_payloads.MarkdownPayload(content="unchanged content"),
+        external_account_uuid=account_uuid,
+        source_name="zulip",
+        source=models.ZulipSource(stream_id=7),
+        provider_external_id="42",
+        provider_metadata={
+            "kind": "zulip",
+            "account_uuid": str(account_uuid),
+            "provider_realm_uuid": str(realm_uuid),
+            "external_id": "42",
+            "provider_original_url": "https://zulip.example/#narrow/near/42",
+            "capabilities": {},
+        },
+    )
+    saved, broadcasts = [], []
+
+    def update_dm(values):
+        saved.append(dict(values))
+        for key, value in values.items():
+            setattr(existing, key, value)
+
+    existing.update_dm = update_dm
+    existing.update = lambda session=None: None
+    assignment = {
+        "owner_user_uuid": owner_uuid,
+        "projection_stream_uuid": stream_uuid,
+        "provider_chat_id": "channel:7",
+        "provider_realm_uuid": realm_uuid,
+        "account_settings": {"server_url": "https://zulip.example"},
+    }
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: existing)
+    monkeypatch.setattr(
+        provider_event_apply, "_message_unread_recipients", lambda *_args: []
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "ensure_workspace_message_recipients",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_compact_workspace_message_updated_events",
+        lambda *_args, **_kwargs: broadcasts.append(True),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.external_projection,
+        "_invalidate_moved_topic_summaries",
+        lambda *_args, **_kwargs: None,
+    )
+    session = Session(assignment)
+    session._workspace_provider_event_batch_cache = {}
+    return event, session, identity, existing, saved, broadcasts
+
+
+def test_partial_move_preserves_only_same_identity_link_and_replay(partial_move):
+    event, session, identity, existing, saved, broadcasts = partial_move
+    old_payload, old_created_at = existing.payload, existing.created_at
+    existing.provider_metadata["obsolete_snapshot_field"] = "stale"
+    expected_link = existing.provider_metadata["provider_original_url"]
+    provider_event_apply.apply_event(event, session, identity)
+    assert existing.topic_uuid == sys_uuid.UUID(
+        event["payload"]["resource"]["topic_uuid"]
+    )
+    assert existing.payload is old_payload
+    assert existing.created_at == old_created_at
+    assert existing.provider_metadata["provider_original_url"] == expected_link
+    assert "obsolete_snapshot_field" not in existing.provider_metadata
+    assert len(saved) == len(broadcasts) == 1
+    provider_event_apply.apply_event(event, session, identity)
+    assert len(saved) == len(broadcasts) == 1
+    event["provider_sequence"] = "43"
+    event["provider_event_uuid"] = str(sys_uuid.uuid4())
+    provider_event_apply.apply_event(event, session, identity)
+    assert existing.provider_metadata["provider_sequence"] == "43"
+    assert len(broadcasts) == 1
+
+
+@pytest.mark.parametrize(
+    "incoming", [None, "https://zulip.example/#narrow/near/42?new"]
+)
+def test_partial_move_explicit_link_is_not_replaced(partial_move, incoming):
+    event, session, identity, existing, saved, _ = partial_move
+    event["payload"]["resource"]["provider_metadata"]["provider_original_url"] = (
+        incoming
+    )
+    provider_event_apply.apply_event(event, session, identity)
+    assert "provider_original_url" in saved[0]["provider_metadata"]
+    assert saved[0]["provider_metadata"]["provider_original_url"] == incoming
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "account",
+        "realm",
+        "external_id",
+        "kind",
+        "missing_realm",
+        "source_message",
+        "native",
+    ],
+)
+def test_partial_move_does_not_copy_link_from_unproven_identity(partial_move, conflict):
+    event, session, identity, existing, saved, _ = partial_move
+    if conflict == "account":
+        existing.provider_metadata["account_uuid"] = str(sys_uuid.uuid4())
+    elif conflict == "realm":
+        existing.provider_metadata["provider_realm_uuid"] = str(sys_uuid.uuid4())
+    elif conflict == "external_id":
+        existing.provider_metadata["external_id"] = "43"
+    elif conflict == "kind":
+        existing.provider_metadata["kind"] = "native"
+    elif conflict == "missing_realm":
+        existing.provider_metadata.pop("provider_realm_uuid")
+    elif conflict == "source_message":
+        existing.source = models.ZulipSource(stream_id=7, message_id=43)
+    else:
+        existing.source_name = "native"
+        existing.source = models.NativeSource()
+    provider_event_apply.apply_event(event, session, identity)
+    assert "provider_original_url" not in saved[0]["provider_metadata"]
+    if conflict == "native":
+        assert existing.source_name == "native"
+
+
 def test_message_update_moves_existing_provider_message_to_reported_stream(
     monkeypatch,
 ):

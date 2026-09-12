@@ -130,7 +130,11 @@ paths:
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
         '422':
-          description: The atomic event batch was rejected and no item committed.
+          description: |
+            The atomic event batch was rejected and no item committed.
+            provider_message_base_missing classifies a partial message update
+            with a valid destination but no base message. Isolate the failed
+            item before targeted recovery; other validation errors are unchanged.
           content:
             application/problem+json:
               schema:

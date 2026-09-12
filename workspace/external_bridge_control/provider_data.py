@@ -130,6 +130,10 @@ class ProviderBatchError(ProviderDataError):
     error = "provider_event_batch_rejected"
 
 
+class ProviderMessageBaseMissingError(ProviderBatchError):
+    error = "provider_message_base_missing"
+
+
 class ProviderReadProjectMoveConflictError(RuntimeError):
     """An in-flight provider read page cannot change project safely."""
 
@@ -3316,6 +3320,8 @@ def apply_provider_event_batch(
                     identity.bridge_instance_uuid,
                 ),
             )
+    except provider_event_apply.ProviderMessageBaseMissing as error:
+        raise ProviderMessageBaseMissingError(str(error)) from error
     except (
         KeyError,
         TypeError,

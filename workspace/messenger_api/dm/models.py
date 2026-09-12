@@ -1144,14 +1144,42 @@ class WorkspaceMessage(
             )
             if binding is None:
                 raise ra_exc.ValidationErrorException()
-        topic_key = (self.project_id, self.stream_uuid, self.topic_uuid)
+        self._validate_topic(self.project_id, self.stream_uuid, self.topic_uuid)
+
+    @classmethod
+    def validate_partial_provider_values(
+        cls, values: typing.Mapping[str, typing.Any], session: typing.Any = None
+    ) -> None:
+        """Validate a payload-less provider update without creating a fake message."""
+        validated = {
+            name: cls.properties.instantiate_property(name, values.get(name)).value
+            for name in cls.properties
+            if name != "payload"
+        }
+        cls._validate_topic(
+            validated["project_id"],
+            validated["stream_uuid"],
+            validated["topic_uuid"],
+            session=session,
+        )
+
+    @staticmethod
+    def _validate_topic(
+        project_id: sys_uuid.UUID,
+        stream_uuid: sys_uuid.UUID,
+        topic_uuid: sys_uuid.UUID,
+        session: typing.Any = None,
+    ) -> None:
+        validation_cache = _PROVIDER_MESSAGE_VALIDATION_CACHE.get()
+        topic_key = (project_id, stream_uuid, topic_uuid)
         if validation_cache is None or topic_key not in validation_cache:
             topic = WorkspaceStreamTopic.objects.get_one_or_none(
                 filters={
-                    "uuid": dm_filters.EQ(self.topic_uuid),
-                    "project_id": dm_filters.EQ(self.project_id),
-                    "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                    "uuid": dm_filters.EQ(topic_uuid),
+                    "project_id": dm_filters.EQ(project_id),
+                    "stream_uuid": dm_filters.EQ(stream_uuid),
                 },
+                session=session,
             )
             if topic is None:
                 raise ra_exc.ValidationErrorException()
