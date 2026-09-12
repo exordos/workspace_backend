@@ -375,7 +375,7 @@ def _message_projection_is_unchanged(
         if isinstance(current_payload, collections.abc.Mapping)
         else getattr(current_payload, "content", None)
     )
-    if (
+    if "payload" in values and (
         not isinstance(incoming_payload, message_payloads.MarkdownPayload)
         or incoming_payload.content != current_content
     ):
@@ -1684,6 +1684,36 @@ def _message_event(
                 "topic_uuid",
             },
         )
+        current_metadata = getattr(existing, "provider_metadata", None) or {}
+        incoming_metadata = update_values["provider_metadata"]
+        if (
+            "provider_original_url" not in incoming_metadata
+            and current_metadata.get("provider_original_url") is not None
+            and getattr(existing, "source_name", None)
+            == identity.provider_kind
+            == models.SourceName.ZULIP.value
+            and isinstance(existing.source, models.ZulipSource)
+            and getattr(existing, "external_account_uuid", None)
+            == projection_account_uuid
+            and current_metadata.get("account_uuid") == str(projection_account_uuid)
+            and current_metadata.get("kind") == identity.provider_kind
+            and current_metadata.get("external_id")
+            == existing.provider_external_id
+            == update_values["provider_external_id"]
+            and (
+                existing.source.message_id is None
+                or str(existing.source.message_id) == existing.provider_external_id
+            )
+            and assignment.get("provider_realm_uuid") is not None
+            and current_metadata.get("provider_realm_uuid")
+            == str(assignment["provider_realm_uuid"])
+        ):
+            # Topic-only records omit the original-message link. Retain only
+            # that field from the same validated provider identity, not stale
+            # capabilities, delivery state, or other snapshot metadata.
+            incoming_metadata["provider_original_url"] = current_metadata[
+                "provider_original_url"
+            ]
         previous_stream_uuid = existing.stream_uuid
         previous_topic_uuid = existing.topic_uuid
         reported_topic_uuid = update_values.get("topic_uuid", previous_topic_uuid)

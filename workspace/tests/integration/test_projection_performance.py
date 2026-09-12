@@ -17,6 +17,7 @@ from restalchemy.common import contexts
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.messenger_api.api import v2_store
 from workspace.services.messenger_workers import v2_projection
 from workspace.tests.integration import conftest
 
@@ -124,6 +125,86 @@ def _plan_nodes(plan):
     yield plan
     for child in plan.get("Plans", []):
         yield from _plan_nodes(child)
+
+
+def test_noninteractive_read_counter_waits_for_read_state_turn(api, monkeypatch):
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    event_uuid = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": f"{api.project_id}:{user_uuid}:{topic_uuid}",
+                "payload": {
+                    "source_kind": "legacy_message_state.updated",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(topic_uuid),
+                },
+            }
+        ],
+    )[0]
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        iter(("fanout", "read_state")),
+    )
+
+    with contexts.Context().session_manager() as session:
+        assert (
+            v2_projection._claim_task(
+                session,
+                "integration:deferred-read",
+                30,
+            )
+            is None
+        )
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:deferred-read",
+            30,
+        )
+        assert claimed is not None
+        assert claimed["outbox_event_uuid"] == event_uuid
+        session.rollback()
+
+
+def test_interactive_read_counter_remains_eligible_for_fallback(api, monkeypatch):
+    user_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    event_uuid = _seed_partition_claim_tasks(
+        api,
+        [
+            {
+                "task_kind": "read_counters",
+                "scope_kind": "user-topic",
+                "scope_key": f"{api.project_id}:{user_uuid}:{topic_uuid}",
+                "payload": {
+                    "source_kind": "topic.read",
+                    "user_uuid": str(user_uuid),
+                    "stream_uuid": str(sys_uuid.uuid4()),
+                    "topic_uuid": str(topic_uuid),
+                },
+            }
+        ],
+    )[0]
+    monkeypatch.setattr(
+        v2_projection,
+        "_FAIR_SCHEDULER_CYCLE",
+        iter(("fanout",)),
+    )
+
+    with contexts.Context().session_manager() as session:
+        claimed = v2_projection._claim_task(
+            session,
+            "integration:interactive-read",
+            30,
+        )
+        assert claimed is not None
+        assert claimed["outbox_event_uuid"] == event_uuid
+        session.rollback()
 
 
 def test_reaction_snapshot_uses_message_scoped_covering_index(api, db):
@@ -1589,6 +1670,74 @@ def test_history_import_snapshot_requeues_on_event_lock_contention(
     assert elapsed < 1
 
 
+def test_project_user_ensure_does_not_create_project_lock_convoy(api):
+    assert api.get(STREAMS).status_code == 200
+    project_lock = psycopg.connect(conftest.TEST_DB_URL, autocommit=True)
+    middle_has_ensured = threading.Event()
+    middle_pid = []
+
+    def ensure_then_wait_for_project_lock():
+        with contexts.Context().session_manager() as session:
+            session.execute("SET LOCAL lock_timeout = '5s'", ())
+            store = v2_store.MessengerV2Store(api.project_id, api.user_uuid)
+            store._ensure_project_user(api.user_uuid)
+            middle_pid.append(
+                session.execute("SELECT pg_backend_pid() AS pid", ()).fetchone()["pid"]
+            )
+            middle_has_ensured.set()
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))",
+                (api.project_id,),
+            )
+        return "middle"
+
+    def request_ensure():
+        assert middle_has_ensured.wait(timeout=5)
+        with contexts.Context().session_manager() as session:
+            session.execute("SET LOCAL lock_timeout = '250ms'", ())
+            store = v2_store.MessengerV2Store(api.project_id, api.user_uuid)
+            store._ensure_project_user(api.user_uuid)
+        return "request"
+
+    try:
+        project_lock.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s::text, 0))",
+            (api.project_id,),
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            middle = executor.submit(ensure_then_wait_for_project_lock)
+            assert middle_has_ensured.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                waiting = project_lock.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_locks
+                        WHERE pid = %s AND locktype = 'advisory' AND NOT granted
+                    )
+                    """,
+                    (middle_pid[0],),
+                ).fetchone()[0]
+                if waiting:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("middle transaction did not wait for project lock")
+            request = executor.submit(request_ensure)
+            try:
+                assert request.result(timeout=2) == "request"
+            finally:
+                project_lock.execute(
+                    "SELECT pg_advisory_unlock(hashtextextended(%s::text, 0))",
+                    (api.project_id,),
+                )
+            assert middle.result(timeout=5) == "middle"
+    finally:
+        if not project_lock.closed:
+            project_lock.execute("SELECT pg_advisory_unlock_all()")
+            project_lock.close()
+
+
 def test_broadcast_guard_does_not_deadlock_with_existing_project_user_update(api):
     stream, message = _create_message(api, "broadcast-project-user-lock-order")
     audience_uuid = sys_uuid.uuid4()
@@ -1837,7 +1986,8 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
                 f"integration:fair:{index}",
                 30,
             )
-            assert task is not None
+            if task is None:
+                continue
             claimed.append((task["task_kind"], task["payload"].get("source_kind")))
             session.execute(
                 """
@@ -1867,6 +2017,15 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
     assert ("read_counters", "topic.read") in claimed
     assert any(task_kind == "reaction_snapshot" for task_kind, _source in claimed)
     assert any(task_kind == "topic_state_projection" for task_kind, _source in claimed)
+    assert (
+        sum(
+            task_kind == "read_counters"
+            and source_kind
+            not in {"message.read", "messages.read", "stream.read", "topic.read"}
+            for task_kind, source_kind in claimed
+        )
+        == 1
+    )
     assert any(
         node.get("Index Name") == "messenger_projection_tasks_fair_claim_idx"
         for node in _plan_nodes(plan["Plan"])
@@ -1880,7 +2039,7 @@ def test_fair_scheduler_bounds_fanout_under_large_read_backlog(api, monkeypatch)
     # cannot turn an otherwise bounded query into a flaky test.
     assert v2_projection.CLAIM_CANDIDATE_LIMIT < 30000
     assert elapsed < 10
-    assert metrics["unfinished"] >= 29994
+    assert metrics["unfinished"] >= 29999
     assert metrics["oldest_pending_task_seconds"] >= 23 * 60 * 60
 
 

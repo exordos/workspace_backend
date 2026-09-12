@@ -325,8 +325,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             """
             INSERT INTO messenger_project_users (project_id, user_uuid)
             SELECT %s, uuid FROM m_workspace_users WHERE uuid = %s
-            ON CONFLICT (project_id, user_uuid) DO UPDATE
-            SET updated_at = NOW()
+            ON CONFLICT (project_id, user_uuid) DO NOTHING
             """,
             (self.project_uuid, value),
         )

@@ -164,7 +164,8 @@ def test_messenger_v2_projection_worker_is_explicitly_enabled():
     ):
         config = _read(config_path)
         assert "v2_projection_enabled = true" in config
-        assert "v2_projection_workers = 4" in config
+        assert config.count("v2_projection_workers = 2") == 1
+        assert "v2_projection_workers = 4" not in config
         assert "v2_projection_idle_sleep_seconds = 0.5" in config
         assert "v2_metrics_log_interval_seconds = 30" in config
 

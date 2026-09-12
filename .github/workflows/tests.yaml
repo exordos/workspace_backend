@@ -66,6 +66,65 @@ jobs:
           DATABASE_URI: "postgresql://workspace:pass@localhost:5432/workspace"
         run: |
           tox -e ${{ matrix.python-version }}-functional
+  Integration-regressions:
+    runs-on: ubuntu-24.04
+    services:
+      postgresql:
+        image: postgres:latest
+        env:
+          POSTGRES_DB: workspace_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: workspace
+          POSTGRES_PASSWORD: pass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install requirements
+        run: sudo apt update && sudo apt install --yes libev-dev libvirt-dev
+      - uses: astral-sh/setup-uv@v7
+      - name: Install tox-uv
+        run: uv tool install tox --with tox-uv
+      - name: Build integration environment
+        run: tox -e develop --notest
+      - name: Run responsiveness regressions
+        env:
+          WORKSPACE_TEST_DB_URL: >-
+            postgresql://workspace:pass@localhost:5432/workspace_test
+        run: |
+          set -euo pipefail
+          .tox/develop/bin/python -c \
+            'import os, psycopg; psycopg.connect(os.environ["WORKSPACE_TEST_DB_URL"]).close()'
+          .tox/develop/bin/pytest -q \
+            --junitxml=integration-regressions.xml \
+            workspace/tests/integration/test_messenger_v2.py::test_opening_store_does_not_refresh_existing_project_user \
+            workspace/tests/integration/test_projection_performance.py::test_project_user_ensure_does_not_create_project_lock_convoy \
+            workspace/tests/integration/test_projection_performance.py::test_noninteractive_read_counter_waits_for_read_state_turn \
+            workspace/tests/integration/test_projection_performance.py::test_interactive_read_counter_remains_eligible_for_fallback \
+            workspace/tests/integration/test_projection_performance.py::test_fair_scheduler_bounds_fanout_under_large_read_backlog
+          .tox/develop/bin/python - <<'PY'
+          import xml.etree.ElementTree as xml_etree
+
+          root = xml_etree.parse("integration-regressions.xml").getroot()
+          cases = root.findall(".//testcase")
+          bad = [
+              case
+              for case in cases
+              if any(case.find(name) is not None for name in ("failure", "error", "skipped"))
+          ]
+          if len(cases) != 5 or bad:
+              raise SystemExit(
+                  f"expected five passing integration regressions: cases={len(cases)} bad={len(bad)}"
+              )
+          PY
   Coverage:
     runs-on: ubuntu-24.04
     strategy:

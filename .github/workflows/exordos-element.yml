@@ -8,12 +8,6 @@ on:
     tags:
       - "*"
   workflow_dispatch:
-    inputs:
-      publish:
-        description: "Publish the built element to the configured Exordos repository"
-        required: false
-        default: false
-        type: boolean
 
 env:
   ARTIFACTS_PATH: output
@@ -24,6 +18,7 @@ jobs:
     runs-on: [self-hosted, vm]
     if: ${{ github.actor != 'dependabot[bot]' }}
     permissions:
+      actions: read
       contents: read
 
     steps:
@@ -82,32 +77,46 @@ jobs:
       - name: Show build output
         run: |
           set -euo pipefail
-          find "${ARTIFACTS_PATH}" -maxdepth 4 -type f -printf "%p %s bytes\n"
+          while IFS= read -r -d '' artifact; do
+            artifact_size="$(stat --format='%s' "${artifact}")"
+            artifact_sha256="$(sha256sum "${artifact}" | cut -d ' ' -f 1)"
+            printf "%s %s bytes sha256=%s\n" \
+              "${artifact}" "${artifact_size}" "${artifact_sha256}"
+          done < <(find "${ARTIFACTS_PATH}" -type f -print0 | sort -z)
+
+      - name: Require green tests for the exact release commit
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "tests.yaml",
+              head_sha: context.sha,
+              status: "completed",
+              per_page: 100,
+            });
+            const passed = response.data.workflow_runs.some(
+              run => run.event === "push" && run.conclusion === "success"
+            );
+            if (!passed) {
+              core.setFailed(`No successful tests workflow for ${context.sha}`);
+            }
 
       - name: Publish element
+        if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
         env:
-          PUBLISH_REQUESTED: ${{ inputs.publish }}
           PUSH_CFG: ${{ secrets.PUSH_CFG }}
         run: |
           set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
-            && "${PUBLISH_REQUESTED:-false}" != "true" ]]; then
-            exit 0
-          fi
 
           : "${PUSH_CFG:?Set secret PUSH_CFG to base64-encoded exordos.push.yaml content}"
 
           push_cfg_path="${RUNNER_TEMP}/exordos.push.yaml"
           printf "%s" "${PUSH_CFG}" | base64 -d > "${push_cfg_path}"
 
-          latest_arg=()
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            latest_arg=(--latest)
-          fi
-
           "${EXORDOS_BIN}" push . \
             --exordos-cfg-file "${push_cfg_path}" \
             --element-dir "${ARTIFACTS_PATH}" \
-            --force \
-            "${latest_arg[@]}"
+            --latest

@@ -9,12 +9,20 @@ import pathlib
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 
 
-def test_element_workflow_builds_and_optionally_publishes_one_element():
+def test_element_workflow_publishes_one_immutable_tagged_element():
     workflow = (PROJECT_ROOT / ".github/workflows/exordos-element.yml").read_text()
+    publish = workflow.split('"${EXORDOS_BIN}" push .', 1)[1]
 
     assert workflow.count('"${EXORDOS_BIN}" build .') == 1
     assert workflow.count('"${EXORDOS_BIN}" push .') == 1
-    assert "PUBLISH_REQUESTED" in workflow
+    assert workflow.count("github.event_name == 'push' && github.ref_type == 'tag'") == 2
+    assert "actions: read" in workflow
+    assert 'workflow_id: "tests.yaml"' in workflow
+    assert "head_sha: context.sha" in workflow
+    assert 'run.event === "push" && run.conclusion === "success"' in workflow
+    assert "PUBLISH_REQUESTED" not in workflow
+    assert "--force" not in publish
+    assert "--latest" in publish
     assert "profile:" not in workflow
     assert "production_migration" not in workflow
     assert "manifest-var" not in workflow
