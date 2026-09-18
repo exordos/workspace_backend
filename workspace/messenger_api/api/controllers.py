@@ -328,6 +328,8 @@ class ContractJSONPacker(ra_packers.JSONPacker):
             "delivery",
             "identity_kind",
             "display_name",
+            "source_name",
+            "source",
         ):
             if extension_name in obj:
                 result[extension_name] = obj[extension_name]

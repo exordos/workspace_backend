@@ -138,6 +138,7 @@ workspace-messenger-worker = "workspace.cmd.messenger_worker:main"
 workspace-messenger-events = "workspace.cmd.messenger_events:main"
 workspace-history-import-worker = "workspace.cmd.history_import_worker:main"
 workspace-external-bridge-api = "workspace.cmd.external_bridge_api:main"
+workspace-v3-worker = "workspace.cmd.workspace_v3_worker:main"
 
 [tool.uv]
 package = true

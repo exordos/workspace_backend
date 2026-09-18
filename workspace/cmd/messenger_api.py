@@ -31,6 +31,7 @@ from workspace.common import external_bridge_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_reaction_opts
+from workspace.common import messenger_store_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import app
 from workspace.messenger_api.api import store as api_store
@@ -65,13 +66,19 @@ external_bridge_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
 messenger_reaction_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
+messenger_store_opts.register_opts(CONF)
 
 
 def build_http_services(iam_driver: typing.Any) -> tuple[typing.Any, ...]:
     services = []
+    application_builder = (
+        app.build_v3_wsgi_application
+        if CONF[messenger_store_opts.DOMAIN].backend == "v3"
+        else app.build_wsgi_application
+    )
     for _ in range(CONF[DOMAIN].workers):
         service = bjoern_service.BjoernService(
-            wsgi_app=app.build_wsgi_application(iam_driver),
+            wsgi_app=application_builder(iam_driver),
             host=CONF[DOMAIN].bind_host,
             port=CONF[DOMAIN].bind_port,
             bjoern_kwargs=dict(reuse_port=True),
@@ -104,7 +111,11 @@ def main() -> None:
         CONF.iam.audience,
         CONF.iam.hs256_jwks_decryption_key,
     )
-    api_store.configure_store_factory(store_factory.build_store_factory())
+    api_store.configure_store_factory(
+        store_factory.build_store_factory(
+            CONF[messenger_store_opts.DOMAIN].backend,
+        )
+    )
 
     for service in build_http_services(iam_driver):
         service_hub.add_service(service)

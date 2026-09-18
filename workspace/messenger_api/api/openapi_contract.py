@@ -8,7 +8,6 @@ import typing
 
 from workspace.messenger_api.dm import message_payloads
 
-
 PAGINATION_LIMIT_PARAMETER = {
     "name": "page_limit",
     "in": "query",
@@ -957,6 +956,52 @@ def add_public_projection_contract(
                     "account_uuid": {"type": "string", "format": "uuid"},
                 },
             }
+    return specification
+
+
+def add_v3_source_contract(
+    specification: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    """Expose only the provider name for clean-v3 Messenger resources."""
+    schemas = specification["components"]["schemas"]
+    projection_schema_prefixes = (
+        "WorkspaceUserStream_",
+        "WorkspaceUserTopic_",
+        "WorkspaceUserMessage_",
+        "WorkspaceMessageReactions_",
+    )
+    source_schema = {
+        "type": "object",
+        "required": ["kind"],
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "enum": ["native", "zulip"]},
+        },
+        "description": "Minimal compatibility projection of source_name.",
+    }
+    for name in schemas:
+        if not name.startswith(projection_schema_prefixes):
+            continue
+        schema = _component_schema(schemas, name)
+        properties = schema["properties"]
+        for field in (
+            "provider",
+            "provider_metadata",
+            "delivery",
+            "delivery_metadata",
+        ):
+            properties.pop(field, None)
+        properties["source"] = copy.deepcopy(source_schema)
+        properties["source_name"] = {
+            "type": "string",
+            "enum": ["native", "zulip"],
+            "description": "Authoritative source/provider name.",
+        }
+    for name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
+        schema = _component_schema(schemas, name)
+        properties = schema["properties"]
+        properties.pop("provider", None)
+        properties.pop("identity_kind", None)
     return specification
 
 

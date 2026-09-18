@@ -234,10 +234,10 @@ def _assert_topic_summary_management_contract(specification, root):
     ]
 
 
-def _build_openapi(app_module):
+def _build_openapi(app_module, openapi_engine=None):
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
-        openapi_engine=app_module.get_openapi_engine(),
+        openapi_engine=openapi_engine or app_module.get_openapi_engine(),
     )
     request = webob.Request.blank(f"/specifications/{OPENAPI_VERSION}")
     request.application = application
@@ -383,6 +383,52 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         "/v1/stream_topics/{WorkspaceUserTopicUuid}",
     )
     _assert_topic_summary_management_contract(specification, "/v1/")
+
+
+def test_v3_openapi_exposes_only_the_minimal_source_marker():
+    specification = _build_openapi(
+        messenger_app,
+        messenger_app.get_v3_openapi_engine(),
+    )
+    for prefix in (
+        "WorkspaceUserStream_",
+        "WorkspaceUserTopic_",
+        "WorkspaceUserMessage_",
+        "WorkspaceMessageReactions_",
+    ):
+        for name in specification["components"]["schemas"]:
+            if not name.startswith(prefix):
+                continue
+            properties = _component_schema(specification, name)["properties"]
+            assert not {
+                "provider",
+                "provider_metadata",
+                "delivery",
+                "delivery_metadata",
+            } & set(properties)
+            assert properties["source_name"]["enum"] == ["native", "zulip"]
+            assert properties["source"]["properties"] == {
+                "kind": {"type": "string", "enum": ["native", "zulip"]}
+            }
+            assert properties["source"]["additionalProperties"] is False
+
+    for name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
+        properties = _component_schema(specification, name)["properties"]
+        assert "provider" not in properties
+        assert "identity_kind" not in properties
+        assert "display_name" in properties
+
+    workspace_specification = _build_openapi(
+        workspace_app,
+        workspace_app.get_v3_openapi_engine(),
+    )
+    workspace_message = _component_schema(
+        workspace_specification,
+        "WorkspaceUserMessage_Get",
+    )["properties"]
+    assert "provider" not in workspace_message
+    assert "delivery" not in workspace_message
+    assert set(workspace_message["source"]["properties"]) == {"kind"}
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():

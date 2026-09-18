@@ -86,6 +86,11 @@ class InvalidTopicSummaryStateError(ra_exc.ValidationErrorException):
     code = 400001013
 
 
+class PrivateStreamMemberLimitError(ra_exc.ValidationErrorException):
+    message = "Private streams cannot have more than two members"
+    code = 400001014
+
+
 class TopicSummaryConflictError(ra_exc.RestAlchemyException):
     message = "A newer topic summary has already been stored"
     code = 409

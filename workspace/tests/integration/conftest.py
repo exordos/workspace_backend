@@ -290,6 +290,7 @@ def _database():
 
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
+            cur.execute('DROP SCHEMA IF EXISTS "workspace_v3" CASCADE;')
             cur.execute('DROP SCHEMA IF EXISTS "public" CASCADE;')
             cur.execute('CREATE SCHEMA "public";')
 
