@@ -1480,6 +1480,11 @@ def add_provider_entity_contract(
     upsert = _object_schema(
         {
             "content_hash": hash_schema,
+            "source_updated_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "UTC modification time in the provider source.",
+            },
             "data": entity_data,
         },
         ["content_hash", "data"],
@@ -1497,8 +1502,13 @@ def add_provider_entity_contract(
                 "format": "date-time",
                 "nullable": True,
             },
+            "source_updated_at": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": True,
+            },
         },
-        ["type", "uuid", "status", "updated_at"],
+        ["type", "uuid", "status", "source_updated_at", "updated_at"],
     )
     entity = _object_schema(
         {
@@ -1507,9 +1517,18 @@ def add_provider_entity_contract(
             "content_hash": hash_schema,
             "data": entity_data,
             "created_at": {"type": "string", "format": "date-time"},
+            "source_updated_at": {"type": "string", "format": "date-time"},
             "updated_at": {"type": "string", "format": "date-time"},
         },
-        ["type", "uuid", "content_hash", "data", "created_at", "updated_at"],
+        [
+            "type",
+            "uuid",
+            "content_hash",
+            "data",
+            "created_at",
+            "source_updated_at",
+            "updated_at",
+        ],
     )
     def json_response(
         schema: dict[str, typing.Any],
@@ -1606,6 +1625,10 @@ def add_provider_entity_contract(
             "type": {"type": "string", "enum": PROVIDER_ENTITY_TYPES},
             "uuid": {"type": "string", "format": "uuid"},
             "content_hash": hash_schema,
+            "source_updated_at": {
+                "type": "string",
+                "format": "date-time",
+            },
             "data": entity_data,
         },
         ["action", "type", "uuid"],
@@ -1641,6 +1664,23 @@ def add_provider_entity_contract(
                     ),
                     "Atomic mutation results",
                 )
+            },
+        }
+    }
+    specification["paths"]["/v1/provider/bootstrap"] = {
+        "get": {
+            "summary": "Stream a consistent provider-visible entity snapshot",
+            "operationId": "Bootstrap_provider_entities",
+            "tags": ["Provider"],
+            "responses": {
+                200: {
+                    "description": "NDJSON snapshot framed by meta and complete records",
+                    "content": {
+                        "application/x-ndjson": {
+                            "schema": {"type": "string", "format": "binary"}
+                        }
+                    },
+                }
             },
         }
     }

@@ -454,6 +454,9 @@ def test_v3_openapi_exposes_only_the_minimal_source_marker():
         "message_flags",
         "message_reactions",
     ]
+    assert "source_updated_at" in operations["items"]["properties"]
+    bootstrap = specification["paths"]["/v1/provider/bootstrap"]["get"]
+    assert "application/x-ndjson" in bootstrap["responses"][200]["content"]
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():

@@ -194,6 +194,7 @@ EXPECTED_COLUMNS = {
         "content_hash",
         "created_at",
         "updated_at",
+        "source_updated_at",
     ),
     "stream_bindings": (
         "uuid",

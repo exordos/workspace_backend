@@ -6,6 +6,7 @@
 import datetime
 import hashlib
 import json
+import tempfile
 import typing
 import uuid as sys_uuid
 
@@ -112,6 +113,17 @@ def jsonable(value: typing.Any) -> typing.Any:
     return value
 
 
+def canonical_hash(value: typing.Any) -> bytes:
+    return hashlib.sha256(
+        json.dumps(
+            jsonable(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+
+
 class ProviderEntityStore:
     """Mutate only entities owned by one authenticated provider consumer."""
 
@@ -191,7 +203,8 @@ class ProviderEntityStore:
     ) -> dict[str, typing.Any] | None:
         row = self.session.execute(
             """
-            SELECT provider_uuid, content_hash, created_at, updated_at
+            SELECT provider_uuid, content_hash, source_updated_at,
+                   created_at, updated_at
             FROM workspace_v3.provider_entity_states
             WHERE project_id = %s AND entity_type = %s AND entity_uuid = %s
             """,
@@ -255,16 +268,19 @@ class ProviderEntityStore:
         resource: str,
         entity_uuid: sys_uuid.UUID,
         content_hash: bytes,
+        source_updated_at: datetime.datetime,
     ) -> dict[str, typing.Any]:
         row = self.session.execute(
             """
             INSERT INTO workspace_v3.provider_entity_states (
-                project_id, provider_uuid, entity_type, entity_uuid, content_hash
-            ) VALUES (%s, %s, %s, %s, %s)
+                project_id, provider_uuid, entity_type, entity_uuid,
+                content_hash, source_updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, provider_uuid, entity_type, entity_uuid)
             DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                          source_updated_at = EXCLUDED.source_updated_at,
                           updated_at = clock_timestamp()
-            RETURNING created_at, updated_at
+            RETURNING source_updated_at, created_at, updated_at
             """,
             (
                 self.project_uuid,
@@ -272,6 +288,7 @@ class ProviderEntityStore:
                 RESOURCE_TYPES[resource],
                 entity_uuid,
                 content_hash,
+                source_updated_at,
             ),
         ).fetchone()
         return dict(row)
@@ -282,7 +299,11 @@ class ProviderEntityStore:
         entity_uuid: sys_uuid.UUID,
         content_hash: bytes,
         data: dict[str, typing.Any],
+        source_updated_at: datetime.datetime | None = None,
     ) -> dict[str, typing.Any]:
+        source_updated_at = source_updated_at or datetime.datetime.now(
+            datetime.timezone.utc
+        )
         state = self._owned_state(resource, entity_uuid)
         if state is not None and bytes(state["content_hash"]) == content_hash:
             return self._result(resource, entity_uuid, "unchanged", state)
@@ -292,7 +313,12 @@ class ProviderEntityStore:
         status = "created" if state is None else "updated"
         with event_origin.use("provider", self.provider_uuid):
             getattr(self, f"_upsert_{resource}")(entity_uuid, data)
-            new_state = self._set_state(resource, entity_uuid, content_hash)
+            new_state = self._set_state(
+                resource,
+                entity_uuid,
+                content_hash,
+                source_updated_at,
+            )
             self._emit_upsert(resource, entity_uuid, status, data)
         return self._result(resource, entity_uuid, status, new_state)
 
@@ -307,6 +333,7 @@ class ProviderEntityStore:
                 "type": resource,
                 "uuid": entity_uuid,
                 "status": "not_found",
+                "source_updated_at": None,
                 "updated_at": None,
             }
         with event_origin.use("provider", self.provider_uuid):
@@ -319,6 +346,7 @@ class ProviderEntityStore:
             "type": resource,
             "uuid": entity_uuid,
             "status": "deleted",
+            "source_updated_at": state["source_updated_at"],
             "updated_at": datetime.datetime.now(datetime.timezone.utc),
         }
 
@@ -345,6 +373,7 @@ class ProviderEntityStore:
         rows = self.session.execute(
             f"""
             SELECT entity.*, state.content_hash,
+                   state.source_updated_at,
                    state.created_at AS provider_created_at,
                    state.updated_at AS provider_updated_at
             FROM workspace_v3.provider_entity_states AS state
@@ -407,6 +436,7 @@ class ProviderEntityStore:
         row = self.session.execute(
             f"""
             SELECT entity.*, state.content_hash,
+                   state.source_updated_at,
                    state.created_at AS provider_created_at,
                    state.updated_at AS provider_updated_at
             FROM workspace_v3.provider_entity_states AS state
@@ -434,6 +464,7 @@ class ProviderEntityStore:
             "uuid": row["uuid"],
             "content_hash": bytes(row["content_hash"]).hex(),
             "data": self._provider_data(resource, row),
+            "source_updated_at": row["source_updated_at"],
             "created_at": row["provider_created_at"],
             "updated_at": row["provider_updated_at"],
         }
@@ -534,8 +565,190 @@ class ProviderEntityStore:
             "type": resource,
             "uuid": entity_uuid,
             "status": status,
+            "source_updated_at": state["source_updated_at"],
             "updated_at": state["updated_at"],
         }
+
+    def bootstrap_snapshot(
+        self, cursor: typing.Mapping[str, typing.Any]
+    ) -> typing.IO[bytes]:
+        snapshot_uuid = sys_uuid.uuid4()
+        output = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+        meta = {
+            "record": "meta",
+            "schema_version": 1,
+            "snapshot_uuid": snapshot_uuid,
+            "project_id": self.project_uuid,
+            "provider_uuid": self.provider_uuid,
+            "epoch_generation": cursor["epoch_generation"],
+            "snapshot_epoch_version": int(cursor["current_epoch_version"]),
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+        }
+        output.write(self._snapshot_line(meta))
+        counts: dict[str, int] = {}
+        digest = hashlib.sha256()
+        for resource in RESOURCE_TYPES:
+            count = 0
+            for row in self._snapshot_rows(resource):
+                data = self._provider_data(resource, row)
+                content_hash = canonical_hash(data)
+                state_hash = row.get("provider_content_hash")
+                source_updated_at = (
+                    row["provider_source_updated_at"]
+                    if state_hash is not None
+                    and bytes(state_hash) == content_hash
+                    and row["provider_source_updated_at"] is not None
+                    else row["updated_at"]
+                )
+                item = {
+                    "record": "entity",
+                    "type": resource,
+                    "uuid": row["uuid"],
+                    "content_hash": content_hash.hex(),
+                    "source_updated_at": source_updated_at,
+                    "data": data,
+                }
+                line = self._snapshot_line(item)
+                output.write(line)
+                digest.update(line)
+                count += 1
+            counts[resource] = count
+        output.write(
+            self._snapshot_line(
+                {
+                    "record": "complete",
+                    "snapshot_uuid": snapshot_uuid,
+                    "counts": counts,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        )
+        output.seek(0)
+        return output
+
+    @staticmethod
+    def _snapshot_line(value: dict[str, typing.Any]) -> bytes:
+        return (
+            json.dumps(
+                jsonable(value),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    def _snapshot_rows(self, resource: str) -> typing.Iterable[dict[str, typing.Any]]:
+        table = TABLES[resource]
+        scope = {
+            "users": """
+                entity.uuid IN (
+                    SELECT stream.owner_uuid
+                    FROM workspace_v3.streams AS stream
+                    WHERE stream.project_id = %(project)s
+                      AND stream.source_name = %(provider_name)s
+                    UNION SELECT stream.direct_user_uuid
+                    FROM workspace_v3.streams AS stream
+                    WHERE stream.project_id = %(project)s
+                      AND stream.source_name = %(provider_name)s
+                      AND stream.direct_user_uuid IS NOT NULL
+                    UNION SELECT binding.user_uuid
+                    FROM workspace_v3.stream_bindings AS binding
+                    JOIN workspace_v3.streams AS stream
+                      ON stream.project_id = binding.project_id
+                     AND stream.uuid = binding.stream_uuid
+                    WHERE binding.project_id = %(project)s
+                      AND stream.source_name = %(provider_name)s
+                    UNION SELECT message.author_uuid
+                    FROM workspace_v3.messages AS message
+                    JOIN workspace_v3.streams AS stream
+                      ON stream.project_id = message.project_id
+                     AND stream.uuid = message.stream_uuid
+                    WHERE message.project_id = %(project)s
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+            "streams": """
+                entity.project_id = %(project)s
+                AND entity.source_name = %(provider_name)s
+            """,
+            "stream_bindings": """
+                entity.project_id = %(project)s AND EXISTS (
+                    SELECT 1 FROM workspace_v3.streams AS stream
+                    WHERE stream.project_id = entity.project_id
+                      AND stream.uuid = entity.stream_uuid
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+            "topics": """
+                entity.project_id = %(project)s AND EXISTS (
+                    SELECT 1 FROM workspace_v3.streams AS stream
+                    WHERE stream.project_id = entity.project_id
+                      AND stream.uuid = entity.stream_uuid
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+            "topic_bindings": """
+                entity.project_id = %(project)s AND EXISTS (
+                    SELECT 1 FROM workspace_v3.streams AS stream
+                    WHERE stream.project_id = entity.project_id
+                      AND stream.uuid = entity.stream_uuid
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+            "messages": """
+                entity.project_id = %(project)s AND EXISTS (
+                    SELECT 1 FROM workspace_v3.streams AS stream
+                    WHERE stream.project_id = entity.project_id
+                      AND stream.uuid = entity.stream_uuid
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+            "message_flags": """
+                entity.project_id = %(project)s AND EXISTS (
+                    SELECT 1 FROM workspace_v3.messages AS message
+                    JOIN workspace_v3.streams AS stream
+                      ON stream.project_id = message.project_id
+                     AND stream.uuid = message.stream_uuid
+                    WHERE message.project_id = entity.project_id
+                      AND message.uuid = entity.message_uuid
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+            "message_reactions": """
+                entity.project_id = %(project)s AND EXISTS (
+                    SELECT 1 FROM workspace_v3.messages AS message
+                    JOIN workspace_v3.streams AS stream
+                      ON stream.project_id = message.project_id
+                     AND stream.uuid = message.stream_uuid
+                    WHERE message.project_id = entity.project_id
+                      AND message.uuid = entity.message_uuid
+                      AND stream.source_name = %(provider_name)s
+                )
+            """,
+        }[resource]
+        rows = self.session.execute(
+            f"""
+            SELECT entity.*,
+                   state.content_hash AS provider_content_hash,
+                   state.source_updated_at AS provider_source_updated_at
+            FROM workspace_v3.{table} AS entity
+            LEFT JOIN workspace_v3.provider_entity_states AS state
+              ON state.project_id = %(project)s
+             AND state.provider_uuid = %(provider)s
+             AND state.entity_type = %(entity_type)s
+             AND state.entity_uuid = entity.uuid
+            WHERE {scope}
+            ORDER BY entity.uuid
+            """,
+            {
+                "project": self.project_uuid,
+                "provider": self.provider_uuid,
+                "provider_name": self.provider_name,
+                "entity_type": RESOURCE_TYPES[resource],
+            },
+        )
+        return (dict(row) for row in rows)
 
     def _created_at(self, data: dict[str, typing.Any]) -> datetime.datetime:
         value = data.get("created_at")
@@ -794,7 +1007,12 @@ class ProviderEntityStore:
             JOIN workspace_v3.stream_bindings AS binding
               ON binding.project_id = message.project_id
              AND binding.stream_uuid = message.stream_uuid
+            JOIN workspace_v3.streams AS stream
+              ON stream.project_id = message.project_id
+             AND stream.uuid = message.stream_uuid
             WHERE message.project_id = %s AND message.uuid = %s
+              AND (stream.history_public_to_subscribers
+                   OR message.created_at >= binding.created_at)
             ON CONFLICT (project_id, message_uuid, user_uuid) DO NOTHING
             """,
             (self.project_uuid, entity_uuid),

@@ -10,6 +10,7 @@ import typing
 import uuid as sys_uuid
 
 import webob
+import webob.static
 from restalchemy.api import middlewares
 from restalchemy.common import contexts
 
@@ -19,6 +20,7 @@ from workspace.messenger_api.api import v3_store
 
 
 _ROOT = "/v1/provider/entities"
+_BOOTSTRAP_PATH = "/v1/provider/bootstrap"
 _BATCH_PATH = f"{_ROOT}/actions/apply/invoke"
 _RESOURCE_NAMES = "|".join(provider_store.RESOURCE_TYPES)
 _COLLECTION_PATH = re.compile(rf"^{_ROOT}/(?P<resource>{_RESOURCE_NAMES})/?$")
@@ -80,10 +82,15 @@ class ProviderApiMiddleware(middlewares.Middleware):
     """Serve Provider CRUD before the public RestAlchemy route dispatcher."""
 
     def process_request(self, req: typing.Any) -> webob.Response | None:
-        if req.path != _ROOT and not req.path.startswith(f"{_ROOT}/"):
+        if (
+            req.path != _BOOTSTRAP_PATH
+            and req.path != _ROOT
+            and not req.path.startswith(f"{_ROOT}/")
+        ):
             return None
         project_uuid = sys_uuid.UUID(str(req.context.project_id))
         iam_user_uuid = sys_uuid.UUID(str(req.context.user_uuid))
+        session = contexts.Context().get_session()
         provider = v3_store.resolve_provider_consumer(project_uuid, iam_user_uuid)
         if provider is None:
             raise messenger_exceptions.ProviderApiError(
@@ -92,11 +99,28 @@ class ProviderApiMiddleware(middlewares.Middleware):
                 message="The IAM identity is not an enabled provider consumer",
             )
         store = provider_store.ProviderEntityStore(
-            contexts.Context().get_session(),
+            session,
             project_uuid,
             iam_user_uuid,
             provider,
         )
+        if req.path == _BOOTSTRAP_PATH:
+            if req.method != "GET":
+                return self._method_not_allowed(("GET",))
+            # Cursor creation is a small, intentional write. Commit it before
+            # opening the read-only consistent snapshot used for all records.
+            cursor = store.events._cursor("provider", store.provider_uuid)
+            session.commit()
+            session.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
+            return webob.Response(
+                app_iter=webob.static.FileIter(store.bootstrap_snapshot(cursor)),
+                status=200,
+                content_type="application/x-ndjson",
+                charset="utf-8",
+                headers={"Cache-Control": "no-store"},
+            )
         if req.path.rstrip("/") == _BATCH_PATH:
             if req.method != "POST":
                 return self._method_not_allowed(("POST",))
@@ -128,6 +152,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
         if req.method == "PUT":
             body = _body(req)
             content_hash = provider_store.parse_content_hash(body.get("content_hash"))
+            source_updated_at = self._source_updated_at(body)
             data = body.get("data")
             if not isinstance(data, dict):
                 raise messenger_exceptions.ProviderApiError(
@@ -137,7 +162,13 @@ class ProviderApiMiddleware(middlewares.Middleware):
                 )
             store.lock_entities(((resource, entity_uuid),))
             try:
-                result = store.upsert(resource, entity_uuid, content_hash, data)
+                result = store.upsert(
+                    resource,
+                    entity_uuid,
+                    content_hash,
+                    data,
+                    source_updated_at,
+                )
             except messenger_exceptions.ProviderApiError:
                 raise
             except Exception as error:
@@ -201,6 +232,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
                         operation["entity_uuid"],
                         operation["content_hash"],
                         operation["data"],
+                        operation["source_updated_at"],
                     )
                 else:
                     result = store.delete(
@@ -256,6 +288,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
             result["content_hash"] = provider_store.parse_content_hash(
                 operation.get("content_hash")
             )
+            result["source_updated_at"] = self._source_updated_at(operation)
             data = operation.get("data")
             if not isinstance(data, dict):
                 raise messenger_exceptions.ProviderApiError(
@@ -265,6 +298,13 @@ class ProviderApiMiddleware(middlewares.Middleware):
                 )
             result["data"] = data
         return result
+
+    @staticmethod
+    def _source_updated_at(body: dict[str, typing.Any]) -> datetime.datetime:
+        value = body.get("source_updated_at")
+        if value is None:
+            return datetime.datetime.now(datetime.timezone.utc)
+        return provider_store.parse_timestamp(value, "source_updated_at")
 
     def _list(
         self,

@@ -382,6 +382,37 @@ def test_provider_batch_imports_graph_emits_events_and_cleans_cascades(api, db):
     ).fetchone()[0]
     assert echoed == 0
 
+    snapshot = api.get("/v1/provider/bootstrap")
+    assert snapshot.status_code == 200, snapshot.text
+    records = [json.loads(line) for line in snapshot.text.splitlines()]
+    assert records[0]["record"] == "meta"
+    assert records[0]["provider_uuid"] == str(provider_uuid)
+    assert records[-1]["record"] == "complete"
+    assert records[-1]["snapshot_uuid"] == records[0]["snapshot_uuid"]
+    assert records[-1]["counts"] == {
+        "message_flags": 2,
+        "message_reactions": 1,
+        "messages": 1,
+        "stream_bindings": 2,
+        "streams": 1,
+        "topic_bindings": 2,
+        "topics": 1,
+        "users": 2,
+    }
+    entity_lines = [
+        line + "\n"
+        for line in snapshot.text.splitlines()
+        if json.loads(line)["record"] == "entity"
+    ]
+    assert records[-1]["sha256"] == hashlib.sha256(
+        "".join(entity_lines).encode()
+    ).hexdigest()
+    assert all(
+        record["source_updated_at"].endswith("Z")
+        for record in records
+        if record["record"] == "entity"
+    )
+
     message_data = next(
         data
         for resource, entity_uuid, data in entities
