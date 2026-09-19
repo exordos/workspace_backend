@@ -24,6 +24,7 @@ from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
 
 from workspace import version as app_version
+from workspace.messenger_api import provider_api
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.messenger_api.api import openapi_contract, versions
@@ -83,9 +84,13 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/",
             components,
         )
-        return openapi_contract.add_current_user_contract(
+        specification = openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",
+        )
+        return openapi_contract.add_provider_entity_contract(
+            specification,
+            "/v1/provider/entities/",
         )
 
 
@@ -137,6 +142,7 @@ def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
             openapi_engine=get_openapi_engine(),
         ),
         [
+            provider_api.ProviderApiMiddleware,
             middlewares.configure_middleware(
                 iam_mw.GenesisCoreAuthMiddleware,
                 iam_engine_driver=iam_engine_driver,
@@ -158,6 +164,7 @@ def build_v3_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
             openapi_engine=get_v3_openapi_engine(),
         ),
         [
+            provider_api.ProviderApiMiddleware,
             middlewares.configure_middleware(
                 iam_mw.GenesisCoreAuthMiddleware,
                 iam_engine_driver=iam_engine_driver,

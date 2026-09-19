@@ -158,11 +158,19 @@ def test_reaction_projection_is_bounded_complete_and_provider_visible(_database,
     with db.cursor() as cursor:
         cursor.execute(
             """
-            INSERT INTO workspace_v3.event_cursors (
-                project_id, consumer_type, consumer_uuid
-            ) VALUES (%s, 'provider', %s)
+            UPDATE workspace_v3.streams
+            SET source_name = 'zulip'
+            WHERE project_id = %s AND uuid = %s
             """,
-            (project_id, provider_uuid),
+            (project_id, stream_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.provider_consumers (
+                uuid, project_id, name, iam_user_uuid
+            ) VALUES (%s, %s, 'zulip', %s)
+            """,
+            (provider_uuid, project_id, sys_uuid.uuid4()),
         )
         cursor.execute(
             """

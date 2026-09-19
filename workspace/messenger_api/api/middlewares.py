@@ -163,6 +163,12 @@ class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
         req: typing.Any,
         error: Exception,
     ) -> typing.Any:
+        if isinstance(error, messenger_exceptions.ProviderApiError):
+            return req.ResponseClass(
+                status=error.status,
+                json=error.as_dict(),
+                headers={"Cache-Control": "no-store"},
+            )
         if isinstance(error, messenger_exceptions.EventsCursorExpiredError):
             return req.ResponseClass(
                 status=410,

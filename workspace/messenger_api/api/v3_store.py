@@ -213,6 +213,9 @@ def _row(value: typing.Any) -> dict[str, typing.Any]:
 def _public(value: typing.Any, resource: str) -> dict[str, typing.Any]:
     result = _simple(_row(value))
     result.pop("private_index", None)
+    if resource == "users":
+        result.pop("disabled", None)
+        result.pop("is_bot", None)
     if resource in _SOURCE_RESOURCES:
         result["source"] = {"kind": result["source_name"]}
     if resource == "folders":
@@ -362,6 +365,7 @@ class MessengerV3Store:
     ) -> None:
         self.project_uuid = sys_uuid.UUID(str(project_uuid))
         self.user_uuid = sys_uuid.UUID(str(user_uuid))
+        self._known_audience_snapshots: set[sys_uuid.UUID] = set()
 
     def _resource_sql(self, resource: str) -> tuple[str, list[typing.Any]]:
         project = self.project_uuid
@@ -874,34 +878,36 @@ class MessengerV3Store:
             sys_uuid.UUID("4a72ce87-e8a3-4f58-9bd7-b8c1d69c19b2"),
             f"{self.project_uuid}:{digest}",
         )
-        session.execute(
-            """
-            INSERT INTO workspace_v3.event_audience_snapshots (
-                uuid, project_id, membership_digest
-            ) VALUES (%s, %s, %s)
-            ON CONFLICT (project_id, membership_digest) DO NOTHING
-            """,
-            (snapshot_uuid, self.project_uuid, digest),
-        )
-        if consumers:
+        if snapshot_uuid not in self._known_audience_snapshots:
             session.execute(
                 """
-                INSERT INTO workspace_v3.event_audience_members (
-                    project_id, audience_snapshot_uuid,
-                    consumer_type, consumer_uuid
-                )
-                SELECT %s, %s, input.consumer_type, input.consumer_uuid
-                FROM unnest(%s::text[], %s::uuid[])
-                    AS input(consumer_type, consumer_uuid)
-                ON CONFLICT DO NOTHING
+                INSERT INTO workspace_v3.event_audience_snapshots (
+                    uuid, project_id, membership_digest
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT (project_id, membership_digest) DO NOTHING
                 """,
-                (
-                    self.project_uuid,
-                    snapshot_uuid,
-                    [item[0] for item in consumers],
-                    [item[1] for item in consumers],
-                ),
+                (snapshot_uuid, self.project_uuid, digest),
             )
+            if consumers:
+                session.execute(
+                    """
+                    INSERT INTO workspace_v3.event_audience_members (
+                        project_id, audience_snapshot_uuid,
+                        consumer_type, consumer_uuid
+                    )
+                    SELECT %s, %s, input.consumer_type, input.consumer_uuid
+                    FROM unnest(%s::text[], %s::uuid[])
+                        AS input(consumer_type, consumer_uuid)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (
+                        self.project_uuid,
+                        snapshot_uuid,
+                        [item[0] for item in consumers],
+                        [item[1] for item in consumers],
+                    ),
+                )
+            self._known_audience_snapshots.add(snapshot_uuid)
         common_payload, recipient_payloads = _partition_event_payloads(
             object_type,
             payloads,

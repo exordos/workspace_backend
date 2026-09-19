@@ -14,8 +14,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from restalchemy.common import exceptions as ra_exc
 import typing
+
+from restalchemy.common import exceptions as ra_exc
 
 
 class OnlyOneAllFolderPerUserError(ra_exc.ValidationErrorException):
@@ -148,6 +149,38 @@ class DatabaseDeadlockRetryExhaustedError(ra_exc.RestAlchemyException):
             "message": self.msg,
             "retryable": True,
         }
+
+
+class ProviderApiError(ra_exc.RestAlchemyException):
+    """A safe provider CRUD error returned after request rollback."""
+
+    code = 400
+    message = "Provider request was rejected"
+
+    def __init__(
+        self,
+        *,
+        status: int,
+        error: str,
+        message: str,
+        item_index: int | None = None,
+    ) -> None:
+        super().__init__()
+        self.status = status
+        self.error = error
+        self.safe_message = message
+        self.item_index = item_index
+
+    def as_dict(self) -> dict[str, typing.Any]:
+        result: dict[str, typing.Any] = {
+            "type": self.__class__.__name__,
+            "status": self.status,
+            "error": self.error,
+            "message": self.safe_message,
+        }
+        if self.item_index is not None:
+            result["item_index"] = self.item_index
+        return result
 
 
 class DraftConflictError(ra_exc.RestAlchemyException):

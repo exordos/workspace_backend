@@ -186,6 +186,15 @@ EXPECTED_COLUMNS = {
         "created_at",
         "updated_at",
     ),
+    "provider_entity_states": (
+        "project_id",
+        "provider_uuid",
+        "entity_type",
+        "entity_uuid",
+        "content_hash",
+        "created_at",
+        "updated_at",
+    ),
     "stream_bindings": (
         "uuid",
         "project_id",
@@ -268,6 +277,8 @@ EXPECTED_COLUMNS = {
         "status_emoji",
         "status_text",
         "avatar",
+        "disabled",
+        "is_bot",
     ),
 }
 

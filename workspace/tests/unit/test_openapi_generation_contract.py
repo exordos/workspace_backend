@@ -430,6 +430,31 @@ def test_v3_openapi_exposes_only_the_minimal_source_marker():
     assert "delivery" not in workspace_message
     assert set(workspace_message["source"]["properties"]) == {"kind"}
 
+    provider_root = "/v1/provider/entities/"
+    provider_entity_path = (
+        f"{provider_root}{{ProviderEntityType}}/{{ProviderEntityUuid}}"
+    )
+    assert set(specification["paths"][provider_entity_path]) == {
+        "get",
+        "put",
+        "delete",
+    }
+    batch = specification["paths"][f"{provider_root}actions/apply/invoke"]["post"]
+    operations = batch["requestBody"]["content"]["application/json"]["schema"][
+        "properties"
+    ]["operations"]
+    assert operations["maxItems"] == 500
+    assert operations["items"]["properties"]["type"]["enum"] == [
+        "users",
+        "streams",
+        "stream_bindings",
+        "topics",
+        "topic_bindings",
+        "messages",
+        "message_flags",
+        "message_reactions",
+    ]
+
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
     specification = _build_openapi(workspace_app)

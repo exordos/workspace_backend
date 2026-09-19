@@ -158,6 +158,9 @@ PER_USER_DELIVERY_REPAIR_MIGRATION_UUID = "e1f5ca44-b5b5-4bdc-bfdd-bf5996a34b4f"
 PER_USER_DELIVERY_REPAIR_MIGRATION_FILE = (
     "0185-Repair-per-user-operation-delivery-projections-e1f5ca.py"
 )
+PROVIDER_ENTITY_STATE_MIGRATION_FILE = (
+    "0189-Add-Workspace-v3-provider-entity-states-d72d97.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -478,7 +481,7 @@ def test_current_migrations_have_a_single_head(_database, db):
 
     assert (
         engine.get_latest_migration()
-        == PER_USER_DELIVERY_REPAIR_MIGRATION_FILE
+        == PROVIDER_ENTITY_STATE_MIGRATION_FILE
     )
     with db.cursor() as cur:
         cur.execute(
