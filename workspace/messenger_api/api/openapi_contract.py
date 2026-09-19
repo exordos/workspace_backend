@@ -1581,6 +1581,14 @@ def add_provider_entity_contract(
                     "schema": {"type": "string", "format": "uuid"},
                 },
                 {
+                    "name": "snapshot_after_uuid",
+                    "in": "query",
+                    "description": (
+                        "UUID-only keyset used after a paged bootstrap manifest"
+                    ),
+                    "schema": {"type": "string", "format": "uuid"},
+                },
+                {
                     "name": "limit",
                     "in": "query",
                     "schema": {
@@ -1672,9 +1680,23 @@ def add_provider_entity_contract(
             "summary": "Stream a consistent provider-visible entity snapshot",
             "operationId": "Bootstrap_provider_entities",
             "tags": ["Provider"],
+            "parameters": [
+                {
+                    "name": "mode",
+                    "in": "query",
+                    "description": (
+                        "Use paged to return only the snapshot/event cursor manifest; "
+                        "entities are then read through the paginated collections."
+                    ),
+                    "schema": {"type": "string", "enum": ["paged"]},
+                }
+            ],
             "responses": {
                 200: {
-                    "description": "NDJSON snapshot framed by meta and complete records",
+                    "description": (
+                        "NDJSON snapshot framed by meta and complete records, or a "
+                        "small JSON manifest when mode=paged"
+                    ),
                     "content": {
                         "application/x-ndjson": {
                             "schema": {"type": "string", "format": "binary"}

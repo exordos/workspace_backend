@@ -478,6 +478,22 @@ def test_provider_batch_imports_graph_emits_events_and_cleans_cascades(api, db):
         if record["record"] == "entity"
     )
 
+    manifest_response = api.get("/v1/provider/bootstrap?mode=paged")
+    assert manifest_response.status_code == 200, manifest_response.text
+    manifest = manifest_response.json()
+    assert manifest["record"] == "manifest"
+    assert manifest["schema_version"] == 2
+    assert manifest["project_id"] == str(api.project_id)
+    assert manifest["provider_uuid"] == str(provider_uuid)
+    assert manifest["snapshot_epoch_version"] >= 0
+    assert manifest["created_at"].endswith("Z")
+    bootstrap_page = api.get(
+        f"{ROOT}/users?limit=1&snapshot_after_uuid={sys_uuid.UUID(int=0)}"
+    )
+    assert bootstrap_page.status_code == 200, bootstrap_page.text
+    assert len(bootstrap_page.json()["items"]) == 1
+    assert bootstrap_page.json()["next_cursor"] is not None
+
     message_data = next(
         data
         for resource, entity_uuid, data in entities

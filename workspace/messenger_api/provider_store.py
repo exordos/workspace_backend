@@ -412,6 +412,65 @@ class ProviderEntityStore:
             }
         return {"items": items, "next_cursor": next_cursor}
 
+    def bootstrap_page(
+        self,
+        resource: str,
+        after_uuid: sys_uuid.UUID,
+        limit: int,
+    ) -> dict[str, typing.Any]:
+        """Return a stable UUID-keyset page with hashes of the current rows."""
+        table = TABLES[resource]
+        project_join = (
+            "" if resource == "users" else "AND entity.project_id = state.project_id"
+        )
+        rows = self.session.execute(
+            f"""
+            SELECT entity.*, state.content_hash AS provider_content_hash,
+                   state.source_updated_at AS provider_source_updated_at
+            FROM workspace_v3.provider_entity_states AS state
+            JOIN workspace_v3.{table} AS entity
+              ON entity.uuid = state.entity_uuid {project_join}
+            WHERE state.project_id = %s AND state.provider_uuid = %s
+              AND state.entity_type = %s AND state.entity_uuid > %s
+            ORDER BY state.entity_uuid
+            LIMIT %s
+            """,
+            (
+                self.project_uuid,
+                self.provider_uuid,
+                RESOURCE_TYPES[resource],
+                after_uuid,
+                limit + 1,
+            ),
+        ).fetchall()
+        has_more = len(rows) > limit
+        items = []
+        for raw_row in rows[:limit]:
+            row = dict(raw_row)
+            data = self._provider_data(resource, row)
+            content_hash = canonical_hash(data)
+            stored_hash = row.get("provider_content_hash")
+            source_updated_at = (
+                row["provider_source_updated_at"]
+                if stored_hash is not None
+                and bytes(stored_hash) == content_hash
+                and row["provider_source_updated_at"] is not None
+                else row["updated_at"]
+            )
+            items.append(
+                {
+                    "type": resource,
+                    "uuid": row["uuid"],
+                    "content_hash": content_hash.hex(),
+                    "source_updated_at": source_updated_at,
+                    "data": data,
+                }
+            )
+        next_cursor = None
+        if has_more:
+            next_cursor = {"after_uuid": items[-1]["uuid"]}
+        return {"items": items, "next_cursor": next_cursor}
+
     def _ensure_identity_unchanged(
         self,
         resource: str,

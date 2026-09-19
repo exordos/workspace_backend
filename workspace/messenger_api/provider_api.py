@@ -110,6 +110,19 @@ class ProviderApiMiddleware(middlewares.Middleware):
             # Capture the event cursor first. Mutations observed while the eager
             # snapshot is built have a newer epoch and are replayed idempotently.
             cursor = store.events._cursor("provider", store.provider_uuid)
+            if req.GET.get("mode") == "paged":
+                return _response(
+                    {
+                        "record": "manifest",
+                        "schema_version": 2,
+                        "snapshot_uuid": sys_uuid.uuid4(),
+                        "project_id": store.project_uuid,
+                        "provider_uuid": store.provider_uuid,
+                        "epoch_generation": cursor["epoch_generation"],
+                        "snapshot_epoch_version": int(cursor["current_epoch_version"]),
+                        "created_at": datetime.datetime.now(datetime.timezone.utc),
+                    }
+                )
             return webob.Response(
                 app_iter=webob.static.FileIter(store.bootstrap_snapshot(cursor)),
                 status=200,
@@ -320,6 +333,24 @@ class ProviderApiMiddleware(middlewares.Middleware):
         store: provider_store.ProviderEntityStore,
         resource: str,
     ) -> dict[str, typing.Any]:
+        raw_snapshot_after = req.GET.get("snapshot_after_uuid")
+        if raw_snapshot_after is not None:
+            after_uuid = _uuid(raw_snapshot_after, "snapshot_after_uuid")
+            try:
+                limit = int(req.GET.get("limit", 100))
+            except (TypeError, ValueError) as error:
+                raise messenger_exceptions.ProviderApiError(
+                    status=400,
+                    error="invalid_limit",
+                    message="limit must be an integer",
+                ) from error
+            if not 1 <= limit <= provider_store.MAX_PAGE_SIZE:
+                raise messenger_exceptions.ProviderApiError(
+                    status=400,
+                    error="invalid_limit",
+                    message="limit must be between 1 and 500",
+                )
+            return store.bootstrap_page(resource, after_uuid, limit)
         raw_updated_after = req.GET.get("updated_after")
         updated_after = (
             datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
