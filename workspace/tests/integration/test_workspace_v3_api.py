@@ -196,6 +196,47 @@ def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
     assert reloaded.json()[0]["read"] is True
 
 
+def test_v3_restricted_history_starts_at_membership(api, db):
+    stream = _create_stream(api, "Restricted history")
+    historical = _create_message(api, stream, "before join")
+    peer_uuid = sys_uuid.uuid4()
+    assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
+    db.execute(
+        """
+        UPDATE workspace_v3.streams
+        SET history_public_to_subscribers = false
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (api.project_id, stream["uuid"]),
+    )
+
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    assert (
+        db.execute(
+            """
+        SELECT last_message_uuid
+        FROM workspace_v3.stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+        """,
+            (api.project_id, stream["uuid"], peer_uuid),
+        ).fetchone()[0]
+        is None
+    )
+    hidden = api.get(MESSAGES, user=peer_uuid)
+    assert hidden.status_code == 200, hidden.text
+    assert hidden.json() == []
+
+    current = _create_message(api, stream, "after join")
+    visible = api.get(MESSAGES, user=peer_uuid)
+    assert visible.status_code == 200, visible.text
+    assert [message["uuid"] for message in visible.json()] == [current["uuid"]]
+    assert historical["uuid"] != current["uuid"]
+
+
 def test_v3_private_stream_rejects_third_member_with_controlled_4xx(api):
     created = api.post(
         STREAMS,

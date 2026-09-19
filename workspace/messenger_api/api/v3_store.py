@@ -979,10 +979,11 @@ class MessengerV3Store:
             INSERT INTO workspace_v3.streams (
                 uuid, project_id, name, description, owner_uuid,
                 source_name, invite_only, announce, direct_user_uuid,
-                private, private_index, color, default_topic_uuid
+                private, private_index, color, default_topic_uuid,
+                history_public_to_subscribers
             ) VALUES (
                 %s, %s, %s, %s, %s, 'native', %s, %s, %s,
-                %s, %s, %s, %s
+                %s, %s, %s, %s, %s
             )
             """,
             (
@@ -998,6 +999,7 @@ class MessengerV3Store:
                 private_index,
                 values.get("color", random.randint(0, 0xFFFFFF)),
                 topic_uuid,
+                values.get("history_public_to_subscribers", True),
             ),
         )
         session.execute(
@@ -1447,6 +1449,16 @@ class MessengerV3Store:
         if not rows:
             return []
         session = _session()
+        history_public_to_subscribers = bool(
+            session.execute(
+                """
+                SELECT history_public_to_subscribers
+                FROM workspace_v3.streams
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, stream_uuid),
+            ).fetchone()["history_public_to_subscribers"]
+        )
         try:
             inserted = session.execute(
                 """
@@ -1479,54 +1491,60 @@ class MessengerV3Store:
             )
             SELECT gen_random_uuid(), topic.project_id, topic.stream_uuid,
                    topic.uuid, input.user_uuid,
-                   (
+                   CASE WHEN %s THEN (
                        SELECT message.uuid
                        FROM workspace_v3.messages AS message
                        WHERE message.project_id = topic.project_id
                          AND message.topic_uuid = topic.uuid
                        ORDER BY message.created_at DESC, message.uuid DESC
                        LIMIT 1
-                   )
+                   ) END
             FROM workspace_v3.topics AS topic
             CROSS JOIN unnest(%s::uuid[]) AS input(user_uuid)
             WHERE topic.project_id = %s AND topic.stream_uuid = %s
             """,
-            (added_users, self.project_uuid, stream_uuid),
+            (
+                history_public_to_subscribers,
+                added_users,
+                self.project_uuid,
+                stream_uuid,
+            ),
         )
-        session.execute(
-            """
-            INSERT INTO workspace_v3.message_flags (
-                project_id, stream_uuid, message_uuid, user_uuid, read, mentioned
+        if history_public_to_subscribers:
+            session.execute(
+                """
+                INSERT INTO workspace_v3.message_flags (
+                    project_id, stream_uuid, message_uuid, user_uuid, read, mentioned
+                )
+                SELECT message.project_id, message.stream_uuid, message.uuid,
+                       input.user_uuid, true,
+                       position(
+                           'urn:user:' || lower(input.user_uuid::text)
+                           IN lower(message.payload ->> 'content')
+                       ) > 0
+                FROM workspace_v3.messages AS message
+                CROSS JOIN unnest(%s::uuid[]) AS input(user_uuid)
+                WHERE message.project_id = %s AND message.stream_uuid = %s
+                """,
+                (added_users, self.project_uuid, stream_uuid),
             )
-            SELECT message.project_id, message.stream_uuid, message.uuid,
-                   input.user_uuid, true,
-                   position(
-                       'urn:user:' || lower(input.user_uuid::text)
-                       IN lower(message.payload ->> 'content')
-                   ) > 0
-            FROM workspace_v3.messages AS message
-            CROSS JOIN unnest(%s::uuid[]) AS input(user_uuid)
-            WHERE message.project_id = %s AND message.stream_uuid = %s
-            """,
-            (added_users, self.project_uuid, stream_uuid),
-        )
-        session.execute(
-            """
-            UPDATE workspace_v3.stream_bindings AS binding
-            SET last_message_uuid = (
+            session.execute(
+                """
+                UPDATE workspace_v3.stream_bindings AS binding
+                SET last_message_uuid = (
                     SELECT message.uuid
                     FROM workspace_v3.messages AS message
                     WHERE message.project_id = binding.project_id
                       AND message.stream_uuid = binding.stream_uuid
                     ORDER BY message.created_at DESC, message.uuid DESC
                     LIMIT 1
-                ),
-                updated_at = clock_timestamp()
-            WHERE binding.project_id = %s AND binding.stream_uuid = %s
-              AND binding.user_uuid = ANY(%s::uuid[])
-            """,
-            (self.project_uuid, stream_uuid, added_users),
-        )
+                    ),
+                    updated_at = clock_timestamp()
+                WHERE binding.project_id = %s AND binding.stream_uuid = %s
+                  AND binding.user_uuid = ANY(%s::uuid[])
+                """,
+                (self.project_uuid, stream_uuid, added_users),
+            )
         result = [
             self.get_resource("stream_bindings", sys_uuid.UUID(str(row["uuid"])))
             for row in inserted

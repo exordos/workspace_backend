@@ -208,6 +208,7 @@ EXPECTED_COLUMNS = {
         "default_topic_uuid",
         "created_at",
         "updated_at",
+        "history_public_to_subscribers",
     ),
     "topic_bindings": (
         "uuid",
