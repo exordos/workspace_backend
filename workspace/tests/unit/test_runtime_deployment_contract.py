@@ -169,6 +169,16 @@ def test_messenger_v2_projection_worker_is_explicitly_enabled():
         assert "v2_metrics_log_interval_seconds = 30" in config
 
 
+def test_messenger_v3_store_is_the_deployed_api_and_websocket_backend():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        assert "[messenger_store]" in config
+        assert "backend = v3" in config
+
+
 def test_manifest_provisions_unassigned_external_integration_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     account_permissions = {
