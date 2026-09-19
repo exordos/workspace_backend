@@ -1530,6 +1530,7 @@ def add_provider_entity_contract(
             "updated_at",
         ],
     )
+
     def json_response(
         schema: dict[str, typing.Any],
         description: str,
@@ -1538,6 +1539,7 @@ def add_provider_entity_contract(
             "description": description,
             "content": {"application/json": {"schema": schema}},
         }
+
     entity_path = f"{root}{{ProviderEntityType}}/{{ProviderEntityUuid}}"
     specification["paths"][entity_path] = {
         "get": {
@@ -1698,9 +1700,58 @@ def add_provider_entity_contract(
                         "small JSON manifest when mode=paged"
                     ),
                     "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": [
+                                    "record",
+                                    "schema_version",
+                                    "snapshot_uuid",
+                                    "project_id",
+                                    "provider_uuid",
+                                    "epoch_generation",
+                                    "snapshot_epoch_version",
+                                    "created_at",
+                                ],
+                                "properties": {
+                                    "record": {
+                                        "type": "string",
+                                        "enum": ["manifest"],
+                                    },
+                                    "schema_version": {
+                                        "type": "integer",
+                                        "enum": [2],
+                                    },
+                                    "snapshot_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "project_id": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "provider_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "epoch_generation": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "snapshot_epoch_version": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                    },
+                                    "created_at": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                    },
+                                },
+                            }
+                        },
                         "application/x-ndjson": {
                             "schema": {"type": "string", "format": "binary"}
-                        }
+                        },
                     },
                 }
             },
