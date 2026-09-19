@@ -83,10 +83,14 @@ class ClientConnection:
         user_uuid: sys_uuid.UUID,
         last_epoch_version: int,
         epoch_generation: str | None = None,
+        consumer_type: str = "user",
+        consumer_uuid: sys_uuid.UUID | None = None,
     ) -> None:
         self.websocket = websocket
         self.project_id = project_id
         self.user_uuid = user_uuid
+        self.consumer_type = consumer_type
+        self.consumer_uuid = consumer_uuid or user_uuid
         self.last_epoch_version = last_epoch_version
         self.epoch_generation = epoch_generation
         self.ready = False
@@ -129,7 +133,7 @@ class MessengerEventsWebsocketServer:
         self._send_queue_limit = send_queue_limit
         self._heartbeat_timeout = heartbeat_timeout
         self._poll_interval = poll_interval
-        self._connections: dict[tuple[str, str], set[ClientConnection]] = {}
+        self._connections: dict[tuple[str, str, str], set[ClientConnection]] = {}
         self._stop_event: asyncio.Event | None = None
         self._catchup_wakeup: asyncio.Event | None = None
         self._pending_catchup_wakeups = 0
@@ -187,6 +191,12 @@ class MessengerEventsWebsocketServer:
                 self._authenticator.authenticate,
                 token,
             )
+            consumer_type, consumer_uuid = await asyncio.to_thread(
+                _call_with_database_session,
+                messenger_events.resolve_websocket_consumer,
+                project_id=project_id,
+                iam_user_uuid=user_uuid,
+            )
             last_epoch_version = websocket_protocol.parse_last_epoch_version(path)
             epoch_generation = websocket_protocol.parse_epoch_generation(path)
         except WebsocketAuthError:
@@ -203,6 +213,8 @@ class MessengerEventsWebsocketServer:
             user_uuid=user_uuid,
             last_epoch_version=last_epoch_version,
             epoch_generation=epoch_generation,
+            consumer_type=consumer_type,
+            consumer_uuid=consumer_uuid,
         )
         self._add_connection(connection)
         try:
@@ -213,8 +225,12 @@ class MessengerEventsWebsocketServer:
         finally:
             self._remove_connection(connection)
 
-    def _connection_key(self, connection: ClientConnection) -> tuple[str, str]:
-        return str(connection.project_id), str(connection.user_uuid)
+    def _connection_key(self, connection: ClientConnection) -> tuple[str, str, str]:
+        return (
+            str(connection.project_id),
+            connection.consumer_type,
+            str(connection.consumer_uuid),
+        )
 
     def _add_connection(self, connection: ClientConnection) -> None:
         key = self._connection_key(connection)
@@ -257,11 +273,24 @@ class MessengerEventsWebsocketServer:
 
     async def _catch_up(self, connection: ClientConnection) -> int | bool:
         try:
+            callback = (
+                messenger_events.get_events_after
+                if connection.consumer_type == "user"
+                else messenger_events.get_consumer_events_after
+            )
+            consumer_kwargs: dict[str, typing.Any] = (
+                {"user_uuid": connection.user_uuid}
+                if connection.consumer_type == "user"
+                else {
+                    "consumer_type": connection.consumer_type,
+                    "consumer_uuid": connection.consumer_uuid,
+                }
+            )
             events = await asyncio.to_thread(
                 _call_with_database_session,
-                messenger_events.get_events_after,
+                callback,
                 project_id=connection.project_id,
-                user_uuid=connection.user_uuid,
+                **consumer_kwargs,
                 after_epoch_version=connection.last_epoch_version,
                 limit=self._catchup_limit,
                 epoch_generation=connection.epoch_generation,
@@ -283,11 +312,24 @@ class MessengerEventsWebsocketServer:
         connection: ClientConnection,
     ) -> bool:
         if connection.last_epoch_version == 0 and connection.epoch_generation is None:
+            callback = (
+                messenger_events.get_event_cursor
+                if connection.consumer_type == "user"
+                else messenger_events.get_consumer_event_cursor
+            )
+            consumer_kwargs: dict[str, typing.Any] = (
+                {"user_uuid": connection.user_uuid}
+                if connection.consumer_type == "user"
+                else {
+                    "consumer_type": connection.consumer_type,
+                    "consumer_uuid": connection.consumer_uuid,
+                }
+            )
             cursor = await asyncio.to_thread(
                 _call_with_database_session,
-                messenger_events.get_event_cursor,
+                callback,
                 project_id=connection.project_id,
-                user_uuid=connection.user_uuid,
+                **consumer_kwargs,
             )
             connection.epoch_generation = cursor["epoch_generation"]
         while True:
@@ -298,11 +340,24 @@ class MessengerEventsWebsocketServer:
                 return True
 
     async def _send_ready(self, connection: ClientConnection) -> bool:
+        callback = (
+            messenger_events.get_event_cursor
+            if connection.consumer_type == "user"
+            else messenger_events.get_consumer_event_cursor
+        )
+        consumer_kwargs: dict[str, typing.Any] = (
+            {"user_uuid": connection.user_uuid}
+            if connection.consumer_type == "user"
+            else {
+                "consumer_type": connection.consumer_type,
+                "consumer_uuid": connection.consumer_uuid,
+            }
+        )
         cursor = await asyncio.to_thread(
             _call_with_database_session,
-            messenger_events.get_event_cursor,
+            callback,
             project_id=connection.project_id,
-            user_uuid=connection.user_uuid,
+            **consumer_kwargs,
         )
         if cursor["epoch_generation"] != connection.epoch_generation:
             error = messenger_exceptions.EventsCursorExpiredError(

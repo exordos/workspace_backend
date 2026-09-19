@@ -281,6 +281,56 @@ def test_v3_events_notify_websocket_listener_after_commit(api):
     assert int(notification.payload) > 0
 
 
+def test_v3_provider_consumer_receives_only_its_source_events(api, db):
+    provider_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.provider_consumers (
+            uuid, project_id, name, iam_user_uuid
+        ) VALUES (%s, %s, 'zulip', %s)
+        """,
+        (provider_uuid, api.project_id, sys_uuid.uuid4()),
+    )
+    zulip_stream = _create_stream(api, "Zulip source")
+    db.execute(
+        """
+        UPDATE workspace_v3.streams
+        SET source_name = 'zulip'
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (api.project_id, zulip_stream["uuid"]),
+    )
+    provider_message = _create_message(api, zulip_stream, "provider visible")
+    native_stream = _create_stream(api, "Native source")
+    native_message = _create_message(api, native_stream, "provider hidden")
+
+    provider_rows = db.execute(
+        """
+        SELECT event.entity_uuid, event.payload ->> 'kind', recipient.payload
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+         AND audience.consumer_type = 'provider'
+         AND audience.consumer_uuid = %s
+        LEFT JOIN workspace_v3.event_recipient_payloads AS recipient
+          ON recipient.project_id = event.project_id
+         AND recipient.event_uuid = event.uuid
+         AND recipient.consumer_type = 'provider'
+         AND recipient.consumer_uuid = %s
+        WHERE event.project_id = %s
+        ORDER BY event.epoch_version
+        """,
+        (provider_uuid, provider_uuid, api.project_id),
+    ).fetchall()
+
+    assert [str(row[0]) for row in provider_rows] == [provider_message["uuid"]]
+    assert provider_rows[0][1] == "message.created"
+    assert provider_rows[0][2]["user_uuid"] == str(api.user_uuid)
+    assert provider_rows[0][2]["read"] is True
+    assert native_message["uuid"] not in {str(row[0]) for row in provider_rows}
+
+
 def test_v3_drafts_and_event_cursor_keep_old_contract(api, workspace_api, db):
     workspace_api.user_uuid = api.user_uuid
     workspace_api.project_id = api.project_id

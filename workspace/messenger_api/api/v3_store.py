@@ -26,6 +26,7 @@ from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api import exceptions as messenger_exceptions
+from workspace.messenger_api import event_origin
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.workspace_v3 import constants
@@ -168,6 +169,21 @@ _EVENT_RESOURCE_QUERIES = {
 
 def _session() -> typing.Any:
     return contexts.Context().get_session()
+
+
+def resolve_provider_consumer(
+    project_uuid: sys_uuid.UUID,
+    iam_user_uuid: sys_uuid.UUID,
+) -> dict[str, typing.Any] | None:
+    row = _session().execute(
+        """
+        SELECT uuid, name
+        FROM workspace_v3.provider_consumers
+        WHERE project_id = %s AND iam_user_uuid = %s AND enabled
+        """,
+        (project_uuid, iam_user_uuid),
+    ).fetchone()
+    return None if row is None else _row(row)
 
 
 def _utc(value: datetime.datetime) -> str:
@@ -705,6 +721,108 @@ class MessengerV3Store:
         )
         return tuple(sys_uuid.UUID(str(row["user_uuid"])) for row in rows)
 
+    def _provider_consumers_for_stream(
+        self,
+        stream_uuid: object,
+    ) -> tuple[sys_uuid.UUID, ...]:
+        rows = _session().execute(
+            """
+            SELECT provider.uuid
+            FROM workspace_v3.streams AS stream
+            JOIN workspace_v3.provider_consumers AS provider
+              ON provider.project_id = stream.project_id
+             AND provider.name = stream.source_name
+             AND provider.enabled
+            WHERE stream.project_id = %s AND stream.uuid = %s
+              AND stream.source_name <> 'native'
+            ORDER BY provider.uuid
+            """,
+            (self.project_uuid, stream_uuid),
+        ).fetchall()
+        return tuple(sys_uuid.UUID(str(row["uuid"])) for row in rows)
+
+    def _provider_consumers_for_user(
+        self,
+        user_uuid: object,
+    ) -> tuple[sys_uuid.UUID, ...]:
+        rows = _session().execute(
+            """
+            SELECT DISTINCT provider.uuid
+            FROM workspace_v3.stream_bindings AS binding
+            JOIN workspace_v3.streams AS stream
+              ON stream.project_id = binding.project_id
+             AND stream.uuid = binding.stream_uuid
+            JOIN workspace_v3.provider_consumers AS provider
+              ON provider.project_id = stream.project_id
+             AND provider.name = stream.source_name
+             AND provider.enabled
+            WHERE binding.project_id = %s AND binding.user_uuid = %s
+              AND stream.source_name <> 'native'
+            ORDER BY provider.uuid
+            """,
+            (self.project_uuid, user_uuid),
+        ).fetchall()
+        return tuple(sys_uuid.UUID(str(row["uuid"])) for row in rows)
+
+    def _provider_consumers_for_resource(
+        self,
+        resource: str,
+        resource_uuid: object,
+    ) -> tuple[sys_uuid.UUID, ...]:
+        if resource == "streams":
+            stream_uuid = resource_uuid
+        elif resource == "stream_topics":
+            row = _session().execute(
+                """
+                SELECT stream_uuid FROM workspace_v3.topics
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
+        elif resource == "messages":
+            row = _session().execute(
+                """
+                SELECT stream_uuid FROM workspace_v3.messages
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
+        elif resource == "message_reactions":
+            row = _session().execute(
+                """
+                SELECT message.stream_uuid
+                FROM workspace_v3.message_reactions AS reaction
+                JOIN workspace_v3.messages AS message
+                  ON message.project_id = reaction.project_id
+                 AND message.uuid = reaction.message_uuid
+                WHERE reaction.project_id = %s AND reaction.uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
+        elif resource == "files":
+            row = _session().execute(
+                """
+                SELECT stream_uuid FROM workspace_v3.files
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None or row["stream_uuid"] is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
+        else:
+            return ()
+        return self._provider_consumers_for_stream(stream_uuid)
+
     def _require_stream(self, stream_uuid: object) -> dict[str, typing.Any]:
         return self.get_resource("streams", sys_uuid.UUID(str(stream_uuid)))
 
@@ -733,6 +851,8 @@ class MessengerV3Store:
         action: str,
         entity_uuid: object,
         payloads: dict[sys_uuid.UUID, dict[str, typing.Any]],
+        provider_consumers: typing.Iterable[sys_uuid.UUID] = (),
+        provider_payload: dict[str, typing.Any] | None = None,
     ) -> int:
         if not payloads:
             return 0
@@ -740,18 +860,12 @@ class MessengerV3Store:
         consumers: list[tuple[str, sys_uuid.UUID]] = [
             ("user", user_uuid) for user_uuid in sorted(payloads, key=str)
         ]
-        providers = session.execute(
-            """
-            SELECT consumer_uuid
-            FROM workspace_v3.event_cursors
-            WHERE project_id = %s AND consumer_type = 'provider'
-            ORDER BY consumer_uuid
-            """,
-            (self.project_uuid,),
-        ).fetchall()
+        origin = event_origin.current()
+        providers = tuple(sorted(set(provider_consumers), key=str))
         consumers.extend(
-            ("provider", sys_uuid.UUID(str(item["consumer_uuid"])))
-            for item in providers
+            ("provider", provider_uuid)
+            for provider_uuid in providers
+            if origin != ("provider", provider_uuid)
         )
         digest = hashlib.sha256(
             "\n".join(f"{kind_}:{uuid}" for kind_, uuid in consumers).encode()
@@ -798,8 +912,9 @@ class MessengerV3Store:
             """
             INSERT INTO workspace_v3.events (
                 uuid, project_id, entity_uuid, audience_snapshot_uuid,
-                object_type, action, payload
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                object_type, action, payload,
+                origin_consumer_type, origin_consumer_uuid
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
             RETURNING epoch_version
             """,
             (
@@ -810,6 +925,8 @@ class MessengerV3Store:
                 object_type,
                 action,
                 json.dumps(_simple(base_payload)),
+                None if origin is None else origin[0],
+                None if origin is None else origin[1],
             ),
         ).fetchone()
         epoch_version = int(event["epoch_version"])
@@ -831,6 +948,29 @@ class MessengerV3Store:
                         json.dumps(_simple(recipient_payloads[user_uuid]))
                         for user_uuid in recipient_payloads
                     ],
+                ),
+            )
+        if provider_payload is None and len(recipient_payloads) == 1:
+            provider_payload = next(iter(recipient_payloads.values()))
+        provider_uuids = [
+            consumer_uuid
+            for consumer_type, consumer_uuid in consumers
+            if consumer_type == "provider"
+        ]
+        if provider_payload is not None and provider_uuids:
+            session.execute(
+                """
+                INSERT INTO workspace_v3.event_recipient_payloads (
+                    project_id, event_uuid, consumer_type, consumer_uuid, payload
+                )
+                SELECT %s, %s, 'provider', input.consumer_uuid, %s::jsonb
+                FROM unnest(%s::uuid[]) AS input(consumer_uuid)
+                """,
+                (
+                    self.project_uuid,
+                    event_uuid,
+                    json.dumps(_simple(provider_payload)),
+                    provider_uuids,
                 ),
             )
         return epoch_version
@@ -855,6 +995,10 @@ class MessengerV3Store:
             action=action,
             entity_uuid=resource_uuid,
             payloads=payloads,
+            provider_consumers=self._provider_consumers_for_resource(
+                resource,
+                resource_uuid,
+            ),
         )
 
     def _event_resource_payloads(
@@ -1246,6 +1390,9 @@ class MessengerV3Store:
         if sys_uuid.UUID(str(message["author_uuid"])) != self.user_uuid:
             _not_found("messages", message_uuid)
         recipients = self._stream_recipients(message["stream_uuid"])
+        provider_consumers = self._provider_consumers_for_stream(
+            message["stream_uuid"]
+        )
         _session().execute(
             "DELETE FROM workspace_v3.messages WHERE project_id = %s AND uuid = %s",
             (self.project_uuid, message_uuid),
@@ -1265,6 +1412,7 @@ class MessengerV3Store:
             action="deleted",
             entity_uuid=message_uuid,
             payloads={recipient: payload for recipient in recipients},
+            provider_consumers=provider_consumers,
         )
         return None
 
@@ -1413,6 +1561,11 @@ class MessengerV3Store:
                 self._require_manage_stream(stream_uuid)
         else:
             recipients = (self.user_uuid,)
+        provider_consumers = (
+            self._provider_consumers_for_stream(stream_uuid)
+            if resource in {"streams", "stream_bindings", "stream_topics"}
+            else self._provider_consumers_for_resource(resource, resource_uuid)
+        )
         query = (
             f'DELETE FROM workspace_v3."{table}" WHERE project_id = %s AND uuid = %s'
         )
@@ -1431,6 +1584,8 @@ class MessengerV3Store:
             action="deleted",
             entity_uuid=resource_uuid,
             payloads={recipient: payload for recipient in recipients},
+            provider_consumers=provider_consumers,
+            provider_payload=_simple(current),
         )
         return None
 
@@ -1562,6 +1717,7 @@ class MessengerV3Store:
                 }
                 for recipient in recipients
             },
+            provider_consumers=self._provider_consumers_for_stream(stream_uuid),
         )
         return result
 
@@ -1647,6 +1803,7 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
+                provider_consumers=self._provider_consumers_for_stream(resource_uuid),
             )
             if (
                 stream["notification_mode"] == "muted"
@@ -1663,6 +1820,9 @@ class MessengerV3Store:
                         action="updated",
                         entity_uuid=topic_row["uuid"],
                         payloads={self.user_uuid: topic_row},
+                        provider_consumers=self._provider_consumers_for_stream(
+                            resource_uuid
+                        ),
                     )
             return row
         if resource in {"messages", "stream_topics", "streams"} and action in {
@@ -1691,6 +1851,9 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
+                provider_consumers=self._provider_consumers_for_stream(
+                    row["stream_uuid"]
+                ),
             )
             return row
         if resource == "stream_topics" and action == "toggle_done":
@@ -1743,6 +1906,9 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
+                provider_consumers=self._provider_consumers_for_stream(
+                    row["stream_uuid"]
+                ),
             )
             return row
         if resource == "stream_topics" and action == "set_default":
@@ -1840,6 +2006,7 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
+                provider_consumers=self._provider_consumers_for_user(resource_uuid),
             )
             return row
         raise ValueError(f"Unsupported Messenger action {resource}.{action}")
@@ -2050,16 +2217,21 @@ class MessengerV3Store:
             current = self.get_draft(draft_uuid)
             raise messenger_exceptions.DraftPreconditionFailedError(current)
 
-    def _cursor(self) -> dict[str, typing.Any]:
+    def _cursor(
+        self,
+        consumer_type: str = "user",
+        consumer_uuid: sys_uuid.UUID | None = None,
+    ) -> dict[str, typing.Any]:
+        consumer_uuid = consumer_uuid or self.user_uuid
         session = _session()
         session.execute(
             """
             INSERT INTO workspace_v3.event_cursors (
                 project_id, consumer_type, consumer_uuid
-            ) VALUES (%s, 'user', %s)
+            ) VALUES (%s, %s, %s)
             ON CONFLICT DO NOTHING
             """,
-            (self.project_uuid, self.user_uuid),
+            (self.project_uuid, consumer_type, consumer_uuid),
         )
         row = session.execute(
             """
@@ -2084,13 +2256,13 @@ class MessengerV3Store:
             LEFT JOIN workspace_v3.events AS event
               ON event.project_id = audience.project_id
              AND event.audience_snapshot_uuid = audience.uuid
-            WHERE cursor.project_id = %s AND cursor.consumer_type = 'user'
+            WHERE cursor.project_id = %s AND cursor.consumer_type = %s
               AND cursor.consumer_uuid = %s
             GROUP BY cursor.epoch_generation,
                      cursor.current_epoch_version,
                      cursor.pruned_through_epoch_version
             """,
-            (self.project_uuid, self.user_uuid),
+            (self.project_uuid, consumer_type, consumer_uuid),
         ).fetchone()
         return _row(row)
 
@@ -2120,8 +2292,27 @@ class MessengerV3Store:
         epoch_generation: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, typing.Any]]:
+        return self.events_after_for_consumer(
+            filters,
+            consumer_type="user",
+            consumer_uuid=self.user_uuid,
+            order_by=order_by,
+            epoch_generation=epoch_generation,
+            limit=limit,
+        )
+
+    def events_after_for_consumer(
+        self,
+        filters: dict[str, typing.Any],
+        *,
+        consumer_type: str,
+        consumer_uuid: sys_uuid.UUID,
+        order_by: dict[str, str] | None = None,
+        epoch_generation: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, typing.Any]]:
         after, clauses = self._after_epoch(filters)
-        cursor = self._cursor()
+        cursor = self._cursor(consumer_type, consumer_uuid)
         generation = str(cursor["epoch_generation"])
         current = int(cursor["current_epoch_version"])
         minimum = int(cursor["pruned_through_epoch_version"]) + 1
@@ -2155,20 +2346,22 @@ class MessengerV3Store:
             JOIN workspace_v3.event_audience_members AS member
               ON member.project_id = event.project_id
              AND member.audience_snapshot_uuid = event.audience_snapshot_uuid
-             AND member.consumer_type = 'user'
+             AND member.consumer_type = %s
              AND member.consumer_uuid = %s
             LEFT JOIN workspace_v3.event_recipient_payloads AS recipient
               ON recipient.project_id = event.project_id
              AND recipient.event_uuid = event.uuid
-             AND recipient.consumer_type = 'user'
+             AND recipient.consumer_type = %s
              AND recipient.consumer_uuid = %s
             WHERE event.project_id = %s AND event.epoch_version > %s
             ORDER BY event.epoch_version {direction}
         """
         parameters: list[typing.Any] = [
-            self.user_uuid,
-            self.user_uuid,
-            self.user_uuid,
+            consumer_uuid,
+            consumer_type,
+            consumer_uuid,
+            consumer_type,
+            consumer_uuid,
             self.project_uuid,
             after,
         ]
@@ -2194,7 +2387,14 @@ class MessengerV3Store:
         return int(self._cursor()["current_epoch_version"])
 
     def event_cursor(self) -> dict[str, typing.Any]:
-        cursor = self._cursor()
+        return self.event_cursor_for_consumer("user", self.user_uuid)
+
+    def event_cursor_for_consumer(
+        self,
+        consumer_type: str,
+        consumer_uuid: sys_uuid.UUID,
+    ) -> dict[str, typing.Any]:
+        cursor = self._cursor(consumer_type, consumer_uuid)
         return {
             "epoch_generation": str(cursor["epoch_generation"]),
             "current_epoch_version": int(cursor["current_epoch_version"]),

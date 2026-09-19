@@ -979,15 +979,41 @@ def _query_consumers(
         users = [user_uuid]
     else:
         users = []
-    provider_rows = session.execute(
-        """
-        SELECT consumer_uuid
-        FROM workspace_v3.event_cursors
-        WHERE project_id = %s AND consumer_type = 'provider'
-        ORDER BY consumer_uuid
-        """,
-        (project_id,),
-    ).fetchall()
+    if stream_uuid is not None:
+        provider_rows = session.execute(
+            """
+            SELECT provider.uuid AS consumer_uuid
+            FROM workspace_v3.streams AS stream
+            JOIN workspace_v3.provider_consumers AS provider
+              ON provider.project_id = stream.project_id
+             AND provider.name = stream.source_name
+             AND provider.enabled
+            WHERE stream.project_id = %s AND stream.uuid = %s
+              AND stream.source_name <> 'native'
+            ORDER BY provider.uuid
+            """,
+            (project_id, stream_uuid),
+        ).fetchall()
+    elif user_uuid is not None:
+        provider_rows = session.execute(
+            """
+            SELECT DISTINCT provider.uuid AS consumer_uuid
+            FROM workspace_v3.stream_bindings AS binding
+            JOIN workspace_v3.streams AS stream
+              ON stream.project_id = binding.project_id
+             AND stream.uuid = binding.stream_uuid
+            JOIN workspace_v3.provider_consumers AS provider
+              ON provider.project_id = stream.project_id
+             AND provider.name = stream.source_name
+             AND provider.enabled
+            WHERE binding.project_id = %s AND binding.user_uuid = %s
+              AND stream.source_name <> 'native'
+            ORDER BY provider.uuid
+            """,
+            (project_id, user_uuid),
+        ).fetchall()
+    else:
+        provider_rows = []
     providers = [
         _uuid(_mapping(row, ("consumer_uuid",))["consumer_uuid"])
         for row in provider_rows
@@ -1168,6 +1194,18 @@ def _emit_events(
         for item in specifications
         for recipient_uuid, payload in item.get("recipient_payloads", {}).items()
     ]
+    provider_recipient_rows = [
+        (
+            item["project_id"],
+            item["event_uuid"],
+            consumer_uuid,
+            next(iter(item["recipient_payloads"].values())),
+        )
+        for item in specifications
+        if len(item.get("recipient_payloads", {})) == 1
+        for consumer_type, consumer_uuid in item["consumers"]
+        if consumer_type == "provider"
+    ]
     if recipient_rows:
         session.execute(
             """
@@ -1187,6 +1225,30 @@ def _emit_events(
                 [row[1] for row in recipient_rows],
                 [row[2] for row in recipient_rows],
                 [json.dumps(row[3], default=_serialize) for row in recipient_rows],
+            ),
+        )
+    if provider_recipient_rows:
+        session.execute(
+            """
+            INSERT INTO workspace_v3.event_recipient_payloads (
+                project_id, event_uuid, consumer_type, consumer_uuid, payload
+            )
+            SELECT input.project_id, input.event_uuid, 'provider',
+                   input.consumer_uuid, input.payload::jsonb
+            FROM unnest(
+                %s::uuid[], %s::uuid[], %s::uuid[], %s::text[]
+            ) AS input(
+                project_id, event_uuid, consumer_uuid, payload
+            )
+            """,
+            (
+                [row[0] for row in provider_recipient_rows],
+                [row[1] for row in provider_recipient_rows],
+                [row[2] for row in provider_recipient_rows],
+                [
+                    json.dumps(row[3], default=_serialize)
+                    for row in provider_recipient_rows
+                ],
             ),
         )
     session.execute(
