@@ -210,6 +210,17 @@ def _row(value: typing.Any) -> dict[str, typing.Any]:
     return dict(typing.cast(typing.Mapping[str, typing.Any], value))
 
 
+def source_projection(source_name: str) -> dict[str, typing.Any]:
+    source: dict[str, typing.Any] = {"kind": source_name}
+    if source_name == "zulip":
+        # Legacy clients require this field to distinguish a valid Zulip source.
+        # The clean schema deliberately does not retain provider-local identifiers,
+        # so zero is the established compatibility sentinel and is never used for
+        # routing or identity.
+        source["stream_id"] = 0
+    return source
+
+
 def _public(value: typing.Any, resource: str) -> dict[str, typing.Any]:
     result = _simple(_row(value))
     result.pop("private_index", None)
@@ -217,7 +228,7 @@ def _public(value: typing.Any, resource: str) -> dict[str, typing.Any]:
         result.pop("disabled", None)
         result.pop("is_bot", None)
     if resource in _SOURCE_RESOURCES:
-        result["source"] = {"kind": result["source_name"]}
+        result["source"] = source_projection(result["source_name"])
     if resource == "folders":
         result["system_type"] = (
             "all" if result.pop("kind") == "all_chats" else "created"

@@ -59,11 +59,11 @@ def _chunks(values, size):
     return [values[offset : offset + size] for offset in range(0, len(values), size)]
 
 
-def _post_batch(api, operations):
+def _post_batch(api, operations, delivery_class="live"):
     started_at = time.perf_counter()
     response = api.post(
         f"{ROOT}/actions/apply/invoke",
-        json={"operations": operations},
+        json={"delivery_class": delivery_class, "operations": operations},
     )
     elapsed = time.perf_counter() - started_at
     response.raise_for_status()
@@ -185,11 +185,15 @@ def _message_operations(message_count, users, stream_uuid, topic_uuid):
     ]
 
 
-def _run_batches(api, operations, batch_size, writers):
+def _run_batches(api, operations, batch_size, writers, delivery_class="live"):
     batches = _chunks(operations, batch_size)
     started_at = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=writers) as executor:
-        responses = list(executor.map(lambda batch: _post_batch(api, batch), batches))
+        responses = list(
+            executor.map(
+                lambda batch: _post_batch(api, batch, delivery_class), batches
+            )
+        )
     elapsed = time.perf_counter() - started_at
     latencies = [item[0] for item in responses]
     statuses = [result["status"] for _latency, results in responses for result in results]
@@ -200,6 +204,8 @@ def _run_batches(api, operations, batch_size, writers):
         "request_p50_ms": statistics.median(latencies) * 1000,
         "request_p95_ms": benchmark_workspace_v3_api._percentile(latencies, 0.95)
         * 1000,
+        "request_max_ms": max(latencies) * 1000,
+        "requests_over_1s": sum(latency > 1 for latency in latencies),
         "statuses": {status: statuses.count(status) for status in set(statuses)},
     }
 
@@ -225,7 +231,16 @@ def _list_all(api):
     }
 
 
-def _run(database_url, connection, base_url, users, messages, batch_size, writers):
+def _run(
+    database_url,
+    connection,
+    base_url,
+    users,
+    messages,
+    batch_size,
+    writers,
+    delivery_class,
+):
     benchmark_workspace_v3_projection._clear_schema(connection)
     api = conftest.ApiClient(base_url, sys_uuid.uuid4(), sys_uuid.uuid4())
     provider_uuid, user_uuids, stream_uuid, topic_uuid = _seed(
@@ -244,8 +259,12 @@ def _run(database_url, connection, base_url, users, messages, batch_size, writer
     )
     sampler.start()
     try:
-        insert = _run_batches(api, operations, batch_size, writers)
-        replay = _run_batches(api, operations, batch_size, writers)
+        insert = _run_batches(
+            api, operations, batch_size, writers, delivery_class
+        )
+        replay = _run_batches(
+            api, operations, batch_size, writers, delivery_class
+        )
     finally:
         stop.set()
         sampler.join(timeout=2)
@@ -280,7 +299,14 @@ def _run(database_url, connection, base_url, users, messages, batch_size, writer
         ),
     ).fetchone()
     expected_flags = users * messages
-    if counts[:4] != (messages, expected_flags, messages, expected_flags):
+    expected_events = messages if delivery_class == "live" else 0
+    expected_payloads = expected_flags if delivery_class == "live" else 0
+    if counts[:4] != (
+        messages,
+        expected_flags,
+        expected_events,
+        expected_payloads,
+    ):
         raise RuntimeError(f"Provider benchmark correctness failed: {counts}")
     if counts[5] != 0 or listing["entities"] != messages:
         raise RuntimeError("Provider echo suppression or listing check failed")
@@ -306,6 +332,7 @@ def _run(database_url, connection, base_url, users, messages, batch_size, writer
         "messages": messages,
         "batch_size": batch_size,
         "writers": writers,
+        "delivery_class": delivery_class,
         "insert": insert,
         "idempotent_replay": replay,
         "list": listing,
@@ -328,6 +355,7 @@ def main():
     parser.add_argument("--messages", type=int, default=2000)
     parser.add_argument("--batch-sizes", default="1,100,500")
     parser.add_argument("--writers", default="1,4")
+    parser.add_argument("--delivery-classes", default="live,backfill")
     args = parser.parse_args()
     benchmark_workspace_v3_projection._validate_database_url(
         parser, args.database_url
@@ -338,6 +366,11 @@ def main():
     writers = benchmark_workspace_v3_api._positive_list(
         parser, args.writers, "writers"
     )
+    delivery_classes = args.delivery_classes.split(",")
+    if not delivery_classes or any(
+        value not in {"live", "backfill"} for value in delivery_classes
+    ):
+        parser.error("delivery-classes must contain live or backfill")
     if args.users < 1 or args.messages < 1:
         parser.error("users and messages must be positive")
     engines.engine_factory.configure_factory(db_url=args.database_url)
@@ -363,9 +396,11 @@ def main():
                 args.messages,
                 batch_size,
                 writer_count,
+                delivery_class,
             )
             for batch_size in batch_sizes
             for writer_count in writers
+            for delivery_class in delivery_classes
         ]
     finally:
         benchmark_workspace_v3_projection._clear_schema(connection)

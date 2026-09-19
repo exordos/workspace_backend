@@ -107,13 +107,9 @@ class ProviderApiMiddleware(middlewares.Middleware):
         if req.path == _BOOTSTRAP_PATH:
             if req.method != "GET":
                 return self._method_not_allowed(("GET",))
-            # Cursor creation is a small, intentional write. Commit it before
-            # opening the read-only consistent snapshot used for all records.
+            # Capture the event cursor first. Mutations observed while the eager
+            # snapshot is built have a newer epoch and are replayed idempotently.
             cursor = store.events._cursor("provider", store.provider_uuid)
-            session.commit()
-            session.execute(
-                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
-            )
             return webob.Response(
                 app_iter=webob.static.FileIter(store.bootstrap_snapshot(cursor)),
                 status=200,
@@ -190,6 +186,13 @@ class ProviderApiMiddleware(middlewares.Middleware):
         store: provider_store.ProviderEntityStore,
         body: dict[str, typing.Any],
     ) -> dict[str, typing.Any]:
+        delivery_class = body.get("delivery_class", "live")
+        if delivery_class not in {"live", "backfill"}:
+            raise messenger_exceptions.ProviderApiError(
+                status=400,
+                error="invalid_delivery_class",
+                message="delivery_class must be live or backfill",
+            )
         operations = body.get("operations")
         if not isinstance(operations, list) or not (
             1 <= len(operations) <= provider_store.MAX_BATCH_SIZE
@@ -233,6 +236,11 @@ class ProviderApiMiddleware(middlewares.Middleware):
                         operation["content_hash"],
                         operation["data"],
                         operation["source_updated_at"],
+                        emit_event=(
+                            delivery_class == "live"
+                            or operation["resource"]
+                            not in provider_store.HISTORY_RESOURCES
+                        ),
                     )
                 else:
                     result = store.delete(

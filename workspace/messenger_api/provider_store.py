@@ -6,6 +6,7 @@
 import datetime
 import hashlib
 import json
+import re
 import tempfile
 import typing
 import uuid as sys_uuid
@@ -39,6 +40,9 @@ TABLES = {
 }
 MAX_BATCH_SIZE = 500
 MAX_PAGE_SIZE = 500
+HISTORY_RESOURCES = frozenset(
+    {"messages", "message_flags", "message_reactions"}
+)
 ZERO_UUID = sys_uuid.UUID(int=0)
 IMMUTABLE_FIELDS = {
     "stream_bindings": ("stream_uuid", "user_uuid"),
@@ -47,6 +51,7 @@ IMMUTABLE_FIELDS = {
     "message_flags": ("stream_uuid", "message_uuid", "user_uuid"),
     "message_reactions": ("message_uuid", "user_uuid"),
 }
+PROVIDER_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def _error(
@@ -139,11 +144,11 @@ class ProviderEntityStore:
         self.iam_user_uuid = iam_user_uuid
         self.provider_uuid = sys_uuid.UUID(str(provider["uuid"]))
         self.provider_name = str(provider["name"])
-        if self.provider_name != "zulip":
+        if PROVIDER_NAME.fullmatch(self.provider_name) is None:
             _error(
                 403,
-                "unsupported_provider",
-                "This Provider API version supports only the zulip source",
+                "invalid_provider_name",
+                "Provider name must be a lowercase source identifier",
             )
         self.events = v3_store.MessengerV3Store(project_uuid, iam_user_uuid)
         self._stream_recipients_cache: dict[
@@ -300,6 +305,8 @@ class ProviderEntityStore:
         content_hash: bytes,
         data: dict[str, typing.Any],
         source_updated_at: datetime.datetime | None = None,
+        *,
+        emit_event: bool = True,
     ) -> dict[str, typing.Any]:
         source_updated_at = source_updated_at or datetime.datetime.now(
             datetime.timezone.utc
@@ -319,7 +326,8 @@ class ProviderEntityStore:
                 content_hash,
                 source_updated_at,
             )
-            self._emit_upsert(resource, entity_uuid, status, data)
+            if emit_event:
+                self._emit_upsert(resource, entity_uuid, status, data)
         return self._result(resource, entity_uuid, status, new_state)
 
     def delete(

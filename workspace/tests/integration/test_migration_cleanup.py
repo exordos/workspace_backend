@@ -161,6 +161,12 @@ PER_USER_DELIVERY_REPAIR_MIGRATION_FILE = (
 PROVIDER_ENTITY_STATE_MIGRATION_FILE = (
     "0189-Add-Workspace-v3-provider-entity-states-d72d97.py"
 )
+PROVIDER_SOURCE_TIME_MIGRATION_FILE = (
+    "0190-Track-provider-source-modification-time-443f26.py"
+)
+GENERIC_PROVIDER_SOURCE_MIGRATION_FILE = (
+    "0191-Allow-generic-Workspace-v3-provider-source-names-5f386c.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -474,15 +480,18 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[PER_USER_DELIVERY_REPAIR_MIGRATION_FILE]._depends == [
         EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE
     ]
+    assert migrations[PROVIDER_SOURCE_TIME_MIGRATION_FILE]._depends == [
+        PROVIDER_ENTITY_STATE_MIGRATION_FILE
+    ]
+    assert migrations[GENERIC_PROVIDER_SOURCE_MIGRATION_FILE]._depends == [
+        PROVIDER_SOURCE_TIME_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert (
-        engine.get_latest_migration()
-        == PROVIDER_ENTITY_STATE_MIGRATION_FILE
-    )
+    assert engine.get_latest_migration() == GENERIC_PROVIDER_SOURCE_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',

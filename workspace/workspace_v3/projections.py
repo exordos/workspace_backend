@@ -1448,13 +1448,15 @@ def _projection_events(
                 "user_uuid": _uuid(payload["user_uuid"]),
                 "emoji_name": payload["emoji_name"],
                 "source_name": payload["source_name"],
-                "source": {"kind": payload["source_name"]},
+                "source": v3_store.source_projection(payload["source_name"]),
             }
             for name in ("old_emoji_name", "old_source_name"):
                 if name in payload:
                     reaction[name] = payload[name]
             if "old_source_name" in payload:
-                reaction["old_source"] = {"kind": payload["old_source_name"]}
+                reaction["old_source"] = v3_store.source_projection(
+                    payload["old_source_name"]
+                )
             events.append(
                 {
                     "project_id": project_id,
