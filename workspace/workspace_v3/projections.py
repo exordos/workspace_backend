@@ -98,7 +98,14 @@ def _claim_tasks(
         UPDATE workspace_v3.projection_tasks
         SET status = 'dead_letter', lease_owner = NULL,
             lease_expires_at = NULL, updated_at = clock_timestamp()
-        WHERE status = 'failed' AND attempts >= %s
+        WHERE attempts >= %s
+          AND (
+                status = 'failed'
+                OR (
+                    status = 'running'
+                    AND lease_expires_at <= clock_timestamp()
+                )
+              )
         """,
         (max_attempts,),
     )
@@ -279,6 +286,7 @@ def _update_stream_counters(
                          ON candidate_flag.project_id = candidate.project_id
                         AND candidate_flag.message_uuid = candidate.uuid
                         AND candidate_flag.user_uuid = target.user_uuid
+                        AND candidate_flag.stream_uuid = target.stream_uuid
                        WHERE candidate.project_id = target.project_id
                          AND candidate.stream_uuid = target.stream_uuid
                        ORDER BY candidate.created_at DESC, candidate.uuid DESC
@@ -292,6 +300,7 @@ def _update_stream_counters(
             LEFT JOIN workspace_v3.message_flags AS flag
               ON flag.project_id = target.project_id
              AND flag.user_uuid = target.user_uuid
+             AND flag.stream_uuid = target.stream_uuid
              AND NOT flag.read
             LEFT JOIN workspace_v3.messages AS message
               ON message.project_id = flag.project_id
@@ -410,6 +419,7 @@ def _update_topic_counters(
             LEFT JOIN workspace_v3.message_flags AS flag
               ON flag.project_id = target.project_id
              AND flag.user_uuid = target.user_uuid
+             AND flag.stream_uuid = topic.stream_uuid
              AND NOT flag.read
             LEFT JOIN workspace_v3.messages AS message
               ON message.project_id = flag.project_id
@@ -610,10 +620,17 @@ def _sync_folder_memberships(
                     desired.project_id IS NULL
                     OR item.folder_uuid NOT IN (%s::uuid, desired.category_uuid)
                   )
-            RETURNING item.uuid, item.project_id, item.user_uuid,
-                      item.folder_uuid, item.stream_uuid, item.order_index,
-                      item.pinned_at, item.chat_type, item.automatic,
-                      item.created_at, item.updated_at
+            RETURNING item.uuid AS uuid,
+                      item.project_id AS project_id,
+                      item.user_uuid AS user_uuid,
+                      item.folder_uuid AS folder_uuid,
+                      item.stream_uuid AS stream_uuid,
+                      item.order_index AS order_index,
+                      item.pinned_at AS pinned_at,
+                      item.chat_type AS chat_type,
+                      item.automatic AS automatic,
+                      item.created_at AS created_at,
+                      item.updated_at AS updated_at
             """,
             (
                 [scope[0] for scope in scopes],
@@ -622,6 +639,22 @@ def _sync_folder_memberships(
                 DIRECT_FOLDER_UUID,
                 STREAMS_FOLDER_UUID,
                 ALL_CHATS_FOLDER_UUID,
+            ),
+        )
+        deleted_rows = _mappings(
+            deleted.fetchall(),
+            (
+                "uuid",
+                "project_id",
+                "user_uuid",
+                "folder_uuid",
+                "stream_uuid",
+                "order_index",
+                "pinned_at",
+                "chat_type",
+                "automatic",
+                "created_at",
+                "updated_at",
             ),
         )
         item_rows: list[
@@ -717,22 +750,6 @@ def _sync_folder_memberships(
             "SELECT set_config("
             "'workspace_v3.suppress_folder_item_projection', 'off', true)"
         )
-    deleted_rows = _mappings(
-        deleted.fetchall(),
-        (
-            "uuid",
-            "project_id",
-            "user_uuid",
-            "folder_uuid",
-            "stream_uuid",
-            "order_index",
-            "pinned_at",
-            "chat_type",
-            "automatic",
-            "created_at",
-            "updated_at",
-        ),
-    )
     operations_by_folder: dict[
         tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID],
         list[dict[str, typing.Any]],

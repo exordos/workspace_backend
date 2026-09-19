@@ -507,6 +507,16 @@ resources:
           v2_metrics_log_interval_seconds = 30
 
 
+          [workspace_v3_projection_worker]
+          workers = 2
+          batch_size = 100
+          lease_seconds = 30
+          max_attempts = 8
+          reaction_user_limit = 4
+          idle_sleep_seconds = 0.1
+          metrics_log_interval_seconds = 30
+
+
           [topic_summary]
           secret_encryption_key = {$core.secret.passwords.$workspace_topic_summary_secret_key:value}
           connect_timeout_seconds = 30
@@ -684,6 +694,21 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-worker
       path: /usr/bin/workspace-messenger-worker --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
+    workspace_v3_worker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-v3-worker
+      path: /usr/bin/workspace-v3-worker --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

@@ -179,6 +179,28 @@ def test_messenger_v3_store_is_the_deployed_api_and_websocket_backend():
         assert "backend = v3" in config
 
 
+def test_messenger_v3_projection_worker_is_deployed():
+    config = _read("etc/workspace/workspace.conf")
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    install = _read("exordos/images/backend-install.sh")
+    restart = _read("exordos/images/workspace-restart-services.sh")
+    service = _read("etc/systemd/workspace-v3-worker.service")
+
+    for rendered_config in (config, manifest):
+        assert "[workspace_v3_projection_worker]" in rendered_config
+        assert "workers = 2" in rendered_config
+        assert "batch_size = 100" in rendered_config
+        assert "reaction_user_limit = 4" in rendered_config
+    assert "name: workspace-v3-worker" in manifest
+    assert (
+        "path: /usr/bin/workspace-v3-worker --config-file "
+        "/etc/workspace/workspace.conf"
+    ) in manifest
+    assert "workspace-v3-worker" in install
+    assert "workspace-v3-worker" in restart
+    assert "ExecStart=workspace-v3-worker --config-file " in service
+
+
 def test_manifest_provisions_unassigned_external_integration_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     account_permissions = {
