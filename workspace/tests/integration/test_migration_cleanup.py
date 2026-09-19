@@ -34,9 +34,7 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
-        engine.rollback_migration(
-            "0174-suppress-legacy-backfill-counters-a2cd99.py"
-        )
+        engine.rollback_migration("0174-suppress-legacy-backfill-counters-a2cd99.py")
         engine.rollback_migration("0173-accelerate-Messenger-v2-projections-8cda92.py")
         engine.rollback_migration("0172-retry-expired-provider-read-pages-05d036.py")
         engine.rollback_migration(
@@ -166,6 +164,9 @@ PROVIDER_SOURCE_TIME_MIGRATION_FILE = (
 )
 GENERIC_PROVIDER_SOURCE_MIGRATION_FILE = (
     "0191-Allow-generic-Workspace-v3-provider-source-names-5f386c.py"
+)
+USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE = (
+    "0192-Index-Workspace-v3-user-message-visibility-6b3971.py"
 )
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
@@ -486,12 +487,15 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[GENERIC_PROVIDER_SOURCE_MIGRATION_FILE]._depends == [
         PROVIDER_SOURCE_TIME_MIGRATION_FILE
     ]
+    assert migrations[USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE]._depends == [
+        GENERIC_PROVIDER_SOURCE_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == GENERIC_PROVIDER_SOURCE_MIGRATION_FILE
+    assert engine.get_latest_migration() == USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
@@ -1181,11 +1185,7 @@ def test_per_user_delivery_migration_repairs_shared_resource_snapshots(
                 (
                     operation_uuid,
                     delivery_status,
-                    (
-                        "failed"
-                        if delivery_status == "discarded"
-                        else delivery_status
-                    ),
+                    ("failed" if delivery_status == "discarded" else delivery_status),
                     project_uuid,
                     target_uuid,
                 ),
@@ -7029,9 +7029,7 @@ def _assert_external_stream_snapshot_migration_resets_affected_event_cursors(
         unaffected_user_uuid,
         "Native cursor unchanged",
     )
-    engine = ra_migrations.MigrationEngine(
-        migrations_path=str(conftest.MIGRATIONS_DIR)
-    )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     migration = engine._load_migrations()[EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE]
 
     with db.cursor() as cur:
@@ -7113,9 +7111,10 @@ def _assert_external_stream_snapshot_migration_resets_affected_event_cursors(
         )
         cursors_after = {row[0]: row[1:] for row in cur.fetchall()}
 
-    assert cursors_after[affected_project_uuid][0] != generations_before[
-        affected_project_uuid
-    ]
+    assert (
+        cursors_after[affected_project_uuid][0]
+        != generations_before[affected_project_uuid]
+    )
     assert cursors_after[affected_project_uuid][1:] == (17, 17)
     assert cursors_after[unaffected_project_uuid] == (
         generations_before[unaffected_project_uuid],

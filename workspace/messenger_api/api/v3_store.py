@@ -459,6 +459,12 @@ class MessengerV3Store:
                 WHERE topic.project_id = %s AND binding.user_uuid = %s
             """,
             "messages": """
+                WITH visible_flags AS MATERIALIZED (
+                    SELECT project_id, message_uuid, user_uuid,
+                           read, pinned, starred, mentioned
+                    FROM workspace_v3.message_flags
+                    WHERE project_id = %s AND user_uuid = %s
+                )
                 SELECT message.uuid, message.project_id, flag.user_uuid,
                        message.stream_uuid, message.topic_uuid,
                        message.author_uuid, message.payload,
@@ -467,11 +473,10 @@ class MessengerV3Store:
                        message.author_uuid = flag.user_uuid AS is_own,
                        message.reactions, message.reaction_users,
                        message.created_at, message.updated_at
-                FROM workspace_v3.messages AS message
-                JOIN workspace_v3.message_flags AS flag
-                  ON flag.project_id = message.project_id
-                 AND flag.message_uuid = message.uuid
-                WHERE message.project_id = %s AND flag.user_uuid = %s
+                FROM visible_flags AS flag
+                JOIN workspace_v3.messages AS message
+                  ON message.project_id = flag.project_id
+                 AND message.uuid = flag.message_uuid
             """,
             "message_reactions": """
                 SELECT reaction.*

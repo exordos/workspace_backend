@@ -33,6 +33,17 @@ def test_factory_can_select_clean_v3_storage():
         store_factory.build_store_factory("unknown")
 
 
+def test_v3_message_reads_materialize_the_viewers_flags_first():
+    store = v3_store.MessengerV3Store(sys_uuid.uuid4(), sys_uuid.uuid4())
+
+    statement, parameters = store._resource_sql("messages")
+
+    assert "WITH visible_flags AS MATERIALIZED" in statement
+    assert "FROM visible_flags AS flag" in statement
+    assert "WHERE project_id = %s AND user_uuid = %s" in statement
+    assert parameters == [store.project_uuid, store.user_uuid]
+
+
 def test_all_messenger_entrypoints_use_the_canonical_factory():
     for relative_path in (
         "workspace/cmd/messenger_api.py",
