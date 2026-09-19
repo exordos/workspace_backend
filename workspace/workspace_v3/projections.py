@@ -28,6 +28,7 @@ DEFAULT_LEASE_SECONDS = 30
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_REACTION_USER_LIMIT = 100
 DEFAULT_EVENT_RETENTION_HOURS = 72
+PROVIDER_BACKFILL_QUIET_SECONDS = 300
 AUDIENCE_NAMESPACE = sys_uuid.UUID("4a72ce87-e8a3-4f58-9bd7-b8c1d69c19b2")
 ALL_CHATS_FOLDER_UUID = constants.ALL_CHATS_FOLDER_UUID
 DIRECT_FOLDER_UUID = constants.DIRECT_FOLDER_UUID
@@ -112,18 +113,36 @@ def _claim_tasks(
     result = session.execute(
         """
         WITH candidates AS MATERIALIZED (
-            SELECT project_id, uuid
-            FROM workspace_v3.projection_tasks
-            WHERE attempts < %s
+            SELECT task.project_id, task.uuid
+            FROM workspace_v3.projection_tasks AS task
+            WHERE task.attempts < %s
               AND (
-                    status IN ('pending', 'failed')
+                    task.status IN ('pending', 'failed')
                     OR (
-                        status = 'running'
-                        AND lease_expires_at <= clock_timestamp()
+                        task.status = 'running'
+                        AND task.lease_expires_at <= clock_timestamp()
                     )
                   )
-              AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
-            ORDER BY created_at, user_uuid NULLS FIRST, scope_uuid, uuid
+              AND (
+                    task.next_retry_at IS NULL
+                    OR task.next_retry_at <= clock_timestamp()
+                  )
+              AND NOT (
+                    task.task_type = 'read_counters'
+                    AND task.payload IN (
+                        '{"emit_message_events": false}'::jsonb,
+                        '{"emit_message_event": false}'::jsonb
+                    )
+                    AND EXISTS (
+                        SELECT 1
+                        FROM workspace_v3.provider_consumers AS provider
+                        WHERE provider.project_id = task.project_id
+                          AND provider.updated_at > clock_timestamp()
+                              - make_interval(secs => %s)
+                    )
+                  )
+            ORDER BY task.created_at, task.user_uuid NULLS FIRST,
+                     task.scope_uuid, task.uuid
             LIMIT %s
             FOR UPDATE SKIP LOCKED
         )
@@ -139,7 +158,13 @@ def _claim_tasks(
                   task.scope_type, task.scope_uuid, task.user_uuid,
                   task.payload, task.attempts, task.created_at
         """,
-        (max_attempts, batch_size, worker_id, lease_seconds),
+        (
+            max_attempts,
+            PROVIDER_BACKFILL_QUIET_SECONDS,
+            batch_size,
+            worker_id,
+            lease_seconds,
+        ),
     )
     return _mappings(result.fetchall(), TASK_COLUMNS)
 

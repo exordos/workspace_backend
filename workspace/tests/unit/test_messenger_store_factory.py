@@ -38,7 +38,7 @@ def test_v3_message_reads_materialize_the_viewers_flags_first():
 
     statement, parameters = store._resource_sql("messages")
 
-    assert "WITH visible_flags AS MATERIALIZED" in statement
+    assert "WITH visible_flags AS NOT MATERIALIZED" in statement
     assert "FROM visible_flags AS flag" in statement
     assert "WHERE project_id = %s AND user_uuid = %s" in statement
     assert parameters == [store.project_uuid, store.user_uuid]

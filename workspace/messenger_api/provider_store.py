@@ -201,6 +201,28 @@ class ProviderEntityStore:
             (keys,),
         )
 
+    def defer_backfill_counter_projections(self) -> None:
+        """Record activity so background counters wait for a quiet project."""
+        lock_key = f"provider-backfill-read-counters:{self.project_uuid}"
+        acquired = self.session.execute(
+            """
+            SELECT pg_try_advisory_xact_lock(
+                hashtextextended(%s, 0)
+            ) AS acquired
+            """,
+            (lock_key,),
+        ).fetchone()["acquired"]
+        if not acquired:
+            return
+        self.session.execute(
+            """
+            UPDATE workspace_v3.provider_consumers
+            SET updated_at = clock_timestamp()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (self.project_uuid, self.provider_uuid),
+        )
+
     def _state(
         self,
         resource: str,
@@ -307,6 +329,7 @@ class ProviderEntityStore:
         source_updated_at: datetime.datetime | None = None,
         *,
         emit_event: bool = True,
+        expand_message_flags: bool = True,
     ) -> dict[str, typing.Any]:
         source_updated_at = source_updated_at or datetime.datetime.now(
             datetime.timezone.utc
@@ -319,7 +342,14 @@ class ProviderEntityStore:
             self._ensure_identity_unchanged(resource, entity_uuid, data)
         status = "created" if state is None else "updated"
         with event_origin.use("provider", self.provider_uuid):
-            getattr(self, f"_upsert_{resource}")(entity_uuid, data)
+            if resource == "messages":
+                self._upsert_messages(
+                    entity_uuid,
+                    data,
+                    expand_flags=expand_message_flags,
+                )
+            else:
+                getattr(self, f"_upsert_{resource}")(entity_uuid, data)
             new_state = self._set_state(
                 resource,
                 entity_uuid,
@@ -1030,7 +1060,11 @@ class ProviderEntityStore:
         )
 
     def _upsert_messages(
-        self, entity_uuid: sys_uuid.UUID, data: dict[str, typing.Any]
+        self,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+        *,
+        expand_flags: bool,
     ) -> None:
         self.session.execute(
             """
@@ -1057,6 +1091,15 @@ class ProviderEntityStore:
                 self._created_at(data),
             ),
         )
+        if expand_flags:
+            self.expand_message_flags((entity_uuid,))
+
+    def expand_message_flags(
+        self, message_uuids: typing.Iterable[sys_uuid.UUID]
+    ) -> None:
+        ordered = sorted(set(message_uuids), key=str)
+        if not ordered:
+            return
         self.session.execute(
             """
             INSERT INTO workspace_v3.message_flags (
@@ -1077,12 +1120,13 @@ class ProviderEntityStore:
             JOIN workspace_v3.streams AS stream
               ON stream.project_id = message.project_id
              AND stream.uuid = message.stream_uuid
-            WHERE message.project_id = %s AND message.uuid = %s
+            WHERE message.project_id = %s
+              AND message.uuid = ANY(%s::uuid[])
               AND (stream.history_public_to_subscribers
                    OR message.created_at >= binding.created_at)
             ON CONFLICT (project_id, message_uuid, user_uuid) DO NOTHING
             """,
-            (self.project_uuid, entity_uuid),
+            (self.project_uuid, ordered),
         )
 
     def _upsert_message_flags(

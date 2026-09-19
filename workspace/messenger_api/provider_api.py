@@ -240,6 +240,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
             (item["resource"], item["entity_uuid"]) for item in prepared
         )
         results = []
+        messages_to_expand = []
         for index, operation in enumerate(prepared):
             try:
                 if operation["action"] == "upsert":
@@ -254,7 +255,14 @@ class ProviderApiMiddleware(middlewares.Middleware):
                             or operation["resource"]
                             not in provider_store.HISTORY_RESOURCES
                         ),
+                        expand_message_flags=(delivery_class == "live"),
                     )
+                    if (
+                        delivery_class == "backfill"
+                        and operation["resource"] == "messages"
+                        and result["status"] != "unchanged"
+                    ):
+                        messages_to_expand.append(operation["entity_uuid"])
                 else:
                     result = store.delete(
                         operation["resource"], operation["entity_uuid"]
@@ -277,6 +285,9 @@ class ProviderApiMiddleware(middlewares.Middleware):
                         message=translated.safe_message,
                         item_index=index,
                     ) from error
+        store.expand_message_flags(messages_to_expand)
+        if delivery_class == "backfill":
+            store.defer_backfill_counter_projections()
         return {"results": results}
 
     def _prepare_operation(self, operation: typing.Any) -> dict[str, typing.Any]:

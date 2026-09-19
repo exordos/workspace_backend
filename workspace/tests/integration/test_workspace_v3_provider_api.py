@@ -751,6 +751,27 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         "SELECT count(*) FROM workspace_v3.events WHERE project_id = %s",
         (api.project_id,),
     ).fetchone()[0]
+    provider_activity_before = db.execute(
+        """
+        SELECT updated_at
+        FROM workspace_v3.provider_consumers
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (api.project_id, provider_uuid),
+    ).fetchone()[0]
+    unrelated_scope_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.projection_tasks (
+            project_id, task_type, scope_type, scope_uuid,
+            user_uuid, payload
+        ) VALUES (
+            %s, 'read_counters', 'user_stream', %s,
+            %s, '{"emit_message_events": false}'::jsonb
+        )
+        """,
+        (api.project_id, unrelated_scope_uuid, owner_uuid),
+    )
 
     history = []
     for number in range(10):
@@ -784,6 +805,34 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         "SELECT count(*) FROM workspace_v3.messages WHERE project_id = %s",
         (api.project_id,),
     ).fetchone()[0] == len(history)
+    assert db.execute(
+        "SELECT count(*) FROM workspace_v3.message_flags WHERE project_id = %s",
+        (api.project_id,),
+    ).fetchone()[0] == len(history)
+    pending_counters = db.execute(
+        """
+        SELECT count(*)
+        FROM workspace_v3.projection_tasks
+        WHERE project_id = %s
+          AND task_type = 'read_counters'
+          AND scope_uuid IN (%s, %s, %s)
+          AND status = 'pending'
+          AND payload IN (
+              '{"emit_message_events": false}'::jsonb,
+              '{"emit_message_event": false}'::jsonb
+          )
+        """,
+        (api.project_id, stream_uuid, topic_uuid, unrelated_scope_uuid),
+    ).fetchone()[0]
+    assert pending_counters > 0
+    assert db.execute(
+        """
+        SELECT updated_at > %s
+        FROM workspace_v3.provider_consumers
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (provider_activity_before, api.project_id, provider_uuid),
+    ).fetchone()[0]
     assert db.execute(
         "SELECT count(*) FROM workspace_v3.events WHERE project_id = %s",
         (api.project_id,),

@@ -459,7 +459,7 @@ class MessengerV3Store:
                 WHERE topic.project_id = %s AND binding.user_uuid = %s
             """,
             "messages": """
-                WITH visible_flags AS MATERIALIZED (
+                WITH visible_flags AS NOT MATERIALIZED (
                     SELECT project_id, message_uuid, user_uuid,
                            read, pinned, starred, mentioned
                     FROM workspace_v3.message_flags
