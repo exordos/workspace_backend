@@ -195,6 +195,7 @@ EXPECTED_COLUMNS = {
         "created_at",
         "updated_at",
         "source_updated_at",
+        "source_content_hash",
     ),
     "stream_bindings": (
         "uuid",
@@ -575,3 +576,19 @@ def test_workspace_v3_private_streams_have_at_most_two_members(_database, db):
             "DELETE FROM workspace_v3.projection_tasks WHERE project_id = %s",
             (project_id,),
         )
+
+
+def test_workspace_v3_indexes_user_reactions_for_user_listing(_database, db):
+    index = db.execute(
+        """
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'workspace_v3'
+          AND indexname = 'message_reactions_user_idx'
+        """
+    ).fetchone()
+
+    assert index is not None
+    assert index[0].endswith(
+        "ON workspace_v3.message_reactions USING btree (project_id, user_uuid)"
+    )

@@ -171,6 +171,19 @@ USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE = (
 LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE = (
     "0193-Backfill-legacy-native-messenger-data-into-Workspace-v3-2ee199.py"
 )
+REACTION_USER_INDEX_MIGRATION_FILE = "0194-Index-Workspace-v3-reaction-users-e429f1.py"
+PROVIDER_SOURCE_HASH_MIGRATION_FILE = (
+    "0195-Preserve-provider-source-content-hash-7aa861.py"
+)
+V3_DELETE_REBIND_MIGRATION_FILE = (
+    "0196-Keep-v3-delete-projections-and-rebinds-consistent-d38bd2.py"
+)
+V3_PROVIDER_MOVE_MIGRATION_FILE = (
+    "0197-Keep-provider-message-moves-and-flag-projections-consistent-4caced.py"
+)
+V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE = (
+    "0198-Support-v3-summaries-and-flag-rebind-projections-c84af7.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -496,12 +509,27 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE]._depends == [
         USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE
     ]
+    assert migrations[REACTION_USER_INDEX_MIGRATION_FILE]._depends == [
+        LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_SOURCE_HASH_MIGRATION_FILE]._depends == [
+        REACTION_USER_INDEX_MIGRATION_FILE
+    ]
+    assert migrations[V3_DELETE_REBIND_MIGRATION_FILE]._depends == [
+        PROVIDER_SOURCE_HASH_MIGRATION_FILE
+    ]
+    assert migrations[V3_PROVIDER_MOVE_MIGRATION_FILE]._depends == [
+        V3_DELETE_REBIND_MIGRATION_FILE
+    ]
+    assert migrations[V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE]._depends == [
+        V3_PROVIDER_MOVE_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE
+    assert engine.get_latest_migration() == V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',

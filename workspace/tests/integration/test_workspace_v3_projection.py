@@ -5,6 +5,8 @@
 
 import concurrent.futures
 import datetime
+import threading
+import time
 import uuid as sys_uuid
 
 import psycopg
@@ -287,6 +289,69 @@ def test_reaction_projection_is_bounded_complete_and_provider_visible(_database,
         assert cursor.fetchone()[0] == event_count + 2
 
 
+def test_reaction_projection_excludes_users_without_message_visibility(_database, db):
+    project_id, stream_uuid, topic_uuid, users = _seed_conversation(
+        db,
+        user_count=3,
+    )
+    message_uuid = _insert_message(
+        db,
+        project_id,
+        stream_uuid,
+        topic_uuid,
+        users[0],
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.message_flags (
+                project_id, stream_uuid, message_uuid, user_uuid, read
+            )
+            SELECT %s, %s, %s, input.user_uuid, false
+            FROM unnest(%s::uuid[]) AS input(user_uuid)
+            """,
+            (project_id, stream_uuid, message_uuid, users[:2]),
+        )
+        cursor.execute(
+            "DELETE FROM workspace_v3.projection_tasks WHERE project_id = %s",
+            (project_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.message_reactions (
+                project_id, message_uuid, user_uuid, emoji_name
+            ) VALUES (%s, %s, %s, 'eyes')
+            """,
+            (project_id, message_uuid, users[0]),
+        )
+
+    metrics = _process(db)
+
+    assert metrics["completed"] == 1
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT event.payload ->> 'kind', member.consumer_uuid
+            FROM workspace_v3.events AS event
+            JOIN workspace_v3.event_audience_members AS member
+              ON member.project_id = event.project_id
+             AND member.audience_snapshot_uuid = event.audience_snapshot_uuid
+            WHERE event.project_id = %s
+              AND event.payload ->> 'kind' IN (
+                  'message.updated', 'message_reaction.created'
+              )
+              AND member.consumer_type = 'user'
+            """,
+            (project_id,),
+        )
+        audiences = {(kind, user_uuid) for kind, user_uuid in cursor.fetchall()}
+    assert audiences == {
+        (kind, user_uuid)
+        for kind in ("message.updated", "message_reaction.created")
+        for user_uuid in users[:2]
+    }
+
+
 def test_message_flags_project_independent_unread_counters(_database, db):
     project_id, stream_uuid, topic_uuid, users = _seed_conversation(
         db,
@@ -415,6 +480,86 @@ def test_message_flags_project_independent_unread_counters(_database, db):
         assert cursor.fetchone()[0] == 1
 
 
+def test_message_delete_reprojects_unread_and_last_message(_database, db):
+    project_id, stream_uuid, topic_uuid, users = _seed_conversation(
+        db,
+        user_count=2,
+    )
+    first_message_uuid = _insert_message(
+        db,
+        project_id,
+        stream_uuid,
+        topic_uuid,
+        users[0],
+    )
+    last_message_uuid = _insert_message(
+        db,
+        project_id,
+        stream_uuid,
+        topic_uuid,
+        users[0],
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.message_flags (
+                project_id, stream_uuid, message_uuid, user_uuid, read
+            )
+            SELECT %s, %s, message_uuid, %s, false
+            FROM unnest(%s::uuid[]) AS input(message_uuid)
+            """,
+            (
+                project_id,
+                stream_uuid,
+                users[1],
+                [first_message_uuid, last_message_uuid],
+            ),
+        )
+    _process(db)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM workspace_v3.messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_id, last_message_uuid),
+        )
+        cursor.execute(
+            """
+            SELECT scope_type, count(*)
+            FROM workspace_v3.projection_tasks
+            WHERE project_id = %s AND task_type = 'read_counters'
+              AND user_uuid = %s AND status = 'pending'
+            GROUP BY scope_type
+            """,
+            (project_id, users[1]),
+        )
+        assert dict(cursor.fetchall()) == {"user_stream": 1, "user_topic": 1}
+
+    _process(db)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT stream.unread_count, stream.last_message_uuid,
+                   topic.unread_count, topic.last_message_uuid
+            FROM workspace_v3.stream_bindings AS stream
+            JOIN workspace_v3.topic_bindings AS topic
+              ON topic.project_id = stream.project_id
+             AND topic.stream_uuid = stream.stream_uuid
+             AND topic.user_uuid = stream.user_uuid
+            WHERE stream.project_id = %s AND stream.stream_uuid = %s
+              AND stream.user_uuid = %s AND topic.topic_uuid = %s
+            """,
+            (project_id, stream_uuid, users[1], topic_uuid),
+        )
+        assert cursor.fetchone() == (
+            1,
+            first_message_uuid,
+            1,
+            first_message_uuid,
+        )
+
+
 def test_projection_failure_is_retried_without_losing_task(_database, db):
     project_id, _stream_uuid, _topic_uuid, users = _seed_conversation(
         db,
@@ -454,6 +599,52 @@ def test_projection_failure_is_retried_without_losing_task(_database, db):
         assert last_error == "ValueError"
 
 
+def test_projection_batch_isolates_a_bad_task(_database, db):
+    project_id, stream_uuid, _topic_uuid, users = _seed_conversation(
+        db,
+        user_count=1,
+    )
+    valid_uuid = sys_uuid.uuid4()
+    invalid_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.projection_tasks (
+                uuid, project_id, task_type, scope_type, scope_uuid,
+                user_uuid
+            ) VALUES
+                (%s, %s, 'read_counters', 'user_stream', %s, %s),
+                (%s, %s, 'folder_counters', 'user_stream', %s, %s)
+            """,
+            (
+                valid_uuid,
+                project_id,
+                stream_uuid,
+                users[0],
+                invalid_uuid,
+                project_id,
+                stream_uuid,
+                users[0],
+            ),
+        )
+
+    metrics = _process(db, worker_id="integration:v3:isolation")
+
+    assert metrics["completed"] == 1
+    assert metrics["failed"] == 1
+    rows = db.execute(
+        """
+        SELECT uuid, status, attempts, last_error
+        FROM workspace_v3.projection_tasks
+        WHERE uuid = ANY(%s::uuid[])
+        """,
+        ([valid_uuid, invalid_uuid],),
+    ).fetchall()
+    states = {row[0]: row[1:] for row in rows}
+    assert states[valid_uuid] == ("completed", 1, None)
+    assert states[invalid_uuid] == ("failed", 1, "ValueError")
+
+
 def test_projection_workers_skip_locked_tasks_without_duplicates(_database, db):
     project_id, stream_uuid, topic_uuid, users = _seed_conversation(
         db,
@@ -470,6 +661,20 @@ def test_projection_workers_skip_locked_tasks_without_duplicates(_database, db):
         for _index in range(20)
     ]
     with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.message_flags (
+                project_id, stream_uuid, message_uuid, user_uuid, read
+            )
+            SELECT %s, %s, input.message_uuid, %s, false
+            FROM unnest(%s::uuid[]) AS input(message_uuid)
+            """,
+            (project_id, stream_uuid, users[0], message_uuids),
+        )
+        cursor.execute(
+            "DELETE FROM workspace_v3.projection_tasks WHERE project_id = %s",
+            (project_id,),
+        )
         cursor.execute(
             """
             INSERT INTO workspace_v3.message_reactions (
@@ -776,6 +981,87 @@ def test_projection_claim_commits_before_processing_locks(_database, db):
             tasks,
         )
     assert metrics["completed"] == 1
+
+
+def test_projection_processing_fences_expired_lease_reclaims(
+    _database,
+    db,
+    monkeypatch,
+):
+    project_id, stream_uuid, _topic_uuid, users = _seed_conversation(
+        db,
+        user_count=1,
+    )
+    task_uuid = sys_uuid.uuid4()
+    db.execute("DELETE FROM workspace_v3.projection_tasks")
+    db.execute(
+        """
+        INSERT INTO workspace_v3.projection_tasks (
+            uuid, project_id, task_type, scope_type, scope_uuid, user_uuid
+        ) VALUES (%s, %s, 'read_counters', 'user_stream', %s, %s)
+        """,
+        (task_uuid, project_id, stream_uuid, users[0]),
+    )
+    worker_id = "integration:v3:lease-owner"
+    with db.transaction():
+        tasks = projections.claim_projection_tasks(
+            db,
+            worker_id,
+            batch_size=1,
+            lease_seconds=1,
+        )
+    assert [task["uuid"] for task in tasks] == [task_uuid]
+
+    processing_started = threading.Event()
+    allow_processing = threading.Event()
+    original_update = projections._update_stream_counters
+
+    def delayed_update(*args, **kwargs):
+        processing_started.set()
+        assert allow_processing.wait(timeout=5)
+        return original_update(*args, **kwargs)
+
+    monkeypatch.setattr(projections, "_update_stream_counters", delayed_update)
+
+    def process_original_claim():
+        connection = psycopg.connect(conftest.TEST_DB_URL, autocommit=True)
+        try:
+            with connection.transaction():
+                return projections.process_claimed_projection_tasks(
+                    connection,
+                    worker_id,
+                    tasks,
+                )
+        finally:
+            connection.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(process_original_claim)
+        assert processing_started.wait(timeout=5)
+        time.sleep(1.1)
+        observer = psycopg.connect(conftest.TEST_DB_URL, autocommit=True)
+        try:
+            with observer.transaction():
+                reclaimed = projections.claim_projection_tasks(
+                    observer,
+                    "integration:v3:lease-reclaimer",
+                    batch_size=1,
+                )
+            assert reclaimed == []
+        finally:
+            observer.close()
+            allow_processing.set()
+        metrics = future.result(timeout=5)
+
+    assert metrics["completed"] == 1
+    assert db.execute(
+        """
+        SELECT status, attempts, lease_owner
+        FROM workspace_v3.projection_tasks
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (project_id, task_uuid),
+    ).fetchone() == ("completed", 1, None)
 
 
 def test_concurrent_folder_workers_converge_for_one_user(_database, db):

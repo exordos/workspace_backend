@@ -52,6 +52,20 @@ WITH native_user_uuids AS (
     FROM m_workspace_user_message_flags AS flag
     JOIN m_workspace_messages AS message ON message.uuid = flag.uuid
     WHERE message.source_name = 'native'
+    UNION
+    SELECT binding.user_uuid
+    FROM messenger_user_folder_bindings AS binding
+    WHERE binding.rule = 'custom'
+      AND EXISTS (
+          SELECT 1 FROM m_workspace_streams AS stream
+          WHERE stream.project_id = binding.project_id
+            AND stream.source_name = 'native'
+      )
+    UNION
+    SELECT file.user_uuid
+    FROM m_workspace_files AS file
+    LEFT JOIN m_workspace_streams AS stream ON stream.uuid = file.stream_uuid
+    WHERE file.stream_uuid IS NULL OR stream.source_name = 'native'
 )
 INSERT INTO workspace_v3.users (
     uuid, created_at, updated_at, username, source, status,
@@ -199,16 +213,46 @@ INSERT INTO workspace_v3.message_flags (
     uuid, project_id, stream_uuid, message_uuid, user_uuid,
     read, pinned, starred, mentioned, created_at, updated_at
 )
-SELECT md5(message.uuid::text || ':' || flag.user_uuid::text)::uuid,
-       message.project_id, message.stream_uuid, message.uuid, flag.user_uuid,
-       flag.read, flag.pinned, flag.starred, FALSE,
-       flag.created_at, flag.updated_at
-FROM m_workspace_user_message_flags AS flag
-JOIN m_workspace_messages AS message ON message.uuid = flag.uuid
+SELECT md5(message.uuid::text || ':' || binding.user_uuid::text)::uuid,
+       message.project_id, message.stream_uuid, message.uuid, binding.user_uuid,
+       CASE
+           WHEN read_project.mode IN ('compact', 'rollback') THEN
+               COALESCE(
+                   get_bit(
+                       read_chunk.read_bits,
+                       (message.ingest_sequence % 4096)::integer
+                   ),
+                   0
+               ) = 1
+           ELSE COALESCE(flag.read, FALSE)
+       END,
+       COALESCE(flag.pinned, FALSE), COALESCE(flag.starred, FALSE),
+       CASE
+           WHEN read_project.mode IN ('compact', 'rollback') THEN
+               mention.message_uuid IS NOT NULL
+           ELSE POSITION(
+               '](urn:user:' || LOWER(binding.user_uuid::text) || ')'
+               IN LOWER(COALESCE(message.payload ->> 'content', ''))
+           ) > 0
+       END,
+       COALESCE(flag.created_at, message.created_at),
+       COALESCE(flag.updated_at, message.updated_at)
+FROM m_workspace_messages AS message
 JOIN workspace_v3.stream_bindings AS binding
   ON binding.project_id = message.project_id
  AND binding.stream_uuid = message.stream_uuid
- AND binding.user_uuid = flag.user_uuid
+LEFT JOIN m_workspace_read_state_projects_v1 AS read_project
+  ON read_project.project_id = message.project_id
+LEFT JOIN m_workspace_user_message_flags AS flag
+  ON flag.project_id = message.project_id
+ AND flag.uuid = message.uuid
+ AND flag.user_uuid = binding.user_uuid
+LEFT JOIN m_workspace_user_read_chunks_v1 AS read_chunk
+  ON read_chunk.user_uuid = binding.user_uuid
+ AND read_chunk.chunk_number = message.ingest_sequence / 4096
+LEFT JOIN m_workspace_message_mentions_v1 AS mention
+  ON mention.message_uuid = message.uuid
+ AND mention.user_uuid = binding.user_uuid
 WHERE message.source_name = 'native'
 ON CONFLICT (project_id, message_uuid, user_uuid) DO NOTHING;
 
@@ -224,10 +268,86 @@ JOIN m_workspace_messages AS message ON message.uuid = reaction.message_uuid
 JOIN m_workspace_streams AS stream ON stream.uuid = message.stream_uuid
 WHERE stream.source_name = 'native'
 ON CONFLICT (project_id, uuid) DO NOTHING;
+
+INSERT INTO workspace_v3.folders (
+    uuid, project_id, user_uuid, kind, title, background_color_value,
+    created_at, updated_at
+)
+SELECT folder.uuid, folder.project_id, binding.user_uuid, 'custom',
+       folder.title, folder.background_color_value,
+       folder.created_at AT TIME ZONE 'UTC',
+       folder.updated_at AT TIME ZONE 'UTC'
+FROM messenger_folders AS folder
+JOIN messenger_user_folder_bindings AS binding
+  ON binding.project_id = folder.project_id
+ AND binding.folder_uuid = folder.uuid
+JOIN workspace_v3.users AS user_record ON user_record.uuid = binding.user_uuid
+WHERE binding.rule = 'custom'
+ON CONFLICT (project_id, user_uuid, uuid) DO NOTHING;
+
+INSERT INTO workspace_v3.folder_items (
+    uuid, project_id, user_uuid, folder_uuid, stream_uuid,
+    order_index, pinned_at, chat_type, automatic, created_at, updated_at
+)
+SELECT item.uuid, item.project_id, item.user_uuid, item.folder_uuid,
+       item.stream_uuid, item.order_index, item.pinned_at, item.chat_type,
+       item.automatic,
+       item.created_at AT TIME ZONE 'UTC',
+       item.updated_at AT TIME ZONE 'UTC'
+FROM messenger_folder_items AS item
+JOIN messenger_user_folder_bindings AS binding
+  ON binding.project_id = item.project_id
+ AND binding.user_uuid = item.user_uuid
+ AND binding.folder_uuid = item.folder_uuid
+JOIN workspace_v3.stream_bindings AS stream_binding
+  ON stream_binding.project_id = item.project_id
+ AND stream_binding.stream_uuid = item.stream_uuid
+ AND stream_binding.user_uuid = item.user_uuid
+WHERE binding.rule = 'custom'
+ON CONFLICT (project_id, user_uuid, folder_uuid, stream_uuid) DO NOTHING;
+
+INSERT INTO workspace_v3.drafts (
+    uuid, project_id, user_uuid, stream_uuid, topic_uuid, payload,
+    revision, created_at, updated_at
+)
+SELECT draft.uuid, draft.project_id, draft.user_uuid, draft.stream_uuid,
+       draft.topic_uuid, draft.payload, draft.revision,
+       draft.created_at, draft.updated_at
+FROM m_workspace_drafts AS draft
+JOIN workspace_v3.stream_bindings AS binding
+  ON binding.project_id = draft.project_id
+ AND binding.stream_uuid = draft.stream_uuid
+ AND binding.user_uuid = draft.user_uuid
+JOIN workspace_v3.topics AS topic
+  ON topic.project_id = draft.project_id
+ AND topic.stream_uuid = draft.stream_uuid
+ AND topic.uuid = draft.topic_uuid
+ON CONFLICT (project_id, user_uuid, uuid) DO NOTHING;
+
+INSERT INTO workspace_v3.files (
+    uuid, project_id, user_uuid, stream_uuid, acl_mode, name, description,
+    content_type, size_bytes, hash, storage_type, storage_id,
+    storage_object_id, created_at, updated_at
+)
+SELECT file.uuid, file.project_id, file.user_uuid, file.stream_uuid,
+       file.acl_mode, file.name, file.description, file.content_type,
+       file.size_bytes, file.hash, file.storage_type, file.storage_id,
+       file.storage_object_id, file.created_at, file.updated_at
+FROM m_workspace_files AS file
+JOIN workspace_v3.users AS user_record ON user_record.uuid = file.user_uuid
+LEFT JOIN workspace_v3.streams AS stream
+  ON stream.project_id = file.project_id AND stream.uuid = file.stream_uuid
+WHERE (file.stream_uuid IS NULL OR stream.uuid IS NOT NULL)
+ON CONFLICT (project_id, uuid) DO NOTHING;
 """
 
 
 DOWNGRADE = """
+DELETE FROM workspace_v3.files AS target
+USING m_workspace_files AS legacy
+WHERE target.project_id = legacy.project_id
+  AND target.uuid = legacy.uuid;
+
 DELETE FROM workspace_v3.streams AS target
 USING m_workspace_streams AS legacy
 WHERE legacy.source_name = 'native'

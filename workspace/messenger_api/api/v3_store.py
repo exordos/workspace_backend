@@ -29,6 +29,8 @@ from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api import event_origin
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
+from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import models
 from workspace.workspace_v3 import constants
 
 _SOURCE_RESOURCES = frozenset(
@@ -69,6 +71,10 @@ _USER_SCOPED = frozenset(
 )
 _TOPIC_NOTIFICATION_MODES = frozenset({"mute", "default", "follow"})
 _MUTED_STREAM_TOPIC_NOTIFICATION_MODES = _TOPIC_NOTIFICATION_MODES | {"unmute"}
+_STREAM_BINDING_ROLES = frozenset(
+    {"guest", "member", "moderator", "administrator", "owner"}
+)
+_STREAM_NOTIFICATION_MODES = frozenset({"all_messages", "mentions_only", "muted"})
 _RESOURCE_OBJECT_TYPES = {
     "folders": "folder",
     "folder_items": "folder_item",
@@ -122,7 +128,7 @@ _EVENT_RESOURCE_QUERIES = {
                binding.passive_unread_count, stream.source_name,
                stream.invite_only, stream.announce, stream.private,
                stream.is_archived,
-               CASE WHEN stream.private THEN COALESCE(
+               CASE WHEN stream.direct_user_uuid IS NOT NULL THEN COALESCE(
                    (
                        SELECT peer.user_uuid
                        FROM workspace_v3.stream_bindings AS peer
@@ -132,7 +138,7 @@ _EVENT_RESOURCE_QUERIES = {
                        ORDER BY peer.user_uuid
                        LIMIT 1
                    ), binding.user_uuid
-               ) ELSE stream.direct_user_uuid END AS direct_user_uuid,
+               ) END AS direct_user_uuid,
                stream.private_index, stream.color,
                binding.last_message_uuid, stream.default_topic_uuid,
                stream.created_at, stream.updated_at
@@ -179,14 +185,18 @@ def resolve_provider_consumer(
     project_uuid: sys_uuid.UUID,
     iam_user_uuid: sys_uuid.UUID,
 ) -> dict[str, typing.Any] | None:
-    row = _session().execute(
-        """
+    row = (
+        _session()
+        .execute(
+            """
         SELECT uuid, name
         FROM workspace_v3.provider_consumers
         WHERE project_id = %s AND iam_user_uuid = %s AND enabled
         """,
-        (project_uuid, iam_user_uuid),
-    ).fetchone()
+            (project_uuid, iam_user_uuid),
+        )
+        .fetchone()
+    )
     return None if row is None else _row(row)
 
 
@@ -398,6 +408,34 @@ class MessengerV3Store:
                            user_row.username
                        ) AS display_name
                 FROM workspace_v3.users AS user_row
+                WHERE user_row.source = 'iam'
+                   OR EXISTS (
+                       SELECT 1
+                       FROM workspace_v3.stream_bindings AS binding
+                       WHERE binding.project_id = %s
+                         AND binding.user_uuid = user_row.uuid
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM workspace_v3.streams AS stream
+                       WHERE stream.project_id = %s
+                         AND (
+                             stream.owner_uuid = user_row.uuid
+                             OR stream.direct_user_uuid = user_row.uuid
+                         )
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM workspace_v3.messages AS message
+                       WHERE message.project_id = %s
+                         AND message.author_uuid = user_row.uuid
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                       FROM workspace_v3.message_reactions AS reaction
+                       WHERE reaction.project_id = %s
+                         AND reaction.user_uuid = user_row.uuid
+                   )
             """,
             "streams": """
                 SELECT stream.uuid, stream.project_id,
@@ -409,7 +447,7 @@ class MessengerV3Store:
                        binding.passive_unread_count, stream.source_name,
                        stream.invite_only, stream.announce, stream.private,
                        stream.is_archived,
-                       CASE WHEN stream.private THEN COALESCE(
+                       CASE WHEN stream.direct_user_uuid IS NOT NULL THEN COALESCE(
                            (
                                SELECT peer.user_uuid
                                FROM workspace_v3.stream_bindings AS peer
@@ -419,7 +457,7 @@ class MessengerV3Store:
                                ORDER BY peer.user_uuid
                                LIMIT 1
                            ), binding.user_uuid
-                       ) ELSE stream.direct_user_uuid END AS direct_user_uuid,
+                       ) END AS direct_user_uuid,
                        stream.private_index, stream.color,
                        binding.last_message_uuid, stream.default_topic_uuid,
                        stream.created_at, stream.updated_at
@@ -487,12 +525,9 @@ class MessengerV3Store:
             "message_reactions": """
                 SELECT reaction.*
                 FROM workspace_v3.message_reactions AS reaction
-                JOIN workspace_v3.messages AS message
-                  ON message.project_id = reaction.project_id
-                 AND message.uuid = reaction.message_uuid
-                JOIN workspace_v3.stream_bindings AS viewer
-                  ON viewer.project_id = message.project_id
-                 AND viewer.stream_uuid = message.stream_uuid
+                JOIN workspace_v3.message_flags AS viewer
+                  ON viewer.project_id = reaction.project_id
+                 AND viewer.message_uuid = reaction.message_uuid
                  AND viewer.user_uuid = %s
                 WHERE reaction.project_id = %s
             """,
@@ -526,7 +561,7 @@ class MessengerV3Store:
                 FROM workspace_v3.files AS file
                 WHERE (
                     file.acl_mode = 'public'
-                    OR file.user_uuid = %s
+                    OR (file.project_id = %s AND file.user_uuid = %s)
                     OR (
                         file.project_id = %s
                         AND file.acl_mode = 'stream'
@@ -546,11 +581,11 @@ class MessengerV3Store:
         except KeyError as exc:
             raise ValueError(f"Unsupported Messenger resource {resource}") from exc
         if resource == "users":
-            return query, []
+            return query, [project, project, project, project]
         if resource == "message_reactions":
             return query, [user, project]
         if resource == "files":
-            return query, [user, project, user]
+            return query, [project, user, project, user]
         return query, [project, user]
 
     def _query_resources(
@@ -747,12 +782,52 @@ class MessengerV3Store:
         )
         return tuple(sys_uuid.UUID(str(row["user_uuid"])) for row in rows)
 
+    def _user_event_recipients(self) -> tuple[sys_uuid.UUID, ...]:
+        rows = (
+            _session()
+            .execute(
+                """
+            SELECT DISTINCT project_user.user_uuid
+            FROM (
+                SELECT user_uuid FROM workspace_v3.stream_bindings
+                WHERE project_id = %s
+                UNION
+                SELECT user_uuid FROM workspace_v3.folders
+                WHERE project_id = %s
+            ) AS project_user
+            ORDER BY project_user.user_uuid
+            """,
+                (self.project_uuid, self.project_uuid),
+            )
+            .fetchall()
+        )
+        return tuple(sys_uuid.UUID(str(row["user_uuid"])) for row in rows)
+
+    def _stream_is_direct(self, stream_uuid: object) -> bool:
+        row = (
+            _session()
+            .execute(
+                """
+            SELECT direct_user_uuid
+            FROM workspace_v3.streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+                (self.project_uuid, stream_uuid),
+            )
+            .fetchone()
+        )
+        if row is None:
+            _not_found("streams", stream_uuid)
+        return row["direct_user_uuid"] is not None
+
     def _provider_consumers_for_stream(
         self,
         stream_uuid: object,
     ) -> tuple[sys_uuid.UUID, ...]:
-        rows = _session().execute(
-            """
+        rows = (
+            _session()
+            .execute(
+                """
             SELECT provider.uuid
             FROM workspace_v3.streams AS stream
             JOIN workspace_v3.provider_consumers AS provider
@@ -763,16 +838,20 @@ class MessengerV3Store:
               AND stream.source_name <> 'native'
             ORDER BY provider.uuid
             """,
-            (self.project_uuid, stream_uuid),
-        ).fetchall()
+                (self.project_uuid, stream_uuid),
+            )
+            .fetchall()
+        )
         return tuple(sys_uuid.UUID(str(row["uuid"])) for row in rows)
 
     def _provider_consumers_for_user(
         self,
         user_uuid: object,
     ) -> tuple[sys_uuid.UUID, ...]:
-        rows = _session().execute(
-            """
+        rows = (
+            _session()
+            .execute(
+                """
             SELECT DISTINCT provider.uuid
             FROM workspace_v3.stream_bindings AS binding
             JOIN workspace_v3.streams AS stream
@@ -786,8 +865,10 @@ class MessengerV3Store:
               AND stream.source_name <> 'native'
             ORDER BY provider.uuid
             """,
-            (self.project_uuid, user_uuid),
-        ).fetchall()
+                (self.project_uuid, user_uuid),
+            )
+            .fetchall()
+        )
         return tuple(sys_uuid.UUID(str(row["uuid"])) for row in rows)
 
     def _provider_consumers_for_resource(
@@ -800,52 +881,70 @@ class MessengerV3Store:
         if resource == "streams":
             stream_uuid = resource_uuid
         elif resource == "stream_bindings":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT stream_uuid FROM workspace_v3.stream_bindings
                 WHERE project_id = %s AND uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None:
                 return ()
             stream_uuid = row["stream_uuid"]
         elif resource == "stream_topics":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT stream_uuid FROM workspace_v3.topics
                 WHERE project_id = %s AND uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None:
                 return ()
             stream_uuid = row["stream_uuid"]
         elif resource == "topic_bindings":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT stream_uuid FROM workspace_v3.topic_bindings
                 WHERE project_id = %s AND uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None:
                 return ()
             stream_uuid = row["stream_uuid"]
         elif resource == "messages":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT stream_uuid FROM workspace_v3.messages
                 WHERE project_id = %s AND uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None:
                 return ()
             stream_uuid = row["stream_uuid"]
         elif resource == "message_flags":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT message.stream_uuid
                 FROM workspace_v3.message_flags AS flag
                 JOIN workspace_v3.messages AS message
@@ -853,14 +952,18 @@ class MessengerV3Store:
                  AND message.uuid = flag.message_uuid
                 WHERE flag.project_id = %s AND flag.uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None:
                 return ()
             stream_uuid = row["stream_uuid"]
         elif resource == "message_reactions":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT message.stream_uuid
                 FROM workspace_v3.message_reactions AS reaction
                 JOIN workspace_v3.messages AS message
@@ -868,19 +971,25 @@ class MessengerV3Store:
                  AND message.uuid = reaction.message_uuid
                 WHERE reaction.project_id = %s AND reaction.uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None:
                 return ()
             stream_uuid = row["stream_uuid"]
         elif resource == "files":
-            row = _session().execute(
-                """
+            row = (
+                _session()
+                .execute(
+                    """
                 SELECT stream_uuid FROM workspace_v3.files
                 WHERE project_id = %s AND uuid = %s
                 """,
-                (self.project_uuid, resource_uuid),
-            ).fetchone()
+                    (self.project_uuid, resource_uuid),
+                )
+                .fetchone()
+            )
             if row is None or row["stream_uuid"] is None:
                 return ()
             stream_uuid = row["stream_uuid"]
@@ -891,7 +1000,12 @@ class MessengerV3Store:
     def _require_stream(self, stream_uuid: object) -> dict[str, typing.Any]:
         return self.get_resource("streams", sys_uuid.UUID(str(stream_uuid)))
 
-    def _require_manage_stream(self, stream_uuid: object) -> None:
+    def _require_manage_stream(
+        self,
+        stream_uuid: object,
+        *,
+        summary_prompt: bool = False,
+    ) -> None:
         row = (
             _session()
             .execute(
@@ -906,6 +1020,8 @@ class MessengerV3Store:
             .fetchone()
         )
         if row is None:
+            if summary_prompt:
+                raise messenger_exceptions.TopicSummaryPromptForbiddenError()
             _not_found("streams", stream_uuid)
 
     def _emit(
@@ -1102,14 +1218,40 @@ class MessengerV3Store:
         # path is used only after both modules are initialized.
         from workspace.messenger_api import provider_store
 
-        provider = _session().execute(
-            """
-            SELECT uuid, name
-            FROM workspace_v3.provider_consumers
-            WHERE project_id = %s AND uuid = %s AND enabled
+        provider = (
+            _session()
+            .execute(
+                """
+            WITH owner AS MATERIALIZED (
+                SELECT provider_uuid
+                FROM workspace_v3.provider_entity_states
+                WHERE project_id = %s
+                  AND entity_type = %s
+                  AND entity_uuid = %s
+            )
+            SELECT provider.uuid, provider.name
+            FROM workspace_v3.provider_consumers AS provider
+            LEFT JOIN owner ON owner.provider_uuid = provider.uuid
+            WHERE provider.project_id = %s
+              AND provider.uuid = ANY(%s::uuid[])
+              AND provider.enabled
+              AND (
+                  NOT EXISTS (SELECT 1 FROM owner)
+                  OR owner.provider_uuid IS NOT NULL
+              )
+            ORDER BY (owner.provider_uuid IS NOT NULL) DESC, provider.uuid
+            LIMIT 1
             """,
-            (self.project_uuid, providers[0]),
-        ).fetchone()
+                (
+                    self.project_uuid,
+                    provider_store.RESOURCE_TYPES[provider_resource],
+                    resource_uuid,
+                    self.project_uuid,
+                    list(providers),
+                ),
+            )
+            .fetchone()
+        )
         if provider is None:
             return None
         store = provider_store.ProviderEntityStore(
@@ -1118,7 +1260,7 @@ class MessengerV3Store:
             self.user_uuid,
             provider,
         )
-        return store.provider_data_for_entity(
+        return store.refresh_owned_state(
             provider_resource,
             sys_uuid.UUID(str(resource_uuid)),
         )
@@ -1257,7 +1399,21 @@ class MessengerV3Store:
     ) -> dict[str, typing.Any]:
         item_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
         self._require_stream(values["stream_uuid"])
-        self.get_resource("folders", sys_uuid.UUID(str(values["folder_uuid"])))
+        folder_uuid = sys_uuid.UUID(str(values["folder_uuid"]))
+        self.get_resource("folders", folder_uuid)
+        folder_kind = (
+            _session()
+            .execute(
+                """
+            SELECT kind FROM workspace_v3.folders
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+                (self.project_uuid, self.user_uuid, folder_uuid),
+            )
+            .fetchone()["kind"]
+        )
+        if folder_kind != "custom":
+            raise ra_exceptions.ValidationErrorException()
         _session().execute(
             """
             INSERT INTO workspace_v3.folder_items (
@@ -1298,18 +1454,48 @@ class MessengerV3Store:
             direct_user = sys_uuid.UUID(str(direct_user))
             self.get_resource("users", direct_user)
         private = bool(values.get("private", False) or direct_user is not None)
-        stream_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
         participant_values = [self.user_uuid]
         if direct_user is not None and direct_user != self.user_uuid:
             participant_values.append(direct_user)
         participants = tuple(sorted(participant_values, key=str))
         private_index = (
-            ":".join(str(item) for item in participants)
+            helpers.build_private_stream_index(self.user_uuid, direct_user)
             if direct_user is not None
             else None
         )
+        stream_uuid = (
+            helpers.deterministic_direct_stream_uuid(
+                self.project_uuid,
+                self.user_uuid,
+                direct_user,
+            )
+            if direct_user is not None
+            else sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
+        )
         topic_uuid = sys_uuid.uuid4()
         session = _session()
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s::text, 0))",
+            (stream_uuid,),
+        )
+        if direct_user is not None:
+            existing = session.execute(
+                """
+                SELECT source_name, private, direct_user_uuid, private_index
+                FROM workspace_v3.streams
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, stream_uuid),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["source_name"] != "native"
+                    or not existing["private"]
+                    or existing["direct_user_uuid"] is None
+                    or existing["private_index"] != private_index
+                ):
+                    raise ra_exceptions.ValidationErrorException()
+                return self.get_resource("streams", stream_uuid)
         session.execute(
             """
             INSERT INTO workspace_v3.streams (
@@ -1409,22 +1595,48 @@ class MessengerV3Store:
             "messages", sys_uuid.UUID(str(values["message_uuid"]))
         )
         reaction_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
-        _session().execute(
-            """
+        row = (
+            _session()
+            .execute(
+                """
             INSERT INTO workspace_v3.message_reactions (
                 uuid, project_id, message_uuid, user_uuid,
                 emoji_name, source_name
             ) VALUES (%s, %s, %s, %s, %s, 'native')
+            ON CONFLICT (project_id, message_uuid, user_uuid, emoji_name)
+            DO NOTHING
+            RETURNING uuid
             """,
-            (
-                reaction_uuid,
-                self.project_uuid,
-                message["uuid"],
-                self.user_uuid,
-                values["emoji_name"],
-            ),
+                (
+                    reaction_uuid,
+                    self.project_uuid,
+                    message["uuid"],
+                    self.user_uuid,
+                    values["emoji_name"],
+                ),
+            )
+            .fetchone()
         )
-        return self.get_resource("message_reactions", reaction_uuid)
+        if row is None:
+            row = (
+                _session()
+                .execute(
+                    """
+                SELECT uuid
+                FROM workspace_v3.message_reactions
+                WHERE project_id = %s AND message_uuid = %s
+                  AND user_uuid = %s AND emoji_name = %s
+                """,
+                    (
+                        self.project_uuid,
+                        message["uuid"],
+                        self.user_uuid,
+                        values["emoji_name"],
+                    ),
+                )
+                .fetchone()
+            )
+        return self.get_resource("message_reactions", row["uuid"])
 
     def _create_file(self, values: dict[str, typing.Any]) -> dict[str, typing.Any]:
         file_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
@@ -1582,9 +1794,7 @@ class MessengerV3Store:
         if sys_uuid.UUID(str(message["author_uuid"])) != self.user_uuid:
             _not_found("messages", message_uuid)
         recipients = self._stream_recipients(message["stream_uuid"])
-        provider_consumers = self._provider_consumers_for_stream(
-            message["stream_uuid"]
-        )
+        provider_consumers = self._provider_consumers_for_stream(message["stream_uuid"])
         provider_payload = self._provider_entity_payload(
             "messages",
             message_uuid,
@@ -1666,6 +1876,20 @@ class MessengerV3Store:
         values: dict[str, typing.Any],
     ) -> dict[str, typing.Any]:
         if resource == "folders":
+            self.get_resource(resource, resource_uuid)
+            kind = (
+                _session()
+                .execute(
+                    """
+                SELECT kind FROM workspace_v3.folders
+                WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+                """,
+                    (self.project_uuid, self.user_uuid, resource_uuid),
+                )
+                .fetchone()["kind"]
+            )
+            if kind != "custom":
+                raise ra_exceptions.ValidationErrorException()
             return self._update_columns(
                 "folders",
                 resource,
@@ -1685,7 +1909,10 @@ class MessengerV3Store:
             )
         if resource == "files":
             current = self.get_resource(resource, resource_uuid)
-            if sys_uuid.UUID(str(current["user_uuid"])) != self.user_uuid:
+            if (
+                sys_uuid.UUID(str(current["project_id"])) != self.project_uuid
+                or sys_uuid.UUID(str(current["user_uuid"])) != self.user_uuid
+            ):
                 _not_found(resource, resource_uuid)
             return self._update_columns(
                 "files",
@@ -1703,6 +1930,48 @@ class MessengerV3Store:
                 values,
                 frozenset({"name", "description", "invite_only", "announce", "color"}),
             )
+        if resource == "stream_bindings":
+            current = self.get_resource(resource, resource_uuid)
+            stream_uuid = sys_uuid.UUID(str(current["stream_uuid"]))
+            if self._stream_is_direct(stream_uuid):
+                raise ra_exceptions.ValidationErrorException()
+            invalid = set(values) - {"role", "notification_mode"}
+            if invalid:
+                raise ra_exceptions.ValidationErrorException()
+            if (
+                "role" in values
+                and values["role"] not in _STREAM_BINDING_ROLES
+                or "notification_mode" in values
+                and values["notification_mode"] not in _STREAM_NOTIFICATION_MODES
+            ):
+                raise ra_exceptions.ValidationErrorException()
+            if not values:
+                return current
+            if (
+                "role" in values
+                or sys_uuid.UUID(str(current["user_uuid"])) != self.user_uuid
+            ):
+                self._require_manage_stream(stream_uuid)
+            assignments = [f'"{name}" = %s' for name in values]
+            parameters: list[typing.Any] = list(values.values())
+            if "notification_mode" in values:
+                assignments.append("notification_updated_at = clock_timestamp()")
+            parameters.extend((self.project_uuid, resource_uuid))
+            _session().execute(
+                "UPDATE workspace_v3.stream_bindings SET "
+                + ", ".join(assignments)
+                + ", updated_at = clock_timestamp() "
+                + "WHERE project_id = %s AND uuid = %s",
+                parameters,
+            )
+            updated = self.get_resource(resource, resource_uuid)
+            self._emit_resource(
+                resource,
+                resource_uuid,
+                "updated",
+                self._stream_recipients(stream_uuid),
+            )
+            return updated
         if resource == "stream_topics":
             return self._update_columns(
                 "topics",
@@ -1741,12 +2010,45 @@ class MessengerV3Store:
         }.get(resource)
         if table is None:
             raise ValueError(f"Unsupported Messenger delete {resource}")
+        if resource == "folders":
+            kind = (
+                _session()
+                .execute(
+                    """
+                SELECT kind FROM workspace_v3.folders
+                WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+                """,
+                    (self.project_uuid, self.user_uuid, resource_uuid),
+                )
+                .fetchone()["kind"]
+            )
+            if kind != "custom":
+                raise ra_exceptions.ValidationErrorException()
+        if resource == "folder_items":
+            automatic = (
+                _session()
+                .execute(
+                    """
+                SELECT automatic FROM workspace_v3.folder_items
+                WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+                """,
+                    (self.project_uuid, self.user_uuid, resource_uuid),
+                )
+                .fetchone()["automatic"]
+            )
+            if automatic:
+                raise ra_exceptions.ValidationErrorException()
         if resource in {"folders", "folder_items", "files", "message_reactions"}:
             owner_field = "user_uuid"
-            if sys_uuid.UUID(str(current[owner_field])) != self.user_uuid:
+            if (
+                resource == "files"
+                and sys_uuid.UUID(str(current["project_id"])) != self.project_uuid
+            ) or sys_uuid.UUID(str(current[owner_field])) != self.user_uuid:
                 _not_found(resource, resource_uuid)
         if resource == "stream_bindings":
             stream_uuid = current["stream_uuid"]
+            if self._stream_is_direct(stream_uuid):
+                raise ra_exceptions.ValidationErrorException()
             if sys_uuid.UUID(str(current["user_uuid"])) != self.user_uuid:
                 self._require_manage_stream(stream_uuid)
             recipients = self._stream_recipients(stream_uuid)
@@ -1756,6 +2058,8 @@ class MessengerV3Store:
             )
             recipients = self._stream_recipients(stream_uuid)
             if resource == "streams":
+                if self._stream_is_direct(stream_uuid):
+                    raise ra_exceptions.ValidationErrorException()
                 self._require_manage_stream(stream_uuid)
         elif resource == "message_reactions":
             # The projection worker emits the complete legacy-compatible
@@ -1796,6 +2100,17 @@ class MessengerV3Store:
             provider_consumers=provider_consumers,
             provider_payload=provider_payload,
         )
+        if resource == "stream_bindings":
+            removed_user_uuid = sys_uuid.UUID(str(current["user_uuid"]))
+            self._emit(
+                kind="stream.deleted",
+                object_type="stream",
+                action="deleted",
+                entity_uuid=stream_uuid,
+                payloads={removed_user_uuid: {"uuid": str(stream_uuid)}},
+            )
+        elif resource == "stream_topics" and current["is_default"]:
+            self._emit_resource("streams", stream_uuid, "updated", recipients)
         return None
 
     def _add_users(
@@ -1982,8 +2297,10 @@ class MessengerV3Store:
             return self.get_resource("streams", resource_uuid)
         if resource == "streams" and action == "notifications":
             stream = self.get_resource("streams", resource_uuid)
-            binding = _session().execute(
-                """
+            binding = (
+                _session()
+                .execute(
+                    """
                 UPDATE workspace_v3.stream_bindings
                 SET notification_mode = %s,
                     notification_updated_at = clock_timestamp(),
@@ -1991,17 +2308,21 @@ class MessengerV3Store:
                 WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
                 RETURNING uuid
                 """,
-                (
-                    values["notification_mode"],
-                    self.project_uuid,
-                    resource_uuid,
-                    self.user_uuid,
-                ),
-            ).fetchone()
+                    (
+                        values["notification_mode"],
+                        self.project_uuid,
+                        resource_uuid,
+                        self.user_uuid,
+                    ),
+                )
+                .fetchone()
+            )
             topic_bindings = []
             if values["notification_mode"] != "muted":
-                topic_bindings = _session().execute(
-                    """
+                topic_bindings = (
+                    _session()
+                    .execute(
+                        """
                     UPDATE workspace_v3.topic_bindings
                     SET notification_mode = 'default',
                         notification_updated_at = clock_timestamp(),
@@ -2010,8 +2331,10 @@ class MessengerV3Store:
                       AND user_uuid = %s AND notification_mode = 'unmute'
                     RETURNING uuid
                     """,
-                    (self.project_uuid, resource_uuid, self.user_uuid),
-                ).fetchall()
+                        (self.project_uuid, resource_uuid, self.user_uuid),
+                    )
+                    .fetchall()
+                )
             row = self.get_resource("streams", resource_uuid)
             self._emit(
                 kind="stream.updated",
@@ -2049,20 +2372,24 @@ class MessengerV3Store:
         }:
             return self._read_action(resource, resource_uuid, action)
         if resource == "messages" and action in {"star", "unstar"}:
-            flag = _session().execute(
-                """
+            flag = (
+                _session()
+                .execute(
+                    """
                 UPDATE workspace_v3.message_flags
                 SET starred = %s, updated_at = clock_timestamp()
                 WHERE project_id = %s AND message_uuid = %s AND user_uuid = %s
                 RETURNING uuid
                 """,
-                (
-                    action == "star",
-                    self.project_uuid,
-                    resource_uuid,
-                    self.user_uuid,
-                ),
-            ).fetchone()
+                    (
+                        action == "star",
+                        self.project_uuid,
+                        resource_uuid,
+                        self.user_uuid,
+                    ),
+                )
+                .fetchone()
+            )
             row = self.get_resource("messages", resource_uuid)
             self._emit(
                 kind="message.updated",
@@ -2102,8 +2429,10 @@ class MessengerV3Store:
                 raise messenger_exceptions.InvalidTopicNotificationModeError(
                     mode=values["notification_mode"]
                 )
-            binding = _session().execute(
-                """
+            binding = (
+                _session()
+                .execute(
+                    """
                 UPDATE workspace_v3.topic_bindings
                 SET notification_mode = %s,
                     notification_updated_at = clock_timestamp(),
@@ -2111,13 +2440,15 @@ class MessengerV3Store:
                 WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
                 RETURNING uuid
                 """,
-                (
-                    values["notification_mode"],
-                    self.project_uuid,
-                    resource_uuid,
-                    self.user_uuid,
-                ),
-            ).fetchone()
+                    (
+                        values["notification_mode"],
+                        self.project_uuid,
+                        resource_uuid,
+                        self.user_uuid,
+                    ),
+                )
+                .fetchone()
+            )
             row = self.get_resource(resource, resource_uuid)
             self._emit(
                 kind="topic.updated",
@@ -2158,19 +2489,56 @@ class MessengerV3Store:
             self._emit_resource(resource, resource_uuid, "updated", recipients)
             return self.get_resource(resource, resource_uuid)
         if resource == "stream_topics" and action == "set_summary_prompt":
-            return self._update_columns(
+            topic = self.get_resource(resource, resource_uuid)
+            self._require_manage_stream(
+                topic["stream_uuid"],
+                summary_prompt=True,
+            )
+            allowed = frozenset(
+                {
+                    "summary_system_prompt",
+                    "summary_reasoning_effort",
+                    "summary_enabled",
+                }
+            )
+            invalid = set(values) - allowed
+            if invalid:
+                raise ra_exceptions.ValidationErrorException()
+            topic_properties = models.WorkspaceStreamTopic.properties.properties
+            if any(
+                not topic_properties[name].get_property_type().validate(value)
+                for name, value in values.items()
+            ):
+                raise ra_exceptions.ValidationErrorException()
+            updated = self._update_columns(
                 "topics",
                 resource,
                 resource_uuid,
                 values,
-                frozenset(
-                    {
-                        "summary_system_prompt",
-                        "summary_reasoning_effort",
-                        "summary_enabled",
-                    }
-                ),
+                allowed,
             )
+            if values.get("summary_enabled") is False:
+                _session().execute(
+                    """
+                    UPDATE m_workspace_llm_endpoints AS endpoint
+                    SET claim_token = NULL,
+                        claim_expires_at = NULL,
+                        updated_at = NOW()
+                    FROM m_workspace_topic_summary_jobs AS job
+                    WHERE job.topic_uuid = %s
+                      AND endpoint.uuid = job.endpoint_uuid
+                      AND endpoint.claim_token = job.endpoint_claim_token
+                    """,
+                    (resource_uuid,),
+                )
+                _session().execute(
+                    """
+                    DELETE FROM m_workspace_topic_summary_jobs
+                    WHERE topic_uuid = %s
+                    """,
+                    (resource_uuid,),
+                )
+            return updated
         if resource == "users" and action == "presence":
             if resource_uuid != self.user_uuid:
                 _not_found(resource, resource_uuid)
@@ -2187,7 +2555,12 @@ class MessengerV3Store:
                 [*updates.values(), resource_uuid],
             )
             row = self.get_resource(resource, resource_uuid)
-            self._emit_resource("users", resource_uuid, "updated", (self.user_uuid,))
+            self._emit_resource(
+                "users",
+                resource_uuid,
+                "updated",
+                self._user_event_recipients(),
+            )
             return row
         if resource == "users" and action in {"avatar_upload", "avatar_reset"}:
             if resource_uuid != self.user_uuid:
@@ -2218,11 +2591,174 @@ class MessengerV3Store:
                 (avatar, resource_uuid),
             )
             if previous_file_uuid is not None:
-                self.delete_resource("files", previous_file_uuid)
+                previous_file = (
+                    _session()
+                    .execute(
+                        """
+                    SELECT project_id FROM workspace_v3.files
+                    WHERE uuid = %s
+                    """,
+                        (previous_file_uuid,),
+                    )
+                    .fetchone()
+                )
+                if (
+                    previous_file is not None
+                    and previous_file["project_id"] == self.project_uuid
+                ):
+                    self.delete_resource("files", previous_file_uuid)
             row = self.get_resource(resource, resource_uuid)
-            self._emit_resource("users", resource_uuid, "updated", (self.user_uuid,))
+            self._emit_resource(
+                "users",
+                resource_uuid,
+                "updated",
+                self._user_event_recipients(),
+            )
             return row
         raise ValueError(f"Unsupported Messenger action {resource}.{action}")
+
+    def set_topic_summary(
+        self,
+        topic_uuid: sys_uuid.UUID,
+        summary: str | None,
+        summary_last_message_uuid: sys_uuid.UUID | None,
+    ) -> dict[str, typing.Any]:
+        if summary is None and summary_last_message_uuid is not None:
+            raise messenger_exceptions.InvalidTopicSummaryStateError()
+        summary_type = models.WorkspaceStreamTopic.properties.properties[
+            "summary"
+        ].get_property_type()
+        if not summary_type.validate(summary):
+            raise ra_exceptions.ValidationErrorException()
+
+        session = _session()
+        topic = session.execute(
+            """
+            SELECT stream_uuid, summary_last_message_uuid
+            FROM workspace_v3.topics
+            WHERE project_id = %s AND uuid = %s
+            FOR UPDATE
+            """,
+            (self.project_uuid, topic_uuid),
+        ).fetchone()
+        if topic is None:
+            _not_found("stream_topics", topic_uuid)
+        self.get_resource("stream_topics", topic_uuid)
+
+        incoming_boundary = None
+        if summary_last_message_uuid is not None:
+            incoming_boundary = session.execute(
+                """
+                SELECT uuid, created_at
+                FROM workspace_v3.messages
+                WHERE project_id = %s AND topic_uuid = %s AND uuid = %s
+                """,
+                (self.project_uuid, topic_uuid, summary_last_message_uuid),
+            ).fetchone()
+            if incoming_boundary is None:
+                raise messenger_exceptions.InvalidTopicSummaryBoundaryError()
+
+        current_boundary = None
+        if topic["summary_last_message_uuid"] is not None:
+            current_boundary = session.execute(
+                """
+                SELECT uuid, created_at
+                FROM workspace_v3.messages
+                WHERE project_id = %s AND topic_uuid = %s AND uuid = %s
+                """,
+                (
+                    self.project_uuid,
+                    topic_uuid,
+                    topic["summary_last_message_uuid"],
+                ),
+            ).fetchone()
+        if summary is not None:
+            if incoming_boundary is None:
+                raise messenger_exceptions.InvalidTopicSummaryBoundaryError()
+            if current_boundary is not None and (
+                incoming_boundary["created_at"],
+                str(incoming_boundary["uuid"]),
+            ) < (
+                current_boundary["created_at"],
+                str(current_boundary["uuid"]),
+            ):
+                raise messenger_exceptions.TopicSummaryConflictError()
+            boundary_created_at = incoming_boundary["created_at"]
+            if boundary_created_at.tzinfo is not None:
+                boundary_created_at = boundary_created_at.astimezone(
+                    datetime.timezone.utc
+                ).replace(tzinfo=None)
+            session.execute(
+                """
+                INSERT INTO m_workspace_topic_summary_journal (
+                    uuid, topic_uuid, project_id, summary,
+                    boundary_message_uuid, boundary_message_created_at,
+                    generated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    sys_uuid.uuid4(),
+                    topic_uuid,
+                    self.project_uuid,
+                    summary,
+                    summary_last_message_uuid,
+                    boundary_created_at,
+                ),
+            )
+        session.execute(
+            """
+            UPDATE workspace_v3.topics
+            SET summary = %s,
+                summary_last_message_uuid = %s,
+                updated_at = clock_timestamp()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                summary,
+                summary_last_message_uuid,
+                self.project_uuid,
+                topic_uuid,
+            ),
+        )
+        session.execute(
+            """
+            UPDATE workspace_v3.topic_bindings AS binding
+            SET summary_has_new_messages = CASE
+                    WHEN %s::uuid IS NULL THEN NULL
+                    ELSE EXISTS (
+                        SELECT 1
+                        FROM workspace_v3.messages AS candidate
+                        JOIN workspace_v3.message_flags AS flag
+                          ON flag.project_id = candidate.project_id
+                         AND flag.message_uuid = candidate.uuid
+                         AND flag.user_uuid = binding.user_uuid
+                        JOIN workspace_v3.messages AS boundary
+                          ON boundary.project_id = candidate.project_id
+                         AND boundary.topic_uuid = candidate.topic_uuid
+                         AND boundary.uuid = %s
+                        WHERE candidate.project_id = binding.project_id
+                          AND candidate.topic_uuid = binding.topic_uuid
+                          AND (candidate.created_at, candidate.uuid) >
+                              (boundary.created_at, boundary.uuid)
+                    )
+                END,
+                updated_at = clock_timestamp()
+            WHERE binding.project_id = %s AND binding.topic_uuid = %s
+            """,
+            (
+                summary_last_message_uuid,
+                summary_last_message_uuid,
+                self.project_uuid,
+                topic_uuid,
+            ),
+        )
+        self._emit_resource(
+            "stream_topics",
+            topic_uuid,
+            "updated",
+            self._stream_recipients(topic["stream_uuid"]),
+        )
+        return self.get_resource("stream_topics", topic_uuid)
 
     def _read_action(
         self,
@@ -2558,12 +3094,12 @@ class MessengerV3Store:
         direction = (order_by or {"epoch_version": "asc"})["epoch_version"].lower()
         if direction not in {"asc", "desc"}:
             raise ra_exceptions.ValidationErrorException()
-        query = f"""
+        query = """
             SELECT event.schema_version, event.uuid, event.epoch_version,
                    event.project_id, %s::uuid AS user_uuid,
                    event.object_type, event.action,
                    event.payload ||
-                       COALESCE(recipient.payload, '{{}}'::jsonb) AS payload,
+                       COALESCE(recipient.payload, '{}'::jsonb) AS payload,
                    event.created_at, event.updated_at
             FROM workspace_v3.events AS event
             JOIN workspace_v3.event_audience_members AS member
@@ -2577,7 +3113,6 @@ class MessengerV3Store:
              AND recipient.consumer_type = %s
              AND recipient.consumer_uuid = %s
             WHERE event.project_id = %s AND event.epoch_version > %s
-            ORDER BY event.epoch_version {direction}
         """
         parameters: list[typing.Any] = [
             consumer_uuid,
@@ -2588,23 +3123,25 @@ class MessengerV3Store:
             self.project_uuid,
             after,
         ]
-        if limit is not None:
-            query += " LIMIT %s"
-            parameters.append(limit)
-        result = [_simple(_row(row)) for row in _session().execute(query, parameters)]
         for item in clauses:
             value = int(_filter_value(item))
             if isinstance(item, dm_filters.GT):
-                result = [row for row in result if row["epoch_version"] > value]
+                operator = ">"
             elif isinstance(item, dm_filters.GE):
-                result = [row for row in result if row["epoch_version"] >= value]
+                operator = ">="
             elif isinstance(item, dm_filters.LT):
-                result = [row for row in result if row["epoch_version"] < value]
+                operator = "<"
             elif isinstance(item, dm_filters.LE):
-                result = [row for row in result if row["epoch_version"] <= value]
+                operator = "<="
             else:
-                result = [row for row in result if row["epoch_version"] == value]
-        return result
+                operator = "="
+            query += f" AND event.epoch_version {operator} %s"
+            parameters.append(value)
+        query += f" ORDER BY event.epoch_version {direction}"
+        if limit is not None:
+            query += " LIMIT %s"
+            parameters.append(limit)
+        return [_simple(_row(row)) for row in _session().execute(query, parameters)]
 
     def current_epoch(self) -> int:
         return int(self._cursor()["current_epoch_version"])

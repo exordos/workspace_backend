@@ -114,6 +114,7 @@ class MessengerWorkerAgent(basic.BasicService):
         summary_endpoint_claim_seconds: int = (
             topic_summary_opts.DEFAULT_ENDPOINT_CLAIM_SECONDS
         ),
+        summary_store_backend: str = "v2",
         **kwargs: typing.Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -158,6 +159,7 @@ class MessengerWorkerAgent(basic.BasicService):
             summary_endpoint_claim_seconds,
             summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS,
         )
+        self._summary_store_backend = summary_store_backend
         self._last_event_prune: float | None = None
         self._capability_refresh_cursor: object | None = None
         self._capability_projection_refresh_cursor: object | None = None
@@ -461,6 +463,7 @@ class MessengerWorkerAgent(basic.BasicService):
                     key_material=self._summary_secret_key,
                     topic_claim_seconds=self._summary_topic_claim_seconds,
                     endpoint_claim_seconds=self._summary_endpoint_claim_seconds,
+                    storage_backend=self._summary_store_backend,
                 )
         except Exception:
             LOG.exception("Failed to claim bounded topic summary work")

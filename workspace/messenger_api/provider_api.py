@@ -279,7 +279,13 @@ class ProviderApiMiddleware(middlewares.Middleware):
                         messages_to_expand.append(operation["entity_uuid"])
                 else:
                     result = store.delete(
-                        operation["resource"], operation["entity_uuid"]
+                        operation["resource"],
+                        operation["entity_uuid"],
+                        emit_event=(
+                            delivery_class == "live"
+                            or operation["resource"]
+                            not in provider_store.HISTORY_RESOURCES
+                        ),
                     )
                 results.append(result)
             except messenger_exceptions.ProviderApiError as error:

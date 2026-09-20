@@ -40,9 +40,7 @@ TABLES = {
 }
 MAX_BATCH_SIZE = 500
 MAX_PAGE_SIZE = 500
-HISTORY_RESOURCES = frozenset(
-    {"messages", "message_flags", "message_reactions"}
-)
+HISTORY_RESOURCES = frozenset({"messages", "message_flags", "message_reactions"})
 ZERO_UUID = sys_uuid.UUID(int=0)
 IMMUTABLE_FIELDS = {
     "stream_bindings": ("stream_uuid", "user_uuid"),
@@ -162,8 +160,8 @@ class ProviderEntityStore:
         self, stream_uuid: sys_uuid.UUID
     ) -> tuple[sys_uuid.UUID, ...]:
         if stream_uuid not in self._stream_recipients_cache:
-            self._stream_recipients_cache[stream_uuid] = (
-                self.events._stream_recipients(stream_uuid)
+            self._stream_recipients_cache[stream_uuid] = self.events._stream_recipients(
+                stream_uuid
             )
         return self._stream_recipients_cache[stream_uuid]
 
@@ -185,7 +183,7 @@ class ProviderEntityStore:
     ) -> None:
         keys = sorted(
             {
-                f"{self.project_uuid}:{RESOURCE_TYPES[resource]}:{entity_uuid}"
+                f"provider-entity:{RESOURCE_TYPES[resource]}:{entity_uuid}"
                 for resource, entity_uuid in entities
             }
         )
@@ -230,7 +228,8 @@ class ProviderEntityStore:
     ) -> dict[str, typing.Any] | None:
         row = self.session.execute(
             """
-            SELECT provider_uuid, content_hash, source_updated_at,
+            SELECT provider_uuid, content_hash, source_content_hash,
+                   source_updated_at,
                    created_at, updated_at
             FROM workspace_v3.provider_entity_states
             WHERE project_id = %s AND entity_type = %s AND entity_uuid = %s
@@ -253,6 +252,35 @@ class ProviderEntityStore:
             parameters = (self.project_uuid, entity_uuid)
         return self.session.execute(query, parameters).fetchone() is not None
 
+    def _entity_project(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+    ) -> sys_uuid.UUID | None:
+        if resource == "users":
+            return None
+        row = self.session.execute(
+            f"SELECT project_id FROM workspace_v3.{TABLES[resource]} WHERE uuid = %s",
+            (entity_uuid,),
+        ).fetchone()
+        if row is None:
+            return None
+        return sys_uuid.UUID(str(row["project_id"]))
+
+    def _ensure_project_identity_available(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+    ) -> None:
+        project_uuid = self._entity_project(resource, entity_uuid)
+        if project_uuid is None or project_uuid == self.project_uuid:
+            return
+        _error(
+            409,
+            "entity_project_conflict",
+            "The entity UUID already belongs to another project",
+        )
+
     def _owned_state(
         self,
         resource: str,
@@ -274,37 +302,138 @@ class ProviderEntityStore:
         resource: str,
         entity_uuid: sys_uuid.UUID,
         state: dict[str, typing.Any] | None,
+        entity_exists: bool,
+        data: dict[str, typing.Any],
     ) -> None:
-        if state is not None or not self._entity_exists(resource, entity_uuid):
+        if not self._incoming_entity_in_provider_scope(resource, data):
+            _error(
+                409,
+                "entity_not_provider_owned",
+                "The entity UUID already belongs to native or unmanaged data",
+            )
+        if state is not None:
             return
-        if resource == "users":
-            row = self.session.execute(
-                "SELECT source FROM workspace_v3.users WHERE uuid = %s",
-                (entity_uuid,),
-            ).fetchone()
-            if row["source"] == self.provider_name:
-                return
+        if entity_exists and self._entity_in_provider_scope(resource, entity_uuid):
+            return
+        if not entity_exists:
+            return
         _error(
             409,
             "entity_not_provider_owned",
             "The entity UUID already belongs to native or unmanaged data",
         )
 
+    def _incoming_entity_in_provider_scope(
+        self,
+        resource: str,
+        data: dict[str, typing.Any],
+    ) -> bool:
+        if resource in {"users", "streams"}:
+            return True
+        if resource in {
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+        }:
+            stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
+        elif resource in {"message_flags", "message_reactions"}:
+            message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
+            row = self.session.execute(
+                """
+                SELECT stream.source_name
+                FROM workspace_v3.messages AS message
+                JOIN workspace_v3.streams AS stream
+                  ON stream.project_id = message.project_id
+                 AND stream.uuid = message.stream_uuid
+                WHERE message.project_id = %s AND message.uuid = %s
+                """,
+                (self.project_uuid, message_uuid),
+            ).fetchone()
+            return row is not None and row["source_name"] == self.provider_name
+        else:
+            return False
+        row = self.session.execute(
+            """
+            SELECT source_name FROM workspace_v3.streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (self.project_uuid, stream_uuid),
+        ).fetchone()
+        return row is not None and row["source_name"] == self.provider_name
+
+    def _entity_in_provider_scope(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+    ) -> bool:
+        """Allow a provider to converge native rows inside its own streams."""
+        if resource == "users":
+            row = self.session.execute(
+                "SELECT 1 FROM workspace_v3.users WHERE uuid = %s AND source = %s",
+                (entity_uuid, self.provider_name),
+            ).fetchone()
+        elif resource == "streams":
+            row = self.session.execute(
+                "SELECT 1 FROM workspace_v3.streams "
+                "WHERE project_id = %s AND uuid = %s AND source_name = %s",
+                (self.project_uuid, entity_uuid, self.provider_name),
+            ).fetchone()
+        elif resource in {
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+        }:
+            row = self.session.execute(
+                f"""
+                SELECT 1
+                FROM workspace_v3.{TABLES[resource]} AS entity
+                JOIN workspace_v3.streams AS stream
+                  ON stream.project_id = entity.project_id
+                 AND stream.uuid = entity.stream_uuid
+                WHERE entity.project_id = %s AND entity.uuid = %s
+                  AND stream.source_name = %s
+                """,
+                (self.project_uuid, entity_uuid, self.provider_name),
+            ).fetchone()
+        elif resource in {"message_flags", "message_reactions"}:
+            row = self.session.execute(
+                f"""
+                SELECT 1
+                FROM workspace_v3.{TABLES[resource]} AS entity
+                JOIN workspace_v3.messages AS message
+                  ON message.project_id = entity.project_id
+                 AND message.uuid = entity.message_uuid
+                JOIN workspace_v3.streams AS stream
+                  ON stream.project_id = message.project_id
+                 AND stream.uuid = message.stream_uuid
+                WHERE entity.project_id = %s AND entity.uuid = %s
+                  AND stream.source_name = %s
+                """,
+                (self.project_uuid, entity_uuid, self.provider_name),
+            ).fetchone()
+        else:
+            return False
+        return row is not None
+
     def _set_state(
         self,
         resource: str,
         entity_uuid: sys_uuid.UUID,
         content_hash: bytes,
+        source_content_hash: bytes,
         source_updated_at: datetime.datetime,
     ) -> dict[str, typing.Any]:
         row = self.session.execute(
             """
             INSERT INTO workspace_v3.provider_entity_states (
                 project_id, provider_uuid, entity_type, entity_uuid,
-                content_hash, source_updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s)
+                content_hash, source_content_hash, source_updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, provider_uuid, entity_type, entity_uuid)
             DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                          source_content_hash = EXCLUDED.source_content_hash,
                           source_updated_at = EXCLUDED.source_updated_at,
                           updated_at = clock_timestamp()
             RETURNING source_updated_at, created_at, updated_at
@@ -315,6 +444,7 @@ class ProviderEntityStore:
                 RESOURCE_TYPES[resource],
                 entity_uuid,
                 content_hash,
+                source_content_hash,
                 source_updated_at,
             ),
         ).fetchone()
@@ -332,19 +462,98 @@ class ProviderEntityStore:
         emit_event: bool = True,
         expand_message_flags: bool = True,
     ) -> dict[str, typing.Any]:
+        source_timestamp_provided = source_updated_at is not None
         source_updated_at = source_updated_at or datetime.datetime.now(
             datetime.timezone.utc
         )
+        self._ensure_project_identity_available(resource, entity_uuid)
         state = self._owned_state(resource, entity_uuid)
-        if state is not None and bytes(state["content_hash"]) == content_hash:
-            return self._result(resource, entity_uuid, "unchanged", state)
-        self._ensure_create_available(resource, entity_uuid, state)
+        if state is not None:
+            current_source_updated_at = state["source_updated_at"]
+            same_content = bytes(state["source_content_hash"]) == content_hash
+            if not source_timestamp_provided and same_content:
+                return self._result(resource, entity_uuid, "unchanged", state)
+            if (
+                source_timestamp_provided
+                and source_updated_at < current_source_updated_at
+            ):
+                return self._result(resource, entity_uuid, "unchanged", state)
+            if (
+                source_timestamp_provided
+                and source_updated_at == current_source_updated_at
+            ):
+                if same_content:
+                    return self._result(resource, entity_uuid, "unchanged", state)
+                _error(
+                    409,
+                    "entity_version_conflict",
+                    "The entity version has conflicting content",
+                )
+            if same_content:
+                new_state = self._set_state(
+                    resource,
+                    entity_uuid,
+                    bytes(state["content_hash"]),
+                    content_hash,
+                    source_updated_at,
+                )
+                return self._result(resource, entity_uuid, "unchanged", new_state)
+        entity_exists = self._entity_exists(resource, entity_uuid)
+        self._ensure_create_available(
+            resource,
+            entity_uuid,
+            state,
+            entity_exists,
+            data,
+        )
+        previous_user_uuid: sys_uuid.UUID | None = None
+        previous_message_flag_event: dict[str, typing.Any] | None = None
+        previous_topic_event: dict[str, typing.Any] | None = None
+        previous_message_event: dict[str, typing.Any] | None = None
+        if emit_event and resource == "topics" and entity_exists:
+            previous_topic_event = dict(
+                self.session.execute(
+                    """
+                    SELECT stream_uuid
+                    FROM workspace_v3.topics
+                    WHERE project_id = %s AND uuid = %s
+                    """,
+                    (self.project_uuid, entity_uuid),
+                ).fetchone()
+            )
+            previous_topic_event["recipients"] = self._stream_recipients(
+                previous_topic_event["stream_uuid"]
+            )
+        if emit_event and resource == "messages" and entity_exists:
+            previous_message_event = dict(
+                self.session.execute(
+                    """
+                    SELECT stream_uuid, topic_uuid, author_uuid, source_name
+                    FROM workspace_v3.messages
+                    WHERE project_id = %s AND uuid = %s
+                    """,
+                    (self.project_uuid, entity_uuid),
+                ).fetchone()
+            )
+            previous_message_event["recipients"] = self._stream_recipients(
+                previous_message_event["stream_uuid"]
+            )
         if state is not None:
             if rebind_identity:
-                self._prepare_identity_rebind(resource, entity_uuid, data)
+                if resource == "message_flags":
+                    previous_message_flag_event = self._capture_delete_event(
+                        resource, entity_uuid
+                    )
+                previous_user_uuid = self._prepare_identity_rebind(
+                    resource, entity_uuid, data
+                )
             else:
                 self._ensure_identity_unchanged(resource, entity_uuid, data)
-        status = "created" if state is None else "updated"
+        status = (
+            "created"
+            if state is None and (resource == "users" or not entity_exists)
+            else "updated"
+        )
         with event_origin.use("provider", self.provider_uuid):
             if resource == "messages":
                 self._upsert_messages(
@@ -354,14 +563,97 @@ class ProviderEntityStore:
                 )
             else:
                 getattr(self, f"_upsert_{resource}")(entity_uuid, data)
+            if resource == "message_reactions" and not emit_event:
+                self._suppress_reaction_projection_events(entity_uuid)
+            canonical_data = self.provider_data_for_entity(resource, entity_uuid)
+            if canonical_data is None:
+                raise RuntimeError("provider upsert did not materialize its entity")
             new_state = self._set_state(
                 resource,
                 entity_uuid,
+                canonical_hash(canonical_data),
                 content_hash,
                 source_updated_at,
             )
             if emit_event:
-                self._emit_upsert(resource, entity_uuid, status, data)
+                self._emit_upsert(
+                    resource,
+                    entity_uuid,
+                    status,
+                    data,
+                    previous_user_uuid=previous_user_uuid,
+                )
+                if previous_message_flag_event is not None and (
+                    previous_message_flag_event["message_uuid"],
+                    previous_message_flag_event["recipients"],
+                ) != (
+                    parse_uuid(data["message_uuid"], "message_uuid"),
+                    (parse_uuid(data["user_uuid"], "user_uuid"),),
+                ):
+                    self._emit_delete(
+                        "message_flags",
+                        entity_uuid,
+                        previous_message_flag_event,
+                    )
+                if previous_topic_event is not None and previous_topic_event[
+                    "stream_uuid"
+                ] != parse_uuid(data["stream_uuid"], "stream_uuid"):
+                    current_recipients = set(
+                        self._stream_recipients(
+                            parse_uuid(data["stream_uuid"], "stream_uuid")
+                        )
+                    )
+                    previous_recipients = (
+                        recipient
+                        for recipient in previous_topic_event["recipients"]
+                        if recipient not in current_recipients
+                    )
+                    payload = {
+                        "uuid": str(entity_uuid),
+                        "stream_uuid": previous_topic_event["stream_uuid"],
+                    }
+                    self.events._emit(
+                        kind="topic.deleted",
+                        object_type="topic",
+                        action="deleted",
+                        entity_uuid=entity_uuid,
+                        payloads={
+                            recipient: payload for recipient in previous_recipients
+                        },
+                    )
+                if previous_message_event is not None and previous_message_event[
+                    "stream_uuid"
+                ] != parse_uuid(data["stream_uuid"], "stream_uuid"):
+                    current_recipients = set(
+                        self._stream_recipients(
+                            parse_uuid(data["stream_uuid"], "stream_uuid")
+                        )
+                    )
+                    previous_message_event["recipients"] = tuple(
+                        recipient
+                        for recipient in previous_message_event["recipients"]
+                        if recipient not in current_recipients
+                    )
+                    payload = {
+                        "uuid": str(entity_uuid),
+                        "stream_uuid": previous_message_event["stream_uuid"],
+                        "topic_uuid": previous_message_event["topic_uuid"],
+                        "author_uuid": previous_message_event["author_uuid"],
+                        "source_name": previous_message_event["source_name"],
+                        "source": v3_store.source_projection(
+                            previous_message_event["source_name"]
+                        ),
+                    }
+                    self.events._emit(
+                        kind="message.deleted",
+                        object_type="message",
+                        action="deleted",
+                        entity_uuid=entity_uuid,
+                        payloads={
+                            recipient: payload
+                            for recipient in previous_message_event["recipients"]
+                        },
+                    )
         return self._result(resource, entity_uuid, status, new_state)
 
     def _prepare_identity_rebind(
@@ -369,13 +661,12 @@ class ProviderEntityStore:
         resource: str,
         entity_uuid: sys_uuid.UUID,
         data: dict[str, typing.Any],
-    ) -> None:
+    ) -> sys_uuid.UUID | None:
         """Make an explicit provider-owned identity migration conflict-safe."""
         if resource == "stream_bindings":
-            self._prepare_stream_binding_identity_rebind(entity_uuid, data)
-            return
+            return self._prepare_stream_binding_identity_rebind(entity_uuid, data)
         if resource != "message_flags":
-            return
+            return None
         message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
         user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
         conflict = self.session.execute(
@@ -425,12 +716,13 @@ class ProviderEntityStore:
                 entity_uuid,
             ),
         )
+        return None
 
     def _prepare_stream_binding_identity_rebind(
         self,
         entity_uuid: sys_uuid.UUID,
         data: dict[str, typing.Any],
-    ) -> None:
+    ) -> sys_uuid.UUID | None:
         """Move a provider binding and its dependent rows to another user."""
         current = self.session.execute(
             """
@@ -440,10 +732,10 @@ class ProviderEntityStore:
             (self.project_uuid, entity_uuid),
         ).fetchone()
         if current is None:
-            return
+            return None
         target_user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
         if current["user_uuid"] == target_user_uuid:
-            return
+            return None
         stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
         conflict = self.session.execute(
             """
@@ -500,26 +792,58 @@ class ProviderEntityStore:
                 "The target user already has data for this stream",
             )
 
-        temporary_uuid = sys_uuid.uuid4()
+        dependent_states = self.session.execute(
+            """
+            SELECT 'topic_bindings' AS resource, state.entity_uuid,
+                   state.source_content_hash, state.source_updated_at
+            FROM workspace_v3.provider_entity_states AS state
+            JOIN workspace_v3.topic_bindings AS binding
+              ON binding.project_id = state.project_id
+             AND binding.uuid = state.entity_uuid
+            WHERE state.project_id = %s AND state.provider_uuid = %s
+              AND state.entity_type = 'topic_binding'
+              AND binding.stream_uuid = %s AND binding.user_uuid = %s
+            UNION ALL
+            SELECT 'message_flags' AS resource, state.entity_uuid,
+                   state.source_content_hash, state.source_updated_at
+            FROM workspace_v3.provider_entity_states AS state
+            JOIN workspace_v3.message_flags AS flag
+              ON flag.project_id = state.project_id
+             AND flag.uuid = state.entity_uuid
+            WHERE state.project_id = %s AND state.provider_uuid = %s
+              AND state.entity_type = 'message_flag'
+              AND flag.stream_uuid = %s AND flag.user_uuid = %s
+            """,
+            (
+                self.project_uuid,
+                self.provider_uuid,
+                stream_uuid,
+                current["user_uuid"],
+                self.project_uuid,
+                self.provider_uuid,
+                stream_uuid,
+                current["user_uuid"],
+            ),
+        ).fetchall()
+
         self.session.execute(
             """
-            INSERT INTO workspace_v3.stream_bindings (
-                uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
-                notification_mode, notification_updated_at, unread_count,
-                active_unread_count, passive_unread_count, last_message_uuid,
-                created_at, updated_at
-            )
-            SELECT %s, project_id, stream_uuid, %s, %s, role,
-                   notification_mode, notification_updated_at, unread_count,
-                   active_unread_count, passive_unread_count, last_message_uuid,
-                   created_at, updated_at
-            FROM workspace_v3.stream_bindings
+            SET CONSTRAINTS
+                workspace_v3.topic_bindings_stream_binding_fkey,
+                workspace_v3.message_flags_stream_binding_fkey,
+                workspace_v3.drafts_stream_binding_fkey,
+                workspace_v3.folder_items_stream_binding_fkey
+            DEFERRED
+            """
+        )
+        self.session.execute(
+            """
+            UPDATE workspace_v3.stream_bindings
+            SET user_uuid = %s
             WHERE project_id = %s AND uuid = %s
             """,
             (
-                temporary_uuid,
                 target_user_uuid,
-                parse_uuid(data.get("who_uuid", target_user_uuid), "who_uuid"),
                 self.project_uuid,
                 entity_uuid,
             ),
@@ -555,41 +879,56 @@ class ProviderEntityStore:
             """,
             (self.project_uuid, stream_uuid, current["user_uuid"]),
         )
-        self.session.execute(
-            """
-            DELETE FROM workspace_v3.stream_bindings
-            WHERE project_id = %s AND uuid = %s
-            """,
-            (self.project_uuid, entity_uuid),
-        )
-        self.session.execute(
-            """
-            UPDATE workspace_v3.stream_bindings SET uuid = %s
-            WHERE project_id = %s AND uuid = %s
-            """,
-            (entity_uuid, self.project_uuid, temporary_uuid),
-        )
+        for dependent_state in dependent_states:
+            resource = dependent_state["resource"]
+            dependent_uuid = sys_uuid.UUID(str(dependent_state["entity_uuid"]))
+            dependent_data = self.provider_data_for_entity(resource, dependent_uuid)
+            if dependent_data is not None:
+                self._set_state(
+                    resource,
+                    dependent_uuid,
+                    canonical_hash(dependent_data),
+                    bytes(dependent_state["source_content_hash"]),
+                    dependent_state["source_updated_at"],
+                )
+        return sys_uuid.UUID(str(current["user_uuid"]))
 
     def delete(
         self,
         resource: str,
         entity_uuid: sys_uuid.UUID,
+        *,
+        emit_event: bool = True,
     ) -> dict[str, typing.Any]:
         state = self._owned_state(resource, entity_uuid)
         if state is None:
-            return {
-                "type": resource,
-                "uuid": entity_uuid,
-                "status": "not_found",
-                "source_updated_at": None,
-                "updated_at": None,
-            }
+            data = self.provider_data_for_entity(resource, entity_uuid)
+            if data is None or not self._entity_in_provider_scope(
+                resource, entity_uuid
+            ):
+                return {
+                    "type": resource,
+                    "uuid": entity_uuid,
+                    "status": "not_found",
+                    "source_updated_at": None,
+                    "updated_at": None,
+                }
+            state = self._set_state(
+                resource,
+                entity_uuid,
+                canonical_hash(data),
+                canonical_hash(data),
+                datetime.datetime.now(datetime.timezone.utc),
+            )
         with event_origin.use("provider", self.provider_uuid):
             event = self._capture_delete_event(resource, entity_uuid)
             getattr(self, f"_delete_{resource}")(entity_uuid)
+            if resource == "message_reactions" and not emit_event:
+                self._suppress_reaction_projection_events(entity_uuid)
             if resource == "stream_bindings":
                 self._invalidate_stream_recipients(event["stream_uuid"])
-            self._emit_delete(resource, entity_uuid, event)
+            if emit_event:
+                self._emit_delete(resource, entity_uuid, event)
         return {
             "type": resource,
             "uuid": entity_uuid,
@@ -660,28 +999,29 @@ class ProviderEntityStore:
     ) -> dict[str, typing.Any]:
         """Return a stable UUID-keyset page with hashes of the current rows."""
         table = TABLES[resource]
-        project_join = (
-            "" if resource == "users" else "AND entity.project_id = state.project_id"
-        )
+        scope = self._snapshot_scope(resource)
         rows = self.session.execute(
             f"""
             SELECT entity.*, state.content_hash AS provider_content_hash,
                    state.source_updated_at AS provider_source_updated_at
-            FROM workspace_v3.provider_entity_states AS state
-            JOIN workspace_v3.{table} AS entity
-              ON entity.uuid = state.entity_uuid {project_join}
-            WHERE state.project_id = %s AND state.provider_uuid = %s
-              AND state.entity_type = %s AND state.entity_uuid > %s
-            ORDER BY state.entity_uuid
-            LIMIT %s
+            FROM workspace_v3.{table} AS entity
+            LEFT JOIN workspace_v3.provider_entity_states AS state
+              ON state.project_id = %(project)s
+             AND state.provider_uuid = %(provider)s
+             AND state.entity_type = %(entity_type)s
+             AND state.entity_uuid = entity.uuid
+            WHERE {scope} AND entity.uuid > %(after_uuid)s
+            ORDER BY entity.uuid
+            LIMIT %(limit)s
             """,
-            (
-                self.project_uuid,
-                self.provider_uuid,
-                RESOURCE_TYPES[resource],
-                after_uuid,
-                limit + 1,
-            ),
+            {
+                "project": self.project_uuid,
+                "provider": self.provider_uuid,
+                "provider_name": self.provider_name,
+                "entity_type": RESOURCE_TYPES[resource],
+                "after_uuid": after_uuid,
+                "limit": limit + 1,
+            },
         ).fetchall()
         has_more = len(rows) > limit
         items = []
@@ -703,12 +1043,19 @@ class ProviderEntityStore:
                     "uuid": row["uuid"],
                     "content_hash": content_hash.hex(),
                     "source_updated_at": source_updated_at,
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
                     "data": data,
                 }
             )
         next_cursor = None
         if has_more:
-            next_cursor = {"after_uuid": items[-1]["uuid"]}
+            next_cursor = {
+                "snapshot_after_uuid": items[-1]["uuid"],
+                # Keep the old alias until existing bridge clients have moved
+                # to the directly reusable snapshot cursor.
+                "after_uuid": items[-1]["uuid"],
+            }
         return {"items": items, "next_cursor": next_cursor}
 
     def _ensure_identity_unchanged(
@@ -781,6 +1128,27 @@ class ProviderEntityStore:
         if row is None:
             return None
         return jsonable(self._provider_data(resource, dict(row)))
+
+    def refresh_owned_state(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+    ) -> dict[str, typing.Any] | None:
+        """Refresh the provider cursor after a Workspace-originated mutation."""
+        data = self.provider_data_for_entity(resource, entity_uuid)
+        state = self._owned_state(resource, entity_uuid)
+        if data is None or state is None:
+            return data
+        content_hash = canonical_hash(data)
+        if bytes(state["content_hash"]) != content_hash:
+            self._set_state(
+                resource,
+                entity_uuid,
+                content_hash,
+                bytes(state["source_content_hash"]),
+                state["source_updated_at"],
+            )
+        return data
 
     def _entity_result(
         self,
@@ -966,34 +1334,62 @@ class ProviderEntityStore:
             + "\n"
         ).encode("utf-8")
 
-    def _snapshot_rows(self, resource: str) -> typing.Iterable[dict[str, typing.Any]]:
-        table = TABLES[resource]
-        scope = {
+    @staticmethod
+    def _snapshot_scope(resource: str) -> str:
+        return {
             "users": """
                 entity.uuid IN (
-                    SELECT stream.owner_uuid
-                    FROM workspace_v3.streams AS stream
-                    WHERE stream.project_id = %(project)s
-                      AND stream.source_name = %(provider_name)s
+                    WITH provider_streams AS (
+                        SELECT stream.uuid, stream.owner_uuid,
+                               stream.direct_user_uuid
+                        FROM workspace_v3.streams AS stream
+                        WHERE stream.project_id = %(project)s
+                          AND stream.source_name = %(provider_name)s
+                    ),
+                    provider_messages AS (
+                        SELECT message.uuid, message.author_uuid
+                        FROM workspace_v3.messages AS message
+                        JOIN provider_streams AS stream
+                          ON stream.uuid = message.stream_uuid
+                        WHERE message.project_id = %(project)s
+                    )
+                    SELECT provider_state.entity_uuid
+                    FROM workspace_v3.provider_entity_states AS provider_state
+                    WHERE provider_state.project_id = %(project)s
+                      AND provider_state.provider_uuid = %(provider)s
+                      AND provider_state.entity_type = 'user'
+                    UNION SELECT stream.owner_uuid
+                    FROM provider_streams AS stream
                     UNION SELECT stream.direct_user_uuid
-                    FROM workspace_v3.streams AS stream
-                    WHERE stream.project_id = %(project)s
-                      AND stream.source_name = %(provider_name)s
-                      AND stream.direct_user_uuid IS NOT NULL
+                    FROM provider_streams AS stream
+                    WHERE stream.direct_user_uuid IS NOT NULL
                     UNION SELECT binding.user_uuid
                     FROM workspace_v3.stream_bindings AS binding
-                    JOIN workspace_v3.streams AS stream
-                      ON stream.project_id = binding.project_id
-                     AND stream.uuid = binding.stream_uuid
+                    JOIN provider_streams AS stream
+                      ON stream.uuid = binding.stream_uuid
                     WHERE binding.project_id = %(project)s
-                      AND stream.source_name = %(provider_name)s
+                    UNION SELECT binding.who_uuid
+                    FROM workspace_v3.stream_bindings AS binding
+                    JOIN provider_streams AS stream
+                      ON stream.uuid = binding.stream_uuid
+                    WHERE binding.project_id = %(project)s
+                    UNION SELECT binding.user_uuid
+                    FROM workspace_v3.topic_bindings AS binding
+                    JOIN provider_streams AS stream
+                      ON stream.uuid = binding.stream_uuid
+                    WHERE binding.project_id = %(project)s
                     UNION SELECT message.author_uuid
-                    FROM workspace_v3.messages AS message
-                    JOIN workspace_v3.streams AS stream
-                      ON stream.project_id = message.project_id
-                     AND stream.uuid = message.stream_uuid
-                    WHERE message.project_id = %(project)s
-                      AND stream.source_name = %(provider_name)s
+                    FROM provider_messages AS message
+                    UNION SELECT flag.user_uuid
+                    FROM workspace_v3.message_flags AS flag
+                    JOIN provider_messages AS message
+                      ON message.uuid = flag.message_uuid
+                    WHERE flag.project_id = %(project)s
+                    UNION SELECT reaction.user_uuid
+                    FROM workspace_v3.message_reactions AS reaction
+                    JOIN provider_messages AS message
+                      ON message.uuid = reaction.message_uuid
+                    WHERE reaction.project_id = %(project)s
                 )
             """,
             "streams": """
@@ -1055,6 +1451,10 @@ class ProviderEntityStore:
                 )
             """,
         }[resource]
+
+    def _snapshot_rows(self, resource: str) -> typing.Iterable[dict[str, typing.Any]]:
+        table = TABLES[resource]
+        scope = self._snapshot_scope(resource)
         rows = self.session.execute(
             f"""
             SELECT entity.*,
@@ -1211,32 +1611,48 @@ class ProviderEntityStore:
         self, entity_uuid: sys_uuid.UUID, data: dict[str, typing.Any]
     ) -> None:
         user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
-        self.session.execute(
+        updated = self.session.execute(
             """
-            INSERT INTO workspace_v3.stream_bindings (
-                uuid, project_id, stream_uuid, user_uuid, who_uuid,
-                role, notification_mode, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp())
-            ON CONFLICT (uuid) DO UPDATE SET
-                stream_uuid = EXCLUDED.stream_uuid,
-                user_uuid = EXCLUDED.user_uuid,
-                who_uuid = EXCLUDED.who_uuid,
-                role = EXCLUDED.role,
-                notification_mode = EXCLUDED.notification_mode,
+            UPDATE workspace_v3.stream_bindings
+            SET stream_uuid = %s,
+                user_uuid = %s,
+                who_uuid = %s,
+                role = %s,
+                notification_mode = %s,
                 notification_updated_at = clock_timestamp(),
                 updated_at = clock_timestamp()
+            WHERE project_id = %s AND uuid = %s
+            RETURNING uuid
             """,
             (
-                entity_uuid,
-                self.project_uuid,
                 data["stream_uuid"],
                 user_uuid,
                 data.get("who_uuid", user_uuid),
                 data.get("role", "member"),
                 data.get("notification_mode", "all_messages"),
-                self._created_at(data),
+                self.project_uuid,
+                entity_uuid,
             ),
-        )
+        ).fetchone()
+        if updated is None:
+            self.session.execute(
+                """
+                INSERT INTO workspace_v3.stream_bindings (
+                    uuid, project_id, stream_uuid, user_uuid, who_uuid,
+                    role, notification_mode, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp())
+                """,
+                (
+                    entity_uuid,
+                    self.project_uuid,
+                    data["stream_uuid"],
+                    user_uuid,
+                    data.get("who_uuid", user_uuid),
+                    data.get("role", "member"),
+                    data.get("notification_mode", "all_messages"),
+                    self._created_at(data),
+                ),
+            )
 
     def _upsert_topics(
         self, entity_uuid: sys_uuid.UUID, data: dict[str, typing.Any]
@@ -1314,7 +1730,10 @@ class ProviderEntityStore:
                 topic_uuid = EXCLUDED.topic_uuid,
                 author_uuid = EXCLUDED.author_uuid,
                 payload = EXCLUDED.payload,
-                created_at = EXCLUDED.created_at,
+                created_at = CASE
+                    WHEN %s THEN EXCLUDED.created_at
+                    ELSE messages.created_at
+                END,
                 updated_at = clock_timestamp()
             """,
             (
@@ -1326,6 +1745,7 @@ class ProviderEntityStore:
                 json.dumps(data["payload"]),
                 self.provider_name,
                 self._created_at(data),
+                "created_at" in data,
             ),
         )
         if expand_flags:
@@ -1423,7 +1843,73 @@ class ProviderEntityStore:
             ),
         )
 
+    def _suppress_reaction_projection_events(
+        self,
+        reaction_uuid: sys_uuid.UUID,
+    ) -> None:
+        self.session.execute(
+            """
+            UPDATE workspace_v3.projection_tasks AS task
+            SET payload = task.payload || '{"emit_events": false}'::jsonb,
+                updated_at = clock_timestamp()
+            WHERE task.project_id = %s
+              AND task.task_type = 'reaction_snapshot'
+              AND task.status = 'pending'
+              AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(
+                      COALESCE(task.payload -> 'operations', '[]'::jsonb)
+                  ) AS operation
+                  WHERE operation ->> 'reaction_uuid' = %s
+              )
+            """,
+            (self.project_uuid, str(reaction_uuid)),
+        )
+
     def _delete_users(self, entity_uuid: sys_uuid.UUID) -> None:
+        local_references = self.session.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM workspace_v3.messages
+                    WHERE project_id = %(project)s AND author_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.stream_bindings
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.stream_bindings
+                    WHERE project_id = %(project)s AND who_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.streams
+                    WHERE project_id = %(project)s
+                      AND (owner_uuid = %(user)s OR direct_user_uuid = %(user)s)
+                UNION ALL
+                SELECT 1 FROM workspace_v3.topic_bindings
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.message_flags
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.message_reactions
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.drafts
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.files
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+                UNION ALL
+                SELECT 1 FROM workspace_v3.folders
+                    WHERE project_id = %(project)s AND user_uuid = %(user)s
+            ) AS referenced
+            """,
+            {"project": self.project_uuid, "user": entity_uuid},
+        ).fetchone()
+        if local_references["referenced"]:
+            _error(
+                409,
+                "provider_user_is_referenced",
+                "Disable a referenced provider user instead of deleting it",
+            )
         shared = self.session.execute(
             """
             SELECT 1
@@ -1530,6 +2016,8 @@ class ProviderEntityStore:
         entity_uuid: sys_uuid.UUID,
         status: str,
         data: dict[str, typing.Any],
+        *,
+        previous_user_uuid: sys_uuid.UUID | None = None,
     ) -> None:
         action = "created" if status == "created" else "updated"
         if resource == "users":
@@ -1581,6 +2069,14 @@ class ProviderEntityStore:
                 self.events._emit_resource(
                     "streams", stream_uuid, "created", (user_uuid,)
                 )
+                if previous_user_uuid is not None:
+                    self.events._emit(
+                        kind="stream.deleted",
+                        object_type="stream",
+                        action="deleted",
+                        entity_uuid=stream_uuid,
+                        payloads={previous_user_uuid: {"uuid": str(stream_uuid)}},
+                    )
             return
         if resource == "topics":
             stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
@@ -1623,18 +2119,9 @@ class ProviderEntityStore:
             )
             return
         if resource == "message_reactions":
-            message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
-            row = self.session.execute(
-                """
-                SELECT stream_uuid FROM workspace_v3.messages
-                WHERE project_id = %s AND uuid = %s
-                """,
-                (self.project_uuid, message_uuid),
-            ).fetchone()
-            recipients = self._stream_recipients(row["stream_uuid"])
-            self.events._emit_resource(
-                "message_reactions", entity_uuid, action, recipients
-            )
+            # The database trigger has queued a reaction projection. That
+            # projection rebuilds the aggregate and emits one complete event.
+            return
 
     def _capture_delete_event(
         self,
@@ -1657,6 +2144,14 @@ class ProviderEntityStore:
         elif resource == "topics":
             result["recipients"] = self._stream_recipients(row["stream_uuid"])
             result["stream_uuid"] = row["stream_uuid"]
+            result["was_default"] = self.session.execute(
+                """
+                SELECT default_topic_uuid = %s AS was_default
+                FROM workspace_v3.streams
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (entity_uuid, self.project_uuid, row["stream_uuid"]),
+            ).fetchone()["was_default"]
         elif resource == "topic_bindings":
             result["recipients"] = (sys_uuid.UUID(str(row["user_uuid"])),)
             result["stream_uuid"] = row["stream_uuid"]
@@ -1690,7 +2185,7 @@ class ProviderEntityStore:
         event: dict[str, typing.Any],
     ) -> None:
         recipients = event["recipients"]
-        if not recipients:
+        if not recipients and resource != "message_reactions":
             return
         payload: dict[str, typing.Any] = {"uuid": str(entity_uuid)}
         object_type = RESOURCE_TYPES[resource]
@@ -1731,6 +2226,10 @@ class ProviderEntityStore:
                 "uuid": str(event["message_uuid"]),
                 "stream_uuid": event["stream_uuid"],
             }
+        elif resource == "message_reactions":
+            # The projection emits the complete user-facing deletion after it
+            # rebuilds the message reaction aggregate.
+            recipients = ()
         provider_consumers: tuple[sys_uuid.UUID, ...] = ()
         if "stream_uuid" in event:
             provider_consumers = self._stream_providers(event["stream_uuid"])
@@ -1743,6 +2242,21 @@ class ProviderEntityStore:
             provider_consumers=provider_consumers,
             provider_payload=jsonable(event["data"]),
         )
+        if resource == "stream_bindings":
+            self.events._emit(
+                kind="stream.deleted",
+                object_type="stream",
+                action="deleted",
+                entity_uuid=event["stream_uuid"],
+                payloads={event["user_uuid"]: {"uuid": str(event["stream_uuid"])}},
+            )
+        elif resource == "topics" and event["was_default"]:
+            self.events._emit_resource(
+                "streams",
+                event["stream_uuid"],
+                "updated",
+                recipients,
+            )
 
 
 def translate_database_error(error: Exception) -> typing.NoReturn:

@@ -186,6 +186,28 @@ def _unique_scopes(
     return sorted(values, key=lambda value: tuple(str(item) for item in value))
 
 
+def _lock_active_task_leases(
+    session: typing.Any,
+    worker_id: str,
+    tasks: list[dict[str, typing.Any]],
+) -> frozenset[sys_uuid.UUID]:
+    """Fence projection writes with the leases currently owned by this worker."""
+    rows = session.execute(
+        """
+        SELECT uuid
+        FROM workspace_v3.projection_tasks
+        WHERE uuid = ANY(%s::uuid[])
+          AND status = 'running'
+          AND lease_owner = %s
+          AND lease_expires_at > clock_timestamp()
+        ORDER BY uuid
+        FOR UPDATE
+        """,
+        ([task["uuid"] for task in tasks], worker_id),
+    ).fetchall()
+    return frozenset(_uuid(_mapping(row, ("uuid",))["uuid"]) for row in rows)
+
+
 def _update_reaction_snapshots(
     session: typing.Any,
     scopes: list[tuple[sys_uuid.UUID, sys_uuid.UUID, sys_uuid.UUID | None]],
@@ -417,18 +439,18 @@ def _update_topic_counters(
                            ELSE false
                        END
                    )::integer AS active_unread_count,
-                   (
-                       SELECT candidate.uuid
-                       FROM workspace_v3.messages AS candidate
-                       JOIN workspace_v3.message_flags AS candidate_flag
-                         ON candidate_flag.project_id = candidate.project_id
-                        AND candidate_flag.message_uuid = candidate.uuid
-                        AND candidate_flag.user_uuid = target.user_uuid
-                       WHERE candidate.project_id = target.project_id
-                         AND candidate.topic_uuid = target.topic_uuid
-                       ORDER BY candidate.created_at DESC, candidate.uuid DESC
-                       LIMIT 1
-                   ) AS last_message_uuid
+                   latest_message.uuid AS last_message_uuid,
+                   CASE
+                       WHEN topic.summary_last_message_uuid IS NULL THEN NULL
+                       WHEN latest_message.uuid IS NULL THEN false
+                       ELSE (
+                           latest_message.created_at,
+                           latest_message.uuid
+                       ) > (
+                           summary_boundary.created_at,
+                           summary_boundary.uuid
+                       )
+                   END AS summary_has_new_messages
             FROM targets AS target
             JOIN workspace_v3.topic_bindings AS topic_binding
               ON topic_binding.project_id = target.project_id
@@ -437,6 +459,10 @@ def _update_topic_counters(
             JOIN workspace_v3.topics AS topic
               ON topic.project_id = target.project_id
              AND topic.uuid = target.topic_uuid
+            LEFT JOIN workspace_v3.messages AS summary_boundary
+              ON summary_boundary.project_id = topic.project_id
+             AND summary_boundary.topic_uuid = topic.uuid
+             AND summary_boundary.uuid = topic.summary_last_message_uuid
             JOIN workspace_v3.stream_bindings AS stream_binding
               ON stream_binding.project_id = topic.project_id
              AND stream_binding.stream_uuid = topic.stream_uuid
@@ -450,7 +476,22 @@ def _update_topic_counters(
               ON message.project_id = flag.project_id
              AND message.uuid = flag.message_uuid
              AND message.topic_uuid = target.topic_uuid
-            GROUP BY target.project_id, target.topic_uuid, target.user_uuid
+            LEFT JOIN LATERAL (
+                SELECT candidate.uuid, candidate.created_at
+                FROM workspace_v3.messages AS candidate
+                JOIN workspace_v3.message_flags AS candidate_flag
+                  ON candidate_flag.project_id = candidate.project_id
+                 AND candidate_flag.message_uuid = candidate.uuid
+                 AND candidate_flag.user_uuid = target.user_uuid
+                WHERE candidate.project_id = target.project_id
+                  AND candidate.topic_uuid = target.topic_uuid
+                ORDER BY candidate.created_at DESC, candidate.uuid DESC
+                LIMIT 1
+            ) AS latest_message ON TRUE
+            GROUP BY target.project_id, target.topic_uuid, target.user_uuid,
+                     topic.summary_last_message_uuid,
+                     summary_boundary.created_at, summary_boundary.uuid,
+                     latest_message.created_at, latest_message.uuid
         )
         UPDATE workspace_v3.topic_bindings AS binding
         SET unread_count = snapshot.unread_count,
@@ -458,6 +499,7 @@ def _update_topic_counters(
             passive_unread_count =
                 snapshot.unread_count - snapshot.active_unread_count,
             last_message_uuid = snapshot.last_message_uuid,
+            summary_has_new_messages = snapshot.summary_has_new_messages,
             updated_at = clock_timestamp()
         FROM snapshots AS snapshot
         WHERE binding.project_id = snapshot.project_id
@@ -467,12 +509,14 @@ def _update_topic_counters(
                 binding.unread_count,
                 binding.active_unread_count,
                 binding.passive_unread_count,
-                binding.last_message_uuid
+                binding.last_message_uuid,
+                binding.summary_has_new_messages
               ) IS DISTINCT FROM (
                 snapshot.unread_count,
                 snapshot.active_unread_count,
                 snapshot.unread_count - snapshot.active_unread_count,
-                snapshot.last_message_uuid
+                snapshot.last_message_uuid,
+                snapshot.summary_has_new_messages
               )
         RETURNING binding.project_id, binding.uuid, binding.topic_uuid,
                   binding.user_uuid, binding.notification_mode,
@@ -1095,6 +1139,12 @@ def _resource_event_specification(
     )
     if not payloads:
         return None
+    visible_recipients = frozenset(payloads)
+    consumers = tuple(
+        (consumer_type, consumer_uuid)
+        for consumer_type, consumer_uuid in consumers
+        if consumer_type != "user" or consumer_uuid in visible_recipients
+    )
     common_payload, recipient_payloads = v3_store.partition_event_payloads(
         object_type,
         payloads,
@@ -1452,8 +1502,16 @@ def _projection_events(
     message_by_key.update(
         {(_uuid(row["project_id"]), _uuid(row["uuid"])): row for row in messages}
     )
+    eventful_reaction_scopes = {
+        (_uuid(task["project_id"]), _uuid(task["scope_uuid"]))
+        for task in tasks
+        if task["task_type"] == "reaction_snapshot"
+        and _payload(task["payload"]).get("emit_events", True)
+    }
     for row in messages:
         project_id = _uuid(row["project_id"])
+        if (project_id, _uuid(row["uuid"])) not in eventful_reaction_scopes:
+            continue
         stream_uuid = _uuid(row["stream_uuid"])
         specification = _resource_event_specification(
             session,
@@ -1467,7 +1525,9 @@ def _projection_events(
         if specification is not None:
             events.append(specification)
     for task in tasks:
-        if task["task_type"] != "reaction_snapshot":
+        if task["task_type"] != "reaction_snapshot" or not _payload(
+            task["payload"]
+        ).get("emit_events", True):
             continue
         project_id = _uuid(task["project_id"])
         message_uuid = _uuid(task["scope_uuid"])
@@ -1499,6 +1559,30 @@ def _projection_events(
                 reaction["old_source"] = v3_store.source_projection(
                     payload["old_source_name"]
                 )
+            reaction_consumers = consumers(
+                project_id,
+                stream_uuid=_uuid(message["stream_uuid"]),
+            )
+            visible_users = {
+                _uuid(row[0])
+                for row in session.execute(
+                    """
+                    SELECT user_uuid
+                    FROM workspace_v3.message_flags
+                    WHERE project_id = %s AND message_uuid = %s
+                      AND user_uuid = ANY(%s::uuid[])
+                    """,
+                    (
+                        project_id,
+                        message_uuid,
+                        [
+                            consumer_uuid
+                            for consumer_type, consumer_uuid in reaction_consumers
+                            if consumer_type == "user"
+                        ],
+                    ),
+                ).fetchall()
+            }
             events.append(
                 {
                     "project_id": project_id,
@@ -1506,9 +1590,10 @@ def _projection_events(
                     "object_type": "message_reaction",
                     "action": action,
                     "payload": _event_payload(f"message_reaction.{action}", reaction),
-                    "consumers": consumers(
-                        project_id,
-                        stream_uuid=_uuid(message["stream_uuid"]),
+                    "consumers": tuple(
+                        (consumer_type, consumer_uuid)
+                        for consumer_type, consumer_uuid in reaction_consumers
+                        if consumer_type != "user" or consumer_uuid in visible_users
                     ),
                 }
             )
@@ -1731,8 +1816,12 @@ def process_claimed_projection_tasks(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     reaction_user_limit: int = DEFAULT_REACTION_USER_LIMIT,
 ) -> dict[str, float]:
-    """Process an already committed lease without keeping claim locks open."""
+    """Process committed leases while fencing their task rows from reclaim."""
     started_at = time.monotonic()
+    if not tasks:
+        return _empty_metrics(started_at)
+    active_task_uuids = _lock_active_task_leases(session, worker_id, tasks)
+    tasks = [task for task in tasks if _uuid(task["uuid"]) in active_task_uuids]
     if not tasks:
         return _empty_metrics(started_at)
     # These are short OLTP projections. PostgreSQL can otherwise spend more
@@ -1824,6 +1913,30 @@ def process_claimed_projection_tasks(
     except Exception as error:
         session.execute("ROLLBACK TO SAVEPOINT workspace_v3_projection_batch")
         session.execute("RELEASE SAVEPOINT workspace_v3_projection_batch")
+        if len(tasks) > 1:
+            LOG.exception("Workspace v3 projection batch failed; isolating tasks")
+            metrics = {
+                "claimed": 0.0,
+                "completed": 0.0,
+                "failed": 0.0,
+                "operations": 0.0,
+                "projections": 0.0,
+                "events": 0.0,
+            }
+            for task in tasks:
+                result = process_claimed_projection_tasks(
+                    session,
+                    worker_id,
+                    [task],
+                    max_attempts=max_attempts,
+                    reaction_user_limit=reaction_user_limit,
+                )
+                for name in metrics:
+                    metrics[name] += result[name]
+            return {
+                **metrics,
+                "elapsed_seconds": time.monotonic() - started_at,
+            }
         _fail_tasks(session, tasks, worker_id, error, max_attempts)
         LOG.exception("Workspace v3 projection batch failed")
         return {

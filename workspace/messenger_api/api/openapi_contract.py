@@ -986,7 +986,10 @@ def add_v3_source_contract(
         "required": ["kind"],
         "additionalProperties": False,
         "properties": {
-            "kind": {"type": "string", "enum": ["native", "zulip"]},
+            "kind": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            },
         },
         "description": "Minimal compatibility projection of source_name.",
     }
@@ -1005,7 +1008,7 @@ def add_v3_source_contract(
         properties["source"] = copy.deepcopy(source_schema)
         properties["source_name"] = {
             "type": "string",
-            "enum": ["native", "zulip"],
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
             "description": "Authoritative source/provider name.",
         }
     for name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
@@ -1486,6 +1489,11 @@ def add_provider_entity_contract(
                 "description": "UTC modification time in the provider source.",
             },
             "data": entity_data,
+            "rebind_identity": {
+                "type": "boolean",
+                "default": False,
+                "description": "Explicitly migrate immutable entity identity fields.",
+            },
         },
         ["content_hash", "data"],
     )
@@ -1619,6 +1627,10 @@ def add_provider_entity_contract(
                                         "type": "string",
                                         "format": "uuid",
                                     },
+                                    "snapshot_after_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
                                 },
                             },
                         },
@@ -1640,6 +1652,11 @@ def add_provider_entity_contract(
                 "format": "date-time",
             },
             "data": entity_data,
+            "rebind_identity": {
+                "type": "boolean",
+                "default": False,
+                "description": "Explicitly migrate immutable entity identity fields.",
+            },
         },
         ["action", "type", "uuid"],
     )
@@ -1651,12 +1668,17 @@ def add_provider_entity_contract(
             "requestBody": _request_body(
                 _object_schema(
                     {
+                        "delivery_class": {
+                            "type": "string",
+                            "enum": ["live", "backfill"],
+                            "default": "live",
+                        },
                         "operations": {
                             "type": "array",
                             "minItems": 1,
                             "maxItems": 500,
                             "items": operation,
-                        }
+                        },
                     },
                     ["operations"],
                 )

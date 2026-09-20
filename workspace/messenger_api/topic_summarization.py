@@ -23,6 +23,7 @@ from restalchemy.dm import filters as dm_filters
 
 from workspace.common import topic_summary_opts
 from workspace.messenger_api import file_storage
+from workspace.messenger_api.api import v3_store
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
 
@@ -75,6 +76,22 @@ _ENDPOINT_FLOAT_FIELDS = {
     "top_p",
     "presence_penalty",
     "frequency_penalty",
+}
+_SUMMARY_SCHEMAS = {
+    "v2": {
+        "topics": "m_workspace_stream_topics",
+        "messages": "m_workspace_messages",
+        "bindings": "m_workspace_stream_bindings",
+        "files": "m_workspace_files",
+        "author": "user_uuid",
+    },
+    "v3": {
+        "topics": "workspace_v3.topics",
+        "messages": "workspace_v3.messages",
+        "bindings": "workspace_v3.stream_bindings",
+        "files": "workspace_v3.files",
+        "author": "author_uuid",
+    },
 }
 
 
@@ -131,6 +148,7 @@ class SummaryWork:
     endpoint_claim_token: sys_uuid.UUID
     endpoint: Endpoint
     attempt: int
+    storage_backend: str = "v2"
 
 
 class ProviderCallError(Exception):
@@ -233,7 +251,11 @@ def normalize_endpoint_values(
             continue
         value = result[name]
         maximum = 255
-        if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.strip()) > maximum
+        ):
             raise ra_exc.ValidationErrorException()
         result[name] = value.strip()
     if "base_url" in result:
@@ -261,9 +283,7 @@ def normalize_endpoint_values(
     }
     for name in _ENDPOINT_FLOAT_FIELDS & set(result):
         float_value = result[name]
-        if isinstance(float_value, bool) or not isinstance(
-            float_value, (int, float)
-        ):
+        if isinstance(float_value, bool) or not isinstance(float_value, (int, float)):
             raise ra_exc.ValidationErrorException()
         minimum_float, maximum_float = float_ranges[name]
         normalized_float = float(float_value)
@@ -339,7 +359,9 @@ def create_endpoint(
     secret = models.WorkspaceLLMEndpointSecret(
         uuid=endpoint.uuid,
         endpoint_uuid=endpoint.uuid,
-        envelope=encrypt_api_key(endpoint.uuid, typing.cast(str, api_key), key_material),
+        envelope=encrypt_api_key(
+            endpoint.uuid, typing.cast(str, api_key), key_material
+        ),
     )
     secret.insert(session=session)
     return endpoint
@@ -401,23 +423,26 @@ def _prompt_fingerprint(prompt: str, reasoning_effort: str | None) -> str:
 def _load_summary_messages(
     session: typing.Any,
     candidate: typing.Any,
+    storage_backend: str,
 ) -> tuple[SummaryMessage, ...]:
+    schema = _SUMMARY_SCHEMAS[storage_backend]
     rows = session.execute(
-        """
+        f"""
         WITH previous_boundary AS (
             SELECT created_at, uuid
-            FROM m_workspace_messages
+            FROM {schema["messages"]}
             WHERE uuid = %s AND project_id = %s AND topic_uuid = %s
         ), selected AS (
-            SELECT message.uuid, message.user_uuid, message.payload,
+            SELECT message.uuid, message.{schema["author"]} AS user_uuid,
+                   message.payload,
                    message.created_at
-            FROM m_workspace_messages AS message
+            FROM {schema["messages"]} AS message
             LEFT JOIN previous_boundary ON TRUE
             WHERE message.project_id = %s
               AND message.topic_uuid = %s
               AND (message.created_at, message.uuid) <= (
                     SELECT created_at, uuid
-                    FROM m_workspace_messages
+                    FROM {schema["messages"]}
                     WHERE uuid = %s
               )
               AND (
@@ -452,7 +477,8 @@ def _load_summary_messages(
         content = payload["content"]
         image_uuids = tuple(
             dict.fromkeys(
-                sys_uuid.UUID(match.group(1)) for match in _IMAGE_URN_RE.finditer(content)
+                sys_uuid.UUID(match.group(1))
+                for match in _IMAGE_URN_RE.finditer(content)
             )
         )
         messages.append(
@@ -470,20 +496,20 @@ def _load_images(
     session: typing.Any,
     candidate: typing.Any,
     messages: tuple[SummaryMessage, ...],
+    storage_backend: str,
 ) -> tuple[ImageAttachment, ...]:
     image_uuids = tuple(
         dict.fromkeys(
-            image_uuid
-            for message in messages
-            for image_uuid in message.image_uuids
+            image_uuid for message in messages for image_uuid in message.image_uuids
         )
     )[:MAX_IMAGES_PER_SUMMARY]
     if not image_uuids:
         return ()
+    schema = _SUMMARY_SCHEMAS[storage_backend]
     rows = session.execute(
-        """
+        f"""
         SELECT uuid, content_type, size_bytes, storage_type, storage_object_id
-        FROM m_workspace_files
+        FROM {schema["files"]}
         WHERE project_id = %s
           AND stream_uuid = %s
           AND uuid = ANY(%s)
@@ -650,9 +676,11 @@ def claim_summary_work(
     key_material: str,
     topic_claim_seconds: int,
     endpoint_claim_seconds: int,
+    storage_backend: str = "v2",
 ) -> SummaryWork | None:
+    schema = _SUMMARY_SCHEMAS[storage_backend]
     candidate = session.execute(
-        """
+        f"""
         SELECT
             topic.uuid AS topic_uuid,
             topic.project_id,
@@ -670,7 +698,7 @@ def claim_summary_work(
             job.claim_token AS job_claim_token,
             job.endpoint_uuid AS job_endpoint_uuid,
             job.endpoint_claim_token AS job_endpoint_claim_token
-        FROM m_workspace_stream_topics AS topic
+        FROM {schema["topics"]} AS topic
         JOIN m_workspace_topic_summary_project_settings AS project_settings
           ON project_settings.project_id = topic.project_id
          AND project_settings.enabled = TRUE
@@ -682,8 +710,8 @@ def claim_summary_work(
             SELECT bounded.uuid
             FROM (
                 SELECT message.uuid, message.created_at
-                FROM m_workspace_messages AS message
-                LEFT JOIN m_workspace_messages AS previous_boundary
+                FROM {schema["messages"]} AS message
+                LEFT JOIN {schema["messages"]} AS previous_boundary
                   ON previous_boundary.uuid = topic.summary_last_message_uuid
                 WHERE message.project_id = topic.project_id
                   AND message.topic_uuid = topic.uuid
@@ -702,7 +730,7 @@ def claim_summary_work(
         ) AS snapshot ON TRUE
         JOIN LATERAL (
             SELECT binding.user_uuid
-            FROM m_workspace_stream_bindings AS binding
+            FROM {schema["bindings"]} AS binding
             WHERE binding.project_id = topic.project_id
               AND binding.stream_uuid = topic.stream_uuid
             ORDER BY
@@ -751,8 +779,8 @@ def claim_summary_work(
     prompt = candidate["summary_system_prompt"] or DEFAULT_SYSTEM_PROMPT
     reasoning_effort = candidate["summary_reasoning_effort"]
     prompt_fingerprint = _prompt_fingerprint(prompt, reasoning_effort)
-    messages = _load_summary_messages(session, candidate)
-    images = _load_images(session, candidate, messages)
+    messages = _load_summary_messages(session, candidate, storage_backend)
+    images = _load_images(session, candidate, messages, storage_backend)
     if not messages:
         return None
     boundary_message_uuid = messages[-1].uuid
@@ -813,9 +841,7 @@ def claim_summary_work(
     )
     if claimed_endpoint is None:
         error_code = (
-            "vision_endpoint_busy"
-            if requires_vision
-            else "endpoint_unavailable"
+            "vision_endpoint_busy" if requires_vision else "endpoint_unavailable"
         )
         _queue_waiting_topic(
             session,
@@ -891,6 +917,7 @@ def claim_summary_work(
         endpoint_claim_token=endpoint_claim_token,
         endpoint=endpoint,
         attempt=attempt,
+        storage_backend=storage_backend,
     )
 
 
@@ -899,9 +926,7 @@ def _image_parts(
     message: SummaryMessage,
 ) -> list[dict[str, typing.Any]]:
     by_uuid = {image.uuid: image for image in work.images}
-    parts: list[dict[str, typing.Any]] = [
-        {"type": "text", "text": message.content}
-    ]
+    parts: list[dict[str, typing.Any]] = [{"type": "text", "text": message.content}]
     for image_uuid in message.image_uuids:
         image = by_uuid.get(image_uuid)
         if image is None:
@@ -969,9 +994,7 @@ def call_openai_compatible_endpoint(
     work: SummaryWork,
     *,
     timeout_seconds: int,
-    connect_timeout_seconds: int = (
-        topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS
-    ),
+    connect_timeout_seconds: int = (topic_summary_opts.DEFAULT_CONNECT_TIMEOUT_SECONDS),
 ) -> str:
     try:
         response = requests.post(
@@ -1063,11 +1086,12 @@ def complete_summary_work(
     *,
     now: datetime.datetime,
 ) -> None:
+    schema = _SUMMARY_SCHEMAS[work.storage_backend]
     current = session.execute(
-        """
+        f"""
         SELECT job.claim_token, topic.summary_enabled
         FROM m_workspace_topic_summary_jobs AS job
-        JOIN m_workspace_stream_topics AS topic
+        JOIN {schema["topics"]} AS topic
           ON topic.uuid = job.topic_uuid
         WHERE job.topic_uuid = %s
         FOR UPDATE OF job, topic
@@ -1081,14 +1105,24 @@ def complete_summary_work(
     ):
         _cancel_endpoint_claim(session, work)
         return
-    helpers.set_workspace_user_stream_topic_summary(
-        work.project_id,
-        work.actor_user_uuid,
-        work.topic_uuid,
-        summary,
-        work.boundary_message_uuid,
-        session=session,
-    )
+    if work.storage_backend == "v3":
+        v3_store.MessengerV3Store(
+            work.project_id,
+            work.actor_user_uuid,
+        ).set_topic_summary(
+            work.topic_uuid,
+            summary,
+            work.boundary_message_uuid,
+        )
+    else:
+        helpers.set_workspace_user_stream_topic_summary(
+            work.project_id,
+            work.actor_user_uuid,
+            work.topic_uuid,
+            summary,
+            work.boundary_message_uuid,
+            session=session,
+        )
     _release_endpoint(session, work, now=now, error_code=None)
     session.execute(
         """

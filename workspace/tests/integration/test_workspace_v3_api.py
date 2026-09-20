@@ -11,8 +11,10 @@ import uuid as sys_uuid
 
 import psycopg
 import pytest
+from restalchemy.common import contexts as ra_contexts
 
 from workspace.messenger_api import file_storage
+from workspace.messenger_api import topic_summarization
 from workspace.messenger_api.api import sql_canonical_store, store_factory
 from workspace.messenger_api.api import store as api_store
 from workspace.tests.integration import conftest
@@ -28,6 +30,12 @@ EVENTS = f"{V1}/events/"
 EPOCH = f"{V1}/epoch/"
 REACTIONS = f"{V1}/message_reactions/"
 FOLDERS = f"{V1}/folders/"
+FOLDER_ITEMS = f"{V1}/folder_items/"
+FILES = f"{V1}/files/"
+TOPIC_SUMMARY_ENDPOINTS = f"{V1}/topic_summary_endpoints/"
+TOPIC_SUMMARY_SETTINGS = f"{V1}/topic_summary_settings/"
+TOPIC_SUMMARY_ENDPOINT_MANAGE = (topic_summarization.ENDPOINT_MANAGE_PERMISSION,)
+TOPIC_SUMMARY_SETTINGS_MANAGE = (topic_summarization.SETTINGS_MANAGE_PERMISSION,)
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +97,11 @@ def _drain_projections(db):
             )
         for name in metrics:
             metrics[name] += batch[name]
+
+
+def _run_database_operation(callback):
+    with ra_contexts.Context().session_manager() as session:
+        return callback(session)
 
 
 def test_v3_api_keeps_routes_and_reduces_provider_projection(api):
@@ -161,6 +174,127 @@ def test_v3_initializes_the_three_legacy_automatic_folders(api):
     }
 
 
+def test_v3_rejects_deleting_system_folders_and_automatic_items(api, db):
+    stream = _create_stream(api, "Protected automatic folders")
+    _drain_projections(db)
+    response = api.get(FOLDERS)
+    assert response.status_code == 200, response.text
+    folders = response.json()
+    system_folder = next(folder for folder in folders if folder["system_type"] == "all")
+    system_update = api.put(
+        f"{FOLDERS}{system_folder['uuid']}",
+        json={"title": "Renamed built-in folder"},
+    )
+    assert system_update.status_code == 400, system_update.text
+    system_delete = api.delete(f"{FOLDERS}{system_folder['uuid']}")
+    assert system_delete.status_code == 400, system_delete.text
+
+    manual_item = api.post(
+        FOLDER_ITEMS,
+        json={
+            "folder_uuid": system_folder["uuid"],
+            "stream_uuid": stream["uuid"],
+            "chat_type": "channel",
+        },
+    )
+    assert manual_item.status_code == 400, manual_item.text
+
+    automatic_item = next(
+        item
+        for item in system_folder["folder_items"]
+        if item["stream_uuid"] == stream["uuid"]
+    )
+    item_delete = api.delete(f"{FOLDER_ITEMS}{automatic_item['uuid']}")
+    assert item_delete.status_code == 400, item_delete.text
+
+
+def test_v3_direct_message_creation_is_idempotent_and_membership_is_immutable(api, db):
+    peer_uuid = sys_uuid.uuid4()
+    assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
+    created = api.post(
+        STREAMS,
+        json={
+            "name": "Protected direct message",
+            "direct_user_uuid": str(peer_uuid),
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    repeated = api.post(
+        STREAMS,
+        json={
+            "name": "Protected direct message",
+            "direct_user_uuid": str(peer_uuid),
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert repeated.status_code == 201, repeated.text
+    assert repeated.json()["uuid"] == created.json()["uuid"]
+
+    binding_uuid = db.execute(
+        """
+        SELECT uuid FROM workspace_v3.stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+        """,
+        (api.project_id, created.json()["uuid"], api.user_uuid),
+    ).fetchone()[0]
+    binding_update = api.put(
+        f"{STREAM_BINDINGS}{binding_uuid}",
+        json={"notification_mode": "mute"},
+    )
+    assert binding_update.status_code == 400, binding_update.text
+    binding_delete = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
+    assert binding_delete.status_code == 400, binding_delete.text
+
+    deleted = api.delete(f"{STREAMS}{created.json()['uuid']}")
+
+    assert deleted.status_code == 400, deleted.text
+    assert api.get(f"{STREAMS}{created.json()['uuid']}").status_code == 200
+
+
+def test_v3_private_non_direct_stream_keeps_null_direct_user_in_rest_and_events(
+    api, workspace_api
+):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    created = api.post(
+        STREAMS,
+        json={"name": "Private channel", "private": True},
+    )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["direct_user_uuid"] is None
+    events = workspace_api.get(f"{EVENTS}?epoch_version%3E=0&page_limit=100")
+    assert events.status_code == 200, events.text
+    stream_created = next(
+        event
+        for event in events.json()
+        if event["payload"].get("kind") == "stream.created"
+        and event["payload"].get("uuid") == created.json()["uuid"]
+    )
+    assert stream_created["payload"]["direct_user_uuid"] is None
+
+
+def test_v3_private_stream_is_not_mistaken_for_direct_message(api):
+    stream = api.post(
+        STREAMS,
+        json={
+            "name": "Private but not direct",
+            "private": True,
+            "source_name": "native",
+            "source": {"kind": "native"},
+        },
+    )
+    assert stream.status_code == 201, stream.text
+
+    deleted = api.delete(f"{STREAMS}{stream.json()['uuid']}")
+
+    assert deleted.status_code == 204, deleted.text
+    assert api.get(f"{STREAMS}{stream.json()['uuid']}").status_code == 404
+
+
 def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
     stream = _create_stream(api, "Membership")
     historical = _create_message(api, stream, "history")
@@ -181,6 +315,22 @@ def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
 
     removed = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
     assert removed.status_code == 204, removed.text
+    removed_stream_event = db.execute(
+        """
+        SELECT event.payload ->> 'kind'
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s
+          AND event.entity_uuid = %s
+          AND event.payload ->> 'kind' = 'stream.deleted'
+          AND audience.consumer_type = 'user'
+          AND audience.consumer_uuid = %s
+        """,
+        (api.project_id, stream["uuid"], peer_uuid),
+    ).fetchone()
+    assert removed_stream_event == ("stream.deleted",)
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -216,9 +366,38 @@ def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
     assert reloaded.json()[0]["read"] is True
 
 
+def test_v3_stream_binding_updates_role_and_notification_mode(api):
+    stream = _create_stream(api, "Mutable membership")
+    peer_uuid = sys_uuid.uuid4()
+    assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    binding_uuid = added.json()[0]["uuid"]
+
+    role = api.put(f"{STREAM_BINDINGS}{binding_uuid}", json={"role": "administrator"})
+    assert role.status_code == 200, role.text
+    assert role.json()["role"] == "administrator"
+    notification = api.put(
+        f"{STREAM_BINDINGS}{binding_uuid}",
+        json={"notification_mode": "muted"},
+        user=peer_uuid,
+    )
+    assert notification.status_code == 200, notification.text
+    assert notification.json()["notification_mode"] == "muted"
+    assert notification.json()["notification_updated_at"] is not None
+
+
 def test_v3_restricted_history_starts_at_membership(api, db):
     stream = _create_stream(api, "Restricted history")
     historical = _create_message(api, stream, "before join")
+    historical_reaction = api.post(
+        REACTIONS,
+        json={"message_uuid": historical["uuid"], "emoji_name": "eyes"},
+    )
+    assert historical_reaction.status_code == 201, historical_reaction.text
     peer_uuid = sys_uuid.uuid4()
     assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
     db.execute(
@@ -249,12 +428,46 @@ def test_v3_restricted_history_starts_at_membership(api, db):
     hidden = api.get(MESSAGES, user=peer_uuid)
     assert hidden.status_code == 200, hidden.text
     assert hidden.json() == []
+    hidden_reactions = api.get(REACTIONS, user=peer_uuid)
+    assert hidden_reactions.status_code == 200, hidden_reactions.text
+    assert hidden_reactions.json() == []
 
     current = _create_message(api, stream, "after join")
+    current_reaction = api.post(
+        REACTIONS,
+        json={"message_uuid": current["uuid"], "emoji_name": "rocket"},
+    )
+    assert current_reaction.status_code == 201, current_reaction.text
     visible = api.get(MESSAGES, user=peer_uuid)
     assert visible.status_code == 200, visible.text
     assert [message["uuid"] for message in visible.json()] == [current["uuid"]]
+    visible_reactions = api.get(REACTIONS, user=peer_uuid)
+    assert visible_reactions.status_code == 200, visible_reactions.text
+    assert [reaction["uuid"] for reaction in visible_reactions.json()] == [
+        current_reaction.json()["uuid"]
+    ]
     assert historical["uuid"] != current["uuid"]
+
+
+def test_v3_deleting_default_topic_emits_updated_stream(api, workspace_api, db):
+    stream = _create_stream(api, "Default topic lifecycle")
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+
+    deleted = api.delete(f"{TOPICS}{stream['default_topic_uuid']}")
+
+    assert deleted.status_code == 204, deleted.text
+    refreshed = api.get(f"{STREAMS}{stream['uuid']}")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["default_topic_uuid"] is None
+    events = workspace_api.get("/v1/events/?epoch_version%3E=0&page_limit=100")
+    assert events.status_code == 200, events.text
+    assert any(
+        event["payload"].get("kind") == "stream.updated"
+        and event["payload"].get("uuid") == stream["uuid"]
+        and event["payload"].get("default_topic_uuid") is None
+        for event in events.json()
+    )
 
 
 def test_v3_private_stream_rejects_third_member_with_controlled_4xx(api):
@@ -443,6 +656,35 @@ def test_v3_drafts_and_event_cursor_keep_old_contract(api, workspace_api, db):
     assert deleted.status_code == 204, deleted.text
 
 
+def test_v3_event_epoch_filters_are_applied_before_page_limit(api, workspace_api):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    stream = _create_stream(api, "Filtered event page")
+    for number in range(3):
+        _create_message(api, stream, f"event {number}")
+    all_events = workspace_api.get(
+        EVENTS,
+        params={"epoch_version>": 0, "page_limit": 100},
+    )
+    assert all_events.status_code == 200, all_events.text
+    versions = [event["epoch_version"] for event in all_events.json()]
+    assert len(versions) >= 3
+    cutoff = versions[-1]
+
+    filtered = workspace_api.get(
+        EVENTS,
+        params={
+            "epoch_version<": cutoff,
+            "sort_key": "epoch_version",
+            "sort_dir": "desc",
+            "page_limit": 1,
+        },
+    )
+
+    assert filtered.status_code == 200, filtered.text
+    assert [event["epoch_version"] for event in filtered.json()] == [versions[-2]]
+
+
 def test_v3_user_actions_keep_scope_events_and_global_topic_done(api, db):
     stream = _create_stream(api, "Actions")
     peer_uuid = sys_uuid.uuid4()
@@ -555,6 +797,114 @@ def test_v3_user_actions_keep_scope_events_and_global_topic_done(api, db):
     assert flags[other_topic_message["uuid"]] == (False, False)
 
 
+def test_v3_topic_summary_prompt_requires_owner_or_administrator(api):
+    stream = _create_stream(api, "V3 summary permissions")
+    member_uuid = sys_uuid.uuid4()
+    administrator_uuid = sys_uuid.uuid4()
+    for user_uuid in (member_uuid, administrator_uuid):
+        assert api.get(f"{V1}/me/", user=user_uuid).status_code == 200
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(member_uuid), str(administrator_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    administrator_binding = next(
+        binding
+        for binding in added.json()
+        if binding["user_uuid"] == str(administrator_uuid)
+    )
+    promoted = api.put(
+        f"{STREAM_BINDINGS}{administrator_binding['uuid']}",
+        json={"role": "administrator"},
+    )
+    assert promoted.status_code == 200, promoted.text
+    action = f"{TOPICS}{stream['default_topic_uuid']}/actions/set_summary_prompt/invoke"
+
+    forbidden = api.post(
+        action,
+        user=member_uuid,
+        json={"summary_system_prompt": "Member prompt."},
+    )
+    assert forbidden.status_code == 403, forbidden.text
+    invalid = api.post(
+        action,
+        json={"summary_reasoning_effort": "ultra"},
+    )
+    assert invalid.status_code == 400, invalid.text
+    administrator_update = api.post(
+        action,
+        user=administrator_uuid,
+        json={
+            "summary_system_prompt": "Focus on decisions.",
+            "summary_reasoning_effort": "off",
+            "summary_enabled": False,
+        },
+    )
+    assert administrator_update.status_code == 200, administrator_update.text
+    assert administrator_update.json()["summary_enabled"] is False
+    owner_update = api.post(
+        action,
+        json={"summary_enabled": True},
+    )
+    assert owner_update.status_code == 200, owner_update.text
+    assert owner_update.json()["summary_enabled"] is True
+
+
+def test_v3_topic_summary_worker_uses_v3_rows(api):
+    endpoint_uuid = sys_uuid.uuid4()
+    endpoint = api.post(
+        TOPIC_SUMMARY_ENDPOINTS,
+        permissions=TOPIC_SUMMARY_ENDPOINT_MANAGE,
+        json={
+            "uuid": str(endpoint_uuid),
+            "name": "v3-summary",
+            "base_url": "https://llm.example.invalid/v1",
+            "model": "summary-model",
+            "api_key": "summary-secret",
+            "priority": 10,
+        },
+    )
+    assert endpoint.status_code == 201, endpoint.text
+    settings = api.put(
+        f"{TOPIC_SUMMARY_SETTINGS}{api.project_id}",
+        permissions=TOPIC_SUMMARY_SETTINGS_MANAGE,
+        json={"global_enabled": True, "project_enabled": True},
+    )
+    assert settings.status_code == 200, settings.text
+    stream = _create_stream(api, "V3 summary worker")
+    message = _create_message(api, stream, "Decision: release tomorrow.")
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    work = _run_database_operation(
+        lambda session: topic_summarization.claim_summary_work(
+            session,
+            now=now,
+            key_material="integration-test-topic-summary-key",
+            topic_claim_seconds=60,
+            endpoint_claim_seconds=60,
+            storage_backend="v3",
+        )
+    )
+    assert work is not None
+    assert work.storage_backend == "v3"
+    assert work.boundary_message_uuid == sys_uuid.UUID(message["uuid"])
+    assert [item.content for item in work.messages] == ["Decision: release tomorrow."]
+    _run_database_operation(
+        lambda session: topic_summarization.complete_summary_work(
+            session,
+            work,
+            "Release is planned for tomorrow.",
+            now=now,
+        )
+    )
+
+    topic = api.get(f"{TOPICS}{stream['default_topic_uuid']}")
+    assert topic.status_code == 200, topic.text
+    assert topic.json()["summary"] == "Release is planned for tomorrow."
+    assert topic.json()["summary_last_message_uuid"] == message["uuid"]
+    assert topic.json()["summary_has_new_messages"] is False
+
+
 def test_v3_reaction_worker_updates_denormalized_message(api, db):
     stream = _create_stream(api, "Reactions")
     message = _create_message(api, stream)
@@ -573,6 +923,34 @@ def test_v3_reaction_worker_updates_denormalized_message(api, db):
     after = api.get(f"{MESSAGES}{message['uuid']}").json()
     assert after["reactions"] == {"eyes": 1}
     assert after["reaction_users"] == {"eyes": [str(api.user_uuid)]}
+
+
+def test_v3_reaction_creation_is_idempotent(api, db):
+    stream = _create_stream(api, "Idempotent reactions")
+    message = _create_message(api, stream)
+    first = api.post(
+        REACTIONS,
+        json={"message_uuid": message["uuid"], "emoji_name": "eyes"},
+    )
+    repeated = api.post(
+        REACTIONS,
+        json={"message_uuid": message["uuid"], "emoji_name": "eyes"},
+    )
+
+    assert first.status_code == 201, first.text
+    assert repeated.status_code == 201, repeated.text
+    assert repeated.json()["uuid"] == first.json()["uuid"]
+    assert (
+        db.execute(
+            """
+        SELECT count(*) FROM workspace_v3.message_reactions
+        WHERE project_id = %s AND message_uuid = %s
+          AND user_uuid = %s AND emoji_name = 'eyes'
+        """,
+            (api.project_id, message["uuid"], api.user_uuid),
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_v3_projection_events_keep_flat_v2_public_payloads(
@@ -758,7 +1136,121 @@ def test_v3_avatar_file_lifecycle_uses_v3_metadata(api, db, tmp_path, monkeypatc
         assert cursor.fetchone()[0] == 0
 
 
-def test_v3_presence_action_accepts_public_resource_uuid(api):
+def test_v3_avatar_replacement_keeps_a_cross_project_previous_file(
+    api,
+    db,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    assert api.get(f"{V1}/me/").status_code == 200
+    previous_file_uuid = sys_uuid.uuid4()
+    other_project_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.files (
+            uuid, project_id, user_uuid, acl_mode, name, content_type,
+            size_bytes, hash, storage_type, storage_object_id
+        ) VALUES (%s, %s, %s, 'public', 'other-avatar.png', 'image/png',
+                  3, 'other-avatar', 'test', 'other-avatar')
+        """,
+        (previous_file_uuid, other_project_uuid, api.user_uuid),
+    )
+    db.execute(
+        "UPDATE workspace_v3.users SET avatar = %s WHERE uuid = %s",
+        (f"urn:image:{previous_file_uuid}", api.user_uuid),
+    )
+
+    uploaded = api.post(
+        f"{V1}/users/{api.user_uuid}/actions/avatar_upload/invoke",
+        files={
+            "file": (
+                "replacement.png",
+                io.BytesIO(b"\x89PNG\r\n\x1a\nreplacement"),
+                "image/png",
+            )
+        },
+    )
+
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json()["avatar"] != f"urn:image:{previous_file_uuid}"
+    assert (
+        db.execute(
+            "SELECT count(*) FROM workspace_v3.files WHERE project_id = %s AND uuid = %s",
+            (other_project_uuid, previous_file_uuid),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_v3_owner_files_stay_scoped_to_the_current_project(api, db):
+    assert api.get(f"{V1}/me/").status_code == 200
+    own_file_uuid = sys_uuid.uuid4()
+    other_owner_file_uuid = sys_uuid.uuid4()
+    public_file_uuid = sys_uuid.uuid4()
+    other_project_id = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.files (
+                uuid, project_id, user_uuid, acl_mode, name, content_type,
+                size_bytes, hash, storage_type, storage_object_id
+            ) VALUES
+                (%s, %s, %s, 'owner', 'own.txt', 'text/plain',
+                 3, 'own', 'test', 'own'),
+                (%s, %s, %s, 'owner', 'other.txt', 'text/plain',
+                 5, 'other', 'test', 'other'),
+                (%s, %s, %s, 'public', 'public.txt', 'text/plain',
+                 6, 'public', 'test', 'public')
+            """,
+            (
+                own_file_uuid,
+                api.project_id,
+                api.user_uuid,
+                other_owner_file_uuid,
+                other_project_id,
+                api.user_uuid,
+                public_file_uuid,
+                other_project_id,
+                api.user_uuid,
+            ),
+        )
+
+    response = api.get(FILES)
+
+    assert response.status_code == 200, response.text
+    visible = {row["uuid"] for row in response.json()}
+    assert str(own_file_uuid) in visible
+    assert str(public_file_uuid) in visible
+    assert str(other_owner_file_uuid) not in visible
+
+    cross_project_update = api.put(
+        f"{FILES}{public_file_uuid}",
+        json={"name": "must-not-change.txt"},
+    )
+    assert cross_project_update.status_code == 404, cross_project_update.text
+    cross_project_delete = api.delete(f"{FILES}{public_file_uuid}")
+    assert cross_project_delete.status_code == 404, cross_project_delete.text
+    assert db.execute(
+        "SELECT name FROM workspace_v3.files WHERE uuid = %s",
+        (public_file_uuid,),
+    ).fetchone() == ("public.txt",)
+    db.execute(
+        "DELETE FROM workspace_v3.files WHERE uuid = ANY(%s::uuid[])",
+        ([own_file_uuid, other_owner_file_uuid, public_file_uuid],),
+    )
+
+
+def test_v3_presence_action_accepts_public_resource_uuid_and_broadcasts(api, db):
+    stream = _create_stream(api, "Presence audience")
+    peer_uuid = sys_uuid.uuid4()
+    assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+
     response = api.post(
         f"{V1}/users/{api.user_uuid}/actions/presence/invoke",
         json={"status": "active"},
@@ -767,3 +1259,198 @@ def test_v3_presence_action_accepts_public_resource_uuid(api):
     assert response.status_code == 200, response.text
     assert response.json()["uuid"] == api.user_uuid
     assert response.json()["status"] == "active"
+    peer_event = db.execute(
+        """
+        SELECT event.payload ->> 'kind'
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s
+          AND event.entity_uuid = %s
+          AND event.payload ->> 'kind' = 'user.updated'
+          AND event.payload ->> 'status' = 'active'
+          AND audience.consumer_type = 'user'
+          AND audience.consumer_uuid = %s
+        """,
+        (api.project_id, api.user_uuid, peer_uuid),
+    ).fetchone()
+    assert peer_event == ("user.updated",)
+
+
+def test_v3_user_mutation_refreshes_owning_provider_and_notifies_all(api, db):
+    assert api.get(f"{V1}/me/").status_code == 200
+    provider_uuids = tuple(sorted((sys_uuid.uuid4(), sys_uuid.uuid4())))
+    owner_provider_uuid = provider_uuids[1]
+    stream_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    source_names = ("alpha", "beta")
+    db.execute(
+        """
+        INSERT INTO workspace_v3.provider_consumers (
+            uuid, project_id, name, iam_user_uuid
+        ) VALUES (%s, %s, %s, %s), (%s, %s, %s, %s)
+        """,
+        (
+            provider_uuids[0],
+            api.project_id,
+            source_names[0],
+            sys_uuid.uuid4(),
+            provider_uuids[1],
+            api.project_id,
+            source_names[1],
+            sys_uuid.uuid4(),
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.streams (
+            uuid, project_id, name, owner_uuid, source_name
+        ) VALUES (%s, %s, 'Alpha stream', %s, %s),
+                 (%s, %s, 'Beta stream', %s, %s)
+        """,
+        (
+            stream_uuids[0],
+            api.project_id,
+            api.user_uuid,
+            source_names[0],
+            stream_uuids[1],
+            api.project_id,
+            api.user_uuid,
+            source_names[1],
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.stream_bindings (
+            uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+        ) VALUES (gen_random_uuid(), %s, %s, %s, %s, 'owner'),
+                 (gen_random_uuid(), %s, %s, %s, %s, 'owner')
+        """,
+        (
+            api.project_id,
+            stream_uuids[0],
+            api.user_uuid,
+            api.user_uuid,
+            api.project_id,
+            stream_uuids[1],
+            api.user_uuid,
+            api.user_uuid,
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.provider_entity_states (
+            project_id, provider_uuid, entity_type, entity_uuid,
+            content_hash, source_content_hash, source_updated_at
+        ) VALUES (
+            %s, %s, 'user', %s,
+            decode(repeat('00', 32), 'hex'),
+            decode(repeat('11', 32), 'hex'),
+            clock_timestamp()
+        )
+        """,
+        (api.project_id, owner_provider_uuid, api.user_uuid),
+    )
+
+    response = api.post(
+        f"{V1}/users/{api.user_uuid}/actions/presence/invoke",
+        json={"status": "active", "text": "shared provider user"},
+    )
+
+    assert response.status_code == 200, response.text
+    state = db.execute(
+        """
+        SELECT provider_uuid, content_hash,
+               encode(source_content_hash, 'hex')
+        FROM workspace_v3.provider_entity_states
+        WHERE project_id = %s AND entity_type = 'user' AND entity_uuid = %s
+        """,
+        (api.project_id, api.user_uuid),
+    ).fetchone()
+    assert state[0] == owner_provider_uuid
+    assert bytes(state[1]) != bytes(32)
+    assert state[2] == "11" * 32
+    notified_providers = db.execute(
+        """
+        SELECT DISTINCT audience.consumer_uuid
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s AND event.entity_uuid = %s
+          AND event.payload ->> 'kind' = 'user.updated'
+          AND audience.consumer_type = 'provider'
+        """,
+        (api.project_id, api.user_uuid),
+    ).fetchall()
+    assert {row[0] for row in notified_providers} == set(provider_uuids)
+
+
+def test_v3_user_mutation_ignores_unaffected_provider_when_owner_is_absent(api, db):
+    assert api.get(f"{V1}/me/").status_code == 200
+    affected_provider_uuid = sys_uuid.uuid4()
+    owner_provider_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.provider_consumers (
+            uuid, project_id, name, iam_user_uuid
+        ) VALUES (%s, %s, 'affected', %s), (%s, %s, 'owner', %s)
+        """,
+        (
+            affected_provider_uuid,
+            api.project_id,
+            sys_uuid.uuid4(),
+            owner_provider_uuid,
+            api.project_id,
+            sys_uuid.uuid4(),
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.streams (
+            uuid, project_id, name, owner_uuid, source_name
+        ) VALUES (%s, %s, 'Affected stream', %s, 'affected')
+        """,
+        (stream_uuid, api.project_id, api.user_uuid),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.stream_bindings (
+            uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+        ) VALUES (gen_random_uuid(), %s, %s, %s, %s, 'owner')
+        """,
+        (api.project_id, stream_uuid, api.user_uuid, api.user_uuid),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.provider_entity_states (
+            project_id, provider_uuid, entity_type, entity_uuid,
+            content_hash, source_content_hash, source_updated_at
+        ) VALUES (
+            %s, %s, 'user', %s,
+            decode(repeat('00', 32), 'hex'),
+            decode(repeat('11', 32), 'hex'),
+            clock_timestamp()
+        )
+        """,
+        (api.project_id, owner_provider_uuid, api.user_uuid),
+    )
+
+    response = api.post(
+        f"{V1}/users/{api.user_uuid}/actions/presence/invoke",
+        json={"status": "active", "text": "owner no longer affected"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "active"
+    state = db.execute(
+        """
+        SELECT provider_uuid, encode(content_hash, 'hex'),
+               encode(source_content_hash, 'hex')
+        FROM workspace_v3.provider_entity_states
+        WHERE project_id = %s AND entity_type = 'user' AND entity_uuid = %s
+        """,
+        (api.project_id, api.user_uuid),
+    ).fetchone()
+    assert state == (owner_provider_uuid, "00" * 32, "11" * 32)
