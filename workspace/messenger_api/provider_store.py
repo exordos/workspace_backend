@@ -328,6 +328,7 @@ class ProviderEntityStore:
         data: dict[str, typing.Any],
         source_updated_at: datetime.datetime | None = None,
         *,
+        rebind_identity: bool = False,
         emit_event: bool = True,
         expand_message_flags: bool = True,
     ) -> dict[str, typing.Any]:
@@ -339,7 +340,10 @@ class ProviderEntityStore:
             return self._result(resource, entity_uuid, "unchanged", state)
         self._ensure_create_available(resource, entity_uuid, state)
         if state is not None:
-            self._ensure_identity_unchanged(resource, entity_uuid, data)
+            if rebind_identity:
+                self._prepare_identity_rebind(resource, entity_uuid, data)
+            else:
+                self._ensure_identity_unchanged(resource, entity_uuid, data)
         status = "created" if state is None else "updated"
         with event_origin.use("provider", self.provider_uuid):
             if resource == "messages":
@@ -359,6 +363,212 @@ class ProviderEntityStore:
             if emit_event:
                 self._emit_upsert(resource, entity_uuid, status, data)
         return self._result(resource, entity_uuid, status, new_state)
+
+    def _prepare_identity_rebind(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+    ) -> None:
+        """Make an explicit provider-owned identity migration conflict-safe."""
+        if resource == "stream_bindings":
+            self._prepare_stream_binding_identity_rebind(entity_uuid, data)
+            return
+        if resource != "message_flags":
+            return
+        message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
+        user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
+        conflict = self.session.execute(
+            """
+            SELECT flag.uuid
+            FROM workspace_v3.message_flags AS flag
+            WHERE flag.project_id = %s AND flag.message_uuid = %s
+              AND flag.user_uuid = %s AND flag.uuid <> %s
+            """,
+            (self.project_uuid, message_uuid, user_uuid, entity_uuid),
+        ).fetchone()
+        if conflict is not None:
+            conflict_owned = self.session.execute(
+                """
+                SELECT 1 FROM workspace_v3.provider_entity_states
+                WHERE project_id = %s AND entity_type = 'message_flag'
+                  AND entity_uuid = %s
+                LIMIT 1
+                """,
+                (self.project_uuid, conflict["uuid"]),
+            ).fetchone()
+            if conflict_owned is not None:
+                _error(
+                    409,
+                    "entity_identity_conflict",
+                    "The target message flag is owned by a provider entity",
+                )
+            self.session.execute(
+                """
+                DELETE FROM workspace_v3.message_flags
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, conflict["uuid"]),
+            )
+        self.session.execute(
+            """
+            UPDATE workspace_v3.message_flags
+            SET stream_uuid = %s, message_uuid = %s, user_uuid = %s,
+                updated_at = clock_timestamp()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                parse_uuid(data["stream_uuid"], "stream_uuid"),
+                message_uuid,
+                user_uuid,
+                self.project_uuid,
+                entity_uuid,
+            ),
+        )
+
+    def _prepare_stream_binding_identity_rebind(
+        self,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+    ) -> None:
+        """Move a provider binding and its dependent rows to another user."""
+        current = self.session.execute(
+            """
+            SELECT * FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (self.project_uuid, entity_uuid),
+        ).fetchone()
+        if current is None:
+            return
+        target_user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
+        if current["user_uuid"] == target_user_uuid:
+            return
+        stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
+        conflict = self.session.execute(
+            """
+            SELECT uuid FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+              AND uuid <> %s
+            """,
+            (self.project_uuid, stream_uuid, target_user_uuid, entity_uuid),
+        ).fetchone()
+        dependent_conflict = self.session.execute(
+            """
+            SELECT 1
+            FROM workspace_v3.topic_bindings AS source
+            JOIN workspace_v3.topic_bindings AS target
+              ON target.project_id = source.project_id
+             AND target.topic_uuid = source.topic_uuid
+             AND target.user_uuid = %s
+             AND target.uuid <> source.uuid
+            WHERE source.project_id = %s AND source.stream_uuid = %s
+              AND source.user_uuid = %s
+            UNION ALL
+            SELECT 1
+            FROM workspace_v3.message_flags AS source
+            JOIN workspace_v3.message_flags AS target
+              ON target.project_id = source.project_id
+             AND target.message_uuid = source.message_uuid
+             AND target.user_uuid = %s
+             AND target.uuid <> source.uuid
+            WHERE source.project_id = %s AND source.stream_uuid = %s
+              AND source.user_uuid = %s
+            UNION ALL
+            SELECT 1 FROM workspace_v3.drafts
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            LIMIT 1
+            """,
+            (
+                target_user_uuid,
+                self.project_uuid,
+                stream_uuid,
+                current["user_uuid"],
+                target_user_uuid,
+                self.project_uuid,
+                stream_uuid,
+                current["user_uuid"],
+                self.project_uuid,
+                stream_uuid,
+                current["user_uuid"],
+            ),
+        ).fetchone()
+        if conflict is not None or dependent_conflict is not None:
+            _error(
+                409,
+                "entity_identity_conflict",
+                "The target user already has data for this stream",
+            )
+
+        temporary_uuid = sys_uuid.uuid4()
+        self.session.execute(
+            """
+            INSERT INTO workspace_v3.stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role,
+                notification_mode, notification_updated_at, unread_count,
+                active_unread_count, passive_unread_count, last_message_uuid,
+                created_at, updated_at
+            )
+            SELECT %s, project_id, stream_uuid, %s, %s, role,
+                   notification_mode, notification_updated_at, unread_count,
+                   active_unread_count, passive_unread_count, last_message_uuid,
+                   created_at, updated_at
+            FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                temporary_uuid,
+                target_user_uuid,
+                parse_uuid(data.get("who_uuid", target_user_uuid), "who_uuid"),
+                self.project_uuid,
+                entity_uuid,
+            ),
+        )
+        self.session.execute(
+            """
+            UPDATE workspace_v3.topic_bindings SET user_uuid = %s
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (
+                target_user_uuid,
+                self.project_uuid,
+                stream_uuid,
+                current["user_uuid"],
+            ),
+        )
+        self.session.execute(
+            """
+            UPDATE workspace_v3.message_flags SET user_uuid = %s
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (
+                target_user_uuid,
+                self.project_uuid,
+                stream_uuid,
+                current["user_uuid"],
+            ),
+        )
+        self.session.execute(
+            """
+            DELETE FROM workspace_v3.folder_items
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (self.project_uuid, stream_uuid, current["user_uuid"]),
+        )
+        self.session.execute(
+            """
+            DELETE FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (self.project_uuid, entity_uuid),
+        )
+        self.session.execute(
+            """
+            UPDATE workspace_v3.stream_bindings SET uuid = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (entity_uuid, self.project_uuid, temporary_uuid),
+        )
 
     def delete(
         self,
@@ -550,6 +760,27 @@ class ProviderEntityStore:
             ),
         ).fetchone()
         return None if row is None else dict(row)
+
+    def provider_data_for_entity(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+    ) -> dict[str, typing.Any] | None:
+        """Return the canonical Provider payload without requiring prior ownership."""
+        table = TABLES[resource]
+        if resource == "users":
+            query = f"SELECT * FROM workspace_v3.{table} WHERE uuid = %s"
+            parameters: tuple[typing.Any, ...] = (entity_uuid,)
+        else:
+            query = (
+                f"SELECT * FROM workspace_v3.{table} "
+                "WHERE project_id = %s AND uuid = %s"
+            )
+            parameters = (self.project_uuid, entity_uuid)
+        row = self.session.execute(query, parameters).fetchone()
+        if row is None:
+            return None
+        return jsonable(self._provider_data(resource, dict(row)))
 
     def _entity_result(
         self,
@@ -987,6 +1218,9 @@ class ProviderEntityStore:
                 role, notification_mode, created_at, updated_at
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp())
             ON CONFLICT (uuid) DO UPDATE SET
+                stream_uuid = EXCLUDED.stream_uuid,
+                user_uuid = EXCLUDED.user_uuid,
+                who_uuid = EXCLUDED.who_uuid,
                 role = EXCLUDED.role,
                 notification_mode = EXCLUDED.notification_mode,
                 notification_updated_at = clock_timestamp(),
@@ -1044,6 +1278,9 @@ class ProviderEntityStore:
                 notification_mode, created_at, updated_at
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, clock_timestamp())
             ON CONFLICT (uuid) DO UPDATE SET
+                stream_uuid = EXCLUDED.stream_uuid,
+                topic_uuid = EXCLUDED.topic_uuid,
+                user_uuid = EXCLUDED.user_uuid,
                 notification_mode = EXCLUDED.notification_mode,
                 notification_updated_at = clock_timestamp(),
                 updated_at = clock_timestamp()
@@ -1170,6 +1407,8 @@ class ProviderEntityStore:
                 emoji_name, source_name, created_at, updated_at
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, clock_timestamp())
             ON CONFLICT (uuid) DO UPDATE SET
+                message_uuid = EXCLUDED.message_uuid,
+                user_uuid = EXCLUDED.user_uuid,
                 emoji_name = EXCLUDED.emoji_name,
                 updated_at = clock_timestamp()
             """,

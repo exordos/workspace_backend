@@ -168,6 +168,9 @@ GENERIC_PROVIDER_SOURCE_MIGRATION_FILE = (
 USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE = (
     "0192-Index-Workspace-v3-user-message-visibility-6b3971.py"
 )
+LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE = (
+    "0193-Backfill-legacy-native-messenger-data-into-Workspace-v3-2ee199.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -490,12 +493,15 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE]._depends == [
         GENERIC_PROVIDER_SOURCE_MIGRATION_FILE
     ]
+    assert migrations[LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE]._depends == [
+        USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE
+    assert engine.get_latest_migration() == LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',

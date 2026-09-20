@@ -301,6 +301,11 @@ def test_v3_provider_consumer_receives_only_its_source_events(api, db):
         (api.project_id, zulip_stream["uuid"]),
     )
     provider_message = _create_message(api, zulip_stream, "provider visible")
+    starred = api.post(
+        f"{MESSAGES}{provider_message['uuid']}/actions/star/invoke",
+        json={},
+    )
+    assert starred.status_code == 200, starred.text
     native_stream = _create_stream(api, "Native source")
     native_message = _create_message(api, native_stream, "provider hidden")
 
@@ -324,10 +329,34 @@ def test_v3_provider_consumer_receives_only_its_source_events(api, db):
         (provider_uuid, provider_uuid, api.project_id),
     ).fetchall()
 
-    assert [str(row[0]) for row in provider_rows] == [provider_message["uuid"]]
+    assert len(provider_rows) == 2
+    assert str(provider_rows[0][0]) == provider_message["uuid"]
     assert provider_rows[0][1] == "message.created"
-    assert provider_rows[0][2]["user_uuid"] == str(api.user_uuid)
-    assert provider_rows[0][2]["read"] is True
+    assert provider_rows[0][2] == {
+        "author_uuid": str(api.user_uuid),
+        "created_at": provider_message["created_at"],
+        "payload": provider_message["payload"],
+        "stream_uuid": provider_message["stream_uuid"],
+        "topic_uuid": provider_message["topic_uuid"],
+    }
+    flag_uuid = db.execute(
+        """
+        SELECT uuid FROM workspace_v3.message_flags
+        WHERE project_id = %s AND message_uuid = %s AND user_uuid = %s
+        """,
+        (api.project_id, provider_message["uuid"], api.user_uuid),
+    ).fetchone()[0]
+    assert provider_rows[1][0] == flag_uuid
+    assert provider_rows[1][1] == "message_flag.updated"
+    assert provider_rows[1][2] == {
+        "mentioned": False,
+        "message_uuid": provider_message["uuid"],
+        "pinned": False,
+        "read": True,
+        "starred": True,
+        "stream_uuid": provider_message["stream_uuid"],
+        "user_uuid": str(api.user_uuid),
+    }
     assert native_message["uuid"] not in {str(row[0]) for row in provider_rows}
 
 
@@ -594,6 +623,56 @@ def test_v3_projection_events_keep_flat_v2_public_payloads(
     assert all(event["payload"]["updated_at"].endswith("Z") for event in folder_events)
 
 
+def test_v3_reaction_delete_emits_one_complete_legacy_event(
+    api,
+    workspace_api,
+    db,
+):
+    workspace_api.user_uuid = api.user_uuid
+    workspace_api.project_id = api.project_id
+    stream = _create_stream(api, "Reaction delete events")
+    message = _create_message(api, stream)
+    reaction = api.post(
+        REACTIONS,
+        json={"message_uuid": message["uuid"], "emoji_name": "eyes"},
+    )
+    assert reaction.status_code == 201, reaction.text
+    _drain_projections(db)
+    before_delete = workspace_api.get(EPOCH).json()
+
+    deleted = api.delete(f"{REACTIONS}{reaction.json()['uuid']}")
+    assert deleted.status_code == 204, deleted.text
+    metrics = _drain_projections(db)
+    assert metrics["failed"] == 0
+
+    response = workspace_api.get(
+        EVENTS,
+        params={
+            "epoch_version>": before_delete["current_epoch_version"],
+            "epoch_generation": before_delete["epoch_generation"],
+            "page_limit": 100,
+        },
+    )
+    assert response.status_code == 200, response.text
+    reaction_events = [
+        event
+        for event in response.json()
+        if event["payload"]["kind"] == "message_reaction.deleted"
+    ]
+    assert [event["payload"] for event in reaction_events] == [
+        {
+            "kind": "message_reaction.deleted",
+            "uuid": reaction.json()["uuid"],
+            "project_id": str(api.project_id),
+            "message_uuid": message["uuid"],
+            "user_uuid": str(api.user_uuid),
+            "emoji_name": "eyes",
+            "source_name": "native",
+            "source": {"kind": "native"},
+        }
+    ]
+
+
 def test_v3_event_retention_advances_reconnect_floor(api, workspace_api, db):
     workspace_api.user_uuid = api.user_uuid
     workspace_api.project_id = api.project_id
@@ -657,3 +736,14 @@ def test_v3_avatar_file_lifecycle_uses_v3_metadata(api, db, tmp_path, monkeypatc
             (file_uuid,),
         )
         assert cursor.fetchone()[0] == 0
+
+
+def test_v3_presence_action_accepts_public_resource_uuid(api):
+    response = api.post(
+        f"{V1}/users/{api.user_uuid}/actions/presence/invoke",
+        json={"status": "active"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["uuid"] == api.user_uuid
+    assert response.json()["status"] == "active"

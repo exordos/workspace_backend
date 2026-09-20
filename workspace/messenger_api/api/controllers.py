@@ -557,8 +557,8 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         action: typing.Any,
         values: typing.Any = None,
     ) -> typing.Any:
-        resource_uuid = (
-            resource["uuid"] if isinstance(resource, dict) else resource.uuid
+        resource_uuid = sys_uuid.UUID(
+            str(resource["uuid"] if isinstance(resource, dict) else resource.uuid)
         )
         with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
             return db.perform_action(

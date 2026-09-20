@@ -76,7 +76,9 @@ _RESOURCE_OBJECT_TYPES = {
     "streams": "stream",
     "stream_bindings": "stream_binding",
     "stream_topics": "topic",
+    "topic_bindings": "topic_binding",
     "messages": "message",
+    "message_flags": "message_flag",
     "message_reactions": "message_reaction",
     "users": "user",
 }
@@ -789,12 +791,36 @@ class MessengerV3Store:
         resource: str,
         resource_uuid: object,
     ) -> tuple[sys_uuid.UUID, ...]:
+        if resource == "users":
+            return self._provider_consumers_for_user(resource_uuid)
         if resource == "streams":
             stream_uuid = resource_uuid
+        elif resource == "stream_bindings":
+            row = _session().execute(
+                """
+                SELECT stream_uuid FROM workspace_v3.stream_bindings
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
         elif resource == "stream_topics":
             row = _session().execute(
                 """
                 SELECT stream_uuid FROM workspace_v3.topics
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
+        elif resource == "topic_bindings":
+            row = _session().execute(
+                """
+                SELECT stream_uuid FROM workspace_v3.topic_bindings
                 WHERE project_id = %s AND uuid = %s
                 """,
                 (self.project_uuid, resource_uuid),
@@ -807,6 +833,21 @@ class MessengerV3Store:
                 """
                 SELECT stream_uuid FROM workspace_v3.messages
                 WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, resource_uuid),
+            ).fetchone()
+            if row is None:
+                return ()
+            stream_uuid = row["stream_uuid"]
+        elif resource == "message_flags":
+            row = _session().execute(
+                """
+                SELECT message.stream_uuid
+                FROM workspace_v3.message_flags AS flag
+                JOIN workspace_v3.messages AS message
+                  ON message.project_id = flag.project_id
+                 AND message.uuid = flag.message_uuid
+                WHERE flag.project_id = %s AND flag.uuid = %s
                 """,
                 (self.project_uuid, resource_uuid),
             ).fetchone()
@@ -874,8 +915,6 @@ class MessengerV3Store:
         provider_consumers: typing.Iterable[sys_uuid.UUID] = (),
         provider_payload: dict[str, typing.Any] | None = None,
     ) -> int:
-        if not payloads:
-            return 0
         session = _session()
         consumers: list[tuple[str, sys_uuid.UUID]] = [
             ("user", user_uuid) for user_uuid in sorted(payloads, key=str)
@@ -887,6 +926,8 @@ class MessengerV3Store:
             for provider_uuid in providers
             if origin != ("provider", provider_uuid)
         )
+        if not consumers:
+            return 0
         digest = hashlib.sha256(
             "\n".join(f"{kind_}:{uuid}" for kind_, uuid in consumers).encode()
         ).hexdigest()
@@ -924,10 +965,13 @@ class MessengerV3Store:
                     ),
                 )
             self._known_audience_snapshots.add(snapshot_uuid)
-        common_payload, recipient_payloads = _partition_event_payloads(
-            object_type,
-            payloads,
-        )
+        if payloads:
+            common_payload, recipient_payloads = _partition_event_payloads(
+                object_type,
+                payloads,
+            )
+        else:
+            common_payload, recipient_payloads = {}, {}
         base_payload = {"kind": kind, **common_payload}
         event_uuid = sys_uuid.uuid4()
         event = session.execute(
@@ -1011,17 +1055,139 @@ class MessengerV3Store:
             recipient_values,
         )
         object_type = _RESOURCE_OBJECT_TYPES[resource]
+        provider_consumers = self._provider_consumers_for_resource(
+            resource,
+            resource_uuid,
+        )
         self._emit(
             kind=f"{object_type}.{action}",
             object_type=object_type,
             action=action,
             entity_uuid=resource_uuid,
             payloads=payloads,
-            provider_consumers=self._provider_consumers_for_resource(
+            provider_consumers=provider_consumers,
+            provider_payload=self._provider_entity_payload(
                 resource,
                 resource_uuid,
+                provider_consumers,
             ),
         )
+
+    def _provider_entity_payload(
+        self,
+        resource: str,
+        resource_uuid: object,
+        provider_consumers: typing.Iterable[sys_uuid.UUID],
+    ) -> dict[str, typing.Any] | None:
+        providers = tuple(provider_consumers)
+        if not providers:
+            return None
+        provider_resource = "topics" if resource == "stream_topics" else resource
+        if provider_resource not in {
+            "users",
+            "streams",
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+            "message_flags",
+            "message_reactions",
+        }:
+            return None
+        # Import lazily: provider_store builds on MessengerV3Store, while this
+        # path is used only after both modules are initialized.
+        from workspace.messenger_api import provider_store
+
+        provider = _session().execute(
+            """
+            SELECT uuid, name
+            FROM workspace_v3.provider_consumers
+            WHERE project_id = %s AND uuid = %s AND enabled
+            """,
+            (self.project_uuid, providers[0]),
+        ).fetchone()
+        if provider is None:
+            return None
+        store = provider_store.ProviderEntityStore(
+            _session(),
+            self.project_uuid,
+            self.user_uuid,
+            provider,
+        )
+        return store.provider_data_for_entity(
+            provider_resource,
+            sys_uuid.UUID(str(resource_uuid)),
+        )
+
+    def _emit_provider_resource(
+        self,
+        resource: str,
+        resource_uuid: object,
+        action: str = "updated",
+    ) -> None:
+        provider_consumers = self._provider_consumers_for_resource(
+            resource,
+            resource_uuid,
+        )
+        provider_payload = self._provider_entity_payload(
+            resource,
+            resource_uuid,
+            provider_consumers,
+        )
+        if provider_payload is None:
+            return
+        object_type = _RESOURCE_OBJECT_TYPES[resource]
+        self._emit(
+            kind=f"{object_type}.{action}",
+            object_type=object_type,
+            action=action,
+            entity_uuid=resource_uuid,
+            payloads={},
+            provider_consumers=provider_consumers,
+            provider_payload=provider_payload,
+        )
+
+    def _emit_provider_resources(
+        self,
+        resource: str,
+        resource_uuids: typing.Iterable[object],
+        action: str = "updated",
+    ) -> None:
+        ordered = tuple(
+            sorted(
+                {sys_uuid.UUID(str(value)) for value in resource_uuids},
+                key=str,
+            )
+        )
+        object_type = _RESOURCE_OBJECT_TYPES[resource]
+        for offset in range(0, len(ordered), 500):
+            items = []
+            consumers: set[sys_uuid.UUID] = set()
+            for resource_uuid in ordered[offset : offset + 500]:
+                providers = self._provider_consumers_for_resource(
+                    resource,
+                    resource_uuid,
+                )
+                payload = self._provider_entity_payload(
+                    resource,
+                    resource_uuid,
+                    providers,
+                )
+                if payload is None:
+                    continue
+                consumers.update(providers)
+                items.append({"uuid": str(resource_uuid), **payload})
+            if not items or not consumers:
+                continue
+            self._emit(
+                kind=f"{object_type}.{action}",
+                object_type=object_type,
+                action=action,
+                entity_uuid=ordered[offset],
+                payloads={},
+                provider_consumers=consumers,
+                provider_payload={"items": items},
+            )
 
     def _event_resource_payloads(
         self,
@@ -1415,6 +1581,11 @@ class MessengerV3Store:
         provider_consumers = self._provider_consumers_for_stream(
             message["stream_uuid"]
         )
+        provider_payload = self._provider_entity_payload(
+            "messages",
+            message_uuid,
+            provider_consumers,
+        )
         _session().execute(
             "DELETE FROM workspace_v3.messages WHERE project_id = %s AND uuid = %s",
             (self.project_uuid, message_uuid),
@@ -1435,6 +1606,7 @@ class MessengerV3Store:
             entity_uuid=message_uuid,
             payloads={recipient: payload for recipient in recipients},
             provider_consumers=provider_consumers,
+            provider_payload=provider_payload,
         )
         return None
 
@@ -1581,12 +1753,23 @@ class MessengerV3Store:
             recipients = self._stream_recipients(stream_uuid)
             if resource == "streams":
                 self._require_manage_stream(stream_uuid)
+        elif resource == "message_reactions":
+            # The projection worker emits the complete legacy-compatible
+            # reaction event after it has rebuilt the message aggregate.
+            # Keep this direct deletion event provider-only so old clients do
+            # not observe a preliminary payload containing just the UUID.
+            recipients = ()
         else:
             recipients = (self.user_uuid,)
         provider_consumers = (
             self._provider_consumers_for_stream(stream_uuid)
             if resource in {"streams", "stream_bindings", "stream_topics"}
             else self._provider_consumers_for_resource(resource, resource_uuid)
+        )
+        provider_payload = self._provider_entity_payload(
+            resource,
+            resource_uuid,
+            provider_consumers,
         )
         query = (
             f'DELETE FROM workspace_v3."{table}" WHERE project_id = %s AND uuid = %s'
@@ -1607,7 +1790,7 @@ class MessengerV3Store:
             entity_uuid=resource_uuid,
             payloads={recipient: payload for recipient in recipients},
             provider_consumers=provider_consumers,
-            provider_payload=_simple(current),
+            provider_payload=provider_payload,
         )
         return None
 
@@ -1739,7 +1922,11 @@ class MessengerV3Store:
                 }
                 for recipient in recipients
             },
-            provider_consumers=self._provider_consumers_for_stream(stream_uuid),
+        )
+        self._emit_provider_resources(
+            "stream_bindings",
+            (row["uuid"] for row in inserted),
+            "created",
         )
         return result
 
@@ -1791,13 +1978,14 @@ class MessengerV3Store:
             return self.get_resource("streams", resource_uuid)
         if resource == "streams" and action == "notifications":
             stream = self.get_resource("streams", resource_uuid)
-            _session().execute(
+            binding = _session().execute(
                 """
                 UPDATE workspace_v3.stream_bindings
                 SET notification_mode = %s,
                     notification_updated_at = clock_timestamp(),
                     updated_at = clock_timestamp()
                 WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+                RETURNING uuid
                 """,
                 (
                     values["notification_mode"],
@@ -1805,9 +1993,10 @@ class MessengerV3Store:
                     resource_uuid,
                     self.user_uuid,
                 ),
-            )
+            ).fetchone()
+            topic_bindings = []
             if values["notification_mode"] != "muted":
-                _session().execute(
+                topic_bindings = _session().execute(
                     """
                     UPDATE workspace_v3.topic_bindings
                     SET notification_mode = 'default',
@@ -1815,9 +2004,10 @@ class MessengerV3Store:
                         updated_at = clock_timestamp()
                     WHERE project_id = %s AND stream_uuid = %s
                       AND user_uuid = %s AND notification_mode = 'unmute'
+                    RETURNING uuid
                     """,
                     (self.project_uuid, resource_uuid, self.user_uuid),
-                )
+                ).fetchall()
             row = self.get_resource("streams", resource_uuid)
             self._emit(
                 kind="stream.updated",
@@ -1825,7 +2015,12 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
-                provider_consumers=self._provider_consumers_for_stream(resource_uuid),
+            )
+            if binding is not None:
+                self._emit_provider_resource("stream_bindings", binding["uuid"])
+            self._emit_provider_resources(
+                "topic_bindings",
+                (item["uuid"] for item in topic_bindings),
             )
             if (
                 stream["notification_mode"] == "muted"
@@ -1842,9 +2037,6 @@ class MessengerV3Store:
                         action="updated",
                         entity_uuid=topic_row["uuid"],
                         payloads={self.user_uuid: topic_row},
-                        provider_consumers=self._provider_consumers_for_stream(
-                            resource_uuid
-                        ),
                     )
             return row
         if resource in {"messages", "stream_topics", "streams"} and action in {
@@ -1853,11 +2045,12 @@ class MessengerV3Store:
         }:
             return self._read_action(resource, resource_uuid, action)
         if resource == "messages" and action in {"star", "unstar"}:
-            _session().execute(
+            flag = _session().execute(
                 """
                 UPDATE workspace_v3.message_flags
                 SET starred = %s, updated_at = clock_timestamp()
                 WHERE project_id = %s AND message_uuid = %s AND user_uuid = %s
+                RETURNING uuid
                 """,
                 (
                     action == "star",
@@ -1865,7 +2058,7 @@ class MessengerV3Store:
                     resource_uuid,
                     self.user_uuid,
                 ),
-            )
+            ).fetchone()
             row = self.get_resource("messages", resource_uuid)
             self._emit(
                 kind="message.updated",
@@ -1873,10 +2066,9 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
-                provider_consumers=self._provider_consumers_for_stream(
-                    row["stream_uuid"]
-                ),
             )
+            if flag is not None:
+                self._emit_provider_resource("message_flags", flag["uuid"])
             return row
         if resource == "stream_topics" and action == "toggle_done":
             topic = self.get_resource(resource, resource_uuid)
@@ -1906,13 +2098,14 @@ class MessengerV3Store:
                 raise messenger_exceptions.InvalidTopicNotificationModeError(
                     mode=values["notification_mode"]
                 )
-            _session().execute(
+            binding = _session().execute(
                 """
                 UPDATE workspace_v3.topic_bindings
                 SET notification_mode = %s,
                     notification_updated_at = clock_timestamp(),
                     updated_at = clock_timestamp()
                 WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
+                RETURNING uuid
                 """,
                 (
                     values["notification_mode"],
@@ -1920,7 +2113,7 @@ class MessengerV3Store:
                     resource_uuid,
                     self.user_uuid,
                 ),
-            )
+            ).fetchone()
             row = self.get_resource(resource, resource_uuid)
             self._emit(
                 kind="topic.updated",
@@ -1928,10 +2121,9 @@ class MessengerV3Store:
                 action="updated",
                 entity_uuid=resource_uuid,
                 payloads={self.user_uuid: row},
-                provider_consumers=self._provider_consumers_for_stream(
-                    row["stream_uuid"]
-                ),
             )
+            if binding is not None:
+                self._emit_provider_resource("topic_bindings", binding["uuid"])
             return row
         if resource == "stream_topics" and action == "set_default":
             topic = self.get_resource(resource, resource_uuid)
@@ -1990,7 +2182,9 @@ class MessengerV3Store:
                 "updated_at = clock_timestamp() WHERE uuid = %s",
                 [*updates.values(), resource_uuid],
             )
-            return self.get_resource(resource, resource_uuid)
+            row = self.get_resource(resource, resource_uuid)
+            self._emit_resource("users", resource_uuid, "updated", (self.user_uuid,))
+            return row
         if resource == "users" and action in {"avatar_upload", "avatar_reset"}:
             if resource_uuid != self.user_uuid:
                 _not_found(resource, resource_uuid)
@@ -2022,14 +2216,7 @@ class MessengerV3Store:
             if previous_file_uuid is not None:
                 self.delete_resource("files", previous_file_uuid)
             row = self.get_resource(resource, resource_uuid)
-            self._emit(
-                kind="user.updated",
-                object_type="user",
-                action="updated",
-                entity_uuid=resource_uuid,
-                payloads={self.user_uuid: row},
-                provider_consumers=self._provider_consumers_for_user(resource_uuid),
-            )
+            self._emit_resource("users", resource_uuid, "updated", (self.user_uuid,))
             return row
         raise ValueError(f"Unsupported Messenger action {resource}.{action}")
 
@@ -2043,7 +2230,7 @@ class MessengerV3Store:
         if resource == "messages":
             self.get_resource(resource, resource_uuid)
             operator = "=" if action == "read" else "<="
-            session.execute(
+            changed = session.execute(
                 f"""
                 UPDATE workspace_v3.message_flags AS flag
                 SET read = true, updated_at = clock_timestamp()
@@ -2057,8 +2244,13 @@ class MessengerV3Store:
                   AND flag.project_id = candidate.project_id
                   AND flag.message_uuid = candidate.uuid
                   AND flag.user_uuid = %s AND NOT flag.read
+                RETURNING flag.uuid
                 """,
                 (self.project_uuid, resource_uuid, self.user_uuid),
+            ).fetchall()
+            self._emit_provider_resources(
+                "message_flags",
+                (row["uuid"] for row in changed),
             )
             return self.get_resource(resource, resource_uuid)
         if resource == "stream_topics":
@@ -2069,7 +2261,7 @@ class MessengerV3Store:
             topic = self.get_resource(resource, resource_uuid)
             predicate = "message.stream_uuid = %s"
             identifier = resource_uuid
-        session.execute(
+        changed = session.execute(
             f"""
             UPDATE workspace_v3.message_flags AS flag
             SET read = true, updated_at = clock_timestamp()
@@ -2078,8 +2270,13 @@ class MessengerV3Store:
               AND flag.project_id = message.project_id
               AND flag.message_uuid = message.uuid
               AND flag.user_uuid = %s AND NOT flag.read
+            RETURNING flag.uuid
             """,
             (self.project_uuid, identifier, self.user_uuid),
+        ).fetchall()
+        self._emit_provider_resources(
+            "message_flags",
+            (row["uuid"] for row in changed),
         )
         return topic
 

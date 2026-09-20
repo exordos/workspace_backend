@@ -78,6 +78,18 @@ def _uuid(value: typing.Any, field: str) -> sys_uuid.UUID:
         ) from error
 
 
+def _rebind_identity(value: typing.Any) -> bool:
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise messenger_exceptions.ProviderApiError(
+            status=422,
+            error="invalid_identity_rebind",
+            message="rebind_identity must be a boolean",
+        )
+    return value
+
+
 class ProviderApiMiddleware(middlewares.Middleware):
     """Serve Provider CRUD before the public RestAlchemy route dispatcher."""
 
@@ -177,6 +189,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
                     content_hash,
                     data,
                     source_updated_at,
+                    rebind_identity=_rebind_identity(body.get("rebind_identity")),
                 )
             except messenger_exceptions.ProviderApiError:
                 raise
@@ -250,6 +263,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
                         operation["content_hash"],
                         operation["data"],
                         operation["source_updated_at"],
+                        rebind_identity=operation["rebind_identity"],
                         emit_event=(
                             delivery_class == "live"
                             or operation["resource"]
@@ -329,6 +343,9 @@ class ProviderApiMiddleware(middlewares.Middleware):
                     message="upsert data must be a JSON object",
                 )
             result["data"] = data
+            result["rebind_identity"] = _rebind_identity(
+                operation.get("rebind_identity")
+            )
         return result
 
     @staticmethod

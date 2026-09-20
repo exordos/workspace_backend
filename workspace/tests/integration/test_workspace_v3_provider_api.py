@@ -49,12 +49,21 @@ def _register_provider(api, db, name="zulip"):
     return provider_uuid
 
 
-def _put(api, resource, entity_uuid, data, content_hash=None):
+def _put(
+    api,
+    resource,
+    entity_uuid,
+    data,
+    content_hash=None,
+    *,
+    rebind_identity=False,
+):
     return api.put(
         f"{ROOT}/{resource}/{entity_uuid}",
         json={
             "content_hash": content_hash or _hash(data),
             "data": data,
+            "rebind_identity": rebind_identity,
         },
     )
 
@@ -507,6 +516,84 @@ def test_provider_batch_imports_graph_emits_events_and_cleans_cascades(api, db):
     )
     assert identity_change.status_code == 409, identity_change.text
     assert identity_change.json()["error"] == "entity_identity_conflict"
+
+    rebound_data = {**message_data, "author_uuid": str(owner_uuid)}
+    identity_rebind = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={
+            "operations": [
+                {
+                    "action": "upsert",
+                    "type": "messages",
+                    "uuid": str(message_uuid),
+                    "content_hash": _hash(rebound_data),
+                    "data": rebound_data,
+                    "rebind_identity": True,
+                }
+            ]
+        },
+    )
+    assert identity_rebind.status_code == 200, identity_rebind.text
+    assert identity_rebind.json()["results"][0]["status"] == "updated"
+    rebound_message = api.get(f"{ROOT}/messages/{message_uuid}")
+    assert rebound_message.json()["data"]["author_uuid"] == str(owner_uuid)
+
+    owner_binding_data = next(
+        data
+        for resource, entity_uuid, data in entities
+        if resource == "stream_bindings" and entity_uuid == owner_binding_uuid
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.users (
+            uuid, created_at, updated_at, username, source, status, avatar
+        ) VALUES (
+            %s, NOW(), NOW(), %s, 'iam', 'active',
+            'urn:gravatar:00000000000000000000000000000000'
+        )
+        ON CONFLICT (uuid) DO NOTHING
+        """,
+        (api.user_uuid, f"iam-{api.user_uuid}"),
+    )
+    rebound_binding_data = {
+        **owner_binding_data,
+        "user_uuid": str(api.user_uuid),
+        "who_uuid": str(api.user_uuid),
+    }
+    binding_rebind = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={
+            "operations": [
+                {
+                    "action": "upsert",
+                    "type": "stream_bindings",
+                    "uuid": str(owner_binding_uuid),
+                    "content_hash": _hash(rebound_binding_data),
+                    "data": rebound_binding_data,
+                    "rebind_identity": True,
+                }
+            ]
+        },
+    )
+    assert binding_rebind.status_code == 200, binding_rebind.text
+    rebound_binding = api.get(f"{ROOT}/stream_bindings/{owner_binding_uuid}")
+    assert rebound_binding.json()["data"]["user_uuid"] == str(api.user_uuid)
+    dependent_users = db.execute(
+        """
+        SELECT
+            (SELECT user_uuid FROM workspace_v3.topic_bindings
+             WHERE project_id = %s AND uuid = %s),
+            (SELECT user_uuid FROM workspace_v3.message_flags
+             WHERE project_id = %s AND uuid = %s)
+        """,
+        (
+            api.project_id,
+            owner_topic_binding_uuid,
+            api.project_id,
+            owner_flag_uuid,
+        ),
+    ).fetchone()
+    assert dependent_users == (sys_uuid.UUID(api.user_uuid),) * 2
 
     blocked = api.delete(f"{ROOT}/users/{peer_uuid}")
     assert blocked.status_code == 409, blocked.text

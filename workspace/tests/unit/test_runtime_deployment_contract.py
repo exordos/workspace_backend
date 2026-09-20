@@ -282,20 +282,23 @@ def test_manifest_exposes_only_api_routes_from_the_backend_node():
 
     assert "location /api/workspace/" in manifest
     assert "location = /api/workspace/v1/events/ws" in manifest
+    assert "location /api/workspace/v1/users/" in manifest
+    assert "proxy_pass http://127.0.0.1:21081/v1/users/;" in manifest
     assert "root /opt/workspace-ui" not in manifest
     assert "alias /opt/workspace-ui" not in manifest
     assert "location / {\n                  return 404;" in manifest
 
 
-def test_manifest_proxies_core_api_over_https():
+def test_manifest_proxies_core_api_over_internal_http():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 
-    assert "proxy_pass https://workspace_core_api/api/core/;" in manifest
-    assert "proxy_pass http://workspace_core_api/api/core/;" not in manifest
-    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' in manifest
+    assert "proxy_pass http://workspace_core_api/api/core/;" in manifest
+    assert "proxy_pass https://workspace_core_api/api/core/;" not in manifest
     assert (
-        'f"server {$workspace.imports.$var_core_ip_address:value}:80;"' not in manifest
+        'f"server {$workspace.imports.$var_core_ip_address:value}:80;"'
+        in manifest
     )
+    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' not in manifest
 
 
 def test_backend_bootstrap_has_no_secondary_storage_gate():
