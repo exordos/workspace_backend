@@ -114,7 +114,8 @@ _EVENT_RESOURCE_QUERIES = {
     """,
     "streams": """
         SELECT stream.uuid, stream.project_id,
-               binding.user_uuid, stream.name, stream.description,
+               binding.user_uuid, stream.name,
+               COALESCE(stream.description, '') AS description,
                stream.owner_uuid AS owner, binding.role,
                binding.notification_mode, binding.unread_count,
                binding.active_unread_count,
@@ -400,7 +401,8 @@ class MessengerV3Store:
             """,
             "streams": """
                 SELECT stream.uuid, stream.project_id,
-                       binding.user_uuid, stream.name, stream.description,
+                       binding.user_uuid, stream.name,
+                       COALESCE(stream.description, '') AS description,
                        stream.owner_uuid AS owner, binding.role,
                        binding.notification_mode, binding.unread_count,
                        binding.active_unread_count,

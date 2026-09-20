@@ -624,6 +624,7 @@ def test_provider_graph_keeps_the_unchanged_client_contract(
     topic_uuid = sys_uuid.uuid4()
     message_uuid = sys_uuid.uuid4()
     reaction_uuid = sys_uuid.uuid4()
+    stream_binding_uuid = sys_uuid.uuid4()
     created_at = "2026-09-19T08:00:00Z"
     entities = [
         ("users", owner_uuid, _user_data(owner_uuid, display_name="Owner")),
@@ -637,7 +638,6 @@ def test_provider_graph_keeps_the_unchanged_client_contract(
             stream_uuid,
             {
                 "name": "Imported channel",
-                "description": "",
                 "owner_uuid": str(owner_uuid),
                 "default_topic_uuid": str(topic_uuid),
                 "created_at": created_at,
@@ -645,7 +645,7 @@ def test_provider_graph_keeps_the_unchanged_client_contract(
         ),
         (
             "stream_bindings",
-            sys_uuid.uuid4(),
+            stream_binding_uuid,
             {
                 "stream_uuid": str(stream_uuid),
                 "user_uuid": str(owner_uuid),
@@ -727,6 +727,7 @@ def test_provider_graph_keeps_the_unchanged_client_contract(
 
     stream = api.get(f"/v1/streams/{stream_uuid}")
     assert stream.status_code == 200, stream.text
+    assert stream.json()["description"] == ""
     assert stream.json()["source_name"] == "zulip"
     assert stream.json()["source"] == {"kind": "zulip", "stream_id": 0}
     assert "provider" not in stream.json()
@@ -765,6 +766,32 @@ def test_provider_graph_keeps_the_unchanged_client_contract(
         "kind": "zulip",
         "stream_id": 0,
     }
+
+    updated_binding = {
+        "stream_uuid": str(stream_uuid),
+        "user_uuid": str(owner_uuid),
+        "who_uuid": str(owner_uuid),
+        "role": "moderator",
+        "created_at": created_at,
+    }
+    updated = _put(
+        api,
+        "stream_bindings",
+        stream_binding_uuid,
+        updated_binding,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["status"] == "updated"
+
+    refreshed_events = workspace_api.get(
+        "/v1/events/?epoch_version%3E=0&page_limit=200"
+    )
+    assert refreshed_events.status_code == 200, refreshed_events.text
+    assert any(
+        event["payload"]["kind"] == "stream.created"
+        and event["payload"].get("uuid") == str(stream_uuid)
+        for event in refreshed_events.json()
+    )
 
 
 def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):

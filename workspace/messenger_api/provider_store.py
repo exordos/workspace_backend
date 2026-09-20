@@ -1577,6 +1577,10 @@ class ProviderEntityStore:
                     payloads=payloads,
                     provider_consumers=self._stream_providers(stream_uuid),
                 )
+                user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
+                self.events._emit_resource(
+                    "streams", stream_uuid, "created", (user_uuid,)
+                )
             return
         if resource == "topics":
             stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
