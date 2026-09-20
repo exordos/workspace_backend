@@ -127,6 +127,26 @@ def test_v3_api_keeps_routes_and_reduces_provider_projection(api):
     assert second["created_at"].endswith("Z")
 
 
+def test_v3_topic_without_default_is_legacy_boolean(api, db):
+    stream = _create_stream(api, "Provider topic compatibility")
+    db.execute(
+        """
+        UPDATE workspace_v3.streams
+        SET default_topic_uuid = NULL
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (api.project_id, stream["uuid"]),
+    )
+
+    topics = api.get(TOPICS)
+
+    assert topics.status_code == 200, topics.text
+    topic = next(
+        row for row in topics.json() if row["uuid"] == stream["default_topic_uuid"]
+    )
+    assert topic["is_default"] is False
+
+
 def test_v3_initializes_the_three_legacy_automatic_folders(api):
     response = api.get(FOLDERS)
 

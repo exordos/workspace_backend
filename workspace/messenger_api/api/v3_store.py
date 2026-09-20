@@ -148,7 +148,8 @@ _EVENT_RESOURCE_QUERIES = {
                binding.last_message_uuid, binding.unread_count,
                binding.active_unread_count,
                binding.passive_unread_count,
-               topic.uuid = stream.default_topic_uuid AS is_default,
+               COALESCE(topic.uuid = stream.default_topic_uuid, FALSE)
+                   AS is_default,
                topic.is_done, binding.notification_mode,
                topic.source_name, topic.summary,
                topic.summary_last_message_uuid,
@@ -443,7 +444,8 @@ class MessengerV3Store:
                        binding.last_message_uuid, binding.unread_count,
                        binding.active_unread_count,
                        binding.passive_unread_count,
-                       topic.uuid = stream.default_topic_uuid AS is_default,
+                       COALESCE(topic.uuid = stream.default_topic_uuid, FALSE)
+                           AS is_default,
                        topic.is_done, binding.notification_mode,
                        topic.source_name, topic.summary,
                        topic.summary_last_message_uuid,
