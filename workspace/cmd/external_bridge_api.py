@@ -118,6 +118,7 @@ def build_runtime(
         base_url,
         control_pki.control_hmac_key(),
         resolve_workspace_file=canonical_files.resolve,
+        resolve_workspace_sticker=canonical_files.resolve_sticker,
         commit_file_projection=canonical_files.commit_projection,
         resolve_workspace_content=canonical_files.find_reusable_content,
     )

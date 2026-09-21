@@ -234,6 +234,27 @@ def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
     assert "endpoint_claim_seconds = 1800" in manifest
 
 
+def test_manifest_provisions_unassigned_sticker_catalog_admin():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert 'name: "workspace.sticker_catalog.manage"' in manifest
+    assert 'name: "workspace-sticker-catalog-admin"' in manifest
+    assert "  $core.iam.rolebinding:" not in manifest
+    assert "  $core.iam.role_bindings:" not in manifest
+    assert "  $core.iam.permission_bindings:" not in manifest
+    bindings = manifest.split("  $core.iam.permissionbinding:\n", 1)[1].split(
+        "\n  $core.compute.nodes:", 1
+    )[0]
+    assert (
+        bindings.count("role: $core.iam.roles.$workspace_sticker_catalog_admin:uuid")
+        == 1
+    )
+    assert (
+        "permission: $core.iam.permissions.$workspace_sticker_catalog_manage:uuid"
+        in bindings
+    )
+
+
 def test_manifest_bounds_websocket_heartbeat_timeout():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     events_config = manifest.split("[messenger_events]", 1)[1].split(

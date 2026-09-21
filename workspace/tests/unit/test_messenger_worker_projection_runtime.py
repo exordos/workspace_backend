@@ -13,6 +13,7 @@ from workspace.cmd import messenger_worker
 from workspace.common import messenger_worker_opts
 from workspace.services.messenger_workers import agents
 from workspace.services.messenger_workers import projection_wakeup
+from workspace.services.messenger_workers import sticker_cleanup
 from workspace.services.messenger_workers import v2_projection
 
 
@@ -119,12 +120,18 @@ def test_worker_entrypoint_builds_one_primary_and_projection_only_peers():
 
 def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):
     sleeps = []
+    cleanups = []
     worker = agents.MessengerWorkerAgent(
         v2_projection_enabled=True,
         projection_only=True,
         v2_idle_sleep_seconds=0.5,
     )
     monkeypatch.setattr(agents.time, "sleep", sleeps.append)
+    monkeypatch.setattr(
+        worker,
+        "_run_sticker_cleanup_task",
+        lambda: cleanups.append(True),
+    )
     monkeypatch.setattr(worker, "_run_v2_projection_tasks", lambda: True)
 
     worker._iteration()
@@ -135,6 +142,65 @@ def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):
     worker._iteration()
 
     assert sleeps == [0.5]
+    assert cleanups == []
+
+
+def test_primary_projection_worker_processes_sticker_cleanup(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace()
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        sticker_cleanup,
+        "process_one_sticker_cleanup_task",
+        lambda _session, worker_id: calls.append(worker_id) or True,
+    )
+    worker = agents.MessengerWorkerAgent(v2_projection_enabled=True)
+
+    assert worker._run_sticker_cleanup_task() is True
+    assert calls == [worker._v2_worker_id]
+
+
+def test_primary_worker_processes_sticker_cleanup_when_v2_is_disabled(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def session_context():
+        yield types.SimpleNamespace(name="session")
+
+    monkeypatch.setattr(agents, "database_session_context", session_context)
+    monkeypatch.setattr(
+        agents.messenger_dm_helpers,
+        "mark_stale_workspace_users_offline",
+        lambda *, session: None,
+    )
+    monkeypatch.setattr(
+        agents.sql_state,
+        "degrade_stale_bridge_instances",
+        lambda session, *, now: 0,
+    )
+    worker = agents.MessengerWorkerAgent(v2_projection_enabled=False)
+    worker._last_event_prune = agents.time.monotonic()
+    monkeypatch.setattr(
+        worker,
+        "_run_sticker_cleanup_task",
+        lambda: calls.append("cleanup") or True,
+    )
+    monkeypatch.setattr(worker, "_refresh_capabilities", lambda _now: None)
+    monkeypatch.setattr(worker, "_refresh_capability_projections", lambda: None)
+    monkeypatch.setattr(
+        worker,
+        "_repair_external_projection_transitions",
+        lambda _session: None,
+    )
+    monkeypatch.setattr(worker, "_summarize_one_topic", lambda: False)
+
+    worker._iteration()
+
+    assert calls == ["cleanup"]
 
 
 def test_projection_pass_checks_cleanup_once_without_deriving(monkeypatch):

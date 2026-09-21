@@ -64,6 +64,7 @@ def test_read_state_failure_does_not_rollback_presence_or_bridge(monkeypatch):
         read_state_batch_size=50_000,
         read_state_max_batches_per_iteration=8,
     )
+    monkeypatch.setattr(worker, "_run_sticker_cleanup_task", lambda: False)
     worker._last_event_prune = 31.0
     monkeypatch.setattr(worker, "_refresh_capabilities", lambda _now: None)
     monkeypatch.setattr(worker, "_refresh_capability_projections", lambda: None)
@@ -156,6 +157,7 @@ def test_read_state_failure_rotates_to_another_project_with_backoff(monkeypatch)
         read_state_compaction_enabled=True,
         read_state_max_batches_per_iteration=3,
     )
+    monkeypatch.setattr(worker, "_run_sticker_cleanup_task", lambda: False)
     worker._last_event_prune = 100.0
     monkeypatch.setattr(worker, "_refresh_capabilities", lambda _now: None)
     monkeypatch.setattr(worker, "_refresh_capability_projections", lambda: None)
@@ -282,6 +284,7 @@ def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
         ),
     )
     worker = agents.MessengerWorkerAgent(read_state_compaction_enabled=False)
+    monkeypatch.setattr(worker, "_run_sticker_cleanup_task", lambda: False)
     monkeypatch.setattr(
         worker,
         "_prune_expired_events",
@@ -371,6 +374,7 @@ def test_worker_continues_projection_repair_after_event_prune_rollback(
         ),
     )
     worker = agents.MessengerWorkerAgent(read_state_compaction_enabled=False)
+    monkeypatch.setattr(worker, "_run_sticker_cleanup_task", lambda: False)
 
     def fail_prune(session, now):
         calls.append(("events", session.name, now))

@@ -16,6 +16,11 @@ INLINE_CODE_RE = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"(?m)^(#{1,6})[ \t]+")
 TABLE_ROW_RE = re.compile(r"(?m)^\|.*\|[ \t]*$")
+# These internal design contracts were explicitly commissioned in Russian.
+RU_ONLY_DESIGN_DOCS = {
+    "sticker_catalog_api_implementation_plan.md",
+    "sticker_catalog_api_tz.md",
+}
 
 
 def _language_artifacts(language):
@@ -23,7 +28,9 @@ def _language_artifacts(language):
     return {
         path.relative_to(root).as_posix()
         for path in root.rglob("*")
-        if path.is_file() and path.suffix in DOCUMENT_SUFFIXES
+        if path.is_file()
+        and path.suffix in DOCUMENT_SUFFIXES
+        and path.relative_to(root).as_posix() not in RU_ONLY_DESIGN_DOCS
     }
 
 
@@ -57,7 +64,9 @@ def test_markdown_structure_and_machine_values_are_identical():
         for language in LANGUAGES[1:]:
             translated_path = DOCS_ROOT / language / relative
             assert _markdown_contract(translated_path) == expected
-            assert machine_values <= set(INLINE_CODE_RE.findall(translated_path.read_text()))
+            assert machine_values <= set(
+                INLINE_CODE_RE.findall(translated_path.read_text())
+            )
 
 
 def test_each_plantuml_source_has_a_rendered_svg():
@@ -83,7 +92,9 @@ def test_local_documentation_links_resolve():
     failures = []
     for markdown in DOCS_ROOT.rglob("*.md"):
         for destination in LINK_RE.findall(markdown.read_text()):
-            if destination.startswith(("http://", "https://", "mailto:", "urn:", "#", "/")):
+            if destination.startswith(
+                ("http://", "https://", "mailto:", "urn:", "#", "/")
+            ):
                 continue
             path = destination.split("#", 1)[0]
             if path and not (markdown.parent / path).resolve().exists():

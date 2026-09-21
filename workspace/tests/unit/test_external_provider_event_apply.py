@@ -3518,3 +3518,92 @@ def test_unknown_provider_event_kind_is_rejected_before_database_access():
         provider_event_apply.apply_event(event, session, _identity())
 
     assert session.statements == []
+
+
+@pytest.mark.parametrize("existing_message", [False, True])
+def test_provider_message_preserves_canonical_sticker_payload(
+    monkeypatch, existing_message
+):
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    event = _message_event(stream_uuid)
+    resource = event["payload"]["resource"]
+    resource["user_uuid"] = str(owner_uuid)
+    content = f"Edited text ![sticker](urn:sticker:{sys_uuid.uuid4()})"
+    resource["payload"]["content"] = content
+    message_uuid = sys_uuid.UUID(resource["uuid"])
+    received_values = []
+    existing = (
+        types.SimpleNamespace(
+            uuid=message_uuid,
+            user_uuid=owner_uuid,
+            stream_uuid=stream_uuid,
+            topic_uuid=sys_uuid.UUID(resource["topic_uuid"]),
+            source_name=models.SourceName.NATIVE.value,
+            payload=message_payloads.MarkdownPayload(content="Previous text"),
+            provider_external_id=None,
+            provider_metadata={},
+            update_dm=lambda values: received_values.append(values),
+            update=lambda session=None: None,
+        )
+        if existing_message
+        else None
+    )
+    session = Session(
+        {
+            "owner_user_uuid": owner_uuid,
+            "projection_stream_uuid": stream_uuid,
+            "provider_chat_id": "zulip-channel-7",
+        }
+    )
+    monkeypatch.setattr(provider_event_apply, "_existing", lambda *_args: existing)
+    monkeypatch.setattr(
+        provider_event_apply,
+        "_ensure_projection_owner_stream",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_workspace_user_message",
+        lambda *_args, **kwargs: received_values.append(kwargs),
+    )
+    monkeypatch.setattr(
+        provider_event_apply.helpers,
+        "create_compact_workspace_message_updated_events",
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert provider_event_apply.apply_event(event, session, _identity()) == message_uuid
+    assert len(received_values) == 1
+    assert isinstance(received_values[0]["payload"], message_payloads.MarkdownPayload)
+    assert received_values[0]["payload"].content == content
+
+
+def test_cross_project_sticker_payload_does_not_create_file_projection(monkeypatch):
+    content = f"Caption ![sticker](urn:sticker:{sys_uuid.uuid4()})"
+    monkeypatch.setattr(
+        provider_event_apply.models,
+        "WorkspaceFile",
+        types.SimpleNamespace(
+            objects=types.SimpleNamespace(
+                get_one_or_none=lambda **_kwargs: pytest.fail(
+                    "Global catalog stickers must not resolve as stream files"
+                )
+            )
+        ),
+    )
+
+    payload = provider_event_apply._reproject_message_payload_files(
+        Session({}),
+        message_payloads.MarkdownPayload(content=content),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+        sys_uuid.uuid4(),
+        False,
+        native_source_payload=message_payloads.MarkdownPayload(content=content),
+    )
+
+    assert payload.content == content

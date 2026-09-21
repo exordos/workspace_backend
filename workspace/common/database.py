@@ -5,10 +5,17 @@
 
 """Process-specific PostgreSQL connection configuration."""
 
+import typing
 import urllib.parse
 
 from oslo_config import cfg
 from restalchemy.storage.sql import engines
+
+
+def rollback_current_session(session: typing.Any) -> None:
+    """Rollback the caller-owned request session after a known failure."""
+
+    session.rollback()
 
 
 def connection_url_with_application_name(connection_url: str, name: str) -> str:
