@@ -192,6 +192,49 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
             event."updated_at", event."schema_version",
             event."object_type", event."action"
         FROM "m_workspace_events" AS event
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                NULLIF(event."payload"->>'stream_uuid', '')::uuid,
+                CASE
+                    WHEN event."object_type" = 'stream'
+                    THEN NULLIF(event."payload"->>'uuid', '')::uuid
+                END,
+                (
+                    SELECT message."stream_uuid"
+                    FROM "m_workspace_messages" AS message
+                    WHERE message."project_id" = event."project_id"
+                      AND message."uuid" = NULLIF(
+                          event."payload"->>'message_uuid', ''
+                      )::uuid
+                ),
+                (
+                    SELECT placement."stream_uuid"
+                    FROM "messenger_message_placements" AS placement
+                    WHERE placement."project_id" = event."project_id"
+                      AND placement."uuid" = NULLIF(
+                          event."payload"->>'message_uuid', ''
+                      )::uuid
+                )
+            ) AS stream_uuid,
+            COALESCE(
+                (
+                    SELECT message."stream_uuid"
+                    FROM "m_workspace_messages" AS message
+                    WHERE message."project_id" = event."project_id"
+                      AND message."uuid" = NULLIF(
+                          event."payload"->>'old_message_uuid', ''
+                      )::uuid
+                ),
+                (
+                    SELECT placement."stream_uuid"
+                    FROM "messenger_message_placements" AS placement
+                    WHERE placement."project_id" = event."project_id"
+                      AND placement."uuid" = NULLIF(
+                          event."payload"->>'old_message_uuid', ''
+                      )::uuid
+                )
+            ) AS old_stream_uuid
+        ) AS event_stream ON TRUE
         WHERE event."project_id" = %s
           AND event."user_uuid" = %s
           AND event."epoch_version" > %s
@@ -213,6 +256,17 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                         event."payload"->'source'->>'server_url'
                     )
               )
+              OR (
+                  event_stream.stream_uuid IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM "m_confirmed_external_stream_access" AS source_access
+                      WHERE source_access."project_id" = event."project_id"
+                        AND source_access."user_uuid" = event."user_uuid"
+                        AND source_access."stream_uuid" =
+                            event_stream.stream_uuid
+                  )
+              )
           )
           AND (
               event."payload"->>'old_source_name' IS NULL
@@ -229,6 +283,40 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                         event."payload"->'old_source'->>'server_url'
                     )
               )
+              OR (
+                  event_stream.old_stream_uuid IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM "m_confirmed_external_stream_access"
+                          AS old_source_access
+                      WHERE old_source_access."project_id" = event."project_id"
+                        AND old_source_access."user_uuid" = event."user_uuid"
+                        AND old_source_access."stream_uuid" =
+                            event_stream.old_stream_uuid
+                  )
+              )
+          )
+          AND (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM "messenger_event_membership_guards" AS guard
+                  WHERE guard."event_uuid" = event."uuid"
+                    AND guard."user_uuid" = event."user_uuid"
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM "messenger_event_membership_guards" AS guard
+                  LEFT JOIN "messenger_stream_bindings" AS binding
+                    ON binding."project_id" = guard."project_id"
+                   AND binding."stream_uuid" = guard."stream_uuid"
+                   AND binding."user_uuid" = guard."user_uuid"
+                   AND binding."active"
+                   AND binding."membership_generation" =
+                       guard."membership_generation"
+                  WHERE guard."event_uuid" = event."uuid"
+                    AND guard."user_uuid" = event."user_uuid"
+                    AND (guard."control_effect" OR binding."uuid" IS NOT NULL)
+              )
           )
           AND (
               event."object_type" <> 'message'
@@ -243,14 +331,16 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
               )
           )
           AND (
-              event."object_type" <> 'message'
-              OR event."payload"->>'stream_uuid' IS NULL
+              (
+                  event."object_type" = 'stream'
+                  AND event."action" = 'deleted'
+              )
+              OR event_stream.stream_uuid IS NULL
               OR NOT EXISTS (
                   SELECT 1
                   FROM "m_workspace_streams" AS external_stream
                   WHERE external_stream."project_id" = event."project_id"
-                    AND external_stream."uuid" =
-                        (event."payload"->>'stream_uuid')::uuid
+                    AND external_stream."uuid" = event_stream.stream_uuid
                     AND external_stream."source_name" <> 'native'
               )
               OR EXISTS (
@@ -258,8 +348,7 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                   FROM "m_confirmed_external_stream_access" AS stream_access
                   WHERE stream_access."project_id" = event."project_id"
                     AND stream_access."user_uuid" = event."user_uuid"
-                    AND stream_access."stream_uuid" =
-                        (event."payload"->>'stream_uuid')::uuid
+                    AND stream_access."stream_uuid" = event_stream.stream_uuid
               )
           )
         ORDER BY event."epoch_version" ASC
@@ -293,6 +382,49 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
     broadcast_events AS (
         SELECT event.*
         FROM broadcast_payloads AS event
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                NULLIF(event."payload"->>'stream_uuid', '')::uuid,
+                CASE
+                    WHEN event."object_type" = 'stream'
+                    THEN NULLIF(event."payload"->>'uuid', '')::uuid
+                END,
+                (
+                    SELECT message."stream_uuid"
+                    FROM "m_workspace_messages" AS message
+                    WHERE message."project_id" = event."project_id"
+                      AND message."uuid" = NULLIF(
+                          event."payload"->>'message_uuid', ''
+                      )::uuid
+                ),
+                (
+                    SELECT placement."stream_uuid"
+                    FROM "messenger_message_placements" AS placement
+                    WHERE placement."project_id" = event."project_id"
+                      AND placement."uuid" = NULLIF(
+                          event."payload"->>'message_uuid', ''
+                      )::uuid
+                )
+            ) AS stream_uuid,
+            COALESCE(
+                (
+                    SELECT message."stream_uuid"
+                    FROM "m_workspace_messages" AS message
+                    WHERE message."project_id" = event."project_id"
+                      AND message."uuid" = NULLIF(
+                          event."payload"->>'old_message_uuid', ''
+                      )::uuid
+                ),
+                (
+                    SELECT placement."stream_uuid"
+                    FROM "messenger_message_placements" AS placement
+                    WHERE placement."project_id" = event."project_id"
+                      AND placement."uuid" = NULLIF(
+                          event."payload"->>'old_message_uuid', ''
+                      )::uuid
+                )
+            ) AS old_stream_uuid
+        ) AS event_stream ON TRUE
         WHERE (
               COALESCE(event."payload"->>'source_name', 'native') = 'native'
               OR (
@@ -311,6 +443,17 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                         event."payload"->'source'->>'server_url'
                     )
               )
+              OR (
+                  event_stream.stream_uuid IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM "m_confirmed_external_stream_access" AS source_access
+                      WHERE source_access."project_id" = event."project_id"
+                        AND source_access."user_uuid" = event."user_uuid"
+                        AND source_access."stream_uuid" =
+                            event_stream.stream_uuid
+                  )
+              )
           )
           AND (
               event."payload"->>'old_source_name' IS NULL
@@ -327,6 +470,40 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                         event."payload"->'old_source'->>'server_url'
                     )
               )
+              OR (
+                  event_stream.old_stream_uuid IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM "m_confirmed_external_stream_access"
+                          AS old_source_access
+                      WHERE old_source_access."project_id" = event."project_id"
+                        AND old_source_access."user_uuid" = event."user_uuid"
+                        AND old_source_access."stream_uuid" =
+                            event_stream.old_stream_uuid
+                  )
+              )
+          )
+          AND (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM "messenger_event_membership_guards" AS guard
+                  WHERE guard."event_uuid" = event."uuid"
+                    AND guard."user_uuid" = event."user_uuid"
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM "messenger_event_membership_guards" AS guard
+                  LEFT JOIN "messenger_stream_bindings" AS binding
+                    ON binding."project_id" = guard."project_id"
+                   AND binding."stream_uuid" = guard."stream_uuid"
+                   AND binding."user_uuid" = guard."user_uuid"
+                   AND binding."active"
+                   AND binding."membership_generation" =
+                       guard."membership_generation"
+                  WHERE guard."event_uuid" = event."uuid"
+                    AND guard."user_uuid" = event."user_uuid"
+                    AND (guard."control_effect" OR binding."uuid" IS NOT NULL)
+              )
           )
           AND (
               event."object_type" <> 'message'
@@ -341,14 +518,16 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
               )
           )
           AND (
-              event."object_type" <> 'message'
-              OR event."payload"->>'stream_uuid' IS NULL
+              (
+                  event."object_type" = 'stream'
+                  AND event."action" = 'deleted'
+              )
+              OR event_stream.stream_uuid IS NULL
               OR NOT EXISTS (
                   SELECT 1
                   FROM "m_workspace_streams" AS external_stream
                   WHERE external_stream."project_id" = event."project_id"
-                    AND external_stream."uuid" =
-                        (event."payload"->>'stream_uuid')::uuid
+                    AND external_stream."uuid" = event_stream.stream_uuid
                     AND external_stream."source_name" <> 'native'
               )
               OR EXISTS (
@@ -356,8 +535,7 @@ BOUNDED_VISIBLE_EVENTS_SQL = """
                   FROM "m_confirmed_external_stream_access" AS stream_access
                   WHERE stream_access."project_id" = event."project_id"
                     AND stream_access."user_uuid" = event."user_uuid"
-                    AND stream_access."stream_uuid" =
-                        (event."payload"->>'stream_uuid')::uuid
+                    AND stream_access."stream_uuid" = event_stream.stream_uuid
               )
           )
         ORDER BY event."epoch_version" ASC
@@ -1310,6 +1488,45 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             return (stream.external_account_uuid,)
         return ()
 
+    def _provider_user_account_uuids_for_message(
+        self,
+        stream: models.WorkspaceStream,
+        topic_uuid: object,
+    ) -> tuple[object, ...]:
+        """Resolve provider routes that own the message's topic."""
+        session = contexts.Context().get_session()
+        rows = session.execute(
+            """
+            SELECT DISTINCT chat.external_account_uuid
+            FROM m_external_chats_v2 AS chat
+            WHERE chat.owner_user_uuid = %s AND chat.project_id = %s
+              AND chat.projection_stream_uuid = %s AND chat.selected
+              AND chat.status IN ('syncing', 'live', 'degraded')
+              AND NOT chat.transition_pending
+              AND (
+                  chat.source->>'chat_type' = 'channel'
+                  OR (
+                      chat.source->>'chat_type' IN ('personal', 'group')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                              COALESCE(chat.source->'topics', '[]'::jsonb)
+                          ) AS topic
+                          WHERE topic->>'topic_uuid' = %s
+                      )
+                  )
+              )
+            ORDER BY chat.external_account_uuid
+            """,
+            (
+                self.user_uuid,
+                self.project_uuid,
+                stream.uuid,
+                str(topic_uuid),
+            ),
+        ).fetchall()
+        return tuple(row["external_account_uuid"] for row in rows)
+
     def _provider_account_uuid_for_stream(
         self,
         stream: models.WorkspaceStream,
@@ -1318,12 +1535,13 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
         account_uuids = self._provider_account_uuids_for_stream(stream)
         return account_uuids[0] if len(account_uuids) == 1 else None
 
-    def _provider_targets_for_stream(
+    def _provider_targets_for_message(
         self,
         stream_uuid: object,
+        topic_uuid: object | None,
         operation_kind: str,
     ) -> tuple[typing.Any, ...]:
-        """Resolve the author's selected provider routes before message creation."""
+        """Resolve the author's provider routes before message creation."""
         stream = models.WorkspaceStream.objects.get_one(
             filters={
                 "project_id": dm_filters.EQ(self.project_uuid),
@@ -1331,7 +1549,11 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             },
             session=contexts.Context().get_session(),
         )
-        account_uuids = self._provider_user_account_uuids_for_stream(stream)
+        topic_uuid = topic_uuid or stream.default_topic_uuid
+        account_uuids = self._provider_user_account_uuids_for_message(
+            stream,
+            topic_uuid,
+        )
         if not account_uuids:
             return ()
         self._lock_provider_accounts(account_uuids)
@@ -2349,8 +2571,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
-        provider_targets = self._provider_targets_for_stream(
+        provider_targets = self._provider_targets_for_message(
             values["stream_uuid"],
+            values.get("topic_uuid"),
             "message.create",
         )
         session = contexts.Context().get_session()

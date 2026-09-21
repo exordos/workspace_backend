@@ -10131,11 +10131,12 @@ def test_message_create_writes_compact_read_state_and_visible_events(
     assert next_page == []
 
 
-def test_events_keep_native_message_visible_through_confirmed_external_stream_access(
+def test_events_keep_native_message_and_snapshots_visible_through_external_stream_access(
     api, workspace_api, db
 ):
-    """A native outgoing message inherits the visibility of its external stream."""
+    """A native outgoing message and its snapshots inherit stream visibility."""
     account_owner_uuid = sys_uuid.uuid4()
+    recipient_uuid = sys_uuid.uuid4()
     external_account_uuid = sys_uuid.uuid4()
     external_chat_uuid = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(
@@ -10144,6 +10145,7 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
     topic_uuid = conftest.seed_stream_topic(
         db, api.project_id, stream_uuid, api.user_uuid, "general", is_default=True
     )
+    conftest.seed_user_stream_binding(db, api.project_id, stream_uuid, recipient_uuid)
     conftest.seed_workspace_user(
         db, account_owner_uuid, f"external-owner-{account_owner_uuid}"
     )
@@ -10211,6 +10213,30 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
         )
         cursor.execute(
             """
+            UPDATE m_workspace_stream_topics
+            SET source_name = 'zulip',
+                source = %s::jsonb,
+                external_account_uuid = %s,
+                provider_external_id = 'channel:42:general'
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://zulip.example.test",
+                        "source_scope": "legacy-shared-scope",
+                        "topic_name": "general",
+                    }
+                ),
+                str(external_account_uuid),
+                api.project_id,
+                topic_uuid,
+            ),
+        )
+        cursor.execute(
+            """
             SELECT
                 EXISTS (
                     SELECT 1
@@ -10228,9 +10254,9 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
             """,
             (
                 api.project_id,
-                api.user_uuid,
+                recipient_uuid,
                 api.project_id,
-                api.user_uuid,
+                recipient_uuid,
                 stream_uuid,
             ),
         )
@@ -10267,6 +10293,161 @@ def test_events_keep_native_message_visible_through_confirmed_external_stream_ac
         if event["payload"]["kind"] == "message.created"
     }
     assert public_message_uuid in visible_messages
+
+    recipient_cursor = workspace_api.get(EPOCH, user=recipient_uuid)
+    assert recipient_cursor.status_code == 200, recipient_cursor.text
+    recipient_events = workspace_api.get(
+        EVENTS,
+        user=recipient_uuid,
+        params={
+            "page_limit": 100,
+            "page_marker": 0,
+            "epoch_generation": recipient_cursor.json()["epoch_generation"],
+        },
+    )
+    assert recipient_events.status_code == 200, recipient_events.text
+    assert [event["payload"]["kind"] for event in recipient_events.json()] == [
+        "message.created",
+        "topic.updated",
+        "stream.updated",
+    ]
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM messenger_message_placements
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            """,
+            (api.project_id, message_uuid),
+        )
+        placement_uuid = cursor.fetchone()[0]
+    assert str(placement_uuid) == public_message_uuid
+
+    reaction_event_uuid = sys_uuid.uuid4()
+    external_source = {
+        "kind": "zulip",
+        "server_url": "https://zulip.example.test",
+        "source_scope": "legacy-shared-scope",
+    }
+    _run_database_operation(
+        lambda session: messenger_models.WorkspaceEvent(
+            schema_version=messenger_models.WORKSPACE_EVENT_SCHEMA_VERSION,
+            uuid=reaction_event_uuid,
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=recipient_uuid,
+            object_type="message_reaction",
+            action="updated",
+            payload={
+                "kind": "message_reaction.updated",
+                "uuid": str(sys_uuid.uuid4()),
+                "project_id": api.project_id,
+                "user_uuid": str(recipient_uuid),
+                "message_uuid": str(placement_uuid),
+                "old_message_uuid": str(placement_uuid),
+                "emoji_name": "heart",
+                "old_emoji_name": "thumbs_up",
+                "source_name": "zulip",
+                "source": external_source,
+                "old_source_name": "zulip",
+                "old_source": external_source,
+            },
+        ).insert(session=session)
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_visible_events_pre_messenger_v2
+            WHERE project_id = %s AND user_uuid = %s AND uuid = %s
+            """,
+            (api.project_id, recipient_uuid, reaction_event_uuid),
+        )
+        assert cursor.fetchone()[0] == 1
+
+    last_epoch = recipient_events.json()[-1]["epoch_version"]
+    reaction_events = workspace_api.get(
+        EVENTS,
+        user=recipient_uuid,
+        params={
+            "page_limit": 100,
+            "page_marker": last_epoch,
+            "epoch_generation": recipient_cursor.json()["epoch_generation"],
+        },
+    )
+    assert reaction_events.status_code == 200, reaction_events.text
+    assert [event["payload"]["kind"] for event in reaction_events.json()] == [
+        "message_reaction.updated"
+    ]
+
+    snapshot_epoch = recipient_events.json()[1]["epoch_version"]
+    reaction_epoch = reaction_events.json()[0]["epoch_version"]
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM m_workspace_broadcast_message_events_v1
+            WHERE project_id = %s AND epoch_version = %s
+            """,
+            (api.project_id, snapshot_epoch),
+        )
+        snapshot_event_uuid = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            SELECT membership_generation
+            FROM messenger_stream_bindings
+            WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+            """,
+            (api.project_id, recipient_uuid, stream_uuid),
+        )
+        membership_generation = cursor.fetchone()[0]
+        cursor.execute(
+            """
+            INSERT INTO messenger_event_membership_guards (
+                event_uuid, project_id, user_uuid, stream_uuid,
+                membership_generation, control_effect
+            ) VALUES (%s, %s, %s, %s, %s, FALSE),
+                     (%s, %s, %s, %s, %s, FALSE)
+            ON CONFLICT (event_uuid, user_uuid) DO UPDATE
+            SET stream_uuid = EXCLUDED.stream_uuid,
+                membership_generation = EXCLUDED.membership_generation,
+                control_effect = EXCLUDED.control_effect
+            """,
+            (
+                snapshot_event_uuid,
+                api.project_id,
+                recipient_uuid,
+                stream_uuid,
+                membership_generation,
+                reaction_event_uuid,
+                api.project_id,
+                recipient_uuid,
+                stream_uuid,
+                membership_generation,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE messenger_stream_bindings
+            SET membership_generation = membership_generation + 1
+            WHERE project_id = %s AND user_uuid = %s AND stream_uuid = %s
+            """,
+            (api.project_id, recipient_uuid, stream_uuid),
+        )
+
+    stale_snapshot_events = workspace_api.get(
+        EVENTS,
+        user=recipient_uuid,
+        params={
+            "page_limit": 100,
+            "page_marker": 0,
+            "epoch_generation": recipient_cursor.json()["epoch_generation"],
+        },
+    )
+    assert stale_snapshot_events.status_code == 200, stale_snapshot_events.text
+    visible_epochs = {event["epoch_version"] for event in stale_snapshot_events.json()}
+    assert snapshot_epoch not in visible_epochs
+    assert reaction_epoch not in visible_epochs
 
 
 def test_message_star_actions_are_user_scoped_idempotent_and_realtime(api, db):
@@ -21676,3 +21857,298 @@ def test_compact_provider_read_state_uses_bitmaps_and_preserves_own_unread(
         assert cursor.fetchone()[0] == (
             0 if mode == read_state.PROJECT_MODE_COMPACT else 4
         )
+
+
+def test_delivery_projection_skips_timestamp_only_pending_transition(api, db):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Delivery projection transition",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "delivery",
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "delivery state"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    operation_uuid = sys_uuid.uuid4()
+    queued_at = datetime.datetime(2026, 9, 11, 10, tzinfo=datetime.timezone.utc)
+    running_at = queued_at + datetime.timedelta(seconds=1)
+    delivered_at = running_at + datetime.timedelta(seconds=1)
+
+    def sync(status, updated_at):
+        operation = types.SimpleNamespace(
+            uuid=operation_uuid,
+            action="message.create",
+            target_type="message",
+            target_uuid=message_uuid,
+            status=status,
+            safe_error=None,
+            can_retry=False,
+            can_discard=False,
+            updated_at=updated_at,
+            duplicate_risk=False,
+            retry_requires_confirmation=False,
+            original_url=None,
+            reconciliation_reason=None,
+        )
+        _run_database_operation(
+            lambda session: provider_data.sync_operation_target_delivery(
+                session,
+                operation,
+                project_uuid,
+            )
+        )
+
+    sync("queued", queued_at)
+    sync("running", running_at)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_updated_at
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == ("pending", queued_at)
+    sync("succeeded", delivered_at)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_updated_at
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == ("delivered", delivered_at)
+        cursor.execute(
+            """
+            SELECT payload->'delivery'->>'status'
+            FROM m_workspace_broadcast_message_events_v1 AS event
+            JOIN m_workspace_event_audience_members_v1 AS member
+              ON member.audience_snapshot_uuid = event.audience_snapshot_uuid
+            WHERE event.project_id = %s
+              AND member.user_uuid = %s
+              AND event.payload->>'kind' = 'message.updated'
+              AND event.payload->'payload'->>'content' = 'delivery state'
+            ORDER BY event.epoch_version
+            """,
+            (project_uuid, api.user_uuid),
+        )
+        delivery_events = cursor.fetchall()
+
+    assert delivery_events == [("pending",), ("delivered",)]
+
+
+def test_read_state_delivery_does_not_overwrite_message_snapshot(api, db):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Read delivery isolation",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "read delivery",
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "read isolation"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+
+    for status in ("queued", "running", "succeeded"):
+        operation = types.SimpleNamespace(
+            uuid=sys_uuid.uuid4(),
+            action="read_state.set",
+            target_type="message",
+            target_uuid=message_uuid,
+            status=status,
+            safe_error=None,
+            can_retry=False,
+            can_discard=False,
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+            duplicate_risk=False,
+            retry_requires_confirmation=False,
+            original_url=None,
+            reconciliation_reason=None,
+        )
+        _run_database_operation(
+            lambda session: provider_data.sync_operation_target_delivery(
+                session,
+                operation,
+                project_uuid,
+            )
+        )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_status, delivery_metadata
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (None, None)
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM m_workspace_broadcast_message_events_v1 AS event
+            JOIN m_workspace_event_audience_members_v1 AS member
+              ON member.audience_snapshot_uuid = event.audience_snapshot_uuid
+            WHERE event.project_id = %s
+              AND member.user_uuid = %s
+              AND event.payload->>'kind' = 'message.updated'
+              AND event.payload->'payload'->>'content' = 'read isolation'
+            """,
+            (project_uuid, api.user_uuid),
+        )
+        assert cursor.fetchone()[0] == 0
+
+
+def test_discarded_operation_restores_previous_message_delivery(api, db):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    stream_uuid = conftest.seed_user_stream(
+        db,
+        api.project_id,
+        api.user_uuid,
+        "Discarded delivery restoration",
+    )
+    topic_uuid = conftest.seed_stream_topic(
+        db,
+        api.project_id,
+        stream_uuid,
+        api.user_uuid,
+        "discarded delivery",
+    )
+    response = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "payload": {"kind": "markdown", "content": "restore delivery"},
+        },
+    )
+    assert response.status_code == 201, response.text
+    message_uuid = sys_uuid.UUID(response.json()["uuid"])
+    account_uuid = sys_uuid.uuid4()
+    previous_operation_uuid = sys_uuid.uuid4()
+    discarded_operation_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2 (
+                uuid, owner_user_uuid, provider, settings,
+                credential_present, status, live_ready
+            ) VALUES (%s, %s, 'zulip', '{}'::jsonb, FALSE, 'live', TRUE)
+            """,
+            (account_uuid, api.user_uuid),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO m_external_operations_v2 (
+                uuid, external_account_uuid, owner_user_uuid,
+                action, target_type, target_uuid, status, updated_at
+            ) VALUES (%s, %s, %s, %s, 'message', %s, %s, %s)
+            """,
+            (
+                (
+                    previous_operation_uuid,
+                    account_uuid,
+                    api.user_uuid,
+                    "message.create",
+                    message_uuid,
+                    "succeeded",
+                    datetime.datetime(2026, 9, 11, tzinfo=datetime.timezone.utc),
+                ),
+                (
+                    discarded_operation_uuid,
+                    account_uuid,
+                    api.user_uuid,
+                    "message.update",
+                    message_uuid,
+                    "discarded",
+                    datetime.datetime(
+                        2026, 9, 11, 0, 0, 1, tzinfo=datetime.timezone.utc
+                    ),
+                ),
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_messages
+            SET delivery_metadata = jsonb_build_object(
+                    'external_operation_uuid', %s::text,
+                    'status', 'discarded'
+                ),
+                delivery_status = 'failed',
+                delivery_updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (discarded_operation_uuid, project_uuid, message_uuid),
+        )
+    db.commit()
+
+    operation = types.SimpleNamespace(
+        uuid=discarded_operation_uuid,
+        target_type="message",
+        target_uuid=message_uuid,
+    )
+    _run_database_operation(
+        lambda session: provider_data.restore_operation_target_delivery(
+            session,
+            operation,
+            project_uuid,
+        )
+    )
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT delivery_metadata->>'external_operation_uuid',
+                   delivery_metadata->>'status', delivery_status
+            FROM m_workspace_messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (
+            str(previous_operation_uuid),
+            "delivered",
+            "delivered",
+        )
+        cursor.execute(
+            """
+            SELECT delivery->>'external_operation_uuid', delivery->>'status'
+            FROM messenger_messages
+            WHERE project_id = %s AND legacy_public_uuid = %s
+            """,
+            (project_uuid, message_uuid),
+        )
+        assert cursor.fetchone() == (str(previous_operation_uuid), "delivered")

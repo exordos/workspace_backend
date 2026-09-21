@@ -2987,6 +2987,48 @@ def _history_range(s, offset):
     return body
 
 
+def test_capacity_backpressure_keeps_active_file_receipts_serviceable(
+    history_setup,
+):
+    s = history_setup
+    active = []
+    for index in range(8):
+        body = _history_range(s, 5000 * index)
+        body["batch"]["messages"][0]["content"] = (
+            "[sample](/user_uploads/1/sample.txt)"
+        )
+        _rehash_history(body)
+        job_uuid = accept(s, body)
+        assert finish(s, job_uuid)["status"] == "waiting_files"
+        active.append(job_uuid)
+
+    ninth = _history_range(s, 40000)
+    response = s.ingress.handle(
+        "POST", contract.PATH, {}, contract.encode(ninth), b"certificate"
+    )
+    assert response.status == 429
+    assert json.loads(response.body) == {"error": "history_import_busy"}
+
+    current = _history_status(s, active[0])
+    assert current["status"] == "waiting_files"
+    assert len(current["files"]) == 1
+    request_uuid = current["files"][0]["uuid"]
+    _upload_history_file(s, active[0], request_uuid)
+    with s.session_factory() as session:
+        file_row = session.execute(
+            """SELECT status FROM m_external_history_files_v1
+               WHERE job_uuid=%s AND uuid=%s""",
+            (active[0], request_uuid),
+        ).fetchone()
+        job = repository.get_job(session, s.identity, active[0])
+    assert file_row["status"] == "ready"
+    assert job["status"] == "pending"
+    assert finish(s, active[0])["status"] == "complete"
+
+    ninth_uuid = accept(s, ninth)
+    assert finish(s, ninth_uuid)["status"] == "complete"
+
+
 def test_consecutive_processing_failures_free_all_admission_slots(
     history_setup,
     monkeypatch,

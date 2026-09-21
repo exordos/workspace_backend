@@ -2570,7 +2570,7 @@ class ExternalOperationController(ExternalResourceController):
             },
             session=session,
         )
-        provider_data.sync_operation_target_delivery(
+        provider_data.restore_operation_target_delivery(
             session,
             operation,
             discarded["project_id"],
