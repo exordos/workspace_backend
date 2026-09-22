@@ -394,6 +394,45 @@ def test_workspace_v3_contains_only_approved_tables_and_columns(_database, db):
     )
 
 
+def test_workspace_entity_description_columns_allow_ten_thousand_characters(
+    _database,
+    db,
+):
+    expected_columns = {
+        ("public", "catalog_services"),
+        ("public", "workspace_streams"),
+        ("public", "m_workspace_streams"),
+        ("public", "m_workspace_files"),
+        ("public", "messenger_streams"),
+        ("workspace_v3", "streams"),
+        ("workspace_v3", "files"),
+    }
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_schema, table_name, character_maximum_length
+            FROM information_schema.columns
+            WHERE column_name = 'description'
+              AND (table_schema, table_name) IN (
+                    ('public', 'catalog_services'),
+                    ('public', 'workspace_streams'),
+                    ('public', 'm_workspace_streams'),
+                    ('public', 'm_workspace_files'),
+                    ('public', 'messenger_streams'),
+                    ('workspace_v3', 'streams'),
+                    ('workspace_v3', 'files')
+              )
+            """
+        )
+        description_columns = {
+            (schema_name, table_name): maximum_length
+            for schema_name, table_name, maximum_length in cur.fetchall()
+        }
+
+    assert set(description_columns) == expected_columns
+    assert set(description_columns.values()) == {10_000}
+
+
 def test_workspace_v3_enforces_project_graph_and_physical_cascade(_database, db):
     user_uuid = sys_uuid.uuid4()
     peer_uuid = sys_uuid.uuid4()

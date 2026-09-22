@@ -89,6 +89,7 @@ def _assert_file_upload_contract(operation):
         "hash",
     ]
     assert "storage_type" not in json_schema["properties"]
+    assert json_schema["properties"]["description"]["maxLength"] == 10_000
     multipart_schema = content["multipart/form-data"]["schema"]
     assert multipart_schema["required"] == ["file"]
     assert multipart_schema["oneOf"] == [
@@ -102,6 +103,7 @@ def _assert_file_upload_contract(operation):
         },
     ]
     assert "storage_type" not in multipart_schema["properties"]
+    assert multipart_schema["properties"]["description"]["maxLength"] == 10_000
 
 
 def _assert_collection_pagination_contract(

@@ -28,6 +28,7 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
+from workspace.common import constants
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import application_services
 from workspace.messenger_api import credential_crypto
@@ -963,7 +964,10 @@ setattr(
                         "properties": {
                             "stream_uuid": {"format": "uuid", "type": "string"},
                             "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "maxLength": constants.WORKSPACE_DESCRIPTION_MAX_LENGTH,
+                            },
                             "content_type": {"type": "string"},
                             "size_bytes": {"minimum": 0, "type": "integer"},
                             "hash": {"type": "string"},
@@ -988,7 +992,10 @@ setattr(
                                 "type": "string",
                             },
                             "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "maxLength": constants.WORKSPACE_DESCRIPTION_MAX_LENGTH,
+                            },
                         },
                         "oneOf": [
                             {

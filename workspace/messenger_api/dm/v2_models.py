@@ -18,6 +18,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
+from workspace.common import constants
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
@@ -250,6 +251,11 @@ class WorkspaceStream(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "messenger_streams"
+
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
 
     owner_uuid = properties.property(types.UUID(), required=True, read_only=True)
     source_name = properties.property(

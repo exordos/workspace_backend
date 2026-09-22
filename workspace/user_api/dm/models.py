@@ -25,6 +25,8 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 from restalchemy.storage.sql import orm
 
+from workspace.common import constants
+
 
 class ChatType(str, enum.Enum):
     STREAM = "stream"
@@ -137,6 +139,11 @@ class Service(
 ):
     __tablename__ = "catalog_services"
 
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
+
     service_url = properties.property(
         types.Url(),
         required=True,
@@ -167,6 +174,11 @@ class WorkspaceStream(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "workspace_streams"
+
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
 
     source_name = properties.property(
         types.String(min_length=1, max_length=64),

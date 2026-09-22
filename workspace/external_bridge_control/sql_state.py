@@ -21,6 +21,7 @@ from typing import Any
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
+from workspace.common import constants
 from workspace.external_bridge_control import state
 from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
@@ -2416,7 +2417,7 @@ class SQLControlState:
         topics = catalog["topics"]
         if (
             not isinstance(catalog["description"], str)
-            or len(catalog["description"]) > 4096
+            or len(catalog["description"]) > constants.WORKSPACE_DESCRIPTION_MAX_LENGTH
             or not isinstance(participants, list)
             or not participants
             or not isinstance(topics, list)

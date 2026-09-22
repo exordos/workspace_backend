@@ -13,6 +13,7 @@ import uuid as sys_uuid
 
 from restalchemy.common import exceptions as ra_exceptions
 
+from workspace.common import constants
 from workspace.messenger_api import event_origin
 from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import v3_store
@@ -462,6 +463,21 @@ class ProviderEntityStore:
         emit_event: bool = True,
         expand_message_flags: bool = True,
     ) -> dict[str, typing.Any]:
+        if resource == "streams":
+            description = data.get("description", "")
+            if not isinstance(description, str):
+                _error(
+                    422,
+                    "invalid_description",
+                    "description must be a string",
+                )
+            if len(description) > constants.WORKSPACE_DESCRIPTION_MAX_LENGTH:
+                _error(
+                    422,
+                    "invalid_description",
+                    "description must not exceed "
+                    f"{constants.WORKSPACE_DESCRIPTION_MAX_LENGTH} characters",
+                )
         source_timestamp_provided = source_updated_at is not None
         source_updated_at = source_updated_at or datetime.datetime.now(
             datetime.timezone.utc
