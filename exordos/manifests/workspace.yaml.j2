@@ -69,6 +69,13 @@ imports:
 resources:
 
   $core.vs.variables:
+    workspace_project_id:
+      name: "workspace_project_id"
+      description: "Workspace project served by external provider bridges"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: selector
+        selector_strategy: latest
     workspace_s3_disk_size:
       name: "workspace_s3_disk_size"
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
@@ -799,4 +806,7 @@ exports:
     kind: "resource"
   provider_sync_role:
     link: "$core.iam.roles.$workspace_provider_sync"
+    kind: "resource"
+  project_id_variable:
+    link: "$core.vs.variables.$workspace_project_id"
     kind: "resource"

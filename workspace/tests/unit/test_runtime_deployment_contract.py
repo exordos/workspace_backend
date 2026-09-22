@@ -251,6 +251,21 @@ def test_manifest_exports_provider_sync_role_for_bridge_identity():
     assert 'link: "$core.iam.roles.$workspace_provider_sync"' in manifest
 
 
+def test_manifest_exports_mutable_workspace_project_variable():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    variable = manifest.split("workspace_project_id:", 1)[1].split(
+        "workspace_s3_disk_size:",
+        1,
+    )[0]
+
+    assert 'name: "workspace_project_id"' in variable
+    assert "kind: selector" in variable
+    assert "selector_strategy: latest" in variable
+    assert "profiles:" not in variable
+    assert "project_id_variable:" in manifest
+    assert 'link: "$core.vs.variables.$workspace_project_id"' in manifest
+
+
 def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 
