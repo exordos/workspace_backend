@@ -193,8 +193,7 @@ def test_messenger_v3_projection_worker_is_deployed():
         assert "reaction_user_limit = 4" in rendered_config
     assert "name: workspace-v3-worker" in manifest
     assert (
-        "path: /usr/bin/workspace-v3-worker --config-file "
-        "/etc/workspace/workspace.conf"
+        "path: /usr/bin/workspace-v3-worker --config-file /etc/workspace/workspace.conf"
     ) in manifest
     assert "workspace-v3-worker" in install
     assert "workspace-v3-worker" in restart
@@ -240,6 +239,16 @@ def test_manifest_provisions_unassigned_external_integration_roles():
     assert bindings.count(
         "role: $core.iam.roles.$workspace_external_integration_admin:uuid"
     ) == len(admin_permissions)
+
+
+def test_manifest_exports_provider_sync_role_for_bridge_identity():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert 'name: "workspace.provider.sync"' in manifest
+    assert 'name: "workspace-provider-sync"' in manifest
+    assert "role: $core.iam.roles.$workspace_provider_sync:uuid" in manifest
+    assert "provider_sync_role:" in manifest
+    assert 'link: "$core.iam.roles.$workspace_provider_sync"' in manifest
 
 
 def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
@@ -294,11 +303,10 @@ def test_manifest_proxies_core_api_over_internal_http():
 
     assert "proxy_pass http://workspace_core_api/api/core/;" in manifest
     assert "proxy_pass https://workspace_core_api/api/core/;" not in manifest
+    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:80;"' in manifest
     assert (
-        'f"server {$workspace.imports.$var_core_ip_address:value}:80;"'
-        in manifest
+        'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' not in manifest
     )
-    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' not in manifest
 
 
 def test_backend_bootstrap_has_no_secondary_storage_gate():

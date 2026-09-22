@@ -18,6 +18,8 @@ from workspace.workspace_v3 import projections
 
 
 ROOT = "/v1/provider/entities"
+REGISTRATION = "/v1/provider/registration"
+PROVIDER_SYNC = ("workspace.provider.sync",)
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +112,67 @@ def test_provider_api_requires_an_enabled_provider_consumer(api):
 
     assert response.status_code == 403, response.text
     assert response.json()["error"] == "provider_consumer_required"
+
+
+def test_provider_registration_is_permission_scoped_and_idempotent(api, db):
+    provider_uuid = sys_uuid.uuid4()
+    denied = api.put(
+        REGISTRATION,
+        json={"provider_uuid": str(provider_uuid), "name": "zulip"},
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["error"] == "provider_registration_forbidden"
+
+    created = api.put(
+        REGISTRATION,
+        permissions=PROVIDER_SYNC,
+        json={"provider_uuid": str(provider_uuid), "name": "zulip"},
+    )
+    repeated = api.put(
+        REGISTRATION,
+        permissions=PROVIDER_SYNC,
+        json={"provider_uuid": str(provider_uuid), "name": "zulip"},
+    )
+
+    assert created.status_code == 200, created.text
+    assert repeated.json() == created.json()
+    assert created.json() == {
+        "provider_uuid": str(provider_uuid),
+        "name": "zulip",
+        "project_id": api.project_id,
+        "iam_user_uuid": api.user_uuid,
+        "enabled": True,
+    }
+    assert api.get(f"{ROOT}/users/{sys_uuid.uuid4()}").status_code == 404
+    row = db.execute(
+        """
+        SELECT uuid, name, enabled
+        FROM workspace_v3.provider_consumers
+        WHERE project_id = %s AND iam_user_uuid = %s
+        """,
+        (api.project_id, api.user_uuid),
+    ).fetchone()
+    assert row == (provider_uuid, "zulip", True)
+
+
+def test_provider_registration_rejects_identity_rebinding(api):
+    first_uuid = sys_uuid.uuid4()
+    assert (
+        api.put(
+            REGISTRATION,
+            permissions=PROVIDER_SYNC,
+            json={"provider_uuid": str(first_uuid), "name": "zulip"},
+        ).status_code
+        == 200
+    )
+    conflict = api.put(
+        REGISTRATION,
+        permissions=PROVIDER_SYNC,
+        json={"provider_uuid": str(sys_uuid.uuid4()), "name": "zulip"},
+    )
+
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["error"] == "provider_registration_conflict"
 
 
 def test_provider_api_accepts_generic_source_names(api, db):

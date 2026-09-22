@@ -21,6 +21,7 @@ from workspace.messenger_api.api import v3_store
 
 _ROOT = "/v1/provider/entities"
 _BOOTSTRAP_PATH = "/v1/provider/bootstrap"
+_REGISTRATION_PATH = "/v1/provider/registration"
 _BATCH_PATH = f"{_ROOT}/actions/apply/invoke"
 _RESOURCE_NAMES = "|".join(provider_store.RESOURCE_TYPES)
 _COLLECTION_PATH = re.compile(rf"^{_ROOT}/(?P<resource>{_RESOURCE_NAMES})/?$")
@@ -96,6 +97,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
     def process_request(self, req: typing.Any) -> webob.Response | None:
         if (
             req.path != _BOOTSTRAP_PATH
+            and req.path != _REGISTRATION_PATH
             and req.path != _ROOT
             and not req.path.startswith(f"{_ROOT}/")
         ):
@@ -103,6 +105,13 @@ class ProviderApiMiddleware(middlewares.Middleware):
         project_uuid = sys_uuid.UUID(str(req.context.project_id))
         iam_user_uuid = sys_uuid.UUID(str(req.context.user_uuid))
         session = contexts.Context().get_session()
+        if req.path == _REGISTRATION_PATH:
+            return self._registration(
+                req,
+                session,
+                project_uuid,
+                iam_user_uuid,
+            )
         provider = v3_store.resolve_provider_consumer(project_uuid, iam_user_uuid)
         if provider is None:
             raise messenger_exceptions.ProviderApiError(
@@ -158,6 +167,86 @@ class ProviderApiMiddleware(middlewares.Middleware):
             status=404,
             error="provider_route_not_found",
             message="Provider API route does not exist",
+        )
+
+    def _registration(
+        self,
+        req: typing.Any,
+        session: typing.Any,
+        project_uuid: sys_uuid.UUID,
+        iam_user_uuid: sys_uuid.UUID,
+    ) -> webob.Response:
+        permissions = req.context.iam_context.get_introspection_info().permissions
+        if "workspace.provider.sync" not in permissions:
+            raise messenger_exceptions.ProviderApiError(
+                status=403,
+                error="provider_registration_forbidden",
+                message="Provider synchronization permission is required",
+            )
+        if req.method != "PUT":
+            return self._method_not_allowed(("PUT",))
+        body = _body(req)
+        provider_uuid = _uuid(body.get("provider_uuid"), "provider_uuid")
+        name = body.get("name")
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,31}", name
+        ):
+            raise messenger_exceptions.ProviderApiError(
+                status=422,
+                error="invalid_provider_name",
+                message="name must be a valid provider source name",
+            )
+        if name in {"iam", "native"}:
+            raise messenger_exceptions.ProviderApiError(
+                status=422,
+                error="invalid_provider_name",
+                message="name must identify an external provider",
+            )
+        existing = session.execute(
+            """
+            SELECT uuid, name, enabled
+            FROM workspace_v3.provider_consumers
+            WHERE project_id = %s AND iam_user_uuid = %s
+            FOR UPDATE
+            """,
+            (project_uuid, iam_user_uuid),
+        ).fetchone()
+        if existing is not None and (
+            existing["uuid"] != provider_uuid or existing["name"] != name
+        ):
+            raise messenger_exceptions.ProviderApiError(
+                status=409,
+                error="provider_registration_conflict",
+                message="IAM identity is registered to another provider",
+            )
+        try:
+            row = session.execute(
+                """
+                INSERT INTO workspace_v3.provider_consumers (
+                    uuid, project_id, name, iam_user_uuid, enabled
+                ) VALUES (%s, %s, %s, %s, TRUE)
+                ON CONFLICT (project_id, iam_user_uuid) DO UPDATE
+                SET enabled = TRUE, updated_at = clock_timestamp()
+                RETURNING uuid, name, enabled
+                """,
+                (provider_uuid, project_uuid, name, iam_user_uuid),
+            ).fetchone()
+        except Exception as error:
+            provider_store.translate_database_error(error)
+        if row["uuid"] != provider_uuid or row["name"] != name:
+            raise messenger_exceptions.ProviderApiError(
+                status=409,
+                error="provider_registration_conflict",
+                message="IAM identity is registered to another provider",
+            )
+        return _response(
+            {
+                "provider_uuid": row["uuid"],
+                "name": row["name"],
+                "project_id": project_uuid,
+                "iam_user_uuid": iam_user_uuid,
+                "enabled": row["enabled"],
+            }
         )
 
     def _entity(

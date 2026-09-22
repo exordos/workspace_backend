@@ -162,6 +162,9 @@ resources:
     workspace_topic_summary_settings_manage:
       name: "workspace.topic_summary_settings.manage"
       description: "Manage global and project Workspace topic summary settings"
+    workspace_provider_sync:
+      name: "workspace.provider.sync"
+      description: "Register and synchronize an external Workspace provider"
 
   # Roles are provisioned with their permission sets but are intentionally not
   # assigned to users. Operators create project-scoped role bindings explicitly.
@@ -177,6 +180,10 @@ resources:
     workspace_topic_summary_admin:
       name: "workspace-topic-summary-admin"
       description: "Administer Workspace topic summarization"
+      project_id: null
+    workspace_provider_sync:
+      name: "workspace-provider-sync"
+      description: "Synchronize one external provider with Workspace"
       project_id: null
 
   $core.iam.permissionbinding:
@@ -247,6 +254,10 @@ resources:
     workspace_topic_summary_admin_settings_manage:
       role: $core.iam.roles.$workspace_topic_summary_admin:uuid
       permission: $core.iam.permissions.$workspace_topic_summary_settings_manage:uuid
+      project_id: null
+    workspace_provider_sync:
+      role: $core.iam.roles.$workspace_provider_sync:uuid
+      permission: $core.iam.permissions.$workspace_provider_sync:uuid
       project_id: null
 
   $core.compute.nodes:
@@ -785,4 +796,7 @@ exports:
     kind: "resource"
   projection_db_instance:
     link: "$dbaas.types.postgres.instances.$workspace_projection_cluster"
+    kind: "resource"
+  provider_sync_role:
+    link: "$core.iam.roles.$workspace_provider_sync"
     kind: "resource"

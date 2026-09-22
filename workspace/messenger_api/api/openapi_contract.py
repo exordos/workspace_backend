@@ -1699,6 +1699,55 @@ def add_provider_entity_contract(
             },
         }
     }
+    specification["paths"]["/v1/provider/registration"] = {
+        "put": {
+            "summary": "Register the authenticated provider consumer",
+            "operationId": "Register_provider_consumer",
+            "tags": ["Provider"],
+            "requestBody": _request_body(
+                _object_schema(
+                    {
+                        "provider_uuid": {
+                            "type": "string",
+                            "format": "uuid",
+                        },
+                        "name": {
+                            "type": "string",
+                            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                        },
+                    },
+                    ["provider_uuid", "name"],
+                )
+            ),
+            "responses": {
+                200: json_response(
+                    _object_schema(
+                        {
+                            "provider_uuid": {
+                                "type": "string",
+                                "format": "uuid",
+                            },
+                            "name": {"type": "string"},
+                            "project_id": {"type": "string", "format": "uuid"},
+                            "iam_user_uuid": {
+                                "type": "string",
+                                "format": "uuid",
+                            },
+                            "enabled": {"type": "boolean"},
+                        },
+                        [
+                            "provider_uuid",
+                            "name",
+                            "project_id",
+                            "iam_user_uuid",
+                            "enabled",
+                        ],
+                    ),
+                    "Provider consumer registration",
+                )
+            },
+        }
+    }
     specification["paths"]["/v1/provider/bootstrap"] = {
         "get": {
             "summary": "Stream a consistent provider-visible entity snapshot",
