@@ -52,6 +52,7 @@ _FIXTURE_EVENTS_SUPPRESSED = contextvars.ContextVar(
     "workspace_fixture_events_suppressed",
     default=False,
 )
+PROVIDER_SYNC_PERMISSION = "workspace.provider.sync"
 
 
 class ProjectEventLockUnavailableError(RuntimeError):
@@ -1964,10 +1965,13 @@ def get_events_after(
 def resolve_websocket_consumer(
     project_id: sys_uuid.UUID,
     iam_user_uuid: sys_uuid.UUID,
+    permissions: collections.abc.Collection[str] = (),
 ) -> tuple[str, sys_uuid.UUID]:
     provider = v3_store.resolve_provider_consumer(project_id, iam_user_uuid)
     if provider is None:
         return "user", iam_user_uuid
+    if PROVIDER_SYNC_PERMISSION not in permissions:
+        raise PermissionError("Provider synchronization permission is required")
     return "provider", sys_uuid.UUID(str(provider["uuid"]))
 
 

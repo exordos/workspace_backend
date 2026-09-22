@@ -1502,16 +1502,33 @@ def _projection_events(
     message_by_key.update(
         {(_uuid(row["project_id"]), _uuid(row["uuid"])): row for row in messages}
     )
-    eventful_reaction_scopes = {
-        (_uuid(task["project_id"]), _uuid(task["scope_uuid"]))
-        for task in tasks
-        if task["task_type"] == "reaction_snapshot"
-        and _payload(task["payload"]).get("emit_events", True)
-    }
+    eventful_reaction_scopes: dict[
+        tuple[sys_uuid.UUID, sys_uuid.UUID], set[sys_uuid.UUID | None]
+    ] = {}
+    for task in tasks:
+        payload = _payload(task["payload"])
+        if task["task_type"] != "reaction_snapshot" or not payload.get(
+            "emit_events", True
+        ):
+            continue
+        key = (_uuid(task["project_id"]), _uuid(task["scope_uuid"]))
+        origin_provider_uuid = payload.get("origin_provider_uuid")
+        eventful_reaction_scopes.setdefault(key, set()).add(
+            None
+            if origin_provider_uuid is None
+            else _uuid(origin_provider_uuid)
+        )
     for row in messages:
         project_id = _uuid(row["project_id"])
-        if (project_id, _uuid(row["uuid"])) not in eventful_reaction_scopes:
+        scope_key = (project_id, _uuid(row["uuid"]))
+        if scope_key not in eventful_reaction_scopes:
             continue
+        origins = eventful_reaction_scopes[scope_key]
+        suppressed_provider_uuid = (
+            next(iter(origins))
+            if len(origins) == 1 and None not in origins
+            else None
+        )
         stream_uuid = _uuid(row["stream_uuid"])
         specification = _resource_event_specification(
             session,
@@ -1520,7 +1537,14 @@ def _projection_events(
             entity_uuid=_uuid(row["uuid"]),
             object_type="message",
             action="updated",
-            consumers=consumers(project_id, stream_uuid=stream_uuid),
+            consumers=tuple(
+                (consumer_type, consumer_uuid)
+                for consumer_type, consumer_uuid in consumers(
+                    project_id, stream_uuid=stream_uuid
+                )
+                if consumer_type != "provider"
+                or consumer_uuid != suppressed_provider_uuid
+            ),
         )
         if specification is not None:
             events.append(specification)
@@ -1531,10 +1555,16 @@ def _projection_events(
             continue
         project_id = _uuid(task["project_id"])
         message_uuid = _uuid(task["scope_uuid"])
+        task_payload = _payload(task["payload"])
+        origin_provider_uuid = (
+            None
+            if task_payload.get("origin_provider_uuid") is None
+            else _uuid(task_payload["origin_provider_uuid"])
+        )
         message = message_by_key.get((project_id, message_uuid))
         if message is None:
             continue
-        for payload in _operations(_payload(task["payload"])):
+        for payload in _operations(task_payload):
             action = str(payload["action"])
             if action in {"insert", "created"}:
                 action = "created"
@@ -1593,7 +1623,11 @@ def _projection_events(
                     "consumers": tuple(
                         (consumer_type, consumer_uuid)
                         for consumer_type, consumer_uuid in reaction_consumers
-                        if consumer_type != "user" or consumer_uuid in visible_users
+                        if (consumer_type != "user" or consumer_uuid in visible_users)
+                        and (
+                            consumer_type != "provider"
+                            or consumer_uuid != origin_provider_uuid
+                        )
                     ),
                 }
             )

@@ -20,6 +20,7 @@ from workspace.workspace_v3 import projections
 ROOT = "/v1/provider/entities"
 REGISTRATION = "/v1/provider/registration"
 PROVIDER_SYNC = ("workspace.provider.sync",)
+_DEFAULT_PERMISSIONS = object()
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +32,32 @@ def _v3_store():
         api_store.configure_store_factory(
             sql_canonical_store.SQLCanonicalMessengerStoreFactory()
         )
+
+
+@pytest.fixture(autouse=True)
+def _provider_permissions(api, monkeypatch):
+    request = api.request
+
+    def request_with_provider_permission(
+        method,
+        path,
+        user=None,
+        project=None,
+        permissions=_DEFAULT_PERMISSIONS,
+        **kwargs,
+    ):
+        if permissions is _DEFAULT_PERMISSIONS:
+            permissions = PROVIDER_SYNC
+        return request(
+            method,
+            path,
+            user=user,
+            project=project,
+            permissions=permissions,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(api, "request", request_with_provider_permission)
 
 
 def _hash(data):
@@ -107,6 +134,121 @@ def _user_data(entity_uuid, **overrides):
     return values
 
 
+def _import_provider_conversation(api, db):
+    provider_uuid = _register_provider(api, db)
+    owner_uuid = sys_uuid.UUID(str(api.user_uuid))
+    peer_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    message_uuid = sys_uuid.uuid4()
+    owner_binding_uuid = sys_uuid.uuid4()
+    topic_binding_uuid = sys_uuid.uuid4()
+    flag_uuid = sys_uuid.uuid4()
+    created_at = "2026-09-19T08:00:00Z"
+    entities = [
+        ("users", owner_uuid, _user_data(owner_uuid, display_name="Owner")),
+        ("users", peer_uuid, _user_data(peer_uuid, display_name="Peer")),
+        (
+            "streams",
+            stream_uuid,
+            {
+                "name": f"Provider {stream_uuid}",
+                "owner_uuid": str(owner_uuid),
+                "default_topic_uuid": str(topic_uuid),
+                "created_at": created_at,
+            },
+        ),
+        (
+            "stream_bindings",
+            owner_binding_uuid,
+            {
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(owner_uuid),
+                "role": "owner",
+                "created_at": created_at,
+            },
+        ),
+        (
+            "stream_bindings",
+            sys_uuid.uuid4(),
+            {
+                "stream_uuid": str(stream_uuid),
+                "user_uuid": str(peer_uuid),
+                "role": "member",
+                "created_at": created_at,
+            },
+        ),
+        (
+            "topics",
+            topic_uuid,
+            {
+                "stream_uuid": str(stream_uuid),
+                "name": "General",
+                "created_at": created_at,
+            },
+        ),
+        (
+            "topic_bindings",
+            topic_binding_uuid,
+            {
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "user_uuid": str(owner_uuid),
+                "created_at": created_at,
+            },
+        ),
+        (
+            "messages",
+            message_uuid,
+            {
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "author_uuid": str(owner_uuid),
+                "payload": {"kind": "markdown", "content": "provider message"},
+                "created_at": created_at,
+            },
+        ),
+        (
+            "message_flags",
+            flag_uuid,
+            {
+                "stream_uuid": str(stream_uuid),
+                "message_uuid": str(message_uuid),
+                "user_uuid": str(owner_uuid),
+                "read": False,
+            },
+        ),
+    ]
+    response = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={
+            "operations": [
+                {
+                    "action": "upsert",
+                    "type": resource,
+                    "uuid": str(entity_uuid),
+                    "content_hash": _hash(data),
+                    "data": data,
+                }
+                for resource, entity_uuid, data in entities
+            ]
+        },
+    )
+    assert response.status_code == 200, response.text
+    return {
+        "provider": provider_uuid,
+        "owner": owner_uuid,
+        "peer": peer_uuid,
+        "stream": stream_uuid,
+        "topic": topic_uuid,
+        "message": message_uuid,
+        "owner_binding": owner_binding_uuid,
+        "topic_binding": topic_binding_uuid,
+        "flag": flag_uuid,
+        "created_at": created_at,
+    }
+
+
 def test_provider_api_requires_an_enabled_provider_consumer(api):
     response = api.get(f"{ROOT}/users/{sys_uuid.uuid4()}")
 
@@ -118,6 +260,7 @@ def test_provider_registration_is_permission_scoped_and_idempotent(api, db):
     provider_uuid = sys_uuid.uuid4()
     denied = api.put(
         REGISTRATION,
+        permissions=(),
         json={"provider_uuid": str(provider_uuid), "name": "zulip"},
     )
     assert denied.status_code == 403, denied.text
@@ -144,6 +287,12 @@ def test_provider_registration_is_permission_scoped_and_idempotent(api, db):
         "enabled": True,
     }
     assert api.get(f"{ROOT}/users/{sys_uuid.uuid4()}").status_code == 404
+    revoked = api.get(
+        f"{ROOT}/users/{sys_uuid.uuid4()}",
+        permissions=(),
+    )
+    assert revoked.status_code == 403, revoked.text
+    assert revoked.json()["error"] == "provider_sync_forbidden"
     row = db.execute(
         """
         SELECT uuid, name, enabled
@@ -302,6 +451,114 @@ def test_provider_users_are_visible_only_in_projects_that_reference_them(api, db
         row["uuid"] for row in other_project_users.json()
     }
     assert str(api.user_uuid) in {row["uuid"] for row in other_project_users.json()}
+
+
+def test_provider_user_updates_refresh_every_referencing_project(api, db):
+    provider_uuid = _register_provider(api, db)
+    user_uuid = sys_uuid.uuid4()
+    original = _user_data(user_uuid, display_name="Original name")
+    assert _put(api, "users", user_uuid, original).status_code == 200
+
+    first_stream_uuid = sys_uuid.uuid4()
+    first_binding_uuid = sys_uuid.uuid4()
+    first_stream = {
+        "name": "First project",
+        "owner_uuid": str(user_uuid),
+        "created_at": original["created_at"],
+    }
+    first_binding = {
+        "stream_uuid": str(first_stream_uuid),
+        "user_uuid": str(user_uuid),
+        "role": "owner",
+        "created_at": original["created_at"],
+    }
+    assert _put(api, "streams", first_stream_uuid, first_stream).status_code == 200
+    assert (
+        _put(api, "stream_bindings", first_binding_uuid, first_binding).status_code
+        == 200
+    )
+
+    other_project = sys_uuid.uuid4()
+    other_provider_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.provider_consumers (
+            uuid, project_id, name, iam_user_uuid
+        ) VALUES (%s, %s, 'zulip', %s)
+        """,
+        (other_provider_uuid, other_project, api.user_uuid),
+    )
+
+    def put_other(resource, entity_uuid, data):
+        return api.put(
+            f"{ROOT}/{resource}/{entity_uuid}",
+            project=other_project,
+            json={"content_hash": _hash(data), "data": data},
+        )
+
+    assert put_other("users", user_uuid, original).status_code == 200
+    other_stream_uuid = sys_uuid.uuid4()
+    other_binding_uuid = sys_uuid.uuid4()
+    other_stream = {
+        "name": "Other project",
+        "owner_uuid": str(user_uuid),
+        "created_at": original["created_at"],
+    }
+    other_binding = {
+        "stream_uuid": str(other_stream_uuid),
+        "user_uuid": str(user_uuid),
+        "role": "owner",
+        "created_at": original["created_at"],
+    }
+    assert put_other("streams", other_stream_uuid, other_stream).status_code == 200
+    assert (
+        put_other("stream_bindings", other_binding_uuid, other_binding).status_code
+        == 200
+    )
+    other_after = db.execute(
+        "SELECT COALESCE(max(epoch_version), 0) FROM workspace_v3.events "
+        "WHERE project_id = %s",
+        (other_project,),
+    ).fetchone()[0]
+
+    updated = {**original, "display_name": "Updated everywhere"}
+    response = _put(api, "users", user_uuid, updated)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "updated"
+
+    other_view = api.get(f"{ROOT}/users/{user_uuid}", project=other_project)
+    assert other_view.status_code == 200, other_view.text
+    assert other_view.json()["data"]["display_name"] == "Updated everywhere"
+    other_state = db.execute(
+        """
+        SELECT content_hash
+        FROM workspace_v3.provider_entity_states
+        WHERE project_id = %s AND provider_uuid = %s
+          AND entity_type = 'user' AND entity_uuid = %s
+        """,
+        (other_project, other_provider_uuid, user_uuid),
+    ).fetchone()
+    assert other_state[0].hex() == other_view.json()["content_hash"]
+
+    other_events = db.execute(
+        """
+        SELECT event.payload ->> 'kind', audience.consumer_type,
+               audience.consumer_uuid
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s AND event.entity_uuid = %s
+          AND event.epoch_version > %s
+        ORDER BY audience.consumer_type, audience.consumer_uuid
+        """,
+        (other_project, user_uuid, other_after),
+    ).fetchall()
+    assert set(other_events) == {
+        ("user.updated", "provider", other_provider_uuid),
+        ("user.updated", "user", user_uuid),
+    }
+    assert provider_uuid != other_provider_uuid
 
 
 def test_provider_bootstrap_includes_owned_and_reachable_users(api, db):
@@ -1537,6 +1794,242 @@ def test_provider_message_flag_rebind_notifies_old_and_new_viewers(api, db):
         (old_user_uuid, "message.deleted"),
         (new_user_uuid, "message.updated"),
     }
+
+
+def test_provider_rebind_rejects_stream_moves_and_reaction_identity_changes(api, db):
+    graph = _import_provider_conversation(api, db)
+    other_stream_uuid = sys_uuid.uuid4()
+    other_topic_uuid = sys_uuid.uuid4()
+    other_stream = {
+        "name": f"Other {other_stream_uuid}",
+        "owner_uuid": str(graph["owner"]),
+        "default_topic_uuid": str(other_topic_uuid),
+        "created_at": graph["created_at"],
+    }
+    other_topic = {
+        "stream_uuid": str(other_stream_uuid),
+        "name": "General",
+        "created_at": graph["created_at"],
+    }
+    second_stream = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={
+            "operations": [
+                {
+                    "action": "upsert",
+                    "type": "streams",
+                    "uuid": str(other_stream_uuid),
+                    "content_hash": _hash(other_stream),
+                    "data": other_stream,
+                },
+                {
+                    "action": "upsert",
+                    "type": "topics",
+                    "uuid": str(other_topic_uuid),
+                    "content_hash": _hash(other_topic),
+                    "data": other_topic,
+                },
+            ]
+        },
+    )
+    assert second_stream.status_code == 200, second_stream.text
+
+    moved_binding = {
+        "stream_uuid": str(other_stream_uuid),
+        "user_uuid": str(graph["owner"]),
+        "role": "owner",
+        "created_at": graph["created_at"],
+    }
+    binding_response = _put(
+        api,
+        "stream_bindings",
+        graph["owner_binding"],
+        moved_binding,
+        rebind_identity=True,
+    )
+    assert binding_response.status_code == 409, binding_response.text
+    assert binding_response.json()["error"] == "entity_identity_conflict"
+
+    reaction_uuid = sys_uuid.uuid4()
+    reaction = {
+        "message_uuid": str(graph["message"]),
+        "user_uuid": str(graph["owner"]),
+        "emoji_name": "eyes",
+        "created_at": graph["created_at"],
+    }
+    assert _put(api, "message_reactions", reaction_uuid, reaction).status_code == 200
+    rebound_reaction = {**reaction, "user_uuid": str(graph["peer"])}
+    reaction_response = _put(
+        api,
+        "message_reactions",
+        reaction_uuid,
+        rebound_reaction,
+        rebind_identity=True,
+    )
+    assert reaction_response.status_code == 409, reaction_response.text
+    assert reaction_response.json()["error"] == "entity_identity_conflict"
+
+
+def test_provider_topic_binding_rebind_notifies_previous_viewer(api, db):
+    graph = _import_provider_conversation(api, db)
+    after = db.execute(
+        "SELECT COALESCE(max(epoch_version), 0) FROM workspace_v3.events "
+        "WHERE project_id = %s",
+        (api.project_id,),
+    ).fetchone()[0]
+    rebound = {
+        "stream_uuid": str(graph["stream"]),
+        "topic_uuid": str(graph["topic"]),
+        "user_uuid": str(graph["peer"]),
+        "created_at": graph["created_at"],
+    }
+    response = _put(
+        api,
+        "topic_bindings",
+        graph["topic_binding"],
+        rebound,
+        rebind_identity=True,
+    )
+    assert response.status_code == 200, response.text
+    events = db.execute(
+        """
+        SELECT audience.consumer_uuid, event.payload ->> 'kind'
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s AND event.entity_uuid = %s
+          AND event.epoch_version > %s AND audience.consumer_type = 'user'
+        ORDER BY audience.consumer_uuid, event.epoch_version
+        """,
+        (api.project_id, graph["topic"], after),
+    ).fetchall()
+    assert set(events) == {
+        (graph["owner"], "topic.deleted"),
+        (graph["peer"], "topic.updated"),
+    }
+
+
+def test_provider_projection_annotations_preserve_live_tasks_and_skip_echo(api, db):
+    graph = _import_provider_conversation(api, db)
+    _drain_projections(db)
+    reaction_uuid = sys_uuid.uuid4()
+    live_reaction = {
+        "message_uuid": str(graph["message"]),
+        "user_uuid": str(graph["owner"]),
+        "emoji_name": "eyes",
+        "created_at": graph["created_at"],
+    }
+    assert (
+        _put(api, "message_reactions", reaction_uuid, live_reaction).status_code == 200
+    )
+    backfill_reaction = {**live_reaction, "emoji_name": "thumbs_up"}
+    backfill = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={
+            "delivery_class": "backfill",
+            "operations": [
+                {
+                    "action": "upsert",
+                    "type": "message_reactions",
+                    "uuid": str(reaction_uuid),
+                    "content_hash": _hash(backfill_reaction),
+                    "data": backfill_reaction,
+                }
+            ],
+        },
+    )
+    assert backfill.status_code == 200, backfill.text
+    reaction_tasks = db.execute(
+        """
+        SELECT payload ->> 'emit_events', payload ->> 'origin_provider_uuid'
+        FROM workspace_v3.projection_tasks AS task
+        WHERE project_id = %s AND task_type = 'reaction_snapshot'
+          AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements(payload -> 'operations') AS operation
+              WHERE operation ->> 'reaction_uuid' = %s
+          )
+        ORDER BY created_at, uuid
+        """,
+        (api.project_id, str(reaction_uuid)),
+    ).fetchall()
+    assert reaction_tasks == [
+        ("true", str(graph["provider"])),
+        ("false", str(graph["provider"])),
+    ]
+
+    existing_flag_tasks = tuple(
+        row[0]
+        for row in db.execute(
+            """
+            SELECT uuid FROM workspace_v3.projection_tasks
+            WHERE project_id = %s AND task_type = 'read_counters'
+            """,
+            (api.project_id,),
+        ).fetchall()
+    )
+    live_flag = {
+        "stream_uuid": str(graph["stream"]),
+        "message_uuid": str(graph["message"]),
+        "user_uuid": str(graph["owner"]),
+        "read": True,
+    }
+    assert _put(api, "message_flags", graph["flag"], live_flag).status_code == 200
+    backfill_flag = {**live_flag, "read": False, "starred": True}
+    flag_backfill = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={
+            "delivery_class": "backfill",
+            "operations": [
+                {
+                    "action": "upsert",
+                    "type": "message_flags",
+                    "uuid": str(graph["flag"]),
+                    "content_hash": _hash(backfill_flag),
+                    "data": backfill_flag,
+                }
+            ],
+        },
+    )
+    assert flag_backfill.status_code == 200, flag_backfill.text
+    flag_tasks = db.execute(
+        """
+        SELECT payload ->> 'emit_message_events'
+        FROM workspace_v3.projection_tasks AS task
+        WHERE project_id = %s AND task_type = 'read_counters'
+          AND user_uuid = %s AND payload ? 'operations'
+          AND uuid <> ALL(%s::uuid[])
+          AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements(payload -> 'operations') AS operation
+              WHERE operation ->> 'message_uuid' = %s
+          )
+        ORDER BY created_at, uuid
+        """,
+        (
+            api.project_id,
+            graph["owner"],
+            list(existing_flag_tasks),
+            str(graph["message"]),
+        ),
+    ).fetchall()
+    assert flag_tasks == [("true",), ("false",)]
+
+    _drain_projections(db)
+    echoed_reactions = db.execute(
+        """
+        SELECT count(*)
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s AND event.entity_uuid = %s
+          AND event.object_type = 'message_reaction'
+          AND audience.consumer_type = 'provider'
+          AND audience.consumer_uuid = %s
+        """,
+        (api.project_id, reaction_uuid, graph["provider"]),
+    ).fetchone()[0]
+    assert echoed_reactions == 0
 
 
 def test_provider_can_converge_native_messages_only_inside_its_streams(api, db):

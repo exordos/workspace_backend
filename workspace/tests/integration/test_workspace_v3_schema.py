@@ -592,3 +592,20 @@ def test_workspace_v3_indexes_user_reactions_for_user_listing(_database, db):
     assert index[0].endswith(
         "ON workspace_v3.message_reactions USING btree (project_id, user_uuid)"
     )
+
+
+def test_workspace_v3_indexes_provider_user_project_discovery(_database, db):
+    index = db.execute(
+        """
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'workspace_v3'
+          AND indexname = 'provider_entity_states_entity_projects_idx'
+        """
+    ).fetchone()
+
+    assert index is not None
+    assert index[0].endswith(
+        "ON workspace_v3.provider_entity_states USING btree "
+        "(entity_type, entity_uuid, project_id)"
+    )

@@ -508,8 +508,10 @@ class ProviderEntityStore:
         )
         previous_user_uuid: sys_uuid.UUID | None = None
         previous_message_flag_event: dict[str, typing.Any] | None = None
+        previous_topic_binding_event: dict[str, typing.Any] | None = None
         previous_topic_event: dict[str, typing.Any] | None = None
         previous_message_event: dict[str, typing.Any] | None = None
+        pending_projection_tasks: tuple[sys_uuid.UUID, ...] = ()
         if emit_event and resource == "topics" and entity_exists:
             previous_topic_event = dict(
                 self.session.execute(
@@ -544,11 +546,23 @@ class ProviderEntityStore:
                     previous_message_flag_event = self._capture_delete_event(
                         resource, entity_uuid
                     )
+                elif resource == "topic_bindings":
+                    previous_topic_binding_event = self._capture_delete_event(
+                        resource, entity_uuid
+                    )
                 previous_user_uuid = self._prepare_identity_rebind(
                     resource, entity_uuid, data
                 )
             else:
                 self._ensure_identity_unchanged(resource, entity_uuid, data)
+        if resource == "message_reactions" or (
+            resource == "message_flags" and not emit_event
+        ):
+            pending_projection_tasks = self._matching_projection_task_ids(
+                resource,
+                entity_uuid,
+                data,
+            )
         status = (
             "created"
             if state is None and (resource == "users" or not entity_exists)
@@ -563,8 +577,17 @@ class ProviderEntityStore:
                 )
             else:
                 getattr(self, f"_upsert_{resource}")(entity_uuid, data)
-            if resource == "message_reactions" and not emit_event:
-                self._suppress_reaction_projection_events(entity_uuid)
+            if resource == "message_reactions":
+                self._annotate_reaction_projection_events(
+                    entity_uuid,
+                    pending_projection_tasks,
+                    emit_event=emit_event,
+                )
+            elif resource == "message_flags" and not emit_event:
+                self._suppress_message_flag_projection_events(
+                    data,
+                    pending_projection_tasks,
+                )
             canonical_data = self.provider_data_for_entity(resource, entity_uuid)
             if canonical_data is None:
                 raise RuntimeError("provider upsert did not materialize its entity")
@@ -594,6 +617,18 @@ class ProviderEntityStore:
                         "message_flags",
                         entity_uuid,
                         previous_message_flag_event,
+                    )
+                if previous_topic_binding_event is not None and (
+                    previous_topic_binding_event["topic_uuid"],
+                    previous_topic_binding_event["recipients"],
+                ) != (
+                    parse_uuid(data["topic_uuid"], "topic_uuid"),
+                    (parse_uuid(data["user_uuid"], "user_uuid"),),
+                ):
+                    self._emit_delete(
+                        "topic_bindings",
+                        entity_uuid,
+                        previous_topic_binding_event,
                     )
                 if previous_topic_event is not None and previous_topic_event[
                     "stream_uuid"
@@ -665,6 +700,9 @@ class ProviderEntityStore:
         """Make an explicit provider-owned identity migration conflict-safe."""
         if resource == "stream_bindings":
             return self._prepare_stream_binding_identity_rebind(entity_uuid, data)
+        if resource == "message_reactions":
+            self._ensure_identity_unchanged(resource, entity_uuid, data)
+            return None
         if resource != "message_flags":
             return None
         message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
@@ -733,10 +771,16 @@ class ProviderEntityStore:
         ).fetchone()
         if current is None:
             return None
+        stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
+        if sys_uuid.UUID(str(current["stream_uuid"])) != stream_uuid:
+            _error(
+                409,
+                "entity_identity_conflict",
+                "stream_uuid cannot change for an existing stream binding",
+            )
         target_user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
         if current["user_uuid"] == target_user_uuid:
             return None
-        stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
         conflict = self.session.execute(
             """
             SELECT uuid FROM workspace_v3.stream_bindings
@@ -922,13 +966,47 @@ class ProviderEntityStore:
             )
         with event_origin.use("provider", self.provider_uuid):
             event = self._capture_delete_event(resource, entity_uuid)
+            restored_topic_uuid = None
+            if resource == "messages":
+                restored_topic_uuid = (
+                    v3_store.restore_topic_summary_after_message_deletion(
+                        self.session,
+                        self.project_uuid,
+                        entity_uuid,
+                    )
+                )
+            pending_projection_tasks: tuple[sys_uuid.UUID, ...] = ()
+            if resource == "message_reactions" or (
+                resource == "message_flags" and not emit_event
+            ):
+                pending_projection_tasks = self._matching_projection_task_ids(
+                    resource,
+                    entity_uuid,
+                    event["data"],
+                )
             getattr(self, f"_delete_{resource}")(entity_uuid)
-            if resource == "message_reactions" and not emit_event:
-                self._suppress_reaction_projection_events(entity_uuid)
+            if resource == "message_reactions":
+                self._annotate_reaction_projection_events(
+                    entity_uuid,
+                    pending_projection_tasks,
+                    emit_event=emit_event,
+                )
+            elif resource == "message_flags" and not emit_event:
+                self._suppress_message_flag_projection_events(
+                    event["data"],
+                    pending_projection_tasks,
+                )
             if resource == "stream_bindings":
                 self._invalidate_stream_recipients(event["stream_uuid"])
             if emit_event:
                 self._emit_delete(resource, entity_uuid, event)
+                if restored_topic_uuid is not None:
+                    self.events._emit_resource(
+                        "stream_topics",
+                        restored_topic_uuid,
+                        "updated",
+                        event["recipients"],
+                    )
         return {
             "type": resource,
             "uuid": entity_uuid,
@@ -1843,18 +1921,75 @@ class ProviderEntityStore:
             ),
         )
 
-    def _suppress_reaction_projection_events(
+    def _matching_projection_task_ids(
+        self,
+        resource: str,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+    ) -> tuple[sys_uuid.UUID, ...]:
+        if resource == "message_reactions":
+            predicate = """
+                task.task_type = 'reaction_snapshot'
+                AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(
+                        COALESCE(task.payload -> 'operations', '[]'::jsonb)
+                    ) AS operation
+                    WHERE operation ->> 'reaction_uuid' = %(entity)s
+                )
+            """
+            parameters = {
+                "project": self.project_uuid,
+                "entity": str(entity_uuid),
+            }
+        else:
+            predicate = """
+                task.task_type = 'read_counters'
+                AND task.user_uuid = %(user)s
+                AND EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(
+                        COALESCE(task.payload -> 'operations', '[]'::jsonb)
+                    ) AS operation
+                    WHERE operation ->> 'message_uuid' = %(message)s
+                )
+            """
+            parameters = {
+                "project": self.project_uuid,
+                "user": parse_uuid(data["user_uuid"], "user_uuid"),
+                "message": str(parse_uuid(data["message_uuid"], "message_uuid")),
+            }
+        rows = self.session.execute(
+            f"""
+            SELECT task.uuid
+            FROM workspace_v3.projection_tasks AS task
+            WHERE task.project_id = %(project)s
+              AND task.status = 'pending'
+              AND {predicate}
+            """,
+            parameters,
+        ).fetchall()
+        return tuple(sys_uuid.UUID(str(row["uuid"])) for row in rows)
+
+    def _annotate_reaction_projection_events(
         self,
         reaction_uuid: sys_uuid.UUID,
+        previous_task_uuids: tuple[sys_uuid.UUID, ...],
+        *,
+        emit_event: bool,
     ) -> None:
         self.session.execute(
             """
             UPDATE workspace_v3.projection_tasks AS task
-            SET payload = task.payload || '{"emit_events": false}'::jsonb,
+            SET payload = task.payload || jsonb_build_object(
+                    'emit_events', %s,
+                    'origin_provider_uuid', %s::text
+                ),
                 updated_at = clock_timestamp()
             WHERE task.project_id = %s
               AND task.task_type = 'reaction_snapshot'
               AND task.status = 'pending'
+              AND task.uuid <> ALL(%s::uuid[])
               AND EXISTS (
                   SELECT 1
                   FROM jsonb_array_elements(
@@ -1863,7 +1998,44 @@ class ProviderEntityStore:
                   WHERE operation ->> 'reaction_uuid' = %s
               )
             """,
-            (self.project_uuid, str(reaction_uuid)),
+            (
+                emit_event,
+                self.provider_uuid,
+                self.project_uuid,
+                list(previous_task_uuids),
+                str(reaction_uuid),
+            ),
+        )
+
+    def _suppress_message_flag_projection_events(
+        self,
+        data: dict[str, typing.Any],
+        previous_task_uuids: tuple[sys_uuid.UUID, ...],
+    ) -> None:
+        self.session.execute(
+            """
+            UPDATE workspace_v3.projection_tasks AS task
+            SET payload = task.payload || '{"emit_message_events": false}'::jsonb,
+                updated_at = clock_timestamp()
+            WHERE task.project_id = %s
+              AND task.task_type = 'read_counters'
+              AND task.status = 'pending'
+              AND task.user_uuid = %s
+              AND task.uuid <> ALL(%s::uuid[])
+              AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(
+                      COALESCE(task.payload -> 'operations', '[]'::jsonb)
+                  ) AS operation
+                  WHERE operation ->> 'message_uuid' = %s
+              )
+            """,
+            (
+                self.project_uuid,
+                parse_uuid(data["user_uuid"], "user_uuid"),
+                list(previous_task_uuids),
+                str(parse_uuid(data["message_uuid"], "message_uuid")),
+            ),
         )
 
     def _delete_users(self, entity_uuid: sys_uuid.UUID) -> None:
@@ -2021,9 +2193,10 @@ class ProviderEntityStore:
     ) -> None:
         action = "created" if status == "created" else "updated"
         if resource == "users":
-            recipients = self._user_recipients(entity_uuid)
-            if recipients:
-                self.events._emit_resource("users", entity_uuid, action, recipients)
+            # Users are global. A provider update in one project must refresh
+            # every project that tracks the provider-owned identity, including
+            # each project's provider projection and content hash.
+            self.events._emit_provider_user_updated_all_projects(entity_uuid)
             return
         if resource == "streams":
             recipients = self.events._stream_recipients(entity_uuid)

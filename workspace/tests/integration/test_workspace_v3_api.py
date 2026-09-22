@@ -17,6 +17,7 @@ from workspace.messenger_api import file_storage
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api.api import sql_canonical_store, store_factory
 from workspace.messenger_api.api import store as api_store
+from workspace.messenger_api.api import v3_store
 from workspace.tests.integration import conftest
 from workspace.workspace_v3 import projections
 
@@ -138,6 +139,40 @@ def test_v3_api_keeps_routes_and_reduces_provider_projection(api):
     assert next_page.status_code == 200, next_page.text
     assert [row["uuid"] for row in next_page.json()] == [second["uuid"]]
     assert second["created_at"].endswith("Z")
+
+
+def test_v3_rejects_cross_stream_topics_for_messages_and_drafts(api, db):
+    first_stream = _create_stream(api, "First stream")
+    second_stream = _create_stream(api, "Second stream")
+
+    message = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": first_stream["uuid"],
+            "topic_uuid": second_stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "wrong topic"},
+        },
+    )
+    draft_uuid = sys_uuid.uuid4()
+    draft = api.post(
+        DRAFTS,
+        json={
+            "uuid": str(draft_uuid),
+            "stream_uuid": first_stream["uuid"],
+            "topic_uuid": second_stream["default_topic_uuid"],
+            "payload": {"kind": "markdown", "content": "wrong topic"},
+        },
+    )
+
+    assert message.status_code == 400, message.text
+    assert draft.status_code == 400, draft.text
+    assert (
+        db.execute(
+            "SELECT count(*) FROM workspace_v3.drafts WHERE uuid = %s",
+            (draft_uuid,),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_v3_topic_without_default_is_legacy_boolean(api, db):
@@ -301,6 +336,14 @@ def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
     peer_uuid = sys_uuid.uuid4()
     own_user = api.get(f"{V1}/me/", user=peer_uuid)
     assert own_user.status_code == 200, own_user.text
+    before_add = db.execute(
+        """
+        SELECT COALESCE(max(epoch_version), 0)
+        FROM workspace_v3.events
+        WHERE project_id = %s
+        """,
+        (api.project_id,),
+    ).fetchone()[0]
 
     added = api.post(
         f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
@@ -312,6 +355,26 @@ def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
     assert peer_messages.status_code == 200, peer_messages.text
     assert peer_messages.json()[0]["uuid"] == historical["uuid"]
     assert peer_messages.json()[0]["read"] is True
+    membership_events = db.execute(
+        """
+        SELECT event.payload ->> 'kind', audience.consumer_uuid
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s
+          AND event.entity_uuid = %s
+          AND event.epoch_version > %s
+          AND audience.consumer_type = 'user'
+        """,
+        (api.project_id, stream["uuid"], before_add),
+    ).fetchall()
+    assert ("stream.created", peer_uuid) in membership_events
+    assert ("stream_bindings.created", peer_uuid) not in membership_events
+    assert (
+        "stream_bindings.created",
+        sys_uuid.UUID(str(api.user_uuid)),
+    ) in membership_events
 
     removed = api.delete(f"{STREAM_BINDINGS}{binding_uuid}")
     assert removed.status_code == 204, removed.text
@@ -368,6 +431,14 @@ def test_v3_membership_delete_and_readd_rebuilds_user_state(api, db):
 
 def test_v3_stream_binding_updates_role_and_notification_mode(api):
     stream = _create_stream(api, "Mutable membership")
+    invalid_notification = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/notifications/invoke",
+        json={"notification_mode": "default"},
+    )
+    assert invalid_notification.status_code == 400, invalid_notification.text
+    assert api.get(f"{STREAMS}{stream['uuid']}").json()["notification_mode"] == (
+        "all_messages"
+    )
     peer_uuid = sys_uuid.uuid4()
     assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
     added = api.post(
@@ -905,6 +976,42 @@ def test_v3_topic_summary_worker_uses_v3_rows(api):
     assert topic.json()["summary_has_new_messages"] is False
 
 
+def test_v3_message_delete_restores_previous_topic_summary(api, db):
+    stream = _create_stream(api, "V3 summary deletion")
+    first = _create_message(api, stream, "first decision")
+    second = _create_message(api, stream, "second decision")
+
+    def store_summary(message_uuid, summary):
+        return _run_database_operation(
+            lambda session: v3_store.MessengerV3Store(
+                api.project_id,
+                api.user_uuid,
+            ).set_topic_summary(
+                sys_uuid.UUID(stream["default_topic_uuid"]),
+                summary,
+                sys_uuid.UUID(message_uuid),
+            )
+        )
+
+    store_summary(first["uuid"], "First summary.")
+    store_summary(second["uuid"], "Second summary.")
+    deleted = api.delete(f"{MESSAGES}{second['uuid']}")
+    assert deleted.status_code == 204, deleted.text
+
+    restored = api.get(f"{TOPICS}{stream['default_topic_uuid']}").json()
+    assert restored["summary"] == "First summary."
+    assert restored["summary_last_message_uuid"] == first["uuid"]
+    invalidated = db.execute(
+        """
+        SELECT count(*)
+        FROM m_workspace_topic_summary_journal
+        WHERE topic_uuid = %s AND invalidated_at IS NOT NULL
+        """,
+        (stream["default_topic_uuid"],),
+    ).fetchone()[0]
+    assert invalidated == 1
+
+
 def test_v3_reaction_worker_updates_denormalized_message(api, db):
     stream = _create_stream(api, "Reactions")
     message = _create_message(api, stream)
@@ -923,6 +1030,122 @@ def test_v3_reaction_worker_updates_denormalized_message(api, db):
     after = api.get(f"{MESSAGES}{message['uuid']}").json()
     assert after["reactions"] == {"eyes": 1}
     assert after["reaction_users"] == {"eyes": [str(api.user_uuid)]}
+
+
+def test_v3_projection_owns_star_and_reaction_update_events(api, db):
+    stream = _create_stream(api, "Single projection event")
+    message = _create_message(api, stream)
+    reaction = api.post(
+        REACTIONS,
+        json={"message_uuid": message["uuid"], "emoji_name": "eyes"},
+    )
+    assert reaction.status_code == 201, reaction.text
+    _drain_projections(db)
+    before_epoch = db.execute(
+        """
+        SELECT COALESCE(max(epoch_version), 0)
+        FROM workspace_v3.events
+        WHERE project_id = %s
+        """,
+        (api.project_id,),
+    ).fetchone()[0]
+
+    starred = api.post(f"{MESSAGES}{message['uuid']}/actions/star/invoke", json={})
+    repeated_star = api.post(
+        f"{MESSAGES}{message['uuid']}/actions/star/invoke",
+        json={},
+    )
+    updated_reaction = api.put(
+        f"{REACTIONS}{reaction.json()['uuid']}",
+        json={"emoji_name": "heart"},
+    )
+    assert starred.status_code == 200, starred.text
+    assert repeated_star.status_code == 200, repeated_star.text
+    assert updated_reaction.status_code == 200, updated_reaction.text
+    metrics = _drain_projections(db)
+    assert metrics["failed"] == 0
+
+    event_kinds = db.execute(
+        """
+        SELECT payload ->> 'kind', count(*)
+        FROM workspace_v3.events
+        WHERE project_id = %s AND epoch_version > %s
+          AND (
+              (entity_uuid = %s AND payload ->> 'kind' = 'message.updated')
+              OR (
+                  entity_uuid = %s
+                  AND payload ->> 'kind' = 'message_reaction.updated'
+              )
+          )
+        GROUP BY payload ->> 'kind'
+        """,
+        (
+            api.project_id,
+            before_epoch,
+            message["uuid"],
+            reaction.json()["uuid"],
+        ),
+    ).fetchall()
+    assert dict(event_kinds) == {
+        "message.updated": 1,
+        "message_reaction.updated": 1,
+    }
+
+
+def test_v3_message_edit_emits_one_event_when_mentions_change(api, db):
+    stream = _create_stream(api, "Mention edit")
+    peer_uuid = sys_uuid.uuid4()
+    assert api.get(f"{V1}/me/", user=peer_uuid).status_code == 200
+    added = api.post(
+        f"{STREAMS}{stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(peer_uuid)]},
+    )
+    assert added.status_code == 200, added.text
+    message = _create_message(api, stream, "before")
+    _drain_projections(db)
+    before_epoch = db.execute(
+        """
+        SELECT COALESCE(max(epoch_version), 0)
+        FROM workspace_v3.events
+        WHERE project_id = %s
+        """,
+        (api.project_id,),
+    ).fetchone()[0]
+
+    updated = api.put(
+        f"{MESSAGES}{message['uuid']}",
+        json={
+            "payload": {
+                "kind": "markdown",
+                "content": f"hello urn:user:{peer_uuid}",
+            }
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    metrics = _drain_projections(db)
+    assert metrics["failed"] == 0
+
+    peer_events = db.execute(
+        """
+        SELECT event.payload ->> 'kind'
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_audience_members AS audience
+          ON audience.project_id = event.project_id
+         AND audience.audience_snapshot_uuid = event.audience_snapshot_uuid
+        WHERE event.project_id = %s
+          AND event.entity_uuid = %s
+          AND event.epoch_version > %s
+          AND audience.consumer_type = 'user'
+          AND audience.consumer_uuid = %s
+        ORDER BY event.epoch_version
+        """,
+        (api.project_id, message["uuid"], before_epoch, peer_uuid),
+    ).fetchall()
+    assert peer_events == [("message.updated",)]
+    assert (
+        api.get(f"{MESSAGES}{message['uuid']}", user=peer_uuid).json()["mentioned"]
+        is True
+    )
 
 
 def test_v3_reaction_creation_is_idempotent(api, db):
@@ -1104,12 +1327,73 @@ def test_v3_event_retention_advances_reconnect_floor(api, workspace_api, db):
 
 def test_v3_avatar_file_lifecycle_uses_v3_metadata(api, db, tmp_path, monkeypatch):
     monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    assert api.get(f"{V1}/me/").status_code == 200
+    other_project_uuid = sys_uuid.uuid4()
+    other_user_uuid = sys_uuid.uuid4()
+    other_stream_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.users (
+            uuid, created_at, updated_at, username, source, status, avatar
+        ) VALUES (
+            %s, NOW(), NOW(), %s, 'iam', 'active',
+            'urn:gravatar:00000000000000000000000000000000'
+        )
+        """,
+        (other_user_uuid, f"other-{other_user_uuid}"),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.streams (
+            uuid, project_id, name, owner_uuid
+        ) VALUES (%s, %s, 'Shared identity', %s)
+        """,
+        (other_stream_uuid, other_project_uuid, api.user_uuid),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.stream_bindings (
+            uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+        ) VALUES
+            (gen_random_uuid(), %s, %s, %s, %s, 'owner'),
+            (gen_random_uuid(), %s, %s, %s, %s, 'member')
+        """,
+        (
+            other_project_uuid,
+            other_stream_uuid,
+            api.user_uuid,
+            api.user_uuid,
+            other_project_uuid,
+            other_stream_uuid,
+            other_user_uuid,
+            api.user_uuid,
+        ),
+    )
+    db.execute(
+        "DELETE FROM workspace_v3.events WHERE entity_uuid = %s",
+        (api.user_uuid,),
+    )
     data = b"\x89PNG\r\n\x1a\nworkspace-v3-avatar"
     uploaded = api.post(
         f"{V1}/users/{api.user_uuid}/actions/avatar_upload/invoke",
         files={"file": ("avatar.png", io.BytesIO(data), "image/png")},
     )
     assert uploaded.status_code == 200, uploaded.text
+    event_projects = {
+        row[0]
+        for row in db.execute(
+            """
+            SELECT DISTINCT project_id
+            FROM workspace_v3.events
+            WHERE entity_uuid = %s AND payload ->> 'kind' = 'user.updated'
+            """,
+            (api.user_uuid,),
+        ).fetchall()
+    }
+    assert event_projects == {
+        sys_uuid.UUID(api.project_id),
+        other_project_uuid,
+    }
     file_uuid = uploaded.json()["avatar"].removeprefix("urn:image:")
     with db.cursor() as cursor:
         cursor.execute(
@@ -1250,6 +1534,34 @@ def test_v3_presence_action_accepts_public_resource_uuid_and_broadcasts(api, db)
         json={"member": [str(peer_uuid)]},
     )
     assert added.status_code == 200, added.text
+    other_project_uuid = sys_uuid.uuid4()
+    other_stream_uuid = sys_uuid.uuid4()
+    db.execute(
+        """
+        INSERT INTO workspace_v3.streams (
+            uuid, project_id, name, owner_uuid
+        ) VALUES (%s, %s, 'Other project presence', %s)
+        """,
+        (other_stream_uuid, other_project_uuid, api.user_uuid),
+    )
+    db.execute(
+        """
+        INSERT INTO workspace_v3.stream_bindings (
+            uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+        ) VALUES (gen_random_uuid(), %s, %s, %s, %s, 'owner'),
+                 (gen_random_uuid(), %s, %s, %s, %s, 'member')
+        """,
+        (
+            other_project_uuid,
+            other_stream_uuid,
+            api.user_uuid,
+            api.user_uuid,
+            other_project_uuid,
+            other_stream_uuid,
+            peer_uuid,
+            api.user_uuid,
+        ),
+    )
 
     response = api.post(
         f"{V1}/users/{api.user_uuid}/actions/presence/invoke",
@@ -1276,6 +1588,18 @@ def test_v3_presence_action_accepts_public_resource_uuid_and_broadcasts(api, db)
         (api.project_id, api.user_uuid, peer_uuid),
     ).fetchone()
     assert peer_event == ("user.updated",)
+    assert (
+        db.execute(
+            """
+            SELECT count(*)
+            FROM workspace_v3.events
+            WHERE project_id = %s AND entity_uuid = %s
+              AND payload ->> 'kind' = 'user.updated'
+            """,
+            (other_project_uuid, api.user_uuid),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_v3_user_mutation_refreshes_owning_provider_and_notifies_all(api, db):

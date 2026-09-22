@@ -1842,10 +1842,23 @@ class MessengerEventsTestCase(unittest.TestCase):
             result = events.resolve_websocket_consumer(
                 project_uuid,
                 iam_user_uuid,
+                permissions={events.PROVIDER_SYNC_PERMISSION},
             )
 
         self.assertEqual(("provider", provider_uuid), result)
         resolve.assert_called_once_with(project_uuid, iam_user_uuid)
+
+    def test_websocket_provider_requires_sync_permission(self):
+        project_uuid = sys_uuid.uuid4()
+        iam_user_uuid = sys_uuid.uuid4()
+
+        with mock.patch.object(
+            events.v3_store,
+            "resolve_provider_consumer",
+            return_value={"uuid": sys_uuid.uuid4(), "name": "zulip"},
+        ):
+            with self.assertRaises(PermissionError):
+                events.resolve_websocket_consumer(project_uuid, iam_user_uuid)
 
     def test_websocket_notification_catches_up_with_per_user_cursor(self):
         websockets_stub = types.ModuleType("websockets")

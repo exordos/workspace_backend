@@ -105,6 +105,18 @@ class ProviderApiMiddleware(middlewares.Middleware):
         project_uuid = sys_uuid.UUID(str(req.context.project_id))
         iam_user_uuid = sys_uuid.UUID(str(req.context.user_uuid))
         session = contexts.Context().get_session()
+        permissions = req.context.iam_context.get_introspection_info().permissions
+        if "workspace.provider.sync" not in permissions:
+            registration = req.path == _REGISTRATION_PATH
+            raise messenger_exceptions.ProviderApiError(
+                status=403,
+                error=(
+                    "provider_registration_forbidden"
+                    if registration
+                    else "provider_sync_forbidden"
+                ),
+                message="Provider synchronization permission is required",
+            )
         if req.path == _REGISTRATION_PATH:
             return self._registration(
                 req,
@@ -176,13 +188,6 @@ class ProviderApiMiddleware(middlewares.Middleware):
         project_uuid: sys_uuid.UUID,
         iam_user_uuid: sys_uuid.UUID,
     ) -> webob.Response:
-        permissions = req.context.iam_context.get_introspection_info().permissions
-        if "workspace.provider.sync" not in permissions:
-            raise messenger_exceptions.ProviderApiError(
-                status=403,
-                error="provider_registration_forbidden",
-                message="Provider synchronization permission is required",
-            )
         if req.method != "PUT":
             return self._method_not_allowed(("PUT",))
         body = _body(req)

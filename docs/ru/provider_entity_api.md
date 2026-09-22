@@ -10,8 +10,8 @@ miss when reading schemas alone.
 - HTTP base: `/v1/provider/`
 - bootstrap schema: `schema_version: 2`
 - timestamps: UTC ISO-8601
-- authenticated caller: one enabled `workspace_v3.provider_consumers` row for
-  the current project and IAM user
+- authenticated caller: the `workspace.provider.sync` permission and one enabled
+  provider registration for the current project and IAM user
 
 `schema_version` versions the bootstrap and entity synchronization protocol. It
 is intentionally independent from the `/v1` public client API version.
@@ -21,6 +21,9 @@ is intentionally independent from the `/v1` public client API version.
 `users`, `streams`, `stream_bindings`, `topics`, `topic_bindings`, `messages`,
 `message_flags`, and `message_reactions` are available through:
 
+- `PUT /v1/provider/registration` to idempotently register the authenticated IAM
+  identity; it requires `workspace.provider.sync`, and changing its existing
+  provider UUID or name returns `409 provider_registration_conflict`
 - `GET|PUT|DELETE /v1/provider/entities/{type}/{uuid}`
 - `GET /v1/provider/entities/{type}` with keyset pagination
 - `POST /v1/provider/entities/actions/apply/invoke` for an atomic batch of up to

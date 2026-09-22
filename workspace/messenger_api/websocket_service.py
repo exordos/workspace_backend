@@ -55,7 +55,7 @@ class MessengerEventsAuthenticator:
     def authenticate(
         self,
         auth_token: str | None,
-    ) -> tuple[sys_uuid.UUID, sys_uuid.UUID]:
+    ) -> tuple[sys_uuid.UUID, sys_uuid.UUID, frozenset[str]]:
         if not auth_token:
             raise WebsocketAuthError("Missing bearer token")
         try:
@@ -69,7 +69,12 @@ class MessengerEventsAuthenticator:
             user_uuid = iam_context.token_info.user_uuid
             if not isinstance(user_uuid, sys_uuid.UUID):
                 user_uuid = sys_uuid.UUID(user_uuid)
-            return user_uuid, iam_context.get_introspection_info().project_id
+            introspection = iam_context.get_introspection_info()
+            return (
+                user_uuid,
+                sys_uuid.UUID(str(introspection.project_id)),
+                frozenset(introspection.permissions),
+            )
         except Exception as exc:
             LOG.exception("Websocket auth failed")
             raise WebsocketAuthError(str(exc))
@@ -187,7 +192,7 @@ class MessengerEventsWebsocketServer:
             websocket.request_headers.get("Sec-WebSocket-Protocol")
         )
         try:
-            user_uuid, project_id = await asyncio.to_thread(
+            user_uuid, project_id, permissions = await asyncio.to_thread(
                 self._authenticator.authenticate,
                 token,
             )
@@ -196,11 +201,15 @@ class MessengerEventsWebsocketServer:
                 messenger_events.resolve_websocket_consumer,
                 project_id=project_id,
                 iam_user_uuid=user_uuid,
+                permissions=permissions,
             )
             last_epoch_version = websocket_protocol.parse_last_epoch_version(path)
             epoch_generation = websocket_protocol.parse_epoch_generation(path)
         except WebsocketAuthError:
             await websocket.close(code=4401, reason="Unauthorized")
+            return
+        except PermissionError:
+            await websocket.close(code=4403, reason="Forbidden")
             return
         except Exception:
             LOG.exception("Invalid websocket handshake")
