@@ -40,6 +40,15 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _observed_report_canonical_sha256(report: dict[str, Any]) -> str:
+    canonical = copy.deepcopy(report)
+    canonical.pop("observed_at", None)
+    progress = canonical.get("progress")
+    if isinstance(progress, dict):
+        progress.pop("last_progress_at", None)
+    return hashlib.sha256(_json(canonical).encode()).hexdigest()
+
+
 def _row_value(row: Any, name: str) -> Any:
     if isinstance(row, collections.abc.Mapping):
         return row[name]
@@ -3003,10 +3012,10 @@ class SQLControlState:
         results = []
         for report in reports:
             report_uuid = sys_uuid.UUID(report["report_uuid"])
-            canonical = hashlib.sha256(_json(report).encode()).hexdigest()
+            canonical = _observed_report_canonical_sha256(report)
             result_safe_error = None
             existing = session.execute(
-                'SELECT "canonical_sha256" '
+                'SELECT "canonical_sha256", "payload" '
                 'FROM "m_external_bridge_observed_reports_v1" '
                 'WHERE "report_uuid" = %s',
                 (report_uuid,),
@@ -3015,6 +3024,8 @@ class SQLControlState:
                 status = (
                     "duplicate"
                     if existing["canonical_sha256"] == canonical
+                    or _observed_report_canonical_sha256(existing["payload"])
+                    == canonical
                     else "rejected"
                 )
             else:
@@ -3090,7 +3101,7 @@ class SQLControlState:
                 ).fetchone()
                 if inserted is None:
                     existing = session.execute(
-                        'SELECT "canonical_sha256" '
+                        'SELECT "canonical_sha256", "payload" '
                         'FROM "m_external_bridge_observed_reports_v1" '
                         'WHERE "report_uuid" = %s',
                         (report_uuid,),
@@ -3098,7 +3109,13 @@ class SQLControlState:
                     status = (
                         "duplicate"
                         if existing is not None
-                        and existing["canonical_sha256"] == canonical
+                        and (
+                            existing["canonical_sha256"] == canonical
+                            or _observed_report_canonical_sha256(
+                                existing["payload"]
+                            )
+                            == canonical
+                        )
                         else "rejected"
                     )
                 elif status == "applied":
