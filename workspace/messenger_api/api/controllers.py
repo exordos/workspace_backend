@@ -1383,6 +1383,16 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
     def _get_project_id(self) -> typing.Any:
         return self.get_context().project_id
 
+    def _sync_request_iam_identity(self) -> typing.Any:
+        iam_user = self.get_context().iam_context.get_introspection_info().user_info
+        return models.WorkspaceUser.sync_iam_identity(
+            user_uuid=self._get_user_uuid(),
+            username=iam_user.name,
+            first_name=iam_user.first_name,
+            last_name=iam_user.last_name,
+            email=iam_user.email,
+        )
+
     def get_packer(
         self, content_type: typing.Any, resource_type: typing.Any = None
     ) -> typing.Any:
@@ -1533,6 +1543,7 @@ class ExternalAccountController(ExternalResourceController):
 
     def create(self, **kwargs: typing.Any) -> typing.Any:
         self._require_permission("workspace.external_account.create")
+        self._sync_request_iam_identity()
         session = contexts.Context().get_session()
         return application_services.ExternalAccountApplicationService.create(
             session,
