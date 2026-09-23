@@ -44,6 +44,17 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
 
 
+def test_manifest_provisions_eight_backend_cores():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    backend_node = manifest.split("workspace_backend:", 1)[1].split(
+        "$core.secret.passwords:",
+        1,
+    )[0]
+
+    assert "cores: 8" in backend_node
+    assert "cores: $workspace.imports.$var_default_cores:value" not in backend_node
+
+
 def test_manifest_scales_s3_disk_size_by_core_profile():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     expected_profile_sizes = {
@@ -110,14 +121,14 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
-def test_messenger_runtime_has_two_workers_with_bounded_pool_budget():
+def test_messenger_runtime_has_sixteen_workers_with_bounded_pool_budget():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
         messenger = config.split("[messenger_api]", 1)[1].split("[", 1)[0]
-        assert "workers = 2" in messenger
+        assert "workers = 16" in messenger
         assert "connection_pool_max_size = 2" in config
 
     messenger_source = _read("workspace/cmd/messenger_api.py")

@@ -271,7 +271,7 @@ resources:
     workspace_backend:
       name: workspace-backend
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      cores: $workspace.imports.$var_default_cores:value
+      cores: 8
       ram: 4096
       disk_spec:
         kind: "disks"
@@ -479,7 +479,7 @@ resources:
           [messenger_api]
           bind_host = 127.0.0.1
           bind_port = 21081
-          workers = 2
+          workers = 16
 
 
           [messenger_store]
