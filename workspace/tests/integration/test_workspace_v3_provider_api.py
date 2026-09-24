@@ -1994,7 +1994,10 @@ def test_provider_projection_annotations_preserve_live_tasks_and_skip_echo(api, 
     assert flag_backfill.status_code == 200, flag_backfill.text
     flag_tasks = db.execute(
         """
-        SELECT payload ->> 'emit_message_events'
+        SELECT COALESCE(
+                   payload ->> 'emit_message_events',
+                   payload ->> 'emit_message_event'
+               ), payload ? 'operations'
         FROM workspace_v3.projection_tasks AS task
         WHERE project_id = %s AND task_type = 'read_counters'
           AND user_uuid = %s AND payload ? 'operations'
@@ -2012,7 +2015,27 @@ def test_provider_projection_annotations_preserve_live_tasks_and_skip_echo(api, 
             str(graph["message"]),
         ),
     ).fetchall()
-    assert flag_tasks == [("true",), ("false",)]
+    assert flag_tasks == [("true", True)]
+    quiet_flag_tasks = db.execute(
+        """
+        SELECT COALESCE(
+                   payload ->> 'emit_message_events',
+                   payload ->> 'emit_message_event'
+               ), payload ? 'operations'
+        FROM workspace_v3.projection_tasks AS task
+        WHERE project_id = %s AND task_type = 'read_counters'
+          AND scope_type = 'user_topic' AND scope_uuid = %s
+          AND user_uuid = %s AND NOT payload ? 'operations'
+          AND status = 'pending'
+        ORDER BY created_at, uuid
+        """,
+        (
+            api.project_id,
+            graph["topic"],
+            graph["owner"],
+        ),
+    ).fetchall()
+    assert quiet_flag_tasks == [("false", False)]
 
     _drain_projections(db)
     echoed_reactions = db.execute(
@@ -2369,6 +2392,75 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         ).fetchone()[0]
         == 0
     )
+    flag_operations = []
+    flag_uuids = []
+    for number, (_resource, message_uuid, _message) in enumerate(history):
+        flag_uuid = sys_uuid.uuid4()
+        flag_uuids.append(flag_uuid)
+        flag_data = {
+            "stream_uuid": str(stream_uuid),
+            "message_uuid": str(message_uuid),
+            "user_uuid": str(owner_uuid),
+            "read": number % 2 == 0,
+            "starred": number % 3 == 0,
+            "mentioned": number % 4 == 0,
+        }
+        flag_operations.append(
+            {
+                "action": "upsert",
+                "type": "message_flags",
+                "uuid": str(flag_uuid),
+                "content_hash": _hash(flag_data),
+                "source_updated_at": "2026-09-19T08:00:02Z",
+                "data": flag_data,
+            }
+        )
+    flags = api.post(
+        f"{ROOT}/actions/apply/invoke",
+        json={"delivery_class": "backfill", "operations": flag_operations},
+    )
+    assert flags.status_code == 200, flags.text
+    assert [item["status"] for item in flags.json()["results"]] == ["created"] * len(
+        flag_operations
+    )
+    imported_flags = db.execute(
+        """
+        SELECT uuid, read, starred, mentioned
+        FROM workspace_v3.message_flags
+        WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+        ORDER BY uuid
+        """,
+        (api.project_id, flag_uuids),
+    ).fetchall()
+    assert len(imported_flags) == len(flag_operations)
+    assert db.execute(
+        """
+        SELECT count(*)
+        FROM workspace_v3.provider_entity_states
+        WHERE project_id = %s AND provider_uuid = %s
+          AND entity_type = 'message_flag'
+          AND entity_uuid = ANY(%s::uuid[])
+        """,
+        (api.project_id, provider_uuid, flag_uuids),
+    ).fetchone()[0] == len(flag_operations)
+    assert not db.execute(
+        """
+        SELECT 1
+        FROM workspace_v3.projection_tasks AS task
+        WHERE task.project_id = %s AND task.task_type = 'read_counters'
+          AND COALESCE(
+              (task.payload ->> 'emit_message_events')::boolean, false
+          )
+          AND EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements(
+                  COALESCE(task.payload -> 'operations', '[]'::jsonb)
+              ) AS operation
+              WHERE (operation ->> 'message_uuid')::uuid = ANY(%s::uuid[])
+          )
+        """,
+        (api.project_id, [item[1] for item in history]),
+    ).fetchone()
     db.execute(
         """
         UPDATE workspace_v3.provider_consumers

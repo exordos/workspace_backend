@@ -222,6 +222,218 @@ class ProviderEntityStore:
             (self.project_uuid, self.provider_uuid),
         )
 
+    def upsert_backfill_message_flags(
+        self,
+        operations: list[dict[str, typing.Any]],
+    ) -> list[dict[str, typing.Any]] | None:
+        """Apply a fresh homogeneous flag batch with set-based SQL.
+
+        Existing provider cursors fall back to the general path so version and
+        identity-conflict semantics stay centralized in ``upsert``.  Initial
+        history imports are the hot path: messages have already materialized
+        their native flag rows, while provider ownership has not yet been
+        recorded for the stable source UUIDs.
+        """
+        rows = []
+        identities: set[tuple[sys_uuid.UUID, sys_uuid.UUID]] = set()
+        try:
+            for index, operation in enumerate(operations):
+                data = operation["data"]
+                stream_uuid = parse_uuid(data["stream_uuid"], "stream_uuid")
+                message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
+                user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
+                identity = (message_uuid, user_uuid)
+                if identity in identities:
+                    return None
+                identities.add(identity)
+                canonical_data = {
+                    "stream_uuid": stream_uuid,
+                    "message_uuid": message_uuid,
+                    "user_uuid": user_uuid,
+                    "read": bool(data.get("read", False)),
+                    "pinned": bool(data.get("pinned", False)),
+                    "starred": bool(data.get("starred", False)),
+                    "mentioned": bool(data.get("mentioned", False)),
+                }
+                rows.append(
+                    {
+                        "item_index": index,
+                        "entity_uuid": str(operation["entity_uuid"]),
+                        "stream_uuid": str(stream_uuid),
+                        "message_uuid": str(message_uuid),
+                        "user_uuid": str(user_uuid),
+                        "read": canonical_data["read"],
+                        "pinned": canonical_data["pinned"],
+                        "starred": canonical_data["starred"],
+                        "mentioned": canonical_data["mentioned"],
+                        "content_hash": canonical_hash(canonical_data).hex(),
+                        "source_content_hash": bytes(operation["content_hash"]).hex(),
+                        "source_updated_at": operation["source_updated_at"].isoformat(),
+                    }
+                )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            messenger_exceptions.ProviderApiError,
+        ):
+            return None
+        self.session.execute(
+            """
+            CREATE TEMPORARY TABLE provider_message_flag_batch (
+                item_index INTEGER PRIMARY KEY,
+                entity_uuid UUID NOT NULL,
+                stream_uuid UUID NOT NULL,
+                message_uuid UUID NOT NULL,
+                user_uuid UUID NOT NULL,
+                read BOOLEAN NOT NULL,
+                pinned BOOLEAN NOT NULL,
+                starred BOOLEAN NOT NULL,
+                mentioned BOOLEAN NOT NULL,
+                content_hash BYTEA NOT NULL,
+                source_content_hash BYTEA NOT NULL,
+                source_updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+            ) ON COMMIT DROP
+            """
+        )
+        self.session.execute(
+            """
+            INSERT INTO provider_message_flag_batch (
+                item_index, entity_uuid, stream_uuid, message_uuid, user_uuid,
+                read, pinned, starred, mentioned, content_hash,
+                source_content_hash, source_updated_at
+            )
+            SELECT input.item_index, input.entity_uuid, input.stream_uuid,
+                   input.message_uuid, input.user_uuid, input.read,
+                   input.pinned, input.starred, input.mentioned,
+                   decode(input.content_hash, 'hex'),
+                   decode(input.source_content_hash, 'hex'),
+                   input.source_updated_at
+            FROM jsonb_to_recordset(%s::jsonb) AS input(
+                item_index INTEGER, entity_uuid UUID, stream_uuid UUID,
+                message_uuid UUID, user_uuid UUID, read BOOLEAN,
+                pinned BOOLEAN, starred BOOLEAN, mentioned BOOLEAN,
+                content_hash TEXT, source_content_hash TEXT,
+                source_updated_at TIMESTAMP WITH TIME ZONE
+            )
+            """,
+            (json.dumps(rows),),
+        )
+        preflight = self.session.execute(
+            """
+            SELECT
+                bool_or(exact_flag.uuid IS NOT NULL) AS has_exact_flag,
+                bool_or(exact_state.entity_uuid IS NOT NULL) AS has_exact_state,
+                bool_or(identity_state.entity_uuid IS NOT NULL)
+                    AS has_identity_state,
+                bool_or(
+                    message.uuid IS NULL
+                    OR stream.source_name IS DISTINCT FROM %s
+                    OR binding.uuid IS NULL
+                ) AS invalid_dependency
+            FROM provider_message_flag_batch AS input
+            LEFT JOIN workspace_v3.message_flags AS exact_flag
+              ON exact_flag.uuid = input.entity_uuid
+            LEFT JOIN workspace_v3.provider_entity_states AS exact_state
+              ON exact_state.project_id = %s
+             AND exact_state.entity_type = 'message_flag'
+             AND exact_state.entity_uuid = input.entity_uuid
+            LEFT JOIN workspace_v3.message_flags AS identity_flag
+              ON identity_flag.project_id = %s
+             AND identity_flag.message_uuid = input.message_uuid
+             AND identity_flag.user_uuid = input.user_uuid
+            LEFT JOIN workspace_v3.provider_entity_states AS identity_state
+              ON identity_state.project_id = identity_flag.project_id
+             AND identity_state.entity_type = 'message_flag'
+             AND identity_state.entity_uuid = identity_flag.uuid
+            LEFT JOIN workspace_v3.messages AS message
+              ON message.project_id = %s
+             AND message.uuid = input.message_uuid
+             AND message.stream_uuid = input.stream_uuid
+            LEFT JOIN workspace_v3.streams AS stream
+              ON stream.project_id = message.project_id
+             AND stream.uuid = message.stream_uuid
+            LEFT JOIN workspace_v3.stream_bindings AS binding
+              ON binding.project_id = message.project_id
+             AND binding.stream_uuid = input.stream_uuid
+             AND binding.user_uuid = input.user_uuid
+            """,
+            (
+                self.provider_name,
+                self.project_uuid,
+                self.project_uuid,
+                self.project_uuid,
+            ),
+        ).fetchone()
+        if (
+            preflight["has_exact_flag"]
+            or preflight["has_exact_state"]
+            or preflight["has_identity_state"]
+            or preflight["invalid_dependency"]
+        ):
+            return None
+        with event_origin.use("provider", self.provider_uuid):
+            self.session.execute(
+                """
+                WITH provider_backfill_mode AS MATERIALIZED (
+                    SELECT set_config(
+                        'workspace_v3.provider_backfill_flags', 'on', true
+                    )
+                )
+                INSERT INTO workspace_v3.message_flags (
+                    uuid, project_id, stream_uuid, message_uuid, user_uuid,
+                    read, pinned, starred, mentioned
+                )
+                SELECT input.entity_uuid, %s, input.stream_uuid,
+                       input.message_uuid, input.user_uuid, input.read,
+                       input.pinned, input.starred, input.mentioned
+                FROM provider_message_flag_batch AS input
+                CROSS JOIN provider_backfill_mode
+                ORDER BY input.item_index
+                ON CONFLICT (project_id, message_uuid, user_uuid) DO UPDATE SET
+                    uuid = EXCLUDED.uuid,
+                    stream_uuid = EXCLUDED.stream_uuid,
+                    read = EXCLUDED.read,
+                    pinned = EXCLUDED.pinned,
+                    starred = EXCLUDED.starred,
+                    mentioned = EXCLUDED.mentioned,
+                    updated_at = clock_timestamp()
+                """,
+                (self.project_uuid,),
+            )
+            result_rows = self.session.execute(
+                """
+                WITH states AS (
+                    INSERT INTO workspace_v3.provider_entity_states (
+                        project_id, provider_uuid, entity_type, entity_uuid,
+                        content_hash, source_content_hash, source_updated_at
+                    )
+                    SELECT %s, %s, 'message_flag', input.entity_uuid,
+                           input.content_hash, input.source_content_hash,
+                           input.source_updated_at
+                    FROM provider_message_flag_batch AS input
+                    ORDER BY input.item_index
+                    RETURNING entity_uuid, source_updated_at, updated_at
+                )
+                SELECT input.item_index, input.entity_uuid,
+                       states.source_updated_at, states.updated_at
+                FROM provider_message_flag_batch AS input
+                JOIN states ON states.entity_uuid = input.entity_uuid
+                ORDER BY input.item_index
+                """,
+                (self.project_uuid, self.provider_uuid),
+            ).fetchall()
+        return [
+            {
+                "type": "message_flags",
+                "uuid": row["entity_uuid"],
+                "status": "created",
+                "source_updated_at": row["source_updated_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in result_rows
+        ]
+
     def _state(
         self,
         resource: str,
@@ -527,7 +739,6 @@ class ProviderEntityStore:
         previous_topic_binding_event: dict[str, typing.Any] | None = None
         previous_topic_event: dict[str, typing.Any] | None = None
         previous_message_event: dict[str, typing.Any] | None = None
-        pending_projection_tasks: tuple[sys_uuid.UUID, ...] = ()
         if emit_event and resource == "topics" and entity_exists:
             previous_topic_event = dict(
                 self.session.execute(
@@ -571,14 +782,6 @@ class ProviderEntityStore:
                 )
             else:
                 self._ensure_identity_unchanged(resource, entity_uuid, data)
-        if resource == "message_reactions" or (
-            resource == "message_flags" and not emit_event
-        ):
-            pending_projection_tasks = self._matching_projection_task_ids(
-                resource,
-                entity_uuid,
-                data,
-            )
         status = (
             "created"
             if state is None and (resource == "users" or not entity_exists)
@@ -591,19 +794,20 @@ class ProviderEntityStore:
                     data,
                     expand_flags=expand_message_flags,
                 )
+            elif resource == "message_flags":
+                self._upsert_message_flags(
+                    entity_uuid,
+                    data,
+                    emit_message_events=emit_event,
+                )
+            elif resource == "message_reactions":
+                self._upsert_message_reactions(
+                    entity_uuid,
+                    data,
+                    emit_events=emit_event,
+                )
             else:
                 getattr(self, f"_upsert_{resource}")(entity_uuid, data)
-            if resource == "message_reactions":
-                self._annotate_reaction_projection_events(
-                    entity_uuid,
-                    pending_projection_tasks,
-                    emit_event=emit_event,
-                )
-            elif resource == "message_flags" and not emit_event:
-                self._suppress_message_flag_projection_events(
-                    data,
-                    pending_projection_tasks,
-                )
             canonical_data = self.provider_data_for_entity(resource, entity_uuid)
             if canonical_data is None:
                 raise RuntimeError("provider upsert did not materialize its entity")
@@ -992,22 +1196,18 @@ class ProviderEntityStore:
                     )
                 )
             pending_projection_tasks: tuple[sys_uuid.UUID, ...] = ()
-            if resource == "message_reactions" or (
-                resource == "message_flags" and not emit_event
-            ):
-                pending_projection_tasks = self._matching_projection_task_ids(
-                    resource,
-                    entity_uuid,
-                    event["data"],
+            if resource == "message_flags" and not emit_event:
+                pending_projection_tasks = (
+                    self._matching_message_flag_projection_task_ids(event["data"])
                 )
-            getattr(self, f"_delete_{resource}")(entity_uuid)
             if resource == "message_reactions":
-                self._annotate_reaction_projection_events(
+                self._delete_message_reactions(
                     entity_uuid,
-                    pending_projection_tasks,
-                    emit_event=emit_event,
+                    emit_events=emit_event,
                 )
-            elif resource == "message_flags" and not emit_event:
+            else:
+                getattr(self, f"_delete_{resource}")(entity_uuid)
+            if resource == "message_flags" and not emit_event:
                 self._suppress_message_flag_projection_events(
                     event["data"],
                     pending_projection_tasks,
@@ -1881,14 +2081,25 @@ class ProviderEntityStore:
         )
 
     def _upsert_message_flags(
-        self, entity_uuid: sys_uuid.UUID, data: dict[str, typing.Any]
+        self,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+        *,
+        emit_message_events: bool = True,
     ) -> None:
         self.session.execute(
             """
+            WITH provider_backfill_mode AS MATERIALIZED (
+                SELECT set_config(
+                    'workspace_v3.provider_backfill_flags', %s, true
+                )
+            )
             INSERT INTO workspace_v3.message_flags (
                 uuid, project_id, stream_uuid, message_uuid, user_uuid,
                 read, pinned, starred, mentioned
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            )
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s
+            FROM provider_backfill_mode
             ON CONFLICT (project_id, message_uuid, user_uuid) DO UPDATE SET
                 uuid = EXCLUDED.uuid,
                 stream_uuid = EXCLUDED.stream_uuid,
@@ -1899,6 +2110,7 @@ class ProviderEntityStore:
                 updated_at = clock_timestamp()
             """,
             (
+                "off" if emit_message_events else "on",
                 entity_uuid,
                 self.project_uuid,
                 data["stream_uuid"],
@@ -1912,14 +2124,29 @@ class ProviderEntityStore:
         )
 
     def _upsert_message_reactions(
-        self, entity_uuid: sys_uuid.UUID, data: dict[str, typing.Any]
+        self,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+        *,
+        emit_events: bool = True,
     ) -> None:
         self.session.execute(
             """
+            WITH provider_reaction_mode AS MATERIALIZED (
+                SELECT
+                    set_config(
+                        'workspace_v3.provider_reaction_emit_events', %s, true
+                    ),
+                    set_config(
+                        'workspace_v3.provider_reaction_origin_uuid', %s, true
+                    )
+            )
             INSERT INTO workspace_v3.message_reactions (
                 uuid, project_id, message_uuid, user_uuid,
                 emoji_name, source_name, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, clock_timestamp())
+            )
+            SELECT %s, %s, %s, %s, %s, %s, %s, clock_timestamp()
+            FROM provider_reaction_mode
             ON CONFLICT (uuid) DO UPDATE SET
                 message_uuid = EXCLUDED.message_uuid,
                 user_uuid = EXCLUDED.user_uuid,
@@ -1927,6 +2154,8 @@ class ProviderEntityStore:
                 updated_at = clock_timestamp()
             """,
             (
+                "on" if emit_events else "off",
+                str(self.provider_uuid),
                 entity_uuid,
                 self.project_uuid,
                 data["message_uuid"],
@@ -1937,44 +2166,25 @@ class ProviderEntityStore:
             ),
         )
 
-    def _matching_projection_task_ids(
-        self,
-        resource: str,
-        entity_uuid: sys_uuid.UUID,
-        data: dict[str, typing.Any],
+    def _matching_message_flag_projection_task_ids(
+        self, data: dict[str, typing.Any]
     ) -> tuple[sys_uuid.UUID, ...]:
-        if resource == "message_reactions":
-            predicate = """
-                task.task_type = 'reaction_snapshot'
-                AND EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements(
-                        COALESCE(task.payload -> 'operations', '[]'::jsonb)
-                    ) AS operation
-                    WHERE operation ->> 'reaction_uuid' = %(entity)s
-                )
-            """
-            parameters = {
-                "project": self.project_uuid,
-                "entity": str(entity_uuid),
-            }
-        else:
-            predicate = """
-                task.task_type = 'read_counters'
-                AND task.user_uuid = %(user)s
-                AND EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements(
-                        COALESCE(task.payload -> 'operations', '[]'::jsonb)
-                    ) AS operation
-                    WHERE operation ->> 'message_uuid' = %(message)s
-                )
-            """
-            parameters = {
-                "project": self.project_uuid,
-                "user": parse_uuid(data["user_uuid"], "user_uuid"),
-                "message": str(parse_uuid(data["message_uuid"], "message_uuid")),
-            }
+        predicate = """
+            task.task_type = 'read_counters'
+            AND task.user_uuid = %(user)s
+            AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements(
+                    COALESCE(task.payload -> 'operations', '[]'::jsonb)
+                ) AS operation
+                WHERE operation ->> 'message_uuid' = %(message)s
+            )
+        """
+        parameters = {
+            "project": self.project_uuid,
+            "user": parse_uuid(data["user_uuid"], "user_uuid"),
+            "message": str(parse_uuid(data["message_uuid"], "message_uuid")),
+        }
         rows = self.session.execute(
             f"""
             SELECT task.uuid
@@ -1986,42 +2196,6 @@ class ProviderEntityStore:
             parameters,
         ).fetchall()
         return tuple(sys_uuid.UUID(str(row["uuid"])) for row in rows)
-
-    def _annotate_reaction_projection_events(
-        self,
-        reaction_uuid: sys_uuid.UUID,
-        previous_task_uuids: tuple[sys_uuid.UUID, ...],
-        *,
-        emit_event: bool,
-    ) -> None:
-        self.session.execute(
-            """
-            UPDATE workspace_v3.projection_tasks AS task
-            SET payload = task.payload || jsonb_build_object(
-                    'emit_events', %s,
-                    'origin_provider_uuid', %s::text
-                ),
-                updated_at = clock_timestamp()
-            WHERE task.project_id = %s
-              AND task.task_type = 'reaction_snapshot'
-              AND task.status = 'pending'
-              AND task.uuid <> ALL(%s::uuid[])
-              AND EXISTS (
-                  SELECT 1
-                  FROM jsonb_array_elements(
-                      COALESCE(task.payload -> 'operations', '[]'::jsonb)
-                  ) AS operation
-                  WHERE operation ->> 'reaction_uuid' = %s
-              )
-            """,
-            (
-                emit_event,
-                self.provider_uuid,
-                self.project_uuid,
-                list(previous_task_uuids),
-                str(reaction_uuid),
-            ),
-        )
 
     def _suppress_message_flag_projection_events(
         self,
@@ -2180,8 +2354,34 @@ class ProviderEntityStore:
     def _delete_message_flags(self, entity_uuid: sys_uuid.UUID) -> None:
         self._delete_entity("message_flags", entity_uuid)
 
-    def _delete_message_reactions(self, entity_uuid: sys_uuid.UUID) -> None:
-        self._delete_entity("message_reactions", entity_uuid)
+    def _delete_message_reactions(
+        self,
+        entity_uuid: sys_uuid.UUID,
+        *,
+        emit_events: bool = True,
+    ) -> None:
+        self.session.execute(
+            """
+            WITH provider_reaction_mode AS MATERIALIZED (
+                SELECT
+                    set_config(
+                        'workspace_v3.provider_reaction_emit_events', %s, true
+                    ),
+                    set_config(
+                        'workspace_v3.provider_reaction_origin_uuid', %s, true
+                    )
+            )
+            DELETE FROM workspace_v3.message_reactions AS reaction
+            USING provider_reaction_mode
+            WHERE reaction.project_id = %s AND reaction.uuid = %s
+            """,
+            (
+                "on" if emit_events else "off",
+                str(self.provider_uuid),
+                self.project_uuid,
+                entity_uuid,
+            ),
+        )
 
     def _user_recipients(self, user_uuid: sys_uuid.UUID) -> tuple[sys_uuid.UUID, ...]:
         rows = self.session.execute(

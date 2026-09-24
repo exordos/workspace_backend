@@ -346,6 +346,16 @@ class ProviderApiMiddleware(middlewares.Middleware):
         store.lock_entities(
             (item["resource"], item["entity_uuid"]) for item in prepared
         )
+        if delivery_class == "backfill" and all(
+            item["action"] == "upsert"
+            and item["resource"] == "message_flags"
+            and not item["rebind_identity"]
+            for item in prepared
+        ):
+            bulk_results = store.upsert_backfill_message_flags(prepared)
+            if bulk_results is not None:
+                store.defer_backfill_counter_projections()
+                return {"results": bulk_results}
         results = []
         messages_to_expand = []
         for index, operation in enumerate(prepared):
