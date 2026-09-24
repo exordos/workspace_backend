@@ -676,6 +676,20 @@ class ProviderEntityStore:
         expand_message_flags: bool = True,
     ) -> dict[str, typing.Any]:
         if resource == "streams":
+            name = data.get("name")
+            if not isinstance(name, str) or not name.strip():
+                _error(
+                    422,
+                    "invalid_name",
+                    "name must be a non-empty string",
+                )
+            if len(name) > constants.WORKSPACE_NAME_MAX_LENGTH:
+                _error(
+                    422,
+                    "invalid_name",
+                    "name must not exceed "
+                    f"{constants.WORKSPACE_NAME_MAX_LENGTH} characters",
+                )
             description = data.get("description", "")
             if not isinstance(description, str):
                 _error(

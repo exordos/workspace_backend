@@ -52,8 +52,28 @@ def test_provider_stream_rejects_invalid_description_before_database_work(
             "streams",
             sys_uuid.uuid4(),
             b"0" * 32,
-            {"description": description},
+            {"name": "stream", "description": description},
         )
 
     assert error.value.status == 422
     assert error.value.error == "invalid_description"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [None, 100, "", " ", "x" * 256],
+    ids=("null", "integer", "empty", "whitespace", "too-long"),
+)
+def test_provider_stream_rejects_invalid_name_before_database_work(name):
+    store = object.__new__(provider_store.ProviderEntityStore)
+
+    with pytest.raises(messenger_exceptions.ProviderApiError) as error:
+        store.upsert(
+            "streams",
+            sys_uuid.uuid4(),
+            b"0" * 32,
+            {"name": name},
+        )
+
+    assert error.value.status == 422
+    assert error.value.error == "invalid_name"

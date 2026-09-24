@@ -1514,9 +1514,7 @@ def _projection_events(
         key = (_uuid(task["project_id"]), _uuid(task["scope_uuid"]))
         origin_provider_uuid = payload.get("origin_provider_uuid")
         eventful_reaction_scopes.setdefault(key, set()).add(
-            None
-            if origin_provider_uuid is None
-            else _uuid(origin_provider_uuid)
+            None if origin_provider_uuid is None else _uuid(origin_provider_uuid)
         )
     for row in messages:
         project_id = _uuid(row["project_id"])
@@ -1525,9 +1523,7 @@ def _projection_events(
             continue
         origins = eventful_reaction_scopes[scope_key]
         suppressed_provider_uuid = (
-            next(iter(origins))
-            if len(origins) == 1 and None not in origins
-            else None
+            next(iter(origins)) if len(origins) == 1 and None not in origins else None
         )
         stream_uuid = _uuid(row["stream_uuid"])
         specification = _resource_event_specification(
@@ -1594,24 +1590,27 @@ def _projection_events(
                 stream_uuid=_uuid(message["stream_uuid"]),
             )
             visible_users = {
-                _uuid(row[0])
-                for row in session.execute(
-                    """
-                    SELECT user_uuid
-                    FROM workspace_v3.message_flags
-                    WHERE project_id = %s AND message_uuid = %s
-                      AND user_uuid = ANY(%s::uuid[])
-                    """,
-                    (
-                        project_id,
-                        message_uuid,
-                        [
-                            consumer_uuid
-                            for consumer_type, consumer_uuid in reaction_consumers
-                            if consumer_type == "user"
-                        ],
-                    ),
-                ).fetchall()
+                _uuid(row["user_uuid"])
+                for row in _mappings(
+                    session.execute(
+                        """
+                        SELECT user_uuid
+                        FROM workspace_v3.message_flags
+                        WHERE project_id = %s AND message_uuid = %s
+                          AND user_uuid = ANY(%s::uuid[])
+                        """,
+                        (
+                            project_id,
+                            message_uuid,
+                            [
+                                consumer_uuid
+                                for consumer_type, consumer_uuid in reaction_consumers
+                                if consumer_type == "user"
+                            ],
+                        ),
+                    ).fetchall(),
+                    ("user_uuid",),
+                )
             }
             events.append(
                 {
