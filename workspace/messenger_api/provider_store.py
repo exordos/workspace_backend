@@ -935,8 +935,7 @@ class ProviderEntityStore:
         if resource == "stream_bindings":
             return self._prepare_stream_binding_identity_rebind(entity_uuid, data)
         if resource == "message_reactions":
-            self._ensure_identity_unchanged(resource, entity_uuid, data)
-            return None
+            return self._prepare_message_reaction_identity_rebind(entity_uuid, data)
         if resource != "message_flags":
             return None
         message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
@@ -988,6 +987,67 @@ class ProviderEntityStore:
                 entity_uuid,
             ),
         )
+        return None
+
+    def _prepare_message_reaction_identity_rebind(
+        self,
+        entity_uuid: sys_uuid.UUID,
+        data: dict[str, typing.Any],
+    ) -> sys_uuid.UUID | None:
+        """Move a provider reaction to the mapped user without moving messages."""
+        current = self._entity_row("message_reactions", entity_uuid)
+        if current is None:
+            _error(409, "entity_state_conflict", "Provider entity state is stale")
+        message_uuid = parse_uuid(data["message_uuid"], "message_uuid")
+        if message_uuid != sys_uuid.UUID(str(current["message_uuid"])):
+            _error(
+                409,
+                "entity_identity_conflict",
+                "message_uuid cannot change for an existing provider entity",
+            )
+        user_uuid = parse_uuid(data["user_uuid"], "user_uuid")
+        if user_uuid == sys_uuid.UUID(str(current["user_uuid"])):
+            return None
+        conflict = self.session.execute(
+            """
+            SELECT reaction.uuid
+            FROM workspace_v3.message_reactions AS reaction
+            WHERE reaction.project_id = %s AND reaction.message_uuid = %s
+              AND reaction.user_uuid = %s AND reaction.emoji_name = %s
+              AND reaction.uuid <> %s
+            """,
+            (
+                self.project_uuid,
+                message_uuid,
+                user_uuid,
+                data["emoji_name"],
+                entity_uuid,
+            ),
+        ).fetchone()
+        if conflict is not None:
+            conflict_owned = self.session.execute(
+                """
+                SELECT 1 FROM workspace_v3.provider_entity_states
+                WHERE project_id = %s AND entity_type = 'message_reaction'
+                  AND entity_uuid = %s
+                LIMIT 1
+                """,
+                (self.project_uuid, conflict["uuid"]),
+            ).fetchone()
+            if conflict_owned is not None:
+                _error(
+                    409,
+                    "entity_identity_conflict",
+                    "The target message reaction is owned by a provider entity",
+                )
+            self._delete_message_reactions(
+                sys_uuid.UUID(str(conflict["uuid"])),
+                emit_events=False,
+            )
+        # The reaction projection trigger intentionally keeps reaction identity
+        # immutable on UPDATE. Replace the provider-owned row under the same
+        # UUID and let the following upsert enqueue one complete projection.
+        self._delete_message_reactions(entity_uuid, emit_events=False)
         return None
 
     def _prepare_stream_binding_identity_rebind(

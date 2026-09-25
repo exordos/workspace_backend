@@ -1796,7 +1796,7 @@ def test_provider_message_flag_rebind_notifies_old_and_new_viewers(api, db):
     }
 
 
-def test_provider_rebind_rejects_stream_moves_and_reaction_identity_changes(api, db):
+def test_provider_rebind_rejects_stream_moves_and_maps_reaction_users(api, db):
     graph = _import_provider_conversation(api, db)
     other_stream_uuid = sys_uuid.uuid4()
     other_topic_uuid = sys_uuid.uuid4()
@@ -1866,8 +1866,30 @@ def test_provider_rebind_rejects_stream_moves_and_reaction_identity_changes(api,
         rebound_reaction,
         rebind_identity=True,
     )
-    assert reaction_response.status_code == 409, reaction_response.text
-    assert reaction_response.json()["error"] == "entity_identity_conflict"
+    assert reaction_response.status_code == 200, reaction_response.text
+    stored_reaction = db.execute(
+        """
+        SELECT message_uuid, user_uuid, emoji_name
+        FROM workspace_v3.message_reactions
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (api.project_id, reaction_uuid),
+    ).fetchone()
+    assert tuple(stored_reaction) == (
+        graph["message"],
+        graph["peer"],
+        "eyes",
+    )
+    moved_reaction = {**rebound_reaction, "message_uuid": str(sys_uuid.uuid4())}
+    moved_reaction_response = _put(
+        api,
+        "message_reactions",
+        reaction_uuid,
+        moved_reaction,
+        rebind_identity=True,
+    )
+    assert moved_reaction_response.status_code == 409, moved_reaction_response.text
+    assert moved_reaction_response.json()["error"] == "entity_not_provider_owned"
 
 
 def test_provider_topic_binding_rebind_notifies_previous_viewer(api, db):
