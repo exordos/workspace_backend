@@ -780,6 +780,8 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 | `announce` | 布尔式 | 不需要 | 不需要 | 广告流旗. |
 | `direct_user_uuid` | UUID | 不需要 | 不需要 | 直接聊天对应.仅用于自动聊天,即当前用户 UUID. |
 | `private` | 布尔式 | 不需要 | 是的 | 个人流旗. |
+| `encryption` | 布尔式 | 不需要 | 不可变 | 客户端可见的加密聊天标志；默认为 `false`，且独立于 `private`. |
+| `current_encryption_key` | 对于一个物体或 `null` | 有条件 | 由轮换管理 | 创建 `encryption: true` 的流时必填。仅包含 `key_uuid` 和不透明的公共 `public_key`；流所有者通过发送 `key_announced` 更改它。 |
 | `is_archived` | 布尔式 | 不需要 | 行动管理 | 档案的旗. |
 | `color` | 整数 `0..0xFFFFFF` | 不需要 | 不需要 | 流色;如果省略或 `null`,则随机生成. |
 | `last_message_uuid` | UUID没有`null` | 不需要 | 是的 | 最后的消息在流中,或者是空时是 `null`. |
@@ -803,6 +805,26 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
   "announce": false
 }
 ```
+
+加密流创建请求:
+
+```json
+{
+  "name": "Secret chat",
+  "source_name": "native",
+  "source": {"kind": "native"},
+  "encryption": true,
+  "current_encryption_key": {
+    "key_uuid": "99999999-9999-4999-8999-999999999999",
+    "public_key": "base64-public-key"
+  }
+}
+```
+
+`encryption` 和初始密钥不能通过 `PUT` 更改。公共密钥是客户端拥有的
+不透明数据；后端不存储私钥，也不执行加密。发送 `key_announced` 会以
+原子方式保存消息并替换 `current_encryption_key`；只有规范流所有者可以
+执行此轮换。
 
 直接创建聊天请求:
 
@@ -1258,13 +1280,14 @@ Authorization: Bearer <access_token>
 
 ## 信息 {#messages}
 
-`POST /api/workspace/v1/messenger/messages/`验证当前的 PostgreSQL 流
-成员和承诺的规范UTF-8下标信息,旗,一个共享
-接收者观众快照,以及紧的消息/topic/stream
-请求交易.它不会为每个接收者创建一个正规事件行.
-读取仍然限于当前的 IAM 用户,并保留现有的响应.
+`POST /api/workspace/v1/messenger/messages/` 验证当前 PostgreSQL 流成员关系，
+并在同一事务中保存规范消息、标志、一个共享收件人快照以及紧凑的
+message/topic/stream 事件。它不会为每个收件人创建一行规范事件。读取仍
+限定为当前 IAM 用户，并保持现有响应格式。
 
-唯一支持的消息有效载荷是:
+API 接受六种固定 payload 结构。每种 kind 都拒绝未知字段。六种类型在
+普通流和加密流中都可使用；`stream.encryption` 是客户端可见的元数据，
+不是消息类型过滤器。
 
 ```json
 {
@@ -1272,6 +1295,62 @@ Authorization: Bearer <access_token>
   "content": "Hello, workspace"
 }
 ```
+
+```json
+{
+  "kind": "e2ee",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "content": "opaque-encrypted-envelope"
+}
+```
+
+```json
+{
+  "kind": "key_request",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "device_id": "iphone-1",
+  "device_name": "iPhone",
+  "public_key": "base64-device-public-key"
+}
+```
+
+```json
+{
+  "kind": "key_grant",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "request_message_uuid": "88888888-8888-4888-8888-888888888888",
+  "sender_device_id": "macbook-1",
+  "recipient_device_id": "iphone-1",
+  "content": "opaque-encrypted-private-key"
+}
+```
+
+```json
+{
+  "kind": "key_reject",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "request_message_uuid": "88888888-8888-4888-8888-888888888888",
+  "sender_device_id": "macbook-1",
+  "recipient_device_id": "iphone-1"
+}
+```
+
+```json
+{
+  "kind": "key_announced",
+  "key_uuid": "77777777-7777-4777-8777-777777777777",
+  "public_key": "base64-new-chat-public-key"
+}
+```
+
+`content` 和 `public_key` 是非空、不透明的字符串，最多 40,000 个字符；
+设备 ID 和名称最多 255 个字符。后端不验证 Base64、不选择当前密钥、不
+比较密钥代次，也不会仅因 `key_uuid` 较旧而拒绝 `e2ee` 消息。
+
+只有 `markdown` 内容参与服务器端提及搜索、Markdown 文件/媒体提取和
+主题摘要。`e2ee` 和 `key_*` 的值在创建、历史记录和 realtime 传递中原样
+往返。现有未读和通知状态仍会更新，但后端不构建解密后的通知预览；客户
+端决定显示文本。
 
 Workspace 标记内容内的实体引用使用常规标记链接
 语法. URL 部分是一个 Workspace URN:
@@ -1294,7 +1373,7 @@ Workspace 标记内容内的实体引用使用常规标记链接
 | `stream_uuid` | UUID | 是的 | 不需要 | 流量 UUID. |
 | `topic_uuid` | UUID | 不需要 | 不需要 | 主题 UUID;省略或 `null` 使用流默认主题.当流没有默认时,请求在代码 `400001007` 中失败. |
 | `author_uuid` | UUID | 不需要 | 是的 | 消息作者 |
-| `payload` | 目标 | 是的 | 不需要 | 标记下来信息的有效载荷; 剪切内容必须为1.4万个字符. |
+| `payload` | 目标 | 是的 | 不需要 | 上述六种固定消息 payload 之一. |
 | `user_uuid` | UUID | 不需要 | 是的 | 目前用户在用户消息视图中. |
 | `read` | 布尔式 | 不需要 | 是的 | 目前用户的读标志.作者是作为读者创建的. |
 | `pinned` | 布尔式 | 不需要 | 是的 | 目前用户的固定标志. |

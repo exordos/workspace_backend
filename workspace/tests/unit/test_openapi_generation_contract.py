@@ -300,14 +300,79 @@ def test_generated_openapi_color_defaults_are_deterministic():
     assert all("default" not in schema for schema in color_schemas.values())
 
 
-def test_generated_openapi_message_payload_uses_markdown_content_limit():
+def test_generated_openapi_exposes_strict_encrypted_chat_contract():
     specification = _build_openapi(messenger_app)
     payload_schema = _component_schema(
         specification,
         "WorkspaceUserMessage_Create",
     )["properties"]["payload"]
 
-    assert payload_schema["oneOf"][0]["properties"]["content"]["maxLength"] == 40000
+    payloads = {
+        payload["properties"]["kind"]["enum"][0]: payload
+        for payload in payload_schema["oneOf"]
+    }
+    assert set(payloads) == {
+        "markdown",
+        "e2ee",
+        "key_request",
+        "key_grant",
+        "key_reject",
+        "key_announced",
+    }
+    for payload in payloads.values():
+        assert payload["additionalProperties"] is False
+        assert payload["required"] == list(payload["properties"])
+    assert payloads["markdown"]["properties"]["content"]["maxLength"] == 40000
+    assert payloads["e2ee"]["properties"]["key_uuid"]["format"] == "uuid"
+
+    stream_schema = _component_schema(
+        specification,
+        "WorkspaceUserStream_Get",
+    )
+    assert stream_schema["properties"]["encryption"]["default"] is False
+    assert stream_schema["properties"]["current_encryption_key"] == {
+        "type": "object",
+        "required": ["key_uuid", "public_key"],
+        "additionalProperties": False,
+        "properties": {
+            "key_uuid": {
+                "type": "string",
+                "example": "00000000-0000-0000-0000-000000000000",
+                "format": "uuid",
+            },
+            "public_key": {
+                "type": "string",
+                "example": "any_string",
+                "minLength": 1,
+                "maxLength": 40000,
+            },
+        },
+        "example": {
+            "key_uuid": "00000000-0000-0000-0000-000000000000",
+            "public_key": "base64-public-key",
+        },
+        "nullable": True,
+    }
+    stream_create = specification["components"]["schemas"]["WorkspaceUserStream_Create"]
+    assert stream_create["oneOf"][0]["required"] == [
+        "encryption",
+        "current_encryption_key",
+    ]
+    assert (
+        "nullable"
+        not in stream_create["oneOf"][0]["properties"]["current_encryption_key"]
+    )
+    assert stream_create["oneOf"][1]["properties"]["current_encryption_key"] == {
+        "type": "object",
+        "nullable": True,
+        "enum": [None],
+    }
+    stream_update = _component_schema(
+        specification,
+        "WorkspaceUserStream_Update",
+    )
+    assert "encryption" not in stream_update["properties"]
+    assert "current_encryption_key" not in stream_update["properties"]
 
 
 def test_generated_openapi_exposes_persisted_complete_reaction_user_lists():

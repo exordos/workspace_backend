@@ -11,6 +11,7 @@ import enum
 import typing
 import uuid as sys_uuid
 
+from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api.dm import models
@@ -48,6 +49,103 @@ EXTENSION_CANONICAL_MODELS: dict[str, typing.Any] = {
     "messages": models.WorkspaceMessage,
 }
 CANONICAL_NOT_PROVIDED = object()
+DEFAULT_STREAM_ENCRYPTION = {
+    "encryption": False,
+    "current_encryption_key": None,
+}
+
+
+def _session_or_none(session: typing.Any = None) -> typing.Any:
+    if session is not None:
+        return session if hasattr(session, "execute") else None
+    try:
+        return contexts.Context().get_session()
+    except ValueError:
+        # Serialization helpers are also used by isolated unit tests and by
+        # rolling-upgrade code paths where no database context exists yet.
+        return None
+
+
+def stream_encryption_schema_available(session: typing.Any = None) -> bool:
+    session = _session_or_none(session)
+    if session is None:
+        return False
+    cached = getattr(session, "_workspace_stream_encryption_schema", None)
+    if cached is not None:
+        return bool(cached)
+    row = session.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'm_workspace_streams'
+              AND column_name = 'encryption'
+        ) AS available
+        """,
+        (),
+    ).fetchone()
+    available = bool(row and row.get("available", False))
+    try:
+        session._workspace_stream_encryption_schema = available
+    except AttributeError:
+        pass
+    return available
+
+
+def stream_encryption_projections(
+    project_id: object,
+    stream_uuids: typing.Iterable[object],
+    session: typing.Any = None,
+) -> dict[sys_uuid.UUID, dict[str, typing.Any]]:
+    normalized_uuids = tuple(sys_uuid.UUID(str(value)) for value in stream_uuids)
+    result: dict[sys_uuid.UUID, dict[str, typing.Any]] = {
+        stream_uuid: dict(DEFAULT_STREAM_ENCRYPTION) for stream_uuid in normalized_uuids
+    }
+    if not normalized_uuids:
+        return result
+    session = _session_or_none(session)
+    if session is None:
+        return result
+    if not stream_encryption_schema_available(session):
+        return result
+    rows = session.execute(
+        """
+        SELECT uuid, encryption, current_encryption_key_uuid,
+               current_encryption_public_key
+        FROM m_workspace_streams
+        WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+        """,
+        (project_id, list(normalized_uuids)),
+    ).fetchall()
+    for row in rows:
+        stream_uuid = sys_uuid.UUID(str(row["uuid"]))
+        current_key: dict[str, typing.Any] | None = (
+            None
+            if row["current_encryption_key_uuid"] is None
+            else {
+                "key_uuid": str(row["current_encryption_key_uuid"]),
+                "public_key": row["current_encryption_public_key"],
+            }
+        )
+        result[stream_uuid] = {
+            "encryption": bool(row["encryption"]),
+            "current_encryption_key": current_key,
+        }
+    return result
+
+
+def stream_encryption_projection(
+    project_id: object,
+    stream_uuid: object,
+    session: typing.Any = None,
+) -> dict[str, typing.Any]:
+    normalized_uuid = sys_uuid.UUID(str(stream_uuid))
+    return stream_encryption_projections(
+        project_id,
+        (normalized_uuid,),
+        session=session,
+    )[normalized_uuid]
 
 
 def simple(value: typing.Any) -> typing.Any:

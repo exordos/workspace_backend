@@ -916,6 +916,10 @@ def add_public_projection_contract(
             properties["provider"] = copy.deepcopy(PROVIDER_SCHEMA)
             properties["delivery"] = copy.deepcopy(DELIVERY_SCHEMA)
         if name.startswith("WorkspaceUserMessage_"):
+            payload_schema = schema["properties"]["payload"]
+            for payload in payload_schema["oneOf"]:
+                payload["required"] = list(payload["properties"])
+                payload["additionalProperties"] = False
             schema["properties"]["reaction_users"] = {
                 "type": "object",
                 "readOnly": True,
@@ -957,6 +961,39 @@ def add_public_projection_contract(
                     "account_uuid": {"type": "string", "format": "uuid"},
                 },
             }
+    stream_create = copy.deepcopy(
+        _component_schema(schemas, "WorkspaceUserStream_Create")
+    )
+    encryption_key = copy.deepcopy(
+        stream_create["properties"]["current_encryption_key"]
+    )
+    encryption_key.pop("nullable", None)
+    stream_create["oneOf"] = [
+        {
+            "required": ["encryption", "current_encryption_key"],
+            "properties": {
+                "encryption": {"enum": [True]},
+                "current_encryption_key": encryption_key,
+            },
+        },
+        {
+            "properties": {
+                "encryption": {"enum": [False]},
+                "current_encryption_key": {
+                    "type": "object",
+                    "nullable": True,
+                    "enum": [None],
+                },
+            },
+        },
+    ]
+    schemas["WorkspaceUserStream_Create"] = stream_create
+    stream_update = copy.deepcopy(
+        _component_schema(schemas, "WorkspaceUserStream_Update")
+    )
+    stream_update["properties"].pop("encryption", None)
+    stream_update["properties"].pop("current_encryption_key", None)
+    schemas["WorkspaceUserStream_Update"] = stream_update
     return specification
 
 

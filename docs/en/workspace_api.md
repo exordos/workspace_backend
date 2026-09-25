@@ -780,6 +780,8 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | `announce` | boolean | no | no | Announcement stream flag. |
 | `direct_user_uuid` | UUID | no | no | Direct-chat counterpart. Equals the current user UUID only for a self chat. |
 | `private` | boolean | no | yes | Private stream flag. |
+| `encryption` | boolean | no | immutable | Client-visible encrypted-chat flag; defaults to `false` and is independent of `private`. |
+| `current_encryption_key` | object or `null` | conditionally | rotation-managed | Required when creating a stream with `encryption: true`. Contains only `key_uuid` and the opaque public `public_key`; a stream owner changes it by sending `key_announced`. |
 | `is_archived` | boolean | no | action-managed | Archived flag. |
 | `color` | integer `0..0xFFFFFF` | no | no | Stream color; generated randomly when omitted or `null`. |
 | `last_message_uuid` | UUID or `null` | no | yes | Latest message in the stream, or `null` when empty. |
@@ -803,6 +805,27 @@ Create request:
   "announce": false
 }
 ```
+
+Encrypted stream create request:
+
+```json
+{
+  "name": "Secret chat",
+  "source_name": "native",
+  "source": {"kind": "native"},
+  "encryption": true,
+  "current_encryption_key": {
+    "key_uuid": "99999999-9999-4999-8999-999999999999",
+    "public_key": "base64-public-key"
+  }
+}
+```
+
+`encryption` and the initial key cannot be changed with `PUT`. The public key
+is client-owned opaque data; the backend does not store private keys or perform
+encryption. Sending `key_announced` atomically stores the message and replaces
+`current_encryption_key`, and only the canonical stream owner may perform this
+rotation.
 
 Direct chat create request:
 
@@ -1259,12 +1282,14 @@ Realtime side effects:
 ## Messages {#messages}
 
 `POST /api/workspace/v1/messenger/messages/` validates current PostgreSQL stream
-membership and commits the canonical UTF-8 markdown message, flags, one shared
+membership and commits the canonical message, flags, one shared
 recipient-audience snapshot, and compact message/topic/stream events in the
 request transaction. It does not create one canonical event row per recipient.
 Reads remain scoped to the current IAM user and keep the existing response.
 
-The only supported message payload in v1 is markdown:
+The API accepts six fixed payload shapes. Unknown fields are rejected for every
+kind. All six kinds are valid in both ordinary and encrypted streams;
+`stream.encryption` is client-visible metadata, not a message-kind filter.
 
 ```json
 {
@@ -1272,6 +1297,64 @@ The only supported message payload in v1 is markdown:
   "content": "Hello, workspace"
 }
 ```
+
+```json
+{
+  "kind": "e2ee",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "content": "opaque-encrypted-envelope"
+}
+```
+
+```json
+{
+  "kind": "key_request",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "device_id": "iphone-1",
+  "device_name": "iPhone",
+  "public_key": "base64-device-public-key"
+}
+```
+
+```json
+{
+  "kind": "key_grant",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "request_message_uuid": "88888888-8888-4888-8888-888888888888",
+  "sender_device_id": "macbook-1",
+  "recipient_device_id": "iphone-1",
+  "content": "opaque-encrypted-private-key"
+}
+```
+
+```json
+{
+  "kind": "key_reject",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "request_message_uuid": "88888888-8888-4888-8888-888888888888",
+  "sender_device_id": "macbook-1",
+  "recipient_device_id": "iphone-1"
+}
+```
+
+```json
+{
+  "kind": "key_announced",
+  "key_uuid": "77777777-7777-4777-8777-777777777777",
+  "public_key": "base64-new-chat-public-key"
+}
+```
+
+`content` and `public_key` values are non-empty opaque strings limited to
+40,000 characters; device IDs and names are limited to 255 characters. The
+backend does not validate Base64, choose a current key, compare key generations,
+or reject an `e2ee` message because its `key_uuid` is old.
+
+Only `markdown` content participates in server-side mention detection, search,
+file/media Markdown extraction, and topic summaries. `e2ee` and `key_*` values
+round-trip unchanged through create, history, and realtime delivery. Existing
+unread and notification state still advances, but the backend does not build a
+decrypted notification preview; clients choose the visible text.
 
 Workspace entity references inside markdown content use regular markdown link
 syntax. The URL part is a Workspace URN:
@@ -1294,7 +1377,7 @@ syntax. The URL part is a Workspace URN:
 | `stream_uuid` | UUID | yes | no | Stream UUID. |
 | `topic_uuid` | UUID | no | no | Topic UUID; omitted or `null` uses the stream default topic. The request fails with code `400001007` when the stream has no default. |
 | `author_uuid` | UUID | no | yes | Message author. |
-| `payload` | object | yes | no | Markdown message payload; trimmed content must be 1..40,000 characters. |
+| `payload` | object | yes | no | One of the six fixed message payloads described above. |
 | `user_uuid` | UUID | no | yes | Current user in the user message view. |
 | `read` | boolean | no | yes | Current user's read flag. Authors are created as read. |
 | `pinned` | boolean | no | yes | Current user's pinned flag. |
@@ -1817,8 +1900,8 @@ from the current user's visible PostgreSQL event surface.
 Top-level fields describe the event row only. `payload.kind` is the only `kind`.
 Do not expect top-level `type`, `kind`, `stream_uuid`, or `topic_uuid`.
 
-Message create/update events carry the same markdown payload stored on the
-message. Entity links remain regular markdown links with `urn:user`,
+Message create/update events carry the same payload stored on the message.
+Entity links in `markdown` payloads remain regular markdown links with `urn:user`,
 `urn:message`, `urn:stream`, `urn:topic`, file/media, avatar, or URL URNs.
 
 Messenger entity create, update, read, and action events carry the same full

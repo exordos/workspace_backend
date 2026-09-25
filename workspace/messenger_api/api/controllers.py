@@ -39,6 +39,7 @@ from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
+from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import push_devices
 from workspace.messenger_api.dm import read_state
@@ -1014,7 +1015,7 @@ WorkspaceFileController.download.openapi_schema = oa_utils.Schema(
 class WorkspaceStreamController(StoreResourceController):
     resource_name = "streams"
     __resource__ = ra_resources.ResourceByRAModel(
-        model_class=models.WorkspaceUserStream,
+        model_class=base.WorkspaceUserStream,
         hidden_fields=["private_index"],
         convert_underscore=False,
         process_filters=True,

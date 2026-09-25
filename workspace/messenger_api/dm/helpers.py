@@ -66,6 +66,7 @@ WORKSPACE_USER_PRESENCE_EVENT_FIELDS = (
 )
 DIRECT_STREAM_NAMESPACE = sys_uuid.UUID("26f42131-4503-5f59-8aa6-32b20f551751")
 STREAM_SOURCE_IDENTITY_FIELDS = frozenset({"source_name", "source"})
+STREAM_ENCRYPTION_IDENTITY_FIELDS = frozenset({"encryption", "current_encryption_key"})
 DIRECT_STREAM_IDENTITY_FIELDS = frozenset(
     {"direct_user_uuid", "private_index", "private"}
 )
@@ -73,6 +74,73 @@ _WORKSPACE_USER_MESSAGE_FLAG_COLUMNS = frozenset({"pinned", "read", "starred"})
 DIRECT_STREAM_CREATE_IDENTITY_FIELDS = (
     STREAM_SOURCE_IDENTITY_FIELDS | DIRECT_STREAM_IDENTITY_FIELDS
 )
+
+
+def _prepare_workspace_stream_encryption_fields(
+    values: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    encryption = bool(values.pop("encryption", False))
+    current_key = values.pop("current_encryption_key", None)
+    current_key_uuid = values.pop("current_encryption_key_uuid", None)
+    current_public_key = values.pop("current_encryption_public_key", None)
+    if current_key is not None:
+        current_key_uuid = sys_uuid.UUID(str(current_key["key_uuid"]))
+        current_public_key = str(current_key["public_key"])
+    key_is_complete = current_key_uuid is not None and bool(current_public_key)
+    if encryption != key_is_complete:
+        raise ra_exc.ValidationErrorException()
+    return {
+        "encryption": encryption,
+        "current_encryption_key_uuid": current_key_uuid,
+        "current_encryption_public_key": current_public_key,
+    }
+
+
+def _apply_workspace_stream_encryption_fields(
+    project_id: object,
+    stream_uuid: object,
+    values: dict[str, typing.Any],
+    session: typing.Any,
+) -> None:
+    if not values["encryption"]:
+        return
+    if not hasattr(session, "execute"):
+        raise ra_exc.ValidationErrorException()
+    row = session.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'm_workspace_streams'
+              AND column_name = 'encryption'
+        ) AS available
+        """,
+        (),
+    ).fetchone()
+    available = (
+        bool(row["available"]) if isinstance(row, collections.abc.Mapping) else False
+    )
+    if not available:
+        raise ra_exc.ValidationErrorException()
+    session.execute(
+        """
+        UPDATE m_workspace_streams
+        SET encryption = %s,
+            current_encryption_key_uuid = %s,
+            current_encryption_public_key = %s,
+            updated_at = NOW()
+        WHERE project_id = %s AND uuid = %s
+        """,
+        (
+            values["encryption"],
+            values["current_encryption_key_uuid"],
+            values["current_encryption_public_key"],
+            project_id,
+            stream_uuid,
+        ),
+    )
+
+
 _WORKSPACE_USER_STREAM_ACCESS_SQL = """
 SELECT
     stream.uuid AS stream_uuid,
@@ -1813,14 +1881,22 @@ LEFT JOIN LATERAL (
                 WHEN 'unmute' THEN POSITION(
                     '](' || 'urn:user:' ||
                     LOWER(scoped.scoped_user_uuid::text) || ')'
-                    IN LOWER(COALESCE(message.payload->>'content', ''))
+                    IN LOWER(CASE
+                        WHEN message.payload->>'kind' = 'markdown'
+                        THEN COALESCE(message.payload->>'content', '')
+                        ELSE ''
+                    END)
                 ) > 0
                 ELSE CASE scoped.stream_notification_mode
                     WHEN 'all_messages' THEN TRUE
                     WHEN 'mentions_only' THEN POSITION(
                         '](' || 'urn:user:' ||
                         LOWER(scoped.scoped_user_uuid::text) || ')'
-                        IN LOWER(COALESCE(message.payload->>'content', ''))
+                        IN LOWER(CASE
+                            WHEN message.payload->>'kind' = 'markdown'
+                            THEN COALESCE(message.payload->>'content', '')
+                            ELSE ''
+                        END)
                     ) > 0
                     ELSE FALSE
                 END
@@ -2024,14 +2100,22 @@ LEFT JOIN LATERAL (
                 WHEN 'follow' THEN TRUE
                 WHEN 'unmute' THEN POSITION(
                     '](' || 'urn:user:' || LOWER(scoped.user_uuid::text) || ')'
-                    IN LOWER(COALESCE(message.payload->>'content', ''))
+                    IN LOWER(CASE
+                        WHEN message.payload->>'kind' = 'markdown'
+                        THEN COALESCE(message.payload->>'content', '')
+                        ELSE ''
+                    END)
                 ) > 0
                 ELSE CASE scoped.stream_notification_mode
                     WHEN 'all_messages' THEN TRUE
                     WHEN 'mentions_only' THEN POSITION(
                         '](' || 'urn:user:' ||
                         LOWER(scoped.user_uuid::text) || ')'
-                        IN LOWER(COALESCE(message.payload->>'content', ''))
+                        IN LOWER(CASE
+                            WHEN message.payload->>'kind' = 'markdown'
+                            THEN COALESCE(message.payload->>'content', '')
+                            ELSE ''
+                        END)
                     ) > 0
                     ELSE FALSE
                 END
@@ -2185,7 +2269,11 @@ SELECT
         mention.message_uuid IS NOT NULL
     ELSE POSITION(
         '](' || 'urn:user:' || LOWER(binding.user_uuid::text) || ')'
-        IN LOWER(COALESCE(message.payload->>'content', ''))
+        IN LOWER(CASE
+            WHEN message.payload->>'kind' = 'markdown'
+            THEN COALESCE(message.payload->>'content', '')
+            ELSE ''
+        END)
     ) > 0 END AS mentioned,
     message.reaction_users
 FROM scoped_messages AS message
@@ -3951,6 +4039,7 @@ def _get_or_create_private_workspace_user_stream(
     create_default_topic: typing.Any = True,
     binding_uuids: typing.Any = None,
     emit_events: bool = True,
+    encryption_fields: dict[str, typing.Any] | None = None,
     **kwargs: typing.Any,
 ) -> typing.Any:
     default_topic_name = kwargs.pop("default_topic_name", "General Topic")
@@ -4001,6 +4090,17 @@ def _get_or_create_private_workspace_user_stream(
             **kwargs,
         )
         stream.insert(session=current_session)
+        _apply_workspace_stream_encryption_fields(
+            project_id,
+            stream.uuid,
+            encryption_fields
+            or {
+                "encryption": False,
+                "current_encryption_key_uuid": None,
+                "current_encryption_public_key": None,
+            },
+            current_session,
+        )
 
         participant_uuids = tuple(
             dict.fromkeys(
@@ -4078,6 +4178,7 @@ def create_workspace_private_group_stream(
     kwargs.pop("direct_user_uuid", None)
     if kwargs.pop("private_index", None) is not None:
         raise messenger_exc.PrivateIndexIsTechnicalFieldError()
+    encryption_fields = _prepare_workspace_stream_encryption_fields(kwargs)
 
     _ensure_color(kwargs)
     default_topic_uuid = kwargs.pop("canonical_default_topic_uuid", None)
@@ -4092,6 +4193,13 @@ def create_workspace_private_group_stream(
         **kwargs,
     )
     stream.insert(session=session)
+    current_session = session or contexts.Context().get_session()
+    _apply_workspace_stream_encryption_fields(
+        project_id,
+        stream.uuid,
+        encryption_fields,
+        current_session,
+    )
 
     _create_owner_binding(
         project_id=project_id,
@@ -4166,6 +4274,7 @@ def get_or_create_workspace_user_stream(
         kwargs["private"] = private
     if kwargs.pop("private_index", None) is not None:
         raise messenger_exc.PrivateIndexIsTechnicalFieldError()
+    encryption_fields = _prepare_workspace_stream_encryption_fields(kwargs)
     if direct_user_uuid is not None:
         if private_is_supplied and private is not True:
             raise messenger_exc.StreamIdentityImmutableError(fields="private")
@@ -4180,6 +4289,7 @@ def get_or_create_workspace_user_stream(
             create_default_topic=create_default_topic,
             binding_uuids=binding_uuids,
             emit_events=emit_events,
+            encryption_fields=encryption_fields,
             **kwargs,
         )
 
@@ -4194,6 +4304,13 @@ def get_or_create_workspace_user_stream(
         **kwargs,
     )
     stream.insert(session=session)
+    current_session = session or contexts.Context().get_session()
+    _apply_workspace_stream_encryption_fields(
+        project_id,
+        stream.uuid,
+        encryption_fields,
+        current_session,
+    )
 
     _create_owner_binding(
         project_id=project_id,
@@ -4266,7 +4383,9 @@ def update_workspace_user_stream(
         },
         session=session,
     )
-    immutable_fields = STREAM_SOURCE_IDENTITY_FIELDS.intersection(values)
+    immutable_fields = (
+        STREAM_SOURCE_IDENTITY_FIELDS | STREAM_ENCRYPTION_IDENTITY_FIELDS
+    ).intersection(values)
     if stream.private_index is not None:
         immutable_fields |= DIRECT_STREAM_IDENTITY_FIELDS.intersection(values)
     if immutable_fields:
@@ -5201,7 +5320,11 @@ def ensure_compact_workspace_message_recipients(
                             THEN target.updated_at END,
                        POSITION(
                            '](urn:user:' || lower(target.user_uuid::text) || ')'
-                           IN lower(COALESCE(target.payload->>'content', ''))
+                           IN lower(CASE
+                               WHEN target.payload->>'kind' = 'markdown'
+                               THEN COALESCE(target.payload->>'content', '')
+                               ELSE ''
+                           END)
                        ) > 0,
                        target.created_at, target.updated_at
                 FROM targets AS target
@@ -5496,11 +5619,7 @@ def create_workspace_user_message(
             current_session,
             project_id,
         ):
-            content = (
-                message.payload.get("content")
-                if hasattr(message.payload, "get")
-                else getattr(message.payload, "content", "")
-            )
+            content = message_payloads.markdown_content(message.payload)
             read_state.sync_message_mentions(
                 current_session,
                 project_id,
@@ -5548,11 +5667,7 @@ def create_workspace_user_message(
     if not return_visible:
         return message
     if compact_events:
-        content = (
-            message.payload.get("content")
-            if hasattr(message.payload, "get")
-            else getattr(message.payload, "content", None)
-        )
+        content = message_payloads.markdown_content(message.payload)
         return models.WorkspaceUserMessage(
             uuid=message.uuid,
             user_uuid=user_uuid,
@@ -5655,11 +5770,7 @@ def update_workspace_user_message(
         )
         if coordinate is None:
             raise RuntimeError("Updated Workspace message has no read coordinate")
-        content = (
-            message.payload.get("content")
-            if hasattr(message.payload, "get")
-            else getattr(message.payload, "content", "")
-        )
+        content = message_payloads.markdown_content(message.payload)
         read_state.sync_message_mentions(
             current_session,
             project_id,
