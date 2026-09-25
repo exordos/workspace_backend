@@ -1395,7 +1395,9 @@ def relocate_message(
         return
     message = session.execute(
         """
-        SELECT stream_uuid, payload->>'content' AS content
+        SELECT stream_uuid,
+               CASE WHEN payload->>'kind' = 'markdown'
+                    THEN payload->>'content' ELSE '' END AS content
         FROM m_workspace_messages
         WHERE project_id = %s AND uuid = %s
         """,
@@ -2259,7 +2261,11 @@ def relocate_stream_project(
                 NOW()
             FROM m_workspace_messages AS message
             CROSS JOIN LATERAL regexp_matches(
-                LOWER(COALESCE(message.payload->>'content', '')),
+                LOWER(CASE
+                    WHEN message.payload->>'kind' = 'markdown'
+                    THEN COALESCE(message.payload->>'content', '')
+                    ELSE ''
+                END),
                 '][(]urn:user:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[)]',
                 'g'
             ) AS matched(value)
@@ -3165,7 +3171,11 @@ def sync_stream_mentions_for_user(
           AND message.stream_uuid = %s
           AND POSITION(
                 '](' || 'urn:user:' || LOWER(%s::uuid::text) || ')'
-                IN LOWER(COALESCE(message.payload->>'content', ''))
+                IN LOWER(CASE
+                    WHEN message.payload->>'kind' = 'markdown'
+                    THEN COALESCE(message.payload->>'content', '')
+                    ELSE ''
+                END)
               ) > 0
         ON CONFLICT (message_uuid, user_uuid) DO NOTHING
         """,
@@ -3986,7 +3996,11 @@ def _compact_mentions_batch(
             NOW()
         FROM m_workspace_messages AS message
         CROSS JOIN LATERAL regexp_matches(
-            LOWER(COALESCE(message.payload->>'content', '')),
+            LOWER(CASE
+                WHEN message.payload->>'kind' = 'markdown'
+                THEN COALESCE(message.payload->>'content', '')
+                ELSE ''
+            END),
             '][(]urn:user:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[)]',
             'g'
         ) AS matched(value)
@@ -4508,7 +4522,11 @@ def _verify_mentions_batch(
                 message.ingest_sequence
             FROM candidates AS message
             CROSS JOIN LATERAL regexp_matches(
-                LOWER(COALESCE(message.payload->>'content', '')),
+                LOWER(CASE
+                    WHEN message.payload->>'kind' = 'markdown'
+                    THEN COALESCE(message.payload->>'content', '')
+                    ELSE ''
+                END),
                 '][(]urn:user:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[)]',
                 'g'
             ) AS matched(value)

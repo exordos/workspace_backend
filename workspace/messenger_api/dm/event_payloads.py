@@ -23,6 +23,7 @@ from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
 from workspace.messenger_api.dm import base
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 
 
@@ -220,6 +221,11 @@ class StreamEventPayloadBase(
     base.WorkspaceUserStreamBase,
     ProviderDeliveryEventPayloadBase,
 ):
+    encryption = properties.property(types.Boolean(), default=False)
+    current_encryption_key = properties.property(
+        types.AllowNone(message_payloads.ENCRYPTION_KEY_TYPE),
+        default=None,
+    )
     created_at = properties.property(
         MESSAGE_EVENT_TIMESTAMP_TYPE,
         read_only=True,

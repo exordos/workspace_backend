@@ -780,6 +780,8 @@ Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisations
 | `announce` | Boolean | - Nein. | - Nein. | Ankündigung der Streaming-Flagge. |
 | `direct_user_uuid` | UUID | - Nein. | - Nein. | Gleich dem aktuellen Benutzer UUID nur für einen Selbstchat. |
 | `private` | Boolean | - Nein. | - Ja, das ist es. | Privater Stromflagge. |
+| `encryption` | Boolean | - Nein. | unveränderlich | Client-sichtbares Kennzeichen für verschlüsselte Chats; standardmäßig `false` und unabhängig von `private`. |
+| `current_encryption_key` | Gegenstand oder `null` | bedingt | rotationsverwaltet | Erforderlich beim Erstellen eines Streams mit `encryption: true`. Enthält nur `key_uuid` und den undurchsichtigen öffentlichen `public_key`; der Stream-Eigentümer ändert ihn mit `key_announced`. |
 | `is_archived` | Boolean | - Nein. | Aktionsmanagement | Archivflagge. |
 | `color` | - Eine ganze Zahl .`0..0xFFFFFF` | - Nein. | - Nein. | Strömungsfarbe; wird zufällig erzeugt, wenn sie weggelassen wird oder `null`. |
 | `last_message_uuid` | UUID oder `null` | - Nein. | - Ja, das ist es. | Letzte Nachricht im Stream oder `null`, wenn es leer ist. |
@@ -803,6 +805,28 @@ Erstellen einer Anfrage:
   "announce": false
 }
 ```
+
+Erstellen eines verschlüsselten Streams:
+
+```json
+{
+  "name": "Secret chat",
+  "source_name": "native",
+  "source": {"kind": "native"},
+  "encryption": true,
+  "current_encryption_key": {
+    "key_uuid": "99999999-9999-4999-8999-999999999999",
+    "public_key": "base64-public-key"
+  }
+}
+```
+
+`encryption` und der anfängliche Schlüssel können nicht mit `PUT` geändert
+werden. Der öffentliche Schlüssel ist undurchsichtiger, clientseitiger Inhalt;
+das Backend speichert keine privaten Schlüssel und führt keine Verschlüsselung
+aus. Das Senden von `key_announced` speichert die Nachricht atomar und ersetzt
+`current_encryption_key`; nur der kanonische Stream-Eigentümer darf diese
+Rotation ausführen.
 
 Erstellen Sie eine direkte Chat-Anfrage:
 
@@ -1258,13 +1282,17 @@ Nebenwirkungen in Echtzeit:
 
 ## Nachrichten {#messages}
 
-`POST /api/workspace/v1/messenger/messages/` validiert den aktuellen PostgreSQL-Stream
-Mitglieder und verpflichtet sich die kanonischen UTF-8 Markdown-Nachricht, Flaggen, eine gemeinsame
-Die Daten werden in einem "Snapshot" von der Zielgruppe des Empfängers und in einem "Compact Message" /topic/stream aufgenommen.
-Es erstellt nicht eine kanonische Ereigniszeile pro Empfänger.
-Die Lesungen bleiben dem aktuellen IAM Benutzer vorbehalten und behalten die vorhandene Antwort.
+`POST /api/workspace/v1/messenger/messages/` prüft die aktuelle
+PostgreSQL-Stream-Mitgliedschaft und speichert die kanonische Nachricht,
+Flags, einen gemeinsamen Empfänger-Snapshot sowie kompakte
+message/topic/stream-Ereignisse in derselben Transaktion. Es wird keine
+kanonische Ereigniszeile pro Empfänger erstellt. Lesezugriffe bleiben auf den
+aktuellen IAM-Benutzer beschränkt und behalten die vorhandene Antwortform bei.
 
-Die einzige unterstützte Nachrichtenlast in v1 ist Markdown:
+Die API akzeptiert sechs feste Payload-Formen. Unbekannte Felder werden für
+jeden kind abgelehnt. Alle sechs Arten sind in normalen und verschlüsselten
+Streams zulässig; `stream.encryption` ist client-sichtbare Metadaten und kein
+Filter für Nachrichtenarten.
 
 ```json
 {
@@ -1272,6 +1300,66 @@ Die einzige unterstützte Nachrichtenlast in v1 ist Markdown:
   "content": "Hello, workspace"
 }
 ```
+
+```json
+{
+  "kind": "e2ee",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "content": "opaque-encrypted-envelope"
+}
+```
+
+```json
+{
+  "kind": "key_request",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "device_id": "iphone-1",
+  "device_name": "iPhone",
+  "public_key": "base64-device-public-key"
+}
+```
+
+```json
+{
+  "kind": "key_grant",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "request_message_uuid": "88888888-8888-4888-8888-888888888888",
+  "sender_device_id": "macbook-1",
+  "recipient_device_id": "iphone-1",
+  "content": "opaque-encrypted-private-key"
+}
+```
+
+```json
+{
+  "kind": "key_reject",
+  "key_uuid": "99999999-9999-4999-8999-999999999999",
+  "request_message_uuid": "88888888-8888-4888-8888-888888888888",
+  "sender_device_id": "macbook-1",
+  "recipient_device_id": "iphone-1"
+}
+```
+
+```json
+{
+  "kind": "key_announced",
+  "key_uuid": "77777777-7777-4777-8777-777777777777",
+  "public_key": "base64-new-chat-public-key"
+}
+```
+
+`content` und `public_key` sind nicht leere, undurchsichtige Zeichenketten mit
+höchstens 40.000 Zeichen; Geräte-IDs und -Namen sind auf 255 Zeichen begrenzt.
+Das Backend validiert Base64 nicht, wählt keinen aktuellen Schlüssel, vergleicht
+keine Schlüsselgenerationen und lehnt eine `e2ee`-Nachricht nicht nur wegen
+einer alten `key_uuid` ab.
+
+Nur `markdown`-Inhalt wird serverseitig für Erwähnungssuche,
+Markdown-Datei-/Medienextraktion und Themenzusammenfassungen verwendet. Werte
+von `e2ee` und `key_*` werden bei Erstellung, Verlauf und realtime unverändert
+übertragen. Der vorhandene Ungelesen- und Benachrichtigungsstatus wird weiterhin
+aktualisiert, aber das Backend erzeugt keine entschlüsselte
+Benachrichtigungsvorschau; die Clients bestimmen den sichtbaren Text.
 
 Workspace Entitätsverweise innerhalb von Markdown-Inhalten verwenden einen regelmäßigen Markdown-Link
 Die URL Teil ist ein Workspace URN:
@@ -1294,7 +1382,7 @@ Die URL Teil ist ein Workspace URN:
 | `stream_uuid` | UUID | - Ja, das ist es. | - Nein. | Strom UUID. |
 | `topic_uuid` | UUID | - Nein. | - Nein. | Thema UUID; ausgelassen oder `null` verwendet das Stream-Standardthema. Die Anfrage scheitert mit Code `400001007`, wenn der Stream keine Standardfunktion hat. |
 | `author_uuid` | UUID | - Nein. | - Ja, das ist es. | Nachrichtenautor. |
-| `payload` | Gegenstand | - Ja, das ist es. | - Nein. | Markdown-Nachrichten-Nutzlast; beschnittener Inhalt muss 1..40.000 Zeichen betragen. |
+| `payload` | Gegenstand | - Ja, das ist es. | - Nein. | Eine der sechs oben beschriebenen festen Payload-Formen. |
 | `user_uuid` | UUID | - Nein. | - Ja, das ist es. | Der aktuelle Benutzer in der Benutzernachrichtansicht. |
 | `read` | Boolean | - Nein. | - Ja, das ist es. | Der aktuelle Benutzer hat eine Leseflagge. |
 | `pinned` | Boolean | - Nein. | - Ja, das ist es. | Die eingeschlossene Flagge des aktuellen Benutzers. |

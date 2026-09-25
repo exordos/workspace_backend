@@ -31,7 +31,9 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api.api import store as api_store
+from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import event_payloads
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 
 
@@ -380,6 +382,13 @@ def _stream_from_event_payload(
         session,
     )
     result.update({"provider": provider, "delivery": delivery})
+    result.update(
+        resource_projection.stream_encryption_projection(
+            _event_payload_get(event_payload, "project_id"),
+            _event_payload_get(event_payload, "uuid"),
+            session=session,
+        )
+    )
     return result
 
 
@@ -586,8 +595,7 @@ def create_message_events(
         )
     recipients = sorted({sys_uuid.UUID(str(value)) for value in recipients}, key=str)
     author_uuid = sys_uuid.UUID(str(message.user_uuid))
-    content = _event_payload_get(message.payload, "content")
-    normalized_content = str(content or "").lower()
+    normalized_content = message_payloads.markdown_content(message.payload).lower()
     shared = {
         "uuid": message.uuid,
         "stream_uuid": message.stream_uuid,
