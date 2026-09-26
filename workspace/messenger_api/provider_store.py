@@ -29,6 +29,8 @@ RESOURCE_TYPES = {
     "message_flags": "message_flag",
     "message_reactions": "message_reaction",
 }
+
+BACKFILL_COUNTER_DELAY_SECONDS = 300
 TABLES = {
     "users": "users",
     "streams": "streams",
@@ -200,26 +202,24 @@ class ProviderEntityStore:
             (keys,),
         )
 
-    def defer_backfill_counter_projections(self) -> None:
-        """Record activity so background counters wait for a quiet project."""
-        lock_key = f"provider-backfill-read-counters:{self.project_uuid}"
-        acquired = self.session.execute(
-            """
-            SELECT pg_try_advisory_xact_lock(
-                hashtextextended(%s, 0)
-            ) AS acquired
-            """,
-            (lock_key,),
-        ).fetchone()["acquired"]
-        if not acquired:
-            return
+    def delay_new_backfill_counter_projections(self) -> None:
+        """Delay only counter scopes first created by this backfill request."""
         self.session.execute(
             """
-            UPDATE workspace_v3.provider_consumers
-            SET updated_at = clock_timestamp()
-            WHERE project_id = %s AND uuid = %s
+            UPDATE workspace_v3.projection_tasks AS task
+            SET next_retry_at = task.created_at + make_interval(secs => %s),
+                updated_at = clock_timestamp()
+            WHERE task.project_id = %s
+              AND task.task_type = 'read_counters'
+              AND task.status = 'pending'
+              AND task.next_retry_at IS NULL
+              AND task.xmin = pg_current_xact_id()::text::xid
+              AND task.payload IN (
+                  '{"emit_message_events": false}'::jsonb,
+                  '{"emit_message_event": false}'::jsonb
+              )
             """,
-            (self.project_uuid, self.provider_uuid),
+            (BACKFILL_COUNTER_DELAY_SECONDS, self.project_uuid),
         )
 
     def upsert_backfill_message_flags(

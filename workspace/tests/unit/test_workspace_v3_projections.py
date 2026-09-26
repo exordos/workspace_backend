@@ -64,7 +64,7 @@ def test_folder_membership_delete_rows_are_fetched_before_next_query():
     assert deleted.fetched
 
 
-def test_claim_skips_background_counters_during_provider_backfill():
+def test_claim_does_not_gate_counters_on_global_provider_activity():
     queries = []
 
     class Session:
@@ -75,6 +75,6 @@ def test_claim_skips_background_counters_during_provider_backfill():
     assert projections.claim_projection_tasks(Session(), "worker") == []
 
     claim_query, claim_params = queries[1]
-    assert "FROM workspace_v3.provider_consumers AS provider" in claim_query
-    assert "provider.updated_at > clock_timestamp()" in claim_query
-    assert claim_params[1] == projections.PROVIDER_BACKFILL_QUIET_SECONDS
+    assert "FROM workspace_v3.provider_consumers AS provider" not in claim_query
+    assert "task.created_at > clock_timestamp()" not in claim_query
+    assert claim_params[1] == projections.DEFAULT_BATCH_SIZE

@@ -120,6 +120,22 @@ def _drain_projections(db):
             )
 
 
+def _age_background_counter_tasks(db, project_id):
+    db.execute(
+        """
+        UPDATE workspace_v3.projection_tasks
+        SET next_retry_at = clock_timestamp() - interval '10 minutes'
+        WHERE project_id = %s AND task_type = 'read_counters'
+          AND status = 'pending'
+          AND payload IN (
+              '{"emit_message_events": false}'::jsonb,
+              '{"emit_message_event": false}'::jsonb
+          )
+        """,
+        (project_id,),
+    )
+
+
 def _user_data(entity_uuid, **overrides):
     values = {
         "username": f"zulip-{entity_uuid}",
@@ -2314,14 +2330,6 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         "SELECT count(*) FROM workspace_v3.events WHERE project_id = %s",
         (api.project_id,),
     ).fetchone()[0]
-    provider_activity_before = db.execute(
-        """
-        SELECT updated_at
-        FROM workspace_v3.provider_consumers
-        WHERE project_id = %s AND uuid = %s
-        """,
-        (api.project_id, provider_uuid),
-    ).fetchone()[0]
     unrelated_scope_uuid = sys_uuid.uuid4()
     db.execute(
         """
@@ -2388,13 +2396,26 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         (api.project_id, stream_uuid, topic_uuid, unrelated_scope_uuid),
     ).fetchone()[0]
     assert pending_counters > 0
+    delayed_counters = db.execute(
+        """
+        SELECT count(*)
+        FROM workspace_v3.projection_tasks
+        WHERE project_id = %s
+          AND task_type = 'read_counters'
+          AND scope_uuid IN (%s, %s)
+          AND status = 'pending'
+          AND next_retry_at > clock_timestamp()
+        """,
+        (api.project_id, stream_uuid, topic_uuid),
+    ).fetchone()[0]
+    assert delayed_counters > 0
     assert db.execute(
         """
-        SELECT updated_at > %s
-        FROM workspace_v3.provider_consumers
-        WHERE project_id = %s AND uuid = %s
+        SELECT next_retry_at IS NULL
+        FROM workspace_v3.projection_tasks
+        WHERE project_id = %s AND scope_uuid = %s AND status = 'pending'
         """,
-        (provider_activity_before, api.project_id, provider_uuid),
+        (api.project_id, unrelated_scope_uuid),
     ).fetchone()[0]
     assert (
         db.execute(
@@ -2483,15 +2504,25 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         """,
         (api.project_id, [item[1] for item in history]),
     ).fetchone()
+    _age_background_counter_tasks(db, api.project_id)
     db.execute(
         """
         UPDATE workspace_v3.provider_consumers
-        SET updated_at = clock_timestamp() - interval '10 minutes'
+        SET updated_at = clock_timestamp()
         WHERE project_id = %s AND uuid = %s
         """,
         (api.project_id, provider_uuid),
     )
     _drain_projections(db)
+    counters = db.execute(
+        """
+        SELECT unread_count, active_unread_count
+        FROM workspace_v3.stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+        """,
+        (api.project_id, stream_uuid, owner_uuid),
+    ).fetchone()
+    assert counters == (len(history) // 2, len(history) // 2)
     events_before_reaction = db.execute(
         "SELECT count(*) FROM workspace_v3.events WHERE project_id = %s",
         (api.project_id,),
@@ -2520,14 +2551,6 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         },
     )
     assert reaction.status_code == 200, reaction.text
-    db.execute(
-        """
-        UPDATE workspace_v3.provider_consumers
-        SET updated_at = clock_timestamp() - interval '10 minutes'
-        WHERE project_id = %s AND uuid = %s
-        """,
-        (api.project_id, provider_uuid),
-    )
     _drain_projections(db)
     projected = db.execute(
         """
@@ -2548,7 +2571,7 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
 
 
 def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, db):
-    provider_uuid = _register_provider(api, db)
+    _register_provider(api, db)
     owner_uuid = api.user_uuid
     author_uuid = sys_uuid.uuid4()
     reader_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
@@ -2652,14 +2675,6 @@ def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, 
     }
     created = _put(api, "messages", message_uuid, original)
     assert created.status_code == 200, created.text
-    db.execute(
-        """
-        UPDATE workspace_v3.provider_consumers
-        SET updated_at = clock_timestamp() - interval '10 minutes'
-        WHERE project_id = %s AND uuid = %s
-        """,
-        (api.project_id, provider_uuid),
-    )
     _drain_projections(db)
     move_after = db.execute(
         "SELECT COALESCE(max(epoch_version), 0) FROM workspace_v3.events "
@@ -2714,14 +2729,6 @@ def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, 
     assert ("user_stream", stream_uuids[1], sys_uuid.UUID(str(owner_uuid))) in {
         (row[0], row[1], row[2]) for row in pending_scopes
     }, pending_scopes
-    db.execute(
-        """
-        UPDATE workspace_v3.provider_consumers
-        SET updated_at = clock_timestamp() - interval '10 minutes'
-        WHERE project_id = %s AND uuid = %s
-        """,
-        (api.project_id, provider_uuid),
-    )
     _drain_projections(db)
     failed_tasks = db.execute(
         """
@@ -2777,14 +2784,6 @@ def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, 
             (api.project_id, owner_uuid, stream_uuids[1], topic_uuids[1]),
         ).fetchone()[0]
         == 2
-    )
-    db.execute(
-        """
-        UPDATE workspace_v3.provider_consumers
-        SET updated_at = clock_timestamp() - interval '10 minutes'
-        WHERE project_id = %s AND uuid = %s
-        """,
-        (api.project_id, provider_uuid),
     )
     _drain_projections(db)
     assert (

@@ -354,7 +354,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
         ):
             bulk_results = store.upsert_backfill_message_flags(prepared)
             if bulk_results is not None:
-                store.defer_backfill_counter_projections()
+                store.delay_new_backfill_counter_projections()
                 return {"results": bulk_results}
         results = []
         messages_to_expand = []
@@ -411,7 +411,7 @@ class ProviderApiMiddleware(middlewares.Middleware):
                     ) from error
         store.expand_message_flags(messages_to_expand)
         if delivery_class == "backfill":
-            store.defer_backfill_counter_projections()
+            store.delay_new_backfill_counter_projections()
         return {"results": results}
 
     def _prepare_operation(self, operation: typing.Any) -> dict[str, typing.Any]:
