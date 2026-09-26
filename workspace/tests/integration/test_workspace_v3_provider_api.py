@@ -2726,9 +2726,17 @@ def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, 
         """,
         (api.project_id,),
     ).fetchall()
-    assert ("user_stream", stream_uuids[1], sys_uuid.UUID(str(owner_uuid))) in {
-        (row[0], row[1], row[2]) for row in pending_scopes
-    }, pending_scopes
+    pending_scope_keys = {(row[0], row[1], row[2]) for row in pending_scopes}
+    assert (
+        "user_topic",
+        topic_uuids[0],
+        sys_uuid.UUID(str(owner_uuid)),
+    ) in pending_scope_keys, pending_scopes
+    assert (
+        "user_topic",
+        topic_uuids[1],
+        sys_uuid.UUID(str(owner_uuid)),
+    ) in pending_scope_keys, pending_scopes
     _drain_projections(db)
     failed_tasks = db.execute(
         """
@@ -2783,7 +2791,7 @@ def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, 
         """,
             (api.project_id, owner_uuid, stream_uuids[1], topic_uuids[1]),
         ).fetchone()[0]
-        == 2
+        == 1
     )
     _drain_projections(db)
     assert (

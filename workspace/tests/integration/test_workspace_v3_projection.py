@@ -136,6 +136,14 @@ def _process(db, worker_id="integration:v3", **kwargs):
         )
 
 
+def _drain(db, limit=10):
+    for _index in range(limit):
+        metrics = _process(db)
+        if metrics["completed"] == 0:
+            return
+    raise AssertionError("Projection tasks did not drain")
+
+
 def test_reaction_projection_is_bounded_complete_and_provider_visible(_database, db):
     project_id, stream_uuid, topic_uuid, users = _seed_conversation(
         db,
@@ -394,8 +402,11 @@ def test_message_flags_project_independent_unread_counters(_database, db):
         )
 
     metrics = _process(db)
-    assert metrics["completed"] == 4
-    assert metrics["projections"] == 4
+    assert metrics["completed"] == 2
+    assert metrics["projections"] == 2
+    metrics = _process(db)
+    assert metrics["completed"] == 2
+    assert metrics["projections"] == 2
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -431,6 +442,9 @@ def test_message_flags_project_independent_unread_counters(_database, db):
             (project_id, topic_uuid, users[1]),
         )
         assert cursor.fetchone() == (1, 1, 0)
+
+    _process(db)
+    with db.cursor() as cursor:
         cursor.execute(
             """
             UPDATE workspace_v3.message_flags
@@ -441,7 +455,8 @@ def test_message_flags_project_independent_unread_counters(_database, db):
         )
 
     metrics = _process(db)
-    assert metrics["completed"] == 2
+    assert metrics["completed"] == 1
+    _process(db)
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -522,6 +537,7 @@ def test_message_delete_reprojects_unread_and_last_message(_database, db):
             ),
         )
     _process(db)
+    _process(db)
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -542,6 +558,7 @@ def test_message_delete_reprojects_unread_and_last_message(_database, db):
         )
         assert dict(cursor.fetchall()) == {"user_stream": 1, "user_topic": 1}
 
+    _process(db)
     _process(db)
     with db.cursor() as cursor:
         cursor.execute(
@@ -1015,6 +1032,7 @@ def test_folder_counters_follow_binding_projection(_database, db):
 
     _process(db)
     _process(db)
+    _process(db)
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -1031,6 +1049,120 @@ def test_folder_counters_follow_binding_projection(_database, db):
             ("custom", 1, 1, 0),
             ("direct", 0, 0, 0),
             ("streams", 1, 1, 0),
+        ]
+
+
+def test_unread_counter_projection_cascades_and_caps_at_display_limit(
+    _database,
+    db,
+):
+    project_id, stream_uuid, topic_uuid, users = _seed_conversation(
+        db,
+        user_count=2,
+        clear_tasks=False,
+    )
+    _drain(db)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            WITH inserted AS (
+                INSERT INTO workspace_v3.messages (
+                    uuid, project_id, stream_uuid, topic_uuid,
+                    author_uuid, payload
+                )
+                SELECT gen_random_uuid(), %s, %s, %s, %s,
+                       '{"kind":"markdown","content":"unread"}'::jsonb
+                FROM generate_series(1, %s)
+                RETURNING uuid
+            )
+            INSERT INTO workspace_v3.message_flags (
+                project_id, stream_uuid, message_uuid, user_uuid, read
+            )
+            SELECT %s, %s, inserted.uuid, %s, false
+            FROM inserted
+            """,
+            (
+                project_id,
+                stream_uuid,
+                topic_uuid,
+                users[0],
+                projections.MAX_UNREAD_COUNT + 1,
+                project_id,
+                stream_uuid,
+                users[1],
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT scope_type, count(*)
+            FROM workspace_v3.projection_tasks
+            WHERE project_id = %s AND status = 'pending'
+              AND task_type = 'read_counters'
+            GROUP BY scope_type
+            """,
+            (project_id,),
+        )
+        assert cursor.fetchall() == [("user_topic", 1)]
+
+    _process(db)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT unread_count, active_unread_count, passive_unread_count
+            FROM workspace_v3.topic_bindings
+            WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
+            """,
+            (project_id, topic_uuid, users[1]),
+        )
+        assert cursor.fetchone() == (projections.MAX_UNREAD_COUNT,) * 2 + (0,)
+        cursor.execute(
+            """
+            SELECT scope_type, count(*)
+            FROM workspace_v3.projection_tasks
+            WHERE project_id = %s AND status = 'pending'
+              AND task_type = 'read_counters'
+            GROUP BY scope_type
+            """,
+            (project_id,),
+        )
+        assert cursor.fetchall() == [("user_stream", 1)]
+
+    _process(db)
+    _process(db)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT unread_count, active_unread_count, passive_unread_count
+            FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_id, stream_uuid, users[1]),
+        )
+        assert cursor.fetchone() == (projections.MAX_UNREAD_COUNT,) * 2 + (0,)
+        cursor.execute(
+            """
+            SELECT kind, unread_count, active_unread_count,
+                   passive_unread_count
+            FROM workspace_v3.folders
+            WHERE project_id = %s AND user_uuid = %s
+            ORDER BY kind
+            """,
+            (project_id, users[1]),
+        )
+        assert cursor.fetchall() == [
+            (
+                "all_chats",
+                projections.MAX_UNREAD_COUNT,
+                projections.MAX_UNREAD_COUNT,
+                0,
+            ),
+            ("direct", 0, 0, 0),
+            (
+                "streams",
+                projections.MAX_UNREAD_COUNT,
+                projections.MAX_UNREAD_COUNT,
+                0,
+            ),
         ]
 
 
