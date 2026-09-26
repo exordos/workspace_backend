@@ -187,6 +187,18 @@ V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE = (
 PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE = (
     "0199-Index-provider-user-project-discovery-117e2a.py"
 )
+WORKSPACE_DESCRIPTION_LIMIT_MIGRATION_FILE = (
+    "0200-Allow-ten-thousand-character-Workspace-descriptions-912ea7.py"
+)
+PROVIDER_BACKFILL_FLAG_MIGRATION_FILE = (
+    "0201-Keep-provider-backfill-flag-events-quiet-without-task-scans-ad3875.py"
+)
+PROVIDER_REACTION_ANNOTATION_MIGRATION_FILE = (
+    "0202-Annotate-provider-reaction-projections-without-task-scans-d1b4a6.py"
+)
+V3_COUNTER_RECOVERY_MIGRATION_FILE = (
+    "0203-Retry-Workspace-v3-dead-counter-projections-fd807a.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -530,12 +542,24 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE]._depends == [
         V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE
     ]
+    assert migrations[WORKSPACE_DESCRIPTION_LIMIT_MIGRATION_FILE]._depends == [
+        PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_BACKFILL_FLAG_MIGRATION_FILE]._depends == [
+        WORKSPACE_DESCRIPTION_LIMIT_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_REACTION_ANNOTATION_MIGRATION_FILE]._depends == [
+        PROVIDER_BACKFILL_FLAG_MIGRATION_FILE
+    ]
+    assert migrations[V3_COUNTER_RECOVERY_MIGRATION_FILE]._depends == [
+        PROVIDER_REACTION_ANNOTATION_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE
+    assert engine.get_latest_migration() == V3_COUNTER_RECOVERY_MIGRATION_FILE
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',

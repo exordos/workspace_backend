@@ -10,9 +10,15 @@ import time
 import uuid as sys_uuid
 
 import psycopg
+from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.tests.integration import conftest
 from workspace.workspace_v3 import projections
+
+
+COUNTER_RECOVERY_MIGRATION = (
+    "0203-Retry-Workspace-v3-dead-counter-projections-fd807a.py"
+)
 
 
 def _insert_user(cursor, user_uuid):
@@ -558,6 +564,91 @@ def test_message_delete_reprojects_unread_and_last_message(_database, db):
             1,
             first_message_uuid,
         )
+
+
+def test_counter_recovery_migration_requeues_each_live_dead_scope_once(
+    _database,
+    db,
+):
+    project_id, stream_uuid, topic_uuid, users = _seed_conversation(
+        db,
+        user_count=1,
+    )
+    user_uuid = users[0]
+    message_uuid = _insert_message(
+        db,
+        project_id,
+        stream_uuid,
+        topic_uuid,
+        user_uuid,
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM workspace_v3.projection_tasks WHERE project_id = %s",
+            (project_id,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.projection_tasks (
+                project_id, task_type, scope_type, scope_uuid,
+                user_uuid, status, attempts
+            ) VALUES
+                (%s, 'read_counters', 'user_stream', %s, %s,
+                 'dead_letter', 8),
+                (%s, 'read_counters', 'user_stream', %s, %s,
+                 'dead_letter', 8),
+                (%s, 'read_counters', 'user_topic', %s, %s,
+                 'dead_letter', 8),
+                (%s, 'read_counters', 'user_topic', %s, %s,
+                 'pending', 0),
+                (%s, 'reaction_snapshot', 'message', %s, NULL,
+                 'dead_letter', 8)
+            """,
+            (
+                project_id,
+                stream_uuid,
+                user_uuid,
+                project_id,
+                stream_uuid,
+                user_uuid,
+                project_id,
+                topic_uuid,
+                user_uuid,
+                project_id,
+                topic_uuid,
+                user_uuid,
+                project_id,
+                message_uuid,
+            ),
+        )
+
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine._load_migrations()[COUNTER_RECOVERY_MIGRATION].upgrade(db)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT task_type, scope_type, status, payload, count(*)
+            FROM workspace_v3.projection_tasks
+            WHERE project_id = %s
+            GROUP BY task_type, scope_type, status, payload
+            ORDER BY task_type, scope_type, status, payload::text
+            """,
+            (project_id,),
+        )
+        assert cursor.fetchall() == [
+            ("reaction_snapshot", "message", "dead_letter", {}, 1),
+            ("read_counters", "user_stream", "completed", {}, 2),
+            (
+                "read_counters",
+                "user_stream",
+                "pending",
+                {"repair": "bounded_topic_counter_scan_v1"},
+                1,
+            ),
+            ("read_counters", "user_topic", "completed", {}, 1),
+            ("read_counters", "user_topic", "pending", {}, 1),
+        ]
 
 
 def test_projection_failure_is_retried_without_losing_task(_database, db):
