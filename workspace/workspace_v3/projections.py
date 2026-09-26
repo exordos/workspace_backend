@@ -407,8 +407,8 @@ def _update_topic_counters(
         ),
         snapshots AS (
             SELECT target.project_id, target.topic_uuid, target.user_uuid,
-                   count(message.uuid)::integer AS unread_count,
-                   count(message.uuid) FILTER (
+                   count(flag.uuid)::integer AS unread_count,
+                   count(flag.uuid) FILTER (
                        WHERE CASE
                            WHEN topic_binding.notification_mode = 'mute'
                                THEN false
@@ -451,15 +451,15 @@ def _update_topic_counters(
               ON stream_binding.project_id = topic.project_id
              AND stream_binding.stream_uuid = topic.stream_uuid
              AND stream_binding.user_uuid = target.user_uuid
-            LEFT JOIN workspace_v3.message_flags AS flag
-              ON flag.project_id = target.project_id
-             AND flag.user_uuid = target.user_uuid
-             AND flag.stream_uuid = topic.stream_uuid
-             AND NOT flag.read
             LEFT JOIN workspace_v3.messages AS message
-              ON message.project_id = flag.project_id
-             AND message.uuid = flag.message_uuid
+              ON message.project_id = target.project_id
+             AND message.stream_uuid = topic.stream_uuid
              AND message.topic_uuid = target.topic_uuid
+            LEFT JOIN workspace_v3.message_flags AS flag
+              ON flag.project_id = message.project_id
+             AND flag.message_uuid = message.uuid
+             AND flag.user_uuid = target.user_uuid
+             AND NOT flag.read
             LEFT JOIN LATERAL (
                 SELECT candidate.uuid, candidate.created_at
                 FROM workspace_v3.messages AS candidate
@@ -468,6 +468,7 @@ def _update_topic_counters(
                  AND candidate_flag.message_uuid = candidate.uuid
                  AND candidate_flag.user_uuid = target.user_uuid
                 WHERE candidate.project_id = target.project_id
+                  AND candidate.stream_uuid = topic.stream_uuid
                   AND candidate.topic_uuid = target.topic_uuid
                 ORDER BY candidate.created_at DESC, candidate.uuid DESC
                 LIMIT 1

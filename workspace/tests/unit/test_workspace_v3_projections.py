@@ -78,3 +78,25 @@ def test_claim_does_not_gate_counters_on_global_provider_activity():
     assert "FROM workspace_v3.provider_consumers AS provider" not in claim_query
     assert "task.created_at > clock_timestamp()" not in claim_query
     assert claim_params[1] == projections.DEFAULT_BATCH_SIZE
+
+
+def test_topic_counter_query_scans_target_topic_before_user_flags():
+    queries = []
+
+    class Session:
+        def execute(self, query, params=()):
+            queries.append((query, params))
+            return _Result()
+
+    projections._update_topic_counters(
+        Session(),
+        [(sys_uuid.uuid4(), sys_uuid.uuid4(), sys_uuid.uuid4())],
+    )
+
+    query, _params = queries[0]
+    message_join = query.index("LEFT JOIN workspace_v3.messages AS message")
+    flag_join = query.index("LEFT JOIN workspace_v3.message_flags AS flag")
+    assert message_join < flag_join
+    assert "message.stream_uuid = topic.stream_uuid" in query
+    assert "count(flag.uuid)::integer AS unread_count" in query
+    assert "candidate.stream_uuid = topic.stream_uuid" in query
