@@ -444,6 +444,12 @@ class HistoryImportWorker:
                     if message["id"] > job["next_message_id"]
                 ],
                 job["part_size"],
+                {
+                    projection["message_id"]: len(projection["attachments"])
+                    for projection in batch.projections
+                }
+                if batch.schema_version == 2
+                else None,
             ),
             [],
         )

@@ -17,6 +17,7 @@
 """Untrusted input, memory bounds and separate transaction boundary contracts."""
 
 import errno
+import datetime
 import threading
 import uuid as sys_uuid
 from unittest import mock
@@ -66,6 +67,35 @@ def batch():
     )
 
 
+def projected_batch():
+    value = batch()
+    message = value["batch"]["messages"][0]
+    slot_uuid = str(sys_uuid.uuid4())
+    attachments = [
+        {
+            "slot_uuid": slot_uuid,
+            "source_path": "/user_uploads/a/report.txt",
+        }
+    ]
+    workspace_content = f"[report]({contract.FILE_SLOT_PREFIX}{slot_uuid})"
+    projection = {
+        "message_id": message["id"],
+        "source_hash": message["hash"],
+        "converter_version": "zulip-workspace-v3",
+        "workspace_content": workspace_content,
+        "attachments": attachments,
+        "projection_sha256": contract.digest(
+            {"content": workspace_content, "attachments": attachments}
+        ),
+    }
+    value.update(
+        schema_version=2,
+        converter_version="zulip-workspace-v3",
+        projections=[projection],
+    )
+    return value
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -89,6 +119,104 @@ def test_source_generation_is_part_of_job_identity():
     first = contract.Batch.parse(value).job_uuid(bridge_uuid)
     value["sources"][0]["assignment_generation"] += 1
     assert contract.Batch.parse(value).job_uuid(bridge_uuid) != first
+
+
+def test_history_v2_keeps_raw_source_and_accepts_bridge_projection():
+    value = projected_batch()
+
+    parsed = contract.Batch.parse(value)
+
+    message = value["batch"]["messages"][0]
+    assert parsed.schema_version == 2
+    assert parsed.body["messages"][0]["content"] == message["content"]
+    assert parsed.projection_for(message["id"]) == value["projections"][0]
+
+
+@pytest.mark.parametrize(
+    "mutation,code",
+    [
+        (
+            lambda value: value["projections"][0].update(source_hash="0" * 64),
+            "history_projection_source_mismatch",
+        ),
+        (
+            lambda value: value["projections"][0].update(projection_sha256="0" * 64),
+            "history_projection_hash_mismatch",
+        ),
+        (
+            lambda value: value.update(projections=[]),
+            "history_projection_coverage_mismatch",
+        ),
+    ],
+)
+def test_history_v2_rejects_projection_drift(mutation, code):
+    value = projected_batch()
+    mutation(value)
+
+    with pytest.raises(contract.ImportError, match=code):
+        contract.Batch.parse(value)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/user_uploads/a/../private",
+        "/user_uploads/a/%2e%2e/private",
+        "/user_uploads/a/%252e%252e/private",
+        "/user_uploads/a/%2fprivate",
+        "/user_uploads/a/%5cprivate",
+        "https://provider.invalid/user_uploads/a/file",
+    ],
+)
+def test_history_v2_rejects_noncanonical_attachment_paths(path):
+    value = projected_batch()
+    value["projections"][0]["attachments"][0]["source_path"] = path
+    projection = value["projections"][0]
+    projection["projection_sha256"] = contract.digest(
+        {
+            "content": projection["workspace_content"],
+            "attachments": projection["attachments"],
+        }
+    )
+
+    with pytest.raises(contract.ImportError, match="invalid_history_attachment_path"):
+        contract.Batch.parse(value)
+
+
+def test_history_v2_uses_structured_attachment_requests_and_materializes_slots():
+    parsed = contract.Batch.parse(projected_batch())
+    projection = parsed.projections[0]
+    sources = [
+        {
+            "chat_key": "channel:42",
+            "provider_owner_user_id": "7",
+            "account_uuid": str(sys_uuid.uuid4()),
+            "history_depth": "all",
+        }
+    ]
+    requests = preparation.file_requests(
+        parsed,
+        sources,
+        sys_uuid.uuid4(),
+        datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    assert [request["source_path"] for request in requests] == [
+        "/user_uploads/a/report.txt"
+    ]
+    file_uuid = str(sys_uuid.uuid4())
+    content = preparation.materialize_workspace_projection(
+        projection,
+        lambda path, label: f"urn:file:{file_uuid}",
+    )
+    assert content == f"[report](urn:file:{file_uuid})"
+    assert (
+        preparation.materialize_workspace_projection(
+            projection,
+            lambda path, label: None,
+        )
+        == "File unavailable"
+    )
 
 
 @pytest.mark.parametrize("kind", ["file", "image", "video"])

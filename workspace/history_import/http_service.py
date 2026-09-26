@@ -94,7 +94,9 @@ class HistoryImportService:
             parts = path.path.removeprefix(contract.PATH).strip("/").split("/")
             if path.path == contract.PATH:
                 if method == "GET":
-                    return service.Response.json(200, {"schema_version": 1})
+                    return service.Response.json(
+                        200, {"schema_version": 1, "schema_versions": [1, 2]}
+                    )
                 if method == "POST":
                     return self.accept(identity, body)
             job_uuid = sys_uuid.UUID(parts[0])
@@ -176,7 +178,10 @@ class HistoryImportService:
         storage = file_storage.save_workspace_file(
             job_uuid,
             encoded,
-            storage_object_id=f"history-imports/v1/{identity.bridge_instance_uuid}/{job_uuid}/batch.json",
+            storage_object_id=(
+                f"history-imports/v{batch.schema_version}/"
+                f"{identity.bridge_instance_uuid}/{job_uuid}/batch.json"
+            ),
         )
         with self.session_factory() as session:
             self.authorize(session, identity)

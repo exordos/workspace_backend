@@ -20,10 +20,8 @@ import typing
 
 import dataclasses
 import datetime
-import pathlib
 import re
 import unicodedata
-import urllib.parse
 import uuid as sys_uuid
 
 from restalchemy.dm import types_dynamic
@@ -60,11 +58,7 @@ def attachment_paths(content: str) -> set[str]:
 
     def collect(link: markdown_conversion.MarkdownLink) -> str:
         if link.destination.startswith("/user_uploads/"):
-            decoded = urllib.parse.unquote(urllib.parse.urlsplit(link.destination).path)
-            if ".." in pathlib.PurePosixPath(decoded).parts or "\\" in decoded:
-                raise contract.ImportError("invalid_history_attachment_path")
-            contract.text(link.destination, 4096)
-            paths.add(link.destination)
+            paths.add(contract.attachment_path(link.destination))
         return link.raw
 
     markdown_conversion.transform_markdown(
@@ -94,7 +88,13 @@ def file_requests(
         accounts = set()
         for access in eligible_accesses(message, sources, created_at):
             accounts.update(observers[(contract.chat_key(message), access["user_id"])])
-        for path in attachment_paths(message["content"]) if accounts else ():
+        projection = batch.projection_for(message["id"])
+        paths = (
+            {attachment["source_path"] for attachment in projection["attachments"]}
+            if projection is not None
+            else attachment_paths(message["content"])
+        )
+        for path in paths if accounts else ():
             files.setdefault(path, set()).update(accounts)
     return [
         {
@@ -104,6 +104,39 @@ def file_requests(
         }
         for path, accounts in sorted(files.items())
     ]
+
+
+def materialize_workspace_projection(
+    projection: dict,
+    file_resolver: typing.Callable[[str, str], str | None],
+) -> str:
+    """Bind opaque bridge file slots without interpreting Zulip Markdown."""
+
+    attachments = {
+        attachment["slot_uuid"]: attachment["source_path"]
+        for attachment in projection["attachments"]
+    }
+
+    def resolve(link: markdown_conversion.MarkdownLink) -> str:
+        if not link.destination.startswith(contract.FILE_SLOT_PREFIX):
+            return link.raw
+        slot_uuid = link.destination.removeprefix(contract.FILE_SLOT_PREFIX)
+        source_path = attachments.get(slot_uuid)
+        if source_path is None:
+            raise contract.ImportError("history_projection_slot_mismatch")
+        target = file_resolver(source_path, link.label)
+        if target is None:
+            return zulip_markdown.UNAVAILABLE_FILE_MARKER
+        return link.with_destination(target)
+
+    content = markdown_conversion.transform_markdown(
+        projection["workspace_content"],
+        text_transform=lambda value: value,
+        link_transform=resolve,
+    )
+    if contract.FILE_SLOT_PREFIX in content:
+        raise contract.ImportError("history_projection_slot_unresolved")
+    return content
 
 
 def load_identities(session: typing.Any, batch: contract.Batch) -> dict[int, str]:
@@ -596,18 +629,25 @@ def prepare_part(
             route["server_url"].rstrip("/") + f"/#narrow/near/{message['id']}"
         )
         if prior is None:
-            content = zulip_markdown._canonicalize_semantic_quotes(
-                message["content"], mapping_store, str(route["account_uuid"])
-            )
-            content, _lossy = zulip_markdown.convert_markdown(
-                content,
-                mention_uuids,
-                original_url,
-                file_resolver=resolve_file,
-                link_resolver=zulip_markdown.ZulipLinkResolver(
-                    mapping_store, str(route["account_uuid"]), owner_uuid
-                ),
-            )
+            projection = batch.projection_for(message["id"])
+            if projection is None:
+                content = zulip_markdown._canonicalize_semantic_quotes(
+                    message["content"], mapping_store, str(route["account_uuid"])
+                )
+                content, _lossy = zulip_markdown.convert_markdown(
+                    content,
+                    mention_uuids,
+                    original_url,
+                    file_resolver=resolve_file,
+                    link_resolver=zulip_markdown.ZulipLinkResolver(
+                        mapping_store, str(route["account_uuid"]), owner_uuid
+                    ),
+                )
+            else:
+                content = materialize_workspace_projection(
+                    projection,
+                    resolve_file,
+                )
             contract.markdown_content(content)
         else:
             content = prior["payload"].get("content", "")

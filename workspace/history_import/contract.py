@@ -23,6 +23,7 @@ import datetime
 import hashlib
 import json
 import re
+import urllib.parse
 import uuid as sys_uuid
 
 from workspace.messenger_api.dm import models
@@ -30,7 +31,10 @@ from workspace.messenger_api.dm import message_payloads
 
 
 BATCH_SIZE = 5000
-MAX_BODY_BYTES = 64 * 1024 * 1024
+MAX_SOURCE_BODY_BYTES = 64 * 1024 * 1024
+# Schema v2 carries the immutable provider source and its Workspace projection.
+# Admission is acquired before this bounded body is allocated.
+MAX_BODY_BYTES = 2 * MAX_SOURCE_BODY_BYTES
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_PART_MESSAGES = 100
 MAX_PART_ROWS = 2000
@@ -38,6 +42,11 @@ MAX_PART_BYTES = 1024 * 1024
 MAX_SOURCES = 512
 PATH = "/v1/history-imports"
 HASH_PATTERN = re.compile(r"[0-9a-f]{64}")
+FILE_SLOT_PREFIX = "urn:workspace-external-file:"
+FILE_SLOT_PATTERN = re.compile(
+    re.escape(FILE_SLOT_PREFIX)
+    + r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})"
+)
 
 
 class ImportError(ValueError):
@@ -100,6 +109,43 @@ def markdown_content(value: object) -> str:
     return content
 
 
+def attachment_path(value: object) -> str:
+    """Validate an authenticated provider upload path at the trust boundary."""
+
+    path = text(value, 4096)
+    if any(ord(character) < 32 or ord(character) == 127 for character in path):
+        raise ImportError("invalid_history_attachment_path")
+    try:
+        parsed = urllib.parse.urlsplit(path)
+    except ValueError as error:
+        raise ImportError("invalid_history_attachment_path") from error
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not parsed.path.startswith("/user_uploads/")
+        or not urllib.parse.urljoin("/", parsed.path).startswith("/user_uploads/")
+    ):
+        raise ImportError("invalid_history_attachment_path")
+    for raw_segment in parsed.path.split("/"):
+        segment = raw_segment
+        for _ in range(8):
+            if segment in {".", ".."} or any(
+                character in "/\\" or ord(character) < 32 or ord(character) == 127
+                for character in segment
+            ):
+                raise ImportError("invalid_history_attachment_path")
+            try:
+                decoded = urllib.parse.unquote(segment, errors="strict")
+            except UnicodeError as error:
+                raise ImportError("invalid_history_attachment_path") from error
+            if decoded == segment:
+                break
+            segment = decoded
+        else:
+            raise ImportError("invalid_history_attachment_path")
+    return path
+
+
 def exact_fields(value: object, fields: set[str]) -> dict:
     if not isinstance(value, dict) or set(value) != fields:
         raise ImportError("invalid_history_fields")
@@ -139,25 +185,36 @@ class Batch:
     generation: int
     sources: tuple[dict, ...]
     body: dict
+    schema_version: int = 1
+    converter_version: str | None = None
+    projections: tuple[dict, ...] = ()
 
     @classmethod
     def parse(cls: typing.Any, envelope: object) -> "Batch":
-        envelope = exact_fields(
-            envelope,
-            {
-                "schema_version",
-                "project_uuid",
-                "provider_realm_uuid",
-                "generation",
-                "sources",
-                "batch",
-            },
-        )
-        if (
-            type(envelope["schema_version"]) is not int
-            or envelope["schema_version"] != 1
-        ):
+        if not isinstance(envelope, dict):
+            raise ImportError("invalid_history_fields")
+        schema_version = envelope.get("schema_version")
+        if type(schema_version) is not int or schema_version not in {1, 2}:
             raise ImportError("unsupported_history_version")
+        fields = {
+            "schema_version",
+            "project_uuid",
+            "provider_realm_uuid",
+            "generation",
+            "sources",
+            "batch",
+        }
+        if schema_version == 2:
+            fields.update({"converter_version", "projections"})
+        envelope = exact_fields(envelope, fields)
+        source_envelope = {
+            key: value
+            for key, value in envelope.items()
+            if key not in {"converter_version", "projections"}
+        }
+        source_envelope["schema_version"] = 1
+        if len(encode(source_envelope)) > MAX_SOURCE_BODY_BYTES:
+            raise ImportError("history_source_body_too_large", 413)
         generation = identifier(envelope["generation"])
         sources = envelope["sources"]
         if not isinstance(sources, list) or not sources:
@@ -295,37 +352,136 @@ class Batch:
             verify_hash(message)
         sorted_unique(messages, lambda message: message["id"])
         verify_hash(body)
+        converter_version = None
+        projections: tuple[dict, ...] = ()
+        if schema_version == 2:
+            converter_version = text(envelope["converter_version"], 128)
+            if not converter_version:
+                raise ImportError("invalid_history_converter_version")
+            raw_projections = envelope["projections"]
+            if not isinstance(raw_projections, list):
+                raise ImportError("invalid_history_projections")
+            message_by_id = {message["id"]: message for message in messages}
+            for projection in raw_projections:
+                exact_fields(
+                    projection,
+                    {
+                        "message_id",
+                        "source_hash",
+                        "converter_version",
+                        "workspace_content",
+                        "attachments",
+                        "projection_sha256",
+                    },
+                )
+                message_id = identifier(projection["message_id"])
+                source = message_by_id.get(message_id)
+                if (
+                    source is None
+                    or projection["source_hash"] != source["hash"]
+                    or projection["converter_version"] != converter_version
+                ):
+                    raise ImportError("history_projection_source_mismatch")
+                content = markdown_content(projection["workspace_content"])
+                attachments = projection["attachments"]
+                if not isinstance(attachments, list):
+                    raise ImportError("invalid_history_projection_attachments")
+                for attachment in attachments:
+                    exact_fields(attachment, {"slot_uuid", "source_path"})
+                    slot_uuid = uuid_field(attachment["slot_uuid"])
+                    attachment_path(attachment["source_path"])
+                    if f"{FILE_SLOT_PREFIX}{slot_uuid}" not in content:
+                        raise ImportError("history_projection_slot_missing")
+                sorted_unique(attachments, lambda value: value["slot_uuid"])
+                slots = {
+                    str(sys_uuid.UUID(value)).lower()
+                    for value in FILE_SLOT_PATTERN.findall(content)
+                }
+                if slots != {
+                    str(sys_uuid.UUID(item["slot_uuid"])) for item in attachments
+                }:
+                    raise ImportError("history_projection_slot_mismatch")
+                if (
+                    1
+                    + 2 * len(source["access"])
+                    + len(source["reactions"])
+                    + len(attachments) * (1 + len(source["access"]))
+                    > MAX_PART_ROWS
+                    or len(encode(projection)) > MAX_PART_BYTES
+                ):
+                    raise ImportError("history_projection_fanout_limit")
+                projection_sha256 = projection["projection_sha256"]
+                if (
+                    not isinstance(projection_sha256, str)
+                    or HASH_PATTERN.fullmatch(projection_sha256) is None
+                    or digest({"content": content, "attachments": attachments})
+                    != projection_sha256
+                ):
+                    raise ImportError("history_projection_hash_mismatch")
+            sorted_unique(raw_projections, lambda value: value["message_id"])
+            if [value["message_id"] for value in raw_projections] != [
+                value["id"] for value in messages
+            ]:
+                raise ImportError("history_projection_coverage_mismatch")
+            projections = tuple(raw_projections)
         return cls(
             uuid_field(envelope["project_uuid"]),
             uuid_field(envelope["provider_realm_uuid"]),
             generation,
             tuple(sources),
             body,
+            schema_version,
+            converter_version,
+            projections,
         )
 
     def job_uuid(
         self, bridge_uuid: sys_uuid.UUID, identity_generation: int = 1
     ) -> sys_uuid.UUID:
+        components = [
+            f"history:v{self.schema_version}",
+            str(identity_generation),
+            str(self.project_uuid),
+            str(self.provider_realm_uuid),
+            str(self.generation),
+            str(self.body["from_id"]),
+            self.body["hash"],
+            digest(list(self.sources)),
+        ]
+        if self.schema_version == 2:
+            components.append(
+                digest(
+                    {
+                        "converter_version": self.converter_version,
+                        "projections": list(self.projections),
+                    }
+                )
+            )
         return sys_uuid.uuid5(
             bridge_uuid,
-            ":".join(
-                (
-                    "history:v1",
-                    str(identity_generation),
-                    str(self.project_uuid),
-                    str(self.provider_realm_uuid),
-                    str(self.generation),
-                    str(self.body["from_id"]),
-                    self.body["hash"],
-                    digest(list(self.sources)),
-                )
+            ":".join(components),
+        )
+
+    def projection_for(self, message_id: int) -> dict | None:
+        if self.schema_version == 1:
+            return None
+        return next(
+            (
+                projection
+                for projection in self.projections
+                if projection["message_id"] == message_id
             ),
+            None,
         )
 
 
-def message_row_cost(message: dict) -> int:
+def message_row_cost(message: dict, attachment_count: int | None = None) -> int:
     # Conservative attachment accounting also bounds file lookups and ACL fanout.
-    files = message["content"].count("/user_uploads/")
+    files = (
+        message["content"].count("/user_uploads/")
+        if attachment_count is None
+        else attachment_count
+    )
     return (
         1
         + 2 * len(message["access"])
@@ -335,13 +491,20 @@ def message_row_cost(message: dict) -> int:
 
 
 def message_parts(
-    messages: list[dict], max_messages: int = MAX_PART_MESSAGES
+    messages: list[dict],
+    max_messages: int = MAX_PART_MESSAGES,
+    attachment_counts: dict[int, int] | None = None,
 ) -> typing.Iterator[list[dict]]:
     """Bound work by message fanout and bytes, not by the total history size."""
     part: list[dict] = []
     rows, size = 0, 0
     for message in messages:
-        message_rows = message_row_cost(message)
+        message_rows = message_row_cost(
+            message,
+            None
+            if attachment_counts is None
+            else attachment_counts.get(message["id"], 0),
+        )
         message_size = len(encode(message))
         if part and (
             len(part) >= max_messages
