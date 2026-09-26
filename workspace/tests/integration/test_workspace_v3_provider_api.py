@@ -2921,7 +2921,7 @@ def test_provider_topic_move_notifies_old_only_reader(api, db):
 
 
 def test_workspace_mutation_refreshes_provider_state_and_cursor(api, db):
-    _register_provider(api, db)
+    provider_uuid = _register_provider(api, db)
     owner_uuid = api.user_uuid
     stream_uuid = sys_uuid.uuid4()
     binding_uuid = sys_uuid.uuid4()
@@ -2966,6 +2966,11 @@ def test_workspace_mutation_refreshes_provider_state_and_cursor(api, db):
     )
     assert imported.status_code == 200, imported.text
     before = api.get(f"{ROOT}/stream_bindings/{binding_uuid}").json()
+    event_after = db.execute(
+        "SELECT COALESCE(max(epoch_version), 0) FROM workspace_v3.events "
+        "WHERE project_id = %s",
+        (api.project_id,),
+    ).fetchone()[0]
 
     changed = api.put(
         f"/v1/stream_bindings/{binding_uuid}",
@@ -2979,6 +2984,25 @@ def test_workspace_mutation_refreshes_provider_state_and_cursor(api, db):
     assert after["content_hash"] != before["content_hash"]
     assert after["source_updated_at"] == before["source_updated_at"]
     assert after["updated_at"] > before["updated_at"]
+
+    provider_event = db.execute(
+        """
+        SELECT event.payload || recipient.payload
+        FROM workspace_v3.events AS event
+        JOIN workspace_v3.event_recipient_payloads AS recipient
+          ON recipient.project_id = event.project_id
+         AND recipient.event_uuid = event.uuid
+        WHERE event.project_id = %s AND event.entity_uuid = %s
+          AND event.epoch_version > %s
+          AND recipient.consumer_type = 'provider'
+          AND recipient.consumer_uuid = %s
+        ORDER BY event.epoch_version DESC
+        LIMIT 1
+        """,
+        (api.project_id, binding_uuid, event_after, provider_uuid),
+    ).fetchone()[0]
+    assert provider_event["uuid"] == str(binding_uuid)
+    assert provider_event["notification_mode"] == "muted"
 
     changes = api.get(
         f"{ROOT}/stream_bindings",

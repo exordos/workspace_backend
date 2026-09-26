@@ -1549,7 +1549,7 @@ class MessengerV3Store:
             entity_uuid=resource_uuid,
             payloads={},
             provider_consumers=provider_consumers,
-            provider_payload=provider_payload,
+            provider_payload={"uuid": str(resource_uuid), **provider_payload},
         )
 
     def _emit_provider_resources(
