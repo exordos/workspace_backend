@@ -202,6 +202,9 @@ V3_COUNTER_RECOVERY_MIGRATION_FILE = (
 V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE = (
     "0204-Cascade-capped-unread-counter-projections-87e406.py"
 )
+V3_HIERARCHICAL_COUNTER_ROLLUP_MIGRATION_FILE = (
+    "0205-Requeue-hierarchical-unread-counter-rollups-bf1934.py"
+)
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
 REACTION_USER_SNAPSHOT_MIGRATION_UUID = "547d747d-c9f1-4583-80d9-b932c1a5df2a"
@@ -560,12 +563,18 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE]._depends == [
         V3_COUNTER_RECOVERY_MIGRATION_FILE
     ]
+    assert migrations[V3_HIERARCHICAL_COUNTER_ROLLUP_MIGRATION_FILE]._depends == [
+        V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
     engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
 
-    assert engine.get_latest_migration() == V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE
+    assert (
+        engine.get_latest_migration()
+        == V3_HIERARCHICAL_COUNTER_ROLLUP_MIGRATION_FILE
+    )
     with db.cursor() as cur:
         cur.execute(
             'SELECT uuid, applied FROM "ra_migrations" WHERE uuid = ANY(%s::text[])',
