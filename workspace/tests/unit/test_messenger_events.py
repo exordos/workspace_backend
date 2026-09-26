@@ -1829,6 +1829,37 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertNotIn("event", json.loads(sent_messages[0]))
         self.assertNotIn("type", json.loads(sent_messages[0]))
 
+    def test_websocket_identity_maps_dedicated_iam_user_to_provider(self):
+        project_uuid = sys_uuid.uuid4()
+        iam_user_uuid = sys_uuid.uuid4()
+        provider_uuid = sys_uuid.uuid4()
+
+        with mock.patch.object(
+            events.v3_store,
+            "resolve_provider_consumer",
+            return_value={"uuid": provider_uuid, "name": "zulip"},
+        ) as resolve:
+            result = events.resolve_websocket_consumer(
+                project_uuid,
+                iam_user_uuid,
+                permissions={events.PROVIDER_SYNC_PERMISSION},
+            )
+
+        self.assertEqual(("provider", provider_uuid), result)
+        resolve.assert_called_once_with(project_uuid, iam_user_uuid)
+
+    def test_websocket_provider_requires_sync_permission(self):
+        project_uuid = sys_uuid.uuid4()
+        iam_user_uuid = sys_uuid.uuid4()
+
+        with mock.patch.object(
+            events.v3_store,
+            "resolve_provider_consumer",
+            return_value={"uuid": sys_uuid.uuid4(), "name": "zulip"},
+        ):
+            with self.assertRaises(PermissionError):
+                events.resolve_websocket_consumer(project_uuid, iam_user_uuid)
+
     def test_websocket_notification_catches_up_with_per_user_cursor(self):
         websockets_stub = types.ModuleType("websockets")
         websockets_stub.serve = None
@@ -1901,6 +1932,56 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual([event], sent_messages)
         self.assertEqual(8, connection.last_epoch_version)
+
+    def test_websocket_provider_connection_uses_provider_cursor(self):
+        websockets_stub = types.ModuleType("websockets")
+        websockets_stub.serve = None
+        sys.modules.setdefault("websockets", websockets_stub)
+        websocket_service = importlib.import_module(
+            "workspace.messenger_api.websocket_service"
+        )
+        provider_uuid = sys_uuid.uuid4()
+        connection = websocket_service.ClientConnection(
+            websocket=FakeWebsocket([]),
+            project_id=sys_uuid.uuid4(),
+            user_uuid=sys_uuid.uuid4(),
+            consumer_type="provider",
+            consumer_uuid=provider_uuid,
+            last_epoch_version=11,
+            epoch_generation="generation",
+        )
+        server = websocket_service.MessengerEventsWebsocketServer(
+            db_url="postgresql://example",
+            iam_engine_driver=None,
+            heartbeat_interval=30,
+            client_timeout=30,
+            catchup_limit=500,
+            send_queue_limit=100,
+        )
+
+        with (
+            mock.patch.object(
+                websocket_service,
+                "_call_with_database_session",
+                new=_call_without_database_session,
+            ),
+            mock.patch.object(
+                websocket_service.messenger_events,
+                "get_consumer_events_after",
+                return_value=[],
+            ) as get_events,
+        ):
+            result = asyncio.run(server._catch_up(connection))
+
+        self.assertEqual(0, result)
+        get_events.assert_called_once_with(
+            project_id=connection.project_id,
+            consumer_type="provider",
+            consumer_uuid=provider_uuid,
+            after_epoch_version=11,
+            limit=500,
+            epoch_generation="generation",
+        )
 
     def test_websocket_catchup_wakeups_coalesce_while_round_is_running(self):
         websockets_stub = types.ModuleType("websockets")

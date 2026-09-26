@@ -8,7 +8,6 @@ import typing
 
 from workspace.messenger_api.dm import message_payloads
 
-
 PAGINATION_LIMIT_PARAMETER = {
     "name": "page_limit",
     "in": "query",
@@ -314,6 +313,17 @@ EXTERNAL_ACCOUNT_SETTINGS_PROPERTIES = {
     "history_depth": EXTERNAL_HISTORY_DEPTH_SCHEMA,
     "default_project_id": {"type": "string", "format": "uuid"},
 }
+
+PROVIDER_ENTITY_TYPES = [
+    "users",
+    "streams",
+    "stream_bindings",
+    "topics",
+    "topic_bindings",
+    "messages",
+    "message_flags",
+    "message_reactions",
+]
 
 
 def _component_schema(
@@ -960,6 +970,55 @@ def add_public_projection_contract(
     return specification
 
 
+def add_v3_source_contract(
+    specification: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    """Expose only the provider name for clean-v3 Messenger resources."""
+    schemas = specification["components"]["schemas"]
+    projection_schema_prefixes = (
+        "WorkspaceUserStream_",
+        "WorkspaceUserTopic_",
+        "WorkspaceUserMessage_",
+        "WorkspaceMessageReactions_",
+    )
+    source_schema = {
+        "type": "object",
+        "required": ["kind"],
+        "additionalProperties": False,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            },
+        },
+        "description": "Minimal compatibility projection of source_name.",
+    }
+    for name in schemas:
+        if not name.startswith(projection_schema_prefixes):
+            continue
+        schema = _component_schema(schemas, name)
+        properties = schema["properties"]
+        for field in (
+            "provider",
+            "provider_metadata",
+            "delivery",
+            "delivery_metadata",
+        ):
+            properties.pop(field, None)
+        properties["source"] = copy.deepcopy(source_schema)
+        properties["source_name"] = {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            "description": "Authoritative source/provider name.",
+        }
+    for name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
+        schema = _component_schema(schemas, name)
+        properties = schema["properties"]
+        properties.pop("provider", None)
+        properties.pop("identity_kind", None)
+    return specification
+
+
 def _pagination_marker_schema(path: str) -> dict[str, typing.Any]:
     if path.endswith("/events/"):
         return {"type": "integer", "minimum": 0}
@@ -1394,6 +1453,380 @@ def add_current_user_contract(
                 },
             },
         },
+    }
+    return specification
+
+
+def add_provider_entity_contract(
+    specification: dict[str, typing.Any],
+    root: str,
+) -> dict[str, typing.Any]:
+    """Document the manually dispatched IAM-authenticated Provider API."""
+    type_parameter = {
+        "name": "ProviderEntityType",
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string", "enum": PROVIDER_ENTITY_TYPES},
+    }
+    uuid_parameter = {
+        "name": "ProviderEntityUuid",
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string", "format": "uuid"},
+    }
+    hash_schema = {
+        "type": "string",
+        "pattern": "^[0-9a-fA-F]{64}$",
+        "description": "SHA-256 of the provider snapshot.",
+    }
+    entity_data = {"type": "object", "additionalProperties": True}
+    upsert = _object_schema(
+        {
+            "content_hash": hash_schema,
+            "source_updated_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "UTC modification time in the provider source.",
+            },
+            "data": entity_data,
+            "rebind_identity": {
+                "type": "boolean",
+                "default": False,
+                "description": "Explicitly migrate immutable entity identity fields.",
+            },
+        },
+        ["content_hash", "data"],
+    )
+    mutation_result = _object_schema(
+        {
+            "type": {"type": "string", "enum": PROVIDER_ENTITY_TYPES},
+            "uuid": {"type": "string", "format": "uuid"},
+            "status": {
+                "type": "string",
+                "enum": ["created", "updated", "unchanged", "deleted", "not_found"],
+            },
+            "updated_at": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": True,
+            },
+            "source_updated_at": {
+                "type": "string",
+                "format": "date-time",
+                "nullable": True,
+            },
+        },
+        ["type", "uuid", "status", "source_updated_at", "updated_at"],
+    )
+    entity = _object_schema(
+        {
+            "type": {"type": "string", "enum": PROVIDER_ENTITY_TYPES},
+            "uuid": {"type": "string", "format": "uuid"},
+            "content_hash": hash_schema,
+            "data": entity_data,
+            "created_at": {"type": "string", "format": "date-time"},
+            "source_updated_at": {"type": "string", "format": "date-time"},
+            "updated_at": {"type": "string", "format": "date-time"},
+        },
+        [
+            "type",
+            "uuid",
+            "content_hash",
+            "data",
+            "created_at",
+            "source_updated_at",
+            "updated_at",
+        ],
+    )
+
+    def json_response(
+        schema: dict[str, typing.Any],
+        description: str,
+    ) -> dict[str, typing.Any]:
+        return {
+            "description": description,
+            "content": {"application/json": {"schema": schema}},
+        }
+
+    entity_path = f"{root}{{ProviderEntityType}}/{{ProviderEntityUuid}}"
+    specification["paths"][entity_path] = {
+        "get": {
+            "summary": "Read one provider-owned entity",
+            "operationId": "Get_provider_entity",
+            "tags": ["Provider"],
+            "parameters": [type_parameter, uuid_parameter],
+            "responses": {200: json_response(entity, "Provider entity")},
+        },
+        "put": {
+            "summary": "Idempotently create or replace a provider entity",
+            "operationId": "Put_provider_entity",
+            "tags": ["Provider"],
+            "parameters": [type_parameter, uuid_parameter],
+            "requestBody": _request_body(upsert),
+            "responses": {200: json_response(mutation_result, "Mutation result")},
+        },
+        "delete": {
+            "summary": "Delete one provider-owned entity",
+            "operationId": "Delete_provider_entity",
+            "tags": ["Provider"],
+            "parameters": [type_parameter, uuid_parameter],
+            "responses": {200: json_response(mutation_result, "Mutation result")},
+        },
+    }
+    specification["paths"][f"{root}{{ProviderEntityType}}"] = {
+        "get": {
+            "summary": "List changed provider-owned entities",
+            "operationId": "List_provider_entities",
+            "tags": ["Provider"],
+            "parameters": [
+                type_parameter,
+                {
+                    "name": "updated_after",
+                    "in": "query",
+                    "schema": {"type": "string", "format": "date-time"},
+                },
+                {
+                    "name": "after_uuid",
+                    "in": "query",
+                    "schema": {"type": "string", "format": "uuid"},
+                },
+                {
+                    "name": "snapshot_after_uuid",
+                    "in": "query",
+                    "description": (
+                        "UUID-only keyset used after a paged bootstrap manifest"
+                    ),
+                    "schema": {"type": "string", "format": "uuid"},
+                },
+                {
+                    "name": "limit",
+                    "in": "query",
+                    "schema": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 500,
+                        "default": 100,
+                    },
+                },
+            ],
+            "responses": {
+                200: json_response(
+                    _object_schema(
+                        {
+                            "items": {"type": "array", "items": entity},
+                            "next_cursor": {
+                                "type": "object",
+                                "nullable": True,
+                                "additionalProperties": False,
+                                "properties": {
+                                    "updated_after": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                    },
+                                    "after_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "snapshot_after_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                },
+                            },
+                        },
+                        ["items", "next_cursor"],
+                    ),
+                    "Provider entity page",
+                )
+            },
+        }
+    }
+    operation = _object_schema(
+        {
+            "action": {"type": "string", "enum": ["upsert", "delete"]},
+            "type": {"type": "string", "enum": PROVIDER_ENTITY_TYPES},
+            "uuid": {"type": "string", "format": "uuid"},
+            "content_hash": hash_schema,
+            "source_updated_at": {
+                "type": "string",
+                "format": "date-time",
+            },
+            "data": entity_data,
+            "rebind_identity": {
+                "type": "boolean",
+                "default": False,
+                "description": "Explicitly migrate immutable entity identity fields.",
+            },
+        },
+        ["action", "type", "uuid"],
+    )
+    specification["paths"][f"{root}actions/apply/invoke"] = {
+        "post": {
+            "summary": "Atomically apply provider entity changes",
+            "operationId": "Apply_provider_entities",
+            "tags": ["Provider"],
+            "requestBody": _request_body(
+                _object_schema(
+                    {
+                        "delivery_class": {
+                            "type": "string",
+                            "enum": ["live", "backfill"],
+                            "default": "live",
+                        },
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 500,
+                            "items": operation,
+                        },
+                    },
+                    ["operations"],
+                )
+            ),
+            "responses": {
+                200: json_response(
+                    _object_schema(
+                        {
+                            "results": {
+                                "type": "array",
+                                "items": mutation_result,
+                            }
+                        },
+                        ["results"],
+                    ),
+                    "Atomic mutation results",
+                )
+            },
+        }
+    }
+    specification["paths"]["/v1/provider/registration"] = {
+        "put": {
+            "summary": "Register the authenticated provider consumer",
+            "operationId": "Register_provider_consumer",
+            "tags": ["Provider"],
+            "requestBody": _request_body(
+                _object_schema(
+                    {
+                        "provider_uuid": {
+                            "type": "string",
+                            "format": "uuid",
+                        },
+                        "name": {
+                            "type": "string",
+                            "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                        },
+                    },
+                    ["provider_uuid", "name"],
+                )
+            ),
+            "responses": {
+                200: json_response(
+                    _object_schema(
+                        {
+                            "provider_uuid": {
+                                "type": "string",
+                                "format": "uuid",
+                            },
+                            "name": {"type": "string"},
+                            "project_id": {"type": "string", "format": "uuid"},
+                            "iam_user_uuid": {
+                                "type": "string",
+                                "format": "uuid",
+                            },
+                            "enabled": {"type": "boolean"},
+                        },
+                        [
+                            "provider_uuid",
+                            "name",
+                            "project_id",
+                            "iam_user_uuid",
+                            "enabled",
+                        ],
+                    ),
+                    "Provider consumer registration",
+                )
+            },
+        }
+    }
+    specification["paths"]["/v1/provider/bootstrap"] = {
+        "get": {
+            "summary": "Stream a consistent provider-visible entity snapshot",
+            "operationId": "Bootstrap_provider_entities",
+            "tags": ["Provider"],
+            "parameters": [
+                {
+                    "name": "mode",
+                    "in": "query",
+                    "description": (
+                        "Use paged to return only the snapshot/event cursor manifest; "
+                        "entities are then read through the paginated collections."
+                    ),
+                    "schema": {"type": "string", "enum": ["paged"]},
+                }
+            ],
+            "responses": {
+                200: {
+                    "description": (
+                        "NDJSON snapshot framed by meta and complete records, or a "
+                        "small JSON manifest when mode=paged"
+                    ),
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": [
+                                    "record",
+                                    "schema_version",
+                                    "snapshot_uuid",
+                                    "project_id",
+                                    "provider_uuid",
+                                    "epoch_generation",
+                                    "snapshot_epoch_version",
+                                    "created_at",
+                                ],
+                                "properties": {
+                                    "record": {
+                                        "type": "string",
+                                        "enum": ["manifest"],
+                                    },
+                                    "schema_version": {
+                                        "type": "integer",
+                                        "enum": [2],
+                                    },
+                                    "snapshot_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "project_id": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "provider_uuid": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "epoch_generation": {
+                                        "type": "string",
+                                        "format": "uuid",
+                                    },
+                                    "snapshot_epoch_version": {
+                                        "type": "integer",
+                                        "minimum": 0,
+                                    },
+                                    "created_at": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                    },
+                                },
+                            }
+                        },
+                        "application/x-ndjson": {
+                            "schema": {"type": "string", "format": "binary"}
+                        },
+                    },
+                }
+            },
+        }
     }
     return specification
 

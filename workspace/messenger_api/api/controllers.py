@@ -28,6 +28,7 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
+from workspace.common import constants
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import application_services
 from workspace.messenger_api import credential_crypto
@@ -328,6 +329,8 @@ class ContractJSONPacker(ra_packers.JSONPacker):
             "delivery",
             "identity_kind",
             "display_name",
+            "source_name",
+            "source",
         ):
             if extension_name in obj:
                 result[extension_name] = obj[extension_name]
@@ -555,8 +558,8 @@ class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
         action: typing.Any,
         values: typing.Any = None,
     ) -> typing.Any:
-        resource_uuid = (
-            resource["uuid"] if isinstance(resource, dict) else resource.uuid
+        resource_uuid = sys_uuid.UUID(
+            str(resource["uuid"] if isinstance(resource, dict) else resource.uuid)
         )
         with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
             return db.perform_action(
@@ -961,7 +964,10 @@ setattr(
                         "properties": {
                             "stream_uuid": {"format": "uuid", "type": "string"},
                             "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "maxLength": constants.WORKSPACE_DESCRIPTION_MAX_LENGTH,
+                            },
                             "content_type": {"type": "string"},
                             "size_bytes": {"minimum": 0, "type": "integer"},
                             "hash": {"type": "string"},
@@ -986,7 +992,10 @@ setattr(
                                 "type": "string",
                             },
                             "name": {"type": "string"},
-                            "description": {"type": "string"},
+                            "description": {
+                                "type": "string",
+                                "maxLength": constants.WORKSPACE_DESCRIPTION_MAX_LENGTH,
+                            },
                         },
                         "oneOf": [
                             {
@@ -1381,6 +1390,16 @@ class ExternalResourceController(ra_controllers.BaseResourceControllerPaginated)
     def _get_project_id(self) -> typing.Any:
         return self.get_context().project_id
 
+    def _sync_request_iam_identity(self) -> typing.Any:
+        iam_user = self.get_context().iam_context.get_introspection_info().user_info
+        return models.WorkspaceUser.sync_iam_identity(
+            user_uuid=self._get_user_uuid(),
+            username=iam_user.name,
+            first_name=iam_user.first_name,
+            last_name=iam_user.last_name,
+            email=iam_user.email,
+        )
+
     def get_packer(
         self, content_type: typing.Any, resource_type: typing.Any = None
     ) -> typing.Any:
@@ -1531,6 +1550,7 @@ class ExternalAccountController(ExternalResourceController):
 
     def create(self, **kwargs: typing.Any) -> typing.Any:
         self._require_permission("workspace.external_account.create")
+        self._sync_request_iam_identity()
         session = contexts.Context().get_session()
         return application_services.ExternalAccountApplicationService.create(
             session,

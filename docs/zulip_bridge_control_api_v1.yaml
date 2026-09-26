@@ -1303,7 +1303,7 @@ components:
           maxLength: 512
         description:
           type: string
-          maxLength: 4096
+          maxLength: 10000
         chat_kind:
           type: string
           enum: [channel, personal_dm, group_dm]
@@ -1903,7 +1903,7 @@ components:
           additionalProperties: true
         description:
           type: string
-          maxLength: 4096
+          maxLength: 10000
         participants:
           type: array
           minItems: 1

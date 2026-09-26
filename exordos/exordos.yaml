@@ -35,6 +35,7 @@ build:
         - name: workspace-backend
           format: zst
           profile: exordos_base
+          profile_version: "1.2.1"
           script: images/backend-install.sh
           override:
             disk_size: "10G"

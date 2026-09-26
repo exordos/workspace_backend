@@ -10,15 +10,38 @@ import types
 import uuid as sys_uuid
 from unittest import mock
 
+import pytest
+
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.messenger_api.api import v3_store
 
 
 def test_factory_is_always_postgresql_canonical():
     factory = store_factory.build_store_factory()
 
     assert isinstance(factory, sql_canonical_store.SQLCanonicalMessengerStoreFactory)
+
+
+def test_factory_can_select_clean_v3_storage():
+    assert isinstance(
+        store_factory.build_store_factory("v3"),
+        v3_store.MessengerV3StoreFactory,
+    )
+    with pytest.raises(ValueError, match="Unsupported Messenger store backend"):
+        store_factory.build_store_factory("unknown")
+
+
+def test_v3_message_reads_materialize_the_viewers_flags_first():
+    store = v3_store.MessengerV3Store(sys_uuid.uuid4(), sys_uuid.uuid4())
+
+    statement, parameters = store._resource_sql("messages")
+
+    assert "WITH visible_flags AS NOT MATERIALIZED" in statement
+    assert "FROM visible_flags AS flag" in statement
+    assert "WHERE project_id = %s AND user_uuid = %s" in statement
+    assert parameters == [store.project_uuid, store.user_uuid]
 
 
 def test_all_messenger_entrypoints_use_the_canonical_factory():
@@ -29,7 +52,30 @@ def test_all_messenger_entrypoints_use_the_canonical_factory():
         "workspace/cmd/messenger_worker.py",
     ):
         source = pathlib.Path(relative_path).read_text()
-        assert "store_factory.build_store_factory()" in source
+        assert "store_factory.build_store_factory(" in source
+
+
+def test_api_and_events_entrypoints_register_store_backend_option():
+    for module in (
+        "workspace.cmd.messenger_api",
+        "workspace.cmd.workspace_api",
+        "workspace.cmd.messenger_events",
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from oslo_config import cfg; "
+                    f"import {module}; "
+                    "assert cfg.CONF['messenger_store'].backend == 'v2'"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 def test_all_messenger_http_entrypoints_register_external_bridge_options():

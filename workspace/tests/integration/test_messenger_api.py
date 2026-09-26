@@ -1025,6 +1025,7 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
     db,
     tmp_path,
 ):
+    api._user_seeder = None
     _enable_zulip_policy(db, max_accounts=1)
     del tmp_path
     realm_uuid = sys_uuid.uuid4()
@@ -1063,6 +1064,12 @@ def test_zb_account_001_external_account_crud_is_owner_scoped_and_write_only(
         assert "api_key" not in account["settings"]
         assert "projection_reset_generation" not in account
         assert create.headers["ETag"] == '"1"'
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT username FROM m_workspace_users WHERE uuid = %s",
+                (api.user_uuid,),
+            )
+            assert cursor.fetchone() == (f"user-{api.user_uuid}",)
 
         duplicate = api.post(
             EXTERNAL_ACCOUNTS,

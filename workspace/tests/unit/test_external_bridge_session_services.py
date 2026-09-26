@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import contextlib
+import copy
 import datetime
 import types
 import uuid as sys_uuid
@@ -343,11 +344,11 @@ def test_concurrent_observed_report_retry_is_idempotent(monkeypatch):
                 if self.canonical_selects == 1:
                     return _Result()
                 canonical = (
-                    __import__("hashlib")
-                    .sha256(sql_state._json(report).encode())
-                    .hexdigest()
+                    sql_state._observed_report_canonical_sha256(report)
                 )
-                return _Result({"canonical_sha256": canonical})
+                return _Result(
+                    {"canonical_sha256": canonical, "payload": report}
+                )
             if 'SELECT "operation", "generation"' in statement:
                 return _Result({"operation": "upsert", "generation": 1})
             if "SELECT MAX" in statement:
@@ -378,3 +379,126 @@ def test_concurrent_observed_report_retry_is_idempotent(monkeypatch):
         ]
     }
     assert any("ON CONFLICT" in statement for statement, _params in session.calls)
+
+
+def test_observed_report_retry_ignores_delivery_timestamps(monkeypatch):
+    bridge_uuid = sys_uuid.uuid4()
+    report_uuid = sys_uuid.uuid4()
+    resource_uuid = sys_uuid.uuid4()
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+    )
+    first_observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    stored_report = {
+        "report_uuid": str(report_uuid),
+        "resource_type": "external_account",
+        "resource_uuid": str(resource_uuid),
+        "observed_generation": 1,
+        "status": "live_ready",
+        "progress": {
+            "phase": "live",
+            "completed": 1,
+            "total": 1,
+            "last_progress_at": first_observed_at,
+        },
+        "safe_error": None,
+        "observed_at": first_observed_at,
+    }
+    retried_report = copy.deepcopy(stored_report)
+    retried_at = (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=30)
+    ).isoformat()
+    retried_report["observed_at"] = retried_at
+    retried_report["progress"]["last_progress_at"] = retried_at
+
+    class Session:
+        @staticmethod
+        def execute(statement, _params):
+            if 'SELECT "canonical_sha256"' in statement:
+                legacy = (
+                    __import__("hashlib")
+                    .sha256(sql_state._json(stored_report).encode())
+                    .hexdigest()
+                )
+                return _Result(
+                    {"canonical_sha256": legacy, "payload": stored_report}
+                )
+            raise AssertionError(statement)
+
+    repository = sql_state.SQLControlState(sys_uuid.uuid4(), b"k" * 32)
+    monkeypatch.setattr(
+        repository,
+        "_reconcile_observed_report",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("timestamp-only retry must not be reconciled")
+        ),
+    )
+
+    result = repository.reconcile_observed_reports(
+        Session(), identity, [retried_report]
+    )
+
+    assert result == {
+        "results": [
+            {
+                "report_uuid": str(report_uuid),
+                "status": "duplicate",
+                "safe_error": None,
+            }
+        ]
+    }
+
+
+def test_observed_report_retry_rejects_semantic_changes(monkeypatch):
+    bridge_uuid = sys_uuid.uuid4()
+    report_uuid = sys_uuid.uuid4()
+    resource_uuid = sys_uuid.uuid4()
+    identity = types.SimpleNamespace(
+        bridge_instance_uuid=bridge_uuid,
+        provider_kind="zulip",
+    )
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    stored_report = {
+        "report_uuid": str(report_uuid),
+        "resource_type": "external_account",
+        "resource_uuid": str(resource_uuid),
+        "observed_generation": 1,
+        "status": "live_ready",
+        "progress": None,
+        "safe_error": None,
+        "observed_at": observed_at,
+    }
+    changed_report = {**stored_report, "status": "degraded"}
+
+    class Session:
+        @staticmethod
+        def execute(statement, _params):
+            if 'SELECT "canonical_sha256"' in statement:
+                return _Result(
+                    {
+                        "canonical_sha256": (
+                            sql_state._observed_report_canonical_sha256(
+                                stored_report
+                            )
+                        ),
+                        "payload": stored_report,
+                    }
+                )
+            raise AssertionError(statement)
+
+    repository = sql_state.SQLControlState(sys_uuid.uuid4(), b"k" * 32)
+    monkeypatch.setattr(
+        repository,
+        "_reconcile_observed_report",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("changed report must not be reconciled")
+        ),
+    )
+
+    result = repository.reconcile_observed_reports(
+        Session(), identity, [changed_report]
+    )
+
+    assert result["results"][0]["status"] == "rejected"

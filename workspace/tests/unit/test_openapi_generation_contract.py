@@ -89,6 +89,7 @@ def _assert_file_upload_contract(operation):
         "hash",
     ]
     assert "storage_type" not in json_schema["properties"]
+    assert json_schema["properties"]["description"]["maxLength"] == 10_000
     multipart_schema = content["multipart/form-data"]["schema"]
     assert multipart_schema["required"] == ["file"]
     assert multipart_schema["oneOf"] == [
@@ -102,6 +103,7 @@ def _assert_file_upload_contract(operation):
         },
     ]
     assert "storage_type" not in multipart_schema["properties"]
+    assert multipart_schema["properties"]["description"]["maxLength"] == 10_000
 
 
 def _assert_collection_pagination_contract(
@@ -234,10 +236,10 @@ def _assert_topic_summary_management_contract(specification, root):
     ]
 
 
-def _build_openapi(app_module):
+def _build_openapi(app_module, openapi_engine=None):
     application = applications.OpenApiApplication(
         route_class=app_module.get_api_application(),
-        openapi_engine=app_module.get_openapi_engine(),
+        openapi_engine=openapi_engine or app_module.get_openapi_engine(),
     )
     request = webob.Request.blank(f"/specifications/{OPENAPI_VERSION}")
     request.application = application
@@ -383,6 +385,97 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
         "/v1/stream_topics/{WorkspaceUserTopicUuid}",
     )
     _assert_topic_summary_management_contract(specification, "/v1/")
+
+
+def test_v3_openapi_exposes_only_the_minimal_source_marker():
+    specification = _build_openapi(
+        messenger_app,
+        messenger_app.get_v3_openapi_engine(),
+    )
+    for prefix in (
+        "WorkspaceUserStream_",
+        "WorkspaceUserTopic_",
+        "WorkspaceUserMessage_",
+        "WorkspaceMessageReactions_",
+    ):
+        for name in specification["components"]["schemas"]:
+            if not name.startswith(prefix):
+                continue
+            properties = _component_schema(specification, name)["properties"]
+            assert not {
+                "provider",
+                "provider_metadata",
+                "delivery",
+                "delivery_metadata",
+            } & set(properties)
+            assert properties["source_name"]["pattern"] == ("^[a-z][a-z0-9_-]{0,31}$")
+            assert properties["source"]["properties"] == {
+                "kind": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+                }
+            }
+            assert properties["source"]["additionalProperties"] is False
+
+    for name in ("WorkspaceUser_Filter", "WorkspaceUser_Get"):
+        properties = _component_schema(specification, name)["properties"]
+        assert "provider" not in properties
+        assert "identity_kind" not in properties
+        assert "display_name" in properties
+
+    workspace_specification = _build_openapi(
+        workspace_app,
+        workspace_app.get_v3_openapi_engine(),
+    )
+    workspace_message = _component_schema(
+        workspace_specification,
+        "WorkspaceUserMessage_Get",
+    )["properties"]
+    assert "provider" not in workspace_message
+    assert "delivery" not in workspace_message
+    assert set(workspace_message["source"]["properties"]) == {"kind"}
+
+    provider_root = "/v1/provider/entities/"
+    provider_entity_path = (
+        f"{provider_root}{{ProviderEntityType}}/{{ProviderEntityUuid}}"
+    )
+    assert set(specification["paths"][provider_entity_path]) == {
+        "get",
+        "put",
+        "delete",
+    }
+    batch = specification["paths"][f"{provider_root}actions/apply/invoke"]["post"]
+    operations = batch["requestBody"]["content"]["application/json"]["schema"][
+        "properties"
+    ]["operations"]
+    assert operations["maxItems"] == 500
+    assert operations["items"]["properties"]["type"]["enum"] == [
+        "users",
+        "streams",
+        "stream_bindings",
+        "topics",
+        "topic_bindings",
+        "messages",
+        "message_flags",
+        "message_reactions",
+    ]
+    assert "source_updated_at" in operations["items"]["properties"]
+    assert operations["items"]["properties"]["rebind_identity"] == {
+        "type": "boolean",
+        "default": False,
+        "description": "Explicitly migrate immutable entity identity fields.",
+    }
+    request_schema = batch["requestBody"]["content"]["application/json"]["schema"]
+    assert request_schema["properties"]["delivery_class"] == {
+        "type": "string",
+        "enum": ["live", "backfill"],
+        "default": "live",
+    }
+    upsert = specification["paths"][provider_entity_path]["put"]["requestBody"]
+    upsert_schema = upsert["content"]["application/json"]["schema"]
+    assert "rebind_identity" in upsert_schema["properties"]
+    bootstrap = specification["paths"]["/v1/provider/bootstrap"]["get"]
+    assert "application/x-ndjson" in bootstrap["responses"][200]["content"]
 
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():

@@ -17,20 +17,18 @@
 import typing
 
 from gcl_iam import middlewares as iam_mw
-from restalchemy.api import applications
+from restalchemy.api import applications, middlewares, routes
 from restalchemy.api.middlewares import logging as logging_mw
-from restalchemy.api import middlewares
-from restalchemy.api import routes
 from restalchemy.openapi import constants as openapi_constants
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
 
+from workspace import version as app_version
+from workspace.messenger_api import provider_api
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
-from workspace.messenger_api.api import openapi_contract
+from workspace.messenger_api.api import openapi_contract, versions
 from workspace.messenger_api.api import routes as app_routes
-from workspace.messenger_api.api import versions
-from workspace import version as app_version
 
 
 class MessengerApiApp(routes.RootRoute):
@@ -42,6 +40,12 @@ class MessengerOpenApiComponents(openapi_structures.OpenApiComponents):
         specification = super().build(request)
         specification = openapi_contract.add_public_projection_contract(specification)
         return openapi_contract.add_avatar_upload_schema(specification)
+
+
+class MessengerV3OpenApiComponents(MessengerOpenApiComponents):
+    def build(self, request: typing.Any) -> dict[str, typing.Any]:
+        specification = super().build(request)
+        return openapi_contract.add_v3_source_contract(specification)
 
 
 class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
@@ -80,9 +84,13 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/",
             components,
         )
-        return openapi_contract.add_current_user_contract(
+        specification = openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",
+        )
+        return openapi_contract.add_provider_entity_contract(
+            specification,
+            "/v1/provider/entities/",
         )
 
 
@@ -112,6 +120,21 @@ def get_openapi_engine() -> typing.Any:
     return openapi_engine
 
 
+def get_v3_openapi_engine() -> typing.Any:
+    """Build the client-compatible contract with minimal source metadata."""
+    return openapi_engines.OpenApiEngine(
+        info=openapi_structures.OpenApiInfo(
+            title=f"Workspace {versions.API_VERSION_1_0} Messenger API v3",
+            version=app_version.version_info,
+            description=f"OpenAPI - Workspace {versions.API_VERSION_1_0}",
+        ),
+        paths=MessengerOpenApiPaths(),
+        components=MessengerV3OpenApiComponents(
+            openapi_constants.OPENAPI_SPECIFICATION_3_0_3,
+        ),
+    )
+
+
 def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
@@ -119,6 +142,29 @@ def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
             openapi_engine=get_openapi_engine(),
         ),
         [
+            provider_api.ProviderApiMiddleware,
+            middlewares.configure_middleware(
+                iam_mw.GenesisCoreAuthMiddleware,
+                iam_engine_driver=iam_engine_driver,
+                context_class=auth_context.WorkspaceMessengerAuthContext,
+            ),
+            app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.DatabaseDeadlockRetryMiddleware,
+            app_middlewares.ErrorsHandlerMiddleware,
+            logging_mw.LoggingMiddleware,
+        ],
+    )
+
+
+def build_v3_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
+    """Build the v3 API surface without changing the deployed application."""
+    return middlewares.attach_middlewares(
+        applications.OpenApiApplication(
+            route_class=get_api_application(),
+            openapi_engine=get_v3_openapi_engine(),
+        ),
+        [
+            provider_api.ProviderApiMiddleware,
             middlewares.configure_middleware(
                 iam_mw.GenesisCoreAuthMiddleware,
                 iam_engine_driver=iam_engine_driver,

@@ -44,6 +44,17 @@ def test_manifest_has_one_postgresql_messenger_runtime():
     assert manifest.count("command: /usr/local/bin/workspace-bootstrap") >= 5
 
 
+def test_manifest_provisions_eight_backend_cores():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    backend_node = manifest.split("workspace_backend:", 1)[1].split(
+        "$core.secret.passwords:",
+        1,
+    )[0]
+
+    assert "cores: 8" in backend_node
+    assert "cores: $workspace.imports.$var_default_cores:value" not in backend_node
+
+
 def test_manifest_scales_s3_disk_size_by_core_profile():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     expected_profile_sizes = {
@@ -110,14 +121,14 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
-def test_messenger_runtime_has_two_workers_with_bounded_pool_budget():
+def test_messenger_runtime_has_sixteen_workers_with_bounded_pool_budget():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
         messenger = config.split("[messenger_api]", 1)[1].split("[", 1)[0]
-        assert "workers = 2" in messenger
+        assert "workers = 16" in messenger
         assert "connection_pool_max_size = 2" in config
 
     messenger_source = _read("workspace/cmd/messenger_api.py")
@@ -169,6 +180,37 @@ def test_messenger_v2_projection_worker_is_explicitly_enabled():
         assert "v2_metrics_log_interval_seconds = 30" in config
 
 
+def test_messenger_v3_store_is_the_deployed_api_and_websocket_backend():
+    for config_path in (
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+    ):
+        config = _read(config_path)
+        assert "[messenger_store]" in config
+        assert "backend = v3" in config
+
+
+def test_messenger_v3_projection_worker_is_deployed():
+    config = _read("etc/workspace/workspace.conf")
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    install = _read("exordos/images/backend-install.sh")
+    restart = _read("exordos/images/workspace-restart-services.sh")
+    service = _read("etc/systemd/workspace-v3-worker.service")
+
+    for rendered_config in (config, manifest):
+        assert "[workspace_v3_projection_worker]" in rendered_config
+        assert "workers = 2" in rendered_config
+        assert "batch_size = 100" in rendered_config
+        assert "reaction_user_limit = 4" in rendered_config
+    assert "name: workspace-v3-worker" in manifest
+    assert (
+        "path: /usr/bin/workspace-v3-worker --config-file /etc/workspace/workspace.conf"
+    ) in manifest
+    assert "workspace-v3-worker" in install
+    assert "workspace-v3-worker" in restart
+    assert "ExecStart=workspace-v3-worker --config-file " in service
+
+
 def test_manifest_provisions_unassigned_external_integration_roles():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
     account_permissions = {
@@ -208,6 +250,31 @@ def test_manifest_provisions_unassigned_external_integration_roles():
     assert bindings.count(
         "role: $core.iam.roles.$workspace_external_integration_admin:uuid"
     ) == len(admin_permissions)
+
+
+def test_manifest_exports_provider_sync_role_for_bridge_identity():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+
+    assert 'name: "workspace.provider.sync"' in manifest
+    assert 'name: "workspace-provider-sync"' in manifest
+    assert "role: $core.iam.roles.$workspace_provider_sync:uuid" in manifest
+    assert "provider_sync_role:" in manifest
+    assert 'link: "$core.iam.roles.$workspace_provider_sync"' in manifest
+
+
+def test_manifest_exports_mutable_workspace_project_variable():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    variable = manifest.split("workspace_project_id:", 1)[1].split(
+        "workspace_s3_disk_size:",
+        1,
+    )[0]
+
+    assert 'name: "workspace_project_id"' in variable
+    assert "kind: selector" in variable
+    assert "selector_strategy: latest" in variable
+    assert "profiles:" not in variable
+    assert "project_id_variable:" in manifest
+    assert 'link: "$core.vs.variables.$workspace_project_id"' in manifest
 
 
 def test_manifest_provisions_topic_summary_admin_and_encryption_secret():
@@ -250,19 +317,21 @@ def test_manifest_exposes_only_api_routes_from_the_backend_node():
 
     assert "location /api/workspace/" in manifest
     assert "location = /api/workspace/v1/events/ws" in manifest
+    assert "location /api/workspace/v1/users/" in manifest
+    assert "proxy_pass http://127.0.0.1:21081/v1/users/;" in manifest
     assert "root /opt/workspace-ui" not in manifest
     assert "alias /opt/workspace-ui" not in manifest
     assert "location / {\n                  return 404;" in manifest
 
 
-def test_manifest_proxies_core_api_over_https():
+def test_manifest_proxies_core_api_over_internal_http():
     manifest = _read("exordos/manifests/workspace.yaml.j2")
 
-    assert "proxy_pass https://workspace_core_api/api/core/;" in manifest
-    assert "proxy_pass http://workspace_core_api/api/core/;" not in manifest
-    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' in manifest
+    assert "proxy_pass http://workspace_core_api/api/core/;" in manifest
+    assert "proxy_pass https://workspace_core_api/api/core/;" not in manifest
+    assert 'f"server {$workspace.imports.$var_core_ip_address:value}:80;"' in manifest
     assert (
-        'f"server {$workspace.imports.$var_core_ip_address:value}:80;"' not in manifest
+        'f"server {$workspace.imports.$var_core_ip_address:value}:443;"' not in manifest
     )
 
 

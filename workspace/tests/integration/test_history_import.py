@@ -59,6 +59,16 @@ HISTORY_CASCADE_MIGRATION = (
 )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _restore_current_migration_head(_database):
+    """Do not leak the history migration rollback into later test modules."""
+    yield
+    engine = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )
+    engine.apply_migration(engine.get_latest_migration())
+
+
 def _completed_history_with_file(s):
     job_uuid = accept(
         s, envelope(s, count=1, content="[sample](/user_uploads/1/a/sample.txt)")

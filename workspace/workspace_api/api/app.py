@@ -41,6 +41,12 @@ class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
         return openapi_contract.add_avatar_upload_schema(specification)
 
 
+class WorkspaceV3OpenApiComponents(WorkspaceOpenApiComponents):
+    def build(self, request: Any) -> dict[str, Any]:
+        specification = super().build(request)
+        return openapi_contract.add_v3_source_contract(specification)
+
+
 class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
     def build(self, request: Any, components: Any) -> dict[str, Any]:
         specification = super().build(request, components)
@@ -107,11 +113,44 @@ def get_openapi_engine() -> openapi_engines.OpenApiEngine:
     )
 
 
+def get_v3_openapi_engine() -> openapi_engines.OpenApiEngine:
+    return openapi_engines.OpenApiEngine(
+        info=openapi_structures.OpenApiInfo(
+            title="Workspace v1 API v3 storage",
+            version=app_version.version_info,
+            description="IAM-authenticated Workspace API",
+        ),
+        paths=WorkspaceOpenApiPaths(),
+        components=WorkspaceV3OpenApiComponents(
+            openapi_constants.OPENAPI_SPECIFICATION_3_0_3,
+        ),
+    )
+
+
 def build_wsgi_application(iam_engine_driver: Any) -> Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
             route_class=get_api_application(),
             openapi_engine=get_openapi_engine(),
+        ),
+        [
+            middlewares.configure_middleware(
+                iam_mw.GenesisCoreAuthMiddleware,
+                iam_engine_driver=iam_engine_driver,
+                context_class=auth_context.WorkspaceMessengerAuthContext,
+            ),
+            app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.ErrorsHandlerMiddleware,
+            logging_mw.LoggingMiddleware,
+        ],
+    )
+
+
+def build_v3_wsgi_application(iam_engine_driver: Any) -> Any:
+    return middlewares.attach_middlewares(
+        applications.OpenApiApplication(
+            route_class=get_api_application(),
+            openapi_engine=get_v3_openapi_engine(),
         ),
         [
             middlewares.configure_middleware(

@@ -92,7 +92,7 @@ class WorkspaceFile(models.ModelWithUUID, models.ModelWithProject,
     user_uuid = properties.property(types.UUID(), required=True, read_only=True)
     stream_uuid = properties.property(types.AllowNone(types.UUID()))
     name = properties.property(types.String(max_length=255), required=True)
-    description = properties.property(types.String(max_length=255), default="")
+    description = properties.property(types.String(max_length=10000), default="")
     content_type = properties.property(types.String(max_length=255), required=True)
     size_bytes = properties.property(types.Integer(min_value=0), required=True)
     hash = properties.property(types.String(max_length=255), required=True)

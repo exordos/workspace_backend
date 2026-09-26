@@ -69,6 +69,13 @@ imports:
 resources:
 
   $core.vs.variables:
+    workspace_project_id:
+      name: "workspace_project_id"
+      description: "Workspace project served by external provider bridges"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: selector
+        selector_strategy: latest
     workspace_s3_disk_size:
       name: "workspace_s3_disk_size"
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
@@ -162,6 +169,9 @@ resources:
     workspace_topic_summary_settings_manage:
       name: "workspace.topic_summary_settings.manage"
       description: "Manage global and project Workspace topic summary settings"
+    workspace_provider_sync:
+      name: "workspace.provider.sync"
+      description: "Register and synchronize an external Workspace provider"
 
   # Roles are provisioned with their permission sets but are intentionally not
   # assigned to users. Operators create project-scoped role bindings explicitly.
@@ -177,6 +187,10 @@ resources:
     workspace_topic_summary_admin:
       name: "workspace-topic-summary-admin"
       description: "Administer Workspace topic summarization"
+      project_id: null
+    workspace_provider_sync:
+      name: "workspace-provider-sync"
+      description: "Synchronize one external provider with Workspace"
       project_id: null
 
   $core.iam.permissionbinding:
@@ -248,12 +262,16 @@ resources:
       role: $core.iam.roles.$workspace_topic_summary_admin:uuid
       permission: $core.iam.permissions.$workspace_topic_summary_settings_manage:uuid
       project_id: null
+    workspace_provider_sync:
+      role: $core.iam.roles.$workspace_provider_sync:uuid
+      permission: $core.iam.permissions.$workspace_provider_sync:uuid
+      project_id: null
 
   $core.compute.nodes:
     workspace_backend:
       name: workspace-backend
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      cores: $workspace.imports.$var_default_cores:value
+      cores: 8
       ram: 4096
       disk_spec:
         kind: "disks"
@@ -461,7 +479,11 @@ resources:
           [messenger_api]
           bind_host = 127.0.0.1
           bind_port = 21081
-          workers = 2
+          workers = 16
+
+
+          [messenger_store]
+          backend = v3
 
 
           [messenger_reactions]
@@ -501,6 +523,16 @@ resources:
           # Poll quickly after an empty cycle; completed work never sleeps.
           v2_projection_idle_sleep_seconds = 0.5
           v2_metrics_log_interval_seconds = 30
+
+
+          [workspace_v3_projection_worker]
+          workers = 2
+          batch_size = 100
+          lease_seconds = 30
+          max_attempts = 8
+          reaction_user_limit = 4
+          idle_sleep_seconds = 0.1
+          metrics_log_interval_seconds = 30
 
 
           [topic_summary]
@@ -563,7 +595,7 @@ resources:
               client_max_body_size 50m;
 
               location /api/core/ {
-                  proxy_pass https://workspace_core_api/api/core/;
+                  proxy_pass http://workspace_core_api/api/core/;
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -586,6 +618,14 @@ resources:
 
               location /api/workspace/v1/messenger/ {
                   proxy_pass http://127.0.0.1:21081/v1/;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+
+              location /api/workspace/v1/users/ {
+                  proxy_pass http://127.0.0.1:21081/v1/users/;
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -617,7 +657,7 @@ resources:
       body:
         kind: text
         content: |
-          f"server {$workspace.imports.$var_core_ip_address:value}:443;"
+          f"server {$workspace.imports.$var_core_ip_address:value}:80;"
 
   $core.em.services:
     workspace_bootstrap:
@@ -691,6 +731,21 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
+    workspace_v3_worker:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: workspace-v3-worker
+      path: /usr/bin/workspace-v3-worker --config-file /etc/workspace/workspace.conf
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_backend:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-bootstrap
     workspace_history_import_worker:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-history-import-worker
@@ -748,4 +803,10 @@ exports:
     kind: "resource"
   projection_db_instance:
     link: "$dbaas.types.postgres.instances.$workspace_projection_cluster"
+    kind: "resource"
+  provider_sync_role:
+    link: "$core.iam.roles.$workspace_provider_sync"
+    kind: "resource"
+  project_id_variable:
+    link: "$core.vs.variables.$workspace_project_id"
     kind: "resource"

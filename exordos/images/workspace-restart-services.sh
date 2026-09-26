@@ -23,6 +23,7 @@ SERVICE_NAMES=(
     workspace-api
     workspace-messenger-api
     workspace-messenger-worker
+    workspace-v3-worker
     workspace-history-import-worker
     workspace-messenger-events
     workspace-external-bridge-api

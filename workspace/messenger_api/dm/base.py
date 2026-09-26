@@ -23,6 +23,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.common import constants
 from workspace.messenger_api.dm import message_payloads
 
 
@@ -236,6 +237,10 @@ class WorkspaceStreamBase(
     models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
     user_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -291,6 +296,10 @@ class WorkspaceUserStreamBase(
     models.ModelWithProject,
     models.ModelWithTimestamp,
 ):
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
     owner = properties.property(
         types.UUID(),
         required=True,
