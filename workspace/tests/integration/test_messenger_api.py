@@ -4570,6 +4570,7 @@ def test_file_json_crud_scopes_access_and_deletes_access_rows(api, db):
     assert resp.status_code == 404, resp.text
     resp = api.get(f"{FILES}{file_uuid}/actions/download", user=outsider_user)
     assert resp.status_code == 404, resp.text
+    assert resp.headers["Cache-Control"] == "no-store"
 
     with db.cursor() as cur:
         cur.execute(
