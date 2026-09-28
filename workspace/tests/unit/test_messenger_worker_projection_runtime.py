@@ -137,7 +137,7 @@ def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):
     assert sleeps == [0.5]
 
 
-def test_projection_pass_checks_cleanup_once_without_deriving(monkeypatch):
+def test_projection_pass_does_not_run_provider_cleanup_or_deriving(monkeypatch):
     calls = []
     outcomes = iter((True, True, True, False))
 
@@ -173,7 +173,7 @@ def test_projection_pass_checks_cleanup_once_without_deriving(monkeypatch):
     )
 
     assert worker._run_v2_projection_tasks() is True
-    assert calls.count("cleanup") == 1
+    assert calls.count("cleanup") == 0
     assert calls.count("derive") == 0
     assert calls.count("process") == 4
 

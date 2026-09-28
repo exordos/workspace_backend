@@ -1293,12 +1293,23 @@ class SQLCanonicalReadStore:
                     resource_uuid,
                 )
             elif resource == "files":
-                row = models.WorkspaceVisibleFile.objects.get_one(
-                    filters=self._scope_filters(
-                        resource,
-                        {"uuid": dm_filters.EQ(resource_uuid)},
+                try:
+                    row = models.WorkspaceVisibleFile.objects.get_one(
+                        filters=self._scope_filters(
+                            resource,
+                            {"uuid": dm_filters.EQ(resource_uuid)},
+                        )
                     )
-                )
+                except Exception as error:
+                    LOG.warning(
+                        "Messenger file visibility lookup failed: "
+                        "project_uuid=%s user_uuid=%s file_uuid=%s error_type=%s",
+                        self.project_uuid,
+                        self.user_uuid,
+                        resource_uuid,
+                        type(error).__name__,
+                    )
+                    raise
             else:
                 model = RESOURCE_MODELS[resource]
                 row = model.objects.get_one(

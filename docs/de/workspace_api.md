@@ -765,7 +765,7 @@ Roh-Providerprotokoll-Identifikatoren, Anmeldeinformationen und Synchronisations
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | - Nein. | - Ja, das ist es. | Streaming-Identifikator. |
 | `name` | String, max. 255 | - Ja, das ist es. | - Nein. | - Der Name des Stroms. |
-| `description` | String, max. 255 | - Nein. | - Nein. | Strömungsbeschreibung; Standard für eine leere Zeichenfolge. |
+| `description` | String, max. 10000 | - Nein. | - Nein. | Strömungsbeschreibung; Standard für eine leere Zeichenfolge. |
 | `project_id` | UUID | - Nein. | - Ja, das ist es. | IAM Projektumfang. |
 | `owner` | UUID | - Nein. | - Ja, das ist es. | Eigentümer aus der Benutzer-Stream-Ansicht. |
 | `user_uuid` | UUID | - Nein. | - Ja, das ist es. | Der aktuelle Benutzer in der Benutzer-Stream-Ansicht. |
@@ -1661,7 +1661,7 @@ Nginx lehnt mehrere Anfragen ab, die größer als `50m` sind, bevor sie erreicht
 | `user_uuid` | UUID | - Nein. | - Ja, das ist es. | Eigentümer/uploader. |
 | `stream_uuid` | UUID oder `null` | - Ja, das ist es. | - Nein. | Streaming, das eine Chatdatei besitzt. Für JSON erstellen und `stream_members` mehrteiligen Uploads erforderlich; für mehrteiligen Uploads mit `acl.mode=public` weggelassen. |
 | `name` | String, max. 255 | - Ja, das ist es. | - Nein. | Anzeigenname der Datei. |
-| `description` | String, max. 255 | - Nein. | - Nein. | Dateibeschreibung; Standard für eine leere Zeichenfolge. |
+| `description` | String, max. 10000 | - Nein. | - Nein. | Dateibeschreibung; Standard für eine leere Zeichenfolge. |
 | `content_type` | String | - Ja, das ist es. | - Nein. | MIME Inhaltstyp. |
 | `size_bytes` | ganzzahl | - Ja, das ist es. | - Nein. | Dateigröße in Bytes. |
 | `hash` | String | - Ja, das ist es. | - Nein. | Dateihash, derzeit SHA-256 für mehrteilige Uploads. |
@@ -1738,7 +1738,7 @@ Dienstleistungen sind nur lesbare Katalogbezeichnungen, die durch die gemeinsame
 | --- | --- | --- |
 | `uuid` | UUID | Dienst-Identifikator. |
 | `name` | String, max. 255 | Dienstnamen. |
-| `description` | String, max. 255 | Servicebeschreibung; Standard für eine leere Zeichenfolge. |
+| `description` | String, max. 10000 | Servicebeschreibung; Standard für eine leere Zeichenfolge. |
 | `service_url` | URL | Dienstleistungseingang URL. |
 | `icon` | URL oder `null` | Optional Symbol URL. |
 | `created_at` | Zeit und Datum | Die Schöpfungszeit. |

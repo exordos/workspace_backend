@@ -1960,6 +1960,51 @@ def get_events_after(
     return events
 
 
+def resolve_websocket_consumer(
+    project_id: sys_uuid.UUID,
+    iam_user_uuid: sys_uuid.UUID,
+    permissions: collections.abc.Collection[str] = (),
+) -> tuple[str, sys_uuid.UUID]:
+    del project_id, permissions
+    return "user", iam_user_uuid
+
+
+def get_consumer_events_after(
+    project_id: sys_uuid.UUID,
+    consumer_type: str,
+    consumer_uuid: sys_uuid.UUID,
+    after_epoch_version: typing.Any = 0,
+    limit: typing.Any = DEFAULT_EVENTS_LIMIT,
+    epoch_generation: typing.Any = None,
+    session: typing.Any = None,
+) -> typing.Any:
+    del session
+    with api_store.open_event_store(project_id, consumer_uuid) as opened_store:
+        store = typing.cast(typing.Any, opened_store)
+        filters = {"epoch_version": dm_filters.GT(after_epoch_version)}
+        order_by = {"epoch_version": "asc"}
+        return store.events_after_for_consumer(
+            filters,
+            consumer_type=consumer_type,
+            consumer_uuid=consumer_uuid,
+            order_by=order_by,
+            epoch_generation=epoch_generation,
+            limit=limit,
+        )
+
+
+def get_consumer_event_cursor(
+    project_id: sys_uuid.UUID,
+    consumer_type: str,
+    consumer_uuid: sys_uuid.UUID,
+    session: typing.Any = None,
+) -> typing.Any:
+    del session
+    with api_store.open_event_store(project_id, consumer_uuid) as opened_store:
+        store = typing.cast(typing.Any, opened_store)
+        return store.event_cursor_for_consumer(consumer_type, consumer_uuid)
+
+
 def get_event_for_user(
     project_id: object,
     user_uuid: object,

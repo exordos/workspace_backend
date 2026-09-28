@@ -106,56 +106,7 @@ resources:
           - profile: $workspace.imports.$profile_legacy:uuid
             value: 512
 
-  # Canonical action permissions for realm-level external-provider operations.
-  # The element owns only the permission catalog. Operators grant the required
-  # subset through a project-scoped role binding; deployment never elevates a
-  # Workspace user implicitly.
   $core.iam.permissions:
-    workspace_external_account_read:
-      name: "workspace.external_account.read"
-      description: "Read the current user's Workspace external accounts"
-    workspace_external_account_create:
-      name: "workspace.external_account.create"
-      description: "Connect a Workspace external account"
-    workspace_external_account_update:
-      name: "workspace.external_account.update"
-      description: "Update the current user's Workspace external accounts"
-    workspace_external_account_reconnect:
-      name: "workspace.external_account.reconnect"
-      description: "Reconnect the current user's Workspace external accounts"
-    workspace_external_account_disconnect:
-      name: "workspace.external_account.disconnect"
-      description: "Disconnect the current user's Workspace external accounts"
-    workspace_external_account_delete:
-      name: "workspace.external_account.delete"
-      description: "Delete the current user's Workspace external accounts"
-    workspace_external_provider_policy_read:
-      name: "workspace.external_provider_policy.read"
-      description: "Read Workspace external provider policy"
-    workspace_external_provider_policy_update:
-      name: "workspace.external_provider_policy.update"
-      description: "Update Workspace external provider policy"
-    workspace_external_provider_policy_suspend:
-      name: "workspace.external_provider_policy.suspend"
-      description: "Suspend a Workspace external provider"
-    workspace_external_provider_policy_resume:
-      name: "workspace.external_provider_policy.resume"
-      description: "Resume a Workspace external provider"
-    workspace_external_provider_health_read:
-      name: "workspace.external_provider_health.read"
-      description: "Read Workspace external provider health"
-    workspace_external_bridge_instance_read:
-      name: "workspace.external_bridge_instance.read"
-      description: "Read Workspace external bridge instances"
-    workspace_external_bridge_instance_suspend:
-      name: "workspace.external_bridge_instance.suspend"
-      description: "Suspend a Workspace external bridge instance"
-    workspace_external_bridge_instance_resume:
-      name: "workspace.external_bridge_instance.resume"
-      description: "Resume a Workspace external bridge instance"
-    workspace_external_bridge_instance_revoke:
-      name: "workspace.external_bridge_instance.revoke"
-      description: "Revoke a Workspace external bridge instance"
     workspace_topic_summary_endpoint_manage:
       name: "workspace.topic_summary_endpoint.manage"
       description: "Manage global Workspace topic summary LLM endpoints"
@@ -166,80 +117,12 @@ resources:
   # Roles are provisioned with their permission sets but are intentionally not
   # assigned to users. Operators create project-scoped role bindings explicitly.
   $core.iam.roles:
-    workspace_external_integration:
-      name: "workspace-external-integration"
-      description: "Use Workspace external account integrations"
-      project_id: null
-    workspace_external_integration_admin:
-      name: "workspace-external-integration-admin"
-      description: "Administer Workspace external provider integrations"
-      project_id: null
     workspace_topic_summary_admin:
       name: "workspace-topic-summary-admin"
       description: "Administer Workspace topic summarization"
       project_id: null
 
   $core.iam.permissionbinding:
-    workspace_external_integration_account_read:
-      role: $core.iam.roles.$workspace_external_integration:uuid
-      permission: $core.iam.permissions.$workspace_external_account_read:uuid
-      project_id: null
-    workspace_external_integration_account_create:
-      role: $core.iam.roles.$workspace_external_integration:uuid
-      permission: $core.iam.permissions.$workspace_external_account_create:uuid
-      project_id: null
-    workspace_external_integration_account_update:
-      role: $core.iam.roles.$workspace_external_integration:uuid
-      permission: $core.iam.permissions.$workspace_external_account_update:uuid
-      project_id: null
-    workspace_external_integration_account_reconnect:
-      role: $core.iam.roles.$workspace_external_integration:uuid
-      permission: $core.iam.permissions.$workspace_external_account_reconnect:uuid
-      project_id: null
-    workspace_external_integration_account_disconnect:
-      role: $core.iam.roles.$workspace_external_integration:uuid
-      permission: $core.iam.permissions.$workspace_external_account_disconnect:uuid
-      project_id: null
-    workspace_external_integration_account_delete:
-      role: $core.iam.roles.$workspace_external_integration:uuid
-      permission: $core.iam.permissions.$workspace_external_account_delete:uuid
-      project_id: null
-    workspace_external_integration_admin_policy_read:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_provider_policy_read:uuid
-      project_id: null
-    workspace_external_integration_admin_policy_update:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_provider_policy_update:uuid
-      project_id: null
-    workspace_external_integration_admin_policy_suspend:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_provider_policy_suspend:uuid
-      project_id: null
-    workspace_external_integration_admin_policy_resume:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_provider_policy_resume:uuid
-      project_id: null
-    workspace_external_integration_admin_health_read:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_provider_health_read:uuid
-      project_id: null
-    workspace_external_integration_admin_bridge_read:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_bridge_instance_read:uuid
-      project_id: null
-    workspace_external_integration_admin_bridge_suspend:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_bridge_instance_suspend:uuid
-      project_id: null
-    workspace_external_integration_admin_bridge_resume:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_bridge_instance_resume:uuid
-      project_id: null
-    workspace_external_integration_admin_bridge_revoke:
-      role: $core.iam.roles.$workspace_external_integration_admin:uuid
-      permission: $core.iam.permissions.$workspace_external_bridge_instance_revoke:uuid
-      project_id: null
     workspace_topic_summary_admin_endpoint_manage:
       role: $core.iam.roles.$workspace_topic_summary_admin:uuid
       permission: $core.iam.permissions.$workspace_topic_summary_endpoint_manage:uuid
@@ -253,7 +136,7 @@ resources:
     workspace_backend:
       name: workspace-backend
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      cores: $workspace.imports.$var_default_cores:value
+      cores: 8
       ram: 4096
       disk_spec:
         kind: "disks"
@@ -261,22 +144,12 @@ resources:
           - size: 10
             image: "{{ workspace_backend_image | default(images['workspace_backend'], true) }}"
             label: root
-          - size: 2
-            label: external-bridge-control
 
   $core.secret.passwords:
     workspace_projection_db_password:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace_projection_db_password
       description: "Workspace rebuildable PostgreSQL projection password"
-      constructor:
-        kind: plain
-      method: AUTO_HEX
-    workspace_zulip_bridge_enrollment_secret:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace_zulip_bridge_enrollment_secret
-      description: "One-time Zulip bridge Provider API enrollment secret"
-      default_length: 40
       constructor:
         kind: plain
       method: AUTO_HEX
@@ -389,29 +262,6 @@ resources:
       instance: $s3aas.types.s3.instances.$workspace_s3:uuid
 
   $core.config.configs:
-    workspace_external_bridge_enrollment_config:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      path: /etc/workspace/external-bridge-enrollment.json
-      mode: "0600"
-      owner: root
-      target:
-        kind: node
-        node: $core.compute.nodes.$workspace_backend:uuid
-      on_change:
-        kind: shell
-        command: /usr/local/bin/workspace-restart-services
-      body:
-        kind: text
-        content: |
-          f"{
-            "schema_version": 1,
-            "enrollments": [{
-              "bridge_instance_uuid": "{$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:uuid}",
-              "provider_kind": "zulip",
-              "enrollment_generation": 1,
-              "enrollment_token": "{$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:value}"
-            }]
-          }"
     workspace_backend_config:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       path: /etc/workspace/workspace.conf
@@ -461,7 +311,11 @@ resources:
           [messenger_api]
           bind_host = 127.0.0.1
           bind_port = 21081
-          workers = 2
+          workers = 16
+
+
+          [messenger_store]
+          backend = v3
 
 
           [messenger_reactions]
@@ -492,15 +346,24 @@ resources:
           read_state_cleanup_enabled = false
           read_state_batch_size = 50000
           read_state_max_batches_per_iteration = 8
-          # Keep the canonical Messenger v2 projection queue active explicitly;
-          # do not rely on the Python option default in deployed installations.
-          v2_projection_enabled = true
-          # One primary maintenance process plus three projection-only workers.
-          # The hard runtime bound is eight to protect the PostgreSQL pool.
+          # The v3 projection worker owns native Workspace projection. Keep the
+          # removed external-provider queue disabled explicitly.
+          v2_projection_enabled = false
+          # Retained for configuration compatibility while the queue is disabled.
           v2_projection_workers = 4
           # Poll quickly after an empty cycle; completed work never sleeps.
           v2_projection_idle_sleep_seconds = 0.5
           v2_metrics_log_interval_seconds = 30
+
+
+          [workspace_v3_projection_worker]
+          workers = 2
+          batch_size = 100
+          lease_seconds = 30
+          max_attempts = 8
+          reaction_user_limit = 4
+          idle_sleep_seconds = 0.1
+          metrics_log_interval_seconds = 30
 
 
           [topic_summary]
@@ -524,22 +387,6 @@ resources:
           region_name = us-east-1
 
 
-          [external_bridge]
-          realm_uuid = {$workspace.imports.$core_local_domain:uuid}
-          bridge_instance_uuid = {$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:uuid}
-          identity_generation = 1
-          enrollment_secret = {$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret:value}
-
-
-          [external_bridge_control]
-          bind_host = 0.0.0.0
-          bootstrap_port = 21085
-          https_port = 21443
-          realm_uuid = {$workspace.imports.$core_local_domain:uuid}
-          hostname = workspace-bridge-control.{$workspace.imports.$core_local_domain:name}
-          persistent_store_path = /var/lib/workspace/external-bridge-control
-          require_dedicated_filesystem = true
-          enrollment_config_path = /etc/workspace/external-bridge-enrollment.json
           "
     workspace_backend_nginx:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
@@ -563,7 +410,7 @@ resources:
               client_max_body_size 50m;
 
               location /api/core/ {
-                  proxy_pass https://workspace_core_api/api/core/;
+                  proxy_pass http://workspace_core_api/api/core/;
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -586,6 +433,14 @@ resources:
 
               location /api/workspace/v1/messenger/ {
                   proxy_pass http://127.0.0.1:21081/v1/;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto https;
+              }
+
+              location /api/workspace/v1/users/ {
+                  proxy_pass http://127.0.0.1:21081/v1/users/;
                   proxy_set_header Host $http_host;
                   proxy_set_header X-Real-IP $remote_addr;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -617,7 +472,7 @@ resources:
       body:
         kind: text
         content: |
-          f"server {$workspace.imports.$var_core_ip_address:value}:443;"
+          f"server {$workspace.imports.$var_core_ip_address:value}:80;"
 
   $core.em.services:
     workspace_bootstrap:
@@ -691,10 +546,10 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
-    workspace_history_import_worker:
+    workspace_v3_worker:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-history-import-worker
-      path: /usr/bin/workspace-history-import-worker --config-file /etc/workspace/workspace.conf
+      name: workspace-v3-worker
+      path: /usr/bin/workspace-v3-worker --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node
@@ -706,23 +561,6 @@ resources:
       before:
         - kind: shell
           command: /usr/local/bin/workspace-bootstrap
-    workspace_external_bridge_control:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-external-bridge-control
-      path: /usr/bin/workspace-external-bridge-api --config-file /etc/workspace/workspace.conf
-      user: root
-      target:
-        kind: node
-        node: $core.compute.nodes.$workspace_backend:uuid
-      service_type:
-        kind: simple
-        count: 1
-      target_status: enabled
-      before:
-        - kind: shell
-          command: /usr/local/bin/workspace-bootstrap
-        - kind: shell
-          command: /usr/local/bin/workspace-external-bridge-control-prepare /var/lib/workspace/external-bridge-control root:root 2
     workspace_messenger_events:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-messenger-events
@@ -742,9 +580,6 @@ resources:
 exports:
   backend_node:
     link: "$core.compute.nodes.$workspace_backend"
-    kind: "resource"
-  zulip_bridge_enrollment_secret:
-    link: "$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret"
     kind: "resource"
   projection_db_instance:
     link: "$dbaas.types.postgres.instances.$workspace_projection_cluster"

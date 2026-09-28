@@ -50,60 +50,6 @@ class WorkspaceMessageUnstarAction(routes.Action):
     __controller__ = controllers.WorkspaceMessageController
 
 
-class ExternalAccountReconnectAction(routes.Action):
-    __controller__ = controllers.ExternalAccountController
-
-
-class ExternalAccountDisconnectAction(routes.Action):
-    __controller__ = controllers.ExternalAccountController
-
-
-class ExternalChatSelectAction(routes.Action):
-    __controller__ = controllers.ExternalChatController
-
-
-class ExternalChatDeselectAction(routes.Action):
-    __controller__ = controllers.ExternalChatController
-
-
-class ExternalChatMoveAction(routes.Action):
-    __controller__ = controllers.ExternalChatController
-
-
-class ExternalOperationRetryAction(routes.Action):
-    __controller__ = controllers.ExternalOperationController
-
-
-class ExternalOperationPreflightAction(routes.Action):
-    __controller__ = controllers.ExternalOperationController
-
-
-ExternalOperationPreflightActionRoute = routes.action(
-    ExternalOperationPreflightAction,
-    invoke=True,
-)
-
-
-class ExternalBridgeInstanceSuspendAction(routes.Action):
-    __controller__ = controllers.ExternalBridgeInstanceController
-
-
-class ExternalBridgeInstanceResumeAction(routes.Action):
-    __controller__ = controllers.ExternalBridgeInstanceController
-
-
-class ExternalBridgeInstanceRevokeAction(routes.Action):
-    __controller__ = controllers.ExternalBridgeInstanceController
-
-
-class ExternalProviderPolicySuspendAction(routes.Action):
-    __controller__ = controllers.ExternalProviderPolicyController
-
-
-class ExternalProviderPolicyResumeAction(routes.Action):
-    __controller__ = controllers.ExternalProviderPolicyController
-
-
 class WorkspaceStreamArchiveAction(routes.Action):
     __controller__ = controllers.WorkspaceStreamController
 
@@ -233,72 +179,6 @@ class WorkspaceDraftRoute(routes.Route):
         routes.UPDATE,
         routes.DELETE,
     ]
-
-
-class ExternalAccountRoute(routes.Route):
-    __controller__ = controllers.ExternalAccountController
-    __allow_methods__ = [
-        routes.CREATE,
-        routes.FILTER,
-        routes.GET,
-        routes.UPDATE,
-        routes.DELETE,
-    ]
-
-    reconnect = routes.action(ExternalAccountReconnectAction, invoke=True)
-    disconnect = routes.action(ExternalAccountDisconnectAction, invoke=True)
-
-
-class ExternalChatRoute(routes.Route):
-    __controller__ = controllers.ExternalChatController
-    __allow_methods__ = [routes.FILTER, routes.GET]
-
-    select = routes.action(ExternalChatSelectAction, invoke=True)
-    deselect = routes.action(ExternalChatDeselectAction, invoke=True)
-    move = routes.action(ExternalChatMoveAction, invoke=True)
-
-
-class ExternalOperationActionsRoute(routes.Route):
-    __controller__ = controllers.ExternalOperationController
-    __allow_methods__: list[str] = []
-
-    def do(
-        self,
-        parent_resource: typing.Any = None,
-        **kwargs: typing.Any,
-    ) -> typing.Any:
-        del parent_resource, kwargs
-        return ExternalOperationPreflightActionRoute(self._req).do(resource=None)
-
-
-class ExternalOperationRoute(routes.Route):
-    __controller__ = controllers.ExternalOperationController
-    __allow_methods__ = [routes.FILTER, routes.GET, routes.DELETE]
-
-    retry = routes.action(ExternalOperationRetryAction, invoke=True)
-    actions = routes.route(ExternalOperationActionsRoute)
-
-
-class ExternalBridgeInstanceRoute(routes.Route):
-    __controller__ = controllers.ExternalBridgeInstanceController
-    __allow_methods__ = [routes.FILTER, routes.GET]
-
-    suspend = routes.action(ExternalBridgeInstanceSuspendAction, invoke=True)
-    resume = routes.action(ExternalBridgeInstanceResumeAction, invoke=True)
-    revoke = routes.action(ExternalBridgeInstanceRevokeAction, invoke=True)
-
-
-class ExternalProviderPolicyRoute(routes.Route):
-    __controller__ = controllers.ExternalProviderPolicyController
-    __allow_methods__ = [routes.GET, routes.UPDATE]
-
-    suspend = routes.action(ExternalProviderPolicySuspendAction, invoke=True)
-    resume = routes.action(ExternalProviderPolicyResumeAction, invoke=True)
-
-
-class ExternalProviderHealthRoute(routes.Route):
-    __controller__ = controllers.ExternalProviderHealthController
-    __allow_methods__ = [routes.GET]
 
 
 class TopicSummaryEndpointRoute(routes.Route):
@@ -453,12 +333,6 @@ class ApiEndpointRoute(routes.Route):
     stream_topics = routes.route(WorkspaceStreamTopicRoute)
     messages = routes.route(WorkspaceMessageRoute)
     drafts = routes.route(WorkspaceDraftRoute)
-    external_accounts = routes.route(ExternalAccountRoute)
-    external_chats = routes.route(ExternalChatRoute)
-    external_operations = routes.route(ExternalOperationRoute)
-    external_bridge_instances = routes.route(ExternalBridgeInstanceRoute)
-    external_provider_policies = routes.route(ExternalProviderPolicyRoute)
-    external_provider_health = routes.route(ExternalProviderHealthRoute)
     topic_summary_endpoints = routes.route(TopicSummaryEndpointRoute)
     topic_summary_settings = routes.route(TopicSummarySettingsRoute)
     message_reactions = routes.route(WorkspaceMessageReactionRoute)

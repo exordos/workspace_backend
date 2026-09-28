@@ -114,6 +114,7 @@ class MessengerWorkerAgent(basic.BasicService):
         summary_endpoint_claim_seconds: int = (
             topic_summary_opts.DEFAULT_ENDPOINT_CLAIM_SECONDS
         ),
+        summary_store_backend: str = "v2",
         **kwargs: typing.Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -158,6 +159,7 @@ class MessengerWorkerAgent(basic.BasicService):
             summary_endpoint_claim_seconds,
             summary_request_timeout_seconds + topic_summary_opts.CLAIM_GRACE_SECONDS,
         )
+        self._summary_store_backend = summary_store_backend
         self._last_event_prune: float | None = None
         self._capability_refresh_cursor: object | None = None
         self._capability_projection_refresh_cursor: object | None = None
@@ -190,9 +192,8 @@ class MessengerWorkerAgent(basic.BasicService):
             >= self._event_prune_interval_seconds
         )
         if prune_due:
-            # Pruning takes per-project advisory locks. Commit them before
-            # capability refresh locks external-account rows so concurrent
-            # message/provider writes cannot form a reverse lock-order cycle.
+            # Pruning takes per-project advisory locks, so commit the bounded
+            # maintenance batch before continuing with regular worker tasks.
             try:
                 with database_session_context() as session:
                     pruned = self._prune_expired_events(session, now)
@@ -207,15 +208,8 @@ class MessengerWorkerAgent(basic.BasicService):
                 messenger_dm_helpers.mark_stale_workspace_users_offline(
                     session=session,
                 )
-                degraded = sql_state.degrade_stale_bridge_instances(
-                    session,
-                    now=now,
-                )
         except Exception:
-            LOG.exception("Failed to refresh stale Workspace presence and bridge rows")
-        else:
-            if degraded:
-                LOG.info("Degraded %d stale external bridge instances", degraded)
+            LOG.exception("Failed to refresh stale Workspace presence")
 
         if self._read_state_compaction_enabled:
             for _batch in range(self._read_state_max_batches_per_iteration):
@@ -275,33 +269,6 @@ class MessengerWorkerAgent(basic.BasicService):
                     },
                 )
 
-        self._refresh_capabilities(now)
-        self._refresh_capability_projections()
-
-        if prune_due:
-            try:
-                with database_session_context() as session:
-                    pruned_heartbeats = sql_state.prune_expired_heartbeats(
-                        session,
-                        now,
-                        retention=self._heartbeat_retention,
-                        batch_size=self._event_prune_batch_size,
-                    )
-            except Exception:
-                LOG.exception("Failed to prune expired bridge heartbeat rows")
-            else:
-                if pruned_heartbeats:
-                    LOG.info(
-                        "Pruned %d expired bridge heartbeat rows",
-                        pruned_heartbeats,
-                    )
-
-        try:
-            with database_session_context() as session:
-                self._repair_external_projection_transitions(session)
-        except Exception:
-            LOG.exception("Failed to repair external projection transitions")
-
         self._summarize_one_topic()
         if self._v2_projection_enabled and not processed_v2:
             self._wait_for_v2_projection_work()
@@ -317,17 +284,9 @@ class MessengerWorkerAgent(basic.BasicService):
         processed_any = False
         deferred = False
         scan_continued = False
-        for task_index in range(self._v2_projection_max_tasks_per_iteration):
+        for _task_index in range(self._v2_projection_max_tasks_per_iteration):
             try:
                 with database_session_context() as session:
-                    cleaned = (
-                        v2_projection.process_one_provider_file_cleanup_task(
-                            session,
-                            self._v2_worker_id,
-                        )
-                        if task_index == 0 and not self._projection_only
-                        else False
-                    )
                     contention_before = metrics.get("event_lock_contention", 0.0)
                     scan_continuation_before = metrics.get(
                         "partition_scan_continuation",
@@ -351,7 +310,7 @@ class MessengerWorkerAgent(basic.BasicService):
                 LOG.exception("Failed to run the Messenger v2 projection queue")
                 metrics["worker_failures"] = metrics.get("worker_failures", 0.0) + 1
                 break
-            if deferred or (not cleaned and not processed and not scan_continued):
+            if deferred or (not processed and not scan_continued):
                 break
         self._record_v2_projection_metrics(metrics)
         return processed_any
@@ -461,6 +420,7 @@ class MessengerWorkerAgent(basic.BasicService):
                     key_material=self._summary_secret_key,
                     topic_claim_seconds=self._summary_topic_claim_seconds,
                     endpoint_claim_seconds=self._summary_endpoint_claim_seconds,
+                    storage_backend=self._summary_store_backend,
                 )
         except Exception:
             LOG.exception("Failed to claim bounded topic summary work")

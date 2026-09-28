@@ -30,6 +30,7 @@ from restalchemy.dm import properties
 from restalchemy.dm import types
 from restalchemy.storage.sql import orm
 
+from workspace.common import constants
 from workspace.common import file_storage_opts
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
@@ -427,6 +428,11 @@ class WorkspaceFile(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_files"
+
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
 
     user_uuid = properties.property(
         types.UUID(),

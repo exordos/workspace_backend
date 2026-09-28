@@ -27,6 +27,7 @@ from workspace.common import config
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_worker_opts
+from workspace.common import messenger_store_opts
 from workspace.common import topic_summary_opts
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
@@ -41,6 +42,7 @@ ra_config_opts.register_posgresql_db_opts(CONF)
 file_storage_opts.register_opts(CONF)
 messenger_worker_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)
+messenger_store_opts.register_opts(CONF)
 
 
 def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
@@ -92,6 +94,7 @@ def build_worker_services() -> tuple[agents.MessengerWorkerAgent, ...]:
             summary_endpoint_claim_seconds=(
                 CONF[TOPIC_SUMMARY_DOMAIN].endpoint_claim_seconds
             ),
+            summary_store_backend=CONF[messenger_store_opts.DOMAIN].backend,
         )
         service.add_setup(
             lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
@@ -106,7 +109,9 @@ def main() -> None:
     infra_log.configure()
     log = logging.getLogger(__name__)
 
-    factory = store_factory.build_store_factory()
+    factory = store_factory.build_store_factory(
+        CONF[messenger_store_opts.DOMAIN].backend
+    )
     api_store.configure_store_factory(factory)
     service_hub = hub.ProcessHubService()
     for service in build_worker_services():

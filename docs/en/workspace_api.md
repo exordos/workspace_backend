@@ -765,7 +765,7 @@ raw provider protocol identifiers, credentials, and synchronization state.
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | no | yes | Stream identifier. |
 | `name` | string, max 255 | yes | no | Stream name. |
-| `description` | string, max 255 | no | no | Stream description; defaults to an empty string. |
+| `description` | string, max 10000 | no | no | Stream description; defaults to an empty string. |
 | `project_id` | UUID | no | yes | IAM project scope. |
 | `owner` | UUID | no | yes | Owner from the user stream view. |
 | `user_uuid` | UUID | no | yes | Current user in the user stream view. |
@@ -1661,7 +1661,7 @@ metadata. Nginx rejects multipart requests larger than `50m` before they reach
 | `user_uuid` | UUID | no | yes | Owner/uploader. |
 | `stream_uuid` | UUID or `null` | yes | no | Stream that owns a chat file. Required for JSON create and `stream_members` multipart uploads; omitted for multipart uploads with `acl.mode=public`. |
 | `name` | string, max 255 | yes | no | File display name. |
-| `description` | string, max 255 | no | no | File description; defaults to an empty string. |
+| `description` | string, max 10000 | no | no | File description; defaults to an empty string. |
 | `content_type` | string | yes | no | MIME content type. |
 | `size_bytes` | integer | yes | no | File size in bytes. |
 | `hash` | string | yes | no | File hash, currently SHA-256 for multipart uploads. |
@@ -1738,7 +1738,7 @@ Services are read-only catalog entries exposed by the common Workspace API.
 | --- | --- | --- |
 | `uuid` | UUID | Service identifier. |
 | `name` | string, max 255 | Service name. |
-| `description` | string, max 255 | Service description; defaults to an empty string. |
+| `description` | string, max 10000 | Service description; defaults to an empty string. |
 | `service_url` | URL | Service entry URL. |
 | `icon` | URL or `null` | Optional icon URL. |
 | `created_at` | datetime | Creation time. |
