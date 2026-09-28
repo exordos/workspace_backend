@@ -75,7 +75,7 @@ from restalchemy.dm import types
 
 class Service(models.ModelWithUUID, models.ModelWithTimestamp):
     name = properties.property(types.String(max_length=255), required=True)
-    description = properties.property(types.String(max_length=255), default="")
+    description = properties.property(types.String(max_length=10000), default="")
     service_url = properties.property(types.Url(), required=True)
     icon = properties.property(types.AllowNone(types.Url()))
 

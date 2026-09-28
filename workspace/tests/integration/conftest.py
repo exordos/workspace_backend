@@ -50,7 +50,6 @@ from oslo_config import cfg
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
-from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
@@ -177,10 +176,6 @@ def build_test_wsgi_application(app_module=messenger_app):
     except cfg.DuplicateOptError:
         pass
     try:
-        external_bridge_opts.register_opts()
-    except cfg.DuplicateOptError:
-        pass
-    try:
         topic_summary_opts.register_opts()
     except cfg.DuplicateOptError:
         pass
@@ -290,6 +285,7 @@ def _database():
 
     with psycopg.connect(TEST_DB_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
+            cur.execute('DROP SCHEMA IF EXISTS "workspace_v3" CASCADE;')
             cur.execute('DROP SCHEMA IF EXISTS "public" CASCADE;')
             cur.execute('CREATE SCHEMA "public";')
 

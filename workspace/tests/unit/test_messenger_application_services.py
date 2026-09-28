@@ -147,12 +147,20 @@ def test_external_account_controller_is_a_thin_request_session_adapter(monkeypat
     spec = _account_spec(project_uuid, account_uuid)
     expected = object()
     calls = []
+    identity_calls = []
+    iam_user = types.SimpleNamespace(
+        name="owner",
+        first_name="Owner",
+        last_name="User",
+        email="owner@example.invalid",
+    )
     controller = controllers.ExternalAccountController(
         types.SimpleNamespace(
             context=types.SimpleNamespace(
                 iam_context=types.SimpleNamespace(
                     get_introspection_info=lambda: types.SimpleNamespace(
-                        permissions=["workspace.external_account.create"]
+                        permissions=["workspace.external_account.create"],
+                        user_info=iam_user,
                     )
                 ),
                 project_id=project_uuid,
@@ -176,8 +184,22 @@ def test_external_account_controller_is_a_thin_request_session_adapter(monkeypat
         "create",
         staticmethod(create),
     )
+    monkeypatch.setattr(
+        controllers.models.WorkspaceUser,
+        "sync_iam_identity",
+        staticmethod(lambda **values: identity_calls.append(values)),
+    )
 
     assert controller.create(**spec) is expected
+    assert identity_calls == [
+        {
+            "user_uuid": owner_uuid,
+            "username": "owner",
+            "first_name": "Owner",
+            "last_name": "User",
+            "email": "owner@example.invalid",
+        }
+    ]
     assert calls == [
         (
             session,

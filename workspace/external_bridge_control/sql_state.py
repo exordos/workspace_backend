@@ -21,6 +21,7 @@ from typing import Any
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
+from workspace.common import constants
 from workspace.external_bridge_control import state
 from workspace.external_bridge_control import identity_linking
 from workspace.external_bridge_control import pki
@@ -37,6 +38,15 @@ LOG = logging.getLogger(__name__)
 
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _observed_report_canonical_sha256(report: dict[str, Any]) -> str:
+    canonical = copy.deepcopy(report)
+    canonical.pop("observed_at", None)
+    progress = canonical.get("progress")
+    if isinstance(progress, dict):
+        progress.pop("last_progress_at", None)
+    return hashlib.sha256(_json(canonical).encode()).hexdigest()
 
 
 def _row_value(row: Any, name: str) -> Any:
@@ -2308,6 +2318,7 @@ class SQLControlState:
                 "kind",
                 "chat_type",
                 "provider_chat_key",
+                "projection_stream_uuid",
                 "provider_realm_uuid",
                 "provider_owner_user_id",
                 "original_url",
@@ -2319,6 +2330,13 @@ class SQLControlState:
             or not isinstance(source["provider_realm_uuid"], str)
             or not isinstance(source["provider_owner_user_id"], str)
             or not source["provider_owner_user_id"]
+            or (
+                source.get("projection_stream_uuid") is not None
+                and (
+                    not isinstance(source["projection_stream_uuid"], str)
+                    or not source["projection_stream_uuid"]
+                )
+            )
             or (
                 source.get("original_url") is not None
                 and (
@@ -2332,6 +2350,11 @@ class SQLControlState:
         owner_uuid = sys_uuid.UUID(str(catalog["owner_user_uuid"]))
         project_uuid = sys_uuid.UUID(str(catalog["project_id"]))
         provider_realm_uuid = sys_uuid.UUID(source["provider_realm_uuid"])
+        preferred_projection_stream_uuid = (
+            None
+            if source.get("projection_stream_uuid") is None
+            else sys_uuid.UUID(source["projection_stream_uuid"])
+        )
         chat_uuid = sys_uuid.UUID(str(report["resource_uuid"]))
         read_state.lock_external_account_resources(
             session,
@@ -2372,6 +2395,25 @@ class SQLControlState:
         ).fetchone()
         if existing is not None and existing["uuid"] != chat_uuid:
             raise ValueError("External chat provider identity changed UUID")
+        if preferred_projection_stream_uuid is not None:
+            projection_owner = session.execute(
+                """
+                SELECT stream.source_name, state.provider_uuid
+                FROM workspace_v3.streams AS stream
+                LEFT JOIN workspace_v3.provider_entity_states AS state
+                  ON state.project_id = stream.project_id
+                 AND state.entity_type = 'stream'
+                 AND state.entity_uuid = stream.uuid
+                WHERE stream.project_id = %s AND stream.uuid = %s
+                FOR UPDATE OF stream
+                """,
+                (project_uuid, preferred_projection_stream_uuid),
+            ).fetchone()
+            if projection_owner is not None and (
+                projection_owner["source_name"] != identity.provider_kind
+                or projection_owner["provider_uuid"] != identity.bridge_instance_uuid
+            ):
+                raise ValueError("External chat projection UUID is not provider-owned")
         uuid_owner = session.execute(
             """
             SELECT external_account_uuid, owner_user_uuid, provider,
@@ -2416,7 +2458,7 @@ class SQLControlState:
         topics = catalog["topics"]
         if (
             not isinstance(catalog["description"], str)
-            or len(catalog["description"]) > 4096
+            or len(catalog["description"]) > constants.WORKSPACE_DESCRIPTION_MAX_LENGTH
             or not isinstance(participants, list)
             or not participants
             or not isinstance(topics, list)
@@ -2581,13 +2623,27 @@ class SQLControlState:
         for topic in topics:
             if (
                 not isinstance(topic, dict)
-                or set(topic) != {"provider_topic_id", "name", "is_default"}
+                or not {"provider_topic_id", "name", "is_default"} <= set(topic)
+                or set(topic)
+                - {
+                    "provider_topic_id",
+                    "projection_topic_uuid",
+                    "name",
+                    "is_default",
+                }
                 or not isinstance(topic["provider_topic_id"], str)
                 or not topic["provider_topic_id"]
                 or topic["provider_topic_id"] in provider_topic_ids
                 or not isinstance(topic["name"], str)
                 or not topic["name"].strip()
                 or not isinstance(topic["is_default"], bool)
+                or (
+                    topic.get("projection_topic_uuid") is not None
+                    and (
+                        not isinstance(topic["projection_topic_uuid"], str)
+                        or not topic["projection_topic_uuid"]
+                    )
+                )
             ):
                 raise ValueError("External chat catalog topic is invalid")
             provider_topic_ids.add(topic["provider_topic_id"])
@@ -2596,7 +2652,8 @@ class SQLControlState:
                 {
                     "topic_uuid": str(
                         sys_uuid.UUID(
-                            existing_topics.get(topic["provider_topic_id"])
+                            topic.get("projection_topic_uuid")
+                            or existing_topics.get(topic["provider_topic_id"])
                             or str(
                                 _projection_uuid(
                                     chat_uuid,
@@ -2629,10 +2686,13 @@ class SQLControlState:
             "participants": normalized_participants,
             "topics": normalized_topics,
         }
+        previous_projection_stream_uuid = (
+            existing["projection_stream_uuid"] if existing is not None else None
+        )
         projection_stream_uuid = (
-            existing["projection_stream_uuid"]
-            if existing is not None and existing["projection_stream_uuid"] is not None
-            else external_chat_projection_stream_uuid(chat_uuid)
+            preferred_projection_stream_uuid
+            or previous_projection_stream_uuid
+            or external_chat_projection_stream_uuid(chat_uuid)
         )
         projection_project_uuid = (
             existing["project_id"]
@@ -2663,6 +2723,7 @@ class SQLControlState:
         select_discovered = selection_all and selected_count < maximum
         shared_projection = False
         if (existing is not None and existing["selected"]) or select_discovered:
+            preferred_source = copy.deepcopy(normalized_source)
             (
                 projection_stream_uuid,
                 normalized_source,
@@ -2677,6 +2738,9 @@ class SQLControlState:
                 fallback_stream_uuid=projection_stream_uuid,
                 source=normalized_source,
             )
+            if preferred_projection_stream_uuid is not None:
+                projection_stream_uuid = preferred_projection_stream_uuid
+                normalized_source = preferred_source
             projection_changed = False
             if not shared_projection:
                 (
@@ -2772,6 +2836,22 @@ class SQLControlState:
                 capabilities=chat.capabilities,
                 account_settings=account["settings"],
                 emit_events=bool(account["live_ready"]),
+                # The v3 provider projection below already emits the events
+                # consumed by the current messenger.  Rebuilding legacy
+                # folder snapshots for every imported catalog membership can
+                # hold the project write lock for minutes on a large realm and
+                # make the bridge retry otherwise successful reports.
+                emit_legacy_events=False,
+                # A single stream/topic projection event already reaches the
+                # catalog audience.  The normal provider data path will emit
+                # membership changes; replaying every imported binding here
+                # multiplies one catalog row into thousands of event writes.
+                emit_membership_events=False,
+                # Topic memberships are provider data, not catalog discovery.
+                # Keep small catalogs immediately complete, but let the normal
+                # v3 synchronization path handle large participant x topic
+                # products instead of expanding them inside this request.
+                topic_binding_materialization_limit=128,
                 shared_projection=shared_projection,
             )
             append_upsert(
@@ -2779,6 +2859,70 @@ class SQLControlState:
                 identity.bridge_instance_uuid,
                 identity.provider_kind,
                 external_chat_assignment_desired(chat, session=session),
+            )
+        duplicate_projection_streams = session.execute(
+            """
+            SELECT duplicate.uuid
+            FROM m_workspace_streams AS target
+            JOIN m_workspace_streams AS duplicate
+              ON duplicate.project_id = target.project_id
+             AND duplicate.source_name = target.source_name
+             AND duplicate.provider_external_id = target.provider_external_id
+             AND duplicate.source->>'server_url' = target.source->>'server_url'
+             AND duplicate.uuid <> target.uuid
+            WHERE target.project_id = %s AND target.uuid = %s
+              AND target.source_name = %s
+              AND (
+                  NOT duplicate.is_archived
+                  OR EXISTS (
+                      SELECT 1 FROM workspace_v3.messages AS message
+                      WHERE message.project_id = duplicate.project_id
+                        AND message.stream_uuid = duplicate.uuid
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM workspace_v3.files AS file
+                      WHERE file.project_id = duplicate.project_id
+                        AND file.stream_uuid = duplicate.uuid
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM m_external_chats_v2 AS referenced
+                  WHERE referenced.project_id = duplicate.project_id
+                    AND referenced.selected
+                    AND referenced.projection_stream_uuid = duplicate.uuid
+              )
+            ORDER BY duplicate.uuid
+            FOR UPDATE OF duplicate
+            """,
+            (
+                projection_project_uuid,
+                projection_stream_uuid,
+                identity.provider_kind,
+            ),
+        ).fetchall()
+        for duplicate_projection in duplicate_projection_streams:
+            duplicate_projection_stream_uuid = sys_uuid.UUID(
+                str(duplicate_projection["uuid"])
+            )
+            external_projection.rebind_external_chat_messages(
+                session,
+                project_id=sys_uuid.UUID(str(projection_project_uuid)),
+                source_stream_uuid=duplicate_projection_stream_uuid,
+                target_stream_uuid=sys_uuid.UUID(str(projection_stream_uuid)),
+            )
+            external_projection.rebind_external_chat_files(
+                session,
+                project_id=sys_uuid.UUID(str(projection_project_uuid)),
+                source_stream_uuid=duplicate_projection_stream_uuid,
+                target_stream_uuid=sys_uuid.UUID(str(projection_stream_uuid)),
+            )
+            external_projection.archive_external_chat_stream(
+                session,
+                project_id=sys_uuid.UUID(str(projection_project_uuid)),
+                projection_stream_uuid=duplicate_projection_stream_uuid,
+                bridge_instance_uuid=identity.bridge_instance_uuid,
+                provider_kind=identity.provider_kind,
+                emit_events=bool(account["live_ready"]),
             )
         for changed_chat_uuid in changed_chat_uuids - {chat.uuid}:
             changed_chat = external_models.ExternalChat.objects.get_one_or_none(
@@ -3002,10 +3146,10 @@ class SQLControlState:
         results = []
         for report in reports:
             report_uuid = sys_uuid.UUID(report["report_uuid"])
-            canonical = hashlib.sha256(_json(report).encode()).hexdigest()
+            canonical = _observed_report_canonical_sha256(report)
             result_safe_error = None
             existing = session.execute(
-                'SELECT "canonical_sha256" '
+                'SELECT "canonical_sha256", "payload" '
                 'FROM "m_external_bridge_observed_reports_v1" '
                 'WHERE "report_uuid" = %s',
                 (report_uuid,),
@@ -3014,6 +3158,8 @@ class SQLControlState:
                 status = (
                     "duplicate"
                     if existing["canonical_sha256"] == canonical
+                    or _observed_report_canonical_sha256(existing["payload"])
+                    == canonical
                     else "rejected"
                 )
             else:
@@ -3089,7 +3235,7 @@ class SQLControlState:
                 ).fetchone()
                 if inserted is None:
                     existing = session.execute(
-                        'SELECT "canonical_sha256" '
+                        'SELECT "canonical_sha256", "payload" '
                         'FROM "m_external_bridge_observed_reports_v1" '
                         'WHERE "report_uuid" = %s',
                         (report_uuid,),
@@ -3097,7 +3243,11 @@ class SQLControlState:
                     status = (
                         "duplicate"
                         if existing is not None
-                        and existing["canonical_sha256"] == canonical
+                        and (
+                            existing["canonical_sha256"] == canonical
+                            or _observed_report_canonical_sha256(existing["payload"])
+                            == canonical
+                        )
                         else "rejected"
                     )
                 elif status == "applied":

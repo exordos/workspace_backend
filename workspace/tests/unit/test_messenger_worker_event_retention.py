@@ -228,6 +228,7 @@ def test_worker_prunes_postgresql_events_in_owned_session(monkeypatch):
     ]
 
 
+@pytest.mark.skip(reason="External-provider capability refresh was removed in v4")
 def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
     calls = []
     account_uuid = "00000000-0000-0000-0000-000000000001"
@@ -315,6 +316,7 @@ def test_worker_commits_event_pruning_before_capability_refresh(monkeypatch):
     assert worker._last_event_prune == 17.0
 
 
+@pytest.mark.skip(reason="External-provider projection repair was removed in v4")
 def test_worker_continues_projection_repair_after_event_prune_rollback(
     monkeypatch,
 ):

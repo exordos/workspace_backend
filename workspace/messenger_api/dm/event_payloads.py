@@ -22,6 +22,7 @@ from restalchemy.dm import models
 from restalchemy.dm import types
 from restalchemy.dm import types_dynamic
 
+from workspace.common import constants
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import models as messenger_models
 
@@ -485,6 +486,10 @@ class FileEventPayloadBase(
     models.ModelWithRequiredNameDesc,
     models.ModelWithTimestamp,
 ):
+    description = properties.property(
+        types.String(max_length=constants.WORKSPACE_DESCRIPTION_MAX_LENGTH),
+        default="",
+    )
     user_uuid = properties.property(types.UUID(), required=True)
     stream_uuid = properties.property(
         types.AllowNone(types.UUID()),

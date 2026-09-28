@@ -765,7 +765,7 @@ UUID 在 `direct_user_uuid` 中.重复或同时发送相同的请求
 | --- | --- | --- | --- | --- |
 | `uuid` | UUID | 不需要 | 是的 | 流量识别器 |
 | `name` | 连接器,最大 255 | 是的 | 不需要 | 流的名称. |
-| `description` | 连接器,最大 255 | 不需要 | 不需要 | 流描述;默认为空字符串. |
+| `description` | 连接器,最大 10000 | 不需要 | 不需要 | 流描述;默认为空字符串. |
 | `project_id` | UUID | 不需要 | 是的 | IAM 项目范围 |
 | `owner` | UUID | 不需要 | 是的 | 从用户流视图中看到所有者. |
 | `user_uuid` | UUID | 不需要 | 是的 | 在用户流视图中的当前用户. |
@@ -1661,7 +1661,7 @@ Workspace IAM中间件,以及没有有效的 Workspace 持有人的任何请求
 | `user_uuid` | UUID | 不需要 | 是的 | 业主/uploader. |
 | `stream_uuid` | UUID没有`null` | 是的 | 不需要 | 拥有聊天文件的流. 需要创建JSON和 `stream_members`多部分上传; 省略了使用`acl.mode=public`多部分上传. |
 | `name` | 连接器,最大 255 | 是的 | 不需要 | 文件显示名称. |
-| `description` | 连接器,最大 255 | 不需要 | 不需要 | 文件描述;默认为空字符串. |
+| `description` | 连接器,最大 10000 | 不需要 | 不需要 | 文件描述;默认为空字符串. |
 | `content_type` | 字符串 | 是的 | 不需要 | MIME 内容类型 |
 | `size_bytes` | 整数 | 是的 | 不需要 | 文件大小以字节. |
 | `hash` | 字符串 | 是的 | 不需要 | 文件哈希,目前为多部分上传 SHA-256. |
@@ -1738,7 +1738,7 @@ SHA-256 `hash`. 两种模式保持相同的二进制加 JSON 侧车布局和
 | --- | --- | --- |
 | `uuid` | UUID | 服务标识符 |
 | `name` | 连接器,最大 255 | 服务名称 |
-| `description` | 连接器,最大 255 | 服务描述;默认为空字符串. |
+| `description` | 连接器,最大 10000 | 服务描述;默认为空字符串. |
 | `service_url` | URL | 服务入口 URL. |
 | `icon` | URL没有`null` | 选择性的图标 URL. |
 | `created_at` | 时间 | 创造时间. |

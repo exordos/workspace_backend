@@ -40,6 +40,9 @@ _IDEMPOTENT_READ_ACTION_PATH = re.compile(
     rf"|^/{versions.API_VERSION_1_0}/messages/[^/]+/"
     r"actions/(?:read|read_up_to)/invoke/?$"
 )
+_FILE_DOWNLOAD_PATH = re.compile(
+    rf"^/{versions.API_VERSION_1_0}/files/[^/]+/actions/download/?$"
+)
 
 
 def _normalize_path(path: str) -> str:
@@ -163,6 +166,12 @@ class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
         req: typing.Any,
         error: Exception,
     ) -> typing.Any:
+        if isinstance(error, messenger_exceptions.ProviderApiError):
+            return req.ResponseClass(
+                status=error.status,
+                json=error.as_dict(),
+                headers={"Cache-Control": "no-store"},
+            )
         if isinstance(error, messenger_exceptions.EventsCursorExpiredError):
             return req.ResponseClass(
                 status=410,
@@ -188,4 +197,7 @@ class ErrorsHandlerMiddleware(iam_middlewares.ErrorsHandlerMiddleware):
                 json={"current": error.current},
                 headers={"ETag": f'"{error.current["revision"]}"'},
             )
-        return super()._construct_error_response(req, error)
+        response = super()._construct_error_response(req, error)
+        if response.status_int == 404 and _FILE_DOWNLOAD_PATH.fullmatch(req.path):
+            response.headers["Cache-Control"] = "no-store"
+        return response

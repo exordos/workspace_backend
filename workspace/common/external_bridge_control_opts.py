@@ -27,6 +27,8 @@ external_bridge_control_opts = [
         default=DEFAULT_ENROLLMENT_CONFIG_PATH,
         help="Core-managed one-time bridge enrollment configuration",
     ),
+    cfg.IntOpt("db-pool-min-size", default=2, min=1, max=64),
+    cfg.IntOpt("db-pool-max-size", default=8, min=1, max=64),
 ]
 
 

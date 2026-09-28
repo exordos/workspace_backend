@@ -34,9 +34,7 @@ def _restore_latest_migration_after_module(_database):
         # so their dependency rows can be false while the v2 head row remains
         # true. Rewind the head first; applying it again then walks and restores
         # the complete dependency graph before rebuilding the canonical model.
-        engine.rollback_migration(
-            "0174-suppress-legacy-backfill-counters-a2cd99.py"
-        )
+        engine.rollback_migration("0174-suppress-legacy-backfill-counters-a2cd99.py")
         engine.rollback_migration("0173-accelerate-Messenger-v2-projections-8cda92.py")
         engine.rollback_migration("0172-retry-expired-provider-read-pages-05d036.py")
         engine.rollback_migration(
@@ -157,6 +155,55 @@ EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE = (
 PER_USER_DELIVERY_REPAIR_MIGRATION_UUID = "e1f5ca44-b5b5-4bdc-bfdd-bf5996a34b4f"
 PER_USER_DELIVERY_REPAIR_MIGRATION_FILE = (
     "0185-Repair-per-user-operation-delivery-projections-e1f5ca.py"
+)
+PROVIDER_ENTITY_STATE_MIGRATION_FILE = (
+    "0189-Add-Workspace-v3-provider-entity-states-d72d97.py"
+)
+PROVIDER_SOURCE_TIME_MIGRATION_FILE = (
+    "0190-Track-provider-source-modification-time-443f26.py"
+)
+GENERIC_PROVIDER_SOURCE_MIGRATION_FILE = (
+    "0191-Allow-generic-Workspace-v3-provider-source-names-5f386c.py"
+)
+USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE = (
+    "0192-Index-Workspace-v3-user-message-visibility-6b3971.py"
+)
+LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE = (
+    "0193-Backfill-legacy-native-messenger-data-into-Workspace-v3-2ee199.py"
+)
+REACTION_USER_INDEX_MIGRATION_FILE = "0194-Index-Workspace-v3-reaction-users-e429f1.py"
+PROVIDER_SOURCE_HASH_MIGRATION_FILE = (
+    "0195-Preserve-provider-source-content-hash-7aa861.py"
+)
+V3_DELETE_REBIND_MIGRATION_FILE = (
+    "0196-Keep-v3-delete-projections-and-rebinds-consistent-d38bd2.py"
+)
+V3_PROVIDER_MOVE_MIGRATION_FILE = (
+    "0197-Keep-provider-message-moves-and-flag-projections-consistent-4caced.py"
+)
+V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE = (
+    "0198-Support-v3-summaries-and-flag-rebind-projections-c84af7.py"
+)
+PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE = (
+    "0199-Index-provider-user-project-discovery-117e2a.py"
+)
+WORKSPACE_DESCRIPTION_LIMIT_MIGRATION_FILE = (
+    "0200-Allow-ten-thousand-character-Workspace-descriptions-912ea7.py"
+)
+PROVIDER_BACKFILL_FLAG_MIGRATION_FILE = (
+    "0201-Keep-provider-backfill-flag-events-quiet-without-task-scans-ad3875.py"
+)
+PROVIDER_REACTION_ANNOTATION_MIGRATION_FILE = (
+    "0202-Annotate-provider-reaction-projections-without-task-scans-d1b4a6.py"
+)
+V3_COUNTER_RECOVERY_MIGRATION_FILE = (
+    "0203-Retry-Workspace-v3-dead-counter-projections-fd807a.py"
+)
+V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE = (
+    "0204-Cascade-capped-unread-counter-projections-87e406.py"
+)
+V3_HIERARCHICAL_COUNTER_ROLLUP_MIGRATION_FILE = (
+    "0205-Requeue-hierarchical-unread-counter-rollups-bf1934.py"
 )
 TOPIC_READ_BOUNDARY_MIGRATION_UUID = "20ae2266-265f-488d-a306-f299160a1b25"
 TOPIC_READ_BOUNDARY_MIGRATION_FILE = "0126-index-topic-read-boundaries-20ae22.py"
@@ -471,6 +518,54 @@ def test_published_messenger_v2_migration_is_immutable_and_joined_at_head():
     assert migrations[PER_USER_DELIVERY_REPAIR_MIGRATION_FILE]._depends == [
         EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE
     ]
+    assert migrations[PROVIDER_SOURCE_TIME_MIGRATION_FILE]._depends == [
+        PROVIDER_ENTITY_STATE_MIGRATION_FILE
+    ]
+    assert migrations[GENERIC_PROVIDER_SOURCE_MIGRATION_FILE]._depends == [
+        PROVIDER_SOURCE_TIME_MIGRATION_FILE
+    ]
+    assert migrations[USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE]._depends == [
+        GENERIC_PROVIDER_SOURCE_MIGRATION_FILE
+    ]
+    assert migrations[LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE]._depends == [
+        USER_MESSAGE_VISIBILITY_INDEX_MIGRATION_FILE
+    ]
+    assert migrations[REACTION_USER_INDEX_MIGRATION_FILE]._depends == [
+        LEGACY_NATIVE_V3_BACKFILL_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_SOURCE_HASH_MIGRATION_FILE]._depends == [
+        REACTION_USER_INDEX_MIGRATION_FILE
+    ]
+    assert migrations[V3_DELETE_REBIND_MIGRATION_FILE]._depends == [
+        PROVIDER_SOURCE_HASH_MIGRATION_FILE
+    ]
+    assert migrations[V3_PROVIDER_MOVE_MIGRATION_FILE]._depends == [
+        V3_DELETE_REBIND_MIGRATION_FILE
+    ]
+    assert migrations[V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE]._depends == [
+        V3_PROVIDER_MOVE_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE]._depends == [
+        V3_SUMMARY_AND_FLAG_REBIND_MIGRATION_FILE
+    ]
+    assert migrations[WORKSPACE_DESCRIPTION_LIMIT_MIGRATION_FILE]._depends == [
+        PROVIDER_USER_PROJECT_INDEX_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_BACKFILL_FLAG_MIGRATION_FILE]._depends == [
+        WORKSPACE_DESCRIPTION_LIMIT_MIGRATION_FILE
+    ]
+    assert migrations[PROVIDER_REACTION_ANNOTATION_MIGRATION_FILE]._depends == [
+        PROVIDER_BACKFILL_FLAG_MIGRATION_FILE
+    ]
+    assert migrations[V3_COUNTER_RECOVERY_MIGRATION_FILE]._depends == [
+        PROVIDER_REACTION_ANNOTATION_MIGRATION_FILE
+    ]
+    assert migrations[V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE]._depends == [
+        V3_COUNTER_RECOVERY_MIGRATION_FILE
+    ]
+    assert migrations[V3_HIERARCHICAL_COUNTER_ROLLUP_MIGRATION_FILE]._depends == [
+        V3_CAPPED_COUNTER_CASCADE_MIGRATION_FILE
+    ]
 
 
 def test_current_migrations_have_a_single_head(_database, db):
@@ -478,7 +573,7 @@ def test_current_migrations_have_a_single_head(_database, db):
 
     assert (
         engine.get_latest_migration()
-        == PER_USER_DELIVERY_REPAIR_MIGRATION_FILE
+        == V3_HIERARCHICAL_COUNTER_ROLLUP_MIGRATION_FILE
     )
     with db.cursor() as cur:
         cur.execute(
@@ -1169,11 +1264,7 @@ def test_per_user_delivery_migration_repairs_shared_resource_snapshots(
                 (
                     operation_uuid,
                     delivery_status,
-                    (
-                        "failed"
-                        if delivery_status == "discarded"
-                        else delivery_status
-                    ),
+                    ("failed" if delivery_status == "discarded" else delivery_status),
                     project_uuid,
                     target_uuid,
                 ),
@@ -7017,9 +7108,7 @@ def _assert_external_stream_snapshot_migration_resets_affected_event_cursors(
         unaffected_user_uuid,
         "Native cursor unchanged",
     )
-    engine = ra_migrations.MigrationEngine(
-        migrations_path=str(conftest.MIGRATIONS_DIR)
-    )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     migration = engine._load_migrations()[EXTERNAL_STREAM_SNAPSHOT_MIGRATION_FILE]
 
     with db.cursor() as cur:
@@ -7101,9 +7190,10 @@ def _assert_external_stream_snapshot_migration_resets_affected_event_cursors(
         )
         cursors_after = {row[0]: row[1:] for row in cur.fetchall()}
 
-    assert cursors_after[affected_project_uuid][0] != generations_before[
-        affected_project_uuid
-    ]
+    assert (
+        cursors_after[affected_project_uuid][0]
+        != generations_before[affected_project_uuid]
+    )
     assert cursors_after[affected_project_uuid][1:] == (17, 17)
     assert cursors_after[unaffected_project_uuid] == (
         generations_before[unaffected_project_uuid],
