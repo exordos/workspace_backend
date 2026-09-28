@@ -17,10 +17,11 @@
 from restalchemy.storage.sql import migrations
 
 
-# Capture still updates exact state and parents during baseline. Only derived
-# snapshot and folder-item tasks are deferred. Their final, bounded binding
-# sweep is already explicit in advance_unread_baseline. Canonical live writes run outside this
-# function-local setting and keep their existing projection/event tasks.
+# Capture still updates exact state and parents during baseline. The wrapper
+# suppresses only derived snapshot tasks; the original bounded page function
+# retains its explicit final snapshot sweep and planner settings. Use ordinary
+# transaction-local set_config: ALTER FUNCTION SET for a custom placeholder
+# requires privileges that the runtime database owner does not have.
 SNAPSHOT_FUNCTION = r"""
 CREATE OR REPLACE FUNCTION workspace_v3.enqueue_exact_counter_snapshot() RETURNS trigger
 LANGUAGE plpgsql AS $f$
@@ -58,18 +59,34 @@ UPGRADE = (
     SNAPSHOT_FUNCTION.replace("BEGIN\n", BASELINE_GUARD, 1)
     + """
 ALTER FUNCTION workspace_v3.advance_unread_baseline(integer)
-    SET workspace_v3.suppress_counter_snapshots = 'on';
-ALTER FUNCTION workspace_v3.advance_unread_baseline(integer)
-    SET workspace_v3.suppress_folder_item_projection = 'on';
+    RENAME TO advance_unread_baseline_page;
+
+CREATE FUNCTION workspace_v3.advance_unread_baseline(batch_size integer)
+RETURNS integer LANGUAGE plpgsql SET enable_sort = off SET jit = off AS $f$
+DECLARE
+    previous_counter_setting text := current_setting(
+        'workspace_v3.suppress_counter_snapshots', true);
+    previous_folder_setting text := current_setting(
+        'workspace_v3.suppress_folder_item_projection', true);
+    advanced integer;
+BEGIN
+    PERFORM set_config('workspace_v3.suppress_counter_snapshots', 'on', true);
+    PERFORM set_config('workspace_v3.suppress_folder_item_projection', 'on', true);
+    advanced := workspace_v3.advance_unread_baseline_page(batch_size);
+    PERFORM set_config('workspace_v3.suppress_counter_snapshots',
+                       previous_counter_setting, true);
+    PERFORM set_config('workspace_v3.suppress_folder_item_projection',
+                       previous_folder_setting, true);
+    RETURN advanced;
+END $f$;
 """
 )
 
 DOWNGRADE = (
     """
-ALTER FUNCTION workspace_v3.advance_unread_baseline(integer)
-    RESET workspace_v3.suppress_counter_snapshots;
-ALTER FUNCTION workspace_v3.advance_unread_baseline(integer)
-    RESET workspace_v3.suppress_folder_item_projection;
+DROP FUNCTION workspace_v3.advance_unread_baseline(integer);
+ALTER FUNCTION workspace_v3.advance_unread_baseline_page(integer)
+    RENAME TO advance_unread_baseline;
 """
     + SNAPSHOT_FUNCTION
 )

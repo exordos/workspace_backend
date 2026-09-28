@@ -26,9 +26,13 @@ with source row locks and a durable UUID cursor using the existing unique index.
 The later binding-snapshot stage uses its own indexed binding UUID cursor.
 Function-local planner settings prefer these ordered indexes over a full sort
 after write churn and disable JIT during these small baseline statements.
-The caller settings are restored when the function returns.
-Migration 0208 also suppresses derived counter and folder-item snapshot tasks
-only inside this baseline function. Exact state and parent deltas still commit.
+The original page function retains these planner settings.
+Migration 0208 wraps that page function and suppresses derived counter and
+folder-item snapshot tasks only while it runs. It uses transaction-local
+`set_config`, which works for the ordinary database owner without superuser
+privileges. The wrapper restores the caller's suppression settings on success,
+including an early lock-skip return. An error rolls them back with the failed
+statement or savepoint. Exact state and parent deltas still commit.
 This prevents each capture page from generating legacy recomputation jobs that
 block subsequent capture. Existing queued work and canonical live-write tasks
 are preserved. The explicit final binding-snapshot sweep is not suppressed and
@@ -72,8 +76,8 @@ that binding from durable exact state and publishes the corrective parent chain.
 Contribution rows are removed as flags become read. Ordinary PostgreSQL vacuum
 reclaims dead tuples; allocated relation bytes can exceed live payload bytes.
 
-Downgrading only 0208 restores the previous enqueue behavior without resetting
-cursors, counters or pending tasks; it can restore the slow feedback during an
+Downgrading only 0208 removes the wrapper, restores the original function name
+and previous enqueue behavior without resetting cursors, counters or pending tasks; it can restore the slow feedback during an
 unfinished baseline. This small rollback does not require a counter rebuild.
 
 Stop the new workers before downgrading 0207 or deploying an older worker.

@@ -966,14 +966,9 @@ def test_counter_read_projection_does_not_scan_unread_history(
     record_property("stream_projection_execution_ms", plans[1]["Execution Time"])
     record_property("folder_projection_execution_ms", plans[2]["Execution Time"])
     settings = db.execute(
-        "SELECT proconfig FROM pg_proc WHERE oid='workspace_v3.advance_unread_baseline(integer)'::regprocedure"
+        "SELECT proconfig FROM pg_proc WHERE oid='workspace_v3.advance_unread_baseline_page(integer)'::regprocedure"
     ).fetchone()[0]
-    assert settings == [
-        "enable_sort=off",
-        "jit=off",
-        "workspace_v3.suppress_counter_snapshots=on",
-        "workspace_v3.suppress_folder_item_projection=on",
-    ]
+    assert settings == ["enable_sort=off", "jit=off"]
     for table in ("message_flags", "topic_bindings"):
         db.execute(f"ANALYZE workspace_v3.{table}")
         for cursor in (

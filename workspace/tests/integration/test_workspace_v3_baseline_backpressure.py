@@ -6,6 +6,7 @@
 import concurrent.futures
 import threading
 import time
+import uuid as sys_uuid
 
 import psycopg
 import pytest
@@ -390,3 +391,116 @@ def test_backpressure_downgrade_preserves_baseline_state_and_query_settings(
     with db.transaction():
         _migrations()[BACKPRESSURE].upgrade(db)
     assert _state(db) == before
+
+
+def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, db):
+    project, _stream, _topics, _user, _messages = cold_corpus(fixed=False)
+    shape_sql = (
+        "SELECT proargnames,proargtypes::text,prorettype::regtype::text,"
+        "prosecdef,provolatile,proparallel,proisstrict,proconfig FROM pg_proc "
+        "WHERE oid='workspace_v3.advance_unread_baseline(integer)'::regprocedure"
+    )
+    original_shape = db.execute(shape_sql).fetchone()
+    role = "cassi_counter_runtime_" + sys_uuid.uuid4().hex
+    role_id = psycopg.sql.Identifier(role)
+    owner = psycopg.sql.Identifier(db.execute("SELECT current_user").fetchone()[0])
+    db.execute(
+        psycopg.sql.SQL(
+            "CREATE ROLE {} NOSUPERUSER NOCREATEDB NOCREATEROLE NOLOGIN"
+        ).format(role_id)
+    )
+    try:
+        db.execute(
+            psycopg.sql.SQL("GRANT USAGE,CREATE ON SCHEMA workspace_v3 TO {}").format(
+                role_id
+            )
+        )
+        db.execute(
+            psycopg.sql.SQL(
+                "GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA workspace_v3 TO {}"
+            ).format(role_id)
+        )
+        db.execute(
+            psycopg.sql.SQL(
+                "GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA workspace_v3 TO {}"
+            ).format(role_id)
+        )
+        for function in (
+            "advance_unread_baseline(integer)",
+            "enqueue_exact_counter_snapshot()",
+        ):
+            db.execute(
+                psycopg.sql.SQL(
+                    "ALTER FUNCTION workspace_v3." + function + " OWNER TO {}"
+                ).format(role_id)
+            )
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as runtime:
+            runtime.execute(psycopg.sql.SQL("SET ROLE {}").format(role_id))
+            assert not runtime.execute(
+                "SELECT rolsuper FROM pg_roles WHERE rolname=current_user"
+            ).fetchone()[0]
+            # Reproduce the rejected mechanism on a fresh non-superuser session.
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                with runtime.transaction():
+                    runtime.execute(
+                        "ALTER FUNCTION workspace_v3.advance_unread_baseline(integer) "
+                        "SET workspace_v3.suppress_counter_snapshots='on'"
+                    )
+            before = _state(runtime)
+            with runtime.transaction():
+                _migrations()[BACKPRESSURE].upgrade(runtime)
+            assert _state(runtime) == before
+            assert runtime.execute(shape_sql).fetchone() == original_shape
+        # A separate fresh session must execute the function without first
+        # initializing custom GUC placeholders as an administrative connection.
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as runtime:
+            runtime.execute(psycopg.sql.SQL("SET ROLE {}").format(role_id))
+            assert (
+                runtime.execute(
+                    "SELECT workspace_v3.advance_unread_baseline(7)"
+                ).fetchone()[0]
+                == 7
+            )
+            # PostgreSQL keeps an empty placeholder after resetting a newly
+            # introduced custom setting; NULL restores its effective unset state.
+            assert _settings(runtime) == ("", "")
+            assert (
+                runtime.execute(
+                    "SELECT count(*) FROM workspace_v3.projection_tasks "
+                    "WHERE project_id=%s AND status='pending'",
+                    (project,),
+                ).fetchone()[0]
+                == 0
+            )
+            with runtime.transaction():
+                _caller_settings(runtime)
+                with pytest.raises(psycopg.errors.InvalidRowCountInLimitClause):
+                    with runtime.transaction():
+                        runtime.execute(
+                            "SELECT workspace_v3.advance_unread_baseline(-1)"
+                        )
+                assert _settings(runtime) == ("off", "off")
+            _finish(runtime)
+            counters._oracle(runtime, project)
+            completed = _state(runtime)
+            with runtime.transaction():
+                _migrations()[BACKPRESSURE].downgrade(runtime)
+            assert _state(runtime) == completed
+            assert (
+                runtime.execute(
+                    "SELECT to_regprocedure('workspace_v3.advance_unread_baseline_page(integer)')"
+                ).fetchone()[0]
+                is None
+            )
+            assert runtime.execute(
+                "SELECT proconfig FROM pg_proc "
+                "WHERE oid='workspace_v3.advance_unread_baseline(integer)'::regprocedure"
+            ).fetchone()[0] == ["enable_sort=off", "jit=off"]
+            with runtime.transaction():
+                _migrations()[BACKPRESSURE].upgrade(runtime)
+            assert _state(runtime) == completed
+    finally:
+        # Restore object ownership before removing this test-only role's grants.
+        db.execute(psycopg.sql.SQL("REASSIGN OWNED BY {} TO {}").format(role_id, owner))
+        db.execute(psycopg.sql.SQL("DROP OWNED BY {}").format(role_id))
+        db.execute(psycopg.sql.SQL("DROP ROLE {}").format(role_id))
