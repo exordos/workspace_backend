@@ -20,6 +20,7 @@ from psycopg.types.json import Jsonb
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from restalchemy.storage.sql import engines
+from restalchemy.storage.sql import migrations as ra_migrations
 
 from workspace.external_bridge_control import (
     file_repository,
@@ -41,6 +42,9 @@ from workspace.messenger_api.dm import (
 from workspace.tests.integration import conftest
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
+FILE_BACKFILL_MIGRATION = (
+    "0206-Backfill-external-bridge-files-into-Workspace-v3-7d5a7e.py"
+)
 
 
 def _identity(instance_uuid, realm_uuid):
@@ -5490,8 +5494,9 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
         assert cursor.fetchone() == (True, projection_stream_uuid)
 
 
+@pytest.mark.parametrize("backend", ["v2", "v3"])
 def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
-    _database, db, tmp_path, monkeypatch
+    _database, db, tmp_path, monkeypatch, backend
 ):
     monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
     owner_uuid = sys_uuid.uuid4()
@@ -5526,6 +5531,35 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
             """,
             (chat_uuid, account_uuid, owner_uuid, project_uuid, stream_uuid),
         )
+        if backend == "v3":
+            cursor.execute(
+                """
+                INSERT INTO workspace_v3.users (
+                    uuid, created_at, updated_at,
+                    username, source, status, avatar
+                ) VALUES (
+                    %s, NOW(), NOW(), %s, 'iam', 'active',
+                    'urn:gravatar:00000000000000000000000000000000'
+                )
+                """,
+                (owner_uuid, f"user-{owner_uuid}"),
+            )
+            cursor.execute(
+                """
+                INSERT INTO workspace_v3.streams (
+                    uuid, project_id, name, owner_uuid, source_name
+                ) VALUES (%s, %s, 'External chat', %s, 'zulip')
+                """,
+                (stream_uuid, project_uuid, owner_uuid),
+            )
+            cursor.execute(
+                """
+                INSERT INTO workspace_v3.stream_bindings (
+                    uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+                ) VALUES (gen_random_uuid(), %s, %s, %s, %s, 'owner')
+                """,
+                (project_uuid, stream_uuid, owner_uuid, owner_uuid),
+            )
 
     file_uuid = sys_uuid.uuid4()
     operation_uuid = sys_uuid.uuid4()
@@ -5574,7 +5608,7 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
         "acl": {"mode": "stream_members", "stream_uuid": str(stream_uuid)},
         "origin": origin,
     }
-    repository = file_repository.CanonicalFileRepository()
+    repository = file_repository.CanonicalFileRepository(backend=backend)
 
     _request_call(repository.commit_projection, sidecar, storage_info)
     _request_call(repository.commit_projection, sidecar, storage_info)
@@ -5584,30 +5618,228 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
     )
 
     with db.cursor() as cursor:
-        cursor.execute(
-            "SELECT COUNT(*) FROM m_workspace_files WHERE uuid = %s",
-            (file_uuid,),
-        )
-        assert cursor.fetchone()[0] == 1
-        cursor.execute(
-            "SELECT COUNT(*) FROM m_workspace_file_accesses WHERE file_uuid = %s",
-            (file_uuid,),
-        )
-        assert cursor.fetchone()[0] == 1
-        cursor.execute(
-            "SELECT COUNT(*) FROM m_workspace_events "
-            "WHERE object_type = 'file' AND payload->>'uuid' = %s",
-            (str(file_uuid),),
-        )
-        assert cursor.fetchone()[0] == 1
+        if backend == "v2":
+            cursor.execute(
+                "SELECT COUNT(*) FROM m_workspace_files WHERE uuid = %s",
+                (file_uuid,),
+            )
+            assert cursor.fetchone()[0] == 1
+            cursor.execute(
+                "SELECT COUNT(*) FROM m_workspace_file_accesses "
+                "WHERE file_uuid = %s",
+                (file_uuid,),
+            )
+            assert cursor.fetchone()[0] == 1
+            cursor.execute(
+                "SELECT COUNT(*) FROM m_workspace_events "
+                "WHERE object_type = 'file' AND payload->>'uuid' = %s",
+                (str(file_uuid),),
+            )
+            assert cursor.fetchone()[0] == 1
+        else:
+            cursor.execute(
+                "SELECT COUNT(*) FROM workspace_v3.files WHERE uuid = %s",
+                (file_uuid,),
+            )
+            assert cursor.fetchone()[0] == 1
 
     resolved = _request_call(repository.resolve, file_uuid)
     assert resolved["origin"] == origin
     assert resolved["authorized_user_uuids"] == [str(owner_uuid)]
 
     with db.cursor() as cursor:
+        if backend == "v2":
+            cursor.execute(
+                "DELETE FROM m_workspace_file_accesses WHERE file_uuid = %s",
+                (file_uuid,),
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM workspace_v3.stream_bindings "
+                "WHERE project_id = %s AND stream_uuid = %s",
+                (project_uuid, stream_uuid),
+            )
+    assert _request_call(repository.resolve, file_uuid)["authorized_user_uuids"] == []
+
+
+def test_v3_native_stream_file_resolves_for_outgoing_transfer(
+    _database, db, tmp_path, monkeypatch
+):
+    monkeypatch.setenv(file_storage.ENV_STORAGE_PATH, str(tmp_path))
+    project_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    member_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    data = b"native workspace file"
+    sha256 = hashlib.sha256(data).hexdigest()
+    storage_info = file_storage.save_workspace_file(
+        file_uuid,
+        data,
+        storage_type="file",
+    )
+    metadata = file_storage.WorkspaceFileMetadata(
+        uuid=file_uuid,
+        project_id=project_uuid,
+        stream_uuid=stream_uuid,
+        owner_uuid=owner_uuid,
+        name="native.txt",
+        description="",
+        content_type="text/plain",
+        size_bytes=len(data),
+        sha256=sha256,
+        created_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    file_storage.save_workspace_file_metadata(metadata, storage_type="file")
+    with db.cursor() as cursor:
+        for user_uuid in (owner_uuid, member_uuid):
+            cursor.execute(
+                """
+                INSERT INTO workspace_v3.users (
+                    uuid, created_at, updated_at,
+                    username, source, status, avatar
+                ) VALUES (
+                    %s, NOW(), NOW(), %s, 'iam', 'active',
+                    'urn:gravatar:00000000000000000000000000000000'
+                )
+                """,
+                (user_uuid, f"user-{user_uuid}"),
+            )
         cursor.execute(
-            "DELETE FROM m_workspace_file_accesses WHERE file_uuid = %s",
+            """
+            INSERT INTO workspace_v3.streams (
+                uuid, project_id, name, owner_uuid
+            ) VALUES (%s, %s, 'Native files', %s)
+            """,
+            (stream_uuid, project_uuid, owner_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+            )
+            SELECT gen_random_uuid(), %s, %s, input.user_uuid, %s,
+                   CASE WHEN input.user_uuid = %s THEN 'owner' ELSE 'member' END
+            FROM unnest(%s::uuid[]) AS input(user_uuid)
+            """,
+            (
+                project_uuid,
+                stream_uuid,
+                owner_uuid,
+                owner_uuid,
+                [owner_uuid, member_uuid],
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.files (
+                uuid, project_id, user_uuid, stream_uuid, acl_mode,
+                name, description, content_type, size_bytes, hash,
+                storage_type, storage_id, storage_object_id
+            ) VALUES (
+                %s, %s, %s, %s, 'stream',
+                'native.txt', '', 'text/plain', %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                file_uuid,
+                project_uuid,
+                owner_uuid,
+                stream_uuid,
+                len(data),
+                sha256,
+                storage_info.storage_type,
+                storage_info.storage_id,
+                storage_info.storage_object_id,
+            ),
+        )
+
+    resolved = _request_call(
+        file_repository.CanonicalFileRepository(backend="v3").resolve,
+        file_uuid,
+    )
+    assert resolved["origin"] is None
+    assert resolved["authorized_user_uuids"] == sorted(
+        [str(owner_uuid), str(member_uuid)]
+    )
+
+
+def test_external_bridge_file_backfill_populates_v3(_database, db):
+    project_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    account_uuid = sys_uuid.uuid4()
+    file_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(db, project_uuid, owner_uuid, "Backfill stream")
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_external_accounts_v2
+                (uuid, owner_user_uuid, provider, settings)
+            VALUES (%s, %s, 'zulip', %s::jsonb)
+            """,
+            (
+                account_uuid,
+                owner_uuid,
+                '{"kind":"zulip","server_url":"https://zulip.example.test"}',
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.users (
+                uuid, created_at, updated_at,
+                username, source, status, avatar
+            ) VALUES (
+                %s, NOW(), NOW(), %s, 'iam', 'active',
+                'urn:gravatar:00000000000000000000000000000000'
+            )
+            """,
+            (owner_uuid, f"user-{owner_uuid}"),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.streams (
+                uuid, project_id, name, owner_uuid, source_name
+            ) VALUES (%s, %s, 'Backfill stream', %s, 'zulip')
+            """,
+            (stream_uuid, project_uuid, owner_uuid),
+        )
+
+    _request_call(
+        helpers.create_workspace_file,
+        uuid=file_uuid,
+        project_id=project_uuid,
+        user_uuid=owner_uuid,
+        stream_uuid=stream_uuid,
+        external_account_uuid=account_uuid,
+        name="backfill.txt",
+        description="",
+        content_type="text/plain",
+        size_bytes=8,
+        hash="0" * 64,
+        storage_type="file",
+        storage_id="",
+        storage_object_id=f"external-content/sha256/00/{'0' * 64}",
+    )
+    engine = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )
+    engine._load_migrations()[FILE_BACKFILL_MIGRATION].upgrade(db)
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT project_id, user_uuid, stream_uuid, name, hash
+            FROM workspace_v3.files
+            WHERE uuid = %s
+            """,
             (file_uuid,),
         )
-    assert _request_call(repository.resolve, file_uuid)["authorized_user_uuids"] == []
+        assert cursor.fetchone() == (
+            project_uuid,
+            owner_uuid,
+            stream_uuid,
+            "backfill.txt",
+            "0" * 64,
+        )

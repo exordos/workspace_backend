@@ -22,6 +22,7 @@ from workspace.common import external_bridge_control_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_reaction_opts
+from workspace.common import messenger_store_opts
 from workspace.external_bridge_control import files
 from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import pki
@@ -37,6 +38,7 @@ CONF = cfg.CONF
 external_bridge_control_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
 messenger_reaction_opts.register_opts(CONF)
+messenger_store_opts.register_opts(CONF)
 ra_config_opts.register_posgresql_db_opts(CONF)
 
 
@@ -126,7 +128,9 @@ def build_runtime(
         control_pki.control_hmac_key(),
     )
     base_url = f"https://{options.hostname}:{options.https_port}"
-    canonical_files = file_repository.CanonicalFileRepository()
+    canonical_files = file_repository.CanonicalFileRepository(
+        backend=conf[messenger_store_opts.DOMAIN].backend,
+    )
     file_manager = files.ExternalFileTransferManager(
         control_state,
         base_url,

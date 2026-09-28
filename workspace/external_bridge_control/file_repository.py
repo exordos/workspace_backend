@@ -21,6 +21,11 @@ EXTERNAL_CONTENT_OBJECT_PREFIX = "external-content/sha256/"
 class CanonicalFileRepository:
     """Canonical SQL projection and current-access resolver for bridge files."""
 
+    def __init__(self, backend: str = "v2") -> None:
+        if backend not in {"v2", "v3"}:
+            raise ValueError("Unsupported Messenger store backend")
+        self._backend = backend
+
     @staticmethod
     def _current_session() -> contextlib.AbstractContextManager[Any]:
         return contextlib.nullcontext(contexts.Context().get_session())
@@ -59,15 +64,10 @@ class CanonicalFileRepository:
             if account is None or chat is None:
                 raise ValueError("External file assignment is no longer canonical")
 
-            existing = models.WorkspaceFile.objects.get_one_or_none(
-                filters={"uuid": dm_filters.EQ(file_uuid)},
-                session=session,
-            )
             expected = {
                 "project_id": project_id,
                 "user_uuid": owner_uuid,
                 "stream_uuid": stream_uuid,
-                "external_account_uuid": account_uuid,
                 "name": sidecar["name"],
                 "description": sidecar["description"],
                 "content_type": sidecar["content_type"],
@@ -77,6 +77,17 @@ class CanonicalFileRepository:
                 "storage_id": storage_info.storage_id,
                 "storage_object_id": storage_info.storage_object_id,
             }
+            if self._backend == "v3":
+                return self._commit_v3_projection(
+                    session,
+                    file_uuid,
+                    expected,
+                )
+            existing = models.WorkspaceFile.objects.get_one_or_none(
+                filters={"uuid": dm_filters.EQ(file_uuid)},
+                session=session,
+            )
+            expected["external_account_uuid"] = account_uuid
             if existing is not None:
                 if any(
                     getattr(existing, name) != value for name, value in expected.items()
@@ -91,18 +102,78 @@ class CanonicalFileRepository:
                 **expected,
             )
 
+    @staticmethod
+    def _commit_v3_projection(
+        session: Any,
+        file_uuid: sys_uuid.UUID,
+        expected: dict[str, Any],
+    ) -> Any:
+        fields = (
+            "project_id",
+            "user_uuid",
+            "stream_uuid",
+            "name",
+            "description",
+            "content_type",
+            "size_bytes",
+            "hash",
+            "storage_type",
+            "storage_id",
+            "storage_object_id",
+        )
+        existing = session.execute(
+            """
+            SELECT project_id, user_uuid, stream_uuid, name, description,
+                   content_type, size_bytes, hash, storage_type, storage_id,
+                   storage_object_id
+            FROM workspace_v3.files
+            WHERE uuid = %s
+            FOR SHARE
+            """,
+            (file_uuid,),
+        ).fetchone()
+        if existing is not None:
+            if any(existing[name] != expected[name] for name in fields):
+                raise ValueError(
+                    "Canonical file UUID conflicts with finalized transfer"
+                )
+            return existing
+        return session.execute(
+            """
+            INSERT INTO workspace_v3.files (
+                uuid, project_id, user_uuid, stream_uuid, acl_mode,
+                name, description, content_type, size_bytes, hash,
+                storage_type, storage_id, storage_object_id
+            ) VALUES (
+                %s, %s, %s, %s, 'stream',
+                %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            RETURNING project_id, user_uuid, stream_uuid, name, description,
+                      content_type, size_bytes, hash, storage_type, storage_id,
+                      storage_object_id
+            """,
+            (
+                file_uuid,
+                *(expected[name] for name in fields),
+            ),
+        ).fetchone()
+
     def find_reusable_content(
         self,
         sha256: str,
         size_bytes: int,
     ) -> file_storage.WorkspaceFileStorageInfo | None:
         with self._current_session() as session:
+            table = (
+                "workspace_v3.files"
+                if self._backend == "v3"
+                else "m_workspace_files"
+            )
             row = session.execute(
-                """
+                f"""
                 SELECT storage_type, storage_id, storage_object_id
-                FROM m_workspace_files
+                FROM {table}
                 WHERE hash = %s AND size_bytes = %s
-                  AND external_account_uuid IS NOT NULL
                   AND storage_object_id LIKE 'external-content/sha256/%%'
                 LIMIT 1
                 FOR SHARE
@@ -120,6 +191,8 @@ class CanonicalFileRepository:
     def resolve(self, file_uuid: sys_uuid.UUID | str) -> dict[str, Any] | None:
         file_uuid = sys_uuid.UUID(str(file_uuid))
         with self._current_session() as session:
+            if self._backend == "v3":
+                return self._resolve_v3(session, file_uuid)
             canonical = models.WorkspaceFile.objects.get_one_or_none(
                 filters={"uuid": dm_filters.EQ(file_uuid)},
                 session=session,
@@ -174,6 +247,81 @@ class CanonicalFileRepository:
                 "origin": metadata.origin,
             }
 
+    @staticmethod
+    def _resolve_v3(
+        session: Any,
+        file_uuid: sys_uuid.UUID,
+    ) -> dict[str, Any] | None:
+        canonical = session.execute(
+            """
+            SELECT uuid, project_id, user_uuid, stream_uuid, acl_mode,
+                   name, description, content_type, size_bytes, hash,
+                   storage_type, storage_id, storage_object_id
+            FROM workspace_v3.files
+            WHERE uuid = %s
+            """,
+            (file_uuid,),
+        ).fetchone()
+        if canonical is None:
+            return None
+        metadata = file_storage.read_workspace_file_metadata(
+            file_uuid,
+            storage_type=canonical["storage_type"],
+        )
+        expected_acl_mode = (
+            "public" if canonical["acl_mode"] == "public" else "stream_members"
+        )
+        if (
+            metadata.uuid != canonical["uuid"]
+            or metadata.project_id != canonical["project_id"]
+            or metadata.stream_uuid != canonical["stream_uuid"]
+            or metadata.owner_uuid != canonical["user_uuid"]
+            or metadata.name != canonical["name"]
+            or metadata.description != canonical["description"]
+            or metadata.content_type != canonical["content_type"]
+            or metadata.size_bytes != canonical["size_bytes"]
+            or metadata.sha256 != canonical["hash"]
+            or metadata.acl_mode != expected_acl_mode
+        ):
+            raise ValueError("Canonical file record and sidecar do not match")
+        if canonical["stream_uuid"] is None:
+            authorized_user_uuids = [str(canonical["user_uuid"])]
+        else:
+            bindings = session.execute(
+                """
+                SELECT user_uuid
+                FROM workspace_v3.stream_bindings
+                WHERE project_id = %s AND stream_uuid = %s
+                ORDER BY user_uuid
+                """,
+                (canonical["project_id"], canonical["stream_uuid"]),
+            ).fetchall()
+            authorized_user_uuids = [str(binding["user_uuid"]) for binding in bindings]
+        acl = {"mode": metadata.acl_mode}
+        if metadata.stream_uuid is not None:
+            acl["stream_uuid"] = str(metadata.stream_uuid)
+        return {
+            "uuid": str(canonical["uuid"]),
+            "project_id": str(canonical["project_id"]),
+            "stream_uuid": (
+                None
+                if canonical["stream_uuid"] is None
+                else str(canonical["stream_uuid"])
+            ),
+            "owner_uuid": str(canonical["user_uuid"]),
+            "name": canonical["name"],
+            "description": canonical["description"],
+            "content_type": canonical["content_type"],
+            "size_bytes": canonical["size_bytes"],
+            "sha256": canonical["hash"],
+            "acl": acl,
+            "authorized_user_uuids": authorized_user_uuids,
+            "storage_type": canonical["storage_type"],
+            "storage_id": canonical["storage_id"],
+            "storage_object_id": canonical["storage_object_id"],
+            "origin": metadata.origin,
+        }
+
 
 def delete_storage_object_if_unreferenced(
     session: Any | None,
@@ -192,8 +340,13 @@ def delete_storage_object_if_unreferenced(
     assert session is not None
     referenced = session.execute(
         """
-        SELECT 1
-        FROM m_workspace_files
+        SELECT 1 FROM (
+            SELECT storage_type, storage_id, storage_object_id
+            FROM m_workspace_files
+            UNION ALL
+            SELECT storage_type, storage_id, storage_object_id
+            FROM workspace_v3.files
+        ) AS file
         WHERE storage_type = %s AND storage_id = %s AND storage_object_id = %s
         LIMIT 1
         """,
