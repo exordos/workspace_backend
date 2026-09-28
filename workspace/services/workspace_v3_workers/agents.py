@@ -16,6 +16,7 @@ from restalchemy.common import contexts
 from workspace.workspace_v3 import projections
 
 LOG = logging.getLogger(__name__)
+COUNTER_BASELINE_BATCH_SIZE = 1000
 
 
 class WorkspaceV3ProjectionAgent(basic.BasicService):
@@ -61,6 +62,11 @@ class WorkspaceV3ProjectionAgent(basic.BasicService):
             with ctx.session_manager() as session:
                 pruned_events = projections.prune_event_journal(session)
             self._event_pruned_at = now
+        with ctx.session_manager() as session:
+            session.execute(
+                "SELECT workspace_v3.advance_unread_baseline(%s)",
+                (COUNTER_BASELINE_BATCH_SIZE,),
+            )
         with ctx.session_manager() as session:
             tasks = projections.claim_projection_tasks(
                 session,

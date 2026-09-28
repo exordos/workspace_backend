@@ -93,6 +93,8 @@ EXPECTED_COLUMNS = {
         "automatic",
         "created_at",
         "updated_at",
+        "counter_unread",
+        "counter_active",
     ),
     "files": (
         "uuid",
@@ -123,6 +125,10 @@ EXPECTED_COLUMNS = {
         "passive_unread_count",
         "created_at",
         "updated_at",
+        "unread_stream_count",
+        "active_unread_stream_count",
+        "passive_unread_stream_count",
+        "counter_version",
     ),
     "message_flags": (
         "uuid",
@@ -212,6 +218,11 @@ EXPECTED_COLUMNS = {
         "last_message_uuid",
         "created_at",
         "updated_at",
+        "last_message_dirty",
+        "unread_topic_count",
+        "active_unread_topic_count",
+        "passive_unread_topic_count",
+        "counter_version",
     ),
     "streams": (
         "uuid",
@@ -247,6 +258,11 @@ EXPECTED_COLUMNS = {
         "summary_has_new_messages",
         "created_at",
         "updated_at",
+        "last_message_dirty",
+        "exact_unread_count",
+        "exact_mentioned_unread_count",
+        "exact_active_unread_count",
+        "counter_version",
     ),
     "topics": (
         "uuid",
@@ -281,6 +297,28 @@ EXPECTED_COLUMNS = {
         "avatar",
         "disabled",
         "is_bot",
+    ),
+    "topic_unread_state": (
+        "uuid",
+        "project_id",
+        "topic_uuid",
+        "user_uuid",
+        "exact_unread_count",
+        "exact_mentioned_unread_count",
+    ),
+    "unread_contributions": (
+        "project_id",
+        "message_uuid",
+        "user_uuid",
+        "topic_uuid",
+        "mentioned",
+    ),
+    "unread_counter_baseline": (
+        "singleton",
+        "last_flag_uuid",
+        "ready",
+        "snapshots_complete",
+        "snapshot_binding_uuid",
     ),
 }
 
@@ -390,7 +428,7 @@ def test_workspace_v3_contains_only_approved_tables_and_columns(_database, db):
     assert all(
         "project_id" in actual_columns[table]
         for table in EXPECTED_COLUMNS
-        if table != "users"
+        if table not in {"users", "unread_counter_baseline"}
     )
 
 

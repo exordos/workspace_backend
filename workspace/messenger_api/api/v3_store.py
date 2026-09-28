@@ -123,9 +123,14 @@ _EVENT_RESOURCE_QUERIES = {
                binding.user_uuid, stream.name,
                COALESCE(stream.description, '') AS description,
                stream.owner_uuid AS owner, binding.role,
-               binding.notification_mode, binding.unread_count,
-               binding.active_unread_count,
-               binding.passive_unread_count, stream.source_name,
+               binding.notification_mode,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN binding.unread_topic_count ELSE binding.unread_count END AS unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN binding.active_unread_topic_count ELSE binding.active_unread_count END AS active_unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN binding.passive_unread_topic_count ELSE binding.passive_unread_count END AS passive_unread_count,
+               stream.source_name,
                stream.invite_only, stream.announce, stream.private,
                stream.is_archived,
                CASE WHEN stream.direct_user_uuid IS NOT NULL THEN COALESCE(
@@ -152,9 +157,17 @@ _EVENT_RESOURCE_QUERIES = {
     "stream_topics": """
         SELECT topic.uuid, topic.project_id, topic.stream_uuid,
                binding.user_uuid, topic.name, topic.color,
-               binding.last_message_uuid, binding.unread_count,
-               binding.active_unread_count,
-               binding.passive_unread_count,
+               binding.last_message_uuid,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN LEAST(binding.exact_unread_count,1001)::integer
+                    ELSE binding.unread_count END AS unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN LEAST(binding.exact_active_unread_count,1001)::integer
+                    ELSE binding.active_unread_count END AS active_unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN LEAST(binding.exact_unread_count,1001)::integer
+                       - LEAST(binding.exact_active_unread_count,1001)::integer
+                    ELSE binding.passive_unread_count END AS passive_unread_count,
                COALESCE(topic.uuid = stream.default_topic_uuid, FALSE)
                    AS is_default,
                topic.is_done, binding.notification_mode,
@@ -373,6 +386,20 @@ def restore_topic_summary_after_message_deletion(
 def _public(value: typing.Any, resource: str) -> dict[str, typing.Any]:
     result = _simple(_row(value))
     result.pop("private_index", None)
+    for internal in (
+        "exact_unread_count",
+        "exact_mentioned_unread_count",
+        "exact_active_unread_count",
+        "last_message_dirty",
+        "unread_topic_count",
+        "active_unread_topic_count",
+        "passive_unread_topic_count",
+        "unread_stream_count",
+        "active_unread_stream_count",
+        "passive_unread_stream_count",
+        "counter_version",
+    ):
+        result.pop(internal, None)
     if resource == "users":
         result.pop("disabled", None)
         result.pop("is_bot", None)
@@ -382,7 +409,8 @@ def _public(value: typing.Any, resource: str) -> dict[str, typing.Any]:
         result["system_type"] = (
             "all" if result.pop("kind") == "all_chats" else "created"
         )
-        result["unread_count"] = result.pop("active_unread_count")
+        result["unread_count"] = result.pop("total_unread_count")
+        result.pop("active_unread_count", None)
         result.pop("passive_unread_count", None)
         result.pop("total_unread_count", None)
     return result
@@ -577,9 +605,14 @@ class MessengerV3Store:
                        binding.user_uuid, stream.name,
                        COALESCE(stream.description, '') AS description,
                        stream.owner_uuid AS owner, binding.role,
-                       binding.notification_mode, binding.unread_count,
-                       binding.active_unread_count,
-                       binding.passive_unread_count, stream.source_name,
+                       binding.notification_mode,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN binding.unread_topic_count ELSE binding.unread_count END AS unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN binding.active_unread_topic_count ELSE binding.active_unread_count END AS active_unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN binding.passive_unread_topic_count ELSE binding.passive_unread_count END AS passive_unread_count,
+               stream.source_name,
                        stream.invite_only, stream.announce, stream.private,
                        stream.is_archived,
                        CASE WHEN stream.direct_user_uuid IS NOT NULL THEN COALESCE(
@@ -616,9 +649,17 @@ class MessengerV3Store:
             "stream_topics": """
                 SELECT topic.uuid, topic.project_id, topic.stream_uuid,
                        binding.user_uuid, topic.name, topic.color,
-                       binding.last_message_uuid, binding.unread_count,
-                       binding.active_unread_count,
-                       binding.passive_unread_count,
+                       binding.last_message_uuid,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN LEAST(binding.exact_unread_count,1001)::integer
+                    ELSE binding.unread_count END AS unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN LEAST(binding.exact_active_unread_count,1001)::integer
+                    ELSE binding.active_unread_count END AS active_unread_count,
+               CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                    THEN LEAST(binding.exact_unread_count,1001)::integer
+                       - LEAST(binding.exact_active_unread_count,1001)::integer
+                    ELSE binding.passive_unread_count END AS passive_unread_count,
                        COALESCE(topic.uuid = stream.default_topic_uuid, FALSE)
                            AS is_default,
                        topic.is_done, binding.notification_mode,
@@ -670,7 +711,8 @@ class MessengerV3Store:
                 SELECT folder.uuid, folder.project_id, folder.user_uuid,
                        folder.kind, folder.title,
                        folder.background_color_value,
-                       folder.unread_count AS total_unread_count,
+                       CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                            THEN folder.unread_stream_count ELSE folder.unread_count END AS total_unread_count,
                        folder.active_unread_count,
                        folder.passive_unread_count,
                        folder.created_at, folder.updated_at
@@ -681,8 +723,12 @@ class MessengerV3Store:
                 SELECT item.uuid, item.project_id, item.user_uuid,
                        item.folder_uuid, item.stream_uuid, item.order_index,
                        item.pinned_at, item.chat_type,
-                       binding.unread_count, binding.active_unread_count,
-                       binding.passive_unread_count,
+                       CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                            THEN binding.unread_topic_count ELSE binding.unread_count END AS unread_count,
+                       CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                            THEN binding.active_unread_topic_count ELSE binding.active_unread_count END AS active_unread_count,
+                       CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                            THEN binding.passive_unread_topic_count ELSE binding.passive_unread_count END AS passive_unread_count,
                        item.created_at, item.updated_at
                 FROM workspace_v3.folder_items AS item
                 JOIN workspace_v3.stream_bindings AS binding

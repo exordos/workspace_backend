@@ -288,34 +288,53 @@ def _update_stream_counters(
 ) -> list[dict[str, typing.Any]]:
     if not scopes:
         return []
+    session.execute(
+        """
+        SELECT binding.uuid FROM workspace_v3.stream_bindings AS binding
+        JOIN unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+            AS target(project_id, stream_uuid, user_uuid) ON binding.project_id = target.project_id AND binding.stream_uuid = target.stream_uuid AND binding.user_uuid = target.user_uuid
+        ORDER BY binding.project_id, binding.user_uuid, binding.uuid
+        FOR NO KEY UPDATE OF binding
+        """,
+        tuple([scope[index] for scope in scopes] for index in range(3)),
+    ).fetchall()
     result = session.execute(
         """
         WITH targets(project_id, stream_uuid, user_uuid) AS MATERIALIZED (
             SELECT * FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
         ),
         counter_snapshots AS MATERIALIZED (
-            SELECT target.project_id, target.stream_uuid, target.user_uuid,
-                   LEAST(
-                       COALESCE(sum(binding.unread_count), 0), %s
-                   )::integer AS unread_count,
-                   LEAST(
-                       COALESCE(sum(binding.active_unread_count), 0), %s
-                   )::integer AS active_unread_count
+            SELECT target.project_id,target.stream_uuid,target.user_uuid,
+                   (CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                         THEN stream_binding.unread_topic_count
+                         ELSE LEAST(COALESCE(fallback.unread_count,0),%s) END)::integer AS unread_count,
+                   (CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                         THEN stream_binding.active_unread_topic_count
+                         ELSE LEAST(COALESCE(fallback.active_unread_count,0),%s) END)::integer AS active_unread_count
             FROM targets AS target
             JOIN workspace_v3.stream_bindings AS stream_binding
-              ON stream_binding.project_id = target.project_id
-             AND stream_binding.stream_uuid = target.stream_uuid
-             AND stream_binding.user_uuid = target.user_uuid
-            LEFT JOIN workspace_v3.topic_bindings AS binding
-              ON binding.project_id = target.project_id
-             AND binding.stream_uuid = target.stream_uuid
-             AND binding.user_uuid = target.user_uuid
-            GROUP BY target.project_id, target.stream_uuid, target.user_uuid
+              ON stream_binding.project_id=target.project_id
+             AND stream_binding.stream_uuid=target.stream_uuid
+             AND stream_binding.user_uuid=target.user_uuid
+            LEFT JOIN LATERAL (
+                SELECT sum(binding.unread_count) AS unread_count,
+                       sum(binding.active_unread_count) AS active_unread_count
+                FROM workspace_v3.topic_bindings AS binding
+                WHERE NOT (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                  AND binding.project_id=target.project_id
+                  AND binding.stream_uuid=target.stream_uuid
+                  AND binding.user_uuid=target.user_uuid
+            ) AS fallback ON true
         ),
         latest_messages AS MATERIALIZED (
             SELECT target.project_id, target.stream_uuid, target.user_uuid,
-                   latest.uuid AS last_message_uuid
+                   CASE WHEN current_binding.last_message_dirty THEN latest.uuid
+                        ELSE current_binding.last_message_uuid END AS last_message_uuid
             FROM targets AS target
+            JOIN workspace_v3.stream_bindings AS current_binding
+              ON current_binding.project_id = target.project_id
+             AND current_binding.stream_uuid = target.stream_uuid
+             AND current_binding.user_uuid = target.user_uuid
             LEFT JOIN LATERAL (
                 SELECT message.uuid
                 FROM workspace_v3.topic_bindings AS binding
@@ -323,7 +342,8 @@ def _update_stream_counters(
                   ON message.project_id = binding.project_id
                  AND message.uuid = binding.last_message_uuid
                  AND message.stream_uuid = binding.stream_uuid
-                WHERE binding.project_id = target.project_id
+                WHERE current_binding.last_message_dirty
+                  AND binding.project_id = target.project_id
                   AND binding.stream_uuid = target.stream_uuid
                   AND binding.user_uuid = target.user_uuid
                 ORDER BY message.created_at DESC, message.uuid DESC
@@ -344,22 +364,12 @@ def _update_stream_counters(
             passive_unread_count =
                 snapshot.unread_count - snapshot.active_unread_count,
             last_message_uuid = snapshot.last_message_uuid,
+            last_message_dirty = false,
             updated_at = clock_timestamp()
         FROM snapshots AS snapshot
         WHERE binding.project_id = snapshot.project_id
           AND binding.stream_uuid = snapshot.stream_uuid
           AND binding.user_uuid = snapshot.user_uuid
-          AND (
-                binding.unread_count,
-                binding.active_unread_count,
-                binding.passive_unread_count,
-                binding.last_message_uuid
-              ) IS DISTINCT FROM (
-                snapshot.unread_count,
-                snapshot.active_unread_count,
-                snapshot.unread_count - snapshot.active_unread_count,
-                snapshot.last_message_uuid
-              )
         RETURNING binding.project_id, binding.uuid, binding.stream_uuid,
                   binding.user_uuid, binding.role, binding.notification_mode,
                   binding.unread_count, binding.active_unread_count,
@@ -397,6 +407,34 @@ def _update_topic_counters(
 ) -> list[dict[str, typing.Any]]:
     if not scopes:
         return []
+    session.execute(
+        """
+        SELECT binding.uuid FROM workspace_v3.topic_bindings AS binding
+        JOIN unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+            AS target(project_id, topic_uuid, user_uuid)
+          USING (project_id, topic_uuid, user_uuid)
+        ORDER BY binding.project_id, binding.user_uuid, binding.uuid
+        FOR NO KEY UPDATE OF binding
+        """,
+        tuple([scope[index] for scope in scopes] for index in range(3)),
+    ).fetchall()
+    session.execute(
+        """
+        UPDATE workspace_v3.topic_bindings AS binding
+        SET exact_unread_count = state.exact_unread_count,
+            exact_mentioned_unread_count = state.exact_mentioned_unread_count
+        FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+            AS target(project_id, topic_uuid, user_uuid)
+        JOIN workspace_v3.topic_unread_state AS state
+          USING (project_id, topic_uuid, user_uuid)
+        WHERE binding.project_id = target.project_id
+          AND binding.topic_uuid = target.topic_uuid
+          AND binding.user_uuid = target.user_uuid
+          AND (binding.exact_unread_count,binding.exact_mentioned_unread_count)
+              IS DISTINCT FROM (state.exact_unread_count,state.exact_mentioned_unread_count)
+        """,
+        tuple([scope[index] for scope in scopes] for index in range(3)),
+    )
     result = session.execute(
         """
         WITH targets(project_id, topic_uuid, user_uuid) AS MATERIALIZED (
@@ -405,6 +443,12 @@ def _update_topic_counters(
         target_rows AS MATERIALIZED (
             SELECT target.project_id, target.topic_uuid, target.user_uuid,
                    topic.stream_uuid, topic.summary_last_message_uuid,
+                   topic_binding.exact_unread_count,
+                   topic_binding.exact_mentioned_unread_count,
+                   topic_binding.last_message_dirty,
+                   cached_latest.uuid AS cached_last_message_uuid,
+                   cached_latest.created_at AS cached_last_message_created_at,
+                   (SELECT ready FROM workspace_v3.unread_counter_baseline) AS counters_ready,
                    summary_boundary.created_at AS summary_created_at,
                    summary_boundary.uuid AS summary_uuid,
                    topic_binding.notification_mode AS topic_notification_mode,
@@ -421,6 +465,9 @@ def _update_topic_counters(
               ON summary_boundary.project_id = topic.project_id
              AND summary_boundary.topic_uuid = topic.uuid
              AND summary_boundary.uuid = topic.summary_last_message_uuid
+            LEFT JOIN workspace_v3.messages AS cached_latest
+              ON cached_latest.project_id=topic_binding.project_id
+             AND cached_latest.uuid=topic_binding.last_message_uuid
             JOIN workspace_v3.stream_bindings AS stream_binding
               ON stream_binding.project_id = topic.project_id
              AND stream_binding.stream_uuid = topic.stream_uuid
@@ -430,7 +477,8 @@ def _update_topic_counters(
             SELECT target.project_id, target.topic_uuid, target.user_uuid,
                    target.topic_notification_mode,
                    target.stream_notification_mode,
-                   (
+                   CASE WHEN target.counters_ready THEN LEAST(target.exact_unread_count, 1001)::integer
+                   ELSE (
                        SELECT count(*)::integer
                        FROM (
                            SELECT 1
@@ -446,8 +494,9 @@ def _update_topic_counters(
                              AND message.topic_uuid = target.topic_uuid
                            LIMIT %s
                        ) AS unread
-                   ) AS unread_count,
-                   (
+                   ) END AS unread_count,
+                   CASE WHEN target.counters_ready THEN LEAST(target.exact_mentioned_unread_count, 1001)::integer
+                   ELSE (
                        SELECT count(*)::integer
                        FROM (
                            SELECT 1
@@ -472,7 +521,7 @@ def _update_topic_counters(
                              )
                            LIMIT %s
                        ) AS mentioned
-                   ) AS mentioned_unread_count
+                   ) END AS mentioned_unread_count
             FROM target_rows AS target
         ),
         counter_snapshots AS MATERIALIZED (
@@ -494,8 +543,10 @@ def _update_topic_counters(
         ),
         latest_messages AS MATERIALIZED (
             SELECT target.project_id, target.topic_uuid, target.user_uuid,
-                   latest_message.uuid AS last_message_uuid,
-                   latest_message.created_at AS last_message_created_at
+                   CASE WHEN target.last_message_dirty THEN latest_message.uuid
+                        ELSE target.cached_last_message_uuid END AS last_message_uuid,
+                   CASE WHEN target.last_message_dirty THEN latest_message.created_at
+                        ELSE target.cached_last_message_created_at END AS last_message_created_at
             FROM target_rows AS target
             LEFT JOIN LATERAL (
                 SELECT candidate.uuid, candidate.created_at
@@ -504,7 +555,8 @@ def _update_topic_counters(
                   ON candidate_flag.project_id = candidate.project_id
                  AND candidate_flag.message_uuid = candidate.uuid
                  AND candidate_flag.user_uuid = target.user_uuid
-                WHERE candidate.project_id = target.project_id
+                WHERE target.last_message_dirty
+                  AND candidate.project_id = target.project_id
                   AND candidate.stream_uuid = target.stream_uuid
                   AND candidate.topic_uuid = target.topic_uuid
                 ORDER BY candidate.created_at DESC, candidate.uuid DESC
@@ -538,25 +590,13 @@ def _update_topic_counters(
             passive_unread_count =
                 snapshot.unread_count - snapshot.active_unread_count,
             last_message_uuid = snapshot.last_message_uuid,
+            last_message_dirty = false,
             summary_has_new_messages = snapshot.summary_has_new_messages,
             updated_at = clock_timestamp()
         FROM snapshots AS snapshot
         WHERE binding.project_id = snapshot.project_id
           AND binding.topic_uuid = snapshot.topic_uuid
           AND binding.user_uuid = snapshot.user_uuid
-          AND (
-                binding.unread_count,
-                binding.active_unread_count,
-                binding.passive_unread_count,
-                binding.last_message_uuid,
-                binding.summary_has_new_messages
-              ) IS DISTINCT FROM (
-                snapshot.unread_count,
-                snapshot.active_unread_count,
-                snapshot.unread_count - snapshot.active_unread_count,
-                snapshot.last_message_uuid,
-                snapshot.summary_has_new_messages
-              )
         RETURNING binding.project_id, binding.uuid, binding.topic_uuid,
                   binding.user_uuid, binding.notification_mode,
                   binding.unread_count, binding.active_unread_count,
@@ -919,29 +959,45 @@ def _update_folder_counters(
     )
     if not ordered:
         return set()
+    session.execute(
+        """
+        SELECT binding.uuid FROM workspace_v3.folders AS binding
+        JOIN unnest(%s::uuid[], %s::uuid[], %s::uuid[])
+            AS target(project_id, user_uuid, folder_uuid) ON binding.project_id = target.project_id AND binding.uuid = target.folder_uuid AND binding.user_uuid = target.user_uuid
+        ORDER BY binding.project_id, binding.user_uuid, binding.uuid
+        FOR NO KEY UPDATE OF binding
+        """,
+        tuple([scope[index] for scope in ordered] for index in range(3)),
+    ).fetchall()
     result = session.execute(
         """
         WITH targets(project_id, user_uuid, folder_uuid) AS MATERIALIZED (
             SELECT * FROM unnest(%s::uuid[], %s::uuid[], %s::uuid[])
         ),
         snapshots AS (
-            SELECT target.project_id, target.user_uuid, target.folder_uuid,
-                   LEAST(
-                       COALESCE(sum(binding.unread_count), 0), %s
-                   )::integer AS unread_count,
-                   LEAST(
-                       COALESCE(sum(binding.active_unread_count), 0), %s
-                   )::integer AS active_unread_count
+            SELECT target.project_id,target.user_uuid,target.folder_uuid,
+                   (CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                         THEN current_folder.unread_stream_count
+                         ELSE LEAST(COALESCE(fallback.unread_count,0),%s) END)::integer AS unread_count,
+                   (CASE WHEN (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                         THEN current_folder.active_unread_stream_count
+                         ELSE LEAST(COALESCE(fallback.active_unread_count,0),%s) END)::integer AS active_unread_count
             FROM targets AS target
-            LEFT JOIN workspace_v3.folder_items AS item
-              ON item.project_id = target.project_id
-             AND item.user_uuid = target.user_uuid
-             AND item.folder_uuid = target.folder_uuid
-            LEFT JOIN workspace_v3.stream_bindings AS binding
-              ON binding.project_id = item.project_id
-             AND binding.user_uuid = item.user_uuid
-             AND binding.stream_uuid = item.stream_uuid
-            GROUP BY target.project_id, target.user_uuid, target.folder_uuid
+            JOIN workspace_v3.folders AS current_folder
+              ON current_folder.project_id=target.project_id
+             AND current_folder.user_uuid=target.user_uuid
+             AND current_folder.uuid=target.folder_uuid
+            LEFT JOIN LATERAL (
+                SELECT sum(binding.unread_count) AS unread_count,
+                       sum(binding.active_unread_count) AS active_unread_count
+                FROM workspace_v3.folder_items AS item
+                JOIN workspace_v3.stream_bindings AS binding
+                  USING(project_id,stream_uuid,user_uuid)
+                WHERE NOT (SELECT ready FROM workspace_v3.unread_counter_baseline)
+                  AND item.project_id=target.project_id
+                  AND item.user_uuid=target.user_uuid
+                  AND item.folder_uuid=target.folder_uuid
+            ) AS fallback ON true
         )
         UPDATE workspace_v3.folders AS folder
         SET unread_count = snapshot.unread_count,
@@ -953,15 +1009,6 @@ def _update_folder_counters(
         WHERE folder.project_id = snapshot.project_id
           AND folder.user_uuid = snapshot.user_uuid
           AND folder.uuid = snapshot.folder_uuid
-          AND (
-                folder.unread_count,
-                folder.active_unread_count,
-                folder.passive_unread_count
-              ) IS DISTINCT FROM (
-                snapshot.unread_count,
-                snapshot.active_unread_count,
-                snapshot.unread_count - snapshot.active_unread_count
-              )
         RETURNING folder.project_id, folder.user_uuid, folder.uuid
         """,
         (
@@ -1083,7 +1130,7 @@ def _folder_event_payload(
 ) -> dict[str, typing.Any]:
     payload = dict(row)
     payload["system_type"] = "all" if payload.pop("kind") == "all_chats" else "created"
-    payload["unread_count"] = payload.pop("active_unread_count")
+    payload.pop("active_unread_count")
     payload.pop("passive_unread_count")
     return _event_payload(kind, payload)
 
@@ -1954,7 +2001,44 @@ def process_claimed_projection_tasks(
             reaction_user_limit,
         )
         topic_bindings = _update_topic_counters(session, topic_scopes)
+        if topic_bindings:
+            # Old clients subtract message deltas from stream badges, including
+            # when a saturated topic or its parent did not cross zero. Always
+            # correct the stream after the topic snapshot, once per scope.
+            session.execute(
+                """
+                INSERT INTO workspace_v3.projection_tasks (
+                    project_id,task_type,scope_type,scope_uuid,user_uuid,payload
+                )
+                SELECT DISTINCT project_id,'read_counters','user_stream',
+                       stream_uuid,user_uuid,'{"emit_message_events":false}'::jsonb
+                FROM workspace_v3.topic_bindings WHERE uuid=ANY(%s::uuid[])
+                ON CONFLICT (project_id,task_type,scope_type,scope_uuid,user_uuid)
+                WHERE status='pending' AND task_type='read_counters'
+                  AND payload IN ('{"emit_message_events":false}'::jsonb,
+                                  '{"emit_message_event":false}'::jsonb) DO NOTHING
+                """,
+                ([binding["uuid"] for binding in topic_bindings],),
+            )
         stream_bindings = _update_stream_counters(session, stream_scopes)
+        if stream_bindings:
+            # A legacy folder reducer applies stream count deltas to the
+            # folder count. Publish the absolute folder after every stream,
+            # even when its count of unread streams stayed unchanged.
+            rows = session.execute(
+                """
+                SELECT DISTINCT item.project_id,item.user_uuid,item.folder_uuid
+                FROM workspace_v3.folder_items AS item
+                JOIN workspace_v3.stream_bindings AS binding
+                  USING(project_id,stream_uuid,user_uuid)
+                WHERE binding.uuid=ANY(%s::uuid[])
+                """,
+                ([binding["uuid"] for binding in stream_bindings],),
+            ).fetchall()
+            folder_scopes.update(
+                (row["project_id"], row["user_uuid"], row["folder_uuid"])
+                for row in _mappings(rows, ("project_id", "user_uuid", "folder_uuid"))
+            )
         created_folders = _sync_folder_memberships(session, membership_scopes)
         changed_folder_scopes = _update_folder_counters(session, folder_scopes)
         operation_folder_scopes = {
