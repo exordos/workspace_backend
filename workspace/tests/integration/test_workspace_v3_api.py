@@ -641,6 +641,7 @@ def test_v3_provider_consumer_receives_only_its_source_events(api, db):
         "created_at": provider_message["created_at"],
         "payload": provider_message["payload"],
         "stream_uuid": provider_message["stream_uuid"],
+        "topic_name": "General Topic",
         "topic_uuid": provider_message["topic_uuid"],
     }
     flag_uuid = db.execute(
@@ -660,6 +661,7 @@ def test_v3_provider_consumer_receives_only_its_source_events(api, db):
         "starred": True,
         "stream_uuid": provider_message["stream_uuid"],
         "user_uuid": str(api.user_uuid),
+        "uuid": str(flag_uuid),
     }
     assert native_message["uuid"] not in {str(row[0]) for row in provider_rows}
 

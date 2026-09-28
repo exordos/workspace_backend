@@ -1831,6 +1831,85 @@ def add_provider_entity_contract(
     return specification
 
 
+def add_provider_realtime_contract(
+    specification: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    """Document the v4 realtime-only Provider mutation endpoint."""
+    entity_type = {
+        "type": "string",
+        "enum": [
+            "users",
+            "streams",
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+        ],
+    }
+    upsert = _object_schema(
+        {
+            "action": {"type": "string", "enum": ["upsert"]},
+            "type": copy.deepcopy(entity_type),
+            "uuid": {"type": "string", "format": "uuid"},
+            "content_hash": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$",
+            },
+            "source_updated_at": {"type": "string", "format": "date-time"},
+            "data": {"type": "object", "additionalProperties": True},
+        },
+        ["action", "type", "uuid", "content_hash", "data"],
+    )
+    delete = _object_schema(
+        {
+            "action": {"type": "string", "enum": ["delete"]},
+            "type": {"type": "string", "enum": ["messages"]},
+            "uuid": {"type": "string", "format": "uuid"},
+        },
+        ["action", "type", "uuid"],
+    )
+    specification["paths"]["/v1/provider/v4/realtime"] = {
+        "post": {
+            "summary": "Apply current provider message events",
+            "operationId": "Apply_provider_realtime_events_v4",
+            "tags": ["Provider"],
+            "requestBody": _request_body(
+                _object_schema(
+                    {
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 500,
+                            "items": {"oneOf": [upsert, delete]},
+                        }
+                    },
+                    ["operations"],
+                )
+            ),
+            "responses": {
+                200: {
+                    "description": "Atomic realtime mutation results",
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["results"],
+                                "properties": {
+                                    "results": {
+                                        "type": "array",
+                                        "items": {"type": "object"},
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
+    }
+    return specification
+
+
 def add_events_cursor_contract(
     specification: dict[str, typing.Any],
     events_path: str,

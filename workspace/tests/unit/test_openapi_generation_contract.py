@@ -477,6 +477,23 @@ def test_v3_openapi_exposes_only_the_minimal_source_marker():
     bootstrap = specification["paths"]["/v1/provider/bootstrap"]["get"]
     assert "application/x-ndjson" in bootstrap["responses"][200]["content"]
 
+    realtime = specification["paths"]["/v1/provider/v4/realtime"]["post"]
+    realtime_items = realtime["requestBody"]["content"]["application/json"]["schema"][
+        "properties"
+    ]["operations"]["items"]
+    realtime_upsert, realtime_delete = realtime_items["oneOf"]
+    assert realtime_upsert["required"] == [
+        "action",
+        "type",
+        "uuid",
+        "content_hash",
+        "data",
+    ]
+    assert realtime_upsert["properties"]["action"]["enum"] == ["upsert"]
+    assert realtime_delete["required"] == ["action", "type", "uuid"]
+    assert realtime_delete["properties"]["action"]["enum"] == ["delete"]
+    assert realtime_delete["properties"]["type"]["enum"] == ["messages"]
+
 
 def test_workspace_openapi_exposes_messenger_and_rest_events():
     specification = _build_openapi(workspace_app)

@@ -1519,10 +1519,26 @@ class MessengerV3Store:
             self.user_uuid,
             provider,
         )
-        return store.refresh_owned_state(
+        payload = store.refresh_owned_state(
             provider_resource,
             sys_uuid.UUID(str(resource_uuid)),
         )
+        if provider_resource != "messages" or payload is None:
+            return payload
+        topic = (
+            _session()
+            .execute(
+                """
+                SELECT name FROM workspace_v3.topics
+                WHERE project_id = %s AND uuid = %s
+                """,
+                (self.project_uuid, payload["topic_uuid"]),
+            )
+            .fetchone()
+        )
+        if topic is None:
+            return payload
+        return {**payload, "topic_name": topic["name"]}
 
     def _emit_provider_resource(
         self,
