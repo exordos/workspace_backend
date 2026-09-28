@@ -5130,6 +5130,14 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
         )
         cursor.execute(
             """
+            INSERT INTO workspace_v3.provider_consumers (
+                uuid, project_id, name, iam_user_uuid, enabled
+            ) VALUES (%s, %s, 'zulip', %s, TRUE)
+            """,
+            (instance_uuid, project_uuid, api.user_uuid),
+        )
+        cursor.execute(
+            """
             INSERT INTO m_external_provider_policies_v1
                 (uuid, provider, enabled, limits)
             VALUES (%s, 'zulip', TRUE,
@@ -5299,6 +5307,45 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             ORDER BY user_uuid
             """,
             (project_uuid, projection_stream_uuid, list(owner_uuids)),
+        )
+        assert {row[0] for row in cursor.fetchall()} == set(owner_uuids)
+
+        cursor.execute(
+            """
+            SELECT source_name, owner_uuid
+            FROM workspace_v3.streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert cursor.fetchone() == ("zulip", owner_uuids[0])
+        cursor.execute(
+            """
+            SELECT uuid::text, source_name
+            FROM workspace_v3.topics
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert cursor.fetchone() == (topic_uuid, "zulip")
+        cursor.execute(
+            """
+            SELECT user_uuid
+            FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+            ORDER BY user_uuid
+            """,
+            (project_uuid, projection_stream_uuid),
+        )
+        assert {row[0] for row in cursor.fetchall()} == set(owner_uuids)
+        cursor.execute(
+            """
+            SELECT binding.user_uuid
+            FROM workspace_v3.topic_bindings AS binding
+            WHERE binding.project_id = %s AND binding.topic_uuid = %s
+            ORDER BY binding.user_uuid
+            """,
+            (project_uuid, topic_uuid),
         )
         assert {row[0] for row in cursor.fetchall()} == set(owner_uuids)
 

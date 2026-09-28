@@ -6,12 +6,14 @@
 """Materialize backend-owned external chat streams in Messenger storage."""
 
 import collections.abc
+import datetime
 import json
 import typing
 import uuid as sys_uuid
 
 from restalchemy.dm import filters as dm_filters
 
+from workspace.messenger_api import provider_store
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import read_state
@@ -497,6 +499,199 @@ def _workspace_source(
     return models.SourceName.NATIVE.value, models.NativeSource()
 
 
+def _stable_binding_uuid(
+    parent_uuid: sys_uuid.UUID,
+    user_uuid: sys_uuid.UUID,
+) -> sys_uuid.UUID:
+    return sys_uuid.uuid5(parent_uuid, f"binding\0{user_uuid}")
+
+
+def _utc_datetime(value: datetime.datetime) -> datetime.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
+
+def _sync_provider_projection_to_v3(
+    session: typing.Any,
+    *,
+    project_id: sys_uuid.UUID,
+    projection_stream_uuid: sys_uuid.UUID,
+    bridge_instance_uuid: sys_uuid.UUID,
+    provider_kind: str,
+    source: collections.abc.Mapping[str, typing.Any],
+    participant_uuids: collections.abc.Iterable[sys_uuid.UUID],
+    emit_events: bool,
+) -> None:
+    """Materialize a catalog-created provider chat in the v3 canonical store."""
+    provider = session.execute(
+        """
+        SELECT uuid, name, iam_user_uuid
+        FROM workspace_v3.provider_consumers
+        WHERE project_id = %s AND uuid = %s AND name = %s AND enabled
+        """,
+        (project_id, bridge_instance_uuid, provider_kind),
+    ).fetchone()
+    if provider is None:
+        return
+    stream = session.execute(
+        """
+        SELECT * FROM m_workspace_streams
+        WHERE project_id = %s AND uuid = %s AND source_name = %s
+        """,
+        (project_id, projection_stream_uuid, provider_kind),
+    ).fetchone()
+    if stream is None:
+        return
+
+    users = sorted(set(participant_uuids) | {stream["user_uuid"]}, key=str)
+    session.execute(
+        """
+        INSERT INTO workspace_v3.users (
+            uuid, created_at, updated_at, username, source, status,
+            first_name, last_name, email, last_ping_at,
+            status_emoji, status_text, avatar
+        )
+        SELECT legacy.uuid, legacy.created_at, legacy.updated_at,
+               COALESCE(NULLIF(legacy.username, ''), legacy.uuid::text),
+               legacy.source, legacy.status, legacy.first_name,
+               legacy.last_name, legacy.email, legacy.last_ping_at,
+               legacy.status_emoji, legacy.status_text,
+               COALESCE(
+                   NULLIF(legacy.avatar, ''),
+                   'urn:gravatar:' || md5(
+                       lower(COALESCE(legacy.email, legacy.username))
+                   )
+               )
+        FROM m_workspace_users AS legacy
+        WHERE legacy.uuid = ANY(%s::uuid[])
+        ON CONFLICT (uuid) DO NOTHING
+        """,
+        (users,),
+    )
+    store = provider_store.ProviderEntityStore(
+        session,
+        project_id,
+        sys_uuid.UUID(str(provider["iam_user_uuid"])),
+        provider,
+    )
+    stream_data = {
+        "name": stream["name"],
+        "description": stream["description"],
+        "owner_uuid": stream["user_uuid"],
+        "invite_only": stream["invite_only"],
+        "announce": stream["announce"],
+        "direct_user_uuid": stream["direct_user_uuid"],
+        "private": stream["private"],
+        "is_archived": stream["is_archived"],
+        "color": stream["color"] or 0,
+        "default_topic_uuid": stream["default_topic_uuid"],
+        "history_public_to_subscribers": True,
+        "created_at": _utc_datetime(stream["created_at"]),
+    }
+    store.upsert(
+        "streams",
+        projection_stream_uuid,
+        provider_store.canonical_hash(stream_data),
+        stream_data,
+        source_updated_at=_utc_datetime(stream["updated_at"]),
+        emit_event=emit_events,
+    )
+
+    topics = []
+    for source_topic in source.get("topics", []):
+        topic_uuid = sys_uuid.UUID(str(source_topic["topic_uuid"]))
+        legacy_topic = session.execute(
+            """
+            SELECT * FROM m_workspace_stream_topics
+            WHERE project_id = %s AND stream_uuid = %s AND uuid = %s
+            """,
+            (project_id, projection_stream_uuid, topic_uuid),
+        ).fetchone()
+        topic_data = {
+            "stream_uuid": projection_stream_uuid,
+            "name": source_topic["name"],
+            "color": 0 if legacy_topic is None else legacy_topic["color"] or 0,
+            "is_done": False,
+            "version": 0,
+            "created_at": (
+                _utc_datetime(stream["created_at"])
+                if legacy_topic is None
+                else _utc_datetime(legacy_topic["created_at"])
+            ),
+        }
+        topic_updated_at = (
+            stream["updated_at"] if legacy_topic is None else legacy_topic["updated_at"]
+        )
+        store.upsert(
+            "topics",
+            topic_uuid,
+            provider_store.canonical_hash(topic_data),
+            topic_data,
+            source_updated_at=_utc_datetime(topic_updated_at),
+            emit_event=emit_events,
+        )
+        topics.append((topic_uuid, topic_data["created_at"]))
+
+    bindings = session.execute(
+        """
+        SELECT * FROM m_workspace_stream_bindings
+        WHERE project_id = %s AND stream_uuid = %s
+          AND user_uuid = ANY(%s::uuid[])
+        ORDER BY user_uuid
+        """,
+        (project_id, projection_stream_uuid, users),
+    ).fetchall()
+    for binding in bindings:
+        user_uuid = sys_uuid.UUID(str(binding["user_uuid"]))
+        binding_data = {
+            "stream_uuid": projection_stream_uuid,
+            "user_uuid": user_uuid,
+            "who_uuid": binding["who_uuid"],
+            "role": binding["role"],
+            "notification_mode": binding["notification_mode"],
+            "created_at": _utc_datetime(binding["created_at"]),
+        }
+        store.upsert(
+            "stream_bindings",
+            _stable_binding_uuid(projection_stream_uuid, user_uuid),
+            provider_store.canonical_hash(binding_data),
+            binding_data,
+            source_updated_at=_utc_datetime(binding["updated_at"]),
+            emit_event=emit_events,
+        )
+        for topic_uuid, topic_created_at in topics:
+            topic_flag = session.execute(
+                """
+                SELECT notification_mode, updated_at
+                FROM m_workspace_user_topic_flags
+                WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+                """,
+                (project_id, topic_uuid, user_uuid),
+            ).fetchone()
+            topic_binding_data = {
+                "stream_uuid": projection_stream_uuid,
+                "topic_uuid": topic_uuid,
+                "user_uuid": user_uuid,
+                "notification_mode": (
+                    "default" if topic_flag is None else topic_flag["notification_mode"]
+                ),
+                "created_at": topic_created_at,
+            }
+            store.upsert(
+                "topic_bindings",
+                _stable_binding_uuid(topic_uuid, user_uuid),
+                provider_store.canonical_hash(topic_binding_data),
+                topic_binding_data,
+                source_updated_at=_utc_datetime(
+                    binding["updated_at"]
+                    if topic_flag is None
+                    else topic_flag["updated_at"]
+                ),
+                emit_event=emit_events,
+            )
+
+
 def ensure_external_chat_stream(
     session: typing.Any,
     *,
@@ -704,27 +899,36 @@ def ensure_external_chat_stream(
         for binding in existing_bindings
         if binding.user_uuid not in participants
     ]
-    if not stale_bindings or shared_projection:
-        return
-    managed_user_uuids = {
-        user.uuid
-        for user in models.WorkspaceUser.objects.get_all(
-            filters={
-                "uuid": dm_filters.In(
-                    [binding.user_uuid for binding in stale_bindings]
-                ),
-                "source": dm_filters.EQ(models.WorkspaceUserSource.ZULIP.value),
-            },
-            session=session,
-        )
-    }
-    for binding in stale_bindings:
-        if binding.user_uuid in managed_user_uuids:
-            helpers.delete_workspace_stream_binding(
-                project_id,
-                binding.uuid,
+    if stale_bindings and not shared_projection:
+        managed_user_uuids = {
+            user.uuid
+            for user in models.WorkspaceUser.objects.get_all(
+                filters={
+                    "uuid": dm_filters.In(
+                        [binding.user_uuid for binding in stale_bindings]
+                    ),
+                    "source": dm_filters.EQ(models.WorkspaceUserSource.ZULIP.value),
+                },
                 session=session,
             )
+        }
+        for binding in stale_bindings:
+            if binding.user_uuid in managed_user_uuids:
+                helpers.delete_workspace_stream_binding(
+                    project_id,
+                    binding.uuid,
+                    session=session,
+                )
+    _sync_provider_projection_to_v3(
+        session,
+        project_id=sys_uuid.UUID(str(project_id)),
+        projection_stream_uuid=projection_stream_uuid,
+        bridge_instance_uuid=bridge_instance_uuid,
+        provider_kind=provider_kind,
+        source=source,
+        participant_uuids=participants,
+        emit_events=emit_events,
+    )
 
 
 def handoff_shared_projection_route(

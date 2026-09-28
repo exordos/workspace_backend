@@ -998,6 +998,11 @@ def test_missing_external_chat_stream_is_materialized(monkeypatch):
         "get_revoked_workspace_external_chat_members",
         lambda *args, **kwargs: set(),
     )
+    monkeypatch.setattr(
+        external_projection,
+        "_sync_provider_projection_to_v3",
+        lambda *args, **kwargs: None,
+    )
 
     external_projection.ensure_external_chat_stream(
         session,
@@ -1163,6 +1168,11 @@ def test_existing_external_chat_stream_reconciles_provider_managed_bindings(
         "get_revoked_workspace_external_chat_members",
         lambda *args, **kwargs: set(),
     )
+    monkeypatch.setattr(
+        external_projection,
+        "_sync_provider_projection_to_v3",
+        lambda *args, **kwargs: None,
+    )
 
     external_projection.ensure_external_chat_stream(
         session,
@@ -1268,6 +1278,11 @@ def test_new_provider_group_dm_is_materialized_as_channel(monkeypatch):
         "get_revoked_workspace_external_chat_members",
         lambda *args, **kwargs: set(),
     )
+    monkeypatch.setattr(
+        external_projection,
+        "_sync_provider_projection_to_v3",
+        lambda *args, **kwargs: None,
+    )
 
     external_projection.ensure_external_chat_stream(
         object(),
@@ -1345,6 +1360,11 @@ def test_new_provider_self_dm_remains_private(monkeypatch):
         external_projection.helpers,
         "get_revoked_workspace_external_chat_members",
         lambda *_args, **_kwargs: set(),
+    )
+    monkeypatch.setattr(
+        external_projection,
+        "_sync_provider_projection_to_v3",
+        lambda *args, **kwargs: None,
     )
 
     external_projection.ensure_external_chat_stream(
