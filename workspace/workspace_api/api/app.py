@@ -78,11 +78,6 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/messenger/",
             components,
         )
-        specification = openapi_contract.add_external_bridge_public_contract(
-            specification,
-            "/v1/messenger/",
-            components,
-        )
         specification = openapi_contract.add_events_cursor_contract(
             specification,
             "/v1/events/",

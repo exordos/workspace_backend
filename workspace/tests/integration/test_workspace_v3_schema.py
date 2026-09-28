@@ -78,8 +78,6 @@ EXPECTED_COLUMNS = {
         "payload",
         "created_at",
         "updated_at",
-        "origin_consumer_type",
-        "origin_consumer_uuid",
     ),
     "folder_items": (
         "uuid",
@@ -176,26 +174,6 @@ EXPECTED_COLUMNS = {
         "last_error",
         "created_at",
         "updated_at",
-    ),
-    "provider_consumers": (
-        "uuid",
-        "project_id",
-        "name",
-        "iam_user_uuid",
-        "enabled",
-        "created_at",
-        "updated_at",
-    ),
-    "provider_entity_states": (
-        "project_id",
-        "provider_uuid",
-        "entity_type",
-        "entity_uuid",
-        "content_hash",
-        "created_at",
-        "updated_at",
-        "source_updated_at",
-        "source_content_hash",
     ),
     "stream_bindings": (
         "uuid",
@@ -630,21 +608,4 @@ def test_workspace_v3_indexes_user_reactions_for_user_listing(_database, db):
     assert index is not None
     assert index[0].endswith(
         "ON workspace_v3.message_reactions USING btree (project_id, user_uuid)"
-    )
-
-
-def test_workspace_v3_indexes_provider_user_project_discovery(_database, db):
-    index = db.execute(
-        """
-        SELECT indexdef
-        FROM pg_indexes
-        WHERE schemaname = 'workspace_v3'
-          AND indexname = 'provider_entity_states_entity_projects_idx'
-        """
-    ).fetchone()
-
-    assert index is not None
-    assert index[0].endswith(
-        "ON workspace_v3.provider_entity_states USING btree "
-        "(entity_type, entity_uuid, project_id)"
     )

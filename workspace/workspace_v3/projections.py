@@ -1109,51 +1109,9 @@ def _query_consumers(
         users = [user_uuid]
     else:
         users = []
-    if stream_uuid is not None:
-        provider_rows = session.execute(
-            """
-            SELECT provider.uuid AS consumer_uuid
-            FROM workspace_v3.streams AS stream
-            JOIN workspace_v3.provider_consumers AS provider
-              ON provider.project_id = stream.project_id
-             AND provider.name = stream.source_name
-             AND provider.enabled
-            WHERE stream.project_id = %s AND stream.uuid = %s
-              AND stream.source_name <> 'native'
-            ORDER BY provider.uuid
-            """,
-            (project_id, stream_uuid),
-        ).fetchall()
-    elif user_uuid is not None:
-        provider_rows = session.execute(
-            """
-            SELECT DISTINCT provider.uuid AS consumer_uuid
-            FROM workspace_v3.stream_bindings AS binding
-            JOIN workspace_v3.streams AS stream
-              ON stream.project_id = binding.project_id
-             AND stream.uuid = binding.stream_uuid
-            JOIN workspace_v3.provider_consumers AS provider
-              ON provider.project_id = stream.project_id
-             AND provider.name = stream.source_name
-             AND provider.enabled
-            WHERE binding.project_id = %s AND binding.user_uuid = %s
-              AND stream.source_name <> 'native'
-            ORDER BY provider.uuid
-            """,
-            (project_id, user_uuid),
-        ).fetchall()
-    else:
-        provider_rows = []
-    providers = [
-        _uuid(_mapping(row, ("consumer_uuid",))["consumer_uuid"])
-        for row in provider_rows
-    ]
     return tuple(
         sorted(
-            {
-                *(("user", value) for value in users),
-                *(("provider", value) for value in providers),
-            },
+            {("user", value) for value in users},
             key=lambda value: (value[0], str(value[1])),
         )
     )
@@ -1330,18 +1288,6 @@ def _emit_events(
         for item in specifications
         for recipient_uuid, payload in item.get("recipient_payloads", {}).items()
     ]
-    provider_recipient_rows = [
-        (
-            item["project_id"],
-            item["event_uuid"],
-            consumer_uuid,
-            next(iter(item["recipient_payloads"].values())),
-        )
-        for item in specifications
-        if len(item.get("recipient_payloads", {})) == 1
-        for consumer_type, consumer_uuid in item["consumers"]
-        if consumer_type == "provider"
-    ]
     if recipient_rows:
         session.execute(
             """
@@ -1361,30 +1307,6 @@ def _emit_events(
                 [row[1] for row in recipient_rows],
                 [row[2] for row in recipient_rows],
                 [json.dumps(row[3], default=_serialize) for row in recipient_rows],
-            ),
-        )
-    if provider_recipient_rows:
-        session.execute(
-            """
-            INSERT INTO workspace_v3.event_recipient_payloads (
-                project_id, event_uuid, consumer_type, consumer_uuid, payload
-            )
-            SELECT input.project_id, input.event_uuid, 'provider',
-                   input.consumer_uuid, input.payload::jsonb
-            FROM unnest(
-                %s::uuid[], %s::uuid[], %s::uuid[], %s::text[]
-            ) AS input(
-                project_id, event_uuid, consumer_uuid, payload
-            )
-            """,
-            (
-                [row[0] for row in provider_recipient_rows],
-                [row[1] for row in provider_recipient_rows],
-                [row[2] for row in provider_recipient_rows],
-                [
-                    json.dumps(row[3], default=_serialize)
-                    for row in provider_recipient_rows
-                ],
             ),
         )
     session.execute(
@@ -1546,29 +1468,21 @@ def _projection_events(
     message_by_key.update(
         {(_uuid(row["project_id"]), _uuid(row["uuid"])): row for row in messages}
     )
-    eventful_reaction_scopes: dict[
-        tuple[sys_uuid.UUID, sys_uuid.UUID], set[sys_uuid.UUID | None]
-    ] = {}
+    eventful_reaction_scopes: set[tuple[sys_uuid.UUID, sys_uuid.UUID]] = set()
     for task in tasks:
         payload = _payload(task["payload"])
         if task["task_type"] != "reaction_snapshot" or not payload.get(
             "emit_events", True
         ):
             continue
-        key = (_uuid(task["project_id"]), _uuid(task["scope_uuid"]))
-        origin_provider_uuid = payload.get("origin_provider_uuid")
-        eventful_reaction_scopes.setdefault(key, set()).add(
-            None if origin_provider_uuid is None else _uuid(origin_provider_uuid)
+        eventful_reaction_scopes.add(
+            (_uuid(task["project_id"]), _uuid(task["scope_uuid"]))
         )
     for row in messages:
         project_id = _uuid(row["project_id"])
         scope_key = (project_id, _uuid(row["uuid"]))
         if scope_key not in eventful_reaction_scopes:
             continue
-        origins = eventful_reaction_scopes[scope_key]
-        suppressed_provider_uuid = (
-            next(iter(origins)) if len(origins) == 1 and None not in origins else None
-        )
         stream_uuid = _uuid(row["stream_uuid"])
         specification = _resource_event_specification(
             session,
@@ -1577,14 +1491,7 @@ def _projection_events(
             entity_uuid=_uuid(row["uuid"]),
             object_type="message",
             action="updated",
-            consumers=tuple(
-                (consumer_type, consumer_uuid)
-                for consumer_type, consumer_uuid in consumers(
-                    project_id, stream_uuid=stream_uuid
-                )
-                if consumer_type != "provider"
-                or consumer_uuid != suppressed_provider_uuid
-            ),
+            consumers=consumers(project_id, stream_uuid=stream_uuid),
         )
         if specification is not None:
             events.append(specification)
@@ -1596,11 +1503,6 @@ def _projection_events(
         project_id = _uuid(task["project_id"])
         message_uuid = _uuid(task["scope_uuid"])
         task_payload = _payload(task["payload"])
-        origin_provider_uuid = (
-            None
-            if task_payload.get("origin_provider_uuid") is None
-            else _uuid(task_payload["origin_provider_uuid"])
-        )
         message = message_by_key.get((project_id, message_uuid))
         if message is None:
             continue
@@ -1666,11 +1568,7 @@ def _projection_events(
                     "consumers": tuple(
                         (consumer_type, consumer_uuid)
                         for consumer_type, consumer_uuid in reaction_consumers
-                        if (consumer_type != "user" or consumer_uuid in visible_users)
-                        and (
-                            consumer_type != "provider"
-                            or consumer_uuid != origin_provider_uuid
-                        )
+                        if consumer_uuid in visible_users
                     ),
                 }
             )

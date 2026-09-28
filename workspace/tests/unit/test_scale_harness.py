@@ -1361,26 +1361,6 @@ def test_correctness_verifier_rejects_content_and_mapping_drift(tmp_path):
     assert operation_uuid in report["outbox_idempotency"]
 
 
-def test_provider_profile_is_e2e_and_does_not_bypass_connector():
-    script = (LOAD_DIRECTORY / "k6" / "zulip_provider.js").read_text()
-
-    assert "sendInboundE2E" in script
-    assert "sendOutboundE2E" in script
-    assert "Zulip -> connector -> Workspace" in script
-    assert "workspace_provider_token" not in script
-    assert "/api/workspace-provider/v1" not in script
-    assert "external_accounts/${account.external_account_uuid}" in script
-    assert "cursor_ordinal_base" in script
-    assert "cursor_ordinal_limit" in script
-    assert "exec.scenario.iterationInTest" in script
-    assert "WORKSPACE_RUN_EXPECTED_V1" in script
-    assert "WORKSPACE_RUN_DIAGNOSTIC_V1" in script
-    assert "WORKSPACE_RUN_OBSERVED_V1" not in script
-    assert "provider expectation requires an explicit direction" in script
-    assert 'row.direction = "inbound";\n    runExpectation(row);' in script
-    assert 'row.direction = "outbound";\n    runExpectation(row);' in script
-
-
 class _RecordingAdapter:
     def __init__(self, completed=()):
         self.completed = set(completed)

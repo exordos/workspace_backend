@@ -1829,36 +1829,18 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertNotIn("event", json.loads(sent_messages[0]))
         self.assertNotIn("type", json.loads(sent_messages[0]))
 
-    def test_websocket_identity_maps_dedicated_iam_user_to_provider(self):
+    def test_websocket_identity_always_uses_native_user(self):
         project_uuid = sys_uuid.uuid4()
         iam_user_uuid = sys_uuid.uuid4()
-        provider_uuid = sys_uuid.uuid4()
 
-        with mock.patch.object(
-            events.v3_store,
-            "resolve_provider_consumer",
-            return_value={"uuid": provider_uuid, "name": "zulip"},
-        ) as resolve:
-            result = events.resolve_websocket_consumer(
+        self.assertEqual(
+            ("user", iam_user_uuid),
+            events.resolve_websocket_consumer(
                 project_uuid,
                 iam_user_uuid,
-                permissions={events.PROVIDER_SYNC_PERMISSION},
-            )
-
-        self.assertEqual(("provider", provider_uuid), result)
-        resolve.assert_called_once_with(project_uuid, iam_user_uuid)
-
-    def test_websocket_provider_requires_sync_permission(self):
-        project_uuid = sys_uuid.uuid4()
-        iam_user_uuid = sys_uuid.uuid4()
-
-        with mock.patch.object(
-            events.v3_store,
-            "resolve_provider_consumer",
-            return_value={"uuid": sys_uuid.uuid4(), "name": "zulip"},
-        ):
-            with self.assertRaises(PermissionError):
-                events.resolve_websocket_consumer(project_uuid, iam_user_uuid)
+                permissions={"workspace.provider.sync"},
+            ),
+        )
 
     def test_websocket_notification_catches_up_with_per_user_cursor(self):
         websockets_stub = types.ModuleType("websockets")
@@ -2414,6 +2396,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "_call_with_database_session",
                 new=_call_without_database_session,
             ):
+
                 async def catch_up_connections():
                     for connection in connections:
                         server._request_catch_up(connection)

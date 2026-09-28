@@ -31,7 +31,6 @@ from restalchemy.common import exceptions as ra_exc
 from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api.api import v3_store
 from workspace.messenger_api.dm import event_payloads
 from workspace.messenger_api.dm import models
 
@@ -52,7 +51,6 @@ _FIXTURE_EVENTS_SUPPRESSED = contextvars.ContextVar(
     "workspace_fixture_events_suppressed",
     default=False,
 )
-PROVIDER_SYNC_PERMISSION = "workspace.provider.sync"
 
 
 class ProjectEventLockUnavailableError(RuntimeError):
@@ -1967,12 +1965,8 @@ def resolve_websocket_consumer(
     iam_user_uuid: sys_uuid.UUID,
     permissions: collections.abc.Collection[str] = (),
 ) -> tuple[str, sys_uuid.UUID]:
-    provider = v3_store.resolve_provider_consumer(project_id, iam_user_uuid)
-    if provider is None:
-        return "user", iam_user_uuid
-    if PROVIDER_SYNC_PERMISSION not in permissions:
-        raise PermissionError("Provider synchronization permission is required")
-    return "provider", sys_uuid.UUID(str(provider["uuid"]))
+    del project_id, permissions
+    return "user", iam_user_uuid
 
 
 def get_consumer_events_after(

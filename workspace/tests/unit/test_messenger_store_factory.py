@@ -78,7 +78,7 @@ def test_api_and_events_entrypoints_register_store_backend_option():
         assert result.returncode == 0, result.stderr
 
 
-def test_all_messenger_http_entrypoints_register_external_bridge_options():
+def test_messenger_http_entrypoints_do_not_register_external_bridge_options():
     for module in (
         "workspace.cmd.messenger_api",
         "workspace.cmd.workspace_api",
@@ -90,7 +90,7 @@ def test_all_messenger_http_entrypoints_register_external_bridge_options():
                 (
                     "from oslo_config import cfg; "
                     f"import {module}; "
-                    "assert cfg.CONF['external_bridge'].realm_uuid is None"
+                    "assert 'external_bridge' not in cfg.CONF"
                 ),
             ],
             check=False,
@@ -103,7 +103,6 @@ def test_all_messenger_http_entrypoints_register_external_bridge_options():
 
 def test_all_message_snapshot_writers_register_reaction_options():
     for module in (
-        "workspace.cmd.external_bridge_api",
         "workspace.cmd.messenger_api",
         "workspace.cmd.workspace_api",
     ):

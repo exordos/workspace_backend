@@ -15,7 +15,6 @@ from restalchemy.common import config_opts as ra_config_opts
 from restalchemy.storage.sql import engines
 
 from workspace.common import config
-from workspace.common import external_bridge_opts
 from workspace.common import file_storage_opts
 from workspace.common import log as infra_log
 from workspace.common import messenger_reaction_opts
@@ -38,7 +37,6 @@ CONF = cfg.CONF
 CONF.register_cli_opts(api_cli_opts, DOMAIN)
 ra_config_opts.register_posgresql_db_opts(CONF)
 iam_opts.register_iam_cli_opts(CONF)
-external_bridge_opts.register_opts(CONF)
 file_storage_opts.register_opts(CONF)
 messenger_reaction_opts.register_opts(CONF)
 topic_summary_opts.register_opts(CONF)

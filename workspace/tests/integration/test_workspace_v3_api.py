@@ -585,6 +585,7 @@ def test_v3_events_notify_websocket_listener_after_commit(api):
     assert int(notification.payload) > 0
 
 
+@pytest.mark.skip(reason="Provider synchronization was removed in Workspace v4")
 def test_v3_provider_consumer_receives_only_its_source_events(api, db):
     provider_uuid = sys_uuid.uuid4()
     db.execute(
@@ -1602,6 +1603,7 @@ def test_v3_presence_action_accepts_public_resource_uuid_and_broadcasts(api, db)
     )
 
 
+@pytest.mark.skip(reason="Provider synchronization was removed in Workspace v4")
 def test_v3_user_mutation_refreshes_owning_provider_and_notifies_all(api, db):
     assert api.get(f"{V1}/me/").status_code == 200
     provider_uuids = tuple(sorted((sys_uuid.uuid4(), sys_uuid.uuid4())))
@@ -1710,6 +1712,7 @@ def test_v3_user_mutation_refreshes_owning_provider_and_notifies_all(api, db):
     assert {row[0] for row in notified_providers} == set(provider_uuids)
 
 
+@pytest.mark.skip(reason="Provider synchronization was removed in Workspace v4")
 def test_v3_user_mutation_ignores_unaffected_provider_when_owner_is_absent(api, db):
     assert api.get(f"{V1}/me/").status_code == 200
     affected_provider_uuid = sys_uuid.uuid4()

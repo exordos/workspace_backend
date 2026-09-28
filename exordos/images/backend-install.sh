@@ -29,13 +29,10 @@ WORKSPACE_BINARIES=(
     workspace-messenger-api
     workspace-messenger-worker
     workspace-v3-worker
-    workspace-history-import-worker
     workspace-messenger-events
-    workspace-external-bridge-api
 )
 WORKSPACE_HELPERS=(
     backend-bootstrap.sh:workspace-bootstrap
-    workspace-external-bridge-control-prepare.sh:workspace-external-bridge-control-prepare
     workspace-nginx-reload.sh:workspace-nginx-reload
     workspace-reload-config.sh:workspace-reload-config
     workspace-restart-services.sh:workspace-restart-services

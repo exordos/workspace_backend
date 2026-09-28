@@ -50,13 +50,11 @@ from oslo_config import cfg
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
-from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api import provider_api
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.workspace_api.api import app as workspace_app
 
@@ -178,10 +176,6 @@ def build_test_wsgi_application(app_module=messenger_app):
     except cfg.DuplicateOptError:
         pass
     try:
-        external_bridge_opts.register_opts()
-    except cfg.DuplicateOptError:
-        pass
-    try:
         topic_summary_opts.register_opts()
     except cfg.DuplicateOptError:
         pass
@@ -197,7 +191,6 @@ def build_test_wsgi_application(app_module=messenger_app):
     return middlewares.attach_middlewares(
         application,
         [
-            provider_api.ProviderApiMiddleware,
             middlewares.configure_middleware(MockedIamAuthMiddleware),
             app_middlewares.ServerSettingsMiddleware,
             app_middlewares.DatabaseDeadlockRetryMiddleware,
