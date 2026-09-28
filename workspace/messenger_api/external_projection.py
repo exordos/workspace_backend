@@ -808,6 +808,19 @@ def ensure_external_chat_stream(
             raise ValueError(
                 "Provider stream projection owner does not match assignment"
             )
+        _sync_provider_projection_to_v3(
+            session,
+            project_id=sys_uuid.UUID(str(project_id)),
+            projection_stream_uuid=projection_stream_uuid,
+            bridge_instance_uuid=bridge_instance_uuid,
+            provider_kind=provider_kind,
+            source=source,
+            participant_uuids=(
+                sys_uuid.UUID(str(participant["identity_uuid"]))
+                for participant in source["participants"]
+            ),
+            emit_events=emit_events,
+        )
         return
     participants = {
         sys_uuid.UUID(str(participant["identity_uuid"])): participant["role"]

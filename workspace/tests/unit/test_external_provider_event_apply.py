@@ -406,6 +406,7 @@ def test_existing_message_projection_skips_participant_reconciliation(monkeypatc
     stream_uuid = sys_uuid.uuid4()
     session = object()
     stream = types.SimpleNamespace(user_uuid=owner_uuid)
+    synced = []
     monkeypatch.setattr(
         external_projection.models,
         "WorkspaceStream",
@@ -424,6 +425,11 @@ def test_existing_message_projection_skips_participant_reconciliation(monkeypatc
             )
         ),
     )
+    monkeypatch.setattr(
+        external_projection,
+        "_sync_provider_projection_to_v3",
+        lambda *args, **kwargs: synced.append((args, kwargs)),
+    )
 
     external_projection.ensure_external_chat_stream(
         session,
@@ -441,6 +447,12 @@ def test_existing_message_projection_skips_participant_reconciliation(monkeypatc
         reconcile_participants=False,
     )
 
+    assert len(synced) == 1
+    assert synced[0][0] == (session,)
+    assert synced[0][1]["project_id"] == project_uuid
+    assert synced[0][1]["projection_stream_uuid"] == stream_uuid
+    assert list(synced[0][1]["participant_uuids"]) == []
+
 
 def test_existing_native_direct_message_projection_accepts_either_owner(monkeypatch):
     project_uuid = sys_uuid.uuid4()
@@ -454,12 +466,18 @@ def test_existing_native_direct_message_projection_accepts_either_owner(monkeypa
             owner_uuid, peer_uuid
         ),
     )
+    synced = []
     monkeypatch.setattr(
         external_projection.models,
         "WorkspaceStream",
         types.SimpleNamespace(
             objects=types.SimpleNamespace(get_one_or_none=lambda **_kwargs: stream)
         ),
+    )
+    monkeypatch.setattr(
+        external_projection,
+        "_sync_provider_projection_to_v3",
+        lambda *args, **kwargs: synced.append((args, kwargs)),
     )
 
     external_projection.ensure_external_chat_stream(
@@ -482,6 +500,9 @@ def test_existing_native_direct_message_projection_accepts_either_owner(monkeypa
         account_settings={"server_url": "https://zulip.example.test"},
         reconcile_participants=False,
     )
+
+    assert len(synced) == 1
+    assert set(synced[0][1]["participant_uuids"]) == {owner_uuid, peer_uuid}
 
 
 def test_existing_native_direct_message_projection_rejects_other_participants(
