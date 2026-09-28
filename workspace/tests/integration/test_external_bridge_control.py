@@ -31,6 +31,7 @@ from workspace.external_bridge_control import (
     sql_state,
 )
 from workspace.messenger_api import events as messenger_events
+from workspace.messenger_api import external_projection
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import controllers as messenger_controllers
 from workspace.messenger_api.dm import (
@@ -5114,6 +5115,10 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
     owner_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
     chat_uuids = (sys_uuid.uuid4(), sys_uuid.uuid4())
     provider_owner_ids = ("7", "8")
+    preferred_stream_uuid = sys_uuid.uuid4()
+    preferred_topic_uuid = sys_uuid.uuid4()
+    historical_stream_binding_uuid = sys_uuid.uuid4()
+    historical_topic_binding_uuid = sys_uuid.uuid4()
     for owner_uuid in owner_uuids:
         conftest.seed_user_stream(db, project_uuid, owner_uuid, "Realm alias owner")
     settings = {
@@ -5139,6 +5144,88 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             ) VALUES (%s, %s, 'zulip', %s, TRUE)
             """,
             (instance_uuid, project_uuid, api.user_uuid),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO workspace_v3.users (
+                uuid, created_at, updated_at, username, source, status, avatar
+            ) VALUES (
+                %s, NOW(), NOW(), %s, 'iam', 'active',
+                'urn:gravatar:00000000000000000000000000000000'
+            )
+            ON CONFLICT (uuid) DO NOTHING
+            """,
+            tuple((owner_uuid, f"owner-{owner_uuid}") for owner_uuid in owner_uuids),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.streams (
+                uuid, project_id, name, owner_uuid, source_name
+            ) VALUES (%s, %s, 'Imported history', %s, 'zulip')
+            """,
+            (preferred_stream_uuid, project_uuid, owner_uuids[0]),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.topics (
+                uuid, project_id, stream_uuid, name, source_name
+            ) VALUES (%s, %s, %s, 'general', 'zulip')
+            """,
+            (preferred_topic_uuid, project_uuid, preferred_stream_uuid),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+            ) VALUES (%s, %s, %s, %s, %s, 'owner')
+            """,
+            (
+                historical_stream_binding_uuid,
+                project_uuid,
+                preferred_stream_uuid,
+                owner_uuids[0],
+                owner_uuids[0],
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.topic_bindings (
+                uuid, project_id, stream_uuid, topic_uuid, user_uuid
+            ) VALUES (%s, %s, %s, %s, %s)
+            """,
+            (
+                historical_topic_binding_uuid,
+                project_uuid,
+                preferred_stream_uuid,
+                preferred_topic_uuid,
+                owner_uuids[0],
+            ),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO workspace_v3.provider_entity_states (
+                project_id, provider_uuid, entity_type, entity_uuid,
+                content_hash, source_content_hash, source_updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                (
+                    project_uuid,
+                    instance_uuid,
+                    "stream",
+                    preferred_stream_uuid,
+                    b"s" * 32,
+                    b"s" * 32,
+                ),
+                (
+                    project_uuid,
+                    instance_uuid,
+                    "topic",
+                    preferred_topic_uuid,
+                    b"t" * 32,
+                    b"t" * 32,
+                ),
+            ),
         )
         cursor.execute(
             """
@@ -5199,12 +5286,12 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
 
     observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    def catalog_report(index):
+    def catalog_report(index, *, preferred=False):
         account_uuid = account_uuids[index]
         owner_uuid = owner_uuids[index]
         chat_uuid = chat_uuids[index]
         provider_owner_id = provider_owner_ids[index]
-        return {
+        report = {
             "report_uuid": str(sys_uuid.uuid4()),
             "resource_type": "external_chat_catalog",
             "resource_uuid": str(chat_uuid),
@@ -5252,14 +5339,124 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
                 "capabilities": {"messenger.message.send": {"available": True}},
             },
         }
+        if preferred:
+            report["catalog"]["source"]["projection_stream_uuid"] = str(
+                preferred_stream_uuid
+            )
+            report["catalog"]["topics"][0]["projection_topic_uuid"] = str(
+                preferred_topic_uuid
+            )
+        return report
 
-    for index in range(2):
-        result = _request_call(
-            repository.observed_reports,
-            identity,
-            [catalog_report(index)],
-        )["results"][0]
-        assert result["status"] == "applied"
+    result = _request_call(
+        repository.observed_reports,
+        identity,
+        [catalog_report(0)],
+    )["results"][0]
+    assert result["status"] == "applied"
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT projection_stream_uuid,
+                   (source#>>'{topics,0,topic_uuid}')::uuid
+            FROM m_external_chats_v2 WHERE uuid = %s
+            """,
+            (chat_uuids[0],),
+        )
+        superseded_stream_uuid, superseded_topic_uuid = cursor.fetchone()
+    assert superseded_stream_uuid != preferred_stream_uuid
+
+    # A legacy default topic can survive after the corresponding provider-v3
+    # topic has disappeared.  Archiving the duplicate must not copy that stale
+    # UUID into workspace_v3.streams and fail the deferred FK at COMMIT.
+    stale_legacy_default_topic_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, stream_uuid, name
+            ) VALUES (%s, %s, %s, 'stale legacy default')
+            """,
+            (
+                stale_legacy_default_topic_uuid,
+                project_uuid,
+                superseded_stream_uuid,
+            ),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET default_topic_uuid = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (
+                stale_legacy_default_topic_uuid,
+                project_uuid,
+                superseded_stream_uuid,
+            ),
+        )
+
+    result = _request_call(
+        repository.observed_reports,
+        identity,
+        [catalog_report(0, preferred=True)],
+    )["results"][0]
+    assert result["status"] == "applied"
+
+    result = _request_call(
+        repository.observed_reports,
+        identity,
+        [catalog_report(1, preferred=True)],
+    )["results"][0]
+    assert result["status"] == "applied"
+
+    historical_message_uuid = sys_uuid.uuid4()
+    historical_message_flag_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.messages (
+                uuid, project_id, stream_uuid, topic_uuid, author_uuid,
+                payload, source_name
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                '{"kind":"markdown","content":"historical"}'::jsonb,
+                'zulip'
+            )
+            """,
+            (
+                historical_message_uuid,
+                project_uuid,
+                superseded_stream_uuid,
+                superseded_topic_uuid,
+                owner_uuids[0],
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.message_flags (
+                uuid, project_id, stream_uuid, message_uuid, user_uuid, read
+            ) VALUES (%s, %s, %s, %s, %s, FALSE)
+            """,
+            (
+                historical_message_flag_uuid,
+                project_uuid,
+                superseded_stream_uuid,
+                historical_message_uuid,
+                owner_uuids[0],
+            ),
+        )
+    with contexts.Context().session_manager():
+        session = contexts.Context().get_session()
+        assert (
+            external_projection.rebind_external_chat_messages(
+                session,
+                project_id=project_uuid,
+                source_stream_uuid=superseded_stream_uuid,
+                target_stream_uuid=preferred_stream_uuid,
+            )
+            == 1
+        )
 
     with db.cursor() as cursor:
         cursor.execute(
@@ -5277,6 +5474,8 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
         assert len({row[1] for row in projections}) == 1
         projection_stream_uuid = projections[0][0]
         topic_uuid = projections[0][1]
+        assert projection_stream_uuid == preferred_stream_uuid
+        assert topic_uuid == str(preferred_topic_uuid)
         cursor.execute(
             """
             SELECT resource->'workspace_projection'->'stream'->>'uuid',
@@ -5313,6 +5512,47 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             (project_uuid, projection_stream_uuid, list(owner_uuids)),
         )
         assert {row[0] for row in cursor.fetchall()} == set(owner_uuids)
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, projection_stream_uuid, owner_uuids[0]),
+        )
+        assert cursor.fetchone()[0] == historical_stream_binding_uuid
+
+        cursor.execute(
+            """
+            SELECT legacy.is_archived, canonical.is_archived
+            FROM m_workspace_streams AS legacy
+            JOIN workspace_v3.streams AS canonical
+              ON canonical.project_id = legacy.project_id
+             AND canonical.uuid = legacy.uuid
+            WHERE legacy.project_id = %s AND legacy.uuid = %s
+            """,
+            (project_uuid, superseded_stream_uuid),
+        )
+        assert cursor.fetchone() == (True, True)
+
+        cursor.execute(
+            """
+            SELECT stream_uuid, topic_uuid
+            FROM workspace_v3.messages
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, historical_message_uuid),
+        )
+        assert cursor.fetchone() == (preferred_stream_uuid, preferred_topic_uuid)
+        cursor.execute(
+            """
+            SELECT stream_uuid
+            FROM workspace_v3.message_flags
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, historical_message_flag_uuid),
+        )
+        assert cursor.fetchone()[0] == preferred_stream_uuid
 
         cursor.execute(
             """
@@ -5342,6 +5582,15 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             (project_uuid, projection_stream_uuid),
         )
         assert {row[0] for row in cursor.fetchall()} == set(owner_uuids)
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM workspace_v3.topic_bindings
+            WHERE project_id = %s AND topic_uuid = %s AND user_uuid = %s
+            """,
+            (project_uuid, topic_uuid, owner_uuids[0]),
+        )
+        assert cursor.fetchone()[0] == historical_topic_binding_uuid
         cursor.execute(
             """
             SELECT binding.user_uuid
@@ -5400,7 +5649,8 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             }
         },
     }
-    with session_factory() as session:
+    with contexts.Context().session_manager():
+        session = contexts.Context().get_session()
         assert provider_event_apply.apply_event(
             provider_topic_event,
             session,
@@ -5492,6 +5742,156 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             (chat_uuids[0],),
         )
         assert cursor.fetchone() == (True, projection_stream_uuid)
+
+
+def test_private_projection_does_not_restore_a_stale_physical_owner(
+    _database, db, api
+):
+    project_uuid = sys_uuid.UUID(api.project_id)
+    instance_uuid = sys_uuid.uuid4()
+    stream_uuid = sys_uuid.uuid4()
+    owner_uuid = sys_uuid.uuid4()
+    peer_uuid = sys_uuid.uuid4()
+    stale_owner_uuid = sys_uuid.uuid4()
+    participant_uuids = (owner_uuid, peer_uuid)
+    for user_uuid in (*participant_uuids, stale_owner_uuid):
+        conftest.seed_workspace_user(db, user_uuid, f"user-{user_uuid}")
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.provider_consumers (
+                uuid, project_id, name, iam_user_uuid, enabled
+            ) VALUES (%s, %s, 'zulip', %s, TRUE)
+            """,
+            (instance_uuid, project_uuid, api.user_uuid),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO workspace_v3.users (
+                uuid, created_at, updated_at, username, source, status, avatar
+            ) VALUES (
+                %s, NOW(), NOW(), %s, 'iam', 'active',
+                'urn:gravatar:00000000000000000000000000000000'
+            ) ON CONFLICT (uuid) DO NOTHING
+            """,
+            tuple(
+                (user_uuid, f"user-{user_uuid}")
+                for user_uuid in (*participant_uuids, stale_owner_uuid)
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_streams (
+                uuid, name, description, source_name, source, user_uuid,
+                project_id, private, invite_only
+            ) VALUES (
+                %s, 'Imported direct', '', 'zulip',
+                '{"kind":"zulip","stream_id":0}'::jsonb,
+                %s, %s, TRUE, TRUE
+            )
+            """,
+            (stream_uuid, stale_owner_uuid, project_uuid),
+        )
+        default_topic_uuid = sys_uuid.uuid4()
+        cursor.execute(
+            """
+            INSERT INTO m_workspace_stream_topics (
+                uuid, project_id, stream_uuid, name
+            ) VALUES (%s, %s, %s, 'Provider default')
+            """,
+            (default_topic_uuid, project_uuid, stream_uuid),
+        )
+        cursor.execute(
+            """
+            UPDATE m_workspace_streams
+            SET default_topic_uuid = %s
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (default_topic_uuid, project_uuid, stream_uuid),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO m_workspace_stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+            ) VALUES (%s, %s, %s, %s, %s, 'member')
+            """,
+            tuple(
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    stream_uuid,
+                    user_uuid,
+                    stale_owner_uuid,
+                )
+                for user_uuid in (*participant_uuids, stale_owner_uuid)
+            ),
+        )
+        cursor.execute(
+            """
+            INSERT INTO workspace_v3.streams (
+                uuid, project_id, name, owner_uuid, source_name, private
+            ) VALUES (%s, %s, 'Imported direct', %s, 'zulip', TRUE)
+            """,
+            (stream_uuid, project_uuid, stale_owner_uuid),
+        )
+        cursor.executemany(
+            """
+            INSERT INTO workspace_v3.stream_bindings (
+                uuid, project_id, stream_uuid, user_uuid, who_uuid, role
+            ) VALUES (%s, %s, %s, %s, %s, 'member')
+            """,
+            tuple(
+                (
+                    sys_uuid.uuid4(),
+                    project_uuid,
+                    stream_uuid,
+                    user_uuid,
+                    stale_owner_uuid,
+                )
+                for user_uuid in (owner_uuid, stale_owner_uuid)
+            ),
+        )
+    session_factory = engines.engine_factory.get_engine().session_manager
+    with session_factory() as session:
+        external_projection._sync_provider_projection_to_v3(
+            session,
+            project_id=project_uuid,
+            projection_stream_uuid=stream_uuid,
+            bridge_instance_uuid=instance_uuid,
+            provider_kind="zulip",
+            source={"chat_type": "direct", "topics": []},
+            participant_uuids=participant_uuids,
+            emit_events=False,
+        )
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT user_uuid
+            FROM workspace_v3.stream_bindings
+            WHERE project_id = %s AND stream_uuid = %s
+            ORDER BY user_uuid
+            """,
+            (project_uuid, stream_uuid),
+        )
+        assert {row[0] for row in cursor.fetchall()} == set(participant_uuids)
+        cursor.execute(
+            """
+            SELECT default_topic_uuid
+            FROM workspace_v3.streams
+            WHERE project_id = %s AND uuid = %s
+            """,
+            (project_uuid, stream_uuid),
+        )
+        assert cursor.fetchone() == (default_topic_uuid,)
+        cursor.execute(
+            """
+            SELECT uuid
+            FROM workspace_v3.topics
+            WHERE project_id = %s AND stream_uuid = %s
+            """,
+            (project_uuid, stream_uuid),
+        )
+        assert cursor.fetchall() == [(default_topic_uuid,)]
 
 
 @pytest.mark.parametrize("backend", ["v2", "v3"])
@@ -5625,8 +6025,7 @@ def test_canonical_bridge_file_projection_is_idempotent_and_access_is_current(
             )
             assert cursor.fetchone()[0] == 1
             cursor.execute(
-                "SELECT COUNT(*) FROM m_workspace_file_accesses "
-                "WHERE file_uuid = %s",
+                "SELECT COUNT(*) FROM m_workspace_file_accesses WHERE file_uuid = %s",
                 (file_uuid,),
             )
             assert cursor.fetchone()[0] == 1
@@ -5822,9 +6221,7 @@ def test_external_bridge_file_backfill_populates_v3(_database, db):
         storage_id="",
         storage_object_id=f"external-content/sha256/00/{'0' * 64}",
     )
-    engine = ra_migrations.MigrationEngine(
-        migrations_path=str(conftest.MIGRATIONS_DIR)
-    )
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
     engine._load_migrations()[FILE_BACKFILL_MIGRATION].upgrade(db)
 
     with db.cursor() as cursor:
