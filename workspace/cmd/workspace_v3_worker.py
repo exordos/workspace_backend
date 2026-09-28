@@ -24,8 +24,21 @@ ra_config_opts.register_posgresql_db_opts(CONF)
 workspace_v3_worker_opts.register_opts(CONF)
 
 
-def build_worker_services() -> tuple[agents.WorkspaceV3ProjectionAgent, ...]:
-    services = []
+def build_worker_services() -> tuple[
+    agents.WorkspaceV3ProjectionAgent | agents.WorkspaceV3BaselineAgent, ...
+]:
+    # One capture process owns the bounded, restartable flag scan. Adding
+    # projection workers must not multiply baseline database pressure.
+    baseline = agents.WorkspaceV3BaselineAgent(
+        iter_min_period=CONF[DOMAIN].baseline_page_interval_seconds,
+        iter_pause=0.01,
+    )
+    baseline.add_setup(
+        lambda: engines.engine_factory.configure_postgresql_factory(conf=CONF)
+    )
+    services: list[
+        agents.WorkspaceV3ProjectionAgent | agents.WorkspaceV3BaselineAgent
+    ] = [baseline]
     for _worker_index in range(CONF[DOMAIN].workers):
         service = agents.WorkspaceV3ProjectionAgent(
             iter_min_period=0,

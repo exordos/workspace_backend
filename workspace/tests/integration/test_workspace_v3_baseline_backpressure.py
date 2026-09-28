@@ -289,9 +289,11 @@ def test_upgrade_with_backlog_and_concurrent_live_writes_preserves_final_snapsho
 
     def run_worker():
         worker = _worker()
+        baseline = agents.WorkspaceV3BaselineAgent()
         with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as observer:
             barrier.wait(timeout=5)
             for iteration in range(2000):
+                baseline._iteration()
                 worker._iteration()
                 if _state(observer)[1]:
                     return iteration + 1
@@ -394,6 +396,10 @@ def test_backpressure_downgrade_preserves_baseline_state_and_query_settings(
 
 
 def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, db):
+    if not db.execute(
+        "SELECT rolcreaterole FROM pg_roles WHERE rolname=current_user"
+    ).fetchone()[0]:
+        pytest.skip("requires CREATEROLE to provision the temporary runtime role")
     project, _stream, _topics, _user, _messages = cold_corpus(fixed=False)
     shape_sql = (
         "SELECT proargnames,proargtypes::text,prorettype::regtype::text,"
@@ -504,3 +510,97 @@ def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, d
         db.execute(psycopg.sql.SQL("REASSIGN OWNED BY {} TO {}").format(role_id, owner))
         db.execute(psycopg.sql.SQL("DROP OWNED BY {}").format(role_id))
         db.execute(psycopg.sql.SQL("DROP ROLE {}").format(role_id))
+
+
+def test_capture_commits_while_projection_batch_waits_for_its_lease(
+    cold_corpus, db, record_property
+):
+    project, stream, topics, user, _messages = cold_corpus(
+        topic_count=24, messages_per_topic=500
+    )
+    # Keep actual live work in the queue. Capture must neither wait for its
+    # completion nor add historical snapshot work before ready.
+    counters._messages(db, project, stream, topics[0], user, 3)
+    tasks = support.projections.claim_projection_tasks(db, "cassi-blocked-projection")
+    assert tasks
+    task_ids = [task["uuid"] for task in tasks]
+    entered = threading.Event()
+    worker_pid = []
+
+    def project_batch():
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as worker:
+            worker_pid.append(worker.info.backend_pid)
+            entered.set()
+            with worker.transaction():
+                worker.execute("SET LOCAL statement_timeout='15s'")
+                return support.projections.process_claimed_projection_tasks(
+                    worker, "cassi-blocked-projection", tasks
+                )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        with psycopg.connect(conftest.TEST_DB_URL, autocommit=True) as blocker:
+            with blocker.transaction():
+                blocker.execute(
+                    "SELECT uuid FROM workspace_v3.projection_tasks "
+                    "WHERE uuid=ANY(%s) FOR UPDATE",
+                    (task_ids,),
+                )
+                projection = pool.submit(project_batch)
+                assert entered.wait(timeout=3)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    waiting = db.execute(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
+                        (worker_pid[0],),
+                    ).fetchone()
+                    if waiting == ("Lock",):
+                        break
+                    time.sleep(0.01)
+                else:
+                    raise AssertionError("Projection did not reach the lease lock")
+                queue_before = db.execute(
+                    "SELECT uuid FROM workspace_v3.projection_tasks ORDER BY uuid"
+                ).fetchall()
+                started = time.monotonic()
+                baseline = agents.WorkspaceV3BaselineAgent()
+                for _ in range(6):
+                    baseline._iteration()
+                assert not projection.done()
+                cursor = _state(db)[2]
+                assert not _state(db)[0]
+                # A replacement worker resumes already committed pages.
+                baseline = agents.WorkspaceV3BaselineAgent()
+                for _ in range(20):
+                    baseline._iteration()
+                    if _state(db)[0]:
+                        break
+                elapsed = time.monotonic() - started
+                assert _state(db)[0]
+                assert not _state(db)[1]
+                assert _state(db)[2] > cursor
+                assert not projection.done()
+                assert (
+                    db.execute(
+                        "SELECT uuid FROM workspace_v3.projection_tasks ORDER BY uuid"
+                    ).fetchall()
+                    == queue_before
+                )
+                record_property("capture_flags", 12003)
+                record_property("capture_seconds_with_blocked_projection", elapsed)
+                record_property("capture_flags_per_second", 12003 / elapsed)
+                counters._oracle(db, project)
+        metrics = projection.result(timeout=15)
+        assert metrics["failed"] == 0
+        assert metrics["completed"] == len(tasks)
+    # Capture stops at ready; the projection workers own the snapshot sweep.
+    before = _state(db)
+    baseline._iteration()
+    assert _state(db) == before
+    worker = _worker()
+    for _ in range(10):
+        worker._iteration()
+        if _state(db)[1]:
+            break
+    assert _state(db)[:2] == (True, True)
+    support._drain(db)
+    counters._oracle(db, project)
