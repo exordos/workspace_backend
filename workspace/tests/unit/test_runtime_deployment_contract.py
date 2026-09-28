@@ -137,6 +137,18 @@ def test_messenger_runtime_has_sixteen_workers_with_bounded_pool_budget():
     assert '"workspace-provider-control"' in provider_source
 
 
+def test_external_bridge_control_has_a_dedicated_bounded_pool_budget():
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    external_bridge = manifest.split("[external_bridge_control]", 1)[1].split('"', 1)[0]
+
+    assert "db_pool_min_size = 2" in external_bridge
+    assert "db_pool_max_size = 8" in external_bridge
+
+    provider_source = _read("workspace/cmd/external_bridge_api.py")
+    assert '"connection_pool_min_size"' in provider_source
+    assert '"connection_pool_max_size"' in provider_source
+
+
 def test_postgresql_runtime_has_import_scale_session_tuning():
     for config_path in (
         "etc/workspace/workspace.conf",

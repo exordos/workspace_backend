@@ -567,6 +567,8 @@ resources:
           bind_host = 0.0.0.0
           bootstrap_port = 21085
           https_port = 21443
+          db_pool_min_size = 2
+          db_pool_max_size = 8
           realm_uuid = {$workspace.imports.$core_local_domain:uuid}
           hostname = workspace-bridge-control.{$workspace.imports.$core_local_domain:name}
           persistent_store_path = /var/lib/workspace/external-bridge-control

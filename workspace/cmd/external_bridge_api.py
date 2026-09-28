@@ -80,6 +80,20 @@ def build_runtime(
     conf: cfg.ConfigOpts = CONF,
 ) -> tuple[server.BootstrapServer, server.PrivateServer]:
     options = conf[external_bridge_control_opts.DOMAIN]
+    if options.db_pool_min_size > options.db_pool_max_size:
+        raise ValueError(
+            "External bridge database pool minimum cannot exceed its maximum"
+        )
+    conf.set_override(
+        "connection_pool_min_size",
+        options.db_pool_min_size,
+        group="db",
+    )
+    conf.set_override(
+        "connection_pool_max_size",
+        options.db_pool_max_size,
+        group="db",
+    )
     root = pathlib.Path(options.persistent_store_path)
     _validate_persistent_root(root, options.require_dedicated_filesystem)
     control_pki = pki.PersistentControlPki(
