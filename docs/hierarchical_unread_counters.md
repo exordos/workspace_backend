@@ -27,8 +27,15 @@ The later binding-snapshot stage uses its own indexed binding UUID cursor.
 Function-local planner settings prefer these ordered indexes over a full sort
 after write churn and disable JIT during these small baseline statements.
 The caller settings are restored when the function returns.
-Each page commits separately before ordinary projection work. It then schedules bounded snapshot
-pages. New writes use the same contribution upsert throughout the baseline;
+Migration 0208 also suppresses derived counter and folder-item snapshot tasks
+only inside this baseline function. Exact state and parent deltas still commit.
+This prevents each capture page from generating legacy recomputation jobs that
+block subsequent capture. Existing queued work and canonical live-write tasks
+are preserved. The explicit final binding-snapshot sweep is not suppressed and
+publishes the authoritative topic, stream and folder corrections.
+Each page commits separately before ordinary projection work. The later snapshot
+sweep also schedules bounded pages. New writes use the same contribution upsert
+throughout the baseline;
 there is no reset of source flags. The old capped read path remains available
 until the internal baseline ready marker is true. Subsequent normal reads use
 exact state and incremental parent totals. The worker refreshes metadata only
@@ -65,8 +72,12 @@ that binding from durable exact state and publishes the corrective parent chain.
 Contribution rows are removed as flags become read. Ordinary PostgreSQL vacuum
 reclaims dead tuples; allocated relation bytes can exceed live payload bytes.
 
-Stop the new workers before downgrading the migration or deploying an older
-worker. Downgrade removes derived state only and leaves source messages, flags,
+Downgrading only 0208 restores the previous enqueue behavior without resetting
+cursors, counters or pending tasks; it can restore the slow feedback during an
+unfinished baseline. This small rollback does not require a counter rebuild.
+
+Stop the new workers before downgrading 0207 or deploying an older worker.
+Downgrade removes derived state only and leaves source messages, flags,
 membership and settings intact. The existing parent columns still contain child
 entity units after downgrade. Before accepting an older backend, requeue ordinary
 `read_counters/user_topic` tasks in bounded pages of `topic_bindings.uuid` using

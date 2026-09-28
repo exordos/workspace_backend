@@ -319,12 +319,17 @@ def test_migration_01_restartable_baseline_with_concurrent_flag_write(
     migration = engine._load_migrations()[
         "0207-Maintain-exact-hierarchical-unread-counters-77e2f5.py"
     ]
+    baseline_queue_migration = engine._load_migrations()[
+        "0208-Keep-unread-baseline-snapshots-out-of-the-legacy-projection-queue-ec0e37.py"
+    ]
     with db.transaction():
+        baseline_queue_migration.downgrade(db)
         migration.downgrade(db)
     message_count = 10033 if batch_size == 1000 else 33
     ids = _messages(db, project, stream, topic, user, message_count)
     with db.transaction():
         migration.upgrade(db)
+        baseline_queue_migration.upgrade(db)
     before = api.get(f"/v1/streams/{stream}", user=user, project=project).json()
     assert "unread_topic_count" not in before and "counter_schema_version" not in before
     started = threading.Event()
@@ -963,7 +968,12 @@ def test_counter_read_projection_does_not_scan_unread_history(
     settings = db.execute(
         "SELECT proconfig FROM pg_proc WHERE oid='workspace_v3.advance_unread_baseline(integer)'::regprocedure"
     ).fetchone()[0]
-    assert settings == ["enable_sort=off", "jit=off"]
+    assert settings == [
+        "enable_sort=off",
+        "jit=off",
+        "workspace_v3.suppress_counter_snapshots=on",
+        "workspace_v3.suppress_folder_item_projection=on",
+    ]
     for table in ("message_flags", "topic_bindings"):
         db.execute(f"ANALYZE workspace_v3.{table}")
         for cursor in (
