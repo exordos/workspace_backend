@@ -24,6 +24,7 @@ BASELINE = "0207-Maintain-exact-hierarchical-unread-counters-77e2f5.py"
 BACKPRESSURE = (
     "0208-Keep-unread-baseline-snapshots-out-of-the-legacy-projection-queue-ec0e37.py"
 )
+SORT_BOUNDS = "0209-Bound-unread-counter-trigger-sorting-to-changed-rows-67afe3.py"
 SETTINGS = (
     "workspace_v3.suppress_counter_snapshots",
     "workspace_v3.suppress_folder_item_projection",
@@ -71,6 +72,7 @@ def _cold_corpus(db, *, topic_count=3, messages_per_topic=20, fixed=True):
         steps[BASELINE].upgrade(db)
         if fixed:
             steps[BACKPRESSURE].upgrade(db)
+            steps[SORT_BOUNDS].upgrade(db)
     return project, stream, topics, users[0], messages
 
 
@@ -434,6 +436,12 @@ def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, d
         for function in (
             "advance_unread_baseline(integer)",
             "enqueue_exact_counter_snapshot()",
+            "publish_topic_unread_state()",
+            *(
+                f"{table}_unread_delta_{operation}()"
+                for table in ("unread_contributions", "topic_bindings", "folder_items")
+                for operation in ("insert", "update", "delete")
+            ),
         ):
             db.execute(
                 psycopg.sql.SQL(
@@ -455,6 +463,7 @@ def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, d
             before = _state(runtime)
             with runtime.transaction():
                 _migrations()[BACKPRESSURE].upgrade(runtime)
+                _migrations()[SORT_BOUNDS].upgrade(runtime)
             assert _state(runtime) == before
             assert runtime.execute(shape_sql).fetchone() == original_shape
         # A separate fresh session must execute the function without first
@@ -490,6 +499,7 @@ def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, d
             counters._oracle(runtime, project)
             completed = _state(runtime)
             with runtime.transaction():
+                _migrations()[SORT_BOUNDS].downgrade(runtime)
                 _migrations()[BACKPRESSURE].downgrade(runtime)
             assert _state(runtime) == completed
             assert (
@@ -504,6 +514,7 @@ def test_baseline_upgrade_runtime_and_downgrade_without_superuser(cold_corpus, d
             ).fetchone()[0] == ["enable_sort=off", "jit=off"]
             with runtime.transaction():
                 _migrations()[BACKPRESSURE].upgrade(runtime)
+                _migrations()[SORT_BOUNDS].upgrade(runtime)
             assert _state(runtime) == completed
     finally:
         # Restore object ownership before removing this test-only role's grants.
@@ -603,4 +614,114 @@ def test_capture_commits_while_projection_batch_waits_for_its_lease(
             break
     assert _state(db)[:2] == (True, True)
     support._drain(db)
+    counters._oracle(db, project)
+
+
+def _parent_reads(db):
+    return dict(
+        db.execute(
+            "SELECT relname,seq_tup_read + idx_tup_fetch "
+            "FROM pg_stat_xact_user_tables WHERE schemaname='workspace_v3' "
+            "AND relname IN ('topic_bindings','topic_unread_state')"
+        ).fetchall()
+    )
+
+
+def test_baseline_topic_binding_locks_only_read_changed_rows(
+    cold_corpus, db, record_property
+):
+    project, stream, _topics, user, _messages = cold_corpus(
+        topic_count=12, messages_per_topic=1000
+    )
+    migration = _migrations()[SORT_BOUNDS]
+    before = _state(db)
+    # Roll back the broad, unrelated parent corpus after measuring. Ordinary
+    # triggers create its zero state, so this test needs no replication bypass.
+    with db.transaction():
+        db.execute(
+            """WITH topics AS (
+                INSERT INTO workspace_v3.topics(project_id,uuid,stream_uuid,name)
+                SELECT %s,gen_random_uuid(),%s,'Unrelated counter scope'
+                FROM generate_series(1,20000) RETURNING project_id,uuid,stream_uuid
+            ) INSERT INTO workspace_v3.topic_bindings
+                (project_id,uuid,stream_uuid,topic_uuid,user_uuid)
+            SELECT project_id,gen_random_uuid(),stream_uuid,uuid,%s FROM topics""",
+            (project, stream, user),
+        )
+        for table in ("topic_bindings", "topic_unread_state", "message_flags"):
+            db.execute(f"ANALYZE workspace_v3.{table}")
+        pending = db.execute(
+            "SELECT count(*) FROM workspace_v3.projection_tasks"
+        ).fetchone()[0]
+        reads = {}
+        for fixed in (False, True):
+            if fixed:
+                migration.upgrade(db)
+            else:
+                migration.downgrade(db)
+            with db.transaction():
+                old = _parent_reads(db)
+                started = time.monotonic()
+                assert (
+                    db.execute(
+                        "SELECT workspace_v3.advance_unread_baseline(1000)"
+                    ).fetchone()[0]
+                    == 1000
+                )
+                elapsed = time.monotonic() - started
+                reads[fixed] = {
+                    table: count - old[table]
+                    for table, count in _parent_reads(db).items()
+                }
+                record_property(f"sort_enabled_{fixed}_page_seconds", elapsed)
+                record_property(f"sort_enabled_{fixed}_parent_reads", reads[fixed])
+                assert (
+                    db.execute(
+                        "SELECT count(*) FROM workspace_v3.projection_tasks"
+                    ).fetchone()[0]
+                    == pending
+                )
+                raise psycopg.Rollback
+            assert _state(db) == before
+        # Assert work, not wall time: publishing a 1000-flag page must not read
+        # unrelated bindings, including on empty UPDATE transitions. A grouped
+        # state UPDATE can still legitimately choose a hash join with its table.
+        assert reads[False]["topic_bindings"] >= 20000
+        assert reads[True]["topic_bindings"] < 2000
+        assert reads[True]["topic_unread_state"] <= reads[False]["topic_unread_state"]
+        raise psycopg.Rollback
+    assert _state(db) == before
+
+
+def test_counter_sort_migration_restores_settings_and_preserves_progress(
+    cold_corpus, db
+):
+    project, _stream, _topics, _user, _messages = cold_corpus()
+    migration = _migrations()[SORT_BOUNDS]
+    before = _state(db)
+    migration.upgrade(db)
+    assert _state(db) == before
+    with db.transaction():
+        db.execute("SET LOCAL enable_sort=off")
+        db.execute("SELECT workspace_v3.advance_unread_baseline(7)")
+        assert db.execute("SHOW enable_sort").fetchone()[0] == "off"
+    after = _state(db)
+    assert after[2] > before[2]
+    migration.downgrade(db)
+    assert _state(db) == after
+    assert (
+        db.execute(
+            "SELECT proconfig FROM pg_proc "
+            "WHERE oid='workspace_v3.publish_topic_unread_state()'::regprocedure"
+        ).fetchone()[0]
+        is None
+    )
+    migration.upgrade(db)
+    assert _state(db) == after
+    for function in ("advance_unread_baseline", "advance_unread_baseline_page"):
+        assert db.execute(
+            "SELECT proconfig FROM pg_proc WHERE oid=%s::regprocedure",
+            (f"workspace_v3.{function}(integer)",),
+        ).fetchone()[0] == ["enable_sort=off", "jit=off"]
+    _finish(db)
     counters._oracle(db, project)
