@@ -16,6 +16,25 @@ from restalchemy.common import contexts
 from workspace.workspace_v3 import projections
 
 LOG = logging.getLogger(__name__)
+COUNTER_BASELINE_BATCH_SIZE = 1000
+
+
+class WorkspaceV3BaselineAgent(basic.BasicService):
+    """Capture bounded flag pages independently of projection queue latency."""
+
+    def _iteration(self) -> None:
+        ctx = contexts.Context()
+        with ctx.session_manager() as session:
+            result = session.execute(
+                "SELECT workspace_v3.advance_unread_baseline(%s) AS advanced "
+                "FROM workspace_v3.unread_counter_baseline WHERE NOT ready",
+                (COUNTER_BASELINE_BATCH_SIZE,),
+            ).fetchone()
+        # A completed capture needs only an occasional poll (including after
+        # a migration resets the baseline). Final snapshots remain paced by
+        # the projection workers, so capture cannot flood their queue.
+        if result is None or result["advanced"] == 0:
+            time.sleep(1.0)
 
 
 class WorkspaceV3ProjectionAgent(basic.BasicService):
@@ -61,6 +80,13 @@ class WorkspaceV3ProjectionAgent(basic.BasicService):
             with ctx.session_manager() as session:
                 pruned_events = projections.prune_event_journal(session)
             self._event_pruned_at = now
+        with ctx.session_manager() as session:
+            session.execute(
+                "SELECT workspace_v3.advance_unread_baseline(%s) "
+                "FROM workspace_v3.unread_counter_baseline "
+                "WHERE ready AND NOT snapshots_complete",
+                (COUNTER_BASELINE_BATCH_SIZE,),
+            )
         with ctx.session_manager() as session:
             tasks = projections.claim_projection_tasks(
                 session,

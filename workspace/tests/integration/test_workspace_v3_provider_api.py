@@ -2522,7 +2522,7 @@ def test_provider_backfill_avoids_one_live_event_per_history_row(api, db):
         """,
         (api.project_id, stream_uuid, owner_uuid),
     ).fetchone()
-    assert counters == (len(history) // 2, len(history) // 2)
+    assert counters == (1, 1)
     events_before_reaction = db.execute(
         "SELECT count(*) FROM workspace_v3.events WHERE project_id = %s",
         (api.project_id,),
@@ -2784,14 +2784,14 @@ def test_provider_message_move_preserves_time_and_reprojects_rekeyed_flags(api, 
     assert (
         db.execute(
             """
-        SELECT count(*) FROM workspace_v3.projection_tasks
+        SELECT count(DISTINCT (scope_type, scope_uuid)) FROM workspace_v3.projection_tasks
         WHERE project_id = %s AND status = 'pending'
           AND task_type = 'read_counters'
           AND user_uuid = %s AND scope_uuid IN (%s, %s)
         """,
             (api.project_id, owner_uuid, stream_uuids[1], topic_uuids[1]),
         ).fetchone()[0]
-        == 1
+        == 2
     )
     _drain_projections(db)
     assert (

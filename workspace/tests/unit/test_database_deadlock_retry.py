@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import webob
+import pytest
 
 from workspace.messenger_api.api import middlewares
 
@@ -110,3 +111,50 @@ def test_idempotent_read_state_request_returns_safe_retryable_error(monkeypatch)
     assert "Process 123" not in response.text
     assert "DETAIL" not in response.text
     assert len(attempts) == middlewares.DATABASE_DEADLOCK_MAX_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/v1/provider/entities/actions/apply/invoke"),
+        ("PUT", "/v1/provider/entities/messages/11111111-1111-1111-1111-111111111111"),
+        (
+            "DELETE",
+            "/v1/provider/entities/message_flags/11111111-1111-1111-1111-111111111111",
+        ),
+    ],
+)
+def test_provider_transaction_retry_rewinds_body_and_preserves_final_error(
+    monkeypatch, method, path
+):
+    bodies = []
+
+    @webob.dec.wsgify
+    def downstream(req):
+        bodies.append(req.body)
+        raise _DeadlockDetected("synthetic collision")
+
+    monkeypatch.setattr(middlewares.time, "sleep", lambda _delay: None)
+    req = webob.Request.blank(
+        path, method=method, body=b'{"operations":[]}', content_type="application/json"
+    )
+    with pytest.raises(_DeadlockDetected):
+        req.get_response(middlewares.DatabaseDeadlockRetryMiddleware(downstream))
+    assert bodies == [b'{"operations":[]}'] * middlewares.DATABASE_DEADLOCK_MAX_ATTEMPTS
+
+
+def test_toggle_done_remains_excluded_from_transaction_retry(monkeypatch):
+    attempts = []
+
+    @webob.dec.wsgify
+    def downstream(_req):
+        attempts.append(1)
+        raise _DeadlockDetected("synthetic collision")
+
+    req = webob.Request.blank(
+        "/v1/stream_topics/11111111-1111-1111-1111-111111111111/actions/toggle_done/invoke",
+        method="POST",
+    )
+    with pytest.raises(_DeadlockDetected):
+        req.get_response(middlewares.DatabaseDeadlockRetryMiddleware(downstream))
+    assert attempts == [1]

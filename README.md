@@ -94,6 +94,28 @@ Files use the configured S3-compatible storage backend. PostgreSQL stores file
 metadata and ACL state; S3 stores file bytes and JSON sidecars. Messages contain
 authorized URNs, never binary MIME parts.
 
+## Unread baseline recovery
+
+The Workspace v3 worker starts one additional process for unread flag capture,
+independent of the configured projection worker count. It commits at most 1,000
+flags per transaction and preserves the database cursor across restarts. Slow
+projection batches therefore do not delay the next capture page.
+
+`[workspace_v3_projection_worker] baseline_page_interval_seconds` sets the
+minimum interval between capture pages (default `0.1`). Increase it to reduce
+recovery I/O pressure. The capture process needs its own database connection
+pool; include it in the deployment connection budget. Capture uses the existing
+row locks, contribution upserts, and exact counter triggers. Contended rows can
+still delay a page, so estimate completion from observed cursor progress and
+page latency on the target database.
+
+After `unread_counter_baseline.ready` becomes true, projection workers perform
+the bounded final snapshot sweep at their existing cadence. The capture process
+does not enqueue these pages independently. Recovery is complete only when
+`snapshots_complete` is true and the resulting projection tasks have completed.
+This scheduling change requires no new migration and preserves the public API,
+client counter units, and event payloads.
+
 ## Local development
 
 The project virtual environment is expected at `.tox/develop`.

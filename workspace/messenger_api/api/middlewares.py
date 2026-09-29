@@ -40,6 +40,12 @@ _IDEMPOTENT_READ_ACTION_PATH = re.compile(
     rf"|^/{versions.API_VERSION_1_0}/messages/[^/]+/"
     r"actions/(?:read|read_up_to)/invoke/?$"
 )
+_IDEMPOTENT_PROVIDER_ENTITY_PATH = re.compile(
+    rf"^/{versions.API_VERSION_1_0}/provider/entities/[^/]+/[^/]+/?$"
+)
+_PROVIDER_APPLY_PATH = (
+    f"/{versions.API_VERSION_1_0}/provider/entities/actions/apply/invoke"
+)
 _FILE_DOWNLOAD_PATH = re.compile(
     rf"^/{versions.API_VERSION_1_0}/files/[^/]+/actions/download/?$"
 )
@@ -118,11 +124,20 @@ def _is_database_deadlock(error: BaseException) -> bool:
 
 
 class DatabaseDeadlockRetryMiddleware(middlewares.Middleware):
-    """Replay only transactionally idempotent read-state requests."""
+    """Replay transaction-only idempotent read-state and provider writes."""
 
     @webob.dec.wsgify
     def __call__(self, req: typing.Any) -> typing.Any:
-        if req.method != "POST" or not _IDEMPOTENT_READ_ACTION_PATH.fullmatch(req.path):
+        provider_write = (
+            req.method == "POST" and req.path.rstrip("/") == _PROVIDER_APPLY_PATH
+        ) or (
+            req.method in {"PUT", "DELETE"}
+            and _IDEMPOTENT_PROVIDER_ENTITY_PATH.fullmatch(req.path) is not None
+        )
+        read_action = req.method == "POST" and _IDEMPOTENT_READ_ACTION_PATH.fullmatch(
+            req.path
+        )
+        if not (read_action or provider_write):
             return req.get_response(self.application)
 
         body = req.body
@@ -134,6 +149,10 @@ class DatabaseDeadlockRetryMiddleware(middlewares.Middleware):
                 if not _is_database_deadlock(error):
                     raise
                 if attempt == DATABASE_DEADLOCK_MAX_ATTEMPTS:
+                    if provider_write:
+                        # Preserve the existing provider error response after
+                        # exhausting retries; only aborted transactions replay.
+                        raise
                     LOG.exception(
                         "Idempotent read-state transaction exhausted PostgreSQL "
                         "deadlock retries",
@@ -148,7 +167,7 @@ class DatabaseDeadlockRetryMiddleware(middlewares.Middleware):
                 delay = DATABASE_DEADLOCK_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
                 delay *= random.uniform(0.75, 1.25)
                 LOG.warning(
-                    "Retrying idempotent read-state transaction after "
+                    "Retrying idempotent database transaction after "
                     "PostgreSQL deadlock",
                     extra={
                         "deadlock_retry_attempt": attempt,

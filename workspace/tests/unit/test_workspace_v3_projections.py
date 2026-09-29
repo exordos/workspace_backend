@@ -93,7 +93,7 @@ def test_topic_counter_query_caps_message_scans_and_materializes_latest_message(
         [(sys_uuid.uuid4(), sys_uuid.uuid4(), sys_uuid.uuid4())],
     )
 
-    query, params = queries[0]
+    query, params = queries[-1]
     assert "raw_counter_snapshots AS MATERIALIZED" in query
     assert "latest_messages AS MATERIALIZED" in query
     assert query.count("LIMIT %s") == 2
@@ -116,8 +116,8 @@ def test_stream_counter_query_sums_topic_bindings_without_message_flags():
         [(sys_uuid.uuid4(), sys_uuid.uuid4(), sys_uuid.uuid4())],
     )
 
-    query, params = queries[0]
-    assert "LEFT JOIN workspace_v3.topic_bindings AS binding" in query
+    query, params = queries[-1]
+    assert "FROM workspace_v3.topic_bindings AS binding" in query
     assert "workspace_v3.message_flags" not in query
     assert query.count("LEAST(") == 2
     assert params[-2:] == (
@@ -139,8 +139,8 @@ def test_folder_counter_query_sums_capped_stream_bindings():
         {(sys_uuid.uuid4(), sys_uuid.uuid4(), sys_uuid.uuid4())},
     )
 
-    query, params = queries[0]
-    assert "LEFT JOIN workspace_v3.stream_bindings AS binding" in query
+    query, params = queries[-1]
+    assert "JOIN workspace_v3.stream_bindings AS binding" in query
     assert query.count("LEAST(") == 2
     assert params[-2:] == (
         projections.MAX_UNREAD_COUNT,

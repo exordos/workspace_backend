@@ -9,6 +9,13 @@ from oslo_config import cfg
 DOMAIN = "workspace_v3_projection_worker"
 
 worker_opts = [
+    cfg.FloatOpt(
+        "baseline-page-interval-seconds",
+        default=0.1,
+        min=0.01,
+        max=10.0,
+        help="Minimum interval between independently committed unread flag pages",
+    ),
     cfg.IntOpt(
         "workers",
         default=1,
