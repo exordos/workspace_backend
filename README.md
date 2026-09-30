@@ -4,12 +4,12 @@ Backend services for **Genesis Workspace Messenger**. The public Messenger API
 is IAM-authenticated and preserves the existing REST and realtime contracts.
 Canonical Messenger persistence is PostgreSQL.
 
-The browser-facing contract does not expose mail or calendar APIs. Provider
-runtimes use the private, bridge-authenticated Workspace Provider HTTP API at
-`/api/workspace-provider/v1`; it projects ordinary Messenger resources into the
-same public API used by the UI. Messenger attachments continue to use the
-configured S3-compatible file storage and IAM remains the source of users and
-authentication.
+External accounts are an owner-scoped registry with a required `provider` and
+generic `settings`. Creating an account does not connect or synchronize it.
+External services handle provider processing. Workspace messages and chats
+retain `source_name: native` and `source: {"kind": "native"}` and use ordinary
+membership permissions. Attachments use the configured file storage and IAM
+remains the source of authentication.
 
 The rendered documentation is published at
 https://exordos.github.io/workspace_backend/ and is available in four
@@ -22,24 +22,11 @@ languages with the same file and section structure:
 
 English contracts and integration guidance:
 
-- [`docs/en/architecture.md`](docs/en/architecture.md)
 - [`docs/en/workspace_api.md`](docs/en/workspace_api.md)
 - [`docs/en/workspace_ui_realtime_integration.md`](docs/en/workspace_ui_realtime_integration.md)
-- [`docs/workspace_provider_api_v1.yaml`](docs/workspace_provider_api_v1.yaml)
-- [`docs/workspace_provider_api_v2.yaml`](docs/workspace_provider_api_v2.yaml)
-- [`docs/en/workspace_server_v2_decisions.md`](docs/en/workspace_server_v2_decisions.md)
+- [`docs/public_workspace_api.yaml`](docs/public_workspace_api.yaml)
 
-Provider product, control-plane, file-boundary, and reusable acceptance
-contracts:
-
-- [`docs/en/zulip_bridge_v1_product_and_api.md`](docs/en/zulip_bridge_v1_product_and_api.md)
-- [`docs/zulip_bridge_control_api_v1.yaml`](docs/zulip_bridge_control_api_v1.yaml)
-- [`docs/zulip_bridge_file_api_v1.yaml`](docs/zulip_bridge_file_api_v1.yaml)
-- [`docs/en/zulip_bridge_v1_test_plan.md`](docs/en/zulip_bridge_v1_test_plan.md)
-
-The private Provider, control, and file specifications are not browser routes.
-The generated public Workspace and Messenger specification remains OpenAPI
-3.0.3 and preserves the existing UI contract.
+The generated public Workspace and Messenger specification uses OpenAPI 3.0.3.
 
 ## Runtime entry points
 
@@ -48,7 +35,6 @@ Direct local services:
 - Messenger REST API: `http://127.0.0.1:21081/v1`
 - WebSocket API: `ws://127.0.0.1:21082/v1/events/ws`
 - Workspace REST API: `http://127.0.0.1:21084/v1`
-- Private bridge control and Provider API: `workspace-external-bridge-api`
 - Messenger worker: `workspace-messenger-worker`
 - Messenger OpenAPI spec: `http://127.0.0.1:21081/specifications/3.0.3`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
@@ -72,7 +58,7 @@ refreshes `workspace/latest`. Updating the UI does not rebuild or replace the
 backend VM.
 
 `GET /v1/messenger/server_settings` is public and is handled by middleware for
-Zulip-compatible client bootstrap behavior. Its `realm_icon` is a public URL
+Workspace client bootstrap behavior. Its `realm_icon` is a public URL
 URN derived from the canonical request realm as
 `urn:url:<realm>/logo-512x512.png`; the `workspace_ui` load balancer serves that
 path from its versioned web artifact. All other Workspace and Messenger
@@ -87,7 +73,7 @@ sends a `ready` control frame before it can deliver live events.
 ## Storage
 
 PostgreSQL is the source of truth for messages, membership, user state, events,
-provider mappings, and client settings. Messenger has no SMTP, IMAP, Exim,
+external-account registration, and client settings. Messenger has no SMTP, IMAP, Exim,
 Dovecot, or Maildir runtime dependency.
 
 Files use the configured S3-compatible storage backend. PostgreSQL stores file

@@ -161,8 +161,8 @@ def test_message_mutations_use_dedicated_canonical_store_operations(fake_store):
 
     assert created["source_name"] == "native"
     assert created["source"] == {"kind": "native"}
-    assert created["provider"] is None
-    assert created["delivery"] is None
+    assert "provider" not in created
+    assert "delivery" not in created
     assert updated["uuid"] == MESSAGE_UUID
     assert deleted == {"uuid": MESSAGE_UUID}
     assert [call[0] for call in fake_store.calls] == [
@@ -287,24 +287,6 @@ def test_event_pagination_pushes_limit_plus_one_into_visible_event_query(fake_st
             {"limit": 3},
         ),
     ]
-
-
-def test_reaction_mutations_reject_internal_provider_projection_fields(fake_store):
-    controller = _controller(controllers.WorkspaceMessageReactionController)
-
-    with pytest.raises(Exception):
-        controller.create(
-            message_uuid=MESSAGE_UUID,
-            emoji_name="eyes",
-            provider_uuid=sys_uuid.uuid4(),
-        )
-    with pytest.raises(Exception):
-        controller.update(
-            sys_uuid.uuid4(),
-            delivery_status="pending",
-        )
-
-    assert fake_store.calls == []
 
 
 def test_draft_mutations_use_postgres_only_store_operations_and_if_match(fake_store):

@@ -15,9 +15,9 @@
 #    under the License.
 
 import datetime
-import dataclasses
 import concurrent.futures
 import io
+import json
 import threading
 import types
 import uuid as sys_uuid
@@ -117,7 +117,9 @@ def test_local_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
 
     file_storage.save_workspace_file_metadata(metadata)
 
-    assert file_storage.read_workspace_file_metadata(file_uuid) == metadata
+    assert (
+        file_storage.get_workspace_file_storage().read_metadata(file_uuid) == metadata
+    )
     metadata_path = tmp_path / file_storage.get_workspace_file_metadata_object_id(
         file_uuid,
     )
@@ -125,22 +127,6 @@ def test_local_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
 
     file_storage.delete_workspace_file_metadata(file_uuid)
     assert not metadata_path.exists()
-
-
-def test_local_storage_lists_stable_object_ids_without_temporary_files(
-    tmp_path,
-    monkeypatch,
-):
-    _patch_conf(monkeypatch, tmp_path)
-    storage = file_storage.LocalWorkspaceFileStorage()
-    first_uuid = sys_uuid.uuid4()
-    second_uuid = sys_uuid.uuid4()
-    first = storage.save(first_uuid, b"first").storage_object_id
-    second = storage.save(second_uuid, b"second").storage_object_id
-    temporary = tmp_path / f"{first}.tmp"
-    temporary.write_bytes(b"partial")
-
-    assert storage.list_object_ids() == sorted((first, second))
 
 
 def test_local_storage_concurrent_replay_uses_distinct_temporary_files(
@@ -172,28 +158,17 @@ def test_local_storage_concurrent_replay_uses_distinct_temporary_files(
     assert storage.read(file_uuid) in {b"first", b"second"}
 
 
-def test_local_storage_reads_external_provider_sidecar_v2(tmp_path, monkeypatch):
+def test_local_storage_reads_legacy_sidecar_without_origin(tmp_path, monkeypatch):
     _patch_conf(monkeypatch, tmp_path)
-    file_uuid = sys_uuid.uuid4()
-    metadata = dataclasses.replace(
-        _metadata(file_uuid),
-        origin={
-            "kind": "external_provider",
-            "provider_kind": "zulip",
-            "external_account_uuid": str(sys_uuid.uuid4()),
-            "external_chat_uuid": str(sys_uuid.uuid4()),
-            "operation_uuid": str(sys_uuid.uuid4()),
-        },
+    metadata = _metadata(sys_uuid.uuid4())
+    payload = json.loads(metadata.to_json())
+    payload["schema_version"] = 2
+    payload["origin"] = {"kind": "legacy"}
+    restored = file_storage.WorkspaceFileMetadata.from_json(
+        json.dumps(payload).encode()
     )
-
-    file_storage.save_workspace_file_metadata(metadata)
-
-    assert file_storage.read_workspace_file_metadata(file_uuid) == metadata
-    payload = (
-        tmp_path / file_storage.get_workspace_file_metadata_object_id(file_uuid)
-    ).read_bytes()
-    assert b'"schema_version":2' in payload
-    assert b'"kind":"external_provider"' in payload
+    assert restored == metadata
+    assert "origin" not in json.loads(restored.to_json())
 
 
 def test_public_file_metadata_has_no_stream_uuid(tmp_path, monkeypatch):
@@ -203,7 +178,9 @@ def test_public_file_metadata_has_no_stream_uuid(tmp_path, monkeypatch):
 
     file_storage.save_workspace_file_metadata(metadata)
 
-    assert file_storage.read_workspace_file_metadata(file_uuid) == metadata
+    assert (
+        file_storage.get_workspace_file_storage().read_metadata(file_uuid) == metadata
+    )
     metadata_path = tmp_path / file_storage.get_workspace_file_metadata_object_id(
         file_uuid,
     )
@@ -317,24 +294,3 @@ def test_s3_storage_keeps_file_metadata_and_acl(tmp_path, monkeypatch):
         Bucket="workspace-files",
         Key=object_id,
     )
-
-
-def test_s3_storage_lists_every_paginated_object(tmp_path, monkeypatch):
-    _patch_conf(monkeypatch, tmp_path)
-    client = mock.Mock()
-    client.list_objects_v2.side_effect = [
-        {
-            "Contents": [{"Key": "z"}],
-            "IsTruncated": True,
-            "NextContinuationToken": "next",
-        },
-        {"Contents": [{"Key": "a"}], "IsTruncated": False},
-    ]
-    storage = file_storage.S3WorkspaceFileStorage()
-    storage._client = client
-
-    assert storage.list_object_ids() == ["a", "z"]
-    assert client.list_objects_v2.call_args_list == [
-        mock.call(Bucket="workspace-files"),
-        mock.call(Bucket="workspace-files", ContinuationToken="next"),
-    ]

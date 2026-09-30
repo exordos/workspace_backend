@@ -188,13 +188,3 @@ def open_event_store(
     """Open the lightweight per-user event journal without project replay."""
 
     return _event_store_factory(project_uuid, user_uuid)
-
-
-def move_stream_projection(**kwargs: typing.Any) -> None:
-    """Move one stream through the configured canonical storage adapter."""
-    move = getattr(_store_factory, "move_stream_projection", None)
-    if move is None:
-        raise StoreNotConfigured(
-            "Configured Messenger store cannot move stream projections"
-        )
-    move(**kwargs)

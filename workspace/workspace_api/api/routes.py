@@ -22,17 +22,6 @@ class MessengerRoute(routes.Route):
     messages = routes.route(messenger_routes.WorkspaceMessageRoute)
     drafts = routes.route(messenger_routes.WorkspaceDraftRoute)
     external_accounts = routes.route(messenger_routes.ExternalAccountRoute)
-    external_chats = routes.route(messenger_routes.ExternalChatRoute)
-    external_operations = routes.route(messenger_routes.ExternalOperationRoute)
-    external_bridge_instances = routes.route(
-        messenger_routes.ExternalBridgeInstanceRoute,
-    )
-    external_provider_policies = routes.route(
-        messenger_routes.ExternalProviderPolicyRoute,
-    )
-    external_provider_health = routes.route(
-        messenger_routes.ExternalProviderHealthRoute,
-    )
     topic_summary_endpoints = routes.route(
         messenger_routes.TopicSummaryEndpointRoute,
     )

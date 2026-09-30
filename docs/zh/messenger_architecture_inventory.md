@@ -2,7 +2,7 @@
 
 状态: **提案; 机器检查的文档词典, 不 production schema**.
 
-[← 文件的主要索引](index.md) · [域名模型](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · [Zulip Bridge proposal](zulip_bridge/README.md)
+[← 文件的主要索引](index.md) · [域名模型](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal
 
 这份文件是唯一的名称,密钥,,
 UUID-算法,任务/事件类型和剩余的 OPEN 解决方案.详细
@@ -225,11 +225,11 @@ at-least-once and clients dedupe by event UUID.
 
 Target ingestion, service identity, registration boundary 对于
 Zulip 没有重复本文库的
-[`zulip_bridge/README.md`](zulip_bridge/README.md). 它的 OPEN-list 具体化
+`zulip_bridge/README.md`. 它的 OPEN-list 具体化
 transport/provider-key 桥的问题;当前mTLS验证已经选择,
 而是共同的 Messenger model/task/event
 他们的名字仍然是正规的.Zulip event/op方向和
 echo-prevention boundary 规范性规定在
-[`zulip_bridge/event_coverage.md`](zulip_bridge/event_coverage.md).
+`zulip_bridge/event_coverage.md`.
 
-[← 文件的主要索引](index.md) · [域名模型](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · [Zulip Bridge proposal](zulip_bridge/README.md)
+[← 文件的主要索引](index.md) · [域名模型](messenger_domain_model.md) · [RestAlchemy API](messenger_restalchemy_api_spec.md) · [Sequence index](diagrams/sequence/README.md) · Zulip Bridge proposal

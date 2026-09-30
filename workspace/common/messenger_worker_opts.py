@@ -27,19 +27,12 @@ messenger_worker_opts = [
         min=1,
         help="Maximum browser event rows removed in one retention pass",
     ),
-    cfg.IntOpt(
-        "heartbeat-retention-seconds",
-        default=24 * 60 * 60,
-        min=60 * 60,
-        help="Private bridge heartbeat idempotency history in seconds",
-    ),
     cfg.BoolOpt(
         "read-state-compaction-enabled",
         default=False,
         help=(
             "Enable resumable legacy unread-state cutover only after every "
-            "Workspace API and worker process uses the current revision and "
-            "connected bridges advertise bounded read result retention"
+            "Workspace API and worker process uses the current revision"
         ),
     ),
     cfg.BoolOpt(
@@ -47,8 +40,7 @@ messenger_worker_opts = [
         default=False,
         help=(
             "Delete redundant legacy unread rows only after every Workspace "
-            "API and worker process uses the current revision and connected "
-            "bridges advertise bounded read result retention"
+            "API and worker process uses the current revision"
         ),
     ),
     cfg.IntOpt(

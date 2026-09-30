@@ -26,11 +26,9 @@ from restalchemy.common import contexts
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api import events as messenger_events
-from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import v2_models
-from workspace.external_bridge_control import file_repository
 
 
 LOG = logging.getLogger(__name__)
@@ -73,79 +71,6 @@ LEGACY_FOLDER_SNAPSHOT_SOURCE_KINDS = (
     "legacy_message_state.deleted",
     "legacy_message_state.updated",
 )
-
-
-def process_one_provider_file_cleanup_task(
-    session: typing.Any,
-    worker_id: str,
-    lease_seconds: int = DEFAULT_LEASE_SECONDS,
-) -> bool:
-    """Delete one reset Zulip object after its database references are gone."""
-    task = session.execute(
-        """
-        WITH candidate AS (
-            SELECT uuid
-            FROM messenger_provider_file_cleanup_tasks
-            WHERE status IN ('pending', 'failed')
-              AND next_retry_at <= NOW()
-              AND (lease_expires_at IS NULL OR lease_expires_at <= NOW())
-            ORDER BY created_at, uuid
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE messenger_provider_file_cleanup_tasks AS task
-        SET status = 'running', attempts = attempts + 1,
-            lease_owner = %s,
-            lease_expires_at = NOW() + make_interval(secs => %s),
-            updated_at = NOW()
-        FROM candidate
-        WHERE task.uuid = candidate.uuid
-        RETURNING task.*
-        """,
-        (worker_id, lease_seconds),
-    ).fetchone()
-    if task is None:
-        return False
-    try:
-        file_repository.delete_storage_object_if_unreferenced(
-            session,
-            task["file_uuid"],
-            task["storage_type"],
-            task["storage_id"],
-            task["storage_object_id"],
-        )
-        file_storage.delete_workspace_file_metadata(
-            _uuid(task["file_uuid"]),
-            storage_type=task["storage_type"],
-        )
-    except Exception as error:
-        delay_seconds = min(5 * (2 ** min(int(task["attempts"]) - 1, 8)), 1200)
-        session.execute(
-            """
-            UPDATE messenger_provider_file_cleanup_tasks
-            SET status = 'failed', safe_error = %s,
-                lease_owner = NULL, lease_expires_at = NULL,
-                next_retry_at = NOW() + make_interval(secs => %s),
-                updated_at = NOW()
-            WHERE uuid = %s AND lease_owner = %s
-            """,
-            (type(error).__name__[:128], delay_seconds, task["uuid"], worker_id),
-        )
-        LOG.exception(
-            "Failed to delete reset Zulip file content",
-            extra={"provider_file_cleanup_uuid": str(task["uuid"])},
-        )
-        return True
-    session.execute(
-        """
-        UPDATE messenger_provider_file_cleanup_tasks
-        SET status = 'completed', safe_error = NULL,
-            lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW()
-        WHERE uuid = %s AND lease_owner = %s
-        """,
-        (task["uuid"], worker_id),
-    )
-    return True
 
 
 def _plain(value: object) -> object:

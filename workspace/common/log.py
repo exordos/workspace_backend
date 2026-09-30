@@ -16,8 +16,6 @@
 
 import logging
 from logging import config as logging_config
-import sys
-from typing import NoReturn
 
 from oslo_config import cfg
 import yaml
@@ -59,10 +57,6 @@ logging_opts = [
 cfg.CONF.register_cli_opts(logging_opts, "logging")
 
 
-class ConfigNotFound(Exception):
-    pass
-
-
 def configure() -> None:
     config = cfg.CONF.logging.config
     config_file = cfg.CONF.find_file(config)
@@ -79,8 +73,3 @@ def configure() -> None:
         logging.getLogger(__name__).warning(
             "Logging configuration %s not found - using defaults", config
         )
-
-
-def die(logger: logging.Logger, message: str) -> NoReturn:
-    logger.error(message)
-    sys.exit(1)

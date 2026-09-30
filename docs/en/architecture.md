@@ -1,10 +1,12 @@
 # Workspace Messenger Architecture
 
+Historical reference. This page describes the retired private bridge HTTP and mTLS/HPKE design. The current backend has no private bridge listener.
+
 This document defines the current Workspace backend service boundaries and
 data ownership. The browser contract remains in
 [`workspace_api.md`](workspace_api.md), the private provider data plane is
 defined by
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml), and
+`workspace_provider_api_v1.yaml`, and
 realtime client behavior is documented in
 [`workspace_ui_realtime_integration.md`](workspace_ui_realtime_integration.md).
 

@@ -57,37 +57,11 @@ class Color(types.Integer):
         return super().to_openapi_spec(prop_kwargs)
 
 
-class ZulipSource(types_dynamic.AbstractKindModel):
-    KIND = "zulip"
-
-    stream_id = properties.property(
-        types.Integer(min_value=0, max_value=2**31 - 1),
-        required=True,
-    )
-    server_url = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-    )
-    source_scope = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-    )
-    topic_name = properties.property(
-        types.AllowNone(types.String(max_length=128)),
-        default=None,
-    )
-    message_id = properties.property(
-        types.AllowNone(types.Integer(min_value=0, max_value=2**63 - 1)),
-        default=None,
-    )
-
-
 class NativeSource(types_dynamic.AbstractKindModel):
     KIND = "native"
 
 
 class SourceName(str, enum.Enum):
-    ZULIP = ZulipSource.KIND
     NATIVE = NativeSource.KIND
 
 
@@ -102,7 +76,6 @@ class WorkspaceSourceBase(models.Model):
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
             types_dynamic.KindModelType(NativeSource),
         ),
         default=native_source,
@@ -258,7 +231,6 @@ class WorkspaceStreamBase(
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
             types_dynamic.KindModelType(NativeSource),
         ),
         required=True,
@@ -311,7 +283,7 @@ class WorkspaceStreamEncryptionCreation(models.Model):
         super().validate()
         if self.encryption != (self.current_encryption_key_uuid is not None):
             raise ra_exc.ValidationErrorException()
-        if self.encryption and self.source_name == SourceName.ZULIP.value:
+        if self.encryption and self.source_name == "zulip":
             raise ra_exc.ValidationErrorException()
 
 
@@ -357,7 +329,6 @@ class WorkspaceUserStreamBase(
     )
     source = properties.property(
         types_dynamic.KindModelSelectorType(
-            types_dynamic.KindModelType(ZulipSource),
             types_dynamic.KindModelType(NativeSource),
         ),
         required=True,
@@ -408,7 +379,7 @@ class WorkspaceUserStreamBase(
     @staticmethod
     def validate_message_kind(source_name: str, kind: str) -> None:
         if (
-            source_name == SourceName.ZULIP.value
+            source_name == "zulip"
             and kind == message_payloads.E2EEPayload.KIND
         ):
             raise ra_exc.ValidationErrorException()

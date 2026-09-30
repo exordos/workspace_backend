@@ -208,7 +208,7 @@ Messenger资源保持一个规范的来源投影,而不是暴露
 `/api/workspace-provider/v1`;其运营通常承诺 Messenger
 资源进入PostgreSQL,因此它不会改变描述的浏览器合同
 根据本文的定义,私人合同
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## 页面排序和过器
 
@@ -388,7 +388,7 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 例子, ETag 和 `If-Match` 规则,操作权限,生命周期语义,
 管理行为, 帐户,聊天,操作,桥接实例,
 提供者健康政策,在第5和第6节
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 提供者数据平面,文件转移部分描述
 后端到桥接合约,并不是公共浏览器的一部分 API.
 
@@ -2144,7 +2144,7 @@ IAM-认证的HTTP表面,没有提供商,邮件或日历
 单独事件 WebSocket 是记录的运行时接口,但没有显示
 作为生成的 OpenAPI 路径.私人提供商合同是保持
 单独在
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 后端元素 Workspace 安装独立的 `workspace-messenger-api`,
 `workspace-api`, `workspace-messenger-events`,以及
@@ -2159,5 +2159,5 @@ IAM-认证的HTTP表面,没有提供商,邮件或日历
 
 - [Workspace 建筑](architecture.md)
 - [Workspace实时集成UI](workspace_ui_realtime_integration.md)
-- [个人 Workspace 提供者 API](../workspace_provider_api_v1.yaml)
-- [Zulip供应商产品和公共 API合同](zulip_bridge_v1_product_and_api.md)
+- 个人 Workspace 提供者 API
+- Zulip供应商产品和公共 API合同

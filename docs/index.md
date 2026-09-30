@@ -13,10 +13,13 @@ and diagram source trees have the same structure in every language.
 OpenAPI documents are not translated: identifiers, schemas, enum values, paths,
 and protocol descriptions remain one canonical source of truth.
 
-- [Workspace Provider API v1](workspace_provider_api_v1.yaml)
-- [Workspace Provider API v2](workspace_provider_api_v2.yaml)
-- [Zulip Bridge Control API v1](zulip_bridge_control_api_v1.yaml)
-- [Zulip Bridge File API v1](zulip_bridge_file_api_v1.yaml)
+- [Workspace public API](public_workspace_api.yaml)
+
+External accounts contain their owner, provider, generic settings and revision.
+Workspace does not process external chats, provider delivery or synchronization.
+Messages, streams and topics retain `source_name` and `source` as
+`native` and `{"kind":"native"}`. Architecture proposals below predate this
+cleanup; the generated public API describes the current supported contract.
 
 ## Translation contract
 

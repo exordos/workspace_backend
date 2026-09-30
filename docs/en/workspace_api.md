@@ -208,7 +208,7 @@ runtimes use the private bridge-authenticated API rooted at
 `/api/workspace-provider/v1`; its operations commit ordinary Messenger
 resources into PostgreSQL, so it does not change the browser contract described
 in this document. The private contract is defined in
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## Pagination And Filters
 
@@ -388,7 +388,7 @@ does not add provider-specific collection routes. Detailed sanitized resource
 examples, ETag and `If-Match` rules, action permissions, lifecycle semantics,
 and administration behavior for accounts, chats, operations, bridge instances,
 provider policies, and provider health are defined in sections 5 and 6 of
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 Its private control, provider data-plane, and file-transfer sections describe
 backend-to-bridge contracts and are not part of the public browser API.
 
@@ -2144,7 +2144,7 @@ browser routes. The middleware-provided `server_settings` aliases and the
 separate Events WebSocket are documented runtime interfaces but do not appear
 as generated OpenAPI paths. The private Provider contract is maintained
 separately in
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 The Workspace backend element installs independent `workspace-messenger-api`,
 `workspace-api`, `workspace-messenger-events`, and
@@ -2159,5 +2159,5 @@ Related documents:
 
 - [Workspace architecture](architecture.md)
 - [Workspace UI realtime integration](workspace_ui_realtime_integration.md)
-- [Private Workspace Provider API](../workspace_provider_api_v1.yaml)
-- [Zulip provider product and public API contract](zulip_bridge_v1_product_and_api.md)
+- Private Workspace Provider API
+- Zulip provider product and public API contract

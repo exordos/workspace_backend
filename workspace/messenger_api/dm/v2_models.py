@@ -142,23 +142,6 @@ class WorkspaceMessage(
         default=base.SourceName.NATIVE.value,
     )
     source = properties.property(types.Dict(), default=base.native_source)
-    provider_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
-    )
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
-    )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)), default=None, read_only=True
-    )
-    provider_realm_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None, read_only=True
-    )
-    provider_message_id = properties.property(
-        types.AllowNone(types.String(max_length=32)), default=None, read_only=True
-    )
-    provider = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery = properties.property(types.AllowNone(types.Dict()), default=None)
     reactions = properties.property(types.Dict(), default=dict, read_only=True)
     reaction_users = properties.property(types.Dict(), default=dict, read_only=True)
     ingest_sequence = properties.property(
@@ -226,12 +209,6 @@ class WorkspaceUserMessage(
     canonical_message_uuid = properties.property(
         types.UUID(), required=True, read_only=True
     )
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
@@ -295,8 +272,6 @@ class WorkspaceStream(
     default_topic_uuid = properties.property(
         types.AllowNone(types.UUID()), default=None, read_only=True
     )
-    provider = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery = properties.property(types.AllowNone(types.Dict()), default=None)
 
 
 class WorkspaceStreamBinding(
@@ -335,12 +310,6 @@ class WorkspaceUserStream(
 ):
     __tablename__ = "messenger_api_user_streams_v1"
 
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
@@ -393,8 +362,6 @@ class WorkspaceStreamTopic(
     summary_reasoning_effort = properties.property(
         types.AllowNone(types.String(max_length=16)), default=None
     )
-    provider = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery = properties.property(types.AllowNone(types.Dict()), default=None)
     is_done = properties.property(types.Boolean(), default=False)
     version = properties.property(types.Integer(min_value=0), default=0, read_only=True)
 
@@ -464,12 +431,6 @@ class WorkspaceUserTopic(
     summary_reasoning_effort = properties.property(
         types.AllowNone(types.String(max_length=16)), default=None, read_only=True
     )
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )
@@ -504,12 +465,6 @@ class WorkspaceMessageReactionView(
     message_uuid = properties.property(types.UUID(), required=True)
     user_uuid = properties.property(types.UUID(), required=True, read_only=True)
     emoji_name = properties.property(types.String(max_length=128), required=True)
-    provider = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
-    delivery = properties.property(
-        types.AllowNone(types.Dict()), default=None, read_only=True
-    )
     deleted_at = properties.property(
         types.AllowNone(types.UTCDateTimeZ()), default=None, read_only=True
     )

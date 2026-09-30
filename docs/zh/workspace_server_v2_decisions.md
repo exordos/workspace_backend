@@ -1,8 +1,10 @@
 # Workspace Server v2: 实施的决定
 
-状态: ** 作为一个功能完善的架构和封闭 Provider API v2**.
+Historical reference. This page describes the retired private bridge HTTP and mTLS/HPKE design. The current backend has no private bridge listener.
 
-[← 主指数](index.md) · [Provider API v2](../workspace_provider_api_v2.yaml) · [目标架构 Zulip Bridge](zulip_bridge/README.md)
+Status: **Historical reference**.
+
+[← 主指数](index.md) · Provider API v2 · 目标架构 Zulip Bridge
 
 这份文件记录了 `1B`, `2A`, `3A`, `4A`, `5A` 协议的决定
 它们的目标是要实现新的 Workspace 服务器. docs-first
@@ -427,4 +429,4 @@ legacy flag。迁移随后重建受影响的 stream、topic 和 folder 计数，
 - V1 transport 只是作为滚动适配器保存;
   提供者身份是 v2 contract.
 - 完整的 wire-contract 在
-    [`workspace_provider_api_v2.yaml`](../workspace_provider_api_v2.yaml).
+    `workspace_provider_api_v2.yaml`.

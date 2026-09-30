@@ -212,58 +212,58 @@
 
 | Метод + путь | Markdown операции | PlantUML | SVG |
 | --- | --- | --- | --- |
-| `GET /api/workspace/v1/messenger/external_accounts/` | [`get_external_accounts.md`](external/operations/get_external_accounts.md) | [`get_external_accounts.puml`](external/operations/diagrams/get_external_accounts.puml) | [`get_external_accounts.svg`](external/operations/diagrams/get_external_accounts.svg) |
-| `POST /api/workspace/v1/messenger/external_accounts/` | [`post_external_accounts.md`](external/operations/post_external_accounts.md) | [`post_external_accounts.puml`](external/operations/diagrams/post_external_accounts.puml) | [`post_external_accounts.svg`](external/operations/diagrams/post_external_accounts.svg) |
-| `GET /api/workspace/v1/messenger/external_accounts/{account_uuid}` | [`get_external_account.md`](external/operations/get_external_account.md) | [`get_external_account.puml`](external/operations/diagrams/get_external_account.puml) | [`get_external_account.svg`](external/operations/diagrams/get_external_account.svg) |
-| `PUT /api/workspace/v1/messenger/external_accounts/{account_uuid}` | [`put_external_account.md`](external/operations/put_external_account.md) | [`put_external_account.puml`](external/operations/diagrams/put_external_account.puml) | [`put_external_account.svg`](external/operations/diagrams/put_external_account.svg) |
-| `DELETE /api/workspace/v1/messenger/external_accounts/{account_uuid}` | [`delete_external_account.md`](external/operations/delete_external_account.md) | [`delete_external_account.puml`](external/operations/diagrams/delete_external_account.puml) | [`delete_external_account.svg`](external/operations/diagrams/delete_external_account.svg) |
-| `POST /api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | [`post_external_account_disconnect.md`](external/operations/post_external_account_disconnect.md) | [`post_external_account_disconnect.puml`](external/operations/diagrams/post_external_account_disconnect.puml) | [`post_external_account_disconnect.svg`](external/operations/diagrams/post_external_account_disconnect.svg) |
-| `POST /api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | [`post_external_account_reconnect.md`](external/operations/post_external_account_reconnect.md) | [`post_external_account_reconnect.puml`](external/operations/diagrams/post_external_account_reconnect.puml) | [`post_external_account_reconnect.svg`](external/operations/diagrams/post_external_account_reconnect.svg) |
+| `GET /api/workspace/v1/messenger/external_accounts/` | `get_external_accounts.md` | `get_external_accounts.puml` | `get_external_accounts.svg` |
+| `POST /api/workspace/v1/messenger/external_accounts/` | `post_external_accounts.md` | `post_external_accounts.puml` | `post_external_accounts.svg` |
+| `GET /api/workspace/v1/messenger/external_accounts/{account_uuid}` | `get_external_account.md` | `get_external_account.puml` | `get_external_account.svg` |
+| `PUT /api/workspace/v1/messenger/external_accounts/{account_uuid}` | `put_external_account.md` | `put_external_account.puml` | `put_external_account.svg` |
+| `DELETE /api/workspace/v1/messenger/external_accounts/{account_uuid}` | `delete_external_account.md` | `delete_external_account.puml` | `delete_external_account.svg` |
+| `POST /api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/disconnect/invoke` | `post_external_account_disconnect.md` | `post_external_account_disconnect.puml` | `post_external_account_disconnect.svg` |
+| `POST /api/workspace/v1/messenger/external_accounts/{account_uuid}/actions/reconnect/invoke` | `post_external_account_reconnect.md` | `post_external_account_reconnect.puml` | `post_external_account_reconnect.svg` |
 
 ### Внешние чаты
 
 | Метод + путь | Markdown операции | PlantUML | SVG |
 | --- | --- | --- | --- |
-| `GET /api/workspace/v1/messenger/external_chats/` | [`get_external_chats.md`](external/operations/get_external_chats.md) | [`get_external_chats.puml`](external/operations/diagrams/get_external_chats.puml) | [`get_external_chats.svg`](external/operations/diagrams/get_external_chats.svg) |
-| `GET /api/workspace/v1/messenger/external_chats/{chat_uuid}` | [`get_external_chat.md`](external/operations/get_external_chat.md) | [`get_external_chat.puml`](external/operations/diagrams/get_external_chat.puml) | [`get_external_chat.svg`](external/operations/diagrams/get_external_chat.svg) |
-| `POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/deselect/invoke` | [`post_external_chat_deselect.md`](external/operations/post_external_chat_deselect.md) | [`post_external_chat_deselect.puml`](external/operations/diagrams/post_external_chat_deselect.puml) | [`post_external_chat_deselect.svg`](external/operations/diagrams/post_external_chat_deselect.svg) |
-| `POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/move/invoke` | [`post_external_chat_move.md`](external/operations/post_external_chat_move.md) | [`post_external_chat_move.puml`](external/operations/diagrams/post_external_chat_move.puml) | [`post_external_chat_move.svg`](external/operations/diagrams/post_external_chat_move.svg) |
-| `POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/select/invoke` | [`post_external_chat_select.md`](external/operations/post_external_chat_select.md) | [`post_external_chat_select.puml`](external/operations/diagrams/post_external_chat_select.puml) | [`post_external_chat_select.svg`](external/operations/diagrams/post_external_chat_select.svg) |
+| `GET /api/workspace/v1/messenger/external_chats/` | `get_external_chats.md` | `get_external_chats.puml` | `get_external_chats.svg` |
+| `GET /api/workspace/v1/messenger/external_chats/{chat_uuid}` | `get_external_chat.md` | `get_external_chat.puml` | `get_external_chat.svg` |
+| `POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/deselect/invoke` | `post_external_chat_deselect.md` | `post_external_chat_deselect.puml` | `post_external_chat_deselect.svg` |
+| `POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/move/invoke` | `post_external_chat_move.md` | `post_external_chat_move.puml` | `post_external_chat_move.svg` |
+| `POST /api/workspace/v1/messenger/external_chats/{chat_uuid}/actions/select/invoke` | `post_external_chat_select.md` | `post_external_chat_select.puml` | `post_external_chat_select.svg` |
 
 ### Внешние операции
 
 | Метод + путь | Markdown операции | PlantUML | SVG |
 | --- | --- | --- | --- |
-| `GET /api/workspace/v1/messenger/external_operations/` | [`get_external_operations.md`](external/operations/get_external_operations.md) | [`get_external_operations.puml`](external/operations/diagrams/get_external_operations.puml) | [`get_external_operations.svg`](external/operations/diagrams/get_external_operations.svg) |
-| `POST /api/workspace/v1/messenger/external_operations/actions/preflight/invoke` | [`post_external_operation_preflight.md`](external/operations/post_external_operation_preflight.md) | [`post_external_operation_preflight.puml`](external/operations/diagrams/post_external_operation_preflight.puml) | [`post_external_operation_preflight.svg`](external/operations/diagrams/post_external_operation_preflight.svg) |
-| `GET /api/workspace/v1/messenger/external_operations/{operation_uuid}` | [`get_external_operation.md`](external/operations/get_external_operation.md) | [`get_external_operation.puml`](external/operations/diagrams/get_external_operation.puml) | [`get_external_operation.svg`](external/operations/diagrams/get_external_operation.svg) |
-| `DELETE /api/workspace/v1/messenger/external_operations/{operation_uuid}` | [`delete_external_operation.md`](external/operations/delete_external_operation.md) | [`delete_external_operation.puml`](external/operations/diagrams/delete_external_operation.puml) | [`delete_external_operation.svg`](external/operations/diagrams/delete_external_operation.svg) |
-| `POST /api/workspace/v1/messenger/external_operations/{operation_uuid}/actions/retry/invoke` | [`post_external_operation_retry.md`](external/operations/post_external_operation_retry.md) | [`post_external_operation_retry.puml`](external/operations/diagrams/post_external_operation_retry.puml) | [`post_external_operation_retry.svg`](external/operations/diagrams/post_external_operation_retry.svg) |
+| `GET /api/workspace/v1/messenger/external_operations/` | `get_external_operations.md` | `get_external_operations.puml` | `get_external_operations.svg` |
+| `POST /api/workspace/v1/messenger/external_operations/actions/preflight/invoke` | `post_external_operation_preflight.md` | `post_external_operation_preflight.puml` | `post_external_operation_preflight.svg` |
+| `GET /api/workspace/v1/messenger/external_operations/{operation_uuid}` | `get_external_operation.md` | `get_external_operation.puml` | `get_external_operation.svg` |
+| `DELETE /api/workspace/v1/messenger/external_operations/{operation_uuid}` | `delete_external_operation.md` | `delete_external_operation.puml` | `delete_external_operation.svg` |
+| `POST /api/workspace/v1/messenger/external_operations/{operation_uuid}/actions/retry/invoke` | `post_external_operation_retry.md` | `post_external_operation_retry.puml` | `post_external_operation_retry.svg` |
 
 ### Экземпляры внешнего моста
 
 | Метод + путь | Markdown операции | PlantUML | SVG |
 | --- | --- | --- | --- |
-| `GET /api/workspace/v1/messenger/external_bridge_instances/` | [`get_external_bridge_instances.md`](external/operations/get_external_bridge_instances.md) | [`get_external_bridge_instances.puml`](external/operations/diagrams/get_external_bridge_instances.puml) | [`get_external_bridge_instances.svg`](external/operations/diagrams/get_external_bridge_instances.svg) |
-| `GET /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}` | [`get_external_bridge_instance.md`](external/operations/get_external_bridge_instance.md) | [`get_external_bridge_instance.puml`](external/operations/diagrams/get_external_bridge_instance.puml) | [`get_external_bridge_instance.svg`](external/operations/diagrams/get_external_bridge_instance.svg) |
-| `POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/resume/invoke` | [`post_external_bridge_instance_resume.md`](external/operations/post_external_bridge_instance_resume.md) | [`post_external_bridge_instance_resume.puml`](external/operations/diagrams/post_external_bridge_instance_resume.puml) | [`post_external_bridge_instance_resume.svg`](external/operations/diagrams/post_external_bridge_instance_resume.svg) |
-| `POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/revoke/invoke` | [`post_external_bridge_instance_revoke.md`](external/operations/post_external_bridge_instance_revoke.md) | [`post_external_bridge_instance_revoke.puml`](external/operations/diagrams/post_external_bridge_instance_revoke.puml) | [`post_external_bridge_instance_revoke.svg`](external/operations/diagrams/post_external_bridge_instance_revoke.svg) |
-| `POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/suspend/invoke` | [`post_external_bridge_instance_suspend.md`](external/operations/post_external_bridge_instance_suspend.md) | [`post_external_bridge_instance_suspend.puml`](external/operations/diagrams/post_external_bridge_instance_suspend.puml) | [`post_external_bridge_instance_suspend.svg`](external/operations/diagrams/post_external_bridge_instance_suspend.svg) |
+| `GET /api/workspace/v1/messenger/external_bridge_instances/` | `get_external_bridge_instances.md` | `get_external_bridge_instances.puml` | `get_external_bridge_instances.svg` |
+| `GET /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}` | `get_external_bridge_instance.md` | `get_external_bridge_instance.puml` | `get_external_bridge_instance.svg` |
+| `POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/resume/invoke` | `post_external_bridge_instance_resume.md` | `post_external_bridge_instance_resume.puml` | `post_external_bridge_instance_resume.svg` |
+| `POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/revoke/invoke` | `post_external_bridge_instance_revoke.md` | `post_external_bridge_instance_revoke.puml` | `post_external_bridge_instance_revoke.svg` |
+| `POST /api/workspace/v1/messenger/external_bridge_instances/{instance_uuid}/actions/suspend/invoke` | `post_external_bridge_instance_suspend.md` | `post_external_bridge_instance_suspend.puml` | `post_external_bridge_instance_suspend.svg` |
 
 ### Политики внешних провайдеров
 
 | Метод + путь | Markdown операции | PlantUML | SVG |
 | --- | --- | --- | --- |
-| `GET /api/workspace/v1/messenger/external_provider_policies/{kind}` | [`get_external_provider_policy.md`](external/operations/get_external_provider_policy.md) | [`get_external_provider_policy.puml`](external/operations/diagrams/get_external_provider_policy.puml) | [`get_external_provider_policy.svg`](external/operations/diagrams/get_external_provider_policy.svg) |
-| `PUT /api/workspace/v1/messenger/external_provider_policies/{kind}` | [`put_external_provider_policy.md`](external/operations/put_external_provider_policy.md) | [`put_external_provider_policy.puml`](external/operations/diagrams/put_external_provider_policy.puml) | [`put_external_provider_policy.svg`](external/operations/diagrams/put_external_provider_policy.svg) |
-| `POST /api/workspace/v1/messenger/external_provider_policies/{kind}/actions/resume/invoke` | [`post_external_provider_policy_resume.md`](external/operations/post_external_provider_policy_resume.md) | [`post_external_provider_policy_resume.puml`](external/operations/diagrams/post_external_provider_policy_resume.puml) | [`post_external_provider_policy_resume.svg`](external/operations/diagrams/post_external_provider_policy_resume.svg) |
-| `POST /api/workspace/v1/messenger/external_provider_policies/{kind}/actions/suspend/invoke` | [`post_external_provider_policy_suspend.md`](external/operations/post_external_provider_policy_suspend.md) | [`post_external_provider_policy_suspend.puml`](external/operations/diagrams/post_external_provider_policy_suspend.puml) | [`post_external_provider_policy_suspend.svg`](external/operations/diagrams/post_external_provider_policy_suspend.svg) |
+| `GET /api/workspace/v1/messenger/external_provider_policies/{kind}` | `get_external_provider_policy.md` | `get_external_provider_policy.puml` | `get_external_provider_policy.svg` |
+| `PUT /api/workspace/v1/messenger/external_provider_policies/{kind}` | `put_external_provider_policy.md` | `put_external_provider_policy.puml` | `put_external_provider_policy.svg` |
+| `POST /api/workspace/v1/messenger/external_provider_policies/{kind}/actions/resume/invoke` | `post_external_provider_policy_resume.md` | `post_external_provider_policy_resume.puml` | `post_external_provider_policy_resume.svg` |
+| `POST /api/workspace/v1/messenger/external_provider_policies/{kind}/actions/suspend/invoke` | `post_external_provider_policy_suspend.md` | `post_external_provider_policy_suspend.puml` | `post_external_provider_policy_suspend.svg` |
 
 ### Состояние внешних провайдеров
 
 | Метод + путь | Markdown операции | PlantUML | SVG |
 | --- | --- | --- | --- |
-| `GET /api/workspace/v1/messenger/external_provider_health/{kind}` | [`get_external_provider_health.md`](external/operations/get_external_provider_health.md) | [`get_external_provider_health.puml`](external/operations/diagrams/get_external_provider_health.puml) | [`get_external_provider_health.svg`](external/operations/diagrams/get_external_provider_health.svg) |
+| `GET /api/workspace/v1/messenger/external_provider_health/{kind}` | `get_external_provider_health.md` | `get_external_provider_health.puml` | `get_external_provider_health.svg` |
 
 ## WebSocket событий
 

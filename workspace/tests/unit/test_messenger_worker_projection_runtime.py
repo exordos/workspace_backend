@@ -137,47 +137,6 @@ def test_projection_only_worker_sleeps_only_after_an_empty_cycle(monkeypatch):
     assert sleeps == [0.5]
 
 
-def test_projection_pass_checks_cleanup_once_without_deriving(monkeypatch):
-    calls = []
-    outcomes = iter((True, True, True, False))
-
-    @contextlib.contextmanager
-    def session_context():
-        yield types.SimpleNamespace()
-
-    monkeypatch.setattr(agents, "database_session_context", session_context)
-    monkeypatch.setattr(
-        agents.v2_projection,
-        "process_one_provider_file_cleanup_task",
-        lambda _session, _worker_id: calls.append("cleanup") or False,
-    )
-    monkeypatch.setattr(
-        agents.v2_projection,
-        "derive_projection_tasks",
-        lambda _session: calls.append("derive") or 4,
-    )
-
-    def process(_session, _worker_id, **_kwargs):
-        calls.append("process")
-        return next(outcomes)
-
-    monkeypatch.setattr(
-        agents.v2_projection,
-        "process_one_projection_task",
-        process,
-    )
-    worker = agents.MessengerWorkerAgent(
-        v2_projection_enabled=True,
-        v2_projection_max_tasks_per_iteration=10,
-        v2_metrics_log_interval_seconds=300,
-    )
-
-    assert worker._run_v2_projection_tasks() is True
-    assert calls.count("cleanup") == 1
-    assert calls.count("derive") == 0
-    assert calls.count("process") == 4
-
-
 def test_projection_worker_waits_for_database_notification(monkeypatch):
     waits = []
     wakeup = types.SimpleNamespace(
@@ -249,11 +208,6 @@ def test_projection_pass_keeps_earlier_progress_after_event_lock_contention(
     monkeypatch.setattr(agents, "database_session_context", session_context)
     monkeypatch.setattr(
         agents.v2_projection,
-        "process_one_provider_file_cleanup_task",
-        lambda _session, _worker_id: False,
-    )
-    monkeypatch.setattr(
-        agents.v2_projection,
         "derive_projection_tasks",
         lambda _session: 0,
     )
@@ -292,11 +246,6 @@ def test_projection_pass_reports_no_progress_for_only_event_lock_contention(
     monkeypatch.setattr(agents, "database_session_context", session_context)
     monkeypatch.setattr(
         agents.v2_projection,
-        "process_one_provider_file_cleanup_task",
-        lambda _session, _worker_id: False,
-    )
-    monkeypatch.setattr(
-        agents.v2_projection,
         "derive_projection_tasks",
         lambda _session: 0,
     )
@@ -329,11 +278,6 @@ def test_projection_pass_continues_a_truncated_partition_scan(monkeypatch):
         yield types.SimpleNamespace()
 
     monkeypatch.setattr(agents, "database_session_context", session_context)
-    monkeypatch.setattr(
-        agents.v2_projection,
-        "process_one_provider_file_cleanup_task",
-        lambda _session, _worker_id: False,
-    )
     monkeypatch.setattr(
         agents.v2_projection,
         "derive_projection_tasks",
@@ -372,11 +316,6 @@ def test_projection_pass_paces_after_maximum_truncated_scans(monkeypatch):
         yield types.SimpleNamespace()
 
     monkeypatch.setattr(agents, "database_session_context", session_context)
-    monkeypatch.setattr(
-        agents.v2_projection,
-        "process_one_provider_file_cleanup_task",
-        lambda _session, _worker_id: False,
-    )
     monkeypatch.setattr(
         agents.v2_projection,
         "derive_projection_tasks",
@@ -445,11 +384,6 @@ def test_projection_pass_sleeps_after_a_complete_empty_partition_scan(monkeypatc
         yield types.SimpleNamespace()
 
     monkeypatch.setattr(agents, "database_session_context", session_context)
-    monkeypatch.setattr(
-        agents.v2_projection,
-        "process_one_provider_file_cleanup_task",
-        lambda _session, _worker_id: False,
-    )
     monkeypatch.setattr(
         agents.v2_projection,
         "derive_projection_tasks",

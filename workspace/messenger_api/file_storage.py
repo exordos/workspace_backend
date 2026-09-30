@@ -52,7 +52,6 @@ class WorkspaceFileMetadata:
     sha256: str
     created_at: datetime.datetime
     acl_mode: str = "stream_members"
-    origin: dict | None = None
 
     def to_json(self) -> bytes:
         created_at = self.created_at
@@ -71,26 +70,6 @@ class WorkspaceFileMetadata:
             acl = {"mode": self.acl_mode}
         else:
             raise ValueError("Unsupported file metadata ACL mode")
-        schema_version = 2 if self.origin is not None else 1
-        if self.origin is not None:
-            required_origin_fields = {
-                "kind",
-                "provider_kind",
-                "external_account_uuid",
-                "external_chat_uuid",
-                "operation_uuid",
-            }
-            if (
-                set(self.origin) != required_origin_fields
-                or self.origin["kind"] != "external_provider"
-            ):
-                raise ValueError("External file metadata origin is invalid")
-            for field_name in (
-                "external_account_uuid",
-                "external_chat_uuid",
-                "operation_uuid",
-            ):
-                sys_uuid.UUID(str(self.origin[field_name]))
         payload = {
             "acl": acl,
             "content_type": self.content_type,
@@ -101,15 +80,13 @@ class WorkspaceFileMetadata:
             "name": self.name,
             "owner_uuid": str(self.owner_uuid),
             "project_id": str(self.project_id),
-            "schema_version": schema_version,
+            "schema_version": 1,
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
             "uuid": str(self.uuid),
         }
         if self.stream_uuid is not None:
             payload["stream_uuid"] = str(self.stream_uuid)
-        if self.origin is not None:
-            payload["origin"] = self.origin
         return json.dumps(
             payload,
             ensure_ascii=False,
@@ -122,29 +99,6 @@ class WorkspaceFileMetadata:
         data = json.loads(value.decode("utf-8"))
         if data["schema_version"] not in (1, 2):
             raise ValueError("Unsupported file metadata schema version")
-        origin = data.get("origin")
-        if data["schema_version"] == 1 and origin is not None:
-            raise ValueError("Version 1 file metadata cannot contain origin")
-        if data["schema_version"] == 2:
-            required_origin_fields = {
-                "kind",
-                "provider_kind",
-                "external_account_uuid",
-                "external_chat_uuid",
-                "operation_uuid",
-            }
-            if (
-                not isinstance(origin, dict)
-                or set(origin) != required_origin_fields
-                or origin["kind"] != "external_provider"
-            ):
-                raise ValueError("External file metadata origin is invalid")
-            for field_name in (
-                "external_account_uuid",
-                "external_chat_uuid",
-                "operation_uuid",
-            ):
-                sys_uuid.UUID(str(origin[field_name]))
         acl_mode = data["acl"]["mode"]
         if acl_mode not in ("stream_members", "public"):
             raise ValueError("Unsupported file metadata ACL mode")
@@ -169,7 +123,6 @@ class WorkspaceFileMetadata:
             sha256=data["sha256"],
             created_at=datetime.datetime.fromisoformat(data["created_at"]),
             acl_mode=acl_mode,
-            origin=origin,
         )
 
 
@@ -304,16 +257,6 @@ class LocalWorkspaceFileStorage:
         except FileNotFoundError:
             pass
 
-    def list_object_ids(self) -> list[str]:
-        root = pathlib.Path(get_storage_path()).resolve()
-        if not root.exists():
-            return []
-        return sorted(
-            path.relative_to(root).as_posix()
-            for path in root.rglob("*")
-            if path.is_file() and not path.name.endswith(".tmp")
-        )
-
 
 class S3WorkspaceFileStorage:
     storage_type = file_storage_opts.STORAGE_TYPE_S3
@@ -424,21 +367,6 @@ class S3WorkspaceFileStorage:
             Key=get_workspace_file_metadata_object_id(file_uuid),
         )
 
-    def list_object_ids(self) -> list[str]:
-        object_ids: list[str] = []
-        continuation_token = None
-        while True:
-            request = {"Bucket": self.bucket_name}
-            if continuation_token is not None:
-                request["ContinuationToken"] = continuation_token
-            response = self.client.list_objects_v2(**request)
-            object_ids.extend(item["Key"] for item in response.get("Contents", ()))
-            if not response.get("IsTruncated"):
-                return sorted(object_ids)
-            continuation_token = response.get("NextContinuationToken")
-            if not continuation_token:
-                raise ValueError("S3 object listing omitted its continuation token")
-
 
 def get_workspace_file_storage(
     storage_type: str | None = None,
@@ -510,14 +438,6 @@ def save_workspace_file_metadata(
 ) -> None:
     storage = get_workspace_file_storage(storage_type=storage_type)
     storage.save_metadata(metadata.uuid, metadata)
-
-
-def read_workspace_file_metadata(
-    file_uuid: sys_uuid.UUID,
-    storage_type: str | None = None,
-) -> WorkspaceFileMetadata:
-    storage = get_workspace_file_storage(storage_type=storage_type)
-    return storage.read_metadata(file_uuid)
 
 
 def delete_workspace_file_metadata(

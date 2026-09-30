@@ -13,7 +13,6 @@ import uuid as sys_uuid
 from restalchemy.common import contexts
 from restalchemy.common import exceptions as ra_exceptions
 from restalchemy.dm import filters as dm_filters
-from restalchemy.storage import exceptions as storage_exceptions
 
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import sql_canonical_store
@@ -58,9 +57,6 @@ def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
         result.pop(name, None)
     if resource == "streams":
         result.setdefault("current_encryption_key_uuid", None)
-    if resource in {"streams", "stream_topics", "messages", "message_reactions"}:
-        result.setdefault("provider", None)
-        result.setdefault("delivery", None)
     return result
 
 
@@ -876,36 +872,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if resource == "streams":
             return self._create_stream(values)
         if resource == "stream_topics":
-            provider_target = self._provider_target(
-                values["stream_uuid"],
-                "topic.create",
-            )
             row = self._create_topic(values)
-            self._queue_provider_operation(
-                operation_kind="topic.create",
-                target_type="topic",
-                target_uuid=sys_uuid.UUID(str(row["uuid"])),
-                stream_uuid=sys_uuid.UUID(str(row["stream_uuid"])),
-                payload=row,
-                provider_target=provider_target,
-            )
             return row
         if resource == "message_reactions":
-            message = self._message(values["message_uuid"])
-            provider_targets = self._message_provider_targets(
-                message,
-                "reaction.create",
-            )
+            self._message(values["message_uuid"])
             row = self._create_reaction(values)
-            for provider_target in provider_targets:
-                self._queue_provider_operation(
-                    operation_kind="reaction.create",
-                    target_type="reaction",
-                    target_uuid=sys_uuid.UUID(str(row["uuid"])),
-                    stream_uuid=message.stream_uuid,
-                    payload=row,
-                    provider_target=provider_target,
-                )
             return row
         return super().create_resource(resource, values)
 
@@ -950,19 +921,8 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             or existing_placement["source"] != source
         ):
             raise ra_exceptions.ValidationErrorException()
-        provider_targets = self._provider_targets_for_message(
-            stream.uuid,
-            topic.uuid,
-            "message.create",
-        )
         if existing_placement is not None:
             row = _public(self._message(placement_uuid), "messages")
-            self._queue_message_provider_operations(
-                "message.create",
-                row,
-                stream.uuid,
-                provider_targets,
-            )
             return row
         existing_canonical = session.execute(
             """
@@ -1040,12 +1000,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         ).fetchone()
         if inserted_placement is None:
             row = _public(self._message(placement_uuid), "messages")
-            self._queue_message_provider_operations(
-                "message.create",
-                row,
-                stream.uuid,
-                provider_targets,
-            )
             return row
         if announced:
             self._apply_key_announcement(
@@ -1135,30 +1089,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             },
         )
         row = _public(self._message(placement_uuid), "messages")
-        self._queue_message_provider_operations(
-            "message.create",
-            row,
-            stream.uuid,
-            provider_targets,
-        )
         return row
-
-    def _queue_message_provider_operations(
-        self,
-        operation_kind: str,
-        row: dict[str, typing.Any],
-        stream_uuid: object,
-        provider_targets: typing.Iterable[typing.Any],
-    ) -> None:
-        for provider_target in provider_targets:
-            self._queue_provider_operation(
-                operation_kind=operation_kind,
-                target_type="message",
-                target_uuid=sys_uuid.UUID(str(row["uuid"])),
-                stream_uuid=stream_uuid,
-                payload=row,
-                provider_target=provider_target,
-            )
 
     def update_message(
         self,
@@ -1171,10 +1102,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             raise ra_exceptions.ValidationErrorException()
         message.validate_payload_update(
             resource_projection.simple(values["payload"]), session
-        )
-        provider_targets = self._message_provider_targets(
-            message,
-            "message.update",
         )
         session.execute(
             """
@@ -1210,12 +1137,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 },
             )
         row = _public(self._message(message_uuid), "messages")
-        self._queue_message_provider_operations(
-            "message.update",
-            row,
-            message.stream_uuid,
-            provider_targets,
-        )
         return row
 
     def delete_message(
@@ -1225,11 +1146,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         message = self._message(message_uuid)
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
-        provider_targets = self._message_provider_targets(
-            message,
-            "message.delete",
-        )
-        provider_payload = _public(message, "messages")
         session = contexts.Context().get_session()
         placements = session.execute(
             """
@@ -1262,12 +1178,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             WHERE project_id = %s AND uuid = %s
             """,
             (self.project_uuid, message.canonical_message_uuid),
-        )
-        self._queue_message_provider_operations(
-            "message.delete",
-            provider_payload,
-            message.stream_uuid,
-            provider_targets,
         )
         return None
 
@@ -1382,10 +1292,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if resource == "streams":
             stream = self._stream(resource_uuid)
             stream.validate_encryption_update(values)
-            provider_target = self._provider_target(
-                stream.uuid,
-                "stream.update",
-            )
             forbidden = {"source_name", "source", "direct_user_uuid", "private_index"}
             if forbidden.intersection(values):
                 raise ra_exceptions.ValidationErrorException()
@@ -1404,21 +1310,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 source_kind="stream.updated",
             )
             row = _public(self._stream(stream.uuid), "streams")
-            self._queue_provider_operation(
-                operation_kind="stream.update",
-                target_type="stream",
-                target_uuid=stream.uuid,
-                stream_uuid=stream.uuid,
-                payload=row,
-                provider_target=provider_target,
-            )
             return row
         if resource == "stream_topics":
             topic = self._topic(resource_uuid)
-            provider_target = self._provider_target(
-                topic.stream_uuid,
-                "topic.update",
-            )
             allowed = {"name", "color"}
             updates = {name: values[name] for name in allowed if name in values}
             if not updates or set(values) - allowed:
@@ -1436,14 +1330,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 {"source_kind": "topic.updated", "topic_uuid": topic.uuid},
             )
             row = _public(self._topic(topic.uuid), "stream_topics")
-            self._queue_provider_operation(
-                operation_kind="topic.update",
-                target_type="topic",
-                target_uuid=topic.uuid,
-                stream_uuid=topic.stream_uuid,
-                payload=row,
-                provider_target=provider_target,
-            )
             return row
         if resource == "message_reactions":
             reaction = v2_models.WorkspaceMessageReactionView.objects.get_one(
@@ -1454,10 +1340,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             if reaction.user_uuid != self.user_uuid:
                 raise ra_exceptions.ValidationErrorException()
             old_message = self._message(reaction.message_uuid)
-            provider_targets = self._message_provider_targets(
-                old_message,
-                "reaction.update",
-            )
             message = self._message(values.get("message_uuid", reaction.message_uuid))
             session.execute(
                 """
@@ -1502,22 +1384,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                         "placement_uuid": old_message.uuid,
                         "emit_reaction_event": False,
                     },
-                )
-            provider_payload = dict(updated_reaction)
-            provider_payload.update(
-                {
-                    "previous_message_uuid": str(reaction.message_uuid),
-                    "previous_emoji_name": reaction.emoji_name,
-                }
-            )
-            for provider_target in provider_targets:
-                self._queue_provider_operation(
-                    operation_kind="reaction.update",
-                    target_type="reaction",
-                    target_uuid=reaction.uuid,
-                    stream_uuid=old_message.stream_uuid,
-                    payload=provider_payload,
-                    provider_target=provider_target,
                 )
             return updated_reaction
         if resource == "stream_bindings":
@@ -1659,12 +1525,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             )
             if reaction.user_uuid != self.user_uuid:
                 raise ra_exceptions.ValidationErrorException()
-            message = self._message(reaction.message_uuid)
-            provider_targets = self._message_provider_targets(
-                message,
-                "reaction.delete",
-            )
-            provider_payload = _public(reaction, resource)
+            self._message(reaction.message_uuid)
             canonical = session.execute(
                 """
                 SELECT canonical_message_uuid
@@ -1692,15 +1553,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     "emit_reaction_event": True,
                 },
             )
-            for provider_target in provider_targets:
-                self._queue_provider_operation(
-                    operation_kind="reaction.delete",
-                    target_type="reaction",
-                    target_uuid=reaction.uuid,
-                    stream_uuid=message.stream_uuid,
-                    payload=provider_payload,
-                    provider_target=provider_target,
-                )
             return None
         if resource == "stream_bindings":
             binding = v2_models.WorkspaceStreamBindingView.objects.get_one(
@@ -1717,16 +1569,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 if participant != binding.user_uuid
             )
             self._validate_stream_participants(binding.stream_uuid, remaining)
-            try:
-                provider_target = self._provider_target(
-                    binding.stream_uuid,
-                    "membership.remove",
-                )
-            except (
-                ra_exceptions.ValidationErrorException,
-                storage_exceptions.RecordNotFound,
-            ):
-                provider_target = None
             binding_snapshot = _public(binding, resource)
             generation = session.execute(
                 """
@@ -1778,22 +1620,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 """,
                 (self.project_uuid, binding.uuid),
             )
-            self._queue_provider_operation(
-                operation_kind="membership.remove",
-                target_type="stream_binding",
-                target_uuid=binding.uuid,
-                stream_uuid=binding.stream_uuid,
-                payload=binding_snapshot,
-                provider_target=provider_target,
-            )
             return None
         if resource == "stream_topics":
             topic = self._topic(resource_uuid)
-            provider_target = self._provider_target(
-                topic.stream_uuid,
-                "topic.delete",
-            )
-            provider_payload = _public(topic, resource)
             self._enqueue(
                 "delivery_snapshot_event",
                 "topic",
@@ -1826,23 +1655,11 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 "WHERE project_id = %s AND uuid = %s",
                 (self.project_uuid, topic.uuid),
             )
-            self._queue_provider_operation(
-                operation_kind="topic.delete",
-                target_type="topic",
-                target_uuid=topic.uuid,
-                stream_uuid=topic.stream_uuid,
-                payload=provider_payload,
-                provider_target=provider_target,
-            )
             return None
         if resource == "streams":
             stream = self._stream(resource_uuid)
             if stream.direct_user_uuid is not None:
                 raise ra_exceptions.ValidationErrorException()
-            provider_target = self._provider_target(
-                stream.uuid,
-                "stream.delete",
-            )
             self._enqueue(
                 "delivery_snapshot_event",
                 "resource",
@@ -1860,14 +1677,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 "UPDATE messenger_streams SET deleted_at = NOW() "
                 "WHERE project_id = %s AND uuid = %s",
                 (self.project_uuid, stream.uuid),
-            )
-            self._queue_provider_operation(
-                operation_kind="stream.delete",
-                target_type="stream",
-                target_uuid=stream.uuid,
-                stream_uuid=stream.uuid,
-                payload={"uuid": str(stream.uuid)},
-                provider_target=provider_target,
             )
             return None
         return super().delete_resource(resource, resource_uuid)
@@ -1901,57 +1710,21 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         )
         return _public(self._message(message.uuid), "messages")
 
-    def _queue_v2_provider_read_snapshot(
+    def _has_unread_candidates(
         self,
         *,
-        stream_uuid: object,
-        topic_uuid: object | None,
-        target_type: str,
-        target_uuid: object,
         candidate_sql: str,
         candidate_values: typing.Sequence[object],
-        provider_candidate_sql: str | None = None,
-        provider_candidate_values: typing.Sequence[object] | None = None,
     ) -> bool:
-        """Snapshot exact unread placements without materializing them in Python."""
+        """Check exact unread placements without materializing them in Python."""
         session = contexts.Context().get_session()
-        provider_account_uuids = self._lock_provider_read_accounts_for_stream(
-            stream_uuid
-        )
-        changed = (
+        return (
             session.execute(
                 f"SELECT 1 FROM ({candidate_sql}) AS candidate LIMIT 1",
                 candidate_values,
             ).fetchone()
             is not None
         )
-        if not provider_account_uuids:
-            return changed
-        callback = self._provider_read_snapshot_callback(
-            provider_account_uuids=provider_account_uuids,
-            stream_uuid=stream_uuid,
-            topic_uuid=topic_uuid,
-            target_type=target_type,
-            target_uuid=target_uuid,
-        )
-        if callback is not None:
-            try:
-                callback(
-                    session,
-                    provider_candidate_sql or candidate_sql,
-                    (
-                        provider_candidate_values
-                        if provider_candidate_values is not None
-                        else candidate_values
-                    ),
-                )
-            except (
-                ra_exceptions.ValidationErrorException,
-                storage_exceptions.RecordNotFound,
-            ):
-                if changed:
-                    raise
-        return changed
 
     def perform_action(
         self,
@@ -2001,20 +1774,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 for user_uuid in user_uuids
             }
             self._validate_stream_participants(stream.uuid, tuple(participants))
-            new_participants = participants - current_participants
-            if new_participants:
-                try:
-                    provider_target = self._provider_target(
-                        stream.uuid,
-                        "membership.add",
-                    )
-                except (
-                    ra_exceptions.ValidationErrorException,
-                    storage_exceptions.RecordNotFound,
-                ):
-                    provider_target = None
-            else:
-                provider_target = None
             now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
             created_binding_uuids = []
             changed_binding_uuids = []
@@ -2163,28 +1922,12 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                         "exclude_binding_uuids": changed_binding_uuids,
                     },
                 )
-            queued_binding_uuids = set()
-            for binding_uuid in changed_binding_uuids:
-                if binding_uuid in queued_binding_uuids:
-                    continue
-                queued_binding_uuids.add(binding_uuid)
-                self._queue_provider_operation(
-                    operation_kind="membership.add",
-                    target_type="stream_binding",
-                    target_uuid=binding_uuid,
-                    stream_uuid=stream.uuid,
-                    payload=self.get_resource("stream_bindings", binding_uuid),
-                    provider_target=provider_target,
-                )
             return [
                 self.get_resource("stream_bindings", binding_uuid)
                 for binding_uuid in created_binding_uuids
             ]
         if resource == "messages" and action == "read":
             message = self._message(resource_uuid)
-            provider_account_uuids = self._lock_provider_read_accounts_for_stream(
-                message.stream_uuid
-            )
             changed = session.execute(
                 """
                 UPDATE messenger_user_message_states
@@ -2202,28 +1945,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                     self._legacy_message_uuid(session, message.uuid),
                     True,
-                )
-            try:
-                provider_targets = self._message_provider_targets(
-                    message,
-                    "read_state.set",
-                    account_locked=bool(provider_account_uuids),
-                )
-            except (
-                ra_exceptions.ValidationErrorException,
-                storage_exceptions.RecordNotFound,
-            ):
-                if changed is not None:
-                    raise
-                provider_targets = ()
-            for provider_target in provider_targets:
-                self._queue_provider_read(
-                    stream_uuid=message.stream_uuid,
-                    topic_uuid=message.topic_uuid,
-                    message_uuids=(message.uuid,),
-                    target_type="message",
-                    target_uuid=resource_uuid,
-                    provider_target=provider_target,
                 )
             self._enqueue_counter_projections(
                 source_kind="message.read",
@@ -2265,21 +1986,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 False,
                 message.topic_uuid,
             )
-            provider_candidate_values = (
-                message.uuid,
-                self.project_uuid,
-                self.user_uuid,
-                True,
-                message.topic_uuid,
-            )
-            changed = self._queue_v2_provider_read_snapshot(
-                stream_uuid=message.stream_uuid,
-                topic_uuid=message.topic_uuid,
-                target_type="message",
-                target_uuid=resource_uuid,
+            changed = self._has_unread_candidates(
                 candidate_sql=candidate_sql,
                 candidate_values=candidate_values,
-                provider_candidate_values=provider_candidate_values,
             )
             session.execute(
                 """
@@ -2414,20 +2123,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 False,
                 stream.uuid,
             )
-            stream_provider_candidate_values = (
-                self.project_uuid,
-                self.user_uuid,
-                True,
-                stream.uuid,
-            )
-            changed = self._queue_v2_provider_read_snapshot(
-                stream_uuid=stream.uuid,
-                topic_uuid=None,
-                target_type="stream",
-                target_uuid=resource_uuid,
+            changed = self._has_unread_candidates(
                 candidate_sql=candidate_sql,
                 candidate_values=stream_read_candidate_values,
-                provider_candidate_values=stream_provider_candidate_values,
             )
             session.execute(
                 """
@@ -2485,10 +2183,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._stream(stream.uuid), "streams")
         if resource == "streams" and action == "notifications":
             stream = self._stream(resource_uuid)
-            provider_target = self._provider_target(
-                stream.uuid,
-                "stream.notification.update",
-            )
             session.execute(
                 """
                 UPDATE messenger_stream_bindings
@@ -2504,7 +2198,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                 ),
             )
-            notification = session.execute(
+            session.execute(
                 """
                 SELECT notification_mode, notification_updated_at
                 FROM messenger_stream_bindings
@@ -2546,20 +2240,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     },
                 )
             row = _public(self._stream(stream.uuid), "streams")
-            self._queue_provider_operation(
-                operation_kind="stream.notification.update",
-                target_type="stream",
-                target_uuid=stream.uuid,
-                stream_uuid=stream.uuid,
-                payload={
-                    "uuid": str(stream.uuid),
-                    "stream_uuid": str(stream.uuid),
-                    "user_uuid": str(self.user_uuid),
-                    "notification_mode": notification["notification_mode"],
-                    "notification_updated_at": notification["notification_updated_at"],
-                },
-                provider_target=provider_target,
-            )
             return row
         if resource == "stream_topics" and action == "toggle_done":
             topic = self._topic(resource_uuid)
@@ -2601,20 +2281,9 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 False,
                 topic.uuid,
             )
-            topic_provider_candidate_values = (
-                self.project_uuid,
-                self.user_uuid,
-                True,
-                topic.uuid,
-            )
-            changed = self._queue_v2_provider_read_snapshot(
-                stream_uuid=topic.stream_uuid,
-                topic_uuid=topic.uuid,
-                target_type="topic",
-                target_uuid=resource_uuid,
+            changed = self._has_unread_candidates(
                 candidate_sql=candidate_sql,
                 candidate_values=topic_read_candidate_values,
-                provider_candidate_values=topic_provider_candidate_values,
             )
             session.execute(
                 """
@@ -2685,10 +2354,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return _public(self._topic(topic.uuid), "stream_topics")
         if resource == "stream_topics" and action == "notifications":
             topic = self._topic(resource_uuid)
-            provider_target = self._provider_target(
-                topic.stream_uuid,
-                "topic.notification.update",
-            )
             stream = self._stream(topic.stream_uuid)
             helpers._validate_topic_notification_mode(
                 stream_notification_mode=stream.notification_mode,
@@ -2707,7 +2372,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     self.user_uuid,
                 ),
             )
-            notification = session.execute(
+            session.execute(
                 """
                 SELECT notification_mode, updated_at
                 FROM messenger_user_topic_bindings
@@ -2722,20 +2387,6 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 topic_uuid=topic.uuid,
             )
             row = _public(self._topic(topic.uuid), "stream_topics")
-            self._queue_provider_operation(
-                operation_kind="topic.notification.update",
-                target_type="topic",
-                target_uuid=topic.uuid,
-                stream_uuid=topic.stream_uuid,
-                payload={
-                    "uuid": str(topic.uuid),
-                    "stream_uuid": str(topic.stream_uuid),
-                    "user_uuid": str(self.user_uuid),
-                    "notification_mode": notification["notification_mode"],
-                    "notification_updated_at": notification["updated_at"],
-                },
-                provider_target=provider_target,
-            )
             return row
         return super().perform_action(resource, resource_uuid, action, values)
 

@@ -14,9 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import contextlib
-import contextvars
-import collections.abc
 import datetime
 import hashlib
 import json
@@ -47,28 +44,12 @@ FOLDER_OBJECT_TYPE = "folder"
 FOLDER_ITEM_OBJECT_TYPE = "folder_item"
 FILE_OBJECT_TYPE = "file"
 EXTERNAL_ACCOUNT_OBJECT_TYPE = "external_account"
-EXTERNAL_CHAT_OBJECT_TYPE = "external_chat"
-_FIXTURE_EVENTS_SUPPRESSED = contextvars.ContextVar(
-    "workspace_fixture_events_suppressed",
-    default=False,
-)
 
 
 class ProjectEventLockUnavailableError(RuntimeError):
     """Raised when a nonblocking event writer cannot serialize a project."""
 
 
-@contextlib.contextmanager
-def suppress_unplanned_fixture_events() -> collections.abc.Iterator[None]:
-    """Suppress runtime broadcasts while isolated fixture state is materialized."""
-    token = _FIXTURE_EVENTS_SUPPRESSED.set(True)
-    try:
-        yield
-    finally:
-        _FIXTURE_EVENTS_SUPPRESSED.reset(token)
-
-
-EXTERNAL_OPERATION_OBJECT_TYPE = "external_operation"
 CREATED_ACTION = "created"
 UPDATED_ACTION = "updated"
 DELETED_ACTION = "deleted"
@@ -103,18 +84,6 @@ FILE_DELETED_EVENT = event_payloads.FileDeletedEventPayload.KIND
 EXTERNAL_ACCOUNT_CREATED_EVENT = event_payloads.ExternalAccountCreatedEventPayload.KIND
 EXTERNAL_ACCOUNT_UPDATED_EVENT = event_payloads.ExternalAccountUpdatedEventPayload.KIND
 EXTERNAL_ACCOUNT_DELETED_EVENT = event_payloads.ExternalAccountDeletedEventPayload.KIND
-EXTERNAL_CHAT_CREATED_EVENT = event_payloads.ExternalChatCreatedEventPayload.KIND
-EXTERNAL_CHAT_UPDATED_EVENT = event_payloads.ExternalChatUpdatedEventPayload.KIND
-EXTERNAL_CHAT_DELETED_EVENT = event_payloads.ExternalChatDeletedEventPayload.KIND
-EXTERNAL_OPERATION_CREATED_EVENT = (
-    event_payloads.ExternalOperationCreatedEventPayload.KIND
-)
-EXTERNAL_OPERATION_UPDATED_EVENT = (
-    event_payloads.ExternalOperationUpdatedEventPayload.KIND
-)
-EXTERNAL_OPERATION_DELETED_EVENT = (
-    event_payloads.ExternalOperationDeletedEventPayload.KIND
-)
 EVENT_METADATA = {
     MESSAGE_CREATED_EVENT: (MESSAGE_OBJECT_TYPE, CREATED_ACTION),
     MESSAGE_UPDATED_EVENT: (MESSAGE_OBJECT_TYPE, UPDATED_ACTION),
@@ -164,12 +133,6 @@ EVENT_METADATA = {
     EXTERNAL_ACCOUNT_CREATED_EVENT: (EXTERNAL_ACCOUNT_OBJECT_TYPE, CREATED_ACTION),
     EXTERNAL_ACCOUNT_UPDATED_EVENT: (EXTERNAL_ACCOUNT_OBJECT_TYPE, UPDATED_ACTION),
     EXTERNAL_ACCOUNT_DELETED_EVENT: (EXTERNAL_ACCOUNT_OBJECT_TYPE, DELETED_ACTION),
-    EXTERNAL_CHAT_CREATED_EVENT: (EXTERNAL_CHAT_OBJECT_TYPE, CREATED_ACTION),
-    EXTERNAL_CHAT_UPDATED_EVENT: (EXTERNAL_CHAT_OBJECT_TYPE, UPDATED_ACTION),
-    EXTERNAL_CHAT_DELETED_EVENT: (EXTERNAL_CHAT_OBJECT_TYPE, DELETED_ACTION),
-    EXTERNAL_OPERATION_CREATED_EVENT: (EXTERNAL_OPERATION_OBJECT_TYPE, CREATED_ACTION),
-    EXTERNAL_OPERATION_UPDATED_EVENT: (EXTERNAL_OPERATION_OBJECT_TYPE, UPDATED_ACTION),
-    EXTERNAL_OPERATION_DELETED_EVENT: (EXTERNAL_OPERATION_OBJECT_TYPE, DELETED_ACTION),
 }
 WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
     model_class=models.WorkspaceVisibleEvent,
@@ -177,7 +140,6 @@ WORKSPACE_EVENT_RESOURCE = ra_resources.ResourceByRAModel(
     process_filters=True,
 )
 DEFAULT_EVENTS_LIMIT = 100
-MAX_EVENTS_LIMIT = 500
 WORKSPACE_USER_MESSAGE_FIELDS = tuple(models.WorkspaceUserMessage.properties.properties)
 WORKSPACE_USER_STREAM_FIELDS = tuple(
     name
@@ -189,16 +151,7 @@ WORKSPACE_STREAM_BINDING_FIELDS = tuple(
 )
 WORKSPACE_USER_TOPIC_FIELDS = tuple(models.WorkspaceUserTopic.properties.properties)
 WORKSPACE_USER_FOLDER_FIELDS = tuple(models.UserFolder.properties.properties)
-WORKSPACE_USER_FIELDS = tuple(
-    name
-    for name in models.WorkspaceUser.properties.properties
-    if name
-    not in {
-        "provider_uuid",
-        "external_account_uuid",
-        "provider_external_id",
-    }
-)
+WORKSPACE_USER_FIELDS = tuple(models.WorkspaceUser.properties.properties)
 WORKSPACE_FILE_EVENT_FIELDS = (
     "uuid",
     "project_id",
@@ -260,87 +213,6 @@ def _event_payload_get(event_payload: typing.Any, name: typing.Any) -> typing.An
         return None
 
 
-def _external_metadata_from_canonical(
-    event_payload: typing.Any, model: typing.Any, session: typing.Any
-) -> typing.Any:
-    provider = _event_payload_get(event_payload, "provider")
-    delivery = _event_payload_get(event_payload, "delivery")
-    if provider is not None or delivery is not None:
-        return (
-            _event_payload_value("provider", provider),
-            _event_payload_value("delivery", delivery),
-        )
-    if session is None or not hasattr(session, "execute"):
-        return None, None
-    resource_uuid = _event_payload_get(event_payload, "uuid")
-    project_id = _event_payload_get(event_payload, "project_id")
-    if resource_uuid is None or project_id is None:
-        return None, None
-    metadata_cache = getattr(session, "_workspace_event_metadata_cache", None)
-    cache_key = (model.__tablename__, str(resource_uuid), str(project_id))
-    if metadata_cache is not None and cache_key in metadata_cache:
-        return metadata_cache[cache_key]
-    try:
-        canonical = model.objects.get_one_or_none(
-            filters={
-                "uuid": dm_filters.EQ(resource_uuid),
-                "project_id": dm_filters.EQ(project_id),
-            },
-            session=session,
-        )
-    except ra_exc.ValidationErrorException:
-        table = {
-            models.WorkspaceStream: "m_workspace_streams",
-            models.WorkspaceStreamTopic: "m_workspace_stream_topics",
-            models.WorkspaceMessage: "m_workspace_messages",
-        }.get(model)
-        if table is None:
-            raise
-        # Capability projection also updates historical rows whose current
-        # stream membership can no longer satisfy the canonical model's
-        # runtime validation. Event metadata is still safe to read directly;
-        # do not let that legacy recipient state break the bridge heartbeat.
-        canonical = session.execute(
-            f"""
-            SELECT provider_metadata, external_account_uuid,
-                   provider_external_id, delivery_metadata, delivery_status,
-                   delivery_error, delivery_updated_at
-            FROM {table}
-            WHERE uuid = %s AND project_id = %s
-            """,
-            (resource_uuid, project_id),
-        ).fetchone()
-    if canonical is None:
-        result: tuple[typing.Any, typing.Any] = (None, None)
-        if metadata_cache is not None:
-            metadata_cache[cache_key] = result
-        return result
-    provider = _event_payload_get(canonical, "provider_metadata")
-    external_account_uuid = _event_payload_get(canonical, "external_account_uuid")
-    if provider is None and external_account_uuid is not None:
-        provider = {
-            "kind": models.SourceName.ZULIP.value,
-            "account_uuid": str(external_account_uuid),
-            "external_id": _event_payload_get(canonical, "provider_external_id"),
-            "capabilities": {},
-        }
-    delivery = _event_payload_get(canonical, "delivery_metadata")
-    delivery_status = _event_payload_get(canonical, "delivery_status")
-    if delivery is None and delivery_status is not None:
-        delivery = {
-            "status": delivery_status,
-            "safe_error": _event_payload_get(canonical, "delivery_error"),
-            "updated_at": _event_payload_get(canonical, "delivery_updated_at"),
-        }
-    result = (
-        _event_payload_value("provider", provider),
-        _event_payload_value("delivery", delivery),
-    )
-    if metadata_cache is not None:
-        metadata_cache[cache_key] = result
-    return result
-
-
 def _message_from_event_payload(
     event_payload: typing.Any, session: typing.Any = None
 ) -> typing.Any:
@@ -352,12 +224,6 @@ def _message_from_event_payload(
         if value is None:
             continue
         result[name] = _event_payload_value(name, value)
-    provider, delivery = _external_metadata_from_canonical(
-        event_payload,
-        models.WorkspaceMessage,
-        session,
-    )
-    result.update({"provider": provider, "delivery": delivery})
     return result
 
 
@@ -375,12 +241,6 @@ def _stream_from_event_payload(
         name: _event_payload_value(name, _event_payload_get(event_payload, name))
         for name in WORKSPACE_USER_STREAM_FIELDS
     }
-    provider, delivery = _external_metadata_from_canonical(
-        event_payload,
-        models.WorkspaceStream,
-        session,
-    )
-    result.update({"provider": provider, "delivery": delivery})
     return result
 
 
@@ -393,12 +253,6 @@ def _topic_from_event_payload(
         if name == "notification_mode" and value is None:
             value = models.WorkspaceTopicNotificationMode.DEFAULT.value
         result[name] = _event_payload_value(name, value)
-    provider, delivery = _external_metadata_from_canonical(
-        event_payload,
-        models.WorkspaceStreamTopic,
-        session,
-    )
-    result.update({"provider": provider, "delivery": delivery})
     return result
 
 
@@ -527,13 +381,6 @@ def pack_workspace_event(event: typing.Any, request: typing.Any = None) -> typin
 
 def event_row_to_messenger_event(row: typing.Any) -> typing.Any:
     return pack_workspace_event(_workspace_event_from_row(row))
-
-
-def _fetch_one(
-    session: typing.Any, statement: typing.Any, values: typing.Any
-) -> typing.Any:
-    result = session.execute(statement, values)
-    return result.fetchone()
 
 
 def _create_workspace_event(
@@ -689,83 +536,6 @@ def _compress_recipient_payloads(
     return common, {key: value for key, value in overrides.items() if value}
 
 
-_PROVIDER_BATCH_BROADCAST_EVENTS_KEY = ("prepared_broadcast_events",)
-
-
-def _coalesce_prepared_resource_broadcast_events(
-    prepared_events: typing.Iterable[dict[str, typing.Any]],
-) -> list[dict[str, typing.Any]]:
-    """Merge equivalent recipient snapshots without collapsing causal updates.
-
-    Provider batches commonly project one provider message once per external
-    account. Those projections describe the same Workspace entity, but each
-    prepared event initially contains only that account owner. Events can share
-    one broadcast row while their recipient sets are disjoint. Seeing the same
-    recipient again starts a new group, because that represents a later causal
-    update that must remain separately ordered for that recipient.
-    """
-    groups: list[dict[str, typing.Any]] = []
-    latest_by_key: dict[tuple[str, str, str], dict[str, typing.Any]] = {}
-    last_group_index_by_recipient: dict[str, int] = {}
-    for event in prepared_events:
-        recipients = sorted(
-            {sys_uuid.UUID(str(value)) for value in event["recipients"]},
-            key=str,
-        )
-        if not recipients:
-            continue
-        key = (
-            str(event["project_id"]),
-            str(event["entity_uuid"]),
-            str(event["kind"]),
-        )
-        group = latest_by_key.get(key)
-        group_index = -1 if group is None else int(group["index"])
-        if group is None or any(
-            str(recipient) in group["payloads"]
-            or last_group_index_by_recipient.get(str(recipient), -1) >= group_index
-            for recipient in recipients
-        ):
-            group = {
-                "index": len(groups),
-                "project_id": event["project_id"],
-                "entity_uuid": event["entity_uuid"],
-                "kind": event["kind"],
-                "payloads": {},
-            }
-            groups.append(group)
-            latest_by_key[key] = group
-            group_index = int(group["index"])
-        overrides = {
-            str(user_uuid): payload
-            for user_uuid, payload in (event.get("recipient_payloads") or {}).items()
-        }
-        for recipient in recipients:
-            recipient_uuid = str(recipient)
-            payload = dict(event["payload"])
-            payload.update(overrides.get(recipient_uuid, {}))
-            group["payloads"][recipient_uuid] = payload
-            last_group_index_by_recipient[recipient_uuid] = group_index
-
-    coalesced = []
-    for group in groups:
-        payload, recipient_payloads = _compress_recipient_payloads(group["payloads"])
-        coalesced.append(
-            {
-                "project_id": group["project_id"],
-                "entity_uuid": group["entity_uuid"],
-                "recipients": sorted(
-                    (sys_uuid.UUID(value) for value in group["payloads"]),
-                    key=str,
-                ),
-                "kind": group["kind"],
-                "payload": payload,
-                "recipient_payloads": recipient_payloads,
-            }
-        )
-    return coalesced
-
-
 def create_resource_broadcast_event(
     project_id: object,
     entity_uuid: object,
@@ -839,15 +609,9 @@ def create_prepared_resource_broadcast_events(
 ) -> list[int]:
     """Persist an already-serialized bounded event batch in causal order."""
     prepared_events = list(prepared_events)
-    if _FIXTURE_EVENTS_SUPPRESSED.get() or not prepared_events:
+    if not prepared_events:
         return []
     session = session or contexts.Context().get_session()
-    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
-    if batch_cache is not None:
-        batch_cache.setdefault(_PROVIDER_BATCH_BROADCAST_EVENTS_KEY, []).extend(
-            prepared_events
-        )
-        return []
     return _persist_prepared_resource_broadcast_events(
         prepared_events,
         session=session,
@@ -877,240 +641,6 @@ def _persist_prepared_resource_broadcast_events(
     return epochs
 
 
-def flush_buffered_resource_broadcast_events(session: typing.Any) -> list[int]:
-    """Persist a provider batch's coalesced broadcasts in causal order."""
-    batch_cache = getattr(session, "_workspace_provider_event_batch_cache", None)
-    if batch_cache is None:
-        return []
-    prepared_events = batch_cache.pop(_PROVIDER_BATCH_BROADCAST_EVENTS_KEY, [])
-    if not prepared_events:
-        return []
-    return _persist_prepared_resource_broadcast_events_bulk(
-        _coalesce_prepared_resource_broadcast_events(prepared_events), session
-    )
-
-
-def _persist_prepared_resource_broadcast_events_bulk(
-    prepared_events: typing.Iterable[dict[str, typing.Any]],
-    session: typing.Any,
-) -> list[int]:
-    """Persist a provider batch with bounded SQL round trips.
-
-    ``apply_provider_event_batch`` already holds every affected project lock,
-    so the ordered insert below cannot race a direct writer for the same
-    project. The event UUID mapping makes the returned epoch list independent
-    of PostgreSQL's ``RETURNING`` row order.
-    """
-    event_rows = []
-    snapshots: dict[sys_uuid.UUID, tuple[object, str]] = {}
-    members: set[tuple[sys_uuid.UUID, sys_uuid.UUID]] = set()
-    recipient_payload_rows: list[tuple[sys_uuid.UUID, sys_uuid.UUID, str]] = []
-    for event in prepared_events:
-        recipients = sorted(
-            {sys_uuid.UUID(str(value)) for value in event["recipients"]},
-            key=str,
-        )
-        if not recipients:
-            continue
-        membership_digest = hashlib.sha256(
-            "\n".join(str(value) for value in recipients).encode("ascii")
-        ).hexdigest()
-        audience_snapshot_uuid = sys_uuid.uuid5(
-            sys_uuid.UUID(str(event["project_id"])),
-            membership_digest,
-        )
-        snapshots[audience_snapshot_uuid] = (
-            event["project_id"],
-            membership_digest,
-        )
-        members.update(
-            (audience_snapshot_uuid, recipient_uuid) for recipient_uuid in recipients
-        )
-        object_type, action = _event_metadata_for_kind(event["kind"])
-        event_uuid = sys_uuid.uuid4()
-        event_rows.append(
-            {
-                "uuid": event_uuid,
-                "project_id": event["project_id"],
-                "entity_uuid": event["entity_uuid"],
-                "audience_snapshot_uuid": audience_snapshot_uuid,
-                "object_type": object_type,
-                "action": action,
-                "payload": json.dumps(
-                    _payload_with_kind(event["kind"], event["payload"]),
-                    sort_keys=True,
-                ),
-            }
-        )
-        recipient_payload_rows.extend(
-            (
-                event_uuid,
-                sys_uuid.UUID(str(user_uuid)),
-                json.dumps(payload, sort_keys=True),
-            )
-            for user_uuid, payload in (event.get("recipient_payloads") or {}).items()
-        )
-    if not event_rows:
-        return []
-
-    snapshot_rows = sorted(snapshots.items(), key=lambda item: str(item[0]))
-    session.execute(
-        """
-        INSERT INTO m_workspace_event_audience_snapshots_v1 (
-            uuid, project_id, membership_digest
-        )
-        SELECT input.uuid, input.project_id, input.membership_digest
-        FROM unnest(%s::uuid[], %s::uuid[], %s::text[]) AS input(
-            uuid, project_id, membership_digest
-        )
-        ON CONFLICT (project_id, membership_digest) DO NOTHING
-        """,
-        (
-            [row[0] for row in snapshot_rows],
-            [row[1][0] for row in snapshot_rows],
-            [row[1][1] for row in snapshot_rows],
-        ),
-    )
-    member_rows = sorted(members, key=lambda item: (str(item[0]), str(item[1])))
-    session.execute(
-        """
-        INSERT INTO m_workspace_event_audience_members_v1 (
-            audience_snapshot_uuid, user_uuid
-        )
-        SELECT input.audience_snapshot_uuid, input.user_uuid
-        FROM unnest(%s::uuid[], %s::uuid[]) AS input(
-            audience_snapshot_uuid, user_uuid
-        )
-        ON CONFLICT (audience_snapshot_uuid, user_uuid) DO NOTHING
-        """,
-        (
-            [row[0] for row in member_rows],
-            [row[1] for row in member_rows],
-        ),
-    )
-    inserted_rows = session.execute(
-        """
-        WITH input AS (
-            SELECT *
-            FROM unnest(
-                %s::uuid[], %s::uuid[], %s::uuid[], %s::uuid[],
-                %s::integer[], %s::text[], %s::text[], %s::jsonb[]
-            ) WITH ORDINALITY AS event(
-                uuid, project_id, entity_uuid, audience_snapshot_uuid,
-                schema_version, object_type, action, payload, ordinal
-            )
-        )
-        INSERT INTO m_workspace_broadcast_message_events_v1 (
-            uuid, project_id, entity_uuid, audience_snapshot_uuid,
-            schema_version, object_type, action, payload
-        )
-        SELECT uuid, project_id, entity_uuid, audience_snapshot_uuid,
-               schema_version, object_type, action, payload
-        FROM input
-        ORDER BY ordinal
-        RETURNING uuid, epoch_version
-        """,
-        (
-            [row["uuid"] for row in event_rows],
-            [row["project_id"] for row in event_rows],
-            [row["entity_uuid"] for row in event_rows],
-            [row["audience_snapshot_uuid"] for row in event_rows],
-            [models.WORKSPACE_EVENT_SCHEMA_VERSION] * len(event_rows),
-            [row["object_type"] for row in event_rows],
-            [row["action"] for row in event_rows],
-            [row["payload"] for row in event_rows],
-        ),
-    ).fetchall()
-    epochs_by_uuid = {
-        sys_uuid.UUID(str(row["uuid"])): int(row["epoch_version"])
-        for row in inserted_rows
-    }
-    if set(epochs_by_uuid) != {row["uuid"] for row in event_rows}:
-        raise RuntimeError("Broadcast event batch insert returned incomplete results")
-    if recipient_payload_rows:
-        session.execute(
-            """
-            INSERT INTO m_workspace_event_recipient_payloads_v1 (
-                event_uuid, user_uuid, payload
-            )
-            SELECT input.event_uuid, input.user_uuid, input.payload
-            FROM unnest(%s::uuid[], %s::uuid[], %s::jsonb[]) AS input(
-                event_uuid, user_uuid, payload
-            )
-            """,
-            (
-                [row[0] for row in recipient_payload_rows],
-                [row[1] for row in recipient_payload_rows],
-                [row[2] for row in recipient_payload_rows],
-            ),
-        )
-    snapshot_epochs: dict[sys_uuid.UUID, int] = {}
-    for row in event_rows:
-        snapshot_uuid = row["audience_snapshot_uuid"]
-        snapshot_epochs[snapshot_uuid] = max(
-            snapshot_epochs.get(snapshot_uuid, 0),
-            epochs_by_uuid[row["uuid"]],
-        )
-    ordered_snapshot_epochs = sorted(
-        snapshot_epochs.items(), key=lambda item: str(item[0])
-    )
-    session.execute(
-        """
-        WITH current(audience_snapshot_uuid, epoch_version) AS (
-            SELECT * FROM unnest(%s::uuid[], %s::bigint[])
-        )
-        UPDATE m_workspace_event_audience_snapshots_v1 AS audience
-        SET current_epoch_version = GREATEST(
-            audience.current_epoch_version,
-            current.epoch_version
-        )
-        FROM current
-        WHERE audience.uuid = current.audience_snapshot_uuid
-        """,
-        (
-            [row[0] for row in ordered_snapshot_epochs],
-            [row[1] for row in ordered_snapshot_epochs],
-        ),
-    )
-    return [epochs_by_uuid[row["uuid"]] for row in event_rows]
-
-
-def prepare_stream_updated_broadcast(
-    project_id: object,
-    streams: typing.Any,
-    session: typing.Any = None,
-) -> dict[str, typing.Any] | None:
-    streams = list(streams)
-    if not streams:
-        return None
-    return prepare_resource_broadcast_event(
-        project_id,
-        _event_payload_get(streams[0], "uuid"),
-        STREAM_UPDATED_EVENT,
-        streams,
-        _stream_from_event_payload,
-        session=session,
-    )
-
-
-def prepare_topic_updated_broadcast(
-    project_id: object,
-    topics: typing.Any,
-    session: typing.Any = None,
-) -> dict[str, typing.Any] | None:
-    topics = list(topics)
-    if not topics:
-        return None
-    return prepare_resource_broadcast_event(
-        project_id,
-        _event_payload_get(topics[0], "uuid"),
-        TOPIC_UPDATED_EVENT,
-        topics,
-        _topic_from_event_payload,
-        session=session,
-    )
-
-
 def create_broadcast_event(
     project_id: object,
     entity_uuid: object,
@@ -1123,8 +653,6 @@ def create_broadcast_event(
     created_at: typing.Any = None,
     wait_for_project_lock: bool = True,
 ) -> typing.Any:
-    if _FIXTURE_EVENTS_SUPPRESSED.get():
-        return []
     if not recipients:
         return []
     session = session or contexts.Context().get_session()
@@ -1229,33 +757,6 @@ def create_broadcast_event(
         (epoch_version, audience_snapshot_uuid),
     )
     return [epoch_version]
-
-
-def create_deterministic_fixture_broadcast_event(
-    project_id: object,
-    entity_uuid: object,
-    recipients: typing.Any,
-    kind: typing.Any,
-    payload: typing.Any,
-    event_uuid: object,
-    created_at: typing.Any,
-    session: typing.Any,
-) -> typing.Any:
-    """Apply one isolated-test event without changing the public event API."""
-    token = _FIXTURE_EVENTS_SUPPRESSED.set(False)
-    try:
-        return create_broadcast_event(
-            project_id,
-            entity_uuid,
-            recipients,
-            kind,
-            payload,
-            session=session,
-            event_uuid=event_uuid,
-            created_at=created_at,
-        )
-    finally:
-        _FIXTURE_EVENTS_SUPPRESSED.reset(token)
 
 
 def create_message_updated_events(
@@ -1461,27 +962,6 @@ def create_message_read_event(
     )
 
 
-def create_messages_read_event(
-    project_id: object,
-    user_uuid: object,
-    message_uuids: typing.Any,
-    session: typing.Any = None,
-) -> typing.Any:
-    return _create_workspace_event(
-        project_id=project_id,
-        user_uuid=user_uuid,
-        kind=MESSAGES_READ_EVENT,
-        payload={
-            "project_id": _event_payload_value("project_id", project_id),
-            "message_uuids": [
-                _event_payload_value("uuid", message_uuid)
-                for message_uuid in message_uuids
-            ],
-        },
-        session=session,
-    )
-
-
 def create_message_deleted_event(
     project_id: object,
     user_uuid: object,
@@ -1535,7 +1015,6 @@ def _message_reaction_event_payload(
         "source": _event_payload_value("source", message.source),
     }
     payload.update(values)
-    payload.update({"provider": None, "delivery": None})
     return payload
 
 
@@ -1961,35 +1440,6 @@ def get_events_after(
     return events
 
 
-def get_event_for_user(
-    project_id: object,
-    user_uuid: object,
-    epoch_version: typing.Any,
-    session: typing.Any = None,
-) -> typing.Any:
-    events = get_events_after(
-        project_id,
-        user_uuid,
-        after_epoch_version=max(0, epoch_version - 1),
-        limit=1,
-        session=session,
-    )
-    if not events or events[0]["epoch_version"] != epoch_version:
-        return None
-    return events[0]
-
-
-def get_current_epoch_version(
-    project_id: object, user_uuid: object, session: typing.Any = None
-) -> typing.Any:
-    del session
-    with api_store.open_event_store(
-        typing.cast(sys_uuid.UUID, project_id),
-        typing.cast(sys_uuid.UUID, user_uuid),
-    ) as store:
-        return store.current_epoch()
-
-
 def get_event_cursor(
     project_id: object, user_uuid: object, session: typing.Any = None
 ) -> typing.Any:
@@ -2014,18 +1464,3 @@ def normalize_epoch_version(
     if parsed < 0:
         raise ra_exc.ParseError(value=value)
     return parsed
-
-
-def normalize_events_limit(
-    value: str | bytes | bytearray | int | float | None,
-    default: int = DEFAULT_EVENTS_LIMIT,
-) -> int:
-    if value is None or value == "":
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        raise ra_exc.ParseError(value=value)
-    if parsed < 1:
-        raise ra_exc.ParseError(value=value)
-    return min(parsed, MAX_EVENTS_LIMIT)

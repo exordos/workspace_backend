@@ -586,12 +586,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
         "properties"
     ]
     assert raw_provider_fields.isdisjoint(user_properties)
-    assert user_properties["identity_kind"]["enum"] == ["external"]
-    assert user_properties["display_name"]["readOnly"] is True
-    assert set(user_properties["provider"]["properties"]) == {
-        "kind",
-        "account_uuid",
-    }
+    assert {"provider", "identity_kind", "display_name"}.isdisjoint(user_properties)
     assert raw_provider_fields.isdisjoint(
         _component_schema(specification, "WorkspaceFile_Filter")["properties"],
     )
@@ -605,9 +600,8 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
             "properties"
         ]
         assert raw_provider_fields.isdisjoint(projection_properties)
-        assert {"provider", "delivery"} <= set(projection_properties)
+        assert {"provider", "delivery"}.isdisjoint(projection_properties)
         assert "identity_kind" not in projection_properties
-        assert "external_id" in projection_properties["provider"]["properties"]
     topic_properties = _component_schema(
         specification,
         "WorkspaceUserTopic_Get",
@@ -623,8 +617,6 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     )["properties"]
     assert event_properties["object_type"]["enum"] == [
         "external_account",
-        "external_chat",
-        "external_operation",
         "file",
         "folder",
         "folder_item",

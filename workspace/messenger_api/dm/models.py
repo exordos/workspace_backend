@@ -14,7 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import contextvars
 import datetime
 import enum
 import hashlib
@@ -35,11 +34,6 @@ from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import message_payloads
 
 
-_PROVIDER_MESSAGE_VALIDATION_CACHE: contextvars.ContextVar[
-    set[tuple[object, ...]] | None
-] = contextvars.ContextVar("provider_message_validation_cache", default=None)
-
-
 class ChatType(str, enum.Enum):
     STREAM = "stream"
     GROUP = "group"
@@ -51,7 +45,6 @@ class SystemFolderType(str, enum.Enum):
     CREATED = base.FOLDER_SYSTEM_TYPE_CREATED
 
 
-ZulipSource = base.ZulipSource
 NativeSource = base.NativeSource
 SourceName = base.SourceName
 WorkspaceStreamRole = base.WorkspaceStreamRole
@@ -211,7 +204,7 @@ class WorkspaceUserStatus(str, enum.Enum):
 
 class WorkspaceUserSource(str, enum.Enum):
     IAM = "iam"
-    ZULIP = "zulip"
+    NATIVE = "native"
 
 
 class WorkspaceUserLastPingAtType(types.UTCDateTimeZ):
@@ -292,19 +285,6 @@ class WorkspaceUser(
     orm.SQLStorableMixin,
 ):
     __tablename__ = "m_workspace_users"
-
-    provider_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)),
-        default=None,
-    )
 
     def pour(self, **kwargs: typing.Any) -> None:
         if "uuid" not in kwargs:
@@ -440,14 +420,6 @@ class WorkspaceFile(
         types.Enum(["owner", "stream", "public"]),
         default="stream",
     )
-    provider_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()),
-        default=None,
-    )
     content_type = properties.property(
         types.String(min_length=1, max_length=255),
         required=True,
@@ -502,24 +474,6 @@ class WorkspaceVisibleFile(WorkspaceFile):
 
 class WorkspaceStream(base.WorkspaceStreamBase, orm.SQLStorableMixin):
     __tablename__ = "m_workspace_streams"
-
-    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None
-    )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)), default=None
-    )
-    delivery_status = properties.property(
-        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
-        default=None,
-    )
-    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
-    delivery_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
 
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(
@@ -617,24 +571,6 @@ class WorkspaceMessageReactions(
 ):
     __tablename__ = "m_workspace_message_reactions"
 
-    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None
-    )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)), default=None
-    )
-    delivery_status = properties.property(
-        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
-        default=None,
-    )
-    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
-    delivery_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-
     message_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -667,8 +603,6 @@ WORKSPACE_EVENT_OBJECT_TYPES = (
     "folder_item",
     "file",
     "external_account",
-    "external_chat",
-    "external_operation",
 )
 WORKSPACE_EVENT_ACTIONS = (
     "created",
@@ -900,24 +834,6 @@ class WorkspaceStreamTopic(
 ):
     __tablename__ = "m_workspace_stream_topics"
 
-    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None
-    )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)), default=None
-    )
-    delivery_status = properties.property(
-        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
-        default=None,
-    )
-    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
-    delivery_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-
     name = properties.property(
         types.String(max_length=128),
         required=True,
@@ -1097,24 +1013,6 @@ class WorkspaceMessage(
 ):
     __tablename__ = "m_workspace_messages"
 
-    provider_uuid = properties.property(types.AllowNone(types.UUID()), default=None)
-    external_account_uuid = properties.property(
-        types.AllowNone(types.UUID()), default=None
-    )
-    provider_external_id = properties.property(
-        types.AllowNone(types.String(max_length=2048)), default=None
-    )
-    delivery_status = properties.property(
-        types.AllowNone(types.Enum(["pending", "delivered", "failed"])),
-        default=None,
-    )
-    delivery_error = properties.property(types.AllowNone(types.String()), default=None)
-    delivery_updated_at = properties.property(
-        types.AllowNone(types.UTCDateTimeZ()), default=None
-    )
-    provider_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-    delivery_metadata = properties.property(types.AllowNone(types.Dict()), default=None)
-
     user_uuid = properties.property(
         types.UUID(),
         required=True,
@@ -1131,32 +1029,24 @@ class WorkspaceMessage(
 
     def validate(self) -> None:
         super().validate()
-        validation_cache = _PROVIDER_MESSAGE_VALIDATION_CACHE.get()
-        if validation_cache is None and (
-            self.provider_uuid is None or self.external_account_uuid is None
-        ):
-            binding = WorkspaceStreamBinding.objects.get_one_or_none(
-                filters={
-                    "project_id": dm_filters.EQ(self.project_id),
-                    "stream_uuid": dm_filters.EQ(self.stream_uuid),
-                    "user_uuid": dm_filters.EQ(self.user_uuid),
-                },
-            )
-            if binding is None:
-                raise ra_exc.ValidationErrorException()
-        topic_key = (self.project_id, self.stream_uuid, self.topic_uuid)
-        if validation_cache is None or topic_key not in validation_cache:
-            topic = WorkspaceStreamTopic.objects.get_one_or_none(
-                filters={
-                    "uuid": dm_filters.EQ(self.topic_uuid),
-                    "project_id": dm_filters.EQ(self.project_id),
-                    "stream_uuid": dm_filters.EQ(self.stream_uuid),
-                },
-            )
-            if topic is None:
-                raise ra_exc.ValidationErrorException()
-            if validation_cache is not None:
-                validation_cache.add(topic_key)
+        binding = WorkspaceStreamBinding.objects.get_one_or_none(
+            filters={
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.stream_uuid),
+                "user_uuid": dm_filters.EQ(self.user_uuid),
+            },
+        )
+        if binding is None:
+            raise ra_exc.ValidationErrorException()
+        topic = WorkspaceStreamTopic.objects.get_one_or_none(
+            filters={
+                "uuid": dm_filters.EQ(self.topic_uuid),
+                "project_id": dm_filters.EQ(self.project_id),
+                "stream_uuid": dm_filters.EQ(self.stream_uuid),
+            },
+        )
+        if topic is None:
+            raise ra_exc.ValidationErrorException()
 
     def get_recipients(self, session: typing.Any = None) -> list[sys_uuid.UUID]:
         return get_stream_recipients(

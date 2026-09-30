@@ -38,21 +38,6 @@ class ApiEndpointController(ra_controllers.RoutesListController):
     __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/"
 
 
-_TRUE_VALUES = frozenset({"1", "true", "yes"})
-_FALSE_VALUES = frozenset({"0", "false", "no"})
-
-
-def _parse_bool(value: object, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        if value.lower() in _TRUE_VALUES:
-            return True
-        if value.lower() in _FALSE_VALUES:
-            return False
-    return default
-
-
 class UserScopedMixin:
     def _get_user_id(self) -> int:
         ctx = getattr(self, "get_context")()

@@ -71,90 +71,6 @@ class MessengerEventsTestCase(unittest.TestCase):
         to_thread.start()
         self.addCleanup(to_thread.stop)
 
-    def test_fixture_suppression_blocks_runtime_events_but_not_planned_events(self):
-        session = mock.Mock()
-        project_id = sys_uuid.uuid4()
-        entity_uuid = sys_uuid.uuid4()
-        recipient_uuid = sys_uuid.uuid4()
-
-        with events.suppress_unplanned_fixture_events():
-            self.assertEqual(
-                [],
-                events.create_broadcast_event(
-                    project_id,
-                    entity_uuid,
-                    [recipient_uuid],
-                    "message.created",
-                    {"uuid": str(entity_uuid)},
-                    session=session,
-                ),
-            )
-        session.execute.assert_not_called()
-
-        def planned_event(*args, **kwargs):
-            self.assertFalse(events._FIXTURE_EVENTS_SUPPRESSED.get())
-            return [72]
-
-        with (
-            events.suppress_unplanned_fixture_events(),
-            mock.patch.object(
-                events,
-                "create_broadcast_event",
-                side_effect=planned_event,
-            ) as create,
-        ):
-            result = events.create_deterministic_fixture_broadcast_event(
-                project_id,
-                entity_uuid,
-                [recipient_uuid],
-                "message.created",
-                {"uuid": str(entity_uuid)},
-                sys_uuid.uuid4(),
-                datetime.datetime.now(datetime.timezone.utc),
-                session,
-            )
-
-        self.assertEqual([72], result)
-        create.assert_called_once()
-
-    def test_deterministic_fixture_event_forwards_exact_identity_and_time(self):
-        project_id = sys_uuid.uuid4()
-        entity_uuid = sys_uuid.uuid4()
-        recipient_uuid = sys_uuid.uuid4()
-        event_uuid = sys_uuid.uuid4()
-        created_at = datetime.datetime(
-            2026, 7, 18, 10, 30, tzinfo=datetime.timezone.utc
-        )
-        session = object()
-
-        with mock.patch.object(
-            events,
-            "create_broadcast_event",
-            return_value=[71],
-        ) as create:
-            result = events.create_deterministic_fixture_broadcast_event(
-                project_id,
-                entity_uuid,
-                [recipient_uuid],
-                "message.created",
-                {"uuid": str(entity_uuid)},
-                event_uuid,
-                created_at,
-                session,
-            )
-
-        self.assertEqual([71], result)
-        create.assert_called_once_with(
-            project_id,
-            entity_uuid,
-            [recipient_uuid],
-            "message.created",
-            {"uuid": str(entity_uuid)},
-            session=session,
-            event_uuid=event_uuid,
-            created_at=created_at,
-        )
-
     def test_broadcast_event_serializes_project_epoch_commits(self):
         project_id = sys_uuid.uuid4()
         entity_uuid = sys_uuid.uuid4()
@@ -228,161 +144,6 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertIn("pg_try_advisory_xact_lock", lock_statement)
         self.assertEqual((project_id,), lock_params)
 
-    def test_provider_batch_coalesces_disjoint_recipient_broadcasts(self):
-        project_id = sys_uuid.uuid4()
-        entity_uuid = sys_uuid.uuid4()
-        first_recipient = sys_uuid.uuid4()
-        second_recipient = sys_uuid.uuid4()
-        prepared_events = [
-            {
-                "project_id": project_id,
-                "entity_uuid": entity_uuid,
-                "recipients": [first_recipient],
-                "kind": events.MESSAGE_CREATED_EVENT,
-                "payload": {"uuid": str(entity_uuid), "read": True},
-                "recipient_payloads": {},
-            },
-            {
-                "project_id": project_id,
-                "entity_uuid": entity_uuid,
-                "recipients": [second_recipient],
-                "kind": events.MESSAGE_CREATED_EVENT,
-                "payload": {"uuid": str(entity_uuid), "read": False},
-                "recipient_payloads": {},
-            },
-        ]
-
-        result = events._coalesce_prepared_resource_broadcast_events(prepared_events)
-
-        self.assertEqual(1, len(result))
-        self.assertEqual(project_id, result[0]["project_id"])
-        self.assertEqual(entity_uuid, result[0]["entity_uuid"])
-        self.assertEqual(
-            sorted([first_recipient, second_recipient], key=str),
-            result[0]["recipients"],
-        )
-        self.assertEqual({"uuid": str(entity_uuid), "read": True}, result[0]["payload"])
-        self.assertEqual(
-            {str(second_recipient): {"read": False}},
-            result[0]["recipient_payloads"],
-        )
-
-    def test_provider_batch_keeps_repeated_recipient_updates_ordered(self):
-        project_id = sys_uuid.uuid4()
-        entity_uuid = sys_uuid.uuid4()
-        recipient_uuid = sys_uuid.uuid4()
-        prepared_events = [
-            {
-                "project_id": project_id,
-                "entity_uuid": entity_uuid,
-                "recipients": [recipient_uuid],
-                "kind": events.MESSAGE_UPDATED_EVENT,
-                "payload": {"uuid": str(entity_uuid), "content": content},
-                "recipient_payloads": {},
-            }
-            for content in ("first", "second")
-        ]
-
-        result = events._coalesce_prepared_resource_broadcast_events(prepared_events)
-
-        self.assertEqual(2, len(result))
-        self.assertEqual("first", result[0]["payload"]["content"])
-        self.assertEqual("second", result[1]["payload"]["content"])
-
-    def test_provider_batch_does_not_move_event_before_recipient_predecessor(self):
-        project_id = sys_uuid.uuid4()
-        topic_uuid = sys_uuid.uuid4()
-        stream_uuid = sys_uuid.uuid4()
-        first_recipient = sys_uuid.uuid4()
-        second_recipient = sys_uuid.uuid4()
-        prepared_events = [
-            {
-                "project_id": project_id,
-                "entity_uuid": topic_uuid,
-                "recipients": [first_recipient],
-                "kind": events.TOPIC_UPDATED_EVENT,
-                "payload": {"uuid": str(topic_uuid), "unread_count": 1},
-                "recipient_payloads": {},
-            },
-            {
-                "project_id": project_id,
-                "entity_uuid": stream_uuid,
-                "recipients": [second_recipient],
-                "kind": events.STREAM_UPDATED_EVENT,
-                "payload": {"uuid": str(stream_uuid), "unread_count": 1},
-                "recipient_payloads": {},
-            },
-            {
-                "project_id": project_id,
-                "entity_uuid": topic_uuid,
-                "recipients": [second_recipient],
-                "kind": events.TOPIC_UPDATED_EVENT,
-                "payload": {"uuid": str(topic_uuid), "unread_count": 1},
-                "recipient_payloads": {},
-            },
-        ]
-
-        result = events._coalesce_prepared_resource_broadcast_events(prepared_events)
-
-        self.assertEqual(3, len(result))
-        self.assertEqual(stream_uuid, result[1]["entity_uuid"])
-        self.assertEqual(topic_uuid, result[2]["entity_uuid"])
-        self.assertEqual([second_recipient], result[2]["recipients"])
-
-    def test_provider_batch_flush_persists_many_broadcasts_in_bounded_queries(self):
-        project_id = sys_uuid.uuid4()
-        recipient_uuid = sys_uuid.uuid4()
-        prepared_events = [
-            {
-                "project_id": project_id,
-                "entity_uuid": sys_uuid.uuid4(),
-                "recipients": [recipient_uuid],
-                "kind": events.MESSAGE_CREATED_EVENT,
-                "payload": {"uuid": str(sys_uuid.uuid4()), "index": index},
-                "recipient_payloads": {},
-            }
-            for index in range(200)
-        ]
-
-        class Result:
-            def __init__(self, rows=None):
-                self.rows = rows or []
-
-            def fetchall(self):
-                return self.rows
-
-        class Session:
-            def __init__(self):
-                self._workspace_provider_event_batch_cache = {
-                    events._PROVIDER_BATCH_BROADCAST_EVENTS_KEY: prepared_events
-                }
-                self.statements = []
-
-            def execute(self, statement, params=None):
-                self.statements.append((statement, params))
-                if "RETURNING uuid, epoch_version" in statement:
-                    return Result(
-                        [
-                            {"uuid": event_uuid, "epoch_version": index + 1}
-                            for index, event_uuid in enumerate(params[0])
-                        ]
-                    )
-                return Result()
-
-        session = Session()
-
-        result = events.flush_buffered_resource_broadcast_events(session)
-
-        self.assertEqual(list(range(1, 201)), result)
-        self.assertEqual(4, len(session.statements))
-        self.assertEqual(
-            1,
-            sum(
-                "INSERT INTO m_workspace_broadcast_message_events_v1" in statement
-                for statement, _params in session.statements
-            ),
-        )
-
     def test_websocket_event_reads_use_canonical_store_boundary(self):
         project_id = sys_uuid.uuid4()
         user_uuid = sys_uuid.uuid4()
@@ -396,9 +157,9 @@ class MessengerEventsTestCase(unittest.TestCase):
                 )
                 return [event] if filters["epoch_version"].value < 7 else []
 
-            def current_epoch(self):
-                calls.append(("epoch",))
-                return 7
+            def event_cursor(self):
+                calls.append(("cursor",))
+                return {"current_epoch_version": 7}
 
         api_store.configure_store_factory(
             lambda opened_project, opened_user: (
@@ -413,12 +174,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                 events.get_events_after(project_id, user_uuid, 0, limit=10),
             )
             self.assertEqual(
-                event,
-                events.get_event_for_user(project_id, user_uuid, 7),
-            )
-            self.assertEqual(
-                7,
-                events.get_current_epoch_version(project_id, user_uuid),
+                {"current_epoch_version": 7},
+                events.get_event_cursor(project_id, user_uuid),
             )
         finally:
             api_store.reset_store_factory()
@@ -426,8 +183,7 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(
             [
                 ("events", 0, {"epoch_version": "asc"}, 10),
-                ("events", 6, {"epoch_version": "asc"}, 1),
-                ("epoch",),
+                ("cursor",),
             ],
             calls,
         )
@@ -437,12 +193,6 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(42, events.normalize_epoch_version("42"))
         with self.assertRaises(ra_exc.ParseError):
             events.normalize_epoch_version("-1")
-
-    def test_limit_is_capped(self):
-        self.assertEqual(1, events.normalize_events_limit("1"))
-        self.assertEqual(events.MAX_EVENTS_LIMIT, events.normalize_events_limit("9999"))
-        with self.assertRaises(ra_exc.ParseError):
-            events.normalize_events_limit("0")
 
     def test_bearer_token_from_subprotocols(self):
         self.assertEqual(
@@ -601,14 +351,8 @@ class MessengerEventsTestCase(unittest.TestCase):
             "message_uuid": str(message_uuid),
             "user_uuid": str(user_uuid),
             "emoji_name": "thumbs_up",
-            "source_name": "zulip",
-            "source": {
-                "kind": "zulip",
-                "stream_id": 17,
-                "server_url": "https://zulip.example.test",
-                "topic_name": "general",
-                "message_id": 42,
-            },
+            "source_name": "native",
+            "source": {"kind": "native"},
         }
         row = self._workspace_event_row(
             payload=payload,
@@ -872,16 +616,14 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "invite_only": False,
                 "announce": False,
                 "private": False,
-                "provider": None,
-                "delivery": None,
                 "created_at": "2026-06-24T22:28:34.166369",
                 "updated_at": "2026-06-24T22:28:34.166369",
             }
         )
 
         self.assertEqual("Engineering", payload.name)
-        self.assertIsNone(payload.provider)
-        self.assertIsNone(payload.delivery)
+        self.assertFalse(hasattr(payload, "provider"))
+        self.assertFalse(hasattr(payload, "delivery"))
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
             event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.created_at),
@@ -977,23 +719,13 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "is_default": False,
                 "is_done": False,
                 "notification_mode": "default",
-                "provider": {
-                    "uuid": str(sys_uuid.uuid4()),
-                    "name": "Zulip Main",
-                    "kind": "zulip",
-                },
-                "delivery": {
-                    "status": "delivered",
-                    "safe_error": None,
-                    "updated_at": "2026-06-24T22:28:34.166369Z",
-                },
             }
         )
 
         self.assertEqual("Planning", payload.name)
         self.assertEqual("default", payload.notification_mode)
-        self.assertEqual("Zulip Main", payload.provider["name"])
-        self.assertEqual("delivered", payload.delivery["status"])
+        self.assertFalse(hasattr(payload, "provider"))
+        self.assertFalse(hasattr(payload, "delivery"))
         self.assertEqual(
             "2026-06-24T22:28:34.166369Z",
             event_payloads.MESSAGE_EVENT_TIMESTAMP_TYPE.dump_value(payload.created_at),
@@ -1190,82 +922,6 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_event["payload"]["updated_at"],
         )
 
-    def test_external_metadata_falls_back_for_legacy_invalid_message(self):
-        project_id = sys_uuid.uuid4()
-        message_uuid = sys_uuid.uuid4()
-        account_uuid = sys_uuid.uuid4()
-        session = mock.MagicMock()
-        session.execute.return_value.fetchone.return_value = {
-            "provider_metadata": {
-                "kind": "zulip",
-                "account_uuid": str(account_uuid),
-                "external_id": "42",
-                "capabilities": {"messenger.message.read": {"available": True}},
-            },
-            "external_account_uuid": account_uuid,
-            "provider_external_id": "42",
-            "delivery_metadata": None,
-            "delivery_status": "delivered",
-            "delivery_error": None,
-            "delivery_updated_at": None,
-        }
-        payload = {"uuid": message_uuid, "project_id": project_id}
-
-        with mock.patch.object(
-            events.models.WorkspaceMessage,
-            "objects",
-            types.SimpleNamespace(
-                get_one_or_none=mock.Mock(
-                    side_effect=ra_exc.ValidationErrorException()
-                ),
-            ),
-        ):
-            provider, delivery = events._external_metadata_from_canonical(
-                payload,
-                events.models.WorkspaceMessage,
-                session,
-            )
-
-        self.assertEqual("42", provider["external_id"])
-        self.assertEqual(
-            {"status": "delivered", "safe_error": None, "updated_at": None},
-            delivery,
-        )
-        statement, parameters = session.execute.call_args.args
-        self.assertIn("FROM m_workspace_messages", statement)
-        self.assertEqual((message_uuid, project_id), parameters)
-
-    def test_create_messages_read_event_uses_legacy_payload(self):
-        project_id = sys_uuid.uuid4()
-        user_uuid = sys_uuid.uuid4()
-        message_uuid_1 = sys_uuid.uuid4()
-        message_uuid_2 = sys_uuid.uuid4()
-        session = object()
-
-        result, created_events = self._capture_workspace_events(
-            lambda: events.create_messages_read_event(
-                project_id=project_id,
-                user_uuid=user_uuid,
-                message_uuids=[message_uuid_1, message_uuid_2],
-                session=session,
-            )
-        )
-
-        created_event = created_events[0]
-        self.assertEqual(1, result)
-        self.assertIs(session, created_event["insert_session"])
-        self._assert_created_event_contract(
-            created_event,
-            "message",
-            "read",
-            "messages.read",
-        )
-        self.assertEqual(str(project_id), created_event["payload"]["project_id"])
-        self.assertEqual(
-            [str(message_uuid_1), str(message_uuid_2)],
-            created_event["payload"]["message_uuids"],
-        )
-
     def test_user_updated_event_uses_one_broadcast_without_payload_change(self):
         project_id = sys_uuid.uuid4()
         recipient_uuids = [sys_uuid.uuid4(), sys_uuid.uuid4()]
@@ -1386,8 +1042,6 @@ class MessengerEventsTestCase(unittest.TestCase):
         )
         self.assertEqual("Engineering", created_events[1]["payload"]["name"])
         self.assertEqual({"kind": "native"}, created_events[1]["payload"]["source"])
-        self.assertIsNone(created_events[1]["payload"]["provider"])
-        self.assertIsNone(created_events[1]["payload"]["delivery"])
         self._assert_created_event_contract(
             created_events[2], "stream", "read", "stream.read"
         )
@@ -1395,8 +1049,6 @@ class MessengerEventsTestCase(unittest.TestCase):
             created_events[3], "topic", "created", "topic.created"
         )
         self.assertEqual("Planning", created_events[3]["payload"]["name"])
-        self.assertIsNone(created_events[3]["payload"]["provider"])
-        self.assertIsNone(created_events[3]["payload"]["delivery"])
         self._assert_created_event_contract(
             created_events[4], "topic", "read", "topic.read"
         )
@@ -1496,70 +1148,6 @@ class MessengerEventsTestCase(unittest.TestCase):
             events._message_from_event_payload,
             session=session,
         )
-
-    def test_source_provenance_keeps_nullable_provider_delivery_extensions(self):
-        project_id = sys_uuid.uuid4()
-        user_uuid = sys_uuid.uuid4()
-        stream_uuid = sys_uuid.uuid4()
-        topic_uuid = sys_uuid.uuid4()
-        message_uuid = sys_uuid.uuid4()
-        stream = models.WorkspaceUserStream(
-            uuid=stream_uuid,
-            user_uuid=user_uuid,
-            name="Engineering",
-            description="Engineering workspace",
-            project_id=project_id,
-            owner=user_uuid,
-            role="member",
-            notification_mode="all_messages",
-            source_name="zulip",
-            source=models.ZulipSource(
-                stream_id=17,
-                server_url="https://zulip.example.test",
-            ),
-        )
-        topic = models.WorkspaceUserTopic(
-            uuid=topic_uuid,
-            user_uuid=user_uuid,
-            project_id=project_id,
-            name="Planning",
-            stream_uuid=stream_uuid,
-        )
-        reaction = types.SimpleNamespace(
-            uuid=sys_uuid.uuid4(),
-            project_id=project_id,
-            message_uuid=message_uuid,
-            user_uuid=user_uuid,
-            emoji_name="thumbs_up",
-        )
-        message = types.SimpleNamespace(
-            source_name="zulip",
-            source=models.ZulipSource(
-                stream_id=17,
-                server_url="https://zulip.example.test",
-                topic_name="Planning",
-                message_id=42,
-            ),
-        )
-        session = object()
-
-        _result, created_events = self._capture_workspace_events(
-            lambda: [
-                events.create_stream_event(stream, session=session),
-                events.create_topic_event(topic, session=session),
-                events.create_message_reaction_created_event(
-                    reaction,
-                    message,
-                    session=session,
-                ),
-            ]
-        )
-
-        for created_event in created_events:
-            self.assertIsNone(created_event["payload"]["provider"])
-            self.assertIsNone(created_event["payload"]["delivery"])
-        self.assertEqual("zulip", created_events[0]["payload"]["source_name"])
-        self.assertEqual("zulip", created_events[2]["payload"]["source_name"])
 
     def test_create_stream_bindings_created_event_uses_items_payload(self):
         project_id = sys_uuid.uuid4()
@@ -1662,13 +1250,8 @@ class MessengerEventsTestCase(unittest.TestCase):
                     stream_uuid=stream_uuid,
                     topic_uuid=topic_uuid,
                     author_uuid=user_uuid,
-                    source_name="zulip",
-                    source=models.ZulipSource(
-                        stream_id=3,
-                        server_url="https://zulip.example.com",
-                        topic_name="deploys",
-                        message_id=12345,
-                    ),
+                    source_name="native",
+                    source=models.NativeSource(),
                 ),
                 events.create_folder_deleted_event(
                     project_id=project_id,
@@ -1708,15 +1291,10 @@ class MessengerEventsTestCase(unittest.TestCase):
         self.assertEqual(str(message_uuid), created_events[2]["payload"]["uuid"])
         self.assertEqual(str(topic_uuid), created_events[2]["payload"]["topic_uuid"])
         self.assertEqual(str(user_uuid), created_events[2]["payload"]["author_uuid"])
-        self.assertEqual("zulip", created_events[2]["payload"]["source_name"])
+        self.assertEqual("native", created_events[2]["payload"]["source_name"])
         self.assertEqual(
             {
-                "kind": "zulip",
-                "stream_id": 3,
-                "server_url": "https://zulip.example.com",
-                "source_scope": None,
-                "topic_name": "deploys",
-                "message_id": 12345,
+                "kind": "native",
             },
             created_events[2]["payload"]["source"],
         )
@@ -2333,6 +1911,7 @@ class MessengerEventsTestCase(unittest.TestCase):
                 "_call_with_database_session",
                 new=_call_without_database_session,
             ):
+
                 async def catch_up_connections():
                     for connection in connections:
                         server._request_catch_up(connection)

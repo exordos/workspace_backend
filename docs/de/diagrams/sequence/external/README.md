@@ -1,26 +1,16 @@
-[← Hauptindex der Dokumentation](../../../index.md) ·
-[Index der Abfolge-Diagramme](../README.md) ·
-[Vollständige Operationenmatrix](operations/README.md)
+# Accounts and events
 
-# Diagramme der Abfolge der externen Integration und der Ausführungszeit
+External accounts store an owner, a required provider, and generic settings.
+Creating an account does not connect or synchronize it. Workspace provides
+account CRUD; updates require the current `If-Match` revision.
 
-Status: **Vollständige Anzeige des aktuellen öffentlichen Vertrages, angefangen mit Dokumentation**.
-Öffentliche Methoden, Wege und JSON beschreiben den laufenden Vertrag; zielgerichtete interne
-Modelle und Hintergrundströme sind ein Vorschlag.
+Workspace entities retain native `source_name` and `source` fields.
+Messages and attachments use ordinary membership permissions and file ACLs.
 
-In der Dokumentation werden die Begriffe gebraucht: Binden (binding), Platzieren
-(placement), Transaktionsjournal (transactional outbox), Projektion
-(projection), Windverbreitung (fan-out) und Vorker (worker).
+See the [current public API contract](../../../../public_workspace_api.yaml).
 
-Vollständige Methoden- und Wegmatrix, einschließlich Events, Epochen und externen Abrechnungen
-Aufzeichnungen/Chats/Operationen, Bridge-Nachweise, Anbieter-Politik/Gesundheitspolice und WebSocket
-Events, ist in
-[`operations/README.md`](operations/README.md).
+Native event operations:
 
-Abdeckung: **29 HTTP-Operationen + 1 Eingangspunkt WebSocket Ausführungszeit**, für jede
-Einheitliche Markdowns, die von PlantUML und lokal bearbeitet werden können
-Rendered SVG.
-
-[← Hauptindex der Dokumentation](../../../index.md) ·
-[Index der Abfolge-Diagramme](../README.md) ·
-[Vollständige Operationenmatrix](operations/README.md)
+- [Epoch](operations/get_epoch.md)
+- [REST events](operations/get_events.md)
+- [WebSocket events](operations/websocket_events.md)

@@ -23,9 +23,7 @@ SERVICE_NAMES=(
     workspace-api
     workspace-messenger-api
     workspace-messenger-worker
-    workspace-history-import-worker
     workspace-messenger-events
-    workspace-external-bridge-api
 )
 
 for service_name in "${SERVICE_NAMES[@]}"; do

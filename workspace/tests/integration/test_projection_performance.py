@@ -14,7 +14,7 @@ import psycopg
 import pytest
 from restalchemy.common import contexts
 
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
 from workspace.services.messenger_workers import v2_projection
@@ -33,9 +33,7 @@ def _production_v2_store():
     try:
         yield
     finally:
-        api_store.configure_store_factory(
-            sql_canonical_store.SQLCanonicalMessengerStoreFactory()
-        )
+        api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
 
 
 @pytest.fixture(autouse=True)

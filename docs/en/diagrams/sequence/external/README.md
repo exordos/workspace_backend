@@ -1,26 +1,16 @@
-[← The main index of the documentation](../../../index.md) ·
-[Index of sequence diagrams](../README.md) ·
-[Full matrix of operations](operations/README.md)
+# Accounts and events
 
-# Diagrams of sequences of external integration and execution time
+External accounts store an owner, a required provider, and generic settings.
+Creating an account does not connect or synchronize it. Workspace provides
+account CRUD; updates require the current `If-Match` revision.
 
-Status: **Full current public contract view, starting with documentation**.
-Public methods, paths and JSON describe the current contract; target internal
-The models and background streams are the proposition.
+Workspace entities retain native `source_name` and `source` fields.
+Messages and attachments use ordinary membership permissions and file ACLs.
 
-In the documentation used the terms: binding , placement
-(placement), The transactional outbox , the projection
-(projection), Fan-out and worker (worker).
+See the [current public API contract](../../../../public_workspace_api.yaml).
 
-Complete matrix of methods and paths, including Events, Epoch and external accounts
-records/chats/operations, bridge copies, provider policy/health and WebSocket
-Events, It 's in
-[`operations/README.md`](operations/README.md).
+Native event operations:
 
-Coverage: **29 HTTP-operations + 1 entry point WebSocket of execution time**, for each
-Provided separate Markdown, editable PlantUML and locally
-It 's rendered . SVG.
-
-[← The main index of the documentation](../../../index.md) ·
-[Index of sequence diagrams](../README.md) ·
-[Full matrix of operations](operations/README.md)
+- [Epoch](operations/get_epoch.md)
+- [REST events](operations/get_events.md)
+- [WebSocket events](operations/websocket_events.md)

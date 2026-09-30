@@ -208,7 +208,7 @@ Messenger ресурсы сохраняют канонический прови�
 `/api/workspace-provider/v1`; его операции обязывают обычные Messenger
 ресурсов в PostgreSQL, так что это не меняет браузерный контракт, описанный
 Частный договор определяется в
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## Странирование и фильтры
 
@@ -388,7 +388,7 @@ Zulip является первым зарегистрированным тип�
 Примеры, правила ETag и `If-Match`, разрешения на действия, семантика жизненного цикла,
 и поведение администратора для учетных записей, чатов, операций, мостовых экземпляров,
 Политики и правила здравоохранения поставщиков определены в разделах 5 и 6
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 Его частный контроль, провайдер данных-плана, и файловых передач разделов описывают
 контракты с использованием серверов backend-to-bridge и не являются частью общедоступного браузера API.
 
@@ -2144,7 +2144,7 @@ IAM-аутентифицированная HTTP поверхность и не �
 отдельные события WebSocket являются документально зарегистрированными интерфейсами в режиме выполнения, но не отображаются
 как генерируемые OpenAPI пути. Контракт частного поставщика поддерживается
 отдельно в
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 Элемент Workspace устанавливает независимый `workspace-messenger-api`,
 `workspace-api`, `workspace-messenger-events` и
@@ -2159,5 +2159,5 @@ IAM-аутентифицированная HTTP поверхность и не �
 
 - [Workspace архитектура](architecture.md)
 - [Workspace Интеграция пользовательского интерфейса в режиме реального времени](workspace_ui_realtime_integration.md)
-- [Частный Workspace Поставщик API](../workspace_provider_api_v1.yaml)
-- [Zulip Продукт поставщика и общественный контракт API](zulip_bridge_v1_product_and_api.md)
+- Частный Workspace Поставщик API
+- Zulip Продукт поставщика и общественный контракт API

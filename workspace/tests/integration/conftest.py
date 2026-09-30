@@ -27,13 +27,16 @@ request headers.  This keeps the tests hermetic while exercising everything
 below the auth layer, including the composite-primary-key controllers.
 """
 
+import contextlib
 import os
 import pathlib
 import threading
+import urllib.parse
 import uuid as sys_uuid
 import wsgiref.simple_server
 
 import psycopg
+from psycopg import sql
 import pytest
 import requests
 
@@ -50,11 +53,10 @@ from oslo_config import cfg
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
-from workspace.common import external_bridge_opts
 from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
-from workspace.messenger_api.api import sql_canonical_store
+from workspace.tests.integration import legacy_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.workspace_api.api import app as workspace_app
@@ -177,10 +179,6 @@ def build_test_wsgi_application(app_module=messenger_app):
     except cfg.DuplicateOptError:
         pass
     try:
-        external_bridge_opts.register_opts()
-    except cfg.DuplicateOptError:
-        pass
-    try:
         topic_summary_opts.register_opts()
     except cfg.DuplicateOptError:
         pass
@@ -297,14 +295,40 @@ def _database():
 
     engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
     engine.apply_migration(engine.get_latest_migration())
-    api_store.configure_store_factory(
-        sql_canonical_store.SQLCanonicalMessengerStoreFactory()
-    )
+    api_store.configure_store_factory(legacy_store.LegacyMessengerStoreFactory())
 
     yield
 
     api_store.reset_store_factory()
     engines.engine_factory.destroy_all_engines()
+
+
+@contextlib.contextmanager
+def isolated_migration_database(migration):
+    """Own a disposable database for tests of a published schema revision."""
+    database_name = "workspace_migration_" + sys_uuid.uuid4().hex
+    database_url = (
+        urllib.parse.urlsplit(TEST_DB_URL)._replace(path="/" + database_name).geturl()
+    )
+    with psycopg.connect(TEST_DB_URL, autocommit=True) as admin:
+        admin.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
+        )
+    try:
+        engines.engine_factory.destroy_all_engines()
+        engines.engine_factory.configure_factory(db_url=database_url)
+        engine = ra_migrations.MigrationEngine(migrations_path=str(MIGRATIONS_DIR))
+        engine.apply_migration(migration)
+        yield database_url
+    finally:
+        engines.engine_factory.destroy_all_engines()
+        engines.engine_factory.configure_factory(db_url=TEST_DB_URL)
+        with psycopg.connect(TEST_DB_URL, autocommit=True) as admin:
+            admin.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
+                    sql.Identifier(database_name)
+                )
+            )
 
 
 @pytest.fixture(scope="session")

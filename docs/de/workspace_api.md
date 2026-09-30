@@ -208,7 +208,7 @@ Die Ausführungszeiten verwenden die private Brücke-Authentifizierung API mit R
 `/api/workspace-provider/v1`; seine Geschäfte verpflichten sich zu gewöhnlichen Messenger
 Ressourcen in PostgreSQL, so dass es den beschriebenen Browservertrag nicht ändert
 Die private Vereinbarung ist in diesem Dokument definiert.
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 ## Seitenaufzeichnung und Filter
 
@@ -388,7 +388,7 @@ Die Datenbank wird nicht für die Bereitstellung von Daten verwendet.
 Beispiele, ETag und `If-Match`-Regeln, Handlungserlaubnisse, Lebenszyklussemantik,
 und Verwaltung Verhalten für Konten, Chats, Operationen, Brücken Instanzen,
 Die Gesundheitspolitik der Anbieter und die Gesundheitspolitik der Anbieter sind in den Abschnitten 5 und 6 der
-[`zulip_bridge_v1_product_and_api.md`](zulip_bridge_v1_product_and_api.md).
+`zulip_bridge_v1_product_and_api.md`.
 Die private Steuerung, die Datenbereitstellung und die Dateiübertragung beschreiben
 Backend-to-Bridge-Verträge und sind nicht Teil des öffentlichen Browsers API.
 
@@ -2144,7 +2144,7 @@ Die von der Middleware bereitgestellten `server_settings` Alias-Namen und die
 separate Ereignisse WebSocket sind dokumentierte Laufzeitschnittstellen, erscheinen aber nicht
 wie erzeugt .OpenAPIDer Privatanbietervertrag wird beibehalten.
 getrennt in
-[`workspace_provider_api_v1.yaml`](../workspace_provider_api_v1.yaml).
+`workspace_provider_api_v1.yaml`.
 
 Das Backend-Element Workspace installiert unabhängige `workspace-messenger-api`,
 `workspace-api`, `workspace-messenger-events` und
@@ -2159,5 +2159,5 @@ Verwandte Dokumente:
 
 - [Workspace Architektur](architecture.md)
 - [Workspace Echtzeit-Integration der Benutzeroberfläche](workspace_ui_realtime_integration.md)
-- [Privater Workspace Anbieter API](../workspace_provider_api_v1.yaml)
-- [Zulip Lieferantprodukt und öffentlicher API-Vertrag](zulip_bridge_v1_product_and_api.md)
+- Privater Workspace Anbieter API
+- Zulip Lieferantprodukt und öffentlicher API-Vertrag
