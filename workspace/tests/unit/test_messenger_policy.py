@@ -20,6 +20,7 @@ from restalchemy.api import routes as ra_routes
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
@@ -375,7 +376,7 @@ def test_stream_resource_hides_internal_private_index():
 
 
 def test_route_permissions_and_action_owners_are_preserved():
-    assert routes.ApiEndpointRoute.files is routes.WorkspaceFileRoute
+    assert workspace_routes.MessengerRoute.files is routes.WorkspaceFileRoute
     assert ra_routes.DELETE in routes.WorkspaceStreamRoute.__allow_methods__
     assert ra_routes.UPDATE in routes.WorkspaceStreamRoute.__allow_methods__
     assert ra_routes.UPDATE in routes.WorkspaceMessageRoute.__allow_methods__

@@ -110,18 +110,18 @@ def test_postgresql_runtime_has_bounded_connection_lifetimes():
             assert f"{name} = {value}" in config
 
 
-def test_messenger_runtime_has_two_workers_with_bounded_pool_budget():
+def test_workspace_runtime_has_two_workers_with_bounded_pool_budget():
     for config_path in (
         "etc/workspace/workspace.conf",
         "exordos/manifests/workspace.yaml.j2",
     ):
         config = _read(config_path)
-        messenger = config.split("[messenger_api]", 1)[1].split("[", 1)[0]
-        assert "workers = 2" in messenger
+        workspace = config.split("[workspace_api]", 1)[1].split("[", 1)[0]
+        assert "workers = 2" in workspace
         assert "connection_pool_max_size = 2" in config
 
-    messenger_source = _read("workspace/cmd/messenger_api.py")
-    assert '"workspace-messenger-api"' in messenger_source
+    workspace_source = _read("workspace/cmd/workspace_api.py")
+    assert '"workspace-api"' in workspace_source
 
 
 def test_postgresql_runtime_has_import_scale_session_tuning():
@@ -254,3 +254,22 @@ def test_event_retention_migration_follows_canonical_schema_directly():
 
     assert "0109-add-scalable-Messenger-visibility-views-0ae35f.py" in migration
     assert "canonical-import-ledger" not in migration
+
+
+def test_only_workspace_rest_service_is_deployed():
+    for relative_path in (
+        "pyproject.toml",
+        "etc/workspace/workspace.conf",
+        "exordos/manifests/workspace.yaml.j2",
+        "exordos/images/backend-install.sh",
+        "exordos/images/workspace-restart-services.sh",
+    ):
+        source = _read(relative_path)
+        assert "workspace-messenger-api" not in source
+        assert "[messenger_api]" not in source
+        assert "21081" not in source
+
+    manifest = _read("exordos/manifests/workspace.yaml.j2")
+    assert "location /api/workspace/v1/messenger/" not in manifest
+    assert "proxy_pass http://127.0.0.1:21084/;" in manifest
+    assert "proxy_pass http://127.0.0.1:21082/v1/events/ws;" in manifest

@@ -329,25 +329,3 @@ class MeRoute(routes.Route):
 
     __controller__ = controllers.MeController
     __allow_methods__ = [routes.FILTER]
-
-
-class ApiEndpointRoute(routes.Route):
-    """Handler for /v1/ endpoint."""
-
-    __controller__ = controllers.ApiEndpointController
-    __allow_methods__ = [routes.FILTER]
-
-    folders = routes.route(FolderRoute)
-    folder_items = routes.route(FolderItemRoute)
-    streams = routes.route(WorkspaceStreamRoute)
-    stream_bindings = routes.route(WorkspaceStreamBindingRoute)
-    stream_topics = routes.route(WorkspaceStreamTopicRoute)
-    messages = routes.route(WorkspaceMessageRoute)
-    drafts = routes.route(WorkspaceDraftRoute)
-    external_accounts = routes.route(ExternalAccountRoute)
-    topic_summary_endpoints = routes.route(TopicSummaryEndpointRoute)
-    topic_summary_settings = routes.route(TopicSummarySettingsRoute)
-    message_reactions = routes.route(WorkspaceMessageReactionRoute)
-    files = routes.route(WorkspaceFileRoute)
-    users = routes.route(WorkspaceUserRoute)
-    me = routes.route(MeRoute)

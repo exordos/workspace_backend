@@ -22,9 +22,9 @@ from workspace.tests.integration import conftest
 
 
 V1 = "/v1"
-STREAMS = f"{V1}/streams/"
-MESSAGES = f"{V1}/messages/"
-MESSAGE_REACTIONS = f"{V1}/message_reactions/"
+STREAMS = f"{V1}/messenger/streams/"
+MESSAGES = f"{V1}/messenger/messages/"
+MESSAGE_REACTIONS = f"{V1}/messenger/message_reactions/"
 
 
 @pytest.fixture(autouse=True)

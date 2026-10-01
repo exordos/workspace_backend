@@ -3,6 +3,8 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import typing
+
 from gcl_iam import middlewares as iam_mw
 from restalchemy.api import applications
 from restalchemy.api import middlewares
@@ -11,7 +13,6 @@ from restalchemy.api.middlewares import logging as logging_mw
 from restalchemy.openapi import constants as openapi_constants
 from restalchemy.openapi import engines as openapi_engines
 from restalchemy.openapi import structures as openapi_structures
-from typing import Any
 
 from workspace import version as app_version
 from workspace.messenger_api.api import context as auth_context
@@ -28,7 +29,7 @@ WorkspaceApiApp.v1 = routes.route(app_routes.WorkspaceApiEndpointRoute)
 
 
 class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
-    def build(self, request: Any) -> dict[str, Any]:
+    def build(self, request: typing.Any) -> dict[str, typing.Any]:
         specification = super().build(request)
         specification["components"]["securitySchemes"] = {
             "bearerAuth": {
@@ -42,7 +43,9 @@ class WorkspaceOpenApiComponents(openapi_structures.OpenApiComponents):
 
 
 class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
-    def build(self, request: Any, components: Any) -> dict[str, Any]:
+    def build(
+        self, request: typing.Any, components: typing.Any
+    ) -> dict[str, typing.Any]:
         specification = super().build(request, components)
         for path in specification["paths"].values():
             for operation in path.values():
@@ -112,7 +115,7 @@ def get_openapi_engine() -> openapi_engines.OpenApiEngine:
     )
 
 
-def build_wsgi_application(iam_engine_driver: Any) -> Any:
+def build_wsgi_application(iam_engine_driver: typing.Any) -> typing.Any:
     return middlewares.attach_middlewares(
         applications.OpenApiApplication(
             route_class=get_api_application(),
@@ -125,6 +128,7 @@ def build_wsgi_application(iam_engine_driver: Any) -> Any:
                 context_class=auth_context.WorkspaceMessengerAuthContext,
             ),
             app_middlewares.ServerSettingsMiddleware,
+            app_middlewares.DatabaseDeadlockRetryMiddleware,
             app_middlewares.ErrorsHandlerMiddleware,
             logging_mw.LoggingMiddleware,
         ],

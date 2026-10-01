@@ -7,7 +7,7 @@ import uuid as sys_uuid
 
 
 def test_generic_account_crud_is_owner_scoped(api):
-    root = "/v1/external_accounts/"
+    root = "/v1/messenger/external_accounts/"
     account_uuid = str(sys_uuid.uuid4())
     spec = {
         "uuid": account_uuid,

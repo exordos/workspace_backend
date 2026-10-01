@@ -341,12 +341,6 @@ resources:
           [workspace_api]
           bind_host = 127.0.0.1
           bind_port = 21084
-          workers = 1
-
-
-          [messenger_api]
-          bind_host = 127.0.0.1
-          bind_port = 21081
           workers = 2
 
 
@@ -451,14 +445,6 @@ resources:
                   proxy_send_timeout 3600s;
               }
 
-              location /api/workspace/v1/messenger/ {
-                  proxy_pass http://127.0.0.1:21081/v1/;
-                  proxy_set_header Host $http_host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto https;
-              }
-
               location /api/workspace/ {
                   proxy_pass http://127.0.0.1:21084/;
                   proxy_set_header Host $http_host;
@@ -517,21 +503,6 @@ resources:
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
       name: workspace-api
       path: /usr/bin/workspace-api --config-file /etc/workspace/workspace.conf
-      user: root
-      target:
-        kind: node
-        node: $core.compute.nodes.$workspace_backend:uuid
-      service_type:
-        kind: simple
-        count: 1
-      target_status: enabled
-      before:
-        - kind: shell
-          command: /usr/local/bin/workspace-bootstrap
-    workspace_messenger_api:
-      project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      name: workspace-messenger-api
-      path: /usr/bin/workspace-messenger-api --config-file /etc/workspace/workspace.conf
       user: root
       target:
         kind: node

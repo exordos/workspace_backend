@@ -32,12 +32,14 @@ The generated public Workspace and Messenger specification uses OpenAPI 3.0.3.
 
 Direct local services:
 
-- Messenger REST API: `http://127.0.0.1:21081/v1`
+- Messenger REST API: `http://127.0.0.1:21084/v1/messenger`
 - WebSocket API: `ws://127.0.0.1:21082/v1/events/ws`
 - Workspace REST API: `http://127.0.0.1:21084/v1`
 - Messenger worker: `workspace-messenger-worker`
-- Messenger OpenAPI spec: `http://127.0.0.1:21081/specifications/3.0.3`
 - Workspace OpenAPI spec: `http://127.0.0.1:21084/specifications/3.0.3`
+
+The single `workspace-api` process serves all REST resources, including Messenger,
+with two HTTP workers by default.
 
 Nginx exposes:
 

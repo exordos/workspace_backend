@@ -8,6 +8,7 @@ import uuid as sys_uuid
 import pytest
 
 from workspace.messenger_api.api import routes
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.dm import models
 
 
@@ -31,7 +32,7 @@ def test_workspace_gravatar_avatar_normalizes_email():
 
 
 def test_external_accounts_use_the_new_provider_neutral_messenger_route():
-    assert routes.ApiEndpointRoute.external_accounts is routes.ExternalAccountRoute
+    assert workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
     assert routes.ExternalAccountRoute.__controller__.__name__ == (
         "ExternalAccountController"
     )

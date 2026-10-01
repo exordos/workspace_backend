@@ -53,7 +53,6 @@ from oslo_config import cfg
 from workspace.common import file_storage_opts
 from workspace.common import messenger_reaction_opts
 from workspace.common import topic_summary_opts
-from workspace.messenger_api.api import app as messenger_app
 from workspace.messenger_api.api import context as auth_context
 from workspace.messenger_api.api import middlewares as app_middlewares
 from workspace.tests.integration import legacy_store
@@ -171,7 +170,7 @@ class MockedIamAuthMiddleware(iam_mw.GenesisCoreAuthMiddleware):
                 return contexts_mw.ContextMiddleware._get_response(self, ctx, req)
 
 
-def build_test_wsgi_application(app_module=messenger_app):
+def build_test_wsgi_application():
     """Same WSGI app + middleware stack as production, mocked auth layer only."""
     file_storage_opts.register_opts()
     try:
@@ -188,8 +187,8 @@ def build_test_wsgi_application(app_module=messenger_app):
         group=topic_summary_opts.DOMAIN,
     )
     application = applications.OpenApiApplication(
-        route_class=app_module.get_api_application(),
-        openapi_engine=app_module.get_openapi_engine(),
+        route_class=workspace_app.get_api_application(),
+        openapi_engine=workspace_app.get_openapi_engine(),
     )
     return middlewares.attach_middlewares(
         application,
@@ -351,25 +350,6 @@ def http_server(_database):
         server.server_close()
 
 
-@pytest.fixture(scope="session")
-def workspace_http_server(_database):
-    server = wsgiref.simple_server.make_server(
-        "127.0.0.1",
-        0,
-        build_test_wsgi_application(workspace_app),
-        handler_class=_QuietHandler,
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    host, port = server.server_address
-    try:
-        yield f"http://{host}:{port}"
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-
-
 @pytest.fixture
 def api(http_server, db):
     """API client scoped to a fresh, unique (user, project) pair per test."""
@@ -387,10 +367,10 @@ def api(http_server, db):
 
 
 @pytest.fixture
-def workspace_api(workspace_http_server, db):
+def workspace_api(http_server, db):
     user_uuid = sys_uuid.uuid4()
     return ApiClient(
-        base_url=workspace_http_server,
+        base_url=http_server,
         user_uuid=user_uuid,
         project_id=sys_uuid.uuid4(),
         user_seeder=lambda value: seed_workspace_user(

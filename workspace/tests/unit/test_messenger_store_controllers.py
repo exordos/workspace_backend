@@ -12,6 +12,7 @@ import pytest
 
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import routes
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import helpers
 
@@ -338,7 +339,7 @@ def test_draft_mutations_require_if_match(fake_store):
 
 
 def test_external_accounts_are_part_of_messenger_routes():
-    assert routes.ApiEndpointRoute.external_accounts is routes.ExternalAccountRoute
+    assert workspace_routes.MessengerRoute.external_accounts is routes.ExternalAccountRoute
 
 
 def test_controllers_do_not_access_sql_objects_or_deleted_provider_api():

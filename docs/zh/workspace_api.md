@@ -1,10 +1,9 @@
 # Workspace v1 API
 
-这份文件描述了由nginx编写的浏览器面向的API合同
-保存的 `workspace-messenger-api`,普通的 `workspace-api` 和
-伴随服务 `workspace-messenger-events` 网接口服务. 公共服务 Messenger
-请求使用专用Messenger过程;普通用户,客户端服务
-设置,按设备注册,以及 REST 事件使用 `workspace-api`.
+This document describes the browser-facing API contract served by the unified
+`workspace-api` REST service and the companion `workspace-messenger-events`
+websocket service. Messenger resources, users, client service settings,
+push-device registrations, and REST events all use `workspace-api`.
 独立邮件,日历和外部用户终端点不是此项的组成部分
 提供者中立的外部帐户,聊天,运营,政策,健康,
 桥接实例资源是 Messenger API 的一部分.
@@ -18,11 +17,10 @@
 直接的本地服务:
 
 ```text
-Messenger REST API:  http://127.0.0.1:21081/v1
+Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -38,11 +36,11 @@ Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epo
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
-`/api/workspace/v1/messenger/`是被保存到Messenger REST的代理
-在 `127.0.0.1:21081` 上服务;剩余的 `/api/workspace/` 代为
-在 `127.0.0.1:21084` 上的 Workspace REST 服务.
-确切的nginx位置 `/api/workspace/v1/events/ws`是代理到
-在 `127.0.0.1:21082` 上的websocket服务终点 `/v1/events/ws`.
+All REST requests under `/api/workspace/`, including
+`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`127.0.0.1:21084` without changing the public URL structure. The exact nginx
+location `/api/workspace/v1/events/ws` is proxied to the websocket service
+endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
 后端 nginx 显示设置 `client_max_body_size 50m` 作为代理请求.
 它不支持WebUI;不匹配的非API路径返回`404`.
@@ -1730,7 +1728,7 @@ Workspace IAM中间件,以及没有有效的 Workspace 持有人的任何请求
 `public`无论项目或流程成员是谁.`public`侧车
 不应包含 `stream_uuid`;它保留`owner_uuid`和所有完整性
 超级数据. Nginx 拒绝超过 `50m` 的多部分请求,
-`workspace-messenger-api`.
+`workspace-api`.
 
 | 场地 | 类型 | 需要在 JSON 创建时 | 仅供读取 | 描述 |
 | --- | --- | --- | --- | --- |
@@ -2146,14 +2144,12 @@ IAM-认证的HTTP表面,没有提供商,邮件或日历
 单独在
 `workspace_provider_api_v1.yaml`.
 
-后端元素 Workspace 安装独立的 `workspace-messenger-api`,
-`workspace-api`, `workspace-messenger-events`,以及
-`workspace-messenger-worker` 过程加上私人
-`workspace-external-bridge-api`服务. PostgreSQL-规范运行时间是
-没有启动或连接到邮件服务.该元素需要S3aaS
-对象和 JSON 侧车和 DBaaS 对于可规性 Messenger 和提供者状态.
-它将现有的 Workspace UI 构建为 Messenger 模式,并从
-现在我们要做什么?
+The Workspace backend element installs `workspace-api`,
+`workspace-messenger-events`, and `workspace-messenger-worker`. The REST API
+uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
+S3aaS stores file bytes and JSON sidecars. The separately versioned
+`workspace_ui` element serves the web UI and proxies API requests to the
+backend nginx gateway.
 
 相关文件:
 

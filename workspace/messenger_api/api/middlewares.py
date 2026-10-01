@@ -30,14 +30,14 @@ from workspace.messenger_api import exceptions as messenger_exceptions
 from workspace.messenger_api.api import versions
 
 
-SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/server_settings"
+SERVER_SETTINGS_PATH = f"/{versions.API_VERSION_1_0}/messenger/server_settings"
 DATABASE_DEADLOCK_MAX_ATTEMPTS = 3
 DATABASE_DEADLOCK_RETRY_BASE_SECONDS = 0.05
 LOG = logging.getLogger(__name__)
 _IDEMPOTENT_READ_ACTION_PATH = re.compile(
-    rf"^/{versions.API_VERSION_1_0}/"
+    rf"^/{versions.API_VERSION_1_0}/messenger/"
     r"(?:streams|stream_topics)/[^/]+/actions/read/invoke/?$"
-    rf"|^/{versions.API_VERSION_1_0}/messages/[^/]+/"
+    rf"|^/{versions.API_VERSION_1_0}/messenger/messages/[^/]+/"
     r"actions/(?:read|read_up_to)/invoke/?$"
 )
 
@@ -89,7 +89,10 @@ def build_server_settings(req: typing.Any) -> dict[str, typing.Any]:
 
 class ServerSettingsMiddleware(middlewares.Middleware):
     def process_request(self, req: typing.Any) -> webob.Response | None:
-        if req.method == "GET" and _normalize_path(req.path) == SERVER_SETTINGS_PATH:
+        if req.method == "GET" and _normalize_path(req.path) in {
+            SERVER_SETTINGS_PATH,
+            f"/{versions.API_VERSION_1_0}/server_settings",
+        }:
             body = json.dumps(build_server_settings(req)).encode("utf-8")
             return webob.Response(
                 body=body,

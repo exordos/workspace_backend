@@ -6,8 +6,12 @@
 import concurrent.futures
 import threading
 import urllib.parse
+from unittest import mock
 
-from workspace.cmd import messenger_api
+import pytest
+import webob
+
+from workspace.cmd import workspace_api
 from workspace.common import database
 
 
@@ -19,17 +23,17 @@ def test_database_application_name_replaces_only_process_identity():
 
     result = database.connection_url_with_application_name(
         connection_url,
-        "workspace-messenger-api",
+        "workspace-api",
     )
 
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(result).query)
     assert query == {
         "options": ["-c work_mem=32MB"],
-        "application_name": ["workspace-messenger-api"],
+        "application_name": ["workspace-api"],
     }
 
 
-def test_free_messenger_worker_serves_settings_while_peer_is_delayed(monkeypatch):
+def test_free_workspace_worker_serves_settings_while_peer_is_delayed(monkeypatch):
     delayed_started = threading.Event()
     release_delayed = threading.Event()
     settings_finished = threading.Event()
@@ -43,7 +47,7 @@ def test_free_messenger_worker_serves_settings_while_peer_is_delayed(monkeypatch
             if worker_index == 0 and path == "/delayed":
                 delayed_started.set()
                 assert release_delayed.wait(timeout=5)
-            if path == "/api/workspace/v1/server_settings":
+            if path == "/v1/messenger/server_settings":
                 settings_finished.set()
             start_response("200 OK", [("Content-Type", "application/json")])
             return [b"{}"]
@@ -60,20 +64,20 @@ def test_free_messenger_worker_serves_settings_while_peer_is_delayed(monkeypatch
             self.setups.append(setup)
 
     monkeypatch.setattr(
-        messenger_api.app,
+        workspace_api.app,
         "build_wsgi_application",
         build_application,
     )
     monkeypatch.setattr(
-        messenger_api.bjoern_service,
+        workspace_api.bjoern_service,
         "BjoernService",
         FakeService,
     )
-    messenger_api.CONF.set_override("workers", 2, group=messenger_api.DOMAIN)
+    workspace_api.CONF.set_override("workers", 2, group=workspace_api.DOMAIN)
     try:
-        services = messenger_api.build_http_services(object())
+        services = workspace_api.build_http_services(object())
     finally:
-        messenger_api.CONF.clear_override("workers", group=messenger_api.DOMAIN)
+        workspace_api.CONF.clear_override("workers", group=workspace_api.DOMAIN)
 
     def request(application, path):
         statuses = []
@@ -92,9 +96,29 @@ def test_free_messenger_worker_serves_settings_while_peer_is_delayed(monkeypatch
         settings = executor.submit(
             request,
             services[1].wsgi_app,
-            "/api/workspace/v1/server_settings",
+            "/v1/messenger/server_settings",
         )
         assert settings_finished.wait(timeout=1)
         assert settings.result(timeout=1) == (["200 OK"], [b"{}"])
         release_delayed.set()
         assert delayed.result(timeout=1) == (["200 OK"], [b"{}"])
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/v1/messenger/server_settings",
+        "/v1/messenger/server_settings/",
+        "/v1/server_settings",
+        "/v1/server_settings/",
+    ),
+)
+def test_unified_app_serves_public_settings_without_iam(path):
+    iam_driver = mock.Mock()
+    application = workspace_api.app.build_wsgi_application(iam_driver)
+
+    response = webob.Request.blank(path).get_response(application)
+
+    assert response.status_code == 200
+    assert response.json["result"] == "success"
+    assert not iam_driver.mock_calls

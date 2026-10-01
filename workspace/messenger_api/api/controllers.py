@@ -32,7 +32,6 @@ from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import exceptions as messenger_exc
 from workspace.messenger_api import topic_summarization
 from workspace.messenger_api.api import store as api_store
-from workspace.messenger_api.api import versions
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
@@ -84,10 +83,6 @@ def _build_openapi_multipart_request_body(
     schema["type"] = "object"
     schema["required"] = list(required)
     return request_body
-
-
-class ApiEndpointController(ra_controllers.RoutesListController):
-    __TARGET_PATH__ = f"/{versions.API_VERSION_1_0}/"
 
 
 class ContractJSONPacker(ra_packers.JSONPacker):

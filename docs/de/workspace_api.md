@@ -1,10 +1,9 @@
 # Workspace v1 API
 
-Dieses Dokument beschreibt den browser-orientierten API Vertrag, der von nginx aus
-die aufbewahrten `workspace-messenger-api`, die gemeinsamen `workspace-api` und die
-- Ich bin ein Freund .`workspace-messenger-events`Websocket-Dienstleistung.Messenger
-Anfragen verwenden den dedizierten Messenger Prozess; gemeinsame Benutzer, Kundenservice
-Einstellungen, Registrierungen von Push-Geräten und REST Ereignisse verwenden `workspace-api`.
+This document describes the browser-facing API contract served by the unified
+`workspace-api` REST service and the companion `workspace-messenger-events`
+websocket service. Messenger resources, users, client service settings,
+push-device registrations, and REST events all use `workspace-api`.
 Alleine Mail, Kalender und Externe Benutzer Endpunkte sind nicht Teil dieser
 Anbieter-neutrale externe Konten, Chat, Betrieb, Richtlinien, Gesundheit,
 und Brückeninstanzressourcen sind Teil derMessenger API.
@@ -18,11 +17,10 @@ die Anbieteridentität ohne Browserwechsel bewahren API.
 Direktes örtliches Angebot:
 
 ```text
-Messenger REST API:  http://127.0.0.1:21081/v1
+Messenger REST API:  http://127.0.0.1:21084/v1/messenger
 Events WebSocket:    ws://127.0.0.1:21082/v1/events/ws
 Workspace REST API:  http://127.0.0.1:21084/v1
 Worker:              workspace-messenger-worker
-Messenger OpenAPI:   http://127.0.0.1:21081/specifications/3.0.3
 Workspace OpenAPI:   http://127.0.0.1:21084/specifications/3.0.3
 ```
 
@@ -38,11 +36,11 @@ Events WebSocket:    /api/workspace/v1/events/ws?last_epoch_version=<number>&epo
 OpenAPI spec:        /api/workspace/specifications/3.0.3
 ```
 
-`/api/workspace/v1/messenger/` ist an die gespeicherte Messenger REST
-Dienst am `127.0.0.1:21081`; der Rest von `/api/workspace/` wird durch
-der Workspace REST-Dienst am `127.0.0.1:21084`.
-Der genaue nginx-Standort `/api/workspace/v1/events/ws` ist dem
-Websocket-Dienst-Endpunkt `/v1/events/ws` auf `127.0.0.1:21082`.
+All REST requests under `/api/workspace/`, including
+`/api/workspace/v1/messenger/`, are proxied to `workspace-api` on
+`127.0.0.1:21084` without changing the public URL structure. The exact nginx
+location `/api/workspace/v1/events/ws` is proxied to the websocket service
+endpoint `/v1/events/ws` on `127.0.0.1:21082`.
 
 Das Backend-Nginx-Manifest setzt `client_max_body_size 50m` für Proxy-Anfragen.
 Es dient nicht der Web-Benutzeroberfläche; nicht übereinstimmende nicht-API Pfade kehren `404` zurück.
@@ -1730,7 +1728,7 @@ Ein gültiges Workspace Träger-Token kann eine
 `public`Die Teilnehmer sind unabhängig von der Mitgliedschaft in einem Projekt oder einem Strom.`public`Seitenwagen
 darf nicht `stream_uuid` enthalten; es behält `owner_uuid` und alle Integrität
 Nginx lehnt mehrere Anfragen ab, die größer als `50m` sind, bevor sie erreicht werden
-`workspace-messenger-api`.
+`workspace-api`.
 
 | Feld | Typ | Erforderlich bei JSON erstellen | Nur für Lesen | Beschreibung |
 | --- | --- | --- | --- | --- |
@@ -2146,14 +2144,12 @@ wie erzeugt .OpenAPIDer Privatanbietervertrag wird beibehalten.
 getrennt in
 `workspace_provider_api_v1.yaml`.
 
-Das Backend-Element Workspace installiert unabhängige `workspace-messenger-api`,
-`workspace-api`, `workspace-messenger-events` und
-`workspace-messenger-worker` Prozesse plus die privaten
-`workspace-external-bridge-api` Dienst. Die PostgreSQL-kanonische Laufzeit macht
-Das Element benötigt S3aaS für binäre
-Objekte und JSON Sidecars und DBaaS für den kanonischen Messenger- und Provider-Zustand.
-Es baut die vorhandene Workspace Benutzeroberfläche im Messenger-Modus und bedient sie von
-- Ich bin nicht sicher.
+The Workspace backend element installs `workspace-api`,
+`workspace-messenger-events`, and `workspace-messenger-worker`. The REST API
+uses two HTTP workers by default. DBaaS provides PostgreSQL storage, and
+S3aaS stores file bytes and JSON sidecars. The separately versioned
+`workspace_ui` element serves the web UI and proxies API requests to the
+backend nginx gateway.
 
 Verwandte Dokumente:
 

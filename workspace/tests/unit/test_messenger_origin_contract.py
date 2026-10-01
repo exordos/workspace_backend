@@ -21,7 +21,8 @@ import uuid as sys_uuid
 from restalchemy.api import routes as ra_routes
 import webob
 
-from workspace.messenger_api.api import app
+from workspace.workspace_api.api import app
+from workspace.workspace_api.api import routes as workspace_routes
 from workspace.messenger_api.api import controllers
 from workspace.messenger_api.api import middlewares
 from workspace.messenger_api.api import routes
@@ -234,18 +235,23 @@ ACTION_MANIFEST = {
 
 
 def test_messenger_v1_route_and_method_manifest_is_preserved():
-    assert app.MessengerApiApp.v1 is routes.ApiEndpointRoute
-    assert set(routes.ApiEndpointRoute.__allow_methods__) == {ra_routes.FILTER}
+    assert app.WorkspaceApiApp.v1 is workspace_routes.WorkspaceApiEndpointRoute
+    assert set(workspace_routes.MessengerRoute.__allow_methods__) == {ra_routes.FILTER}
 
     root_routes = {
         name
-        for name, value in routes.ApiEndpointRoute.__dict__.items()
+        for name, value in workspace_routes.MessengerRoute.__dict__.items()
         if inspect.isclass(value) and issubclass(value, ra_routes.Route)
     }
-    assert root_routes == set(ROUTE_MANIFEST)
+    assert root_routes == set(ROUTE_MANIFEST) - {"users", "me"}
 
     for name, (route_class, controller_class, methods) in ROUTE_MANIFEST.items():
-        assert getattr(routes.ApiEndpointRoute, name) is route_class
+        parent = (
+            workspace_routes.WorkspaceApiEndpointRoute
+            if name in {"users", "me"}
+            else workspace_routes.MessengerRoute
+        )
+        assert getattr(parent, name) is route_class
         assert route_class.__controller__ is controller_class
         assert set(route_class.__allow_methods__) == methods
 
@@ -259,7 +265,7 @@ def test_messenger_action_manifest_is_preserved():
 
 
 def test_server_settings_origin_path_and_fields_are_preserved():
-    assert middlewares.SERVER_SETTINGS_PATH == "/v1/server_settings"
+    assert middlewares.SERVER_SETTINGS_PATH == "/v1/messenger/server_settings"
     request = webob.Request.blank(
         middlewares.SERVER_SETTINGS_PATH,
         base_url="http://127.0.0.1:3000",
