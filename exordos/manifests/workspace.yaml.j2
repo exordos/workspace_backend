@@ -749,3 +749,6 @@ exports:
   projection_db_instance:
     link: "$dbaas.types.postgres.instances.$workspace_projection_cluster"
     kind: "resource"
+  workspace_s3:
+    link: "$s3aas.types.s3.instances.$workspace_s3"
+    kind: "resource"
