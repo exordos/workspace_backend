@@ -26,6 +26,7 @@ from workspace.messenger_api.api import resource_projection
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models
 from workspace.messenger_api.dm import read_state
 
@@ -96,7 +97,11 @@ MENTIONED_MESSAGE_UUIDS_SQL = """
           {read_clause}
           AND POSITION(
               '](' || 'urn:user:' || LOWER(%s::text) || ')'
-              IN LOWER(COALESCE(message.payload->>'content', ''))
+              IN LOWER(CASE
+                  WHEN message.payload->>'kind' = 'markdown'
+                  THEN COALESCE(message.payload->>'content', '')
+                  ELSE ''
+              END)
           ) > 0
           {marker_clause}
         ORDER BY message.created_at {direction}, message.uuid {direction}
@@ -558,13 +563,34 @@ class EventCursor(typing.TypedDict):
     minimum_epoch_version: int
 
 
-def _public_dict(row: typing.Any, resource: str) -> dict[str, typing.Any]:
+def _row_value(row: typing.Any, name: str) -> typing.Any:
+    if isinstance(row, typing.Mapping):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def _public_dict(
+    row: typing.Any,
+    resource: str,
+    stream_encryption: dict[str, typing.Any] | None = None,
+) -> dict[str, typing.Any]:
     # Canonical rows already contain the provider and delivery columns.  Passing
     # the row explicitly avoids the transitional serializer's per-row lookup.
     result = resource_projection.as_dict(row, resource, canonical=row)
     result.pop("viewer_user_uuid", None)
     if resource == "files":
         result.pop("acl_mode", None)
+    if resource == "streams":
+        project_id = _row_value(row, "project_id")
+        stream_uuid = _row_value(row, "uuid")
+        if stream_encryption is None and project_id is not None:
+            stream_encryption = resource_projection.stream_encryption_projection(
+                project_id,
+                stream_uuid,
+            )
+        result.update(
+            stream_encryption or resource_projection.DEFAULT_STREAM_ENCRYPTION
+        )
     return result
 
 
@@ -861,7 +887,22 @@ class SQLCanonicalReadStore:
                         "projection_duration_seconds": duration,
                     },
                 )
-        return [_public_dict(row, resource) for row in rows]
+        if resource != "streams":
+            return [_public_dict(row, resource) for row in rows]
+        projections = resource_projection.stream_encryption_projections(
+            self.project_uuid,
+            (_row_value(row, "uuid") for row in rows),
+        )
+        return [
+            _public_dict(
+                row,
+                resource,
+                stream_encryption=projections.get(
+                    sys_uuid.UUID(str(_row_value(row, "uuid")))
+                ),
+            )
+            for row in rows
+        ]
 
     def _filter_mentioned_message_page(
         self,
@@ -1382,6 +1423,75 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 "user_uuid": dm_filters.EQ(user_uuid or self.user_uuid),
             }
         )
+
+    def _lock_key_rotation_stream(
+        self,
+        stream_uuid: object,
+        payload: dict[str, typing.Any],
+    ) -> typing.Any:
+        if payload.get("kind") != message_payloads.KeyAnnouncedPayload.KIND:
+            return None
+        session = contexts.Context().get_session()
+        if not resource_projection.stream_encryption_schema_available(session):
+            raise ra_exceptions.ValidationErrorException()
+        row = session.execute(
+            """
+            SELECT stream.uuid
+            FROM m_workspace_streams AS stream
+            JOIN m_workspace_stream_bindings AS binding
+              ON binding.project_id = stream.project_id
+             AND binding.stream_uuid = stream.uuid
+             AND binding.user_uuid = %s
+            WHERE stream.project_id = %s AND stream.uuid = %s
+              AND stream.user_uuid = %s
+            FOR UPDATE OF stream
+            """,
+            (
+                self.user_uuid,
+                self.project_uuid,
+                stream_uuid,
+                self.user_uuid,
+            ),
+        ).fetchone()
+        if row is None:
+            raise ra_exceptions.ValidationErrorException()
+        return row["uuid"]
+
+    def _apply_key_rotation(
+        self,
+        stream_uuid: object | None,
+        payload: dict[str, typing.Any],
+    ) -> None:
+        if stream_uuid is None:
+            return
+        session = contexts.Context().get_session()
+        session.execute(
+            """
+            UPDATE m_workspace_streams
+            SET current_encryption_key_uuid = %s,
+                current_encryption_public_key = %s,
+                updated_at = NOW()
+            WHERE project_id = %s AND uuid = %s AND user_uuid = %s
+            """,
+            (
+                payload["key_uuid"],
+                payload["public_key"],
+                self.project_uuid,
+                stream_uuid,
+                self.user_uuid,
+            ),
+        )
+        for user_stream in models.WorkspaceUserStream.objects.get_all(
+            filters={
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+            session=session,
+        ):
+            messenger_events.create_stream_updated_event(
+                stream=user_stream,
+                session=session,
+            )
 
     def _stream_participants(self, stream_uuid: object) -> tuple[object, ...]:
         return tuple(
@@ -2571,10 +2681,18 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
     ) -> dict[str, typing.Any]:
         values = self._projection_values(values)
         values["uuid"] = values.get("uuid") or sys_uuid.uuid4()
-        provider_targets = self._provider_targets_for_message(
-            values["stream_uuid"],
-            values.get("topic_uuid"),
-            "message.create",
+        payload = typing.cast(dict[str, typing.Any], values["payload"])
+        rotation_stream_uuid = self._lock_key_rotation_stream(
+            values["stream_uuid"], payload
+        )
+        provider_targets = (
+            self._provider_targets_for_message(
+                values["stream_uuid"],
+                values.get("topic_uuid"),
+                "message.create",
+            )
+            if payload.get("kind") == message_payloads.MarkdownPayload.KIND
+            else ()
         )
         session = contexts.Context().get_session()
         row = helpers.create_workspace_user_message(
@@ -2585,6 +2703,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             compact_events=True,
             **values,
         )
+        self._apply_key_rotation(rotation_stream_uuid, payload)
         for provider_target in provider_targets:
             self._queue_provider_operation(
                 operation_kind="message.create",
@@ -2606,14 +2725,24 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             self.user_uuid,
             message_uuid,
         )
-        provider_targets = self._message_provider_targets(message, "message.update")
+        projected_values = self._projection_values(values)
+        payload = typing.cast(dict[str, typing.Any], projected_values["payload"])
+        rotation_stream_uuid = self._lock_key_rotation_stream(
+            message.stream_uuid, payload
+        )
+        provider_targets = (
+            self._message_provider_targets(message, "message.update")
+            if payload.get("kind") == message_payloads.MarkdownPayload.KIND
+            else ()
+        )
         row = helpers.update_workspace_user_message(
             self.project_uuid,
             self.user_uuid,
             message_uuid,
-            self._projection_values(values),
+            projected_values,
             compact_events=True,
         )
+        self._apply_key_rotation(rotation_stream_uuid, payload)
         for provider_target in provider_targets:
             self._queue_provider_operation(
                 operation_kind="message.update",

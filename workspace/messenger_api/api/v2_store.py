@@ -20,6 +20,7 @@ from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.dm import base
 from workspace.messenger_api.dm import helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import read_state
 from workspace.messenger_api.dm import v2_models
 
@@ -51,14 +52,37 @@ def _simple_source(value: object) -> dict[str, typing.Any]:
     return source
 
 
-def _public(row: typing.Any, resource: str) -> dict[str, typing.Any]:
+def _public(
+    row: typing.Any,
+    resource: str,
+    stream_encryption: dict[str, typing.Any] | None = None,
+) -> dict[str, typing.Any]:
     result = resource_projection.simple(row)
     for name in _INTERNAL_FIELDS:
         result.pop(name, None)
     if resource in {"streams", "stream_topics", "messages", "message_reactions"}:
         result.setdefault("provider", None)
         result.setdefault("delivery", None)
+    if resource == "streams":
+        if stream_encryption is None:
+            stream_encryption = resource_projection.stream_encryption_projection(
+                row.project_id,
+                row.uuid,
+            )
+        result.update(stream_encryption)
     return result
+
+
+def _payload_kind(payload: dict[str, typing.Any]) -> str:
+    return str(payload.get("kind", ""))
+
+
+def _is_markdown_payload(payload: dict[str, typing.Any]) -> bool:
+    return _payload_kind(payload) == message_payloads.MarkdownPayload.KIND
+
+
+def _is_key_announced_payload(payload: dict[str, typing.Any]) -> bool:
+    return _payload_kind(payload) == message_payloads.KeyAnnouncedPayload.KIND
 
 
 class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
@@ -120,7 +144,16 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             order_by=order_by,
             limit=limit,
         )
-        return [_public(row, resource) for row in rows]
+        if resource != "streams":
+            return [_public(row, resource) for row in rows]
+        projections = resource_projection.stream_encryption_projections(
+            self.project_uuid,
+            (row.uuid for row in rows),
+        )
+        return [
+            _public(row, resource, stream_encryption=projections[row.uuid])
+            for row in rows
+        ]
 
     def filter_message_page(
         self,
@@ -468,6 +501,24 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         source = _simple_source(values.get("source", {"kind": "native"}))
         if source_name != "native":
             raise ra_exceptions.ValidationErrorException()
+        encryption = bool(values.get("encryption", False))
+        current_encryption_key = values.get("current_encryption_key")
+        if encryption != (current_encryption_key is not None):
+            raise ra_exceptions.ValidationErrorException()
+        if current_encryption_key is None:
+            current_encryption_key_uuid = None
+            current_encryption_public_key = None
+        else:
+            current_encryption_key = resource_projection.simple(current_encryption_key)
+            current_encryption_key_uuid = sys_uuid.UUID(
+                str(current_encryption_key["key_uuid"])
+            )
+            current_encryption_public_key = str(current_encryption_key["public_key"])
+        encryption_schema = resource_projection.stream_encryption_schema_available(
+            session
+        )
+        if encryption and not encryption_schema:
+            raise ra_exceptions.ValidationErrorException()
         direct_user_uuid = values.get("direct_user_uuid")
         direct_user = (
             None if direct_user_uuid is None else sys_uuid.UUID(str(direct_user_uuid))
@@ -506,13 +557,16 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             )
             private_index = None
             participants = (self.user_uuid,)
+            encryption_columns = (
+                ", encryption, current_encryption_key_uuid, "
+                "current_encryption_public_key"
+                if encryption_schema
+                else ""
+            )
             existing_row = session.execute(
-                """
-                SELECT project_id, owner_uuid, source_name, source, private,
-                       direct_user_uuid, name, description
-                FROM messenger_streams
-                WHERE uuid = %s
-                """,
+                "SELECT project_id, owner_uuid, source_name, source, private, "
+                "direct_user_uuid, name, description"
+                f"{encryption_columns} FROM messenger_streams WHERE uuid = %s",
                 (stream_uuid,),
             ).fetchone()
             if existing_row is not None:
@@ -526,42 +580,79 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                     or existing_row["direct_user_uuid"] is not None
                     or existing_row["name"] != values["name"]
                     or existing_row["description"] != expected_description
+                    or (
+                        encryption_schema
+                        and (
+                            existing_row["encryption"] != encryption
+                            or existing_row["current_encryption_key_uuid"]
+                            != current_encryption_key_uuid
+                            or existing_row["current_encryption_public_key"]
+                            != current_encryption_public_key
+                        )
+                    )
                 ):
                     raise ra_exceptions.ValidationErrorException()
                 return _public(self._stream(stream_uuid), "streams")
         topic_uuid = sys_uuid.uuid4()
         now = session.execute("SELECT NOW() AS value", ()).fetchone()["value"]
-        session.execute(
-            """
-            INSERT INTO messenger_streams (
-                uuid, project_id, name, description, owner_uuid,
-                source_name, source, invite_only, announce,
-                direct_user_uuid, private, private_index, color,
-                default_topic_uuid, created_at, updated_at
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s
-            )
-            """,
-            (
-                stream_uuid,
-                self.project_uuid,
-                values["name"],
-                values.get("description"),
-                self.user_uuid,
-                source_name,
-                json.dumps(source),
-                values.get("invite_only", False),
-                values.get("announce", False),
-                direct_user,
-                private,
-                private_index,
-                values.get("color", base.random_color()),
-                topic_uuid,
-                now,
-                now,
-            ),
+        common_values = (
+            stream_uuid,
+            self.project_uuid,
+            values["name"],
+            values.get("description"),
+            self.user_uuid,
+            source_name,
+            json.dumps(source),
+            values.get("invite_only", False),
+            values.get("announce", False),
+            direct_user,
+            private,
         )
+        trailing_values = (
+            private_index,
+            values.get("color", base.random_color()),
+            topic_uuid,
+            now,
+            now,
+        )
+        if encryption_schema:
+            session.execute(
+                """
+                INSERT INTO messenger_streams (
+                    uuid, project_id, name, description, owner_uuid,
+                    source_name, source, invite_only, announce,
+                    direct_user_uuid, private, encryption,
+                    current_encryption_key_uuid,
+                    current_encryption_public_key, private_index, color,
+                    default_topic_uuid, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                common_values
+                + (
+                    encryption,
+                    current_encryption_key_uuid,
+                    current_encryption_public_key,
+                )
+                + trailing_values,
+            )
+        else:
+            session.execute(
+                """
+                INSERT INTO messenger_streams (
+                    uuid, project_id, name, description, owner_uuid,
+                    source_name, source, invite_only, announce,
+                    direct_user_uuid, private, private_index, color,
+                    default_topic_uuid, created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                common_values + trailing_values,
+            )
         for participant in participants:
             session.execute(
                 """
@@ -904,6 +995,20 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         canonical_uuid = sys_uuid.UUID(str(values.get("uuid") or sys_uuid.uuid4()))
         placement_uuid = sys_uuid.uuid5(topic.uuid, str(canonical_uuid))
         canonical_payload = resource_projection.simple(values["payload"])
+        if _is_key_announced_payload(canonical_payload):
+            if not resource_projection.stream_encryption_schema_available(session):
+                raise ra_exceptions.ValidationErrorException()
+            locked_stream = session.execute(
+                """
+                SELECT uuid
+                FROM messenger_streams
+                WHERE project_id = %s AND uuid = %s AND owner_uuid = %s
+                FOR UPDATE
+                """,
+                (self.project_uuid, stream.uuid, self.user_uuid),
+            ).fetchone()
+            if locked_stream is None:
+                raise ra_exceptions.ValidationErrorException()
         existing_placement = session.execute(
             """
             SELECT message.author_uuid, message.payload,
@@ -923,10 +1028,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             or existing_placement["source"] != source
         ):
             raise ra_exceptions.ValidationErrorException()
-        provider_targets = self._provider_targets_for_message(
-            stream.uuid,
-            topic.uuid,
-            "message.create",
+        provider_targets = (
+            self._provider_targets_for_message(
+                stream.uuid,
+                topic.uuid,
+                "message.create",
+            )
+            if _is_markdown_payload(canonical_payload)
+            else ()
         )
         if existing_placement is not None:
             row = _public(self._message(placement_uuid), "messages")
@@ -1020,7 +1129,32 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 provider_targets,
             )
             return row
-        content = str(canonical_payload.get("content", ""))
+        if _is_key_announced_payload(canonical_payload):
+            session.execute(
+                """
+                UPDATE messenger_streams
+                SET current_encryption_key_uuid = %s,
+                    current_encryption_public_key = %s,
+                    updated_at = NOW()
+                WHERE project_id = %s AND uuid = %s AND owner_uuid = %s
+                """,
+                (
+                    canonical_payload["key_uuid"],
+                    canonical_payload["public_key"],
+                    self.project_uuid,
+                    stream.uuid,
+                    self.user_uuid,
+                ),
+            )
+            self._enqueue_stream_snapshot(
+                stream.uuid,
+                source_kind="stream.updated",
+            )
+        content = (
+            str(canonical_payload["content"])
+            if _is_markdown_payload(canonical_payload)
+            else ""
+        )
         mentioned = f"](urn:user:{str(self.user_uuid).lower()})" in content.lower()
         binding_uuid = sys_uuid.uuid5(placement_uuid, str(self.user_uuid))
         session.execute(
@@ -1132,11 +1266,47 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         message = self._message(message_uuid)
         if message.author_uuid != self.user_uuid:
             raise ra_exceptions.ValidationErrorException()
-        provider_targets = self._message_provider_targets(
-            message,
-            "message.update",
-        )
+        canonical_payload = resource_projection.simple(values["payload"])
         session = contexts.Context().get_session()
+        if _is_key_announced_payload(
+            canonical_payload
+        ) and not resource_projection.stream_encryption_schema_available(session):
+            raise ra_exceptions.ValidationErrorException()
+        placements = session.execute(
+            """
+            SELECT placement.uuid, placement.stream_uuid,
+                   placement.topic_uuid, stream.owner_uuid
+            FROM messenger_message_placements AS placement
+            JOIN messenger_streams AS stream
+              ON stream.project_id = placement.project_id
+             AND stream.uuid = placement.stream_uuid
+            WHERE placement.project_id = %s AND placement.message_uuid = %s
+            ORDER BY placement.topic_uuid, placement.uuid
+            """,
+            (self.project_uuid, message.canonical_message_uuid),
+        ).fetchall()
+        stream_uuids = tuple(
+            dict.fromkeys(placement["stream_uuid"] for placement in placements)
+        )
+        if _is_key_announced_payload(canonical_payload):
+            locked_streams = session.execute(
+                """
+                SELECT uuid
+                FROM messenger_streams
+                WHERE project_id = %s AND uuid = ANY(%s::uuid[])
+                  AND owner_uuid = %s
+                ORDER BY uuid
+                FOR UPDATE
+                """,
+                (self.project_uuid, list(stream_uuids), self.user_uuid),
+            ).fetchall()
+            if len(locked_streams) != len(stream_uuids):
+                raise ra_exceptions.ValidationErrorException()
+        provider_targets = (
+            self._message_provider_targets(message, "message.update")
+            if _is_markdown_payload(canonical_payload)
+            else ()
+        )
         session.execute(
             """
             UPDATE messenger_messages
@@ -1144,20 +1314,33 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             WHERE project_id = %s AND uuid = %s
             """,
             (
-                json.dumps(resource_projection.simple(values["payload"])),
+                json.dumps(canonical_payload),
                 self.project_uuid,
                 message.canonical_message_uuid,
             ),
         )
-        placements = session.execute(
-            """
-            SELECT uuid, topic_uuid
-            FROM messenger_message_placements
-            WHERE project_id = %s AND message_uuid = %s
-            ORDER BY topic_uuid, uuid
-            """,
-            (self.project_uuid, message.canonical_message_uuid),
-        ).fetchall()
+        if _is_key_announced_payload(canonical_payload):
+            for stream_uuid in stream_uuids:
+                session.execute(
+                    """
+                    UPDATE messenger_streams
+                    SET current_encryption_key_uuid = %s,
+                        current_encryption_public_key = %s,
+                        updated_at = NOW()
+                    WHERE project_id = %s AND uuid = %s AND owner_uuid = %s
+                    """,
+                    (
+                        canonical_payload["key_uuid"],
+                        canonical_payload["public_key"],
+                        self.project_uuid,
+                        stream_uuid,
+                        self.user_uuid,
+                    ),
+                )
+                self._enqueue_stream_snapshot(
+                    stream_uuid,
+                    source_kind="stream.updated",
+                )
         for placement in placements:
             self._enqueue(
                 "content_mentions",
@@ -1346,7 +1529,14 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 stream.uuid,
                 "stream.update",
             )
-            forbidden = {"source_name", "source", "direct_user_uuid", "private_index"}
+            forbidden = {
+                "source_name",
+                "source",
+                "direct_user_uuid",
+                "private_index",
+                "encryption",
+                "current_encryption_key",
+            }
             if forbidden.intersection(values):
                 raise ra_exceptions.ValidationErrorException()
             allowed = {"name", "description", "invite_only", "announce", "color"}

@@ -4,6 +4,7 @@
 # not use this file except in compliance with the License.
 
 import contextlib
+import datetime
 import json
 import unittest.mock
 import uuid as sys_uuid
@@ -21,6 +22,32 @@ def test_default_system_prompt_uses_the_topics_primary_language():
         "Write the summary in the primary language used in the topic."
         in topic_summarization.DEFAULT_SYSTEM_PROMPT
     )
+
+
+def test_summary_claim_ignores_non_markdown_payloads():
+    statements = []
+
+    class _Result:
+        @staticmethod
+        def fetchone():
+            return None
+
+    class _Session:
+        @staticmethod
+        def execute(statement, values):
+            statements.append((statement, values))
+            return _Result()
+
+    result = topic_summarization.claim_summary_work(
+        _Session(),
+        now=datetime.datetime.now(datetime.timezone.utc),
+        key_material="unused",
+        topic_claim_seconds=30,
+        endpoint_claim_seconds=30,
+    )
+
+    assert result is None
+    assert "message.payload->>'kind' = 'markdown'" in statements[0][0]
 
 
 def _endpoint(**overrides):

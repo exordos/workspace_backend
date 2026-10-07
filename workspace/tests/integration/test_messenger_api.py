@@ -5411,6 +5411,228 @@ def test_stream_create_writes_realtime_event(api, db):
     assert all(payload["user_uuid"] == str(api.user_uuid) for payload in folder_events)
 
 
+def test_encrypted_chat_contract_round_trips_in_all_streams(api, db):
+    initial_key_uuid = str(sys_uuid.uuid4())
+    stream_payload = {
+        "name": "Secret chat",
+        "description": "Encrypted-chat contract",
+        "source_name": "native",
+        "source": {"kind": "native"},
+    }
+    plain_response = api.post(STREAMS, json={**stream_payload, "name": "Plain"})
+    assert plain_response.status_code == 201, plain_response.text
+    plain_stream = plain_response.json()
+    assert plain_stream["encryption"] is False
+    assert plain_stream.get("current_encryption_key") is None
+
+    encrypted_response = api.post(
+        STREAMS,
+        json={
+            **stream_payload,
+            "encryption": True,
+            "current_encryption_key": {
+                "key_uuid": initial_key_uuid,
+                "public_key": "initial-chat-public-key",
+            },
+        },
+    )
+    assert encrypted_response.status_code == 201, encrypted_response.text
+    encrypted_stream = encrypted_response.json()
+    assert encrypted_stream["encryption"] is True
+    assert encrypted_stream["current_encryption_key"] == {
+        "key_uuid": initial_key_uuid,
+        "public_key": "initial-chat-public-key",
+    }
+
+    for stream in (plain_stream, encrypted_stream):
+        fetched = api.get(f"{STREAMS}{stream['uuid']}")
+        assert fetched.status_code == 200, fetched.text
+        assert fetched.json()["encryption"] is stream["encryption"]
+        assert fetched.json().get("current_encryption_key") == stream.get(
+            "current_encryption_key"
+        )
+    listed = {item["uuid"]: item for item in api.get(STREAMS).json()}
+    assert listed[plain_stream["uuid"]]["encryption"] is False
+    assert listed[encrypted_stream["uuid"]]["current_encryption_key"] == {
+        "key_uuid": initial_key_uuid,
+        "public_key": "initial-chat-public-key",
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+              AND payload->>'kind' = 'stream.created'
+              AND payload->>'uuid' = %s
+            """,
+            (api.project_id, api.user_uuid, encrypted_stream["uuid"]),
+        )
+        created_stream_event = cursor.fetchone()[0]
+    assert created_stream_event["encryption"] is True
+    assert created_stream_event["current_encryption_key"] == {
+        "key_uuid": initial_key_uuid,
+        "public_key": "initial-chat-public-key",
+    }
+
+    key_uuid = str(sys_uuid.uuid4())
+    request_uuid = str(sys_uuid.uuid4())
+    payloads = (
+        {"kind": "markdown", "content": "visible markdown"},
+        {
+            "kind": "e2ee",
+            "key_uuid": key_uuid,
+            "content": (f"opaque-envelope ](urn:user:{str(api.user_uuid).lower()})"),
+        },
+        {
+            "kind": "key_request",
+            "key_uuid": key_uuid,
+            "device_id": "iphone-1",
+            "device_name": "iPhone",
+            "public_key": "device-public-key",
+        },
+        {
+            "kind": "key_grant",
+            "key_uuid": key_uuid,
+            "request_message_uuid": request_uuid,
+            "sender_device_id": "mac-1",
+            "recipient_device_id": "iphone-1",
+            "content": "encrypted-private-key",
+        },
+        {
+            "kind": "key_reject",
+            "key_uuid": key_uuid,
+            "request_message_uuid": request_uuid,
+            "sender_device_id": "mac-1",
+            "recipient_device_id": "iphone-1",
+        },
+        {
+            "kind": "key_announced",
+            "key_uuid": key_uuid,
+            "public_key": "rotated-chat-public-key",
+        },
+    )
+    for stream in (plain_stream, encrypted_stream):
+        created = []
+        for payload in payloads:
+            response = api.post(
+                MESSAGES,
+                json={
+                    "stream_uuid": stream["uuid"],
+                    "topic_uuid": stream["default_topic_uuid"],
+                    "payload": payload,
+                },
+            )
+            assert response.status_code == 201, response.text
+            assert response.json()["payload"] == payload
+            if payload["kind"] == "e2ee":
+                assert response.json()["mentioned"] is False
+            created.append(response.json()["uuid"])
+
+        history_response = api.get(
+            MESSAGES,
+            params={"stream_uuid": stream["uuid"]},
+        )
+        assert history_response.status_code == 200, history_response.text
+        history = {
+            message["uuid"]: message["payload"] for message in history_response.json()
+        }
+        assert [history[message_uuid] for message_uuid in created] == list(payloads)
+
+        rotated_stream = api.get(f"{STREAMS}{stream['uuid']}").json()
+        assert rotated_stream["current_encryption_key"] == {
+            "key_uuid": key_uuid,
+            "public_key": "rotated-chat-public-key",
+        }
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload->'payload'
+            FROM m_workspace_visible_events
+            WHERE project_id = %s
+              AND user_uuid = %s
+              AND payload->>'kind' = 'message.created'
+              AND payload->>'stream_uuid' = ANY(%s::text[])
+            ORDER BY epoch_version
+            """,
+            (
+                api.project_id,
+                api.user_uuid,
+                [plain_stream["uuid"], encrypted_stream["uuid"]],
+            ),
+        )
+        realtime_payloads = [row[0] for row in cursor.fetchall()]
+    assert realtime_payloads == list(payloads) + list(payloads)
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+              AND payload->>'kind' = 'stream.updated'
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (api.project_id, api.user_uuid, encrypted_stream["uuid"]),
+        )
+        rotated_stream_event = cursor.fetchone()[0]
+    assert rotated_stream_event["current_encryption_key"] == {
+        "key_uuid": key_uuid,
+        "public_key": "rotated-chat-public-key",
+    }
+
+    rejected = api.post(
+        MESSAGES,
+        json={
+            "stream_uuid": plain_stream["uuid"],
+            "topic_uuid": plain_stream["default_topic_uuid"],
+            "payload": {**payloads[1], "unknown": "must-not-survive"},
+        },
+    )
+    assert rejected.status_code == 400, rejected.text
+
+    for update in (
+        {"encryption": True},
+        {
+            "current_encryption_key": {
+                "key_uuid": str(sys_uuid.uuid4()),
+                "public_key": "cannot-update-directly",
+            }
+        },
+    ):
+        response = api.put(f"{STREAMS}{plain_stream['uuid']}", json=update)
+        assert response.status_code == 400, response.text
+
+    other_user = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, other_user, f"user-{other_user}")
+    add_response = api.post(
+        f"{STREAMS}{encrypted_stream['uuid']}/actions/add_users/invoke",
+        json={"member": [str(other_user)]},
+    )
+    assert add_response.status_code == 200, add_response.text
+    unauthorized = api.post(
+        MESSAGES,
+        user=other_user,
+        json={
+            "stream_uuid": encrypted_stream["uuid"],
+            "topic_uuid": encrypted_stream["default_topic_uuid"],
+            "payload": {
+                "kind": "key_announced",
+                "key_uuid": str(sys_uuid.uuid4()),
+                "public_key": "member-public-key",
+            },
+        },
+    )
+    assert unauthorized.status_code == 400, unauthorized.text
+    unchanged = api.get(f"{STREAMS}{encrypted_stream['uuid']}").json()
+    assert unchanged["current_encryption_key"] == {
+        "key_uuid": key_uuid,
+        "public_key": "rotated-chat-public-key",
+    }
+
+
 def test_stream_notifications_are_user_scoped_and_write_event(api, db):
     other_user = sys_uuid.uuid4()
     stream_uuid = conftest.seed_user_stream(

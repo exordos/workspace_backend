@@ -80,7 +80,14 @@ def test_resource_reads_are_project_and_user_scoped(monkeypatch):
         {"uuid": "asc"},
     )
 
-    assert result == [{**row, "resource": "streams"}]
+    assert result == [
+        {
+            **row,
+            "resource": "streams",
+            "encryption": False,
+            "current_encryption_key": None,
+        }
+    ]
     _operation, query = objects.calls[0]
     assert query["filters"]["project_id"].value == PROJECT_UUID
     assert query["filters"]["user_uuid"].value == USER_UUID
@@ -1865,7 +1872,9 @@ def test_stream_read_queues_complete_provider_scope(monkeypatch):
     )
 
     assert store.perform_action("streams", stream_uuid, "read", {}) == {
-        "uuid": stream_uuid
+        "uuid": stream_uuid,
+        "encryption": False,
+        "current_encryption_key": None,
     }
     assert call_order == ["visible", "account-lock", "update", "provider-target"]
     assert len(queued) == 1

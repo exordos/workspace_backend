@@ -88,6 +88,9 @@ PROJECTION_ACCELERATION_MIGRATION = "0173-accelerate-Messenger-v2-projections-8c
 LEGACY_BACKFILL_COUNTER_MIGRATION = (
     "0174-suppress-legacy-backfill-counters-a2cd99.py"
 )
+ENCRYPTED_CHAT_CONTRACT_MIGRATION = (
+    "0186-Add-encrypted-chat-contracts-3b3c4f.py"
+)
 
 
 def _truncate_messenger_test_data():
@@ -224,6 +227,21 @@ def _register_project_user(db, project_uuid, user_uuid):
         )
 
 
+@pytest.fixture
+def encrypted_chat_schema():
+    engine = ra_migrations.MigrationEngine(
+        migrations_path=str(conftest.MIGRATIONS_DIR)
+    )
+    migration = engine._load_migrations()[ENCRYPTED_CHAT_CONTRACT_MIGRATION]
+    with contexts.Context().session_manager() as session:
+        migration.upgrade(session)
+    try:
+        yield
+    finally:
+        with contexts.Context().session_manager() as session:
+            migration.downgrade(session)
+
+
 def test_first_request_materializes_iam_user_before_native_write(http_server, db):
     user_uuid = sys_uuid.uuid4()
     project_uuid = sys_uuid.uuid4()
@@ -252,6 +270,191 @@ def test_first_request_materializes_iam_user_before_native_write(http_server, db
             (user_uuid, project_uuid),
         )
         assert cursor.fetchone() == (f"user-{user_uuid}", user_uuid)
+
+
+def test_encrypted_chat_contract_on_v2_store(api, db, encrypted_chat_schema):
+    del encrypted_chat_schema
+    initial_key_uuid = str(sys_uuid.uuid4())
+    common_stream = {
+        "description": "v2 encrypted-chat contract",
+        "source_name": "native",
+        "source": {"kind": "native"},
+    }
+    plain_response = api.post(
+        STREAMS,
+        json={**common_stream, "name": "Plain v2"},
+    )
+    assert plain_response.status_code == 201, plain_response.text
+    encrypted_response = api.post(
+        STREAMS,
+        json={
+            **common_stream,
+            "name": "Encrypted v2",
+            "encryption": True,
+            "current_encryption_key": {
+                "key_uuid": initial_key_uuid,
+                "public_key": "initial-v2-public-key",
+            },
+        },
+    )
+    assert encrypted_response.status_code == 201, encrypted_response.text
+    streams = (plain_response.json(), encrypted_response.json())
+    assert streams[0]["encryption"] is False
+    assert streams[1]["current_encryption_key"] == {
+        "key_uuid": initial_key_uuid,
+        "public_key": "initial-v2-public-key",
+    }
+    _drain()
+
+    key_uuid = str(sys_uuid.uuid4())
+    request_uuid = str(sys_uuid.uuid4())
+    payloads = (
+        {"kind": "markdown", "content": "plain text"},
+        {
+            "kind": "e2ee",
+            "key_uuid": key_uuid,
+            "content": f"opaque ](urn:user:{str(api.user_uuid).lower()})",
+        },
+        {
+            "kind": "key_request",
+            "key_uuid": key_uuid,
+            "device_id": "phone-1",
+            "device_name": "Phone",
+            "public_key": "device-public-key",
+        },
+        {
+            "kind": "key_grant",
+            "key_uuid": key_uuid,
+            "request_message_uuid": request_uuid,
+            "sender_device_id": "laptop-1",
+            "recipient_device_id": "phone-1",
+            "content": "wrapped-private-key",
+        },
+        {
+            "kind": "key_reject",
+            "key_uuid": key_uuid,
+            "request_message_uuid": request_uuid,
+            "sender_device_id": "laptop-1",
+            "recipient_device_id": "phone-1",
+        },
+        {
+            "kind": "key_announced",
+            "key_uuid": key_uuid,
+            "public_key": "rotated-v2-public-key",
+        },
+    )
+    for stream in streams:
+        for payload in payloads:
+            response = api.post(
+                MESSAGES,
+                json={
+                    "stream_uuid": stream["uuid"],
+                    "topic_uuid": stream["default_topic_uuid"],
+                    "payload": payload,
+                },
+            )
+            assert response.status_code == 201, response.text
+            assert response.json()["payload"] == payload
+            if payload["kind"] == "e2ee":
+                assert response.json()["mentioned"] is False
+        _drain()
+        history_response = api.get(
+            MESSAGES,
+            params={"stream_uuid": stream["uuid"]},
+        )
+        assert history_response.status_code == 200, history_response.text
+        assert [message["payload"] for message in history_response.json()] == list(
+            payloads
+        )
+        rotated = api.get(f"{STREAMS}{stream['uuid']}")
+        assert rotated.status_code == 200, rotated.text
+        assert rotated.json()["current_encryption_key"] == {
+            "key_uuid": key_uuid,
+            "public_key": "rotated-v2-public-key",
+        }
+
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+              AND payload->>'kind' = 'stream.created'
+              AND payload->>'uuid' = %s
+            """,
+            (api.project_id, api.user_uuid, streams[1]["uuid"]),
+        )
+        stream_event = cursor.fetchone()[0]
+    assert stream_event["encryption"] is True
+    assert stream_event["current_encryption_key"] == {
+        "key_uuid": initial_key_uuid,
+        "public_key": "initial-v2-public-key",
+    }
+    with db.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT payload->'payload'
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+              AND payload->>'kind' = 'message.created'
+              AND payload->>'stream_uuid' = ANY(%s::text[])
+            ORDER BY epoch_version
+            """,
+            (
+                api.project_id,
+                api.user_uuid,
+                [stream["uuid"] for stream in streams],
+            ),
+        )
+        realtime_payloads = [row[0] for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT payload
+            FROM m_workspace_visible_events
+            WHERE project_id = %s AND user_uuid = %s
+              AND payload->>'kind' = 'stream.updated'
+              AND payload->>'uuid' = %s
+            ORDER BY epoch_version DESC
+            LIMIT 1
+            """,
+            (api.project_id, api.user_uuid, streams[1]["uuid"]),
+        )
+        rotated_stream_event = cursor.fetchone()[0]
+    assert realtime_payloads == list(payloads) + list(payloads)
+    assert rotated_stream_event["current_encryption_key"] == {
+        "key_uuid": key_uuid,
+        "public_key": "rotated-v2-public-key",
+    }
+
+    other_user = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, other_user, f"user-{other_user}")
+    _register_project_user(db, api.project_id, other_user)
+    add_response = api.post(
+        f"{STREAMS}{streams[1]['uuid']}/actions/add_users/invoke",
+        json={"member": [str(other_user)]},
+    )
+    assert add_response.status_code == 200, add_response.text
+    _drain()
+    unauthorized = api.post(
+        MESSAGES,
+        user=other_user,
+        json={
+            "stream_uuid": streams[1]["uuid"],
+            "topic_uuid": streams[1]["default_topic_uuid"],
+            "payload": {
+                "kind": "key_announced",
+                "key_uuid": str(sys_uuid.uuid4()),
+                "public_key": "member-cannot-rotate",
+            },
+        },
+    )
+    assert unauthorized.status_code == 400, unauthorized.text
+    assert api.get(f"{STREAMS}{streams[1]['uuid']}").json()[
+        "current_encryption_key"
+    ] == {
+        "key_uuid": key_uuid,
+        "public_key": "rotated-v2-public-key",
+    }
 
 
 def test_concurrent_first_requests_share_one_iam_user_import(db, monkeypatch):

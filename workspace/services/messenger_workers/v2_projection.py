@@ -28,6 +28,7 @@ from restalchemy.dm import filters as dm_filters
 from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api import file_storage
 from workspace.messenger_api.api import resource_projection
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import v2_models
 from workspace.external_bridge_control import file_repository
 
@@ -1598,7 +1599,7 @@ def _process_fanout(
             (project_id, root_uuid),
         )
         return True
-    content = str(message.payload.get("content", "")).lower()
+    content = message_payloads.markdown_content(message.payload).lower()
     author_uuid = _uuid(message.user_uuid)
     now = datetime.datetime.now(datetime.timezone.utc)
     accepted_recipients = []
@@ -1767,7 +1768,7 @@ def _process_content_mentions(
     message = _message_namespace(session, task["project_id"], placement_uuid)
     if message is None:
         return True
-    content = str(message.payload.get("content", "")).lower()
+    content = message_payloads.markdown_content(message.payload).lower()
     states = session.execute(
         """
         SELECT user_uuid
@@ -2601,7 +2602,7 @@ def _process_topic_membership_policy_rebuild(
                 now,
             ),
         )
-        content = str(row["payload"].get("content", "")).lower()
+        content = message_payloads.markdown_content(row["payload"]).lower()
         session.execute(
             """
             INSERT INTO messenger_user_message_states (

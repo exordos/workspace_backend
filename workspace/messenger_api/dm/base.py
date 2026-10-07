@@ -363,3 +363,13 @@ class WorkspaceUserStreamBase(
         default=None,
         read_only=True,
     )
+
+
+class WorkspaceUserStream(WorkspaceUserStreamBase):
+    """HTTP contract kept separate from rolling-compatible SQL views."""
+
+    encryption = properties.property(types.Boolean(), default=False)
+    current_encryption_key = properties.property(
+        types.AllowNone(message_payloads.ENCRYPTION_KEY_TYPE),
+        default=None,
+    )
