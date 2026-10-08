@@ -372,6 +372,7 @@ authoritative snapshots before starting a new cursor.
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Upload and select the current user's avatar. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Remove the current user's custom avatar and restore the canonical Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | Return the current authenticated Workspace user. |
+| `PUT` | `/api/workspace/v1/me/` | Update the authenticated user profile through IAM. |
 
 ### External integration contract boundary
 
@@ -1927,12 +1928,49 @@ data are not deleted.
 Workspace users are stored in `m_workspace_users`. The route is global rather
 than project-scoped.
 
-`GET /api/workspace/v1/me/` returns the same `WorkspaceUser_Get` object as
-`GET /api/workspace/v1/users/{user_uuid}`, using the user UUID from the IAM
-token. The client does not send or derive a user UUID for this request. The
-backend takes `project_id` from IAM introspection, refreshes the IAM-owned
-username, first name, last name, and email projection, and returns the local
-Workspace status, avatar, and presence fields.
+`GET /api/workspace/v1/me/` returns `WorkspaceUserProfile_Get`, using the
+user UUID from the IAM token. It preserves the fields returned by
+`GET /api/workspace/v1/users/{user_uuid}` and adds `surname`, `phone`,
+`description`, and `custom_props` from IAM. The backend reads the authoritative
+IAM user resource with the caller's bearer token, refreshes the username,
+first name, last name, and email projection, and keeps Workspace avatar,
+presence, and timestamps. `project_id` comes from IAM introspection.
+
+`PUT /api/workspace/v1/me/` updates only the authenticated user's profile.
+The editable fields are `username`, `first_name`, `last_name`, `surname`,
+`phone`, `description`, and `custom_props`. Send at least one field; omitted
+fields keep their current IAM values. Email and all other Workspace or IAM
+service fields are read-only. Sending a read-only field returns HTTP `403`;
+unknown fields or an empty object return HTTP `400` before any IAM write.
+
+```http
+PUT /api/workspace/v1/me/
+Content-Type: application/json
+
+{
+  "username": "cassi",
+  "first_name": "Cassandra",
+  "last_name": "Volkova",
+  "surname": "",
+  "phone": "+123456789",
+  "description": "Engineer",
+  "custom_props": {"kind": "basic", "other": {"team": "Workspace"}}
+}
+```
+
+The response is HTTP `200` with the saved `WorkspaceUserProfile_Get`.
+IAM validates the profile and enforces its existing permissions using the
+caller's bearer token; Workspace does not use an administrator credential.
+`custom_props` still requires its separate IAM read/update permissions and
+replaces the entire object, so preserve existing keys when editing it. If IAM
+omits `custom_props` because read permission is absent, Workspace omits it too.
+IAM client errors preserve their HTTP status with a sanitized message;
+transport failures, invalid JSON, and server errors return HTTP `502`.
+
+IAM is saved before Workspace refreshes its projection. These are separate
+transactions: if the projection refresh fails after IAM succeeds, read the
+profile again to reconcile it. No schema migration or UI editor is required
+by this API change.
 
 IAM identities are projected lazily. Calling `/me/` or requesting the current
 user through `/users/{user_uuid}` creates or refreshes that user's Workspace

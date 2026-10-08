@@ -177,7 +177,7 @@ ROUTE_MANIFEST = {
     "me": (
         routes.MeRoute,
         controllers.MeController,
-        {ra_routes.FILTER},
+        {ra_routes.FILTER, ra_routes.UPDATE},
     ),
 }
 

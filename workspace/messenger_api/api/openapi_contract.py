@@ -1382,15 +1382,29 @@ def add_topic_summary_management_contract(
 def add_current_user_contract(
     specification: dict[str, typing.Any],
     path: str,
+    components: dict[str, typing.Any],
 ) -> dict[str, typing.Any]:
+    schemas = components["components"]["schemas"]
+    schemas["WorkspaceUserProfile_Get"] = {
+        "$ref": "#/components/schemas/WorkspaceUserProfile_Filter",
+    }
+    update_schema = _component_schema(schemas, "WorkspaceUserProfile_Update")
+    update_schema["properties"] = {
+        name: value
+        for name, value in update_schema["properties"].items()
+        if not value.get("readOnly", False)
+    }
+    update_schema["required"] = []
+    update_schema["minProperties"] = 1
+    update_schema["additionalProperties"] = False
     operation = specification["paths"][path]["get"]
     operation["parameters"] = []
     operation["responses"][200] = {
-        "description": "WorkspaceUser_Get",
+        "description": "WorkspaceUserProfile_Get",
         "content": {
             "application/json": {
                 "schema": {
-                    "$ref": "#/components/schemas/WorkspaceUser_Get",
+                    "$ref": "#/components/schemas/WorkspaceUserProfile_Get",
                 },
             },
         },

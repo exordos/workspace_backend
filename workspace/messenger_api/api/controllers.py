@@ -15,6 +15,7 @@ import uuid as sys_uuid
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 import webob
+from oslo_config import cfg
 from restalchemy.api import actions as ra_actions
 from restalchemy.api import constants as ra_constants
 from restalchemy.api import controllers as ra_controllers
@@ -28,6 +29,7 @@ from restalchemy.openapi import constants as oa_c
 from restalchemy.openapi import utils as oa_utils
 from webob import multidict
 
+from workspace.common.clients import iam as iam_client
 from workspace.messenger_api import file_storage
 from workspace.messenger_api import application_services
 from workspace.messenger_api import credential_crypto
@@ -42,6 +44,7 @@ from workspace.messenger_api.dm import external_models
 from workspace.messenger_api.dm import helpers
 from workspace.messenger_api.dm import push_devices
 from workspace.messenger_api.dm import read_state
+from workspace.messenger_api.dm import user_profile
 from workspace.external_bridge_control import provider_data
 from workspace.external_bridge_control import file_repository
 from workspace.external_bridge_control import identity_linking
@@ -401,6 +404,17 @@ class TopicSummaryManagementJSONPacker(ContractJSONPacker):
         if not isinstance(result, dict):
             raise ra_exc.ValidationErrorException()
         return result
+
+
+class UserProfileJSONPacker(ContractJSONPacker):
+    def unpack(self, value: typing.Any) -> typing.Any:
+        try:
+            data = json.loads(value)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ra_exc.ValidationErrorException() from exc
+        if not isinstance(data, dict):
+            raise ra_exc.ValidationErrorException()
+        return ra_packers.BaseResourcePacker.unpack(self, data)
 
 
 class StoreResourceController(ra_controllers.BaseResourceControllerPaginated):
@@ -3508,9 +3522,79 @@ WorkspaceUserController.avatar_upload.openapi_schema = oa_utils.Schema(
 
 
 class MeController(WorkspaceUserController):
+    __resource__ = ra_resources.ResourceByRAModel(
+        model_class=user_profile.WorkspaceUserProfile,
+        convert_underscore=False,
+        fields_permissions=ra_field_permissions.FieldsPermissions(
+            default=ra_field_permissions.Permissions.RO,
+            fields={
+                **{
+                    name: {ra_constants.UPDATE: ra_field_permissions.Permissions.RW}
+                    for name in user_profile.EDITABLE_FIELDS
+                },
+                **{
+                    name: {ra_constants.ALL: ra_field_permissions.Permissions.HIDDEN}
+                    for name in (
+                        "provider_uuid",
+                        "external_account_uuid",
+                        "provider_external_id",
+                    )
+                },
+            },
+        ),
+    )
+
+    def get_packer(
+        self, content_type: typing.Any, resource_type: typing.Any = None
+    ) -> typing.Any:
+        return UserProfileJSONPacker(
+            resource_type or self.get_resource(), request=self.request
+        )
+
+    def _iam_client(self) -> iam_client.IamClient:
+        return iam_client.IamClient(cfg.CONF.iam.iam_endpoint)
+
+    def _profile(self, iam_user: dict[str, typing.Any]) -> dict[str, typing.Any]:
+        with api_store.open_store(self._get_project_id(), self._get_user_uuid()) as db:
+            db.sync_iam_identity(
+                {
+                    "user_uuid": self._get_user_uuid(),
+                    "username": iam_user["username"],
+                    "first_name": iam_user["first_name"],
+                    "last_name": iam_user["last_name"],
+                    "email": iam_user["email"],
+                }
+            )
+            result = db.get_resource(self.resource_name, self._get_user_uuid())
+        result.update(
+            {
+                name: iam_user[name]
+                for name in user_profile.IAM_ONLY_FIELDS
+                if name in iam_user
+            }
+        )
+        return result
+
     def filter(self, filters: typing.Any, order_by: typing.Any = None) -> typing.Any:
         del filters, order_by
-        return self.get(self._get_user_uuid())
+        iam_user = self._iam_client().get_user(
+            self._get_user_uuid(),
+            token=self.get_context().iam_context.token_info.token,
+        )
+        return self._profile(iam_user)
+
+    def update(self, uuid: object, **kwargs: typing.Any) -> typing.Any:
+        if uuid != self._get_user_uuid():
+            raise messenger_exc.ExternalResourceForbiddenError()
+        if not kwargs or not set(kwargs) <= set(user_profile.EDITABLE_FIELDS):
+            raise ra_exc.ValidationErrorException()
+        update = user_profile.UserProfileUpdate(**kwargs)
+        iam_user = self._iam_client().update_user(
+            self._get_user_uuid(),
+            token=self.get_context().iam_context.token_info.token,
+            values={name: getattr(update, name) for name in kwargs},
+        )
+        return self._profile(iam_user)
 
 
 setattr(
@@ -3519,6 +3603,13 @@ setattr(
     oa_utils.Schema(
         summary="Get current Workspace user",
         parameters=(),
-        responses=oa_c.build_openapi_get_update_response("WorkspaceUser_Get"),
+        responses=oa_c.build_openapi_get_update_response("WorkspaceUserProfile_Get"),
     ),
+)
+
+MeController.update.openapi_schema = oa_utils.Schema(
+    summary="Update current user's IAM profile",
+    parameters=(),
+    request_body=oa_c.build_openapi_json_req_body("WorkspaceUserProfile_Update"),
+    responses=oa_c.build_openapi_get_update_response("WorkspaceUserProfile_Get"),
 )

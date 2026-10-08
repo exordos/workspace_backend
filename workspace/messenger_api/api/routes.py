@@ -18,6 +18,7 @@ import typing
 
 from restalchemy.api import constants
 from restalchemy.api import routes
+from restalchemy.common import exceptions as ra_exc
 
 from workspace.messenger_api.api import controllers
 
@@ -437,7 +438,28 @@ class MeRoute(routes.Route):
     """Handler for the current IAM user endpoint."""
 
     __controller__ = controllers.MeController
-    __allow_methods__ = [routes.FILTER]
+    __allow_methods__ = [routes.FILTER, routes.UPDATE]
+
+    def do(self, parent_resource=None, **kwargs):
+        # /me is a singleton: PUT uses the authenticated UUID, never a path ID.
+        if self._req.method == routes.PUT:
+            if self._req.path_info not in ("", "/"):
+                raise ra_exc.UnsupportedHttpMethod(method=routes.PUT)
+            controller = self.get_controller(self._req)
+            self.restore_path_info(self._req)
+            return controller.do_resource(str(controller.get_context().user_uuid))
+        return super().do(parent_resource=parent_resource, **kwargs)
+
+    def build_openapi_specification(self, current_path="/", parameters=None):
+        paths, schemas = super().build_openapi_specification(current_path, parameters)
+        resource_path = next(path for path in paths if path != current_path)
+        paths.pop(resource_path)
+        paths[current_path]["put"] = self._build_openapi_method_specification(
+            routes.UPDATE,
+            parameters,
+            current_path,
+        )
+        return paths, schemas
 
 
 class ApiEndpointRoute(routes.Route):

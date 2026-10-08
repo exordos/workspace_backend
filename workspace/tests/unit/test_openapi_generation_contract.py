@@ -368,7 +368,7 @@ def test_messenger_openapi_keeps_internal_v1_paths_and_add_users_action():
     me_operation = paths["/v1/me/"]["get"]
     assert me_operation["parameters"] == []
     assert me_operation["responses"][200]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/WorkspaceUser_Get"
+        "$ref": "#/components/schemas/WorkspaceUserProfile_Get"
     }
     _assert_multipart_object(paths[avatar_upload_path]["post"], ["file"])
     _assert_file_upload_contract(paths["/v1/files/"]["post"])
@@ -453,7 +453,7 @@ def test_workspace_openapi_exposes_messenger_and_rest_events():
     me_operation = paths["/v1/me/"]["get"]
     assert me_operation["parameters"] == []
     assert me_operation["responses"][200]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/WorkspaceUser_Get"
+        "$ref": "#/components/schemas/WorkspaceUserProfile_Get"
     }
     _assert_message_pagination_contract(
         specification,

@@ -372,6 +372,7 @@ Autoritative Momentaufnahmen vor dem Start eines neuen Cursors.
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Laden Sie den Avatar des aktuellen Benutzers hoch und wählen Sie ihn aus. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Entfernen Sie den benutzerdefinierten Avatar des aktuellen Benutzers und stellen Sie den kanonischen Gravatar URN wieder her. |
 | `GET` | `/api/workspace/v1/me/` | Die aktuelle authentifizierte Workspace Benutzer zurückgeben. |
+| `PUT` | `/api/workspace/v1/me/` | Das Profil des angemeldeten Benutzers über IAM aktualisieren. |
 
 ### Grenze des Außenintegrationsvertrags
 
@@ -1927,12 +1928,52 @@ Daten werden nicht gelöscht.
 Workspace Benutzer werden in `m_workspace_users` gespeichert.
 Die Kommission hat die Kommission aufgefordert,
 
-`GET /api/workspace/v1/me/` gibt das gleiche `WorkspaceUser_Get` Objekt zurück wie
-`GET /api/workspace/v1/users/{user_uuid}`, mit dem Benutzer UUID aus dem IAM
-Der Client sendet oder leitet keinen Benutzer UUID für diese Anfrage ab.
-Das Backend nimmt `project_id` aus IAM-Introspection, aktualisiert die IAM-eigenen
-Benutzername, Vorname, Nachname und E-Mail-Projektion, und gibt die lokale
-Workspace Status, Avatar und Anwesenheitsfelder.
+`GET /api/workspace/v1/me/` liefert `WorkspaceUserProfile_Get` anhand der
+Benutzer-UUID aus dem IAM-Token. Die Felder von
+`GET /api/workspace/v1/users/{user_uuid}` bleiben erhalten; `surname`, `phone`,
+`description` und `custom_props` aus IAM kommen hinzu. Das Backend liest die
+maßgebliche IAM-Benutzerressource mit dem Bearer-Token des Aufrufers und
+aktualisiert Benutzername, Vorname, Nachname und E-Mail in der Projektion.
+Avatar, Präsenz und Zeitstempel bleiben in Workspace. `project_id` stammt
+aus der IAM-Introspektion.
+
+`PUT /api/workspace/v1/me/` ändert nur das Profil des angemeldeten Benutzers.
+Erlaubt sind `username`, `first_name`, `last_name`, `surname`, `phone`,
+`description` und `custom_props`. Mindestens ein Feld muss angegeben werden;
+ausgelassene Felder behalten ihre IAM-Werte. E-Mail und alle übrigen
+Workspace/IAM-Systemfelder sind schreibgeschützt. Schreibgeschützte Felder
+führen zu HTTP `403`; unbekannte Felder oder ein leeres Objekt zu HTTP `400`,
+bevor IAM geändert wird.
+
+```http
+PUT /api/workspace/v1/me/
+Content-Type: application/json
+
+{
+  "username": "cassi",
+  "first_name": "Cassandra",
+  "last_name": "Volkova",
+  "surname": "",
+  "phone": "+123456789",
+  "description": "Engineer",
+  "custom_props": {"kind": "basic", "other": {"team": "Workspace"}}
+}
+```
+
+Die Antwort ist HTTP `200` mit dem gespeicherten `WorkspaceUserProfile_Get`.
+IAM validiert Werte und bestehende Berechtigungen mit dem Bearer-Token des
+Aufrufers; Workspace verwendet keine Administrator-Zugangsdaten.
+Für `custom_props` gelten weiterhin separate IAM-Lese- und Schreibrechte.
+Das gesamte Objekt wird ersetzt; vorhandene Schlüssel müssen beim Bearbeiten
+erhalten bleiben. Fehlt die Leseberechtigung und lässt IAM `custom_props` weg,
+lässt Workspace dieses Feld ebenfalls weg. IAM-Clientfehler behalten ihren
+HTTP-Status mit einer bereinigten Meldung; Transportfehler, ungültiges JSON
+und Serverfehler liefern HTTP `502`.
+
+IAM wird vor der Workspace-Projektion gespeichert. Es handelt sich um
+getrennte Transaktionen: Schlägt die Projektion nach erfolgreicher
+IAM-Speicherung fehl, gleicht erneutes Lesen des Profils die Daten ab.
+Diese API-Änderung erfordert keine Schemamigration oder UI-Profilbearbeitung.
 
 IAMDie Identitäten werden faul projiziert.`/me/`oder die aktuelle
 Benutzer durch `/users/{user_uuid}` erstellt oder aktualisiert die Benutzer Workspace
