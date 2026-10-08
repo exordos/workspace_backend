@@ -108,8 +108,8 @@ def test_me_returns_current_iam_user_profile():
     project_uuid = sys_uuid.uuid4()
     user_uuid = sys_uuid.uuid4()
     calls = []
-    iam_user = types.SimpleNamespace(
-        name="cassi",
+    iam_user = dict(
+        username="cassi",
         first_name="Cassandra",
         last_name="Volkova",
         email="cassi@exordos.com",
@@ -146,7 +146,15 @@ def test_me_returns_current_iam_user_profile():
 
     api_store.configure_store_factory(factory)
     try:
-        result = controllers.MeController(request).filter({}, order_by=None)
+        request.context.iam_context.token_info = types.SimpleNamespace(
+            token="test-token"
+        )
+        with mock.patch.object(controllers.MeController, "_iam_client") as client:
+            client.return_value.get_user.return_value = iam_user
+            result = controllers.MeController(request).filter({}, order_by=None)
+        client.return_value.get_user.assert_called_once_with(
+            user_uuid, token="test-token"
+        )
     finally:
         api_store.reset_store_factory()
 

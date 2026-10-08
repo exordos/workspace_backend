@@ -372,6 +372,7 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | 现在的用户的化身. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | 删除当前用户的自定义化身,并恢复正规的Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | 返回当前认证的 Workspace 用户. |
+| `PUT` | `/api/workspace/v1/me/` | 通过 IAM 更新当前用户的个人资料。 |
 
 ### 外部整合合同的边界
 
@@ -1927,12 +1928,44 @@ GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_genera
 Workspace用户存储在`m_workspace_users`.路线是全球性的
 项目范围.
 
-`GET /api/workspace/v1/me/`返回相同的`WorkspaceUser_Get`作为对象
-`GET /api/workspace/v1/users/{user_uuid}`,使用用户UUID从IAM
-客户端没有发送或导出一个用户UUID这个请求.
-后端从 IAM 内省中取出`project_id`,更新IAM拥有的
-返回本地用户名,姓名,姓氏,电子邮件投影,
-Workspace状态,形象和存在字段.
+`GET /api/workspace/v1/me/` 使用 IAM 令牌中的用户 UUID 返回
+`WorkspaceUserProfile_Get`。它保留
+`GET /api/workspace/v1/users/{user_uuid}` 的字段，并添加 IAM 中的
+`surname`、`phone`、`description` 和 `custom_props`。后端使用调用者的
+Bearer 令牌读取 IAM 的权威用户资源，刷新用户名、名、姓和电子邮件投影，
+同时保留 Workspace 的头像、在线状态和时间戳。`project_id` 来自 IAM 内省。
+
+`PUT /api/workspace/v1/me/` 只能更新当前登录用户的个人资料。
+可编辑字段为 `username`、`first_name`、`last_name`、`surname`、`phone`、
+`description` 和 `custom_props`。至少提交一个字段；未提交的字段保留 IAM
+中的当前值。电子邮件及其他 Workspace/IAM 系统字段为只读。
+提交只读字段返回 HTTP `403`；未知字段或空对象在写入 IAM 前返回 HTTP `400`。
+
+```http
+PUT /api/workspace/v1/me/
+Content-Type: application/json
+
+{
+  "username": "cassi",
+  "first_name": "Cassandra",
+  "last_name": "Volkova",
+  "surname": "",
+  "phone": "+123456789",
+  "description": "Engineer",
+  "custom_props": {"kind": "basic", "other": {"team": "Workspace"}}
+}
+```
+
+成功响应为 HTTP `200`，内容是已保存的 `WorkspaceUserProfile_Get`。
+IAM 使用调用者的 Bearer 令牌验证数据并执行现有权限规则；Workspace 不使用
+管理员凭据。`custom_props` 仍需要独立的 IAM 读取和更新权限，且会替换整个
+对象，因此修改时必须保留现有键。若 IAM 因缺少读取权限而省略 `custom_props`，
+Workspace 也会省略该字段。IAM 客户端错误保留 HTTP 状态并返回经过清理的
+消息；网络故障、无效 JSON 和服务端错误返回 HTTP `502`。
+
+IAM 保存先于 Workspace 投影刷新，两者使用独立事务。如果 IAM 已保存但投影
+刷新失败，重新读取个人资料可以协调数据。此 API 变更不需要数据库迁移或 UI
+个人资料编辑器。
 
 IAM它们的身份被地投射出来.`/me/`或要求当前
 通过 `/users/{user_uuid}` 创建或更新该用户的 Workspace

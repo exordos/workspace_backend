@@ -372,6 +372,7 @@ GET /api/workspace/v1/events/?epoch_version%3E=123&epoch_generation=781203&page_
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_upload/invoke` | Загрузить и выбрать аватара текущего пользователя. |
 | `POST` | `/api/workspace/v1/users/{user_uuid}/actions/avatar_reset/invoke` | Удалить пользовательский аватара текущего пользователя и восстановить канонический Gravatar URN. |
 | `GET` | `/api/workspace/v1/me/` | Возвращение текущего аутентифицированного пользователя Workspace. |
+| `PUT` | `/api/workspace/v1/me/` | Изменить профиль текущего пользователя через IAM. |
 
 ### Граница договора внешней интеграции
 
@@ -1927,12 +1928,51 @@ GET /api/workspace/v1/events/?epoch_version%3E=<last_epoch_version>&epoch_genera
 Workspace пользователи хранятся в `m_workspace_users`. маршрут является глобальным, а
 чем в рамках проекта.
 
-`GET /api/workspace/v1/me/` возвращает тот же объект `WorkspaceUser_Get`, что и
-`GET /api/workspace/v1/users/{user_uuid}`, используя пользователя UUID из IAM
-Клиент не отправляет или получает пользователя UUID для этого запроса.
-Backend берет `project_id` из IAM самоанализа, обновляет IAM-владельцев
-имя пользователя, имя, фамилия и электронная почта проекции, и возвращает локальный
-Workspace статус, аватар и поля присутствия.
+`GET /api/workspace/v1/me/` возвращает `WorkspaceUserProfile_Get` по UUID
+пользователя из IAM-токена. Ответ сохраняет поля
+`GET /api/workspace/v1/users/{user_uuid}` и добавляет `surname`, `phone`,
+`description` и `custom_props` из IAM. Backend читает актуальный ресурс
+пользователя IAM с bearer-токеном вызывающего пользователя, обновляет проекцию
+username, имени, фамилии и email, сохраняя аватар, присутствие и временные
+метки Workspace. `project_id` берётся из интроспекции IAM.
+
+`PUT /api/workspace/v1/me/` изменяет только профиль текущего пользователя.
+Разрешены поля `username`, `first_name`, `last_name`, `surname`, `phone`,
+`description` и `custom_props`. Нужно передать хотя бы одно поле; пропущенные
+поля сохраняют текущие значения в IAM. Email и остальные служебные поля
+Workspace/IAM доступны только для чтения. Передача поля только для чтения
+возвращает HTTP `403`; неизвестные поля или пустой объект — HTTP `400`
+до записи в IAM.
+
+```http
+PUT /api/workspace/v1/me/
+Content-Type: application/json
+
+{
+  "username": "cassi",
+  "first_name": "Cassandra",
+  "last_name": "Volkova",
+  "surname": "",
+  "phone": "+123456789",
+  "description": "Engineer",
+  "custom_props": {"kind": "basic", "other": {"team": "Workspace"}}
+}
+```
+
+Ответ — HTTP `200` с сохранённым `WorkspaceUserProfile_Get`.
+IAM проверяет значения и действующие права по bearer-токену пользователя;
+Workspace не использует административные учётные данные.
+Для `custom_props` сохраняются отдельные права IAM на чтение и изменение.
+Объект заменяется целиком: при редактировании нужно сохранять существующие
+ключи. Если IAM не возвращает `custom_props` из-за отсутствия права чтения,
+Workspace тоже опускает это поле. Клиентские ошибки IAM сохраняют HTTP-статус
+с безопасным сообщением; сетевые ошибки, неверный JSON и серверные ошибки
+возвращают HTTP `502`.
+
+Запись в IAM предшествует обновлению проекции Workspace. Это отдельные
+транзакции: если обновление проекции завершилось ошибкой после успешной записи
+IAM, повторное чтение профиля согласует данные. Изменение API не требует
+миграции схемы или редактора профиля в UI.
 
 IAM идентичности проецируются лениво. вызов `/me/` или запрос текущего
 пользователь через `/users/{user_uuid}` создает или обновляет этот пользователь Workspace
