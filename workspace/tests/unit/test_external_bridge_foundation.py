@@ -151,6 +151,7 @@ def test_production_database_session_boundaries_are_centralized():
         "session_manager",
     }
     failures = []
+    approved_rollbacks = 0
     for path in workspace_root.rglob("*.py"):
         if "tests" in path.parts:
             continue
@@ -176,12 +177,29 @@ def test_production_database_session_boundaries_are_centralized():
                 if not call.startswith("contexts.Context().get_session("):
                     failures.append(f"{location}: {call}")
             elif name in {"commit", "rollback"}:
-                failures.append(f"{location}: {call}")
+                in_rollback_helper = any(
+                    isinstance(function, ast.FunctionDef)
+                    and function.name == "rollback_current_session"
+                    and node in ast.walk(function)
+                    for function in tree.body
+                )
+                allowed = (
+                    name == "rollback"
+                    and path.relative_to(workspace_root)
+                    == pathlib.Path("common/database.py")
+                    and call == "session.rollback()"
+                    and in_rollback_helper
+                )
+                if allowed:
+                    approved_rollbacks += 1
+                else:
+                    failures.append(f"{location}: {call}")
             elif name == "close" and isinstance(node.func.value, ast.Name):
                 if node.func.value.id in {"session", "s", "engine"}:
                     failures.append(f"{location}: {call}")
 
     assert failures == []
+    assert approved_rollbacks == 1
 
 
 def test_zb_contract_001_public_openapi_exposes_exact_ui_boundary():
@@ -210,9 +228,7 @@ def test_zb_contract_001_public_openapi_exposes_exact_ui_boundary():
         not in schemas["ExternalAccount_Get"]["properties"]["settings"]["properties"]
     )
     for account_schema in ("ExternalAccount_Filter", "ExternalAccount_Get"):
-        assert "projection_reset_generation" not in json.dumps(
-            schemas[account_schema]
-        )
+        assert "projection_reset_generation" not in json.dumps(schemas[account_schema])
     reconnect = paths[
         "/v1/messenger/external_accounts/{ExternalAccountUuid}/actions/reconnect/invoke"
     ]["post"]

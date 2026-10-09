@@ -43,6 +43,7 @@ class MessengerRoute(routes.Route):
         messenger_routes.WorkspaceMessageReactionRoute,
     )
     files = routes.route(messenger_routes.WorkspaceFileRoute)
+    stickers = routes.route(messenger_routes.StickerRoute)
 
 
 class ServiceRoute(user_routes.ServiceRoute):

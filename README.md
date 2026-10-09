@@ -36,6 +36,7 @@ contracts:
 - [`docs/zulip_bridge_control_api_v1.yaml`](docs/zulip_bridge_control_api_v1.yaml)
 - [`docs/zulip_bridge_file_api_v1.yaml`](docs/zulip_bridge_file_api_v1.yaml)
 - [`docs/en/zulip_bridge_v1_test_plan.md`](docs/en/zulip_bridge_v1_test_plan.md)
+- [`docs/en/sticker_zulip_bridge_implementation_plan.md`](docs/en/sticker_zulip_bridge_implementation_plan.md)
 
 The private Provider, control, and file specifications are not browser routes.
 The generated public Workspace and Messenger specification remains OpenAPI

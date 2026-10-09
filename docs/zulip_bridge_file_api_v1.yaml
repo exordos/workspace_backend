@@ -21,7 +21,8 @@ info:
     time and returns a five-minute HTTPS presigned request for object storage.
     Message operations and events remain on the private Provider API, and
     messages contain only the returned `urn:file:*`, `urn:image:*`, or
-    `urn:video:*` value.
+    `urn:video:*` value. Catalog stickers retain `urn:sticker:*`; a scoped
+    read-only metadata lookup supports verification of marked provider images.
 
     Every request is authorized from the current realm state. A valid client
     certificate is necessary but not sufficient: the backend also verifies the
@@ -49,8 +50,86 @@ tags:
     description: Copy provider bytes into Workspace object storage.
   - name: Outgoing files
     description: Copy authorized Workspace bytes into provider storage.
+  - name: Sticker metadata
+    description: Verify catalog references without allocating files or grants.
 
 paths:
+  /v1/stickers/{sticker_uuid}:
+    get:
+      tags: [Sticker metadata]
+      operationId: ResolveBridgeSticker
+      summary: Read available sticker metadata for an assigned chat
+      description: |
+        Uses the existing authenticated bridge and current account/chat
+        assignment checks. No outgoing operation or transfer UUID is required.
+        Only active, nonblocked catalog entries are returned. The response
+        contains no storage keys, credentials, or download grant. Bridges
+        compare the original provider file SHA-256 and size before restoring
+        a marked attachment to a canonical sticker URN. For a recognized
+        supported sticker marker, a 404 produces the generic `Sticker
+        unavailable` placeholder and must not fall back to an ordinary image.
+        Missing, malformed, or unknown-version markers and verified byte
+        mismatches may use ordinary image fallback. Authorization and transient
+        errors are not mismatches.
+      parameters:
+        - name: sticker_uuid
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: external_account_uuid
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: external_chat_uuid
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current available catalog metadata.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [uuid, sha256, size_bytes, content_type]
+                properties:
+                  uuid:
+                    type: string
+                    format: uuid
+                  sha256:
+                    $ref: '#/components/schemas/Sha256Hex'
+                  size_bytes:
+                    $ref: '#/components/schemas/FileSize'
+                  content_type:
+                    $ref: '#/components/schemas/ContentType'
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '401':
+          $ref: '#/components/responses/InvalidBridgeIdentity'
+        '403':
+          $ref: '#/components/responses/AuthorizationDenied'
+        '404':
+          description: >-
+            Sticker does not exist or is unavailable in the catalog. A bridge
+            handling a recognized supported marker renders the generic Sticker
+            unavailable placeholder and does not import an ordinary image.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileApiError'
+        '503':
+          $ref: '#/components/responses/StorageUnavailable'
+
   /v1/file-transfers/incoming/{file_uuid}:
     put:
       tags: [Incoming files]
@@ -227,10 +306,19 @@ paths:
         stream membership. A `public` file is allowed only when it is
         in the authorized operation manifest; public never means anonymous.
 
-        Only Workspace `urn:file`, `urn:image`, and `urn:video` values are
+        Workspace `urn:file`, `urn:image`, `urn:video`, and `urn:sticker` values are
         accepted. URL, Gravatar, and arbitrary schemes are rejected. Query
-        metadata is not trusted for authorization. The stored UUID, media type,
-        size, SHA-256, URN kind, and sidecar determine the response.
+        metadata is accepted only for ordinary file URNs and is not trusted for
+        authorization. Sticker URNs are canonical and contain only the catalog
+        UUID. The stored UUID, media type, size, SHA-256, URN kind, and sidecar
+        determine the response.
+
+        Sticker URNs resolve the global catalog instead of a WorkspaceFile
+        sidecar. The current bridge/account/chat assignment is still required;
+        the catalog entry must be active and nonblocked. Ordinary attachment
+        stream ACL checks are unchanged. For stickers, response `file_uuid`
+        denotes the catalog UUID and `name` is `<uuid>.<format>`. Size, hash,
+        media type and signed target describe the original catalog object.
 
         An exact replay while the target is unexpired returns the same
         authorization generation and target. An exact replay after expiry
@@ -628,12 +716,15 @@ components:
       minLength: 46
       maxLength: 2048
       # yamllint disable-line rule:line-length
-      pattern: '^urn:(file|image|video):[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}(\\?.*)?$'
+      pattern: '^urn:((file|image|video):[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}(\\?.*)?|sticker:[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12})$'
       description: |
-        Workspace file/media URN. Query parameters are display metadata only
-        and are ignored for identity and authorization. The URN kind must match
-        the stored content type: image/* uses image, video/* uses video, and all
-        other media types use file.
+        Workspace file/media URN. Query parameters on file, image, and video
+        values are display metadata only and are ignored for identity and
+        authorization. Sticker values have no query suffix. The URN kind must
+        match the stored content type: image/* uses image, video/* uses video,
+        and all other media types use file. The sticker kind is supported for
+        outgoing catalog authorization; its UUID identifies a Sticker, not a
+        WorkspaceFile. Ordinary incoming file allocation never creates stickers.
 
     PresignedHttpsUrl:
       type: string

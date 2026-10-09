@@ -1,0 +1,587 @@
+# План реализации серверного каталога стикеров
+
+## Статус документа
+
+- Версия плана: `1.2`.
+- Для `D-07` зафиксирована граница заявленных метаданных медиафайла; проверка содержимого вынесена в отдельное будущее усиление.
+- Состояние: решения `D-01`–`D-16` являются обязательными архитектурными контрактами реализации.
+- Основание: `docs/ru/sticker_catalog_api_tz.md`, версия `1.2`.
+- Этот документ описывает структуру реализации, зависимости компонентов и проверки. Источником истины для продуктового и API-контракта остаётся ТЗ.
+
+## 1. Итог первой реализации
+
+После завершения плана Workspace backend должен предоставлять общий серверный каталог GIF и стикеров, в котором:
+
+- медиафайлы хранятся по одному объекту на стикер в S3-совместимом хранилище;
+- карточки каталога, поисковые поля и избранное хранятся в PostgreSQL;
+- аутентифицированный пользователь может получать каталог, искать, разрешать список UUID и работать со своим глобальным избранным;
+- уполномоченный администратор может импортировать ZIP-архив, редактировать карточки и безвозвратно удалять стикеры;
+- скрытые стикеры продолжают разрешаться для истории, а заблокированные не отдают медиа;
+- публичный контракт не раскрывает bucket, S3 key и параметры доступа;
+- сообщения продолжают использовать Markdown и `urn:sticker:<sticker_uuid>` без отдельного `payload.kind`.
+
+## 2. Границы плана
+
+### 2.1. Входит
+
+- миграция PostgreSQL;
+- доменные модели и проверка полей;
+- отдельная граница хранения и поиска глобального каталога;
+- адаптер хранения медиа поверх существующей local/S3 инфраструктуры;
+- REST API каталога, поиска, пакетного разрешения и скачивания;
+- глобальное избранное пользователя;
+- административное редактирование;
+- административный hard delete с каскадным удалением избранного и durable фоновой очисткой storage;
+- синхронный импорт ZIP версии 1;
+- защита от опасных архивов и проверка согласованности заявленных метаданных медиафайла;
+- OpenAPI и контрактные тесты;
+- unit-, integration- и storage-тесты;
+- проверка миграции, индексов, плана поиска и регрессии существующего Messenger API.
+
+### 2.2. Не входит
+
+- клиентский интерфейс каталога в `workspace_ui`;
+- изменение браузерного расширения;
+- административная панель;
+- пользовательская загрузка стикеров;
+- группы и фильтрация по `emoji`;
+- WebM, Lottie, JPEG и MP4;
+- серверное сжатие, перекодирование, постеры и миниатюры;
+- отдельный тип сообщения для стикера;
+- журнал импортов, фоновые импорты и откат нескольких ZIP как единого пакета;
+- события WebSocket для обновления каталога;
+
+Обновление расширения и интеграция фронтенда перечислены в конце как отдельные последующие потоки. Они не должны блокировать backend, кроме согласования импортного и клиентского контрактов.
+
+## 3. Обязательные архитектурные ограничения
+
+1. Каталог общий и не имеет `project_id`.
+2. Избранное имеет ключ `(user_uuid, sticker_uuid)` и также не имеет `project_id`.
+3. Текущий `StoreResourceController` и Messenger store ориентированы на проект. Каталог нельзя молча встроить в них с фиктивным проектом.
+4. Репозиторий каталога получает текущую RestAlchemy `session` от контроллера. Он не открывает собственный `session_manager()`.
+5. Валидация значений доменной модели не дублируется в контроллере.
+6. Сложная SQL-выборка, ранжирование и избранное находятся за отдельным интерфейсом репозитория каталога.
+7. Стикер не создаётся как `WorkspaceFile`: у каталога нет stream/project ACL и файлового sidecar-контракта.
+8. Допускается переиспользовать существующие local/S3 адаптеры байтов с явным `storage_object_id`.
+9. В S3 сохраняется только медиафайл. ZIP и `manifest.json` целиком не сохраняются.
+10. `search_text` и SHA-256 вычисляет backend; `width` и `height` принимаются как необязательные числовые метаданные, могут быть `NULL` и проходят только проверку допустимого значения.
+11. Весь архив валидируется до первой постоянной записи. Дубликат SHA-256 не является ошибкой.
+12. Изменение реализации не расширяет scope ТЗ и не меняет публичный контракт без отдельного согласованного решения.
+
+## 4. Зафиксированные архитектурные решения
+
+| Код | Решение | Контракт реализации |
+|---|---|---|
+| `D-01` | Стабильная пагинация списка, поиска и избранного | `page_marker` — opaque base64url без padding с canonical JSON `{v, sort, filters_sha256, values}`. `values` — полная sort tuple; UUID — последний элемент. Сортировка однозначно выбирается по `q` и `favorite`: без `q`, `favorite=false` — `created_at DESC, uuid DESC`; без `q`, `favorite=true` — `favorite_created_at DESC, uuid DESC`; с `q`, `favorite=false` — `rank DESC, updated_at DESC, uuid DESC`; с `q`, `favorite=true` — `rank DESC, favorite_created_at DESC, uuid DESC`. Fingerprint включает canonical `uuid`: dedupe и lexicographic sort, максимум 100 UUID; pagination с uuid разрешена. Маркер другой сортировки/фильтров даёт 400. |
+| `D-02` | Технические лимиты текстовых полей и метаданных | `title` — 200 символов Unicode, `alt_text` — 500, один tag — 64, не более 64 tags, общий размер tags — 4096 байт UTF-8, `q` — 200, `page_limit` — от 1 до 100 (по умолчанию 50), повторяемый `uuid` — не более 100 значений. `width` и `height` — необязательные поля; при наличии положительное целое, при отсутствии `NULL`. Это техническая проверка формы, а не проверка содержимого. |
+| `D-03` | Ответ при невалидном атомарном импорте | Весь запрос отвечает стандартной ошибкой RestAlchemy `400` (`ValidationErrorException`); постоянные записи и объекты не создаются. Успех — `200` JSON с `created`, `duplicates`, `items`; поля `rejected` нет. |
+| `D-04` | Повторный импорт SHA заблокированного или скрытого стикера | Уникальный SHA возвращает существующий `sticker_uuid` как `duplicate`; копия не создаётся и состояние автоматически не меняется. |
+| `D-05` | Условное обновление каталога | ETag — quoted SHA-256 стабильного UTF-8 JSON тела страницы (с учётом текущего пользователя и всех фильтров); `Cache-Control: private, no-cache`; совпавший `If-None-Match` даёт `304` с ETag и без тела. |
+| `D-06` | Кэш медиа | GET download использует URL без версионного query-параметра и возвращает байты через backend с `ETag: "<sha256>"`, `Cache-Control: private, no-cache`, `Content-Type`, выведенным из сохранённого `format`; клиент выполняет revalidation, а совпавший `If-None-Match` даёт `304` только после проверки доступности. Редирект не используется и object id не раскрывается. |
+| `D-07` | Заявленные метаданные медиафайла в MVP | `format` допускается только как `gif`, `webp` или `png`, а расширение должно ему соответствовать; сервер не декодирует байты медиафайла и не проверяет его содержимое. `width` и `height` — необязательные метаданные из manifest; при наличии положительное целое, при отсутствии `NULL`, без сравнения с байтами. SHA-256 считает сервер потоково. Реальный формат и визуальная пригодность проверяются администратором до импорта; проверка содержимого изображения — отдельное будущее усиление. |
+| `D-08` | Разрешение администратора | Runtime проверяет точное имя из IAM introspection: `workspace.sticker_catalog.manage`. Manifest объявляет permission в `$core.iam.permissions`, отдельную административную роль и `$core.iam.permissionbinding` по схеме `project_id: null`, без implicit user assignment. |
+| `D-09` | Граница транзакции PostgreSQL и S3 | RestAlchemy открывает одну request session и делает `commit()` при любом нормальном возврате WSGI response, включая response со статусом 500; S3 не участвует в транзакции. Импорт делает preflight → upload новых объектов → DB rows. Известная ошибка SQL до подтверждённой финальной фиксации требует `session.rollback()` и удаления только объектов текущей попытки. Только при неопределённом исходе финальной фиксации автоматическое удаление запрещено: retry по SHA безопасен и завершается отдельной orphan-repair проверкой. |
+| `D-10` | Чтение скрытого стикера | Обычный GET и list/search возвращают только `active=true, blocked=false`; batch resolve возвращает hidden (`active=false, blocked=false`) для истории; download разрешён для active и hidden, но blocked отвечает безопасным `404` без чтения storage. |
+| `D-11` | `id` против `uuid` в публичном JSON | Публичная карточка сохраняет поле `id` со значением sticker UUID. В БД и маршрутах используется `uuid`; import result использует `sticker_uuid`. Числовые IDs и `media_object_id` наружу не выдаются. |
+| `D-12` | Идентичность storage | В строке хранится только `media_object_id`; доступ идёт через единый `sticker_storage` adapter. Production — настроенный S3, local backend только для development/tests; bucket и object key не входят в DTO, error и logs. |
+| `D-13` | Одинаковый SHA внутри одного ZIP | Первый элемент с SHA создаёт одну запись; каждый последующий такой SHA получает тот же `sticker_uuid` и `status: duplicate`, независимо от порядка ZIP. |
+| `D-14` | Favorite после hide/block | Favorite row сохраняется при hide/block. `favorite=true` возвращает только видимые элементы; после unhide/unblock ранее сохранённое favorite снова появляется. Star запрещён для hidden/blocked, unstar идемпотентен. |
+| `D-15` | Административный hard delete | `DELETE /stickers/{uuid}` требует `workspace.sticker_catalog.manage`, удаляет корневую строку и каскадно favorites, возвращает `204`. Исторический UUID перестаёт разрешаться: UI показывает generic-заглушку `Стикер недоступен`, bridge выводит `Sticker unavailable` и не выпускает raw URN. Deleted, missing и blocked состояния снаружи не различаются. Повторный импорт тех же байтов после committed delete создаёт новый UUID. |
+| `D-16` | Конкурентность и cleanup delete | Delete и import используют один advisory transaction lock по SHA. В той же PostgreSQL transaction delete создаёт durable cleanup task; основной Messenger worker идемпотентно удаляет storage object после commit и повторяет failed задачи с backoff до completed. Rollback cleanup migration допускается только после завершения всех pending/running/failed задач. |
+
+### 4.1. Доказанные RestAlchemy и runtime conventions
+
+В существующем Messenger коде `WorkspaceFileRoute.download` объявлен как `routes.action(... )` без `invoke=True`, а `WorkspaceMessageRoute.star` и `unstar` — с `invoke=True` (`workspace/messenger_api/api/routes.py:140-150,211-224`). Их контроллеры используют `@ra_actions.get` для download и `@ra_actions.post` для команд (`workspace/messenger_api/api/controllers.py:918-937,1143-1172`). `StoreResourceController.get_packer()` выбирает JSON или multipart packer (`workspace/messenger_api/api/controllers.py:426-434`), но каталог получает собственный packer без storage-полей.
+
+В установленном RestAlchemy `Route.do()` распознаёт action только в ветви, где уже извлечён `{resource_uuid}` (`.tox/develop/lib/python3.10/site-packages/restalchemy/api/routes.py:576-584`); `Action.do()` проверяет `invoke` и разрешённый HTTP method (`:625-657`). Поэтому collection action `/stickers/actions/import_archive/invoke` реализуется отдельным route subclass с явным dispatch collection action. Нельзя объявлять его обычным item action и нельзя менять стандартный route dispatcher.
+
+Маршрут коллекции сначала проверяет ровно `POST /actions/import_archive/invoke`, затем через единую границу `workspace/messenger_api/api/permission_guards.py:require_iam_permission` получает разрешения IAM из контекста запроса. Только после успешной проверки вызывается стандартный `Action.do`; таким образом, до отказа `403` не читаются `request.api_context.params`, тело multipart-запроса или упаковщик. Остальные методы получают `UnsupportedHttpMethod` (405), а отсутствие `/invoke` — `UnsupportedMethod` (404), что зафиксировано контрактным тестом.
+
+Поскольку стандартная генерация OpenAPI также перечисляет actions только для resource route, collection-action path и multipart schema добавляются явной функцией в `workspace/messenger_api/api/openapi_contract.py`; это не меняет поведение RestAlchemy dispatcher и не создаёт отдельную сущность импорта.
+
+Контрактный тест `workspace/tests/unit/test_sticker_catalog_restalchemy_contract.py` проверяет эти flags и фиксирует, что stock dispatcher не принимает collection action.
+
+### 4.2. Transaction failure matrix
+
+| Сбой | Ожидаемое состояние PostgreSQL | Ожидаемое состояние S3 | Действие импорта |
+|---|---|---|---|
+| предварительная проверка/manifest/метаданных | нет записей | нет объектов | вернуть RestAlchemy `400` |
+| N-й upload до DB writes | нет записей | удалить только объекты текущей попытки; cleanup error логировать безопасно | вернуть `500` |
+| известная ошибка SQL до подтверждённой финальной фиксации | rollback | удалить только объекты текущей попытки | вернуть `400/409/500` по типу ошибки |
+| request exception до context exit | rollback | удалить объекты текущей попытки | вернуть ошибку |
+| final `session.commit()` failure | состояние commit неопределённо | не удалять автоматически | вернуть `500`; повтор разрешён по SHA и отдельная orphan-repair проверка |
+| response уже отправлен, процесс остановлен около commit | состояние commit неопределённо | объекты остаются | повторный импорт идемпотентен по UNIQUE SHA; orphan inventory — операционная проверка |
+
+RestAlchemy context middleware оборачивает WSGI вызов в одну session (`restalchemy/api/middlewares/contexts.py:119-134`), а `Context.session_manager()` коммитит только после нормального выхода и закрывает session в `finally` (`restalchemy/common/contexts.py:124-155`). Поэтому S3 нельзя считать частью DB transaction, а компенсация не должна удалять объект после неопределённого commit.
+
+## 5. Целевая структура реализации
+
+Зафиксированное разделение модулей:
+
+```text
+workspace/messenger_api/
+  dm/stickers.py                 # доменные и публичные модели
+  sticker_catalog.py             # нормализация и прикладные операции каталога
+  sticker_repository.py          # SQL, поиск, пагинация, избранное
+  sticker_storage.py             # object id, save/read/delete
+  sticker_import.py              # разбор и полная валидация ZIP
+  api/sticker_controllers.py     # тонкие RestAlchemy-контроллеры
+  api/routes.py                  # shared routes, including sticker actions
+```
+
+Эти границы разделяют доменную логику, storage, SQL и HTTP-интеграцию. Общие точки подключения изменяются согласованно с публичным контрактом.
+
+Общие точки интеграции:
+
+- `workspace/messenger_api/api/routes.py`;
+- `workspace/workspace_api/api/routes.py`;
+- `workspace/messenger_api/api/openapi_contract.py`;
+- `workspace/messenger_api/api/store.py`, если интерфейс общего store действительно потребуется;
+- `pyproject.toml` и lock-файл;
+- номер и dependency graph миграций при интеграции;
+- ТЗ и этот план.
+
+### 5.1. Основной поток чтения
+
+```text
+HTTP list/get
+  -> RestAlchemy controller
+  -> sticker catalog service
+  -> sticker repository + текущий user_uuid
+  -> PostgreSQL
+  -> public DTO с media.url и is_favorite
+```
+
+### 5.2. Поток скачивания
+
+```text
+GET action download
+  -> проверка active/blocked с учётом режима разрешения
+  -> чтение media_object_id из PostgreSQL
+  -> sticker storage
+  -> local/S3 bytes
+```
+
+### 5.3. Поток импорта
+
+```text
+multipart archive
+  -> проверка разрешения и общего размера
+  -> безопасное чтение ZIP directory
+  -> manifest schema
+  -> проверка путей, лимитов и соответствия 1:1
+  -> потоковый SHA-256 и проверка заявленных метаданных
+  -> поиск дубликатов
+  -> загрузка только новых объектов
+  -> одна PostgreSQL-транзакция для новых строк
+  -> результат created/duplicate
+  -> компенсационная очистка новых S3 objects при ошибке
+```
+
+## 6. Зависимости компонентов
+
+```text
+Контракты
+  ├── схема PostgreSQL
+  ├── доменные модели и нормализация
+  ├── хранилище медиа
+  └── валидатор ZIP
+
+Схема PostgreSQL + доменные модели
+  -> репозиторий, поиск и пагинация
+
+Хранилище медиа + репозиторий
+  -> чтение каталога и download
+
+Репозиторий
+  ├── избранное
+  └── административное редактирование и удаление
+
+Схема + модели + storage + repository + admin operations + ZIP validator
+  -> административный импорт
+
+Чтение + избранное + admin operations + импорт
+  -> маршруты, OpenAPI и общая интеграция
+  -> полная приёмка и hardening
+```
+
+Стрелки показывают технические зависимости, а не журнал или порядок работы.
+
+## 7. Ответственность компонентов
+
+### 7.1. Контракты RestAlchemy и каталога
+
+**Назначение:** зафиксировать решения, от которых зависят схема и публичный API.
+
+**Ответственность:**
+
+- сверить каждый маршрут с фактическими RestAlchemy action conventions;
+- проверить форму collection action `/stickers/actions/import_archive/invoke` контрактным тестом;
+- зафиксировать публичные JSON-схемы, коды ответа и стандартные ошибки;
+- определить точную схему непрозрачного курсора и устойчивую сортировку;
+- установить технические лимиты строк, тегов, UUID-фильтра и размера страницы;
+- проверить доступность IAM permission;
+- зафиксировать границу `D-07`: MVP не использует Pillow или иной декодер изображений, не проверяет сигнатуру файла/фактический формат и не меняет файлы зависимостей;
+- учитывать фактический момент commit RestAlchemy в S3 compensation strategy;
+- зафиксировать cache headers и `ETag` behavior;
+- закрыть различия `id`/`uuid`, storage identity, duplicate SHA внутри архива и favorite после hide/block.
+
+**Артефакты:** таблица решений `D-01`–`D-16`, API fixtures и контрактные тесты IAM, метаданных и жизненного цикла транзакции RestAlchemy.
+
+**Проверка:** ТЗ и план совпадают по решениям, а контрактные примеры покрыты тестами.
+
+### 7.2. Схема PostgreSQL
+
+**Зависимость:** контракты каталога. Миграции создаются через `.tox/develop/bin/ra-new-migration --path migrations --depend HEAD`.
+
+**Ответственность:**
+
+- `m_workspace_stickers` со всеми полями из ТЗ;
+- `m_workspace_sticker_favorites` с первичным ключом `(user_uuid, sticker_uuid)`;
+- внешний ключ favorite → sticker с `ON DELETE CASCADE`;
+- без внешнего ключа `user_uuid` на проектно-зависимую строку пользователя;
+- ограничения CHECK для category, format, допускающих `NULL` `width`/`height` и положительных значений при наличии, а также состояния `active/blocked`;
+- UNIQUE для `sha256`;
+- GIN по `tags`;
+- `pg_trgm` GIN по `search_text`;
+- индекс избранного для `(user_uuid, created_at DESC, sticker_uuid)`;
+- необходимые grants для runtime-роли;
+- обратимый rollback в рамках принятых правил миграций проекта.
+
+**Проверка:** миграция применяется на чистой базе, ограничения реально отклоняют плохие строки, индексы существуют с ожидаемыми operator classes, rollback и повторное применение проверены.
+
+### 7.3. Доменные модели, публичные DTO и нормализация
+
+**Зависимость:** контракты каталога.
+
+**Ответственность:**
+
+- модель хранимого стикера;
+- модель favorite при необходимости RestAlchemy mapping;
+- отдельная публичная модель без `media_object_id`, bucket и storage credentials;
+- manifest v1 input models;
+- import result models со статусами `created` и `duplicate`;
+- нормализация title, alt text, tags и `ё/е` для `search_text`;
+- дедупликация tags и emoji с сохранением стабильного порядка;
+- построение `media.url` только из `sticker_uuid`;
+- строгие field permissions для административно изменяемых и read-only полей.
+
+**Не делать:** SQL-поиск, ZIP I/O, S3 I/O и маршруты.
+
+**Проверка:** pure unit tests покрывают границы полей, Unicode, пустые значения, дубликаты, неизвестные поля, category по умолчанию и отсутствие внутренних storage-полей в публичном JSON.
+
+### 7.4. Хранилище медиа стикеров
+
+**Зависимость:** контракты каталога.
+
+**Ответственность:**
+
+- детерминированный object id `stickers/{sticker_uuid}/media.{format}`;
+- интерфейс `save/read/delete` для одного объекта;
+- адаптация существующих local и S3 storage implementations;
+- неизменяемость на уровне adapter: существующие local/S3 `save` paths сейчас допускают overwrite, поэтому adapter обязан перед записью отказать при занятом object id (или сравнить тот же SHA и сделать idempotent no-op); другой content никогда не перезаписывается;
+- отсутствие `WorkspaceFile`, project/stream ACL и metadata sidecar;
+- типизированные ошибки хранения без утечки bucket/key в публичный ответ.
+
+**Проверка:** unit tests local adapter, mocked S3 put/get/delete, точного object id, cleanup и отсутствия лишнего sidecar; тесты не требуют production credentials.
+
+### 7.5. Репозиторий каталога, поиск и пагинация
+
+**Зависимости:** схема PostgreSQL и доменные модели.
+
+**Ответственность:**
+
+- интерфейс репозитория, принимающий текущую `session` и `user_uuid`;
+- list/search с `q`, `favorite`, повторяемым `uuid`, `category`, `format`;
+- get active item;
+- batch resolve, допускающий hidden и исключающий blocked media;
+- вычисление `is_favorite` одним запросом, без N+1;
+- устойчивое ранжирование: exact tag, title exact/prefix, partial text, trigram;
+- непрозрачный курсор, связанный с запросом, фильтрами и сортировкой;
+- операции duplicate lookup, batch insert, update, star и unstar;
+- идемпотентность и защита уникальными ограничениями при гонках.
+
+**Не делать:** HTTP parsing, S3 и ZIP.
+
+**Проверка:** integration tests PostgreSQL проверяют порядок, границы страниц без пропусков/дубликатов, русский и английский поиск, `ё/е`, опечатку, комбинацию фильтров, favorite order, hidden/blocked и два конкурентных действия star/import.
+
+### 7.6. Публичное чтение каталога и скачивание
+
+**Зависимости:** хранилище медиа и репозиторий каталога.
+
+**Ответственность:**
+
+- прикладные handlers list/get/batch resolve;
+- download handler с проверкой состояния до обращения к storage;
+- JSON точно по разделу 7 ТЗ;
+- `is_favorite` для текущего IAM user;
+- `ETag`, `If-None-Match`, cache headers и заголовки media response;
+- одинаковое безопасное внешнее поведение для отсутствующего и недоступного blocked объекта;
+- скрытая карточка доступна только batch resolve для истории, а её download разрешён при `blocked=false`.
+
+**Проверка:** controller/service tests покрывают 200, 304, pagination headers, 404/безопасный отказ, hidden, blocked, отсутствие S3 key и отсутствие чтения storage для заблокированного элемента.
+
+### 7.7. Глобальное избранное
+
+**Зависимость:** репозиторий каталога.
+
+**Ответственность:**
+
+- идемпотентные операции star/unstar;
+- user_uuid берётся только из IAM context;
+- запрет добавления hidden/blocked/несуществующего стикера;
+- точная сортировка `favorite=true`: без `q` — `favorite_created_at DESC, uuid DESC`, с `q` — `rank DESC, favorite_created_at DESC, uuid DESC`;
+- одинаковое избранное для одного пользователя в разных проектах;
+- отсутствие возможности передать user_uuid другого пользователя.
+
+**Проверка:** unit/integration tests повторного star/unstar, двух пользователей, двух проектов одного пользователя, скрытия после добавления и конкурентного star.
+
+### 7.8. Административное редактирование и удаление
+
+**Зависимость:** репозиторий каталога.
+
+**Ответственность:**
+
+- permission gate `workspace.sticker_catalog.manage`;
+- объявление permission в `exordos/manifests/workspace.yaml.j2` и явная привязка только к согласованной административной роли;
+- изменение только `title`, `alt_text`, `emoji`, `tags`, `category`, `active`, `blocked`;
+- пересборка `search_text` при каждом релевантном изменении;
+- DB constraint и проверка допустимого значения для несовместимого `active=true, blocked=true`;
+- запрет изменения UUID, media, format, размеров, SHA и object id;
+- `DELETE` под тем же permission: SHA lock, удаление корневой строки с DB cascade favorites и атомарная постановка cleanup task;
+- идемпотентная post-commit очистка storage основным Messenger worker без удаления S3 внутри request transaction;
+- historical unresolved UUID отображается consumer-side заглушкой, raw URN не отправляется bridge наружу;
+- повторный импорт committed-deleted SHA создаёт новый UUID.
+
+**Проверка:** сценарии без permission, с permission, unknown/read-only fields, повторного обновления, hide/unhide, block/unblock, каскада favorites, rollback/commit boundary, cleanup retry и гонки delete/import.
+
+### 7.9. Безопасный разбор и валидация ZIP
+
+**Зависимость:** контракты импорта.
+
+**Ответственность:**
+
+- чтение ровно одного UTF-8 `manifest.json` schema version 1;
+- проверка 1:1 между manifest items и `media/`;
+- запрет absolute paths, `..`, symlink, duplicate paths, extra media, nested archives и encrypted entries;
+- лимиты 40 МиБ compressed, 100 МиБ unpacked, 50 items, 10 МиБ на media и 20:1 ratio;
+- потоковый hash и безопасное извлечение только ожидаемых файлов во временную директорию;
+- проверка заявленных расширений и значений `format` из manifest;
+- проверка положительных `width`/`height` при наличии без чтения содержимого медиафайла;
+- потоковый SHA-256 и сверка manifest checksum;
+- результат в памяти/temporary files, не создающий DB/S3 side effects.
+
+**Проверка:** table-driven tests валидного архива и каждого класса атаки/ошибки, включая зашифрованные элементы архива; временные файлы удаляются и при успехе, и при исключении; проверки не читают более установленных лимитов; тесты подтверждают отсутствие Pillow/декодера изображений, проверки сигнатуры файла и сравнения размеров с байтами изображения.
+
+### 7.10. Административный импорт
+
+**Зависимости:** схема PostgreSQL, доменные модели, storage, repository, административное разрешение, ZIP validator и решение `D-09`.
+
+**Ответственность:**
+
+- multipart handler поля `archive`;
+- permission проверяется до тяжёлого чтения архива;
+- полная preflight validation до постоянных writes;
+- batch lookup дубликатов по SHA-256;
+- генерация серверных `sticker_uuid` только для новых объектов;
+- загрузка новых медиа и создание каталожных строк в согласованной транзакционной последовательности;
+- компенсационная очистка только объектов текущей неуспешной попытки;
+- защита от гонки двух импортов одинакового SHA;
+- ответ с сопоставлением `client_id`, `file`, status и `sticker_uuid`;
+- архив и manifest не сохраняются как отдельные сущности.
+
+**Проверка:** integration tests all-created, mixed-created/duplicate, all-duplicate, invalid atomic reject, ошибка N-го S3 upload, известная ошибка SQL с rollback и очисткой объектов текущей попытки, duplicate race, ошибка очистки и повтор после неопределённой финальной фиксации без автоматической очистки.
+
+### 7.11. RestAlchemy routes, OpenAPI и интеграция модулей
+
+**Зависимости:** чтение каталога, избранное, административные операции и импорт.
+
+**Ответственность:**
+
+- ресурс `/api/workspace/v1/messenger/stickers/`;
+- GET одного ресурса;
+- GET action `actions/download` без `/invoke`;
+- POST actions `star` и `unstar` с `/invoke`;
+- collection action `actions/import_archive/invoke`;
+- PUT административного редактирования;
+- подключение в `MessengerRoute`;
+- multipart packer и OpenAPI request/response schemas;
+- контрактные snapshot/assertion tests путей, методов, параметров, headers и скрытых полей;
+- отсутствие изменений существующих Messenger routes.
+
+**Проверка:** сгенерированный OpenAPI содержит только согласованные пути; старые route tests зелёные; неизвестные методы получают штатный отказ RestAlchemy.
+
+### 7.12. Общая приёмка, безопасность и производительность
+
+**Зависимость:** интегрированный HTTP API.
+
+**Ответственность:**
+
+- полный E2E через реальный HTTP слой и PostgreSQL;
+- проверка local storage и отдельный S3-compatible smoke, если доступен тестовый endpoint;
+- `EXPLAIN (ANALYZE, BUFFERS)` для типового поиска и списка избранного на репрезентативном объёме;
+- подтверждение использования GIN/pg_trgm индексов там, где это ожидается;
+- тест лимита Nginx `50m` против прикладного лимита `40 MiB`;
+- проверка отсутствия object ids, bucket names и credentials в JSON, errors и logs;
+- проверка авторизации двух пользователей и двух проектов;
+- регрессия сообщений с `urn:sticker:<uuid>` на уровне существующего Markdown parsing/render contract, без нового message kind;
+- фиксация границы MVP: приёмка проверяет заявленные метаданные, безопасность ZIP и потоковый SHA-256; проверка содержимого изображения остаётся отдельным будущим усилением;
+- обновление API-документации и списка известных ограничений.
+
+**Проверка:** focused tests, полный backend test suite, `ruff check`, `ruff format --check`, `mypy`, проверка миграции и `git diff --check` проходят; ручные S3/runtime проверки фиксируются отдельно.
+
+## 8. Интеграционные границы
+
+Компоненты интегрируются через зафиксированные interfaces и контракты:
+
+- решения `D-01`–`D-16`, import manifest и response fixtures определяют входные данные и публичное поведение;
+- миграция, модели, storage и ZIP validator предоставляют фундамент каталога;
+- repository, search, favorites и admin operations работают поверх одной схемы PostgreSQL;
+- RestAlchemy routes и OpenAPI подключают доменные операции без изменения существующих Messenger routes;
+- legacy Zulip fallback и проектная область не используются для глобального каталога;
+- request flow использует текущую DB session и не открывает вложенную session;
+- manifest, пользовательские данные, токены, credentials и S3 secrets не логируются целиком.
+
+### 8.1. Граница проверки медиа D-07
+
+- ZIP validator проверяет заявленные значения `format` и согласованность расширения;
+- сервер защищает ZIP от опасных путей, symlink, nested/encrypted entries, превышения количества, сжатого и распакованного объёма и ratio; временные файлы всегда очищаются;
+- `width` и `height` берутся из необязательных метаданных manifest, при наличии проверяются как положительные целые и не сравниваются с байтами медиафайла;
+- `sha256` считается потоково сервером;
+- архив не сохраняется целиком; реальный формат и визуальная пригодность остаются ответственностью администратора до импорта, а проверка содержимого изображения относится к отдельному будущему усилению.
+
+### 8.2. Условия приёмки
+
+- схема, доменные операции и HTTP API соответствуют ТЗ и OpenAPI;
+- valid import проходит end to end, а failure paths не оставляют видимых строк или незапланированных объектов;
+- hidden/blocked, pagination и authorization semantics подтверждаются тестами;
+- известные ограничения задокументированы, а замечания высокой критичности по security и authorization закрыты;
+- ручные S3/runtime проверки учитываются отдельно от автоматизированных проверок.
+
+## 9. Матрица обязательных проверок
+
+### Unit
+
+- нормализация tags, emoji и `search_text`;
+- field limits и defaults;
+- cursor encode/decode и fingerprint фильтров;
+- object id;
+- пути ZIP, количество, размеры, ratio, заявленные метаданные, hash и согласованность manifest;
+- public DTO не раскрывает internal fields;
+- permission gate вызывается до импорта.
+
+### PostgreSQL integration
+
+- apply/rollback migration;
+- CHECK, UNIQUE, FK и CASCADE;
+- search ranking и pagination;
+- favorite owner isolation и global cross-project behavior;
+- concurrent star и duplicate import;
+- update пересобирает `search_text`.
+
+### HTTP integration
+
+- list/search/filter/batch/get/download;
+- `ETag`/304 и pagination headers;
+- star/unstar;
+- PUT с permission и без него;
+- multipart import;
+- ошибки не раскрывают internal storage data;
+- route/OpenAPI contract.
+
+### Storage
+
+- local save/read/delete;
+- mocked S3 save/read/delete;
+- partial upload cleanup;
+- blocked download не обращается к S3;
+- immutable object behavior.
+
+### Регрессия
+
+- существующий Messenger API;
+- existing file upload/download;
+- message star/unstar;
+- OpenAPI generation;
+- runtime deployment contract.
+
+## 10. Основные риски и способы контроля
+
+### PostgreSQL и S3 не образуют общую транзакцию
+
+Контроль: `D-09` подтверждён исходником RestAlchemy и failure matrix. Upload/SQL failures компенсируются объектами текущей попытки; неопределённый final commit не запускает автоматическое удаление и проверяется orphan inventory/retry по SHA при интеграционной приёмке.
+
+### Ранжирование может ломать маркерную пагинацию
+
+Контроль: курсор содержит полную sort tuple и fingerprint запроса; UUID завершает сортировку; тест проходит несколько страниц при одинаковом score.
+
+### Глобальный user_uuid не имеет естественного FK на проектную таблицу пользователей
+
+Контроль: не добавлять ложный project FK; доверять IAM identity и проверять изоляцию прикладными тестами.
+
+### ZIP может исчерпать память или диск
+
+Контроль: читать multipart и entries потоково, считать compressed/uncompressed limits до extraction, использовать временную директорию и очищать её в `finally`.
+
+### Формат по расширению может быть подделан
+
+Контроль MVP: сверять manifest, согласованность расширения и заявленного `format`, положительность `width`/`height` при наличии и потоковый SHA-256. Реальный формат и визуальная пригодность проверяются администратором; проверка содержимого изображения остаётся будущим усилением.
+
+### Дубликат заблокированного файла может обойти модерацию
+
+Контроль: UNIQUE SHA и правило `D-04`; импорт не меняет состояние существующего стикера.
+
+### Персональный `is_favorite` может попасть в общий кэш
+
+Контроль: каталог имеет private caching и пользовательский ETag; CDN/shared cache не используется для персонализированного JSON.
+
+### Permission может существовать только в проекте документации
+
+Контроль: проверить реальный IAM contract до кодового импорта; production rollout блокируется без выдачи разрешения администратору.
+
+## 11. Последующие отдельные потоки
+
+### EXT-01 — Профиль Workspace в браузерном расширении
+
+Расширение получает отдельный exporter, который:
+
+- создаёт manifest schema version 1 из ТЗ;
+- экспортирует только GIF/WebP/PNG;
+- формирует `media/<client_id>.<format>`;
+- автоматически делит выборку на независимые ZIP не более 40 МиБ и 50 элементов;
+- показывает пропущенные записи и причины;
+- не добавляет `pack`, `name`, `generator`, source и внутренние поля расширения;
+- имеет contract fixtures, общие по смыслу с backend importer tests.
+
+### FE-01 — Каталог в Workspace UI
+
+После развёртывания согласованного backend API фронтенд:
+
+- реализует repository interface только для согласованного backend API;
+- заменяет прямую GIPHY-зависимость в выбранном продуктовом режиме, не смешивая два источника;
+- использует lazy media loading и не сохраняет временные redirect URLs;
+- отправляет уже поддерживаемый Markdown `![sticker](urn:sticker:<uuid>)` со строгим URN без query suffix;
+- хранит cache с owner/org scope и защитой от stale async writes;
+- не реализует emoji groups до отдельного требования.
+
+### ADMIN-01 — Панель управления
+
+После MVP можно добавить UI поверх уже существующих import/update/delete операций. Этот поток не меняет таблицы и API без нового требования.
+
+Deployment gate: сначала разворачивается backend, затем совместимый bridge. Отправку стикеров включают только после развёртывания bridge, а UI-действие delete — только после развёртывания backend API. Очистка строк `messenger_sticker_cleanup_tasks` в состоянии `completed` остаётся отдельным operational follow-up и не входит в текущий scope.
+
+## 12. Definition of Done первой реализации
+
+Первая реализация считается готовой, когда:
+
+1. Администратор с реальным permission загружает валидный ZIP через один RestAlchemy collection action.
+2. Каждый новый файл хранится отдельным неизменяемым объектом, а каталог содержит вычисленные backend данные.
+3. Повторный импорт возвращает duplicate и не создаёт вторую запись.
+4. Обычный пользователь получает страницы каталога, ищет по title/alt/tags и не видит внутренних storage-полей.
+5. Один и тот же пользователь видит одно избранное во всех проектах, другой пользователь — только своё.
+6. Hidden не появляется в каталоге, но разрешается для истории; blocked не отдаёт медиа.
+7. Администратор меняет разрешённые поля, а поиск и доступность обновляются согласованно.
+8. Администратор удаляет стикер; строка и favorites исчезают атомарно, historical UUID получает безопасную заглушку, а durable worker очищает storage после commit.
+9. Ошибочный архив не создаёт строк; проверенные storage/SQL failure paths не оставляют незапланированные объекты.
+10. OpenAPI, миграции, focused tests, полный suite, Ruff, mypy и `git diff --check` проходят.
+11. Проверка с реальным S3-compatible endpoint выполнена либо вынесена в явно названный production gate без заявления о её прохождении.

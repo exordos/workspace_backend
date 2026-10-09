@@ -237,6 +237,21 @@ class PrivateBridgeService:
                     session=request_session,
                 ),
             )
+        match = re.fullmatch(r"/v1/stickers/([0-9a-f-]{36})", path)
+        if method == "GET" and match is not None:
+            return Response.json(
+                200,
+                self.file_manager.sticker_metadata(
+                    identity,
+                    match.group(1),
+                    {
+                        "external_account_uuid": self._single(
+                            query, "external_account_uuid"
+                        ),
+                        "external_chat_uuid": self._single(query, "external_chat_uuid"),
+                    },
+                ),
+            )
         match = re.fullmatch(r"/v1/file-transfers/incoming/([0-9a-f-]{36})", path)
         if method == "PUT" and match is not None:
             response, created = self.file_manager.allocate_incoming(

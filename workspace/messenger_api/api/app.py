@@ -80,6 +80,11 @@ class MessengerOpenApiPaths(openapi_structures.OpenApiPaths):
             "/v1/",
             components,
         )
+        specification = openapi_contract.add_sticker_catalog_contract(
+            specification,
+            "/v1/",
+            components,
+        )
         return openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",
