@@ -23,6 +23,8 @@ from restalchemy.dm import types_dynamic
 
 
 MARKDOWN_CONTENT_MAX_LENGTH = 40_000
+E2EE_CONTENT_MAX_LENGTH = 4 * ((4 * MARKDOWN_CONTENT_MAX_LENGTH + 2) // 3)
+PUBLIC_KEY_MAX_LENGTH = 2048
 
 
 class MarkdownPayload(types_dynamic.AbstractKindModel):
@@ -44,6 +46,65 @@ class MarkdownPayload(types_dynamic.AbstractKindModel):
         )
 
 
+class E2EEPayload(types_dynamic.AbstractKindModel):
+    KIND = "e2ee"
+
+    key_uuid = properties.property(types.UUID(), required=True)
+    content = properties.property(
+        types.String(min_length=1, max_length=E2EE_CONTENT_MAX_LENGTH),
+        required=True,
+    )
+
+
+class KeyRequestPayload(types_dynamic.AbstractKindModel):
+    KIND = "key_request"
+
+    key_uuid = properties.property(types.UUID(), required=True)
+    device_id = properties.property(types.String(max_length=255), required=True)
+    device_name = properties.property(types.String(max_length=255), required=True)
+    public_key = properties.property(
+        types.String(min_length=1, max_length=PUBLIC_KEY_MAX_LENGTH),
+        required=True,
+    )
+
+
+class KeyGrantPayload(types_dynamic.AbstractKindModel):
+    KIND = "key_grant"
+
+    key_uuid = properties.property(types.UUID(), required=True)
+    request_message_uuid = properties.property(types.UUID(), required=True)
+    sender_device_id = properties.property(types.String(max_length=255), required=True)
+    recipient_device_id = properties.property(
+        types.String(max_length=255), required=True
+    )
+    content = properties.property(
+        types.String(min_length=1, max_length=40_000),
+        required=True,
+    )
+
+
+class KeyRejectPayload(types_dynamic.AbstractKindModel):
+    KIND = "key_reject"
+
+    key_uuid = properties.property(types.UUID(), required=True)
+    request_message_uuid = properties.property(types.UUID(), required=True)
+    sender_device_id = properties.property(types.String(max_length=255), required=True)
+    recipient_device_id = properties.property(
+        types.String(max_length=255), required=True
+    )
+
+
+class KeyAnnouncedPayload(types_dynamic.AbstractKindModel):
+    KIND = "key_announced"
+
+    key_uuid = properties.property(types.UUID(), required=True)
+
+
 WORKSPACE_MESSAGE_PAYLOAD_TYPE = types_dynamic.KindModelSelectorType(
     types_dynamic.KindModelType(MarkdownPayload),
+    types_dynamic.KindModelType(E2EEPayload),
+    types_dynamic.KindModelType(KeyRequestPayload),
+    types_dynamic.KindModelType(KeyGrantPayload),
+    types_dynamic.KindModelType(KeyRejectPayload),
+    types_dynamic.KindModelType(KeyAnnouncedPayload),
 )
