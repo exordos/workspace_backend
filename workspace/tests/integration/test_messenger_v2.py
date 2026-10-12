@@ -85,9 +85,7 @@ EXPIRED_PROVIDER_READ_RETRY_MIGRATION = (
     "0172-retry-expired-provider-read-pages-05d036.py"
 )
 PROJECTION_ACCELERATION_MIGRATION = "0173-accelerate-Messenger-v2-projections-8cda92.py"
-LEGACY_BACKFILL_COUNTER_MIGRATION = (
-    "0174-suppress-legacy-backfill-counters-a2cd99.py"
-)
+LEGACY_BACKFILL_COUNTER_MIGRATION = "0174-suppress-legacy-backfill-counters-a2cd99.py"
 
 
 def _truncate_messenger_test_data():
@@ -530,6 +528,57 @@ def test_v2_direct_messages_route_only_from_provider_topic(api, db, chat_type):
     assert routed_message_uuids == [
         sys_uuid.UUID(provider_message_response.json()["uuid"])
     ]
+
+
+def test_shared_provider_topic_create_routes_through_current_user(api, db):
+    response = api.post(STREAMS, json={"name": "Shared provider topic route"})
+    assert response.status_code == 201, response.text
+    stream_uuid = response.json()["uuid"]
+    physical_owner_uuid = sys_uuid.uuid4()
+    conftest.seed_workspace_user(db, physical_owner_uuid, "physical-owner")
+    physical_account_uuid = _seed_v2_provider_route(
+        db, api.project_id, physical_owner_uuid, stream_uuid
+    )
+    actor_account_uuid = _seed_v2_provider_route(
+        db, api.project_id, api.user_uuid, stream_uuid
+    )
+    with db.cursor() as cursor:
+        cursor.execute(
+            "UPDATE m_workspace_streams SET user_uuid=%s,external_account_uuid=%s "
+            "WHERE project_id=%s AND uuid=%s",
+            (physical_owner_uuid, physical_account_uuid, api.project_id, stream_uuid),
+        )
+    db.commit()
+
+    created = api.post(
+        STREAM_TOPICS, json={"stream_uuid": stream_uuid, "name": "Actor topic"}
+    )
+    assert created.status_code == 201, created.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT external_account_uuid,owner_user_uuid FROM m_external_operations_v2 "
+            "WHERE target_uuid=%s AND action='topic.create'",
+            (created.json()["uuid"],),
+        )
+        assert cursor.fetchall() == [(actor_account_uuid, sys_uuid.UUID(api.user_uuid))]
+
+    topic_uuid = created.json()["uuid"]
+    renamed = api.put(
+        f"{STREAM_TOPICS}{topic_uuid}", json={"name": "Renamed actor topic"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    deleted = api.delete(f"{STREAM_TOPICS}{topic_uuid}")
+    assert deleted.status_code == 204, deleted.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT action,external_account_uuid,owner_user_uuid FROM m_external_operations_v2 "
+            "WHERE target_uuid=%s AND action IN ('topic.create','topic.update','topic.delete') ORDER BY action",
+            (topic_uuid,),
+        )
+        assert cursor.fetchall() == [
+            (kind, actor_account_uuid, sys_uuid.UUID(api.user_uuid))
+            for kind in ("topic.create", "topic.delete", "topic.update")
+        ]
 
 
 def test_v2_store_preserves_existing_provider_outbound_actions(api, db):

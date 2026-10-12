@@ -27,6 +27,7 @@ from workspace.external_bridge_control import (
     pki,
     provider_data,
     provider_event_apply,
+    provider_v2,
     sql_state,
 )
 from workspace.messenger_api import events as messenger_events
@@ -5100,6 +5101,64 @@ def test_observed_chat_catalog_is_owned_idempotent_and_drives_selection_all(
         assert cursor.fetchone() == (3, "all")
 
 
+def test_provider_topic_reference_reuses_only_same_realm_materialized_topic(
+    _database, db
+):
+    project_uuid, owner_uuid, account_uuid, realm_uuid = (
+        sys_uuid.uuid4() for _ in range(4)
+    )
+    stream_uuid = sys_uuid.UUID(
+        conftest.seed_user_stream(db, project_uuid, owner_uuid, "Shared topic")
+    )
+    topic_uuid = sys_uuid.UUID(
+        conftest.seed_stream_topic(db, project_uuid, stream_uuid, owner_uuid, "general")
+    )
+    catalog_uuid = sys_uuid.uuid4()
+    with db.cursor() as cursor:
+        cursor.execute(
+            "INSERT INTO m_external_accounts_v2 (uuid,owner_user_uuid,provider,settings,provider_realm_uuid,provider_owner_user_id) "
+            "VALUES (%s,%s,'zulip','{}'::jsonb,%s,'7')",
+            (account_uuid, owner_uuid, realm_uuid),
+        )
+        cursor.execute(
+            "UPDATE m_workspace_stream_topics SET source_name='zulip',source=%s::jsonb, "
+            "external_account_uuid=%s,provider_external_id='42:general' WHERE uuid=%s",
+            (
+                json.dumps(
+                    {
+                        "kind": "zulip",
+                        "stream_id": 42,
+                        "server_url": "https://provider.invalid",
+                        "source_scope": str(account_uuid),
+                        "topic_name": "general",
+                    }
+                ),
+                account_uuid,
+                topic_uuid,
+            ),
+        )
+    db.commit()
+    route = {
+        "project_id": project_uuid,
+        "projection_stream_uuid": stream_uuid,
+        "provider_realm_uuid": realm_uuid,
+        "source": {
+            "topics": [
+                {"provider_topic_id": "42:general", "topic_uuid": str(catalog_uuid)}
+            ]
+        },
+    }
+    with contexts.Context().session_manager() as session:
+        assert provider_v2._topic_uuid(session, route, "42:general") == topic_uuid
+        for field in ("project_id", "projection_stream_uuid", "provider_realm_uuid"):
+            assert (
+                provider_v2._topic_uuid(
+                    session, {**route, field: sys_uuid.uuid4()}, "42:general"
+                )
+                == catalog_uuid
+            )
+
+
 def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
     _database, db, api
 ):
@@ -5311,6 +5370,66 @@ def test_same_realm_chat_reuses_one_project_stream_and_topic_across_accounts(
             (project_uuid, projection_stream_uuid),
         )
         assert cursor.fetchone() == (account_uuids[0], owner_uuids[0])
+
+        capability = {
+            name: {"available": True, "revision": 1, "limits": {}}
+            for name in (
+                "messenger.topic.create",
+                "messenger.topic.rename",
+                "messenger.topic.delete",
+            )
+        }
+        cursor.execute(
+            "UPDATE m_external_accounts_v2 SET status='live',live_ready=TRUE, "
+            "credential_present=TRUE,capabilities=%s::jsonb WHERE uuid=ANY(%s::uuid[])",
+            (json.dumps(capability), list(account_uuids)),
+        )
+        cursor.execute(
+            "UPDATE m_external_chats_v2 SET status='live',capabilities=%s::jsonb, "
+            "catalog_capabilities=%s::jsonb WHERE uuid=ANY(%s::uuid[])",
+            (json.dumps(capability), json.dumps(capability), list(chat_uuids)),
+        )
+        cursor.execute(
+            "UPDATE m_external_bridge_instances_v2 SET capabilities=%s::jsonb, "
+            "last_heartbeat_at=NOW() WHERE uuid=%s",
+            (json.dumps(capability), instance_uuid),
+        )
+
+    db.commit()
+    created = api.post(
+        "/v1/stream_topics/",
+        json={"stream_uuid": str(projection_stream_uuid), "name": "new topic"},
+        user=owner_uuids[1],
+    )
+    assert created.status_code in (200, 201), created.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT external_account_uuid,owner_user_uuid FROM m_external_operations_v2 "
+            "WHERE target_uuid=%s AND action='topic.create'",
+            (created.json()["uuid"],),
+        )
+        assert cursor.fetchall() == [(account_uuids[1], owner_uuids[1])]
+
+    renamed = api.put(
+        f"/v1/stream_topics/{created.json()['uuid']}",
+        json={"name": "renamed topic"},
+        user=owner_uuids[1],
+    )
+    assert renamed.status_code == 200, renamed.text
+    deleted = api.delete(
+        f"/v1/stream_topics/{created.json()['uuid']}", user=owner_uuids[1]
+    )
+    assert deleted.status_code == 204, deleted.text
+    with db.cursor() as cursor:
+        cursor.execute(
+            "SELECT action,external_account_uuid,owner_user_uuid FROM m_external_operations_v2 "
+            "WHERE target_uuid=%s AND action IN ('topic.create','topic.update','topic.delete') ORDER BY action",
+            (created.json()["uuid"],),
+        )
+        assert cursor.fetchall() == [
+            (kind, account_uuids[1], owner_uuids[1])
+            for kind in ("topic.create", "topic.delete", "topic.update")
+        ]
 
         # The persisted physical owner remains sufficient proof of a shared
         # realm/chat even while that owner's account is disconnected. The live

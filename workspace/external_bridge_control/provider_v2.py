@@ -171,7 +171,9 @@ def _resolve_route(
 
 
 def _topic_uuid(
-    route: typing.Mapping[str, typing.Any], provider_topic_id: object
+    session: typing.Any,
+    route: typing.Mapping[str, typing.Any],
+    provider_topic_id: object,
 ) -> sys_uuid.UUID:
     provider_topic_id = str(provider_topic_id)
     source = route["source"]
@@ -183,6 +185,29 @@ def _topic_uuid(
     ]
     if len(matches) != 1:
         raise ValueError("Provider topic mapping is missing")
+    materialized = session.execute(
+        """
+        SELECT topic.uuid
+        FROM m_workspace_stream_topics AS topic
+        JOIN m_external_accounts_v2 AS account
+          ON account.uuid = topic.external_account_uuid
+        WHERE topic.project_id = %s AND topic.stream_uuid = %s
+          AND topic.provider_external_id = %s
+          AND topic.source_name = 'zulip'
+          AND account.provider = 'zulip'
+          AND account.provider_realm_uuid = %s
+        ORDER BY topic.uuid
+        LIMIT 1
+        """,
+        (
+            route["project_id"],
+            route["projection_stream_uuid"],
+            provider_topic_id,
+            route["provider_realm_uuid"],
+        ),
+    ).fetchone()
+    if materialized is not None:
+        return sys_uuid.UUID(str(materialized["uuid"]))
     return sys_uuid.UUID(str(matches[0]["topic_uuid"]))
 
 
@@ -309,7 +334,7 @@ def _canonical_resource(
     object_id = str(provider_object["id"])
     stream_uuid = route.get("projection_stream_uuid")
     topic_uuid = (
-        _topic_uuid(route, references["topic"])
+        _topic_uuid(session, route, references["topic"])
         if references.get("topic") is not None
         else None
     )

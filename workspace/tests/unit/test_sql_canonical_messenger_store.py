@@ -13,6 +13,7 @@ import pytest
 from restalchemy.dm import filters as dm_filters
 
 from workspace.messenger_api.api import sql_canonical_store
+from workspace.messenger_api.api import v2_store
 
 
 PROJECT_UUID = sys_uuid.UUID("10000000-0000-0000-0000-000000000001")
@@ -1654,6 +1655,13 @@ def test_provider_topic_move_fails_before_canonical_mutation(monkeypatch):
             targets.append((stream_uuid, operation_kind)) or provider_target
         ),
     )
+    monkeypatch.setattr(
+        store,
+        "_provider_targets_for_stream",
+        lambda stream_uuid, kind: (
+            targets.append((stream_uuid, kind)) or (provider_target,)
+        ),
+    )
     mutations = []
     monkeypatch.setattr(
         sql_canonical_store.helpers,
@@ -3110,6 +3118,9 @@ def test_provider_route_identity_matches_normalized_legacy_origin(
         "reaction.update",
         "reaction.delete",
         "read_state.set",
+        "topic.create",
+        "topic.update",
+        "topic.delete",
     ],
 )
 def test_actor_provider_target_is_owned_by_current_user(monkeypatch, operation_kind):
@@ -3169,10 +3180,7 @@ def test_actor_provider_target_is_owned_by_current_user(monkeypatch, operation_k
         "membership.add",
         "membership.remove",
         "stream.delete",
-        "topic.create",
         "stream.update",
-        "topic.update",
-        "topic.delete",
     ],
 )
 def test_projection_provider_target_is_owned_by_stream_owner(
@@ -3268,6 +3276,82 @@ def test_message_create_has_no_provider_target_without_selected_topic_route(
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    "store_class",
+    (sql_canonical_store.SQLCanonicalMessengerStore, v2_store.MessengerV2Store),
+)
+def test_topic_create_routes_through_current_users_accounts(monkeypatch, store_class):
+    stream_uuid = sys_uuid.uuid4()
+    topic_uuid = sys_uuid.uuid4()
+    canonical_account_uuid = sys_uuid.uuid4()
+    actor_accounts = (sys_uuid.uuid4(), sys_uuid.uuid4())
+    stream = types.SimpleNamespace(
+        uuid=stream_uuid,
+        user_uuid=PROJECTION_OWNER_UUID,
+        external_account_uuid=canonical_account_uuid,
+    )
+    row = types.SimpleNamespace(uuid=topic_uuid, stream_uuid=stream_uuid)
+    monkeypatch.setattr(
+        sql_canonical_store.models.WorkspaceStream,
+        "objects",
+        FakeObjects([stream]),
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.contexts,
+        "Context",
+        lambda: types.SimpleNamespace(get_session=lambda: object()),
+    )
+    calls = []
+    store = store_class(PROJECT_UUID, USER_UUID)
+    monkeypatch.setattr(
+        store,
+        "_provider_user_account_uuids_for_stream",
+        lambda value: actor_accounts if value is stream else (),
+    )
+    monkeypatch.setattr(
+        store, "_lock_provider_accounts", lambda accounts: calls.append(accounts)
+    )
+
+    def target(_stream_uuid, _kind, **kwargs):
+        account_uuid = kwargs.get("external_account_uuid", canonical_account_uuid)
+        calls.append(account_uuid)
+        return account_uuid
+
+    monkeypatch.setattr(store, "_provider_target", target)
+    monkeypatch.setattr(
+        sql_canonical_store.helpers,
+        "create_workspace_user_stream_topic",
+        lambda **kwargs: calls.append("create") or row,
+    )
+    monkeypatch.setattr(
+        sql_canonical_store.resource_projection,
+        "as_dict",
+        lambda value, resource, **kwargs: {"uuid": value.uuid},
+    )
+    if isinstance(store, v2_store.MessengerV2Store):
+        monkeypatch.setattr(
+            store,
+            "_create_topic",
+            lambda values: (
+                calls.append("create")
+                or {"uuid": str(topic_uuid), "stream_uuid": str(stream_uuid)}
+            ),
+        )
+    queued = []
+    monkeypatch.setattr(
+        store, "_queue_provider_operation", lambda **kw: queued.append(kw)
+    )
+
+    store.create_resource("stream_topics", {"stream_uuid": stream_uuid, "name": "new"})
+
+    assert calls == [actor_accounts, *actor_accounts, "create"]
+    assert [operation["provider_target"] for operation in queued] == list(
+        actor_accounts
+    )
+    assert all(operation["operation_kind"] == "topic.create" for operation in queued)
+    assert all(operation["target_uuid"] == topic_uuid for operation in queued)
 
 
 def test_message_create_uses_stream_default_topic_for_provider_route(monkeypatch):
