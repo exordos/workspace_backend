@@ -2033,6 +2033,34 @@ def test_provider_history_finalizer_schedules_one_exact_counter_pass():
         provider_event_apply.apply_event(event, Session([assignment]), identity)
 
 
+@pytest.mark.parametrize("materialized", (True, False))
+def test_provider_topic_reference_reuses_materialized_shared_projection(materialized):
+    mapped_uuid = sys_uuid.uuid4()
+    materialized_uuid = sys_uuid.uuid4()
+    route = {
+        "project_id": sys_uuid.uuid4(),
+        "projection_stream_uuid": sys_uuid.uuid4(),
+        "provider_realm_uuid": sys_uuid.uuid4(),
+        "source": {
+            "topics": [
+                {"provider_topic_id": "42:general", "topic_uuid": str(mapped_uuid)}
+            ]
+        },
+    }
+    session = Session([{"uuid": materialized_uuid} if materialized else None])
+    resolved = provider_v2._topic_uuid(session, route, "42:general")
+    assert resolved == (materialized_uuid if materialized else mapped_uuid)
+    statement, parameters = session.statements[-1]
+    assert parameters == (
+        route["project_id"],
+        route["projection_stream_uuid"],
+        "42:general",
+        route["provider_realm_uuid"],
+    )
+    assert "account.provider_realm_uuid" in statement
+    assert "topic.source_name = 'zulip'" in statement
+
+
 def test_provider_v2_history_finalizer_is_server_scoped():
     stream_uuid = sys_uuid.uuid4()
     route = {

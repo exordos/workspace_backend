@@ -48,6 +48,9 @@ _CURRENT_USER_PROVIDER_OPERATIONS = frozenset(
         "reaction.update",
         "reaction.delete",
         "read_state.set",
+        "topic.create",
+        "topic.update",
+        "topic.delete",
     }
 )
 _STREAM_OWNER_PROVIDER_OPERATIONS = frozenset(
@@ -57,10 +60,7 @@ _STREAM_OWNER_PROVIDER_OPERATIONS = frozenset(
         "stream.notification.update",
         "topic.notification.update",
         "stream.delete",
-        "topic.create",
         "stream.update",
-        "topic.update",
-        "topic.delete",
     }
 )
 EVENT_RETENTION = datetime.timedelta(hours=72)
@@ -1571,6 +1571,35 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             is not None
         )
 
+    def _provider_targets_for_stream(
+        self, stream_uuid: object, operation_kind: str
+    ) -> tuple[typing.Any, ...]:
+        """Resolve the current user's routes for a shared stream operation."""
+        stream = models.WorkspaceStream.objects.get_one(
+            filters={
+                "project_id": dm_filters.EQ(self.project_uuid),
+                "uuid": dm_filters.EQ(stream_uuid),
+            },
+            session=contexts.Context().get_session(),
+        )
+        account_uuids = self._provider_user_account_uuids_for_stream(stream)
+        if not account_uuids:
+            return ()
+        self._lock_provider_accounts(account_uuids)
+        return tuple(
+            target
+            for account_uuid in account_uuids
+            if (
+                target := self._provider_target(
+                    stream_uuid,
+                    operation_kind,
+                    account_locked=True,
+                    external_account_uuid=account_uuid,
+                )
+            )
+            is not None
+        )
+
     def _message_provider_targets(
         self,
         message: models.WorkspaceMessage,
@@ -2266,7 +2295,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 **values,
             )
         elif resource == "stream_topics":
-            provider_target = self._provider_target(
+            provider_targets = self._provider_targets_for_stream(
                 values["stream_uuid"],
                 "topic.create",
             )
@@ -2275,14 +2304,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 user_uuid=self.user_uuid,
                 values=values,
             )
-            self._queue_provider_operation(
-                operation_kind="topic.create",
-                target_type="topic",
-                target_uuid=row.uuid,
-                stream_uuid=row.stream_uuid,
-                payload=_public_dict(row, resource),
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_operation(
+                    operation_kind="topic.create",
+                    target_type="topic",
+                    target_uuid=row.uuid,
+                    stream_uuid=row.stream_uuid,
+                    payload=_public_dict(row, resource),
+                    provider_target=provider_target,
+                )
         elif resource == "message_reactions":
             message = helpers.get_workspace_user_message(
                 self.project_uuid,
@@ -2358,7 +2388,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
             )
             source_stream_uuid = topic.stream_uuid
-            source_target = self._provider_target(
+            source_targets = self._provider_targets_for_stream(
                 source_stream_uuid,
                 "topic.update",
             )
@@ -2367,7 +2397,7 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
             if destination_stream_uuid != source_stream_uuid:
                 destination_target = self._provider_target(destination_stream_uuid)
-                if source_target is not None or destination_target is not None:
+                if source_targets or destination_target is not None:
                     # Provider topic movement has no negotiated capability in v1.
                     # Reject before touching canonical state instead of producing
                     # a local-only move or addressing the destination account.
@@ -2378,14 +2408,15 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
                 resource_uuid,
                 values,
             )
-            self._queue_provider_operation(
-                operation_kind="topic.update",
-                target_type="topic",
-                target_uuid=row.uuid,
-                stream_uuid=row.stream_uuid,
-                payload=_public_dict(row, resource),
-                provider_target=source_target,
-            )
+            for source_target in source_targets:
+                self._queue_provider_operation(
+                    operation_kind="topic.update",
+                    target_type="topic",
+                    target_uuid=row.uuid,
+                    stream_uuid=row.stream_uuid,
+                    payload=_public_dict(row, resource),
+                    provider_target=source_target,
+                )
         elif resource == "message_reactions":
             reaction = helpers.get_workspace_message_reaction(
                 self.project_uuid,
@@ -2473,6 +2504,9 @@ class SQLCanonicalMessengerStore(SQLCanonicalReadStore):
             )
             provider_stream_uuid = topic.stream_uuid
             provider_payload = _public_dict(topic, resource)
+            provider_targets = self._provider_targets_for_stream(
+                topic.stream_uuid, "topic.delete"
+            )
         elif resource == "message_reactions":
             reaction = helpers.get_workspace_message_reaction(
                 self.project_uuid, self.user_uuid, resource_uuid

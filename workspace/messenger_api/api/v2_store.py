@@ -855,19 +855,20 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
         if resource == "streams":
             return self._create_stream(values)
         if resource == "stream_topics":
-            provider_target = self._provider_target(
+            provider_targets = self._provider_targets_for_stream(
                 values["stream_uuid"],
                 "topic.create",
             )
             row = self._create_topic(values)
-            self._queue_provider_operation(
-                operation_kind="topic.create",
-                target_type="topic",
-                target_uuid=sys_uuid.UUID(str(row["uuid"])),
-                stream_uuid=sys_uuid.UUID(str(row["stream_uuid"])),
-                payload=row,
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_operation(
+                    operation_kind="topic.create",
+                    target_type="topic",
+                    target_uuid=sys_uuid.UUID(str(row["uuid"])),
+                    stream_uuid=sys_uuid.UUID(str(row["stream_uuid"])),
+                    payload=row,
+                    provider_target=provider_target,
+                )
             return row
         if resource == "message_reactions":
             message = self._message(values["message_uuid"])
@@ -1375,7 +1376,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return row
         if resource == "stream_topics":
             topic = self._topic(resource_uuid)
-            provider_target = self._provider_target(
+            provider_targets = self._provider_targets_for_stream(
                 topic.stream_uuid,
                 "topic.update",
             )
@@ -1396,14 +1397,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 {"source_kind": "topic.updated", "topic_uuid": topic.uuid},
             )
             row = _public(self._topic(topic.uuid), "stream_topics")
-            self._queue_provider_operation(
-                operation_kind="topic.update",
-                target_type="topic",
-                target_uuid=topic.uuid,
-                stream_uuid=topic.stream_uuid,
-                payload=row,
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_operation(
+                    operation_kind="topic.update",
+                    target_type="topic",
+                    target_uuid=topic.uuid,
+                    stream_uuid=topic.stream_uuid,
+                    payload=row,
+                    provider_target=provider_target,
+                )
             return row
         if resource == "message_reactions":
             reaction = v2_models.WorkspaceMessageReactionView.objects.get_one(
@@ -1749,7 +1751,7 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
             return None
         if resource == "stream_topics":
             topic = self._topic(resource_uuid)
-            provider_target = self._provider_target(
+            provider_targets = self._provider_targets_for_stream(
                 topic.stream_uuid,
                 "topic.delete",
             )
@@ -1786,14 +1788,15 @@ class MessengerV2Store(sql_canonical_store.SQLCanonicalMessengerStore):
                 "WHERE project_id = %s AND uuid = %s",
                 (self.project_uuid, topic.uuid),
             )
-            self._queue_provider_operation(
-                operation_kind="topic.delete",
-                target_type="topic",
-                target_uuid=topic.uuid,
-                stream_uuid=topic.stream_uuid,
-                payload=provider_payload,
-                provider_target=provider_target,
-            )
+            for provider_target in provider_targets:
+                self._queue_provider_operation(
+                    operation_kind="topic.delete",
+                    target_type="topic",
+                    target_uuid=topic.uuid,
+                    stream_uuid=topic.stream_uuid,
+                    payload=provider_payload,
+                    provider_target=provider_target,
+                )
             return None
         if resource == "streams":
             stream = self._stream(resource_uuid)
