@@ -252,6 +252,10 @@ class WorkspaceStream(
     __tablename__ = "messenger_streams"
 
     owner_uuid = properties.property(types.UUID(), required=True, read_only=True)
+    encryption = properties.property(types.Boolean(), default=False)
+    current_encryption_key_uuid = properties.property(
+        types.AllowNone(types.UUID()), default=None
+    )
     source_name = properties.property(
         types.Enum([source.value for source in base.SourceName]),
         default=base.SourceName.NATIVE.value,

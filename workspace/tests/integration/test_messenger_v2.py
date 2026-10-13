@@ -21,6 +21,8 @@ from restalchemy.storage.sql import migrations as ra_migrations
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
+from workspace.messenger_api.dm import helpers as messenger_helpers
+from workspace.messenger_api.dm import message_payloads
 from workspace.messenger_api.dm import models as messenger_models
 from workspace.services.messenger_workers import v2_projection
 from workspace.external_bridge_control import provider_event_apply
@@ -78,16 +80,6 @@ COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION = (
 )
 PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION = "0169-prefer-provider-chat-labels-485d62.py"
 PROVIDER_CHAT_OWNER_LABEL_MIGRATION = "0170-accept-provider-chat-owner-labels-90d43c.py"
-CANCELLED_PROVIDER_READ_MIGRATION = (
-    "0171-discard-cancelled-provider-read-snapshots-87ed2e.py"
-)
-EXPIRED_PROVIDER_READ_RETRY_MIGRATION = (
-    "0172-retry-expired-provider-read-pages-05d036.py"
-)
-PROJECTION_ACCELERATION_MIGRATION = "0173-accelerate-Messenger-v2-projections-8cda92.py"
-LEGACY_BACKFILL_COUNTER_MIGRATION = (
-    "0174-suppress-legacy-backfill-counters-a2cd99.py"
-)
 
 
 def _truncate_messenger_test_data():
@@ -138,32 +130,12 @@ def _truncate_messenger_test_data():
 
 @pytest.fixture(scope="module", autouse=True)
 def _isolate_v2_module(_database):
-    """Keep migration rollback/reapply tests independent and bounded."""
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(LEGACY_BACKFILL_COUNTER_MIGRATION)
-    engine.rollback_migration(PROJECTION_ACCELERATION_MIGRATION)
-    engine.rollback_migration(EXPIRED_PROVIDER_READ_RETRY_MIGRATION)
-    engine.rollback_migration(CANCELLED_PROVIDER_READ_MIGRATION)
-    engine.rollback_migration(PROVIDER_CHAT_OWNER_LABEL_MIGRATION)
-    engine.rollback_migration(PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION)
-    engine.rollback_migration(COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION)
-    engine.rollback_migration(COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION)
-    engine.rollback_migration(V2_COMPATIBILITY_READ_REPAIR_MIGRATION)
+    """Fence this module's data without rolling back the current API schema."""
     _truncate_messenger_test_data()
     try:
         yield
     finally:
         _truncate_messenger_test_data()
-        engine.apply_migration(V2_COMPATIBILITY_READ_REPAIR_MIGRATION)
-        engine.apply_migration(COMPACT_TOPIC_READ_STAT_REPAIR_MIGRATION)
-        engine.apply_migration(COMPACT_TOPIC_MESSAGE_STAT_REPAIR_MIGRATION)
-        engine.apply_migration(PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION)
-        engine.apply_migration(PROVIDER_CHAT_OWNER_LABEL_MIGRATION)
-        engine.apply_migration(CANCELLED_PROVIDER_READ_MIGRATION)
-        engine.apply_migration(EXPIRED_PROVIDER_READ_RETRY_MIGRATION)
-        engine.apply_migration(PROJECTION_ACCELERATION_MIGRATION)
-        engine.apply_migration(LEGACY_BACKFILL_COUNTER_MIGRATION)
-        engine.apply_migration(engine.get_latest_migration())
 
 
 @pytest.fixture(autouse=True)
@@ -175,6 +147,33 @@ def _production_v2_store():
         api_store.configure_store_factory(
             sql_canonical_store.SQLCanonicalMessengerStoreFactory()
         )
+
+
+@pytest.fixture
+def migration_engine(_database):
+    """Restore HEAD after checking a historical schema, even on failure."""
+    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    try:
+        yield engine
+    finally:
+        _truncate_messenger_test_data()
+        engine.apply_migration(engine.get_latest_migration())
+
+
+def _seed_legacy_message(api, stream_uuid, topic_uuid, content):
+    """Seed persisted legacy data without running the current HTTP API."""
+    with contexts.Context().session_manager() as session:
+        message = messenger_helpers.create_workspace_user_message(
+            project_id=sys_uuid.UUID(api.project_id),
+            user_uuid=sys_uuid.UUID(api.user_uuid),
+            stream_uuid=sys_uuid.UUID(stream_uuid),
+            topic_uuid=sys_uuid.UUID(topic_uuid),
+            payload=message_payloads.MarkdownPayload(content=content),
+            session=session,
+            compact_events=True,
+            return_visible=False,
+        )
+        return str(message.uuid)
 
 
 @pytest.fixture(autouse=True)
@@ -2417,7 +2416,18 @@ def test_projection_claim_bounds_interactive_read_priority(
         )
     db.commit()
     with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session) == 2
+        assert v2_projection.derive_projection_tasks(session) == 0
+        tasks = session.execute(
+            """
+            SELECT outbox_event_uuid FROM messenger_projection_tasks
+            WHERE outbox_event_uuid IN (%s, %s)
+            """,
+            (old_event_uuid, read_event_uuid),
+        ).fetchall()
+        assert {row["outbox_event_uuid"] for row in tasks} == {
+            old_event_uuid,
+            read_event_uuid,
+        }
         session.execute(
             """
             UPDATE messenger_projection_tasks
@@ -2563,7 +2573,17 @@ def test_projection_claim_ignores_unclaimable_overdue_tasks(
                 [event[5] for event in events],
             ),
         )
-        assert v2_projection.derive_projection_tasks(session) == len(events)
+        assert v2_projection.derive_projection_tasks(session) == 0
+        tasks = session.execute(
+            """
+            SELECT outbox_event_uuid FROM messenger_projection_tasks
+            WHERE outbox_event_uuid = ANY(%s::uuid[])
+            """,
+            ([event[0] for event in events],),
+        ).fetchall()
+        assert {row["outbox_event_uuid"] for row in tasks} == {
+            event[0] for event in events
+        }
         session.execute(
             """
             UPDATE messenger_projection_tasks AS task
@@ -2694,11 +2714,10 @@ def test_v2_idempotent_reads_survive_an_unavailable_provider_route(api, db):
         assert cursor.fetchone()[0] == 0
 
 
-def test_native_read_repair_migration_preserves_compact_reads(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(PROVIDER_OWNER_READ_REPAIR_MIGRATION)
-    engine.rollback_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
-    engine.rollback_migration(INTERACTIVE_READ_INDEX_MIGRATION)
+def test_native_read_repair_migration_preserves_compact_reads(
+    api, db, migration_engine
+):
+    engine = migration_engine
     try:
         peer_uuid = sys_uuid.uuid4()
         conftest.seed_workspace_user(db, peer_uuid, f"user-{peer_uuid}")
@@ -2734,6 +2753,7 @@ def test_native_read_repair_migration_preserves_compact_reads(api, db):
             messages.append(response.json()["uuid"])
             _drain()
 
+        engine.rollback_migration(INTERACTIVE_READ_INDEX_MIGRATION)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -2846,9 +2866,10 @@ def test_native_read_repair_migration_preserves_compact_reads(api, db):
         engine.apply_migration(PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION)
 
 
-def test_provider_owner_read_repair_restores_missing_compact_state(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(PROVIDER_OWNER_READ_REPAIR_MIGRATION)
+def test_provider_owner_read_repair_restores_missing_compact_state(
+    api, db, migration_engine
+):
+    engine = migration_engine
     try:
         owner_uuid = sys_uuid.uuid4()
         account_uuid = sys_uuid.uuid4()
@@ -2882,6 +2903,7 @@ def test_provider_owner_read_repair_restores_missing_compact_state(api, db):
         ).json()
         _drain()
 
+        engine.rollback_migration(PROVIDER_OWNER_READ_REPAIR_MIGRATION)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -3035,8 +3057,10 @@ def test_provider_owner_read_repair_restores_missing_compact_state(api, db):
         _truncate_messenger_test_data()
 
 
-def test_v2_compatibility_read_repair_restores_all_canonical_reads(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+def test_v2_compatibility_read_repair_restores_all_canonical_reads(
+    api, db, migration_engine
+):
+    engine = migration_engine
     peer_uuid = sys_uuid.uuid4()
     try:
         conftest.seed_workspace_user(db, peer_uuid, f"compat-read-{peer_uuid}")
@@ -3078,6 +3102,7 @@ def test_v2_compatibility_read_repair_restores_all_canonical_reads(api, db):
             message_uuids.append(response.json()["uuid"])
             _drain()
 
+        engine.rollback_migration(V2_COMPATIBILITY_READ_REPAIR_MIGRATION)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -3286,11 +3311,10 @@ def test_v2_compatibility_read_repair_restores_all_canonical_reads(api, db):
         _truncate_messenger_test_data()
 
 
-def test_provider_group_dm_migrates_to_channel_and_repairs_participants(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(PROVIDER_CHAT_LABEL_PREFERENCE_MIGRATION)
-    engine.rollback_migration(PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION)
-    engine.rollback_migration(PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION)
+def test_provider_group_dm_migrates_to_channel_and_repairs_participants(
+    api, db, migration_engine
+):
+    engine = migration_engine
     try:
         peer_read_uuid = sys_uuid.uuid4()
         peer_unread_uuid = sys_uuid.uuid4()
@@ -3339,6 +3363,7 @@ def test_provider_group_dm_migrates_to_channel_and_repairs_participants(api, db)
         message = message_response.json()
         _drain()
 
+        engine.rollback_migration(PROVIDER_PRIVATE_CHAT_LABEL_MIGRATION)
         participants = [
             {
                 "identity_uuid": str(api.user_uuid),
@@ -3713,13 +3738,14 @@ def test_provider_group_dm_migrates_to_channel_and_repairs_participants(api, db)
                 )
             ]
 
-        renamed = api.put(
-            f"{STREAMS}{stream['uuid']}",
-            json={"name": "Local group channel name"},
-        )
-        assert renamed.status_code == 200, renamed.text
-        assert renamed.json()["name"] == "Local group channel name"
         with db.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE m_workspace_streams SET name = %s
+                WHERE project_id = %s AND uuid = %s
+                """,
+                ("Local group channel name", api.project_id, stream["uuid"]),
+            )
             cursor.execute(
                 """
                 SELECT array_agg(DISTINCT name ORDER BY name)
@@ -3820,6 +3846,13 @@ def test_provider_group_dm_migrates_to_channel_and_repairs_participants(api, db)
                 ],
                 key=lambda row: row[0],
             )
+        engine.apply_migration(engine.get_latest_migration())
+        renamed = api.put(
+            f"{STREAMS}{stream['uuid']}",
+            json={"name": "Local group channel name"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["name"] == "Local group channel name"
     finally:
         _truncate_messenger_test_data()
         engine.apply_migration(PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION)
@@ -3829,9 +3862,9 @@ def test_provider_group_dm_migrates_to_channel_and_repairs_participants(api, db)
 def test_provider_personal_chat_owner_uses_peer_label_without_owner_participant(
     api,
     db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(PROVIDER_CHAT_OWNER_LABEL_MIGRATION)
+    engine = migration_engine
     try:
         peer_uuid = sys_uuid.uuid4()
         bridge_uuid = sys_uuid.uuid4()
@@ -3854,6 +3887,7 @@ def test_provider_personal_chat_owner_uses_peer_label_without_owner_participant(
         stream = response.json()
         _drain()
 
+        engine.rollback_migration(PROVIDER_CHAT_OWNER_LABEL_MIGRATION)
         provider_source = {
             "kind": "zulip",
             "chat_type": "personal",
@@ -3994,9 +4028,10 @@ def test_provider_personal_chat_owner_uses_peer_label_without_owner_participant(
         engine.apply_migration(PROVIDER_CHAT_OWNER_LABEL_MIGRATION)
 
 
-def test_duplicate_provider_projection_repair_keeps_native_author(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION)
+def test_duplicate_provider_projection_repair_keeps_native_author(
+    api, db, migration_engine
+):
+    engine = migration_engine
     try:
         peer_uuid = sys_uuid.uuid4()
         bridge_uuid = sys_uuid.uuid4()
@@ -4038,6 +4073,7 @@ def test_duplicate_provider_projection_repair_keeps_native_author(api, db):
         native_uuid = sys_uuid.UUID(native.json()["uuid"])
         _drain()
 
+        engine.rollback_migration(DUPLICATE_PROVIDER_PROJECTION_REPAIR_MIGRATION)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -4712,8 +4748,10 @@ def test_native_v2_scheduler_drains_aged_tasks_before_fresh_fanout(api, monkeypa
         assert str(claimed["payload"]["placement_uuid"]) == aged["uuid"]
 
 
-def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(
+    api, db, migration_engine
+):
+    engine = migration_engine
     audience_uuid = None
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
@@ -4731,16 +4769,9 @@ def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api
             "Legacy topic",
             is_default=True,
         )
-        legacy = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "legacy message"},
-            },
+        legacy_uuid = _seed_legacy_message(
+            api, stream_uuid, topic_uuid, "legacy message"
         )
-        assert legacy.status_code == 201, legacy.text
-        legacy_uuid = legacy.json()["uuid"]
         orphan_user_uuid = sys_uuid.uuid4()
         audience_uuid = sys_uuid.uuid4()
         with db.cursor() as cursor:
@@ -4801,6 +4832,7 @@ def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api
         placement_uuid = str(
             sys_uuid.uuid5(sys_uuid.UUID(topic_uuid), str(legacy_uuid).lower())
         )
+        engine.apply_migration(engine.get_latest_migration())
         mapped = api.get(f"{MESSAGES}{legacy_uuid}")
         assert mapped.status_code == 200, mapped.text
         assert mapped.json()["uuid"] == placement_uuid
@@ -4835,13 +4867,19 @@ def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api
             sql_canonical_store.SQLCanonicalMessengerStoreFactory()
         )
         engine.rollback_migration(V2_MIGRATION)
-        restored = api.get(f"{MESSAGES}{legacy_uuid}")
-        assert restored.status_code == 200, restored.text
-        assert restored.json()["uuid"] == legacy_uuid
-        restored_v2 = api.get(f"{MESSAGES}{native_v2_uuid}")
-        assert restored_v2.status_code == 200, restored_v2.text
-        assert restored_v2.json()["uuid"] == native_v2_uuid
         with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT uuid FROM m_workspace_user_messages_view
+                WHERE project_id = %s AND user_uuid = %s
+                  AND uuid = ANY(%s::uuid[])
+                """,
+                (api.project_id, api.user_uuid, [legacy_uuid, native_v2_uuid]),
+            )
+            assert {str(row[0]) for row in cursor.fetchall()} == {
+                legacy_uuid,
+                native_v2_uuid,
+            }
             cursor.execute(
                 """
                 SELECT payload->>'uuid'
@@ -4892,8 +4930,10 @@ def test_native_v2_migration_rewrites_and_rolls_back_legacy_message_identity(api
         api_store.configure_store_factory(store_factory.build_store_factory())
 
 
-def test_native_v2_migration_fences_revoked_historical_events(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+def test_native_v2_migration_fences_revoked_historical_events(
+    api, db, migration_engine
+):
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -4912,15 +4952,7 @@ def test_native_v2_migration_fences_revoked_historical_events(api, db):
             "Historical topic",
             is_default=True,
         )
-        message = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "historical"},
-            },
-        )
-        assert message.status_code == 201, message.text
+        message_uuid = _seed_legacy_message(api, stream_uuid, topic_uuid, "historical")
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -4930,7 +4962,7 @@ def test_native_v2_migration_fences_revoked_historical_events(api, db):
                   AND event.object_type = 'message' AND event.action = 'created'
                   AND event.payload->>'uuid' = %s
                 """,
-                (api.project_id, peer_uuid, message.json()["uuid"]),
+                (api.project_id, peer_uuid, message_uuid),
             )
             historical_event_uuid = cursor.fetchone()[0]
             cursor.execute(
@@ -4951,6 +4983,7 @@ def test_native_v2_migration_fences_revoked_historical_events(api, db):
 
         engine.apply_migration(V2_MIGRATION)
         api_store.configure_store_factory(store_factory.build_store_factory())
+        engine.apply_migration(engine.get_latest_migration())
         added = api.post(
             f"{STREAMS}{stream_uuid}/actions/add_users/invoke",
             json={"member": [str(peer_uuid)]},
@@ -4988,8 +5021,10 @@ def test_native_v2_migration_fences_revoked_historical_events(api, db):
         api_store.configure_store_factory(store_factory.build_store_factory())
 
 
-def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+def test_native_v2_migration_rejects_ambiguous_zulip_provenance(
+    api, db, migration_engine
+):
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -5127,9 +5162,12 @@ def test_native_v2_migration_rejects_ambiguous_zulip_provenance(api, db):
 
 
 def test_native_v2_migration_requires_explicit_large_cutover_authorization(
-    api, db, monkeypatch
+    api,
+    db,
+    monkeypatch,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -5196,9 +5234,12 @@ def test_native_v2_migration_requires_explicit_large_cutover_authorization(
 
 
 def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
-    api, db, monkeypatch
+    api,
+    db,
+    monkeypatch,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -5222,33 +5263,15 @@ def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
         retained_video_uuid = sys_uuid.uuid4()
         reset_file_uuid = sys_uuid.uuid4()
         ambiguous_file_uuid = sys_uuid.uuid4()
-        native = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {
-                    "kind": "markdown",
-                    "content": (
-                        f"native urn:file:{retained_file_uuid} "
-                        f"urn:image:{retained_image_uuid} "
-                        f"urn:video:{retained_video_uuid}"
-                    ),
-                },
-            },
+        native = _seed_legacy_message(
+            api,
+            stream_uuid,
+            topic_uuid,
+            f"native urn:file:{retained_file_uuid} urn:image:{retained_image_uuid} urn:video:{retained_video_uuid}",
         )
-        assert native.status_code == 201, native.text
-        native_uuid = native.json()["uuid"]
-        outbound = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "native outbound"},
-            },
-        )
-        assert outbound.status_code == 201, outbound.text
-        outbound_uuid = outbound.json()["uuid"]
+        native_uuid = native
+        outbound = _seed_legacy_message(api, stream_uuid, topic_uuid, "native outbound")
+        outbound_uuid = outbound
 
         account_uuid = sys_uuid.uuid4()
         provider_realm_uuid = sys_uuid.uuid4()
@@ -5637,8 +5660,9 @@ def test_native_v2_migration_resets_zulip_projection_and_preserves_native(
 def test_forward_provider_identity_repair_requires_terminal_operation(
     api,
     db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     engine.rollback_migration(ZULIP_PROJECTION_RESET_MIGRATION)
     engine.rollback_migration(CURRENT_MIGRATION_HEAD)
     engine.rollback_migration(PREPARE_V2_MIGRATION)
@@ -5693,26 +5717,12 @@ def test_forward_provider_identity_repair_requires_terminal_operation(
                 ),
             )
 
-        native = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "native retained"},
-            },
+        native = _seed_legacy_message(api, stream_uuid, topic_uuid, "native retained")
+        outbound = _seed_legacy_message(
+            api, stream_uuid, topic_uuid, "outbound retained"
         )
-        outbound = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "outbound retained"},
-            },
-        )
-        assert native.status_code == 201, native.text
-        assert outbound.status_code == 201, outbound.text
-        native_uuid = sys_uuid.UUID(native.json()["uuid"])
-        outbound_uuid = sys_uuid.UUID(outbound.json()["uuid"])
+        native_uuid = sys_uuid.UUID(native)
+        outbound_uuid = sys_uuid.UUID(outbound)
 
         with db.cursor() as cursor:
             cursor.execute(
@@ -5853,16 +5863,8 @@ def test_forward_provider_identity_repair_requires_terminal_operation(
                     == public_uuid
                 )
 
-        update_path = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "update path"},
-            },
-        )
-        assert update_path.status_code == 201, update_path.text
-        update_path_uuid = sys_uuid.UUID(update_path.json()["uuid"])
+        update_path = _seed_legacy_message(api, stream_uuid, topic_uuid, "update path")
+        update_path_uuid = sys_uuid.UUID(update_path)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -5997,8 +5999,9 @@ def test_forward_provider_identity_repair_requires_terminal_operation(
 def test_forward_provider_identity_repair_detaches_only_proven_aliases(
     api,
     db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     engine.rollback_migration(ZULIP_PROJECTION_RESET_MIGRATION)
     engine.rollback_migration(CURRENT_MIGRATION_HEAD)
     engine.rollback_migration(PREPARE_V2_MIGRATION)
@@ -6055,16 +6058,8 @@ def test_forward_provider_identity_repair_detaches_only_proven_aliases(
 
         public_uuids = []
         for content in ("duplicate one", "duplicate two"):
-            response = api.post(
-                MESSAGES,
-                json={
-                    "stream_uuid": stream_uuid,
-                    "topic_uuid": topic_uuid,
-                    "payload": {"kind": "markdown", "content": content},
-                },
-            )
-            assert response.status_code == 201, response.text
-            public_uuids.append(sys_uuid.UUID(response.json()["uuid"]))
+            response = _seed_legacy_message(api, stream_uuid, topic_uuid, content)
+            public_uuids.append(sys_uuid.UUID(response))
         second_uuid = public_uuids[1]
         with db.cursor() as cursor:
             cursor.executemany(
@@ -6144,9 +6139,16 @@ def test_forward_provider_identity_repair_detaches_only_proven_aliases(
                 "990",
             )
         assert resolved_uuid in public_uuids
-        for public_uuid in public_uuids:
-            response = api.get(f"{MESSAGES}{public_uuid}")
-            assert response.status_code == 200, response.text
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT uuid FROM m_workspace_user_messages_view
+                WHERE project_id = %s AND user_uuid = %s
+                  AND uuid = ANY(%s::uuid[])
+                """,
+                (api.project_id, api.user_uuid, public_uuids),
+            )
+            assert {row[0] for row in cursor.fetchall()} == set(public_uuids)
     finally:
         with db.cursor() as cursor:
             cursor.execute(
@@ -6174,8 +6176,9 @@ def test_forward_provider_identity_repair_detaches_only_proven_aliases(
 def test_forward_provider_identity_repair_prefers_existing_imported_identity(
     api,
     db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     engine.rollback_migration(ZULIP_PROJECTION_RESET_MIGRATION)
     engine.rollback_migration(CURRENT_MIGRATION_HEAD)
     engine.rollback_migration(PREPARE_V2_MIGRATION)
@@ -6267,16 +6270,8 @@ def test_forward_provider_identity_repair_prefers_existing_imported_identity(
                 ),
             )
 
-        retained = api.post(
-            MESSAGES,
-            json={
-                "stream_uuid": stream_uuid,
-                "topic_uuid": topic_uuid,
-                "payload": {"kind": "markdown", "content": "retained alias"},
-            },
-        )
-        assert retained.status_code == 201, retained.text
-        retained_public_uuid = sys_uuid.UUID(retained.json()["uuid"])
+        retained = _seed_legacy_message(api, stream_uuid, topic_uuid, "retained alias")
+        retained_public_uuid = sys_uuid.UUID(retained)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -6369,9 +6364,23 @@ def test_forward_provider_identity_repair_prefers_existing_imported_identity(
                 )
                 == imported_public_uuid
             )
-        for public_uuid in (imported_public_uuid, retained_public_uuid):
-            response = api.get(f"{MESSAGES}{public_uuid}")
-            assert response.status_code == 200, response.text
+        with db.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT uuid FROM m_workspace_user_messages_view
+                WHERE project_id = %s AND user_uuid = %s
+                  AND uuid = ANY(%s::uuid[])
+                """,
+                (
+                    api.project_id,
+                    api.user_uuid,
+                    [imported_public_uuid, retained_public_uuid],
+                ),
+            )
+            assert {row[0] for row in cursor.fetchall()} == {
+                imported_public_uuid,
+                retained_public_uuid,
+            }
     finally:
         with db.cursor() as cursor:
             cursor.execute(
@@ -6400,8 +6409,9 @@ def test_forward_provider_identity_repair_prefers_existing_imported_identity(
 def test_forward_provider_identity_repair_accepts_released_bridge_payload(
     api,
     db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     engine.rollback_migration(ZULIP_PROJECTION_RESET_MIGRATION)
     engine.rollback_migration(CURRENT_MIGRATION_HEAD)
     engine.rollback_migration(PREPARE_V2_MIGRATION)
@@ -6742,9 +6752,9 @@ def test_forward_provider_identity_repair_accepts_released_bridge_payload(
 def test_zulip_projection_reset_preserves_internal_messages_and_clears_counters(
     api,
     db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(ZULIP_PROJECTION_RESET_MIGRATION)
+    engine = migration_engine
     _truncate_messenger_test_data()
     try:
         internal_stream = api.post(
@@ -6859,6 +6869,8 @@ def test_zulip_projection_reset_preserves_internal_messages_and_clears_counters(
         internal_message_uuid = sys_uuid.UUID(internal_message.json()["uuid"])
         external_message_uuid = sys_uuid.UUID(external_message.json()["uuid"])
 
+        _drain()
+        engine.rollback_migration(ZULIP_PROJECTION_RESET_MIGRATION)
         with db.cursor() as cursor:
             cursor.execute(
                 """
@@ -7091,6 +7103,7 @@ def test_zulip_projection_reset_preserves_internal_messages_and_clears_counters(
             )
             assert cursor.fetchone() == (True,)
 
+        engine.apply_migration(engine.get_latest_migration())
         streams = api.get(STREAMS)
         assert streams.status_code == 200, streams.text
         external_row = next(
@@ -7107,13 +7120,10 @@ def test_zulip_projection_reset_preserves_internal_messages_and_clears_counters(
         engine.apply_migration(ZULIP_MESSAGE_RESET_MIGRATION)
 
 
-def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
-    engine.rollback_migration(PROVIDER_OWNER_READ_REPAIR_MIGRATION)
-    engine.rollback_migration(PROVIDER_READ_PAGE_UNBLOCK_MIGRATION)
-    engine.rollback_migration(INTERACTIVE_READ_INDEX_MIGRATION)
-    engine.rollback_migration(PROJECTION_CLAIM_INDEX_MIGRATION)
-    engine.rollback_migration(ZULIP_MESSAGE_RESET_MIGRATION)
+def test_zulip_message_reset_rebuilds_mixed_native_chat_state(
+    api, db, migration_engine
+):
+    engine = migration_engine
     _truncate_messenger_test_data()
     try:
         peer_uuid = sys_uuid.uuid4()
@@ -7304,6 +7314,7 @@ def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
         assert provider_message.status_code == 201, provider_message.text
         _drain()
 
+        engine.rollback_migration(ZULIP_MESSAGE_RESET_MIGRATION)
         provider_public_uuid = sys_uuid.UUID(provider_message.json()["uuid"])
         with db.cursor() as cursor:
             cursor.execute(
@@ -7716,6 +7727,7 @@ def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
             )
             assert cursor.fetchone() == (True,)
 
+        engine.apply_migration(engine.get_latest_migration())
         peer_stream = api.get(f"{STREAMS}{mixed_stream['uuid']}", user=peer_uuid)
         peer_active_topic = api.get(
             f"{STREAM_TOPICS}{active_topic['uuid']}", user=peer_uuid
@@ -7750,8 +7762,10 @@ def test_zulip_message_reset_rebuilds_mixed_native_chat_state(api, db):
         engine.apply_migration(PROVIDER_PARTICIPANT_STATE_REPAIR_MIGRATION)
 
 
-def test_native_v2_migration_canonicalizes_legacy_provider_identity_links(api, db):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+def test_native_v2_migration_canonicalizes_legacy_provider_identity_links(
+    api, db, migration_engine
+):
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -8017,9 +8031,11 @@ def test_native_v2_migration_canonicalizes_legacy_provider_identity_links(api, d
 
 
 def test_native_v2_migration_collapses_realm_chat_aliases_and_keeps_native_rows(
-    api, db
+    api,
+    db,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -8330,9 +8346,12 @@ def test_native_v2_migration_collapses_realm_chat_aliases_and_keeps_native_rows(
 
 @pytest.mark.parametrize("materialized", [True, False])
 def test_native_v2_migration_rejects_realm_chat_selected_in_multiple_projects(
-    api, db, materialized
+    api,
+    db,
+    materialized,
+    migration_engine,
 ):
-    engine = ra_migrations.MigrationEngine(migrations_path=str(conftest.MIGRATIONS_DIR))
+    engine = migration_engine
     api_store.configure_store_factory(
         sql_canonical_store.SQLCanonicalMessengerStoreFactory()
     )
@@ -8615,7 +8634,7 @@ def test_native_v2_coalesces_legacy_folder_snapshot_bursts(api, db):
             ],
         )
     with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session) == 3
+        assert v2_projection.derive_projection_tasks(session) == 0
     competing_claim = psycopg.connect(conftest.TEST_DB_URL)
     try:
         with competing_claim.cursor() as cursor:
@@ -8731,7 +8750,7 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
             ],
         )
     with contexts.Context().session_manager() as session:
-        assert v2_projection.derive_projection_tasks(session) == 4
+        assert v2_projection.derive_projection_tasks(session) == 0
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -8818,10 +8837,6 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
             session,
             "integration:read-counter-coalesce",
         )
-        assert not v2_projection.process_one_projection_task(
-            session,
-            "integration:read-counter-coalesce",
-        )
     with db.cursor() as cursor:
         cursor.execute(
             """
@@ -8834,6 +8849,13 @@ def test_native_v2_coalesces_snapshot_only_read_counter_bursts(api, db):
             (api.project_id, event_uuids),
         )
         assert cursor.fetchone() == (4, 3, 1)
+    # Current migrations enqueue the resulting folder snapshots atomically.
+    _drain()
+    with contexts.Context().session_manager() as session:
+        assert not v2_projection.process_one_projection_task(
+            session,
+            "integration:read-counter-coalesce",
+        )
 
 
 def test_native_v2_fanout_supports_more_than_five_thousand_recipients(api, db):
