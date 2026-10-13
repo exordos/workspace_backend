@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections.abc
 import re
 import uuid as sys_uuid
 
@@ -25,6 +26,12 @@ from restalchemy.dm import types_dynamic
 MARKDOWN_CONTENT_MAX_LENGTH = 40_000
 E2EE_CONTENT_MAX_LENGTH = 4 * ((4 * MARKDOWN_CONTENT_MAX_LENGTH + 2) // 3)
 PUBLIC_KEY_MAX_LENGTH = 2048
+
+
+def markdown_content(payload) -> str:
+    if isinstance(payload, collections.abc.Mapping):
+        return payload["content"] if payload["kind"] == MarkdownPayload.KIND else ""
+    return payload.content if payload.kind == MarkdownPayload.KIND else ""
 
 
 class MarkdownPayload(types_dynamic.AbstractKindModel):

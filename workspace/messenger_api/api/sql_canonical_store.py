@@ -97,7 +97,11 @@ MENTIONED_MESSAGE_UUIDS_SQL = """
           {read_clause}
           AND POSITION(
               '](' || 'urn:user:' || LOWER(%s::text) || ')'
-              IN LOWER(COALESCE(message.payload->>'content', ''))
+              IN LOWER(CASE
+                  WHEN message.payload->>'kind' = 'markdown'
+                      THEN COALESCE(message.payload->>'content', '')
+                  ELSE ''
+              END)
           ) > 0
           {marker_clause}
         ORDER BY message.created_at {direction}, message.uuid {direction}

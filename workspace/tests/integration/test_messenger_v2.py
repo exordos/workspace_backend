@@ -18,6 +18,7 @@ import pytest
 from restalchemy.common import contexts
 from restalchemy.storage.sql import migrations as ra_migrations
 
+from workspace.messenger_api import events as messenger_events
 from workspace.messenger_api.api import sql_canonical_store
 from workspace.messenger_api.api import store as api_store
 from workspace.messenger_api.api import store_factory
@@ -161,7 +162,7 @@ def migration_engine(_database):
 
 
 def _seed_legacy_message(api, stream_uuid, topic_uuid, content):
-    """Seed persisted legacy data without running the current HTTP API."""
+    """Seed a persisted legacy message and its historical message events."""
     with contexts.Context().session_manager() as session:
         message = messenger_helpers.create_workspace_user_message(
             project_id=sys_uuid.UUID(api.project_id),
@@ -172,6 +173,14 @@ def _seed_legacy_message(api, stream_uuid, topic_uuid, content):
             session=session,
             compact_events=True,
             return_visible=False,
+            emit_events=False,
+        )
+        messenger_events.create_message_events(
+            project_id=message.project_id,
+            message=message,
+            recipients=message.get_recipients(session=session),
+            session=session,
+            compact=True,
         )
         return str(message.uuid)
 
