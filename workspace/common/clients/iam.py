@@ -16,8 +16,20 @@
 
 from bazooka import common
 from bazooka import client as bz_client
+from bazooka import exceptions as bz_exc
 from collections.abc import Callable
+from requests import exceptions as request_exc
+from restalchemy.common import exceptions as ra_exc
 from typing import Any
+
+
+class IamProfileRequestError(ra_exc.RestAlchemyException):
+    code = 502
+    message = "IAM profile request failed."
+
+    def __init__(self, code: int = 502) -> None:
+        self.code = code
+        super().__init__()
 
 
 class IamClient(common.RESTClientMixIn):
@@ -47,3 +59,26 @@ class IamClient(common.RESTClientMixIn):
             headers={"Authorization": f"Bearer {token}"},
         )
         return response.json()
+
+    def _profile_request(
+        self, method: str, user_uuid: object, token: str, **kwargs: Any
+    ) -> Any:
+        url = f"{self._get_users_url()}{user_uuid}"
+        try:
+            response = getattr(self._client, method)(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                **kwargs,
+            )
+            return response.json()
+        except bz_exc.BaseHTTPException as exc:
+            code = exc.code if 400 <= exc.code < 500 else 502
+            raise IamProfileRequestError(code) from None
+        except (request_exc.RequestException, ValueError):
+            raise IamProfileRequestError() from None
+
+    def get_user(self, user_uuid: object, token: str) -> Any:
+        return self._profile_request("get", user_uuid, token)
+
+    def update_user(self, user_uuid: object, token: str, values: dict[str, Any]) -> Any:
+        return self._profile_request("put", user_uuid, token, json=values)

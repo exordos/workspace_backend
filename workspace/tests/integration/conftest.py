@@ -93,6 +93,7 @@ class _PolicyShouldNotBeCalledEnforcer:
 
 class _FakeToken:
     otp_enabled = False
+    token = "integration-test-token"
 
     def __init__(self, user_uuid):
         self.user_uuid = str(user_uuid)

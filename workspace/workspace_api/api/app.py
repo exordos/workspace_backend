@@ -91,6 +91,7 @@ class WorkspaceOpenApiPaths(openapi_structures.OpenApiPaths):
         return openapi_contract.add_current_user_contract(
             specification,
             "/v1/me/",
+            components,
         )
 
 
